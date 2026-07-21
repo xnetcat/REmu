@@ -329,6 +329,10 @@ struct RawAllocation {
     kind: AllocationKind,
 }
 
+// SAFETY: RawAllocation is an owning handle to a process-wide VM mapping. Moving that sole owner
+// to another thread does not create aliases; Drop releases the same mapping from either thread.
+unsafe impl Send for RawAllocation {}
+
 impl RawAllocation {
     #[cfg(target_os = "macos")]
     fn allocate_exact(address: u64, size: u64) -> Result<Self, MappingError> {

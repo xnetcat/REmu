@@ -38,6 +38,15 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         timeout_seconds: u32,
     },
+    /// Launch a game with the native Metal presentation window.
+    Run {
+        path: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        import_limit: usize,
+        /// Stop the process after this many seconds; zero disables the timer.
+        #[arg(long, default_value_t = 0)]
+        timeout_seconds: u32,
+    },
 }
 
 fn main() -> ExitCode {
@@ -69,6 +78,11 @@ fn main() -> ExitCode {
             import_limit,
             timeout_seconds,
         } => probe(&path, import_limit, timeout_seconds),
+        Command::Run {
+            path,
+            import_limit,
+            timeout_seconds,
+        } => run_game(&path, import_limit, timeout_seconds),
     }
 }
 
@@ -363,6 +377,63 @@ fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
         }
         Err(error) => {
             eprintln!("error: {}: {error}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
+    let executable = match remu_loader::load_path(path) {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let linked = match remu_runtime::LinkedImage::link_main(&executable) {
+        Ok(linked) => linked,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let image_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("eboot.bin")
+        .to_owned();
+    let game_root = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    remu_gpu::install_event_sink(sender.clone());
+    let guest = std::thread::spawn(move || {
+        let result = linked.probe_entry(&image_name, &game_root, import_limit, timeout_seconds);
+        let _ = sender.send(remu_gpu::GpuEvent::Shutdown);
+        result
+    });
+
+    let presenter_result = remu_gpu_metal::run_presenter(receiver);
+    remu_gpu::clear_event_sink();
+    if let Err(error) = presenter_result {
+        eprintln!("error: {error}");
+        return ExitCode::FAILURE;
+    }
+    if !guest.is_finished() {
+        return ExitCode::SUCCESS;
+    }
+    match guest.join() {
+        Ok(Ok(outcome)) => {
+            eprintln!(
+                "[REMu] guest returned {} after {} imports",
+                outcome.return_value, outcome.import_hits
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Err(error)) => {
+            eprintln!("error: {}: {error}", path.display());
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            eprintln!("error: the guest execution thread panicked");
             ExitCode::FAILURE
         }
     }

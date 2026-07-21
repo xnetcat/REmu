@@ -9,8 +9,10 @@ license.workspace = true
 remu-gpu = { path = "../remu-gpu" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-graphics-types.workspace = true
 metal.workspace = true
+objc.workspace = true
+winit.workspace = true
 
 [lints]
 workspace = true
-

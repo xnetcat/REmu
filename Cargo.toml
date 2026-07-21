@@ -19,12 +19,16 @@ license = "GPL-2.0-or-later"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+core-graphics-types = "0.2"
 libc = "0.2"
 metal = "0.33"
+objc = "0.2"
 thiserror = "2.0"
+winit = "0.30"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

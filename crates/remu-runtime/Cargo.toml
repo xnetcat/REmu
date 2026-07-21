@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 libc.workspace = true
 remu-core = { path = "../remu-core" }
+remu-gpu = { path = "../remu-gpu" }
 remu-loader = { path = "../remu-loader" }
 remu-memory = { path = "../remu-memory" }
 thiserror.workspace = true

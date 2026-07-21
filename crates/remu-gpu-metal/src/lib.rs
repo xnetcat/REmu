@@ -2,6 +2,19 @@
 
 use remu_gpu::{GpuAdapter, GpuProbe, GpuProbeError, GraphicsApi};
 
+#[cfg(target_os = "macos")]
+mod presenter;
+
+#[cfg(target_os = "macos")]
+pub use presenter::run_presenter;
+
+#[cfg(not(target_os = "macos"))]
+pub fn run_presenter(
+    _receiver: std::sync::mpsc::Receiver<remu_gpu::GpuEvent>,
+) -> Result<(), String> {
+    Err("the Metal presenter is available only on macOS".to_owned())
+}
+
 pub struct MetalProbe;
 
 #[cfg(target_os = "macos")]

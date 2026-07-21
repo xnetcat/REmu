@@ -2644,6 +2644,14 @@ fn video_out_register_buffers2(arguments: [u64; 6], state: &mut ProbeDispatchSta
         state.video_out.tiling_mode,
         state.video_out.display_buffers
     );
+    remu_gpu::emit_event(remu_gpu::GpuEvent::DisplayRegistered {
+        width: state.video_out.width,
+        height: state.video_out.height,
+        pitch: state.video_out.width,
+        pixel_format: state.video_out.pixel_format,
+        tiling_mode: state.video_out.tiling_mode,
+        buffers: state.video_out.display_buffers.clone(),
+    });
     u64::from(set_index)
 }
 
@@ -2721,6 +2729,11 @@ fn queue_video_out_flip(
         return;
     };
     let event_data = 6 | ((flip_argument & 0x0000_ffff_ffff_ffff) << 16);
+    remu_gpu::emit_event(remu_gpu::GpuEvent::Flip {
+        address: display_address,
+        buffer_index,
+        flip_argument,
+    });
     for (&equeue, &user_data) in &state.video_out.flip_events {
         state.pending_events.push_back(KernelQueuedEvent {
             equeue,
@@ -2768,6 +2781,40 @@ fn agc_parse_submission(command_address: u64, dword_count: u32, state: &mut Prob
         let opcode = (header >> 8) & 0xff;
         let register = (header >> 2) & 0x3f;
         *packets.entry((opcode, register)).or_default() += 1;
+        if state.agc_submission_count == 0
+            && opcode == AGC_IT_NOP
+            && matches!(
+                register,
+                AGC_R_SH_REGS_INDIRECT | AGC_R_CX_REGS_INDIRECT | AGC_R_UC_REGS_INDIRECT
+            )
+            && length >= 4
+        {
+            let register_count = read_guest_u32(packet_address + 4).min(256);
+            let registers_address = read_guest_u64(packet_address + 8);
+            let space = match register {
+                AGC_R_SH_REGS_INDIRECT => "sh",
+                AGC_R_CX_REGS_INDIRECT => "cx",
+                _ => "uc",
+            };
+            for index in 0..register_count {
+                let entry = registers_address + u64::from(index) * 8;
+                eprintln!(
+                    "[REMu][AGC] reg space={space} offset={:#05x} value={:#010x}",
+                    read_guest_u32(entry),
+                    read_guest_u32(entry + 4),
+                );
+            }
+        }
+        if state.agc_submission_count == 0 && opcode == AGC_IT_SET_SH_REG && length >= 3 {
+            let first_register = read_guest_u32(packet_address + 4);
+            for index in 0..length - 2 {
+                eprintln!(
+                    "[REMu][AGC] reg space=sh-direct offset={:#05x} value={:#010x}",
+                    first_register + index,
+                    read_guest_u32(packet_address + u64::from(index + 2) * 4),
+                );
+            }
+        }
         if opcode == AGC_IT_NOP && register == AGC_R_FLIP && length >= 6 {
             let handle = read_guest_u32(packet_address + 4);
             let buffer_index = read_guest_u32(packet_address + 8);
