@@ -1,7 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -11,8 +11,12 @@ use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
-    Device, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
-    MTLTextureUsage, MetalLayer, Texture, TextureDescriptor,
+    Buffer, CompileOptions, Device, Function, MTLCommandBufferStatus, MTLIndexType, MTLLoadAction,
+    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSize, MTLStorageMode,
+    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer, RenderPassDescriptor,
+    RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor, SamplerState, Texture,
+    TextureDescriptor,
 };
 use objc::runtime::{Class, Object, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -22,6 +26,7 @@ use remu_gpu::{
     PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE,
     PAD_BUTTON_UP, set_host_pad_state,
 };
+use remu_shader::{ImageBinding, ShaderEvaluation};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -104,6 +109,26 @@ struct SpriteVertex {
     opacity: f32,
 }
 
+struct CompiledShaderPair {
+    pipeline: RenderPipelineState,
+    vertex_function: Function,
+    pixel_function: Function,
+    vertex: remu_shader_metal::MetalShader,
+    pixel: remu_shader_metal::MetalShader,
+}
+
+struct UploadedImageTexture {
+    texture: Texture,
+    descriptor: DecodedImageDescriptor,
+    writable: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DecodedImageDescriptor {
+    guest: GuestTextureDescriptor,
+    destination_select: u32,
+}
+
 struct MetalPresenter {
     receiver: Receiver<GpuEvent>,
     window: Option<Window>,
@@ -129,6 +154,9 @@ struct MetalPresenter {
     last_guest_capture: Option<Instant>,
     logged_fill_draw: bool,
     logged_software_draws: HashSet<(SoftwareDrawKind, u64, u64)>,
+    compiled_shader_pairs: HashMap<(u64, u64), CompiledShaderPair>,
+    failed_shader_pairs: HashSet<(u64, u64)>,
+    failed_draw_execution: HashSet<(u64, u64)>,
     capture_directory: Option<PathBuf>,
     pressed_keys: HashSet<KeyCode>,
 }
@@ -162,6 +190,9 @@ impl MetalPresenter {
             last_guest_capture: None,
             logged_fill_draw: false,
             logged_software_draws: HashSet::new(),
+            compiled_shader_pairs: HashMap::new(),
+            failed_shader_pairs: HashSet::new(),
+            failed_draw_execution: HashSet::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
             pressed_keys: HashSet::new(),
         })
@@ -210,6 +241,7 @@ impl MetalPresenter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn receive_events(&mut self, event_loop: &ActiveEventLoop) {
         // A bounded batch prevents a continuously producing guest from starving redraw and input
         // delivery. The bounded sender applies backpressure until the next AppKit iteration.
@@ -250,6 +282,19 @@ impl MetalPresenter {
                     });
                 }
                 Ok(GpuEvent::IndexedDraw(draw)) => {
+                    self.compile_draw_shaders(&draw);
+                    match self.execute_compiled_draw(&draw) {
+                        Ok(()) => continue,
+                        Err(error) => {
+                            let key = (draw.export_shader_address, draw.pixel_shader_address);
+                            if self.failed_draw_execution.insert(key) {
+                                eprintln!(
+                                    "[REMu][METAL] Gen5 draw es={:#x} ps={:#x} could not execute: {error}",
+                                    key.0, key.1
+                                );
+                            }
+                        }
+                    }
                     if is_dreaming_presenter_draw(&draw) {
                         self.pending_guest_draw = Some(*draw);
                     } else if let Some(fill) = execute_dreaming_fill_draw(&draw) {
@@ -313,6 +358,323 @@ impl MetalPresenter {
                 Err(TryRecvError::Empty) => return,
             }
         }
+    }
+
+    fn compile_draw_shaders(&mut self, draw: &IndexedDraw) {
+        let key = (draw.export_shader_address, draw.pixel_shader_address);
+        if self.compiled_shader_pairs.contains_key(&key) || self.failed_shader_pairs.contains(&key)
+        {
+            return;
+        }
+        match self.compile_draw_shader_pair(draw) {
+            Ok(compiled) => {
+                eprintln!(
+                    "[REMu][METAL] compiled Gen5 shader pair es={:#x} ps={:#x} MSL={vertex_bytes}/{pixel_bytes} bytes",
+                    key.0,
+                    key.1,
+                    vertex_bytes = compiled.vertex.source.len(),
+                    pixel_bytes = compiled.pixel.source.len(),
+                );
+                self.compiled_shader_pairs.insert(key, compiled);
+            }
+            Err(error) => {
+                self.failed_shader_pairs.insert(key);
+                eprintln!(
+                    "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
+                    key.0, key.1
+                );
+            }
+        }
+    }
+
+    fn compile_draw_shader_pair(&self, draw: &IndexedDraw) -> Result<CompiledShaderPair, String> {
+        let export = draw
+            .export_shader
+            .as_ref()
+            .ok_or("draw has no decoded export shader")?;
+        let pixel = draw
+            .pixel_shader
+            .as_ref()
+            .ok_or("draw has no decoded pixel shader")?;
+        let export_evaluation = draw
+            .export_shader_evaluation
+            .as_ref()
+            .ok_or("draw has no evaluated export shader resources")?;
+        let pixel_evaluation = draw
+            .pixel_shader_evaluation
+            .as_ref()
+            .ok_or("draw has no evaluated pixel shader resources")?;
+        let device = self.device.as_ref().ok_or("Metal device is unavailable")?;
+        let mut host_location = 0_u32;
+        let pixel_outputs = (0..8)
+            .filter_map(|guest_slot| {
+                let mask = (pixel.program.pixel_color_export_masks() >> (guest_slot * 4)) & 0xf;
+                (mask != 0).then(|| {
+                    let binding = remu_shader::PixelOutputBinding {
+                        guest_slot,
+                        host_location,
+                        kind: remu_shader::PixelOutputKind::Float,
+                    };
+                    host_location += 1;
+                    binding
+                })
+            })
+            .collect();
+        let pixel_options = remu_shader_metal::MetalCompileOptions::pixel(
+            pixel_outputs,
+            register_value(&draw.context_registers, 0x1b3).unwrap_or_default(),
+            register_value(&draw.context_registers, 0x1b4).unwrap_or_default(),
+        );
+        let pixel_msl =
+            remu_shader_metal::compile_msl(&pixel.program, pixel_evaluation, &pixel_options)
+                .map_err(|error| format!("pixel lowering: {error}"))?;
+        let vertex_options =
+            remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count);
+        let vertex_msl =
+            remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)
+                .map_err(|error| format!("vertex lowering: {error}"))?;
+        let compile_options = CompileOptions::new();
+        let vertex_library = device
+            .new_library_with_source(&vertex_msl.source, &compile_options)
+            .map_err(|error| format!("Metal vertex compilation: {error}"))?;
+        let pixel_library = device
+            .new_library_with_source(&pixel_msl.source, &compile_options)
+            .map_err(|error| format!("Metal pixel compilation: {error}"))?;
+        let vertex_function = vertex_library
+            .get_function(&vertex_msl.entry_point, None)
+            .map_err(|error| format!("Metal vertex function: {error}"))?;
+        let pixel_function = pixel_library
+            .get_function(&pixel_msl.entry_point, None)
+            .map_err(|error| format!("Metal pixel function: {error}"))?;
+        let descriptor = RenderPipelineDescriptor::new();
+        descriptor.set_vertex_function(Some(&vertex_function));
+        descriptor.set_fragment_function(Some(&pixel_function));
+        for location in 0..pixel_options.pixel_outputs.len() {
+            descriptor
+                .color_attachments()
+                .object_at(u64::try_from(location).expect("color location fits u64"))
+                .ok_or_else(|| format!("Metal has no color attachment {location}"))?
+                .set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        }
+        let pipeline = device
+            .new_render_pipeline_state(&descriptor)
+            .map_err(|error| format!("Metal render pipeline: {error}"))?;
+        Ok(CompiledShaderPair {
+            pipeline,
+            vertex_function,
+            pixel_function,
+            vertex: vertex_msl,
+            pixel: pixel_msl,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_compiled_draw(&mut self, draw: &IndexedDraw) -> Result<(), String> {
+        let started = Instant::now();
+        let trace = draw.sequence <= 4;
+        let key = (draw.export_shader_address, draw.pixel_shader_address);
+        let compiled = self
+            .compiled_shader_pairs
+            .get(&key)
+            .ok_or("shader pair has no compiled Metal pipeline")?;
+        let export_evaluation = draw
+            .export_shader_evaluation
+            .as_ref()
+            .ok_or("draw has no export resource evaluation")?;
+        let pixel_evaluation = draw
+            .pixel_shader_evaluation
+            .as_ref()
+            .ok_or("draw has no pixel resource evaluation")?;
+        let device = self.device.as_ref().ok_or("Metal device is unavailable")?;
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?;
+        let target = decode_render_target(draw).ok_or("unsupported render-target descriptor")?;
+        let target_bytes = snapshot_guest_texture_rgba(target)
+            .map_err(|error| format!("render target guest memory is unreadable: {error}"))?;
+        if trace {
+            eprintln!(
+                "[REMu][METAL] Gen5 draw={} target snapshot completed in {:?}",
+                draw.sequence,
+                started.elapsed()
+            );
+        }
+        let target_texture = create_rgba_texture(
+            device,
+            target.width,
+            target.height,
+            MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+            &target_bytes,
+        )?;
+
+        let export_buffers = upload_global_buffers(device, export_evaluation)?;
+        let pixel_buffers = upload_global_buffers(device, pixel_evaluation)?;
+        let export_textures = upload_image_textures(device, export_evaluation)?;
+        let pixel_textures = upload_image_textures(device, pixel_evaluation)?;
+        let (export_sampler_buffer, _export_samplers) = create_sampler_argument_buffer(
+            device,
+            &compiled.vertex_function,
+            compiled.vertex.bindings.sampler_argument_buffer_index,
+            export_evaluation,
+        )?;
+        let (pixel_sampler_buffer, _pixel_samplers) = create_sampler_argument_buffer(
+            device,
+            &compiled.pixel_function,
+            compiled.pixel.bindings.sampler_argument_buffer_index,
+            pixel_evaluation,
+        )?;
+        if trace {
+            eprintln!(
+                "[REMu][METAL] Gen5 draw={} resources uploaded in {:?}",
+                draw.sequence,
+                started.elapsed()
+            );
+        }
+
+        let pass = RenderPassDescriptor::new();
+        let attachment = pass
+            .color_attachments()
+            .object_at(0)
+            .ok_or("Metal render pass has no color attachment zero")?;
+        attachment.set_texture(Some(&target_texture));
+        attachment.set_load_action(MTLLoadAction::Load);
+        attachment.set_store_action(MTLStoreAction::Store);
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_render_command_encoder(pass);
+        encoder.set_render_pipeline_state(&compiled.pipeline);
+        encoder.set_viewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: f64::from(target.width),
+            height: f64::from(target.height),
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        for (index, buffer) in export_buffers.iter().enumerate() {
+            encoder.set_vertex_buffer(
+                u64::try_from(index).map_err(|_| "vertex buffer index overflow")?,
+                Some(buffer),
+                0,
+            );
+        }
+        for (index, buffer) in pixel_buffers.iter().enumerate() {
+            encoder.set_fragment_buffer(
+                u64::try_from(index).map_err(|_| "pixel buffer index overflow")?,
+                Some(buffer),
+                0,
+            );
+        }
+        let export_scalar_bytes = export_evaluation.initial_scalar_registers.len() * 4;
+        encoder.set_vertex_bytes(
+            u64::from(compiled.vertex.bindings.initial_scalar_buffer_index),
+            u64::try_from(export_scalar_bytes).map_err(|_| "vertex scalar byte count overflow")?,
+            export_evaluation
+                .initial_scalar_registers
+                .as_ptr()
+                .cast::<c_void>(),
+        );
+        let pixel_scalar_bytes = pixel_evaluation.initial_scalar_registers.len() * 4;
+        encoder.set_fragment_bytes(
+            u64::from(compiled.pixel.bindings.initial_scalar_buffer_index),
+            u64::try_from(pixel_scalar_bytes).map_err(|_| "pixel scalar byte count overflow")?,
+            pixel_evaluation
+                .initial_scalar_registers
+                .as_ptr()
+                .cast::<c_void>(),
+        );
+        for (index, texture) in export_textures.iter().enumerate() {
+            encoder.set_vertex_texture(
+                u64::try_from(index).map_err(|_| "vertex texture index overflow")?,
+                Some(&texture.texture),
+            );
+        }
+        for (index, texture) in pixel_textures.iter().enumerate() {
+            encoder.set_fragment_texture(
+                u64::try_from(index).map_err(|_| "pixel texture index overflow")?,
+                Some(&texture.texture),
+            );
+        }
+        if let (Some(index), Some(buffer)) = (
+            compiled.vertex.bindings.sampler_argument_buffer_index,
+            export_sampler_buffer.as_ref(),
+        ) {
+            encoder.set_vertex_buffer(u64::from(index), Some(buffer), 0);
+        }
+        if let (Some(index), Some(buffer)) = (
+            compiled.pixel.bindings.sampler_argument_buffer_index,
+            pixel_sampler_buffer.as_ref(),
+        ) {
+            encoder.set_fragment_buffer(u64::from(index), Some(buffer), 0);
+        }
+
+        let primitive = metal_primitive_type(draw.primitive_type)?;
+        if draw.indexed {
+            let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
+            let index_buffer = device.new_buffer_with_data(
+                indices.as_ptr().cast::<c_void>(),
+                u64::try_from(indices.len() * 4).map_err(|_| "index byte count overflow")?,
+                MTLResourceOptions::StorageModeShared,
+            );
+            encoder.draw_indexed_primitives_instanced(
+                primitive,
+                u64::try_from(indices.len()).map_err(|_| "index count overflow")?,
+                MTLIndexType::UInt32,
+                &index_buffer,
+                0,
+                u64::from(draw.instance_count),
+            );
+        } else {
+            encoder.draw_primitives_instanced(
+                primitive,
+                u64::from(draw.index_offset),
+                u64::from(draw.index_count),
+                u64::from(draw.instance_count),
+            );
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "Metal command buffer ended in {:?}",
+                command_buffer.status()
+            ));
+        }
+        if trace {
+            eprintln!(
+                "[REMu][METAL] Gen5 draw={} GPU completed in {:?}",
+                draw.sequence,
+                started.elapsed()
+            );
+        }
+
+        write_back_global_buffers(&export_buffers, export_evaluation)?;
+        write_back_global_buffers(&pixel_buffers, pixel_evaluation)?;
+        write_back_image_textures(&export_textures)?;
+        write_back_image_textures(&pixel_textures)?;
+
+        let mut rendered = vec![0_u8; target_bytes.len()];
+        target_texture.get_bytes(
+            rendered.as_mut_ptr().cast::<c_void>(),
+            u64::from(target.width) * 4,
+            MTLRegion::new_2d(0, 0, u64::from(target.width), u64::from(target.height)),
+            0,
+        );
+        write_guest_texture_rgba(target, &rendered).map_err(|error| {
+            format!("could not write Metal render target back to guest memory: {error}")
+        })?;
+        self.capture_translated_frame_if_changed(target, &rendered);
+        if trace {
+            eprintln!(
+                "[REMu][METAL] executed Gen5 draw={} es={:#x} ps={:#x} in {:?}",
+                draw.sequence,
+                key.0,
+                key.1,
+                started.elapsed()
+            );
+        }
+        Ok(())
     }
 
     fn upload_pending_frame(&mut self) {
@@ -500,6 +862,28 @@ impl MetalPresenter {
         }
     }
 
+    fn capture_translated_frame_if_changed(
+        &mut self,
+        descriptor: GuestTextureDescriptor,
+        rgba: &[u8],
+    ) {
+        if self.capture_directory.is_none()
+            || self
+                .last_guest_capture
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.guest_bgra_bytes.resize(rgba.len(), 0);
+        for (source, destination) in rgba
+            .chunks_exact(4)
+            .zip(self.guest_bgra_bytes.chunks_exact_mut(4))
+        {
+            destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
+        }
+        self.capture_guest_frame_if_changed(descriptor);
+    }
+
     fn update_keyboard_input(&mut self, code: KeyCode, state: ElementState) {
         match state {
             ElementState::Pressed => {
@@ -608,6 +992,513 @@ impl MetalPresenter {
         }
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+    }
+}
+
+fn snapshot_guest_texture_rgba(descriptor: GuestTextureDescriptor) -> Result<Vec<u8>, String> {
+    let byte_count = guest_texture_byte_count(descriptor)
+        .ok_or("guest texture byte count overflows the host address space")?;
+    if descriptor.address < 0x10_000 || byte_count > 128 * 1024 * 1024 {
+        return Err(format!(
+            "invalid guest texture range address={:#x} bytes={byte_count}",
+            descriptor.address
+        ));
+    }
+    let source_address = usize::try_from(descriptor.address)
+        .map_err(|_| "guest texture address does not fit usize")?;
+    let source_length =
+        usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
+    let output_length = u64::from(descriptor.width)
+        .checked_mul(u64::from(descriptor.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or("guest texture dimensions overflow")?;
+    // SAFETY: The resource descriptor points into a live guest direct-memory mapping. The decoded
+    // dimensions, pitch, and supported tiling modes bound the view to at most 128 MiB.
+    let source = unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) };
+    let width =
+        usize::try_from(descriptor.width).map_err(|_| "texture width does not fit usize")?;
+    let height =
+        usize::try_from(descriptor.height).map_err(|_| "texture height does not fit usize")?;
+    let mut output = vec![0_u8; output_length];
+    if descriptor.tile_mode == 0 {
+        let source_row_bytes = usize::try_from(descriptor.pitch)
+            .map_err(|_| "texture pitch does not fit usize")?
+            .checked_mul(4)
+            .ok_or("source row byte count overflows")?;
+        let output_row_bytes = width
+            .checked_mul(4)
+            .ok_or("output row byte count overflows")?;
+        for y in 0..height {
+            let source_offset = y
+                .checked_mul(source_row_bytes)
+                .ok_or("source row offset overflows")?;
+            let destination_offset = y
+                .checked_mul(output_row_bytes)
+                .ok_or("destination row offset overflows")?;
+            output[destination_offset..destination_offset + output_row_bytes].copy_from_slice(
+                source
+                    .get(source_offset..source_offset + output_row_bytes)
+                    .ok_or("guest texture row exceeds its decoded allocation")?,
+            );
+        }
+    } else {
+        for y in 0..height {
+            for x in 0..width {
+                let source_offset = guest_pixel_byte_offset(descriptor, x, y);
+                let destination_offset = (y * width + x) * 4;
+                let source_pixel = source
+                    .get(source_offset..source_offset + 4)
+                    .ok_or("guest texture layout points beyond its decoded allocation")?;
+                output[destination_offset..destination_offset + 4].copy_from_slice(source_pixel);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn write_guest_texture_rgba(descriptor: GuestTextureDescriptor, rgba: &[u8]) -> Result<(), String> {
+    let byte_count = guest_texture_byte_count(descriptor)
+        .ok_or("guest texture byte count overflows the host address space")?;
+    if descriptor.address < 0x10_000 || byte_count > 128 * 1024 * 1024 {
+        return Err(format!(
+            "invalid guest texture range address={:#x} bytes={byte_count}",
+            descriptor.address
+        ));
+    }
+    let width =
+        usize::try_from(descriptor.width).map_err(|_| "texture width does not fit usize")?;
+    let height =
+        usize::try_from(descriptor.height).map_err(|_| "texture height does not fit usize")?;
+    let required = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("guest texture dimensions overflow")?;
+    if rgba.len() != required {
+        return Err(format!(
+            "tight RGBA image has {} bytes, expected {required}",
+            rgba.len()
+        ));
+    }
+    let destination_address = usize::try_from(descriptor.address)
+        .map_err(|_| "guest texture address does not fit usize")?;
+    let destination_length =
+        usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
+    // SAFETY: The resource descriptor points into a live writable guest direct-memory mapping.
+    // The decoded dimensions, pitch, and tiling mode bound this mutable view to 128 MiB.
+    let destination = unsafe {
+        std::slice::from_raw_parts_mut(destination_address as *mut u8, destination_length)
+    };
+    if descriptor.tile_mode == 0 {
+        let destination_row_bytes = usize::try_from(descriptor.pitch)
+            .map_err(|_| "texture pitch does not fit usize")?
+            .checked_mul(4)
+            .ok_or("destination row byte count overflows")?;
+        let source_row_bytes = width
+            .checked_mul(4)
+            .ok_or("source row byte count overflows")?;
+        for y in 0..height {
+            let source_offset = y
+                .checked_mul(source_row_bytes)
+                .ok_or("source row offset overflows")?;
+            let destination_offset = y
+                .checked_mul(destination_row_bytes)
+                .ok_or("destination row offset overflows")?;
+            destination
+                .get_mut(destination_offset..destination_offset + source_row_bytes)
+                .ok_or("guest texture row exceeds its decoded allocation")?
+                .copy_from_slice(&rgba[source_offset..source_offset + source_row_bytes]);
+        }
+    } else {
+        for y in 0..height {
+            for x in 0..width {
+                let source_offset = (y * width + x) * 4;
+                let destination_offset = guest_pixel_byte_offset(descriptor, x, y);
+                let destination_pixel = destination
+                    .get_mut(destination_offset..destination_offset + 4)
+                    .ok_or("guest texture layout points beyond its decoded allocation")?;
+                destination_pixel.copy_from_slice(&rgba[source_offset..source_offset + 4]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_rgba_texture(
+    device: &Device,
+    width: u32,
+    height: u32,
+    usage: MTLTextureUsage,
+    rgba: &[u8],
+) -> Result<Texture, String> {
+    let required = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or("Metal texture dimensions overflow")?;
+    if width == 0 || height == 0 || rgba.len() != required {
+        return Err(format!(
+            "invalid RGBA upload {}x{} with {} bytes (expected {required})",
+            width,
+            height,
+            rgba.len()
+        ));
+    }
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+    descriptor.set_width(u64::from(width));
+    descriptor.set_height(u64::from(height));
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(usage);
+    let texture = device.new_texture(&descriptor);
+    texture.replace_region(
+        MTLRegion::new_2d(0, 0, u64::from(width), u64::from(height)),
+        0,
+        rgba.as_ptr().cast::<c_void>(),
+        u64::from(width) * 4,
+    );
+    Ok(texture)
+}
+
+fn upload_global_buffers(
+    device: &Device,
+    evaluation: &ShaderEvaluation,
+) -> Result<Vec<Buffer>, String> {
+    evaluation
+        .global_memory_bindings
+        .iter()
+        .map(|binding| {
+            let empty = [0_u8];
+            let bytes = if binding.data.is_empty() {
+                empty.as_slice()
+            } else {
+                binding.data.as_slice()
+            };
+            let length = u64::try_from(bytes.len())
+                .map_err(|_| "global buffer byte count does not fit Metal")?;
+            Ok(device.new_buffer_with_data(
+                bytes.as_ptr().cast::<c_void>(),
+                length,
+                MTLResourceOptions::StorageModeShared,
+            ))
+        })
+        .collect()
+}
+
+fn write_back_global_buffers(
+    buffers: &[Buffer],
+    evaluation: &ShaderEvaluation,
+) -> Result<(), String> {
+    if buffers.len() != evaluation.global_memory_bindings.len() {
+        return Err("Metal/global buffer binding count mismatch".to_owned());
+    }
+    for (buffer, binding) in buffers
+        .iter()
+        .zip(&evaluation.global_memory_bindings)
+        .filter(|(_, binding)| binding.writable && binding.write_back_to_guest)
+    {
+        if binding.base_address < 0x10_000 || binding.data.len() > 128 * 1024 * 1024 {
+            return Err(format!(
+                "invalid writable global buffer address={:#x} bytes={}",
+                binding.base_address,
+                binding.data.len()
+            ));
+        }
+        let destination = usize::try_from(binding.base_address)
+            .map_err(|_| "writable global buffer address does not fit usize")?;
+        // SAFETY: Shader evaluation retained this live writable guest binding, whose captured data
+        // length is the exact range represented by the corresponding Metal buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buffer.contents().cast::<u8>(),
+                destination as *mut u8,
+                binding.data.len(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescriptor, String> {
+    if words.len() < 4 {
+        return Err(format!(
+            "image resource descriptor has {} dwords, expected at least four",
+            words.len()
+        ));
+    }
+    let address = ((u64::from(words[1] & 0xff) << 32) | u64::from(words[0])) << 8;
+    let width = ((words[1] >> 30) | ((words[2] & 0x3fff) << 2))
+        .checked_add(1)
+        .ok_or("image width overflows")?;
+    let height = ((words[2] >> 14) & 0xffff)
+        .checked_add(1)
+        .ok_or("image height overflows")?;
+    let unified_format = (words[1] >> 20) & 0x1ff;
+    let (data_format, number_format) = remu_shader::decode_unified_format(unified_format)
+        .ok_or_else(|| format!("unknown GFX10 unified image format {unified_format}"))?;
+    let tile_mode = (words[3] >> 20) & 0x1f;
+    let texture_type = (words[3] >> 28) & 0xf;
+    let base_level = (words[3] >> 12) & 0xf;
+    let last_level = (words[3] >> 16) & 0xf;
+    let destination_select = words[3] & 0xfff;
+    let descriptor_pitch =
+        if matches!(texture_type, 8 | 9 | 14) && words.get(4).copied().unwrap_or_default() != 0 {
+            (words[4] & 0x3fff)
+                .checked_add(1)
+                .ok_or("image pitch overflows")?
+        } else {
+            width
+        };
+    let pitch = if tile_mode == 0 {
+        effective_linear_rgba_pitch(width.max(descriptor_pitch))
+            .ok_or("linear image pitch overflows")?
+    } else {
+        descriptor_pitch
+    };
+    if address < 0x10_000 || width > 8_192 || height > 8_192 || pitch < width || pitch > 8_192 {
+        return Err(format!(
+            "invalid image range address={address:#x} extent={width}x{height} pitch={pitch}"
+        ));
+    }
+    if (data_format, number_format) != (10, 0) {
+        return Err(format!(
+            "Metal image upload does not yet implement GFX10 format {data_format}/{number_format} (unified {unified_format})"
+        ));
+    }
+    if texture_type != 9 {
+        return Err(format!(
+            "Metal image upload does not yet implement texture type {texture_type}"
+        ));
+    }
+    if base_level != 0 || last_level != 0 {
+        return Err(format!(
+            "Metal image upload does not yet implement mip range {base_level}..={last_level}"
+        ));
+    }
+    if !matches!(tile_mode, 0 | 27) {
+        return Err(format!(
+            "Metal image upload does not yet implement tile mode {tile_mode}"
+        ));
+    }
+    Ok(DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            address,
+            width,
+            height,
+            pitch,
+            tile_mode,
+        },
+        destination_select,
+    })
+}
+
+fn apply_image_destination_select(rgba: &mut [u8], destination_select: u32) -> Result<(), String> {
+    if destination_select == 0 || destination_select == 0xfac {
+        return Ok(());
+    }
+    let selectors =
+        std::array::from_fn::<_, 4, _>(|channel| (destination_select >> (channel * 3)) & 0x7);
+    if selectors
+        .iter()
+        .any(|selector| !matches!(selector, 0 | 1 | 4..=7))
+    {
+        return Err(format!(
+            "invalid image destination select {destination_select:#x}"
+        ));
+    }
+    for pixel in rgba.chunks_exact_mut(4) {
+        let source: [u8; 4] = pixel.try_into().expect("RGBA pixel has four channels");
+        for (channel, selector) in selectors.iter().copied().enumerate() {
+            pixel[channel] = match selector {
+                0 => 0,
+                1 => 255,
+                4..=7 => source[usize::try_from(selector - 4).expect("channel fits usize")],
+                _ => unreachable!("validated destination selector"),
+            };
+        }
+    }
+    Ok(())
+}
+
+fn upload_image_textures(
+    device: &Device,
+    evaluation: &ShaderEvaluation,
+) -> Result<Vec<UploadedImageTexture>, String> {
+    evaluation
+        .image_bindings
+        .iter()
+        .map(|binding| {
+            let descriptor = decode_image_descriptor(&binding.resource_descriptor)
+                .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+            let writable = binding.opcode.starts_with("ImageStore")
+                || binding.opcode.starts_with("ImageAtomic");
+            if writable && !matches!(descriptor.destination_select, 0 | 0xfac) {
+                return Err(format!(
+                    "writable image at PC {:#x} has non-identity destination select {:#x}",
+                    binding.pc, descriptor.destination_select
+                ));
+            }
+            let mut rgba = snapshot_guest_texture_rgba(descriptor.guest)
+                .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+            if !writable {
+                apply_image_destination_select(&mut rgba, descriptor.destination_select)
+                    .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+            }
+            let usage = if writable {
+                MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+            } else {
+                MTLTextureUsage::ShaderRead
+            };
+            let texture = create_rgba_texture(
+                device,
+                descriptor.guest.width,
+                descriptor.guest.height,
+                usage,
+                &rgba,
+            )?;
+            Ok(UploadedImageTexture {
+                texture,
+                descriptor,
+                writable,
+            })
+        })
+        .collect()
+}
+
+fn write_back_image_textures(textures: &[UploadedImageTexture]) -> Result<(), String> {
+    for uploaded in textures.iter().filter(|texture| texture.writable) {
+        let descriptor = uploaded.descriptor.guest;
+        let length = u64::from(descriptor.width)
+            .checked_mul(u64::from(descriptor.height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or("writable image dimensions overflow")?;
+        let mut rgba = vec![0_u8; length];
+        uploaded.texture.get_bytes(
+            rgba.as_mut_ptr().cast::<c_void>(),
+            u64::from(descriptor.width) * 4,
+            MTLRegion::new_2d(
+                0,
+                0,
+                u64::from(descriptor.width),
+                u64::from(descriptor.height),
+            ),
+            0,
+        );
+        write_guest_texture_rgba(descriptor, &rgba)?;
+    }
+    Ok(())
+}
+
+fn sampler_address_mode(value: u32) -> MTLSamplerAddressMode {
+    match value {
+        0 => MTLSamplerAddressMode::Repeat,
+        1 => MTLSamplerAddressMode::MirrorRepeat,
+        2 => MTLSamplerAddressMode::ClampToEdge,
+        3 | 5 | 7 => MTLSamplerAddressMode::MirrorClampToEdge,
+        4 | 6 => MTLSamplerAddressMode::ClampToBorderColor,
+        _ => unreachable!("three-bit sampler address mode"),
+    }
+}
+
+fn sampler_min_mag_filter(value: u32) -> MTLSamplerMinMagFilter {
+    if matches!(value, 1 | 3) {
+        MTLSamplerMinMagFilter::Linear
+    } else {
+        MTLSamplerMinMagFilter::Nearest
+    }
+}
+
+fn sampler_mip_filter(value: u32) -> MTLSamplerMipFilter {
+    match value {
+        0 => MTLSamplerMipFilter::NotMipmapped,
+        1 => MTLSamplerMipFilter::Nearest,
+        2 | 3 => MTLSamplerMipFilter::Linear,
+        _ => unreachable!("two-bit sampler mip filter"),
+    }
+}
+
+fn sampled_image_bindings(evaluation: &ShaderEvaluation) -> impl Iterator<Item = &ImageBinding> {
+    evaluation.image_bindings.iter().filter(|binding| {
+        binding.opcode.starts_with("ImageSample") || binding.opcode.starts_with("ImageGather")
+    })
+}
+
+fn create_sampler_argument_buffer(
+    device: &Device,
+    function: &Function,
+    buffer_index: Option<u32>,
+    evaluation: &ShaderEvaluation,
+) -> Result<(Option<Buffer>, Vec<SamplerState>), String> {
+    let sampled_bindings: Vec<_> = sampled_image_bindings(evaluation).collect();
+    let Some(buffer_index) = buffer_index else {
+        if sampled_bindings.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        return Err("Metal shader has sampled images but no sampler argument buffer".to_owned());
+    };
+    if sampled_bindings.is_empty() {
+        return Err("Metal shader declares a sampler argument buffer without samplers".to_owned());
+    }
+    let argument_encoder = function.new_argument_encoder(u64::from(buffer_index));
+    let argument_buffer = device.new_buffer(
+        argument_encoder.encoded_length(),
+        MTLResourceOptions::StorageModeShared,
+    );
+    argument_encoder.set_argument_buffer(&argument_buffer, 0);
+    let mut samplers = Vec::with_capacity(sampled_bindings.len());
+    for (slot, binding) in sampled_bindings.iter().enumerate() {
+        if binding.sampler_descriptor.len() < 4 {
+            return Err(format!(
+                "sampler at PC {:#x} has {} dwords, expected four",
+                binding.pc,
+                binding.sampler_descriptor.len()
+            ));
+        }
+        let words = &binding.sampler_descriptor;
+        let lod_bias = words[2] & 0x3fff;
+        if lod_bias != 0 {
+            return Err(format!(
+                "sampler at PC {:#x} has unimplemented LOD bias {lod_bias:#x}",
+                binding.pc
+            ));
+        }
+        let descriptor = SamplerDescriptor::new();
+        descriptor.set_address_mode_s(sampler_address_mode(words[0] & 0x7));
+        descriptor.set_address_mode_t(sampler_address_mode((words[0] >> 3) & 0x7));
+        descriptor.set_address_mode_r(sampler_address_mode((words[0] >> 6) & 0x7));
+        descriptor.set_max_anisotropy(u64::from(1_u32 << ((words[0] >> 9) & 0x7).min(4)));
+        descriptor.set_mag_filter(sampler_min_mag_filter((words[2] >> 20) & 0x3));
+        descriptor.set_min_filter(sampler_min_mag_filter((words[2] >> 22) & 0x3));
+        descriptor.set_mip_filter(sampler_mip_filter((words[2] >> 26) & 0x3));
+        descriptor.set_lod_min_clamp(
+            f32::from(u16::try_from(words[1] & 0xfff).expect("12-bit LOD fits u16")) / 256.0,
+        );
+        descriptor.set_lod_max_clamp(
+            f32::from(u16::try_from((words[1] >> 12) & 0xfff).expect("12-bit LOD fits u16"))
+                / 256.0,
+        );
+        descriptor.set_support_argument_buffers(true);
+        let sampler = device.new_sampler(&descriptor);
+        argument_encoder.set_sampler_state(
+            u64::try_from(slot).map_err(|_| "sampler slot does not fit Metal")?,
+            &sampler,
+        );
+        samplers.push(sampler);
+    }
+    Ok((Some(argument_buffer), samplers))
+}
+
+fn metal_primitive_type(guest: u32) -> Result<MTLPrimitiveType, String> {
+    match guest {
+        1 => Ok(MTLPrimitiveType::Point),
+        2 => Ok(MTLPrimitiveType::Line),
+        3 => Ok(MTLPrimitiveType::LineStrip),
+        4 => Ok(MTLPrimitiveType::Triangle),
+        6 | 0x11 => Ok(MTLPrimitiveType::TriangleStrip),
+        5 => Err("triangle-fan topology requires explicit Metal index expansion".to_owned()),
+        _ => Err(format!("unknown guest primitive topology {guest:#x}")),
     }
 }
 
@@ -1689,10 +2580,10 @@ mod tests {
 
     use super::{
         DREAMING_FILL_ES_PREFIX, DREAMING_FILL_PS_PREFIX, GuestPresentConstants,
-        GuestTextureDescriptor, blend_premultiplied_rgba, blit_guest_texture_bytes,
-        convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra, effective_linear_rgba_pitch,
-        execute_dreaming_fill_draw, mode27_source_byte_offset, read_draw_indices,
-        transform_sprite_position,
+        GuestTextureDescriptor, apply_image_destination_select, blend_premultiplied_rgba,
+        blit_guest_texture_bytes, convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra,
+        decode_image_descriptor, effective_linear_rgba_pitch, execute_dreaming_fill_draw,
+        mode27_source_byte_offset, read_draw_indices, transform_sprite_position,
     };
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
@@ -1714,6 +2605,8 @@ mod tests {
             pixel_shader_prefix: [0; 4],
             export_shader: None,
             pixel_shader: None,
+            export_shader_evaluation: None,
+            pixel_shader_evaluation: None,
             color_target_address: 0,
             context_registers: Vec::new(),
             shader_registers: Vec::new(),
@@ -1737,6 +2630,38 @@ mod tests {
         assert_eq!(effective_linear_rgba_pitch(320), Some(320));
         assert_eq!(effective_linear_rgba_pitch(980), Some(1024));
         assert_eq!(effective_linear_rgba_pitch(250), Some(256));
+    }
+
+    #[test]
+    fn decodes_the_complete_observed_gfx10_image_descriptor() {
+        let address = 0x0070_0119_0000_u64;
+        let width = 1_280_u32;
+        let height = 720_u32;
+        let encoded_width = width - 1;
+        let mut words = [0_u32; 8];
+        words[0] = u32::try_from(address >> 8).expect("low image address fits");
+        words[1] = u32::try_from(address >> 40).expect("high image address fits")
+            | (56 << 20)
+            | ((encoded_width & 0x3) << 30);
+        words[2] = (encoded_width >> 2) | ((height - 1) << 14);
+        words[3] = 0xfac | (27 << 20) | (9 << 28);
+        words[4] = width - 1;
+
+        let descriptor = decode_image_descriptor(&words).expect("valid RGBA8 2D descriptor");
+        assert_eq!(descriptor.guest.address, address);
+        assert_eq!(descriptor.guest.width, width);
+        assert_eq!(descriptor.guest.height, height);
+        assert_eq!(descriptor.guest.pitch, width);
+        assert_eq!(descriptor.guest.tile_mode, 27);
+        assert_eq!(descriptor.destination_select, 0xfac);
+    }
+
+    #[test]
+    fn applies_gfx10_constant_and_channel_image_swizzles() {
+        let mut rgba = [10_u8, 20, 30, 40];
+        let destination_select = 1 | (5 << 6) | (4 << 9);
+        apply_image_destination_select(&mut rgba, destination_select).expect("valid swizzle");
+        assert_eq!(rgba, [255, 0, 20, 10]);
     }
 
     #[test]
@@ -1780,6 +2705,8 @@ mod tests {
             pixel_shader_prefix: DREAMING_FILL_PS_PREFIX,
             export_shader: None,
             pixel_shader: None,
+            export_shader_evaluation: None,
+            pixel_shader_evaluation: None,
             color_target_address: u64::try_from(target.as_mut_ptr().addr())
                 .expect("target address"),
             context_registers: vec![

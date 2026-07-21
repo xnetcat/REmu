@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use remu_shader::{Program, ShaderMetadata};
+use remu_shader::{Program, ShaderEvaluation, ShaderMetadata};
 use thiserror::Error;
 
 pub const PAD_BUTTON_L3: u32 = 0x0002;
@@ -132,6 +132,8 @@ pub struct IndexedDraw {
     pub pixel_shader_prefix: [u32; 4],
     pub export_shader: Option<ShaderSnapshot>,
     pub pixel_shader: Option<ShaderSnapshot>,
+    pub export_shader_evaluation: Option<Arc<ShaderEvaluation>>,
+    pub pixel_shader_evaluation: Option<Arc<ShaderEvaluation>>,
     pub color_target_address: u64,
     pub context_registers: Vec<GpuRegister>,
     pub shader_registers: Vec<GpuRegister>,

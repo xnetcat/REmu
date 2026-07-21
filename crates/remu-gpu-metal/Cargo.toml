@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 remu-gpu = { path = "../remu-gpu" }
+remu-shader = { path = "../remu-shader" }
+remu-shader-metal = { path = "../remu-shader-metal" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics-types.workspace = true

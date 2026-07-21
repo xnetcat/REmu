@@ -848,7 +848,7 @@ impl<'a> Compiler<'a> {
     fn mask_source(&self, operand: Operand) -> Result<String, String> {
         match operand.kind {
             OperandKind::ScalarRegister if operand.value + 1 < SCALAR_REGISTER_COUNT => {
-                Ok(format!("((s[{}] >> remu_lane) & 1u) != 0u)", operand.value))
+                Ok(format!("((s[{}] >> remu_lane) & 1u) != 0u", operand.value))
             }
             _ => Err(format!("invalid lane-mask operand {operand}")),
         }

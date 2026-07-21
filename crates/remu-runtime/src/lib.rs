@@ -3956,7 +3956,7 @@ fn agc_emit_draw(
         .unwrap_or_default();
     let export_shader = agc_shader_snapshot(graphics, export_shader_address);
     let pixel_shader = agc_shader_snapshot(graphics, pixel_shader_address);
-    let draw = remu_gpu::IndexedDraw {
+    let mut draw = remu_gpu::IndexedDraw {
         sequence: graphics.emitted_draws,
         indexed,
         instance_count: graphics.instance_count.max(1),
@@ -3974,11 +3974,36 @@ fn agc_emit_draw(
         pixel_shader_prefix: agc_shader_prefix_snapshot(pixel_shader_address),
         export_shader,
         pixel_shader,
+        export_shader_evaluation: None,
+        pixel_shader_evaluation: None,
         color_target_address,
         context_registers: agc_register_snapshot(&graphics.context_registers),
         shader_registers: agc_register_snapshot(&graphics.shader_registers),
         user_config_registers: agc_register_snapshot(&graphics.user_config_registers),
     };
+    let export_user_data_base = export_user_data_register(&draw);
+    draw.export_shader_evaluation = draw.export_shader.as_ref().and_then(|snapshot| {
+        evaluate_shader_snapshot(&draw, snapshot, export_user_data_base, 8)
+            .map(Arc::new)
+            .map_err(|error| {
+                eprintln!(
+                    "[REMu][AGC][SHADER] export evaluation failed at {:#x}: {error}",
+                    draw.export_shader_address
+                );
+            })
+            .ok()
+    });
+    draw.pixel_shader_evaluation = draw.pixel_shader.as_ref().and_then(|snapshot| {
+        evaluate_shader_snapshot(&draw, snapshot, 0x00c, 0)
+            .map(Arc::new)
+            .map_err(|error| {
+                eprintln!(
+                    "[REMu][AGC][SHADER] pixel evaluation failed at {:#x}: {error}",
+                    draw.pixel_shader_address
+                );
+            })
+            .ok()
+    });
     if draw.sequence <= 8 {
         eprintln!(
             "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x}",
@@ -4035,14 +4060,7 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
                 .join(",")
         })
     });
-    let export_user_data_base = [0x08c, 0x0cc, 0x04c]
-        .into_iter()
-        .find(|base| {
-            draw.shader_registers
-                .iter()
-                .any(|register| register.offset == base - 1)
-        })
-        .unwrap_or(0x0cc);
+    let export_user_data_base = export_user_data_register(draw);
     let evaluation_summaries = [
         trace_shader_evaluation(draw, draw.export_shader.as_ref(), export_user_data_base, 8),
         trace_shader_evaluation(draw, draw.pixel_shader.as_ref(), 0x00c, 0),
@@ -4071,6 +4089,17 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
         draw.shader_registers,
         draw.user_config_registers,
     );
+}
+
+fn export_user_data_register(draw: &remu_gpu::IndexedDraw) -> u32 {
+    [0x08c, 0x0cc, 0x04c]
+        .into_iter()
+        .find(|base| {
+            draw.shader_registers
+                .iter()
+                .any(|register| register.offset == base - 1)
+        })
+        .unwrap_or(0x0cc)
 }
 
 fn evaluate_shader_snapshot(
@@ -6987,7 +7016,9 @@ mod platform_independent_tests {
         let vtable = read_guest_u64(locale);
         let retain = read_guest_u64(vtable + 0x10);
         // SAFETY: guest_global_locale installs this exact process-local C ABI function pointer.
-        let retain: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(retain as usize) };
+        let retain: extern "C" fn(u64) -> u64 = unsafe {
+            std::mem::transmute(usize::try_from(retain).expect("function pointer fits usize"))
+        };
 
         assert_ne!(locale, 0);
         assert_ne!(vtable, 0);
