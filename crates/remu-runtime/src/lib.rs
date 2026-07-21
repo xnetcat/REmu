@@ -3823,9 +3823,11 @@ fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -
         },
     );
     write_guest_u64(output, offset);
-    eprintln!(
-        "[REMu][VM] allocated direct start={offset:#x} length={length:#x} alignment={alignment:#x} type={memory_type:#x}"
-    );
+    if trace_guest_vm() {
+        eprintln!(
+            "[REMu][VM] allocated direct start={offset:#x} length={length:#x} alignment={alignment:#x} type={memory_type:#x}"
+        );
+    }
     0
 }
 
@@ -3998,9 +4000,11 @@ fn map_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         direct_start,
         protection,
     });
-    eprintln!(
-        "[REMu][VM] mapped direct={direct_start:#x} address={aligned_address:#x} length={length:#x} protection={protection:#x}"
-    );
+    if trace_guest_vm() {
+        eprintln!(
+            "[REMu][VM] mapped direct={direct_start:#x} address={aligned_address:#x} length={length:#x} protection={protection:#x}"
+        );
+    }
     0
 }
 
@@ -4090,10 +4094,12 @@ fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 
     for (index, byte) in b"direct".iter().copied().enumerate() {
         write_guest_u8(output + 0x21 + u64::try_from(index).unwrap_or(0), byte);
     }
-    eprintln!(
-        "[REMu][VM] query={query:#x} start={:#x} end={end:#x} direct={:#x}",
-        allocation.address, allocation.direct_start
-    );
+    if trace_guest_vm() {
+        eprintln!(
+            "[REMu][VM] query={query:#x} start={:#x} end={end:#x} direct={:#x}",
+            allocation.address, allocation.direct_start
+        );
+    }
     0
 }
 
@@ -4148,7 +4154,9 @@ fn kernel_munmap(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
         }
     }
     state.mapped_allocations = replacement;
-    eprintln!("[REMu][VM] unmapped address={address:#x} length={length:#x}");
+    if trace_guest_vm() {
+        eprintln!("[REMu][VM] unmapped address={address:#x} length={length:#x}");
+    }
     0
 }
 
@@ -4204,8 +4212,15 @@ fn kernel_release_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchSt
             );
         }
     }
-    eprintln!("[REMu][VM] released direct start={start:#x} length={length:#x}");
+    if trace_guest_vm() {
+        eprintln!("[REMu][VM] released direct start={start:#x} length={length:#x}");
+    }
     0
+}
+
+fn trace_guest_vm() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_VM").is_some_and(|value| value == "1"))
 }
 
 fn guest_memset(destination: u64, value: u64, length: u64) -> u64 {
