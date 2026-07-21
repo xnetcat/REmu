@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -22,6 +23,8 @@ use winit::window::{Window, WindowId};
 
 const DREAMING_PRESENTER_ES_PREFIX: [u32; 4] = [0xbfa0_0003, 0x93eb_ff03, 0x0008_0008, 0x8f6a_8c6b];
 const DREAMING_PRESENTER_PS_PREFIX: [u32; 4] = [0xbfa0_0001, 0xbefc_0310, 0xf42c_0406, 0xfa00_0000];
+const DREAMING_FILL_ES_PREFIX: [u32; 4] = [0xbfa0_0001, 0x7e00_0000, 0x7e00_0000, 0x7e00_0000];
+const DREAMING_FILL_PS_PREFIX: [u32; 4] = [0xd52f_0000, 0x0000_0200, 0xd52f_0001, 0x0000_0602];
 
 #[derive(Clone, Copy)]
 struct DisplayConfiguration {
@@ -52,6 +55,17 @@ struct GuestTextureDescriptor {
     pitch: u32,
 }
 
+#[derive(Clone, Copy)]
+struct ExecutedFill {
+    address: u64,
+    width: u32,
+    height: u32,
+    format: u32,
+    number_type: u32,
+    tile_mode: u32,
+    rgba: [u8; 4],
+}
+
 struct MetalPresenter {
     receiver: Receiver<GpuEvent>,
     window: Option<Window>,
@@ -71,8 +85,9 @@ struct MetalPresenter {
     uploaded_flip_sequence: u64,
     startup_error: Option<String>,
     logged_unsupported_layout: bool,
-    logged_unsupported_guest_draw: bool,
+    logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
     logged_guest_draw: bool,
+    logged_fill_draw: bool,
 }
 
 impl MetalPresenter {
@@ -98,8 +113,9 @@ impl MetalPresenter {
             uploaded_flip_sequence: 0,
             startup_error: None,
             logged_unsupported_layout: false,
-            logged_unsupported_guest_draw: false,
+            logged_unsupported_guest_draws: HashSet::new(),
             logged_guest_draw: false,
+            logged_fill_draw: false,
         })
     }
 
@@ -186,12 +202,41 @@ impl MetalPresenter {
                 Ok(GpuEvent::IndexedDraw(draw)) => {
                     if is_dreaming_presenter_draw(&draw) {
                         self.pending_guest_draw = Some(draw);
-                    } else if !self.logged_unsupported_guest_draw {
+                    } else if let Some(fill) = execute_dreaming_fill_draw(&draw) {
+                        if !self.logged_fill_draw {
+                            eprintln!(
+                                "[REMu][METAL] executed Dreaming Sarah fill target={:#x} {}x{} format={} number={} tile={} rgba={:02x?}",
+                                fill.address,
+                                fill.width,
+                                fill.height,
+                                fill.format,
+                                fill.number_type,
+                                fill.tile_mode,
+                                fill.rgba,
+                            );
+                            self.logged_fill_draw = true;
+                        }
+                    } else if self.logged_unsupported_guest_draws.len() < 16
+                        && self
+                            .logged_unsupported_guest_draws
+                            .insert((draw.export_shader_prefix, draw.pixel_shader_prefix))
+                    {
+                        let pixel_scalars = pixel_scalars(&draw);
                         eprintln!(
-                            "[REMu][METAL] no translated Metal path for es={:#x} ps={:#x}",
-                            draw.export_shader_address, draw.pixel_shader_address
+                            "[REMu][METAL] no translated Metal path for es={:#x}/{:x?} ps={:#x}/{:x?} indexed={} count={} instances={} target={:#x} cb_info={:#x} cb_attrib2={:#x} cb_attrib3={:#x} target_mask={:#x} ps_scalars={pixel_scalars:x?}",
+                            draw.export_shader_address,
+                            draw.export_shader_prefix,
+                            draw.pixel_shader_address,
+                            draw.pixel_shader_prefix,
+                            draw.indexed,
+                            draw.index_count,
+                            draw.instance_count,
+                            draw.color_target_address,
+                            register_value(&draw.context_registers, 0x31c).unwrap_or_default(),
+                            register_value(&draw.context_registers, 0x3b0).unwrap_or_default(),
+                            register_value(&draw.context_registers, 0x3b8).unwrap_or_default(),
+                            register_value(&draw.context_registers, 0x08e).unwrap_or_default(),
                         );
-                        self.logged_unsupported_guest_draw = true;
                     }
                 }
                 Ok(GpuEvent::Shutdown) | Err(TryRecvError::Disconnected) => {
@@ -437,6 +482,79 @@ fn is_dreaming_presenter_draw(draw: &IndexedDraw) -> bool {
         && shader_matches_prefix(&draw.pixel_shader_prefix, &DREAMING_PRESENTER_PS_PREFIX)
 }
 
+fn is_dreaming_fill_draw(draw: &IndexedDraw) -> bool {
+    !draw.indexed
+        && draw.index_count == 3
+        && shader_matches_prefix(&draw.export_shader_prefix, &DREAMING_FILL_ES_PREFIX)
+        && shader_matches_prefix(&draw.pixel_shader_prefix, &DREAMING_FILL_PS_PREFIX)
+}
+
+fn pixel_scalars(draw: &IndexedDraw) -> [u32; 4] {
+    std::array::from_fn(|index| {
+        register_value(
+            &draw.shader_registers,
+            0x00c + u32::try_from(index).expect("scalar index fits"),
+        )
+        .unwrap_or_default()
+    })
+}
+
+fn execute_dreaming_fill_draw(draw: &IndexedDraw) -> Option<ExecutedFill> {
+    if !is_dreaming_fill_draw(draw) {
+        return None;
+    }
+    let info = register_value(&draw.context_registers, 0x31c)?;
+    let attrib2 = register_value(&draw.context_registers, 0x3b0)?;
+    let attrib3 = register_value(&draw.context_registers, 0x3b8)?;
+    let target_mask = register_value(&draw.context_registers, 0x08e).unwrap_or(0xf);
+    let width = ((attrib2 >> 14) & 0x3fff).checked_add(1)?;
+    let height = (attrib2 & 0x3fff).checked_add(1)?;
+    let format = (info >> 2) & 0x1f;
+    let number_type = (info >> 8) & 0x7;
+    let tile_mode = (attrib3 >> 14) & 0x1f;
+    if draw.color_target_address < 0x10_000
+        || width > 8_192
+        || height > 8_192
+        || format != 10
+        || number_type != 0
+        || target_mask.trailing_zeros() >= 4
+    {
+        return None;
+    }
+    let pixel_count = u64::from(width).checked_mul(u64::from(height))?;
+    let byte_count = pixel_count.checked_mul(4)?;
+    if byte_count > 128 * 1024 * 1024 {
+        return None;
+    }
+    let scalar_bits = pixel_scalars(draw);
+    let rgba = scalar_bits.map(|bits| {
+        let value = f32::from_bits(bits & 0xffff_e000);
+        if value.is_finite() {
+            transform_color_channel(255, value, 0.0)
+        } else {
+            0
+        }
+    });
+    let address = usize::try_from(draw.color_target_address).ok()?;
+    let length = usize::try_from(byte_count).ok()?;
+    // SAFETY: The AGC color-target registers identify a live guest direct-memory allocation. Its
+    // decoded dimensions and format bound this write to at most 128 MiB. Constant fills are
+    // layout-independent, so this also works for Dreaming Sarah's observed tile mode 27 surface.
+    let target = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length) };
+    for pixel in target.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&rgba);
+    }
+    Some(ExecutedFill {
+        address: draw.color_target_address,
+        width,
+        height,
+        format,
+        number_type,
+        tile_mode,
+        rgba,
+    })
+}
+
 fn decode_dreaming_presenter_draw(
     draw: &IndexedDraw,
 ) -> Option<(GuestTextureDescriptor, GuestPresentConstants)> {
@@ -670,7 +788,12 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuestPresentConstants, convert_guest_rgba_to_bgra};
+    use remu_gpu::{GpuRegister, IndexedDraw};
+
+    use super::{
+        DREAMING_FILL_ES_PREFIX, DREAMING_FILL_PS_PREFIX, GuestPresentConstants,
+        convert_guest_rgba_to_bgra, execute_dreaming_fill_draw,
+    };
 
     #[test]
     fn converts_pitched_rgba_and_applies_presenter_constants() {
@@ -690,5 +813,60 @@ mod tests {
                 56, 10, 10, 40, 166, 60, 100, 160, 86, 20, 20, 80, 255, 110, 200, 255
             ]
         );
+    }
+
+    #[test]
+    fn executes_the_observed_constant_fill_into_guest_memory() {
+        let mut target = vec![0xcc_u8; 16];
+        let draw = IndexedDraw {
+            sequence: 1,
+            indexed: false,
+            instance_count: 1,
+            index_buffer_address: 0,
+            index_resource_address: 0,
+            index_buffer_count: 0,
+            index_size: 0,
+            index_offset: 0,
+            index_count: 3,
+            draw_flags: 0,
+            primitive_type: 4,
+            export_shader_address: 0,
+            pixel_shader_address: 0,
+            export_shader_prefix: DREAMING_FILL_ES_PREFIX,
+            pixel_shader_prefix: DREAMING_FILL_PS_PREFIX,
+            color_target_address: u64::try_from(target.as_mut_ptr().addr())
+                .expect("target address"),
+            context_registers: vec![
+                GpuRegister {
+                    offset: 0x08e,
+                    value: 0xf,
+                },
+                GpuRegister {
+                    offset: 0x31c,
+                    value: 10 << 2,
+                },
+                GpuRegister {
+                    offset: 0x3b0,
+                    value: (1 << 14) | 1,
+                },
+                GpuRegister {
+                    offset: 0x3b8,
+                    value: 27 << 14,
+                },
+            ],
+            shader_registers: [1.0_f32, 0.5, 0.0, 1.0]
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| GpuRegister {
+                    offset: 0x00c + u32::try_from(index).expect("register index"),
+                    value: value.to_bits(),
+                })
+                .collect(),
+            user_config_registers: Vec::new(),
+        };
+
+        let fill = execute_dreaming_fill_draw(&draw).expect("recognized fill draw");
+        assert_eq!(fill.rgba, [255, 128, 0, 255]);
+        assert_eq!(target, [255, 128, 0, 255].repeat(4));
     }
 }
