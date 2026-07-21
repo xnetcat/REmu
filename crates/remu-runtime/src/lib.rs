@@ -1128,6 +1128,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "QOQtbeDqsT4" => "sceAudioOutOutput",
         "GrQ9s4IrNaQ" => "sceAudioOutGetPortState",
         "rPo6tV8D9bM" => "sceSystemServiceGetStatus",
+        "fZo48un7LK4" => "sceSystemServiceParamGetInt",
         "Vo5V8KAwCmk" => "sceSystemServiceHideSplashScreen",
         "uoUpLGNkygk" => "sceCommonDialogInitialize",
         "ERKzksauAJA" => "sceSaveDataDialogGetStatus",
@@ -1259,6 +1260,7 @@ struct ProbeDispatchState {
     agc_primary_register_defaults: u64,
     agc_internal_register_defaults: u64,
     ctype_table: u64,
+    tolower_table: u64,
     toupper_table: u64,
     tls_template: Vec<u8>,
     tls_static_block_size: u64,
@@ -1534,6 +1536,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.agc_primary_register_defaults = 0;
     state.agc_internal_register_defaults = 0;
     state.ctype_table = 0;
+    state.tolower_table = 0;
     state.toupper_table = 0;
     let tls_template_address = image.tls.thread_pointer.get() - GUEST_TLS_PREFIX_SIZE;
     let tls_template_size = usize::try_from(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
@@ -2308,7 +2311,8 @@ fn dispatch_probe_import(
         // Dinkumware's locale helpers are used by the save-error formatting path. The character
         // table accessor must return a live table; its lock and lifetime helpers are process-local
         // bookkeeping in the single-process HLE runtime.
-        "sUP1hBaouOw" | "1uJgoVq3bQU" => guest_ctype_table(state),
+        "sUP1hBaouOw" => guest_ctype_table(state),
+        "1uJgoVq3bQU" => guest_tolower_table(state),
         "rcQCUr0EaRU" => guest_toupper_table(state),
         "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" | "sDCBrmc61XU" | "85zul--eGXs"
         | "c88Yy54Mx0w" | "ie7qhZ4X0Cc" => 0,
@@ -2415,6 +2419,7 @@ fn dispatch_probe_import(
         "hv1luiJrqQM" => pad_initialize(state),
         // libSceSystemService status used by the foreground/background state machine.
         "rPo6tV8D9bM" => system_service_get_status(arguments),
+        "fZo48un7LK4" => system_service_param_get_int(arguments),
         "Vo5V8KAwCmk" => system_service_hide_splash(state),
         // libSceSaveData. Returning success without filling the mount result leaves the game's
         // mount point empty, which turns `/savedata0/-saveindex` into the invalid `/-saveindex`.
@@ -2848,6 +2853,21 @@ fn system_service_get_status(arguments: [u64; 6]) -> u64 {
     }
     guest_memset(output, 0, 0x0c);
     write_guest_u8(output + 0x06, 1);
+    0
+}
+
+fn system_service_param_get_int(arguments: [u64; 6]) -> u64 {
+    const SYSTEM_SERVICE_ERROR_PARAMETER: u32 = 0x80a1_0003;
+
+    if arguments[1] == 0 {
+        return sce_kernel_error(SYSTEM_SERVICE_ERROR_PARAMETER);
+    }
+    let value: i32 = match low_i32(arguments[0]) {
+        1 | 2 | 3 | 1000 => 1,
+        4 => 180,
+        _ => 0,
+    };
+    write_guest_u32(arguments[1], value.cast_unsigned());
     0
 }
 
@@ -4047,23 +4067,55 @@ fn guest_ctype_table(state: &mut ProbeDispatchState) -> u64 {
     state.ctype_table
 }
 
-fn guest_toupper_table(state: &mut ProbeDispatchState) -> u64 {
-    if state.toupper_table == 0 {
-        // Dinkumware indexes the signed-char range as well as 0..=255. Each entry is a 32-bit
-        // character value and the exported pointer addresses the c == 0 element.
-        let storage = guest_calloc(384, 4);
+fn guest_tolower_table(state: &mut ProbeDispatchState) -> u64 {
+    if state.tolower_table == 0 {
+        // Dinkumware's narrow-character case tables contain signed 16-bit values and cover
+        // [-128, 255]. The returned pointer addresses the c == 0 element.
+        let storage = guest_calloc(384, 2);
         if storage == 0 {
             return 0;
         }
-        state.toupper_table = storage + 128 * 4;
-        for index in 0_u32..384 {
-            let character = i32::try_from(index).expect("ctype index fits i32") - 128;
+        state.tolower_table = storage + 128 * 2;
+        for index in 0_u16..384 {
+            let character = i32::from(index) - 128;
+            let mapped = if (i32::from(b'A')..=i32::from(b'Z')).contains(&character) {
+                character - i32::from(b'A') + i32::from(b'a')
+            } else {
+                character
+            };
+            write_guest_u16(
+                storage + u64::from(index) * 2,
+                i16::try_from(mapped)
+                    .expect("case mapping fits i16")
+                    .cast_unsigned(),
+            );
+        }
+    }
+    state.tolower_table
+}
+
+fn guest_toupper_table(state: &mut ProbeDispatchState) -> u64 {
+    if state.toupper_table == 0 {
+        // Dinkumware indexes the signed-char range as well as 0..=255. Each entry is a 16-bit
+        // character value and the exported pointer addresses the c == 0 element.
+        let storage = guest_calloc(384, 2);
+        if storage == 0 {
+            return 0;
+        }
+        state.toupper_table = storage + 128 * 2;
+        for index in 0_u16..384 {
+            let character = i32::from(index) - 128;
             let mapped = if (i32::from(b'a')..=i32::from(b'z')).contains(&character) {
                 character - i32::from(b'a') + i32::from(b'A')
             } else {
                 character
             };
-            write_guest_u32(storage + u64::from(index) * 4, mapped.cast_unsigned());
+            write_guest_u16(
+                storage + u64::from(index) * 2,
+                i16::try_from(mapped)
+                    .expect("case mapping fits i16")
+                    .cast_unsigned(),
+            );
         }
     }
     state.toupper_table
@@ -4861,6 +4913,12 @@ fn write_guest_u64(address: u64, value: u64) {
 fn read_guest_u8(address: u64) -> u8 {
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u8) }
+}
+
+#[cfg(test)]
+fn read_guest_u16(address: u64) -> u16 {
+    // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
+    unsafe { std::ptr::read_unaligned(address as *const u16) }
 }
 
 fn read_guest_u32(address: u64) -> u32 {
@@ -6392,11 +6450,12 @@ mod platform_independent_tests {
         ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, create_pthread_attr, destroy_pthread_attr, dispatch_probe_import,
-        guest_clock_gettime, guest_qsort, kernel_release_direct_memory, kernel_stat_payload,
-        kernel_virtual_query, low_f32, low_u32, pthread_attr_get_stack,
-        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
-        pthread_attr_set_stack_size, read_guest_u64, resolve_guest_path, sanitize_save_segment,
-        sce_kernel_error, take_exit_callbacks, write_guest_u32, write_guest_u64,
+        guest_clock_gettime, guest_free, guest_qsort, guest_tolower_table, guest_toupper_table,
+        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
+        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
+        sanitize_save_segment, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
+        write_guest_u32, write_guest_u64,
     };
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -6464,6 +6523,41 @@ mod platform_independent_tests {
         assert!(seconds >= before);
         assert!(seconds <= before + 2);
         assert!((0..1_000_000_000).contains(&output.tv_nsec));
+    }
+
+    #[test]
+    fn builds_distinct_dinkumware_case_mapping_tables() {
+        let mut state = ProbeDispatchState::default();
+        let lower = guest_tolower_table(&mut state);
+        let upper = guest_toupper_table(&mut state);
+
+        assert_ne!(lower, 0);
+        assert_ne!(upper, 0);
+        assert_ne!(lower, upper);
+        assert_eq!(read_guest_u16(lower + u64::from(b'A') * 2), u16::from(b'a'));
+        assert_eq!(read_guest_u16(lower + u64::from(b'a') * 2), u16::from(b'a'));
+        assert_eq!(read_guest_u16(upper + u64::from(b'a') * 2), u16::from(b'A'));
+        assert_eq!(read_guest_u16(upper + u64::from(b'A') * 2), u16::from(b'A'));
+        assert_eq!(read_guest_u16(lower - 2), u16::MAX);
+        assert_eq!(read_guest_u16(upper - 2), u16::MAX);
+
+        guest_free(lower - 128 * 2);
+        guest_free(upper - 128 * 2);
+    }
+
+    #[test]
+    fn returns_stable_integer_system_parameters() {
+        let mut value = 0_i32;
+        let output = (&raw mut value).addr() as u64;
+
+        assert_eq!(system_service_param_get_int([1, output, 0, 0, 0, 0]), 0);
+        assert_eq!(value, 1);
+        assert_eq!(system_service_param_get_int([4, output, 0, 0, 0, 0]), 0);
+        assert_eq!(value, 180);
+        assert_eq!(
+            system_service_param_get_int([1, 0, 0, 0, 0, 0]),
+            sce_kernel_error(0x80a1_0003)
+        );
     }
 
     #[test]
