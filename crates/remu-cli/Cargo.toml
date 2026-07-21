@@ -1,0 +1,21 @@
+[package]
+name = "remu-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "remu"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+remu-gpu = { path = "../remu-gpu" }
+remu-gpu-metal = { path = "../remu-gpu-metal" }
+remu-loader = { path = "../remu-loader" }
+remu-platform = { path = "../remu-platform" }
+
+[lints]
+workspace = true
+

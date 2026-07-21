@@ -1,0 +1,16 @@
+[package]
+name = "remu-gpu-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+remu-gpu = { path = "../remu-gpu" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal.workspace = true
+
+[lints]
+workspace = true
+
