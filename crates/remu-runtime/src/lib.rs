@@ -4773,8 +4773,8 @@ mod platform_independent_tests {
     fn decodes_float_argument_from_low_xmm_bits() {
         let expected = -1.25_f32;
         assert_eq!(
-            low_f32(f64::from_bits(u64::from(expected.to_bits()))),
-            expected
+            low_f32(f64::from_bits(u64::from(expected.to_bits()))).to_bits(),
+            expected.to_bits()
         );
     }
 
@@ -4785,7 +4785,7 @@ mod platform_independent_tests {
             u64::try_from(values.as_mut_ptr().addr()).unwrap(),
             u64::try_from(values.len()).unwrap(),
             u64::try_from(std::mem::size_of::<i32>()).unwrap(),
-            u64::try_from(compare_i32 as usize).unwrap(),
+            u64::try_from(compare_i32 as *const () as usize).unwrap(),
             0,
             0,
         ]);
