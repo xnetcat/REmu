@@ -1144,6 +1144,8 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "Q3VBxCXhUHs" => guest_memcpy(arguments[0], arguments[1], arguments[2]),
         // libc memmove
         "+P6FRGH4LfA" => guest_memmove(arguments[0], arguments[1], arguments[2]),
+        // libc memcmp
+        "DfivPArhucg" => guest_memcmp(arguments[0], arguments[1], arguments[2]),
         // The native x86-64 process and guest share the libc allocation ABI.
         "gQX+4GDQjpM" => guest_malloc(arguments[0]),
         "tIhsqj0qsFE" => guest_free(arguments[0]),
@@ -1165,6 +1167,9 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "Qazy8LmXTvw" => guest_ftell(arguments[0]),
         "uodLYyUip20" => guest_fclose(arguments[0]),
         "lbB+UlZqVG0" => guest_fread(arguments[0], arguments[1], arguments[2], arguments[3]),
+        // Preserve the SysV variadic register layout for the integer/pointer formats used by the
+        // game's asset path builder. Floating-point varargs require a wider import frame later.
+        "tcVi5SivF7Q" => guest_sprintf(arguments),
         // libc fputs
         "QrZZdJ8XsX0" => guest_fputs(arguments[0]),
         // Itanium C++ one-time initialization guards.
@@ -1939,6 +1944,44 @@ fn guest_fread(destination: u64, size: u64, count: u64, handle: u64) -> u64 {
             handle as *mut libc::FILE,
         ) as u64
     }
+}
+
+fn guest_memcmp(left: u64, right: u64, length: u64) -> u64 {
+    if length == 0 {
+        return 0;
+    }
+    if left == 0 || right == 0 {
+        return u64::MAX;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return u64::MAX;
+    };
+    // SAFETY: memcmp's guest ABI contract supplies readable ranges through `length`.
+    signed_i32_return(unsafe {
+        libc::memcmp(
+            left as *const libc::c_void,
+            right as *const libc::c_void,
+            length,
+        )
+    })
+}
+
+fn guest_sprintf(arguments: [u64; 6]) -> u64 {
+    if arguments[0] == 0 || arguments[1] == 0 {
+        return u64::MAX;
+    }
+    // SAFETY: The guest supplies a writable destination, a valid format string, and SysV integer
+    // or pointer varargs. Passing all four available argument registers preserves their bit layout.
+    signed_i32_return(unsafe {
+        libc::sprintf(
+            arguments[0] as *mut libc::c_char,
+            arguments[1] as *const libc::c_char,
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+        )
+    })
 }
 
 fn guest_strcpy(destination: u64, source: u64) -> u64 {
