@@ -5,6 +5,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 use std::time::Duration;
@@ -531,6 +532,20 @@ fn native_cxx_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
         "vkuuLfhnSZI" => c"__cxa_throw",
         "XbAd9Ach9mo" => c"__cxa_throw_bad_array_new_length",
         "cmBRQsLPqwA" => c"__cxa_uncaught_exception",
+        "qYhnoevd9bI" => c"_ZSt9terminatev",
+        "ozMAr28BwSY" => c"_ZSt14_Xout_of_rangePKc",
+        "eT2UsmTewbU" => c"_ZSt11_Xbad_allocv",
+        "pZ9WXcClPO8" => c"_ZTVN10__cxxabiv120__si_class_type_infoE",
+        "byV+FWlAnB4" => c"_ZTVN10__cxxabiv117__class_type_infoE",
+        "tQIo+GIPklo" => c"_ZSt14_Xlength_errorPKc",
+        "9ByRMdo7ywg" => c"_ZTVN10__cxxabiv121__vmi_class_type_infoE",
+        "V23qt24VPVs" => c"_ZSt17iostream_categoryv",
+        "tyHd3P7oDrU" => c"_ZNKSt9exception8_DoraiseEv",
+        "Q1BL70XVV0o" => c"_ZSt18uncaught_exceptionv",
+        "MELi-cKqWq0" => c"_ZSt19_Xbad_function_callv",
+        "NU-T4QowTNA" => c"_ZSt18_Xinvalid_argumentPKc",
+        "hMAe+TWS9mQ" => c"__dynamic_cast",
+        "apPZ6HKZWaQ" => c"_ZNKSt9exception4whatEv",
         "7P1Wm-5KgAY" => c"_ZNSt12domain_errorD1Ev",
         "MOBxtefPZUg" => c"_ZNSt9exceptionD2Ev",
         "5BIbzIuDxTQ" => c"_ZTISt12domain_error",
@@ -543,6 +558,7 @@ fn native_cxx_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
         "Kcb+MNSzZcc" => c"_ZNSt12out_of_rangeD1Ev",
         "BJCgW9-OxLA" => c"_ZTISt8ios_base",
         "Bq8m04PN1zw" => c"_ZTVSt12system_error",
+        "-L+-8F0+gBc" => c"_ZTVSt13runtime_error",
         "bLPn1gfqSW8" => c"_ZTISt13runtime_error",
         "qOD-ksTkE08" => c"_ZTISt8bad_cast",
         "tVHE+C8vGXk" => c"_ZTVSt8bad_cast",
@@ -606,6 +622,11 @@ fn native_libc_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
         "VOBg+iNwB-4" => c"strtoll",
         "2vDqwBlpF-o" => c"strtod",
         "dhK16CKwhQg" => c"__isfinited",
+        "GfxAp9Xyiqs" => c"__isnand",
+        "fL3O02ypZFE" => c"wmemcpy",
+        "Noj9PsJrsa8" => c"wmemmove",
+        "fnUEjBCNRVU" => c"wmemchr",
+        "QJ5xVfKkni0" => c"wmemcmp",
         "eLdDw6l0-bU" => c"snprintf",
         "Q2V+iqvjgC0" => c"vsnprintf",
         "tcVi5SivF7Q" => c"sprintf",
@@ -658,6 +679,80 @@ fn native_import_target(nid: &str) -> Option<u64> {
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 const fn native_import_target(_nid: &str) -> Option<u64> {
     None
+}
+
+extern "C" fn synthetic_data_noop(
+    _argument0: u64,
+    _argument1: u64,
+    _argument2: u64,
+    _argument3: u64,
+    _argument4: u64,
+    _argument5: u64,
+) -> u64 {
+    0
+}
+
+struct SyntheticDataImports {
+    _classic_vtable: Box<[u64; 32]>,
+    _classic_object: Box<[u64; 8]>,
+    classic_symbol: Box<u64>,
+    cells: BTreeMap<&'static str, Box<[u64; 32]>>,
+}
+
+fn synthetic_data_imports() -> &'static SyntheticDataImports {
+    static IMPORTS: OnceLock<SyntheticDataImports> = OnceLock::new();
+    IMPORTS.get_or_init(|| {
+        let noop = synthetic_data_noop as *const () as usize as u64;
+        let mut classic_vtable = Box::new([0_u64; 32]);
+        classic_vtable[2..].fill(noop);
+        let mut classic_object = Box::new([0_u64; 8]);
+        classic_object[0] = classic_vtable.as_ptr() as usize as u64 + 16;
+        let classic_symbol = Box::new(classic_object.as_ptr() as usize as u64);
+
+        let mut cells = BTreeMap::new();
+        for nid in [
+            "H8AprKeZtNg",
+            "sBCTjFk7Gi4",
+            "yLE5H3058Ao",
+            "Cv+zC4EjGMA",
+            "H4fcpQOpc08",
+            "FQ9NFbBHb5Y",
+            "wiR+rIcbnlc",
+            "E14mW8pVpoE",
+            "1kZFcktOm+s",
+            "VmqsS6auJzo",
+            "irGo1yaJ-vM",
+            "2sWzhYqFH4E",
+            "f7uOxY9mM1U",
+        ] {
+            let mut cell = Box::new([0_u64; 32]);
+            if nid == "FQ9NFbBHb5Y" {
+                cell[0] = u64::MAX;
+            } else if nid == "f7uOxY9mM1U" {
+                cell[0] = 0x9e37_79b9_7f4a_7c15;
+            } else if matches!(nid, "yLE5H3058Ao" | "1kZFcktOm+s") {
+                cell[2..].fill(noop);
+            }
+            cells.insert(nid, cell);
+        }
+        SyntheticDataImports {
+            _classic_vtable: classic_vtable,
+            _classic_object: classic_object,
+            classic_symbol,
+            cells,
+        }
+    })
+}
+
+fn synthetic_data_import_target(nid: &str) -> Option<u64> {
+    let imports = synthetic_data_imports();
+    if nid == "Qoo175Ig+-k" {
+        return Some((&raw const *imports.classic_symbol) as usize as u64);
+    }
+    imports
+        .cells
+        .get(nid)
+        .map(|cell| cell.as_ptr() as usize as u64)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -799,6 +894,9 @@ fn resolve_symbol(
             return Ok(0);
         }
         if let Some(address) = native_import_target(extract_nid(&symbol.name)) {
+            return Ok(address);
+        }
+        if let Some(address) = synthetic_data_import_target(extract_nid(&symbol.name)) {
             return Ok(address);
         }
         return symbol_stubs
@@ -1601,6 +1699,26 @@ fn low_i32(value: u64) -> i32 {
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+fn guest_atomic_fetch_4(address: u64, value: u64, subtract: bool) -> u64 {
+    if address == 0 || !address.is_multiple_of(std::mem::align_of::<AtomicU32>() as u64) {
+        return u64::MAX;
+    }
+    let Ok(host_address) = usize::try_from(address) else {
+        return u64::MAX;
+    };
+    let pointer = host_address as *mut u32;
+    // SAFETY: Guest atomic imports provide a live, naturally aligned four-byte object in the
+    // shared process address space. SeqCst is at least as strong as every guest memory-order mode.
+    let atomic = unsafe { AtomicU32::from_ptr(pointer) };
+    let value = low_u32(value);
+    let previous = if subtract {
+        atomic.fetch_sub(value, Ordering::SeqCst)
+    } else {
+        atomic.fetch_add(value, Ordering::SeqCst)
+    };
+    u64::from(previous)
+}
+
 fn dispatch_probe_import(
     nid: &str,
     arguments: [u64; 6],
@@ -1624,6 +1742,9 @@ fn dispatch_probe_import(
         "DfivPArhucg" => guest_memcmp(arguments[0], arguments[1], arguments[2]),
         // libc memchr
         "8u8lPzUEq+U" => guest_memchr(arguments[0], arguments[1], arguments[2]),
+        // The guest ABI returns the previous four-byte value; the third argument is memory order.
+        "2HnmKiLmV6s" => guest_atomic_fetch_4(arguments[0], arguments[1], true),
+        "iPBqs+YUUFw" => guest_atomic_fetch_4(arguments[0], arguments[1], false),
         // The native x86-64 process and guest share the libc allocation ABI.
         "gQX+4GDQjpM" => guest_malloc(arguments[0]),
         "tIhsqj0qsFE" => guest_free(arguments[0]),
