@@ -4011,8 +4011,31 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
                 .count()
         })
     });
+    let opcode_lists = [&draw.export_shader, &draw.pixel_shader].map(|shader| {
+        shader.as_ref().map_or_else(String::new, |shader| {
+            shader
+                .program
+                .instructions
+                .iter()
+                .map(|instruction| instruction.opcode.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    });
+    let export_user_data_base = [0x08c, 0x0cc, 0x04c]
+        .into_iter()
+        .find(|base| {
+            draw.shader_registers
+                .iter()
+                .any(|register| register.offset == base - 1)
+        })
+        .unwrap_or(0x0cc);
+    let evaluation_summaries = [
+        trace_shader_evaluation(draw, draw.export_shader.as_ref(), export_user_data_base, 8),
+        trace_shader_evaluation(draw, draw.pixel_shader.as_ref(), 0x00c, 0),
+    ];
     eprintln!(
-        "[REMu][AGC][SHADER] es={:#x} ps={:#x} indexed={} count={} instances={} target={:#x} es_ir={}/{} ps_ir={}/{} es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
+        "[REMu][AGC][SHADER] es={:#x} ps={:#x} indexed={} count={} instances={} target={:#x} es_ir={}/{} ps_ir={}/{} es_eval={} ps_eval={} es_ops=[{}] ps_ops=[{}] es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
         draw.export_shader_address,
         draw.pixel_shader_address,
         draw.indexed,
@@ -4023,12 +4046,56 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
         raw_counts[0],
         instruction_counts[1],
         raw_counts[1],
+        evaluation_summaries[0],
+        evaluation_summaries[1],
+        opcode_lists[0],
+        opcode_lists[1],
         draw.export_shader_prefix,
         draw.pixel_shader_prefix,
         draw.context_registers,
         draw.shader_registers,
         draw.user_config_registers,
     );
+}
+
+fn trace_shader_evaluation(
+    draw: &remu_gpu::IndexedDraw,
+    snapshot: Option<&remu_gpu::ShaderSnapshot>,
+    user_data_register: u32,
+    scalar_register_base: u32,
+) -> String {
+    let Some(snapshot) = snapshot else {
+        return "missing".to_owned();
+    };
+    let state = match remu_shader::build_shader_state(
+        Arc::clone(&snapshot.program),
+        snapshot.metadata.clone(),
+        user_data_register,
+        scalar_register_base,
+        None,
+        |offset| {
+            draw.shader_registers
+                .iter()
+                .find(|register| register.offset == offset)
+                .map(|register| register.value)
+        },
+    ) {
+        Ok(state) => state,
+        Err(error) => return format!("state-error({error})"),
+    };
+    match remu_shader::evaluate_shader(
+        &ProcessGuestMemory,
+        &state,
+        remu_shader::EvaluationOptions::default(),
+    ) {
+        Ok(evaluation) => format!(
+            "ok(i={},g={},v={})",
+            evaluation.image_bindings.len(),
+            evaluation.global_memory_bindings.len(),
+            evaluation.vertex_inputs.len(),
+        ),
+        Err(error) => format!("error({error})"),
+    }
 }
 
 fn agc_emit_indexed_draw(packet_address: u64, graphics: &mut AgcGraphicsState) {
