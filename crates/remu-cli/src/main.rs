@@ -318,7 +318,8 @@ fn probe(path: &Path, import_limit: usize) -> ExitCode {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("eboot.bin");
-    match linked.probe_entry(image_name, import_limit) {
+    let game_root = path.parent().unwrap_or_else(|| Path::new("."));
+    match linked.probe_entry(image_name, game_root, import_limit) {
         Ok(outcome) => {
             println!("return_value={}", outcome.return_value);
             println!("import_hits={}", outcome.import_hits);

@@ -3,8 +3,8 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-#[cfg(target_arch = "x86_64")]
 use std::ffi::CString;
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 use std::time::Duration;
@@ -135,9 +135,10 @@ impl LinkedImage {
     pub fn probe_entry(
         &self,
         process_image_name: &str,
+        game_root: &Path,
         maximum_import_hits: usize,
     ) -> Result<ProbeOutcome, LinkError> {
-        probe_entry(self, process_image_name, maximum_import_hits)
+        probe_entry(self, process_image_name, game_root, maximum_import_hits)
     }
 }
 
@@ -617,6 +618,18 @@ struct ProbeDispatchState {
     ctype_table: u64,
     tls_template_address: u64,
     tls_static_block_size: u64,
+    video_out: VideoOutState,
+    game_root: PathBuf,
+    next_np_handle: i32,
+}
+
+#[derive(Debug, Default)]
+struct VideoOutState {
+    pixel_format: u64,
+    tiling_mode: u32,
+    width: u32,
+    height: u32,
+    display_buffers: Vec<u64>,
 }
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
@@ -656,7 +669,7 @@ fn set_current_guest_thread_pointer(thread_pointer: u64) {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn configure_probe_dispatch(image: &LinkedImage, maximum_hits: usize) {
+fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits: usize) {
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = state
         .write()
@@ -679,6 +692,9 @@ fn configure_probe_dispatch(image: &LinkedImage, maximum_hits: usize) {
     state.ctype_table = 0;
     state.tls_template_address = image.tls.thread_pointer.get() - GUEST_TLS_PREFIX_SIZE;
     state.tls_static_block_size = image.tls.static_block_size;
+    state.video_out = VideoOutState::default();
+    game_root.clone_into(&mut state.game_root);
+    state.next_np_handle = 1;
     let sync = GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()));
     *sync
         .0
@@ -762,6 +778,13 @@ extern "C" fn import_dispatch(
     if is_guest_sync_import(&nid) {
         drop(state);
         return dispatch_guest_sync_import(&nid, call_args);
+    }
+    // A real AudioOut submission blocks for approximately one 256-frame buffer. Without pacing,
+    // the emulated audio worker monopolizes the import boundary and starves the render worker.
+    if nid == "QOQtbeDqsT4" {
+        drop(state);
+        std::thread::sleep(Duration::from_micros(5_333));
+        return 0;
     }
     dispatch_probe_import(&nid, call_args, &mut state)
 }
@@ -1126,6 +1149,13 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "kiZSXIWd9vg" => guest_strcpy(arguments[0], arguments[1]),
         "6sJWiWSRuqk" => guest_strncpy(arguments[0], arguments[1], arguments[2]),
         "Ls4tzzhimqQ" => guest_strcat(arguments[0], arguments[1]),
+        "AV6ipCNa4Rw" => guest_strcasecmp(arguments[0], arguments[1]),
+        // libc stdio uses host FILE objects after resolving console paths inside the game dump.
+        "xeYO4u7uyJ0" => guest_fopen(arguments[0], arguments[1], state),
+        "rQFVBXp-Cxg" => guest_fseek(arguments[0], arguments[1], arguments[2]),
+        "Qazy8LmXTvw" => guest_ftell(arguments[0]),
+        "uodLYyUip20" => guest_fclose(arguments[0]),
+        "lbB+UlZqVG0" => guest_fread(arguments[0], arguments[1], arguments[2], arguments[3]),
         // libc fputs
         "QrZZdJ8XsX0" => guest_fputs(arguments[0]),
         // Itanium C++ one-time initialization guards.
@@ -1135,12 +1165,21 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         // The single-thread bootstrap uses these attributes only to configure the first worker.
         "F8bUHwAG284" | "nsYoNRywwNg" => initialize_synthetic_handle(arguments[0]),
         "smWEktiyyG0" | "62KCwEMmzcM" => destroy_synthetic_handle(arguments[0]),
+        // scePthreadAttrGetstack returns both values through caller-owned outputs.
+        "-quPa4SEJUw" => pthread_attr_get_stack(arguments),
         // Initial single-device handles for input, video, and audio.
         "xk0AcarP3V4" | "Up36PTk687E" | "ekNvsT22rsY" => 1,
-        // sceUserServiceGetInitialUser
-        "CdWp0oHWGr0" => write_output_i32(arguments[0], 1),
+        // AGC shader construction and VideoOut mutate caller-owned descriptors. Games consume the
+        // resulting pointers and command data immediately, so successful no-ops are insufficient.
+        "f3dg2CSgRKY" => agc_create_shader(arguments),
+        "PjS5uASwcV8" => video_out_set_buffer_attribute2(arguments, state),
+        "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
+        // Initial user, NP context, and trophy context IDs.
+        "CdWp0oHWGr0" | "5zBnau1uIEo" | "Bagshr7OQ6Q" => write_output_i32(arguments[0], 1),
         // sceKernelCreateEqueue
         "D0OdFMjp46I" => write_output_u64(arguments[0], 1),
+        // Minimal offline NP identities. These services only require stable nonzero IDs at boot.
+        "hT0IAEvN+M0" => np_create_handle(arguments, state),
         // Minimal AGC register-default descriptor; zero groups select the game's fallback path.
         "2JtWUUiYBXs" | "wRbq6ZjNop4" => agc_register_defaults(state),
         // Inferred from the immediate two-byte character-class lookup at every call site.
@@ -1166,11 +1205,224 @@ fn agc_register_defaults(state: &mut ProbeDispatchState) -> u64 {
     state.agc_register_defaults
 }
 
+const AGC_SHADER_FILE_HEADER: u32 = 0x3433_3231;
+const AGC_SHADER_VERSION: u32 = 0x18;
+const AGC_SHADER_USER_DATA_OFFSET: u64 = 0x08;
+const AGC_SHADER_CODE_OFFSET: u64 = 0x10;
+const AGC_SHADER_CX_REGISTERS_OFFSET: u64 = 0x18;
+const AGC_SHADER_SH_REGISTERS_OFFSET: u64 = 0x20;
+const AGC_SHADER_SPECIALS_OFFSET: u64 = 0x28;
+const AGC_SHADER_INPUT_SEMANTICS_OFFSET: u64 = 0x30;
+const AGC_SHADER_OUTPUT_SEMANTICS_OFFSET: u64 = 0x38;
+const AGC_SHADER_TYPE_OFFSET: u64 = 0x5a;
+const AGC_SHADER_SH_REGISTER_COUNT_OFFSET: u64 = 0x5c;
+
+fn agc_create_shader(arguments: [u64; 6]) -> u64 {
+    let destination = arguments[0];
+    let header = arguments[1];
+    let code = arguments[2];
+    if header == 0 || code == 0 {
+        return u64::MAX;
+    }
+    if read_guest_u32(header) != AGC_SHADER_FILE_HEADER
+        || read_guest_u32(header + 4) != AGC_SHADER_VERSION
+    {
+        eprintln!(
+            "[REMu][AGC] rejected shader header at {header:#x}: magic={:#x} version={:#x}",
+            read_guest_u32(header),
+            read_guest_u32(header + 4)
+        );
+        return u64::MAX;
+    }
+
+    for offset in [
+        AGC_SHADER_CX_REGISTERS_OFFSET,
+        AGC_SHADER_SH_REGISTERS_OFFSET,
+        AGC_SHADER_USER_DATA_OFFSET,
+        AGC_SHADER_SPECIALS_OFFSET,
+        AGC_SHADER_INPUT_SEMANTICS_OFFSET,
+        AGC_SHADER_OUTPUT_SEMANTICS_OFFSET,
+    ] {
+        relocate_guest_pointer(header + offset);
+    }
+    write_guest_u64(header + AGC_SHADER_CODE_OFFSET, code);
+
+    let user_data = read_guest_u64(header + AGC_SHADER_USER_DATA_OFFSET);
+    if user_data != 0 {
+        for offset in [0, 8, 0x10, 0x18, 0x20] {
+            relocate_guest_pointer(user_data + offset);
+        }
+    }
+
+    if !patch_agc_shader_program_registers(header, code) {
+        return u64::MAX;
+    }
+    if destination != 0 {
+        write_guest_u64(destination, header);
+    }
+    0
+}
+
+fn relocate_guest_pointer(field: u64) {
+    let relative = read_guest_u64(field);
+    if relative != 0 {
+        write_guest_u64(field, field.wrapping_add(relative));
+    }
+}
+
+fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
+    let registers = read_guest_u64(header + AGC_SHADER_SH_REGISTERS_OFFSET);
+    let shader_type = read_guest_u8(header + AGC_SHADER_TYPE_OFFSET);
+    let register_count = read_guest_u8(header + AGC_SHADER_SH_REGISTER_COUNT_OFFSET);
+    if registers == 0 || register_count < 2 {
+        return false;
+    }
+    let expected = match shader_type {
+        0 => (0x20c, 0x20d),
+        1 => (0x008, 0x009),
+        2 | 6 => (0x0c8, 0x0c9),
+        4 => (0x08a, 0x08b),
+        7 => (0x148, 0x149),
+        _ => return false,
+    };
+    if (read_guest_u32(registers), read_guest_u32(registers + 8)) != expected {
+        return false;
+    }
+    write_guest_u32(registers + 4, ((code >> 8) & 0xffff_ffff) as u32);
+    write_guest_u32(registers + 12, ((code >> 40) & 0xff) as u32);
+    true
+}
+
+fn video_out_set_buffer_attribute2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let attribute = arguments[0];
+    if attribute == 0 {
+        return u64::MAX;
+    }
+    guest_memset(attribute, 0, 0x50);
+    write_guest_u32(attribute + 0x04, low_u32(arguments[2]));
+    write_guest_u32(attribute + 0x0c, low_u32(arguments[3]));
+    write_guest_u32(attribute + 0x10, low_u32(arguments[4]));
+    write_guest_u64(attribute + 0x18, arguments[5]);
+    write_guest_u64(attribute + 0x20, arguments[1]);
+
+    state.video_out.pixel_format = arguments[1];
+    state.video_out.tiling_mode = low_u32(arguments[2]);
+    state.video_out.width = low_u32(arguments[3]);
+    state.video_out.height = low_u32(arguments[4]);
+    0
+}
+
+fn video_out_register_buffers2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let set_index = low_u32(arguments[1]);
+    let buffer_index_start = usize::try_from(low_u32(arguments[2])).unwrap_or(usize::MAX);
+    let entries = arguments[3];
+    let buffer_count = usize::try_from(low_u32(arguments[4])).unwrap_or(usize::MAX);
+    let attribute = arguments[5];
+    if arguments[0] == 0
+        || entries == 0
+        || attribute == 0
+        || buffer_index_start > 15
+        || buffer_count == 0
+        || buffer_count > 16
+        || buffer_index_start.saturating_add(buffer_count) > 16
+    {
+        return u64::MAX;
+    }
+
+    state.video_out.pixel_format = read_guest_u64(attribute + 0x20);
+    state.video_out.tiling_mode = read_guest_u32(attribute + 0x04);
+    state.video_out.width = read_guest_u32(attribute + 0x0c);
+    state.video_out.height = read_guest_u32(attribute + 0x10);
+    state
+        .video_out
+        .display_buffers
+        .resize(buffer_index_start + buffer_count, 0);
+    for index in 0..buffer_count {
+        let entry = entries + u64::try_from(index).unwrap_or(u64::MAX) * 0x20;
+        state.video_out.display_buffers[buffer_index_start + index] = read_guest_u64(entry);
+    }
+    eprintln!(
+        "[REMu][VIDEO] registered {} buffers at {}x{} format={:#x} tiling={} addresses={:x?}",
+        buffer_count,
+        state.video_out.width,
+        state.video_out.height,
+        state.video_out.pixel_format,
+        state.video_out.tiling_mode,
+        state.video_out.display_buffers
+    );
+    u64::from(set_index)
+}
+
 fn guest_ctype_table(state: &mut ProbeDispatchState) -> u64 {
     if state.ctype_table == 0 {
-        state.ctype_table = guest_calloc(256, 2);
+        // Sony's libc follows the Dinkumware mask layout and indexes this table over
+        // [-128, 255]. Return the c == 0 entry, leaving 128 valid entries before it.
+        let storage = guest_calloc(384, 2);
+        if storage == 0 {
+            return 0;
+        }
+        state.ctype_table = storage + 128 * 2;
+        for character in 0_u16..=0x7f {
+            write_guest_u16(
+                state.ctype_table + u64::from(character) * 2,
+                guest_ctype_flags(character),
+            );
+        }
     }
     state.ctype_table
+}
+
+fn guest_ctype_flags(character: u16) -> u16 {
+    const XDIGIT: u16 = 0x001;
+    const UPPER: u16 = 0x002;
+    const SPACE: u16 = 0x004;
+    const PUNCT: u16 = 0x008;
+    const LOWER: u16 = 0x010;
+    const DIGIT: u16 = 0x020;
+    const CONTROL_SPACE: u16 = 0x040;
+    const CONTROL: u16 = 0x080;
+    const BLANK: u16 = 0x400;
+
+    let upper = (u16::from(b'A')..=u16::from(b'Z')).contains(&character);
+    let lower = (u16::from(b'a')..=u16::from(b'z')).contains(&character);
+    let digit = (u16::from(b'0')..=u16::from(b'9')).contains(&character);
+    let hexadecimal = digit
+        || (u16::from(b'A')..=u16::from(b'F')).contains(&character)
+        || (u16::from(b'a')..=u16::from(b'f')).contains(&character);
+    let alphanumeric = upper || lower || digit;
+    let control_space = (0x09..=0x0d).contains(&character);
+    let control = character <= 0x08 || (0x0e..=0x1f).contains(&character) || character == 0x7f;
+    let printable = (0x20..=0x7e).contains(&character);
+
+    let mut flags = 0;
+    if upper {
+        flags |= UPPER;
+    }
+    if lower {
+        flags |= LOWER;
+    }
+    if digit {
+        flags |= DIGIT;
+    }
+    if hexadecimal {
+        flags |= XDIGIT;
+    }
+    if character == u16::from(b' ') {
+        flags |= SPACE | BLANK;
+    }
+    if character == u16::from(b'\t') {
+        flags |= BLANK;
+    }
+    if control_space {
+        flags |= CONTROL_SPACE;
+    }
+    if printable && !alphanumeric && character != u16::from(b' ') {
+        flags |= PUNCT;
+    }
+    if control {
+        flags |= CONTROL;
+    }
+    flags
 }
 
 fn run_guest_thread(entry: u64, argument: u64) -> u64 {
@@ -1200,6 +1452,29 @@ fn destroy_synthetic_handle(address: u64) -> u64 {
     }
     write_guest_u64(address, 0);
     0
+}
+
+fn pthread_attr_get_stack(arguments: [u64; 6]) -> u64 {
+    if arguments[0] == 0 || arguments[1] == 0 || arguments[2] == 0 {
+        return u64::MAX;
+    }
+    write_guest_u64(arguments[1], 0);
+    write_guest_u64(arguments[2], 0x80000);
+    0
+}
+
+fn np_create_handle(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let output = if arguments[0] != 0 {
+        arguments[0]
+    } else {
+        arguments[1]
+    };
+    if output == 0 {
+        return u64::MAX;
+    }
+    let handle = state.next_np_handle;
+    state.next_np_handle = state.next_np_handle.saturating_add(1);
+    write_output_i32(output, handle)
 }
 
 fn guest_guard_acquire(address: u64) -> u64 {
@@ -1233,6 +1508,35 @@ fn write_guest_u64(address: u64, value: u64) {
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe {
         std::ptr::write_unaligned(address as *mut u64, value);
+    }
+}
+
+fn read_guest_u8(address: u64) -> u8 {
+    // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
+    unsafe { std::ptr::read_unaligned(address as *const u8) }
+}
+
+fn read_guest_u32(address: u64) -> u32 {
+    // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
+    unsafe { std::ptr::read_unaligned(address as *const u32) }
+}
+
+fn read_guest_u64(address: u64) -> u64 {
+    // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
+    unsafe { std::ptr::read_unaligned(address as *const u64) }
+}
+
+fn write_guest_u32(address: u64, value: u32) {
+    // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
+    unsafe {
+        std::ptr::write_unaligned(address as *mut u32, value);
+    }
+}
+
+fn write_guest_u16(address: u64, value: u16) {
+    // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
+    unsafe {
+        std::ptr::write_unaligned(address as *mut u16, value);
     }
 }
 
@@ -1433,12 +1737,15 @@ fn guest_realloc(address: u64, size: u64) -> u64 {
 }
 
 fn guest_aligned_alloc(alignment: u64, size: u64) -> u64 {
-    let (Ok(alignment), Ok(size)) = (usize::try_from(alignment), usize::try_from(size)) else {
+    let (Ok(mut alignment), Ok(size)) = (usize::try_from(alignment), usize::try_from(size)) else {
         return 0;
     };
     if alignment == 0 || !alignment.is_power_of_two() {
         return 0;
     }
+    // Guest memalign accepts sub-pointer alignments; the host allocator requires at least
+    // sizeof(void*), which still satisfies the guest's weaker request.
+    alignment = alignment.max(std::mem::size_of::<usize>());
     let mut output = std::ptr::null_mut();
     // SAFETY: `output` is writable and alignment/size are represented in the host ABI.
     let result = unsafe { libc::posix_memalign(&raw mut output, alignment, size) };
@@ -1498,6 +1805,131 @@ fn guest_strncmp(left: u64, right: u64, length: u64) -> u64 {
         )
     };
     signed_i32_return(result)
+}
+
+fn guest_strcasecmp(left: u64, right: u64) -> u64 {
+    if left == 0 || right == 0 {
+        return u64::from(left != right);
+    }
+    // SAFETY: strcasecmp's guest ABI contract supplies two NUL-terminated strings.
+    let result =
+        unsafe { libc::strcasecmp(left as *const libc::c_char, right as *const libc::c_char) };
+    signed_i32_return(result)
+}
+
+fn guest_fopen(path_address: u64, mode_address: u64, state: &ProbeDispatchState) -> u64 {
+    let (Some(guest_path), Some(mode)) = (
+        read_guest_cstring(path_address),
+        read_guest_cstring(mode_address),
+    ) else {
+        return 0;
+    };
+    let Some(host_path) = resolve_guest_path(&state.game_root, &guest_path) else {
+        eprintln!("[REMu][VFS] rejected path {guest_path:?}");
+        return 0;
+    };
+    // The bring-up VFS is intentionally read-only; saves receive a separate writable mount later.
+    if !mode.starts_with('r') {
+        eprintln!("[REMu][VFS] rejected write mode {mode:?} for {guest_path:?}");
+        return 0;
+    }
+    let (Ok(host_path), Ok(mode)) = (
+        CString::new(host_path.to_string_lossy().as_bytes()),
+        CString::new(mode),
+    ) else {
+        return 0;
+    };
+    // SAFETY: Both strings are NUL-terminated and host libc owns the returned FILE object.
+    let file = unsafe { libc::fopen(host_path.as_ptr(), mode.as_ptr()) };
+    eprintln!(
+        "[REMu][VFS] fopen guest={guest_path:?} host={:?} result={file:p}",
+        host_path.to_string_lossy()
+    );
+    file as usize as u64
+}
+
+fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<PathBuf> {
+    let normalized = guest_path.replace('\\', "/");
+    let relative = if let Some(path) = normalized.strip_prefix("/app0/") {
+        path
+    } else if normalized == "/app0" {
+        ""
+    } else if let Some((_, path)) = normalized.split_once("/app0/") {
+        path
+    } else if normalized.starts_with('/') {
+        return None;
+    } else {
+        normalized.as_str()
+    };
+    let mut host = game_root.to_owned();
+    // Console paths routinely contain duplicate separators (for example
+    // `/app0//shaders/presenter.vert`). Treat them like POSIX does while keeping parent traversal
+    // outside the read-only game root impossible.
+    for component in relative.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            component => host.push(component),
+        }
+    }
+    Some(host)
+}
+
+fn read_guest_cstring(address: u64) -> Option<String> {
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: Guest libc string arguments are NUL-terminated within live guest memory.
+    let string = unsafe { std::ffi::CStr::from_ptr(address as *const libc::c_char) };
+    string.to_str().ok().map(ToOwned::to_owned)
+}
+
+fn guest_fseek(handle: u64, offset: u64, whence: u64) -> u64 {
+    if handle == 0 {
+        return u64::MAX;
+    }
+    // SAFETY: fopen returned the handle, and libc validates offset/whence.
+    signed_i32_return(unsafe {
+        libc::fseek(
+            handle as *mut libc::FILE,
+            i64::from_ne_bytes(offset.to_ne_bytes()),
+            low_i32(whence),
+        )
+    })
+}
+
+fn guest_ftell(handle: u64) -> u64 {
+    if handle == 0 {
+        return u64::MAX;
+    }
+    // SAFETY: fopen returned the live FILE handle.
+    unsafe { libc::ftell(handle as *mut libc::FILE).cast_unsigned() }
+}
+
+fn guest_fclose(handle: u64) -> u64 {
+    if handle == 0 {
+        return u64::MAX;
+    }
+    // SAFETY: fopen returned the live FILE handle and ownership ends here.
+    signed_i32_return(unsafe { libc::fclose(handle as *mut libc::FILE) })
+}
+
+fn guest_fread(destination: u64, size: u64, count: u64, handle: u64) -> u64 {
+    if destination == 0 || handle == 0 || size == 0 || count == 0 {
+        return 0;
+    }
+    let (Ok(size), Ok(count)) = (usize::try_from(size), usize::try_from(count)) else {
+        return 0;
+    };
+    // SAFETY: The guest supplies a destination sized for size*count and fopen returned the handle.
+    unsafe {
+        libc::fread(
+            destination as *mut libc::c_void,
+            size,
+            count,
+            handle as *mut libc::FILE,
+        ) as u64
+    }
 }
 
 fn guest_strcpy(destination: u64, source: u64) -> u64 {
@@ -1581,6 +2013,7 @@ const fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
 fn probe_entry(
     image: &LinkedImage,
     process_image_name: &str,
+    game_root: &Path,
     maximum_import_hits: usize,
 ) -> Result<ProbeOutcome, LinkError> {
     #[repr(C)]
@@ -1602,7 +2035,7 @@ fn probe_entry(
         argument1: 0,
         argument2: 0,
     };
-    configure_probe_dispatch(image, maximum_import_hits);
+    configure_probe_dispatch(image, game_root, maximum_import_hits);
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     // SAFETY: Alarm only bounds this diagnostic process; the default SIGALRM action terminates it.
     unsafe {
@@ -1634,6 +2067,7 @@ fn probe_entry(
 const fn probe_entry(
     _image: &LinkedImage,
     _process_image_name: &str,
+    _game_root: &Path,
     _maximum_import_hits: usize,
 ) -> Result<ProbeOutcome, LinkError> {
     Err(LinkError::ProbeRequiresX86_64)
@@ -1654,6 +2088,29 @@ fn terminate_probe(code: i32) -> ! {
 
     #[cfg(not(unix))]
     std::process::exit(code)
+}
+
+#[cfg(test)]
+mod platform_independent_tests {
+    use std::path::Path;
+
+    use super::resolve_guest_path;
+
+    #[test]
+    fn resolves_duplicate_console_path_separators() {
+        assert_eq!(
+            resolve_guest_path(Path::new("/games/title"), "/app0//shaders/presenter.vert"),
+            Some(Path::new("/games/title/shaders/presenter.vert").to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_game_root_parent_traversal() {
+        assert_eq!(
+            resolve_guest_path(Path::new("/games/title"), "/app0/../outside.bin"),
+            None
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]

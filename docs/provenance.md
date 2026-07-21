@@ -36,5 +36,11 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   startup behavior, and the first mutex/condition/semaphore services follow the corresponding
   SharpEmu CPU and HLE implementations at snapshot `ada67a19`. The Rust implementation uses host
   threads and condition variables while retaining guest-visible handles and ownership state.
+- AGC shader-header pointer relocation, program-register patching, and the VideoOut buffer-attribute
+  and registration layouts were adapted from SharpEmu's GPL-2.0-or-later `AgcExports.cs` and
+  `VideoOutExports.cs` at local snapshot `ada67a19`.
+- Read-only app filesystem path resolution and libc stdio forwarding follow SharpEmu's
+  GPL-2.0-or-later `LibcStdioExports.cs` design at local snapshot `ada67a19`; REmu uses native
+  `FILE` objects directly because the Rosetta guest and host share the x86-64 libc ABI.
 - REmu applies the four relocation types present in the first two authorized test titles before
   finalizing memory protections: `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE`.
