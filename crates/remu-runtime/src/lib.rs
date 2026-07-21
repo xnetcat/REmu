@@ -616,7 +616,7 @@ struct ProbeDispatchState {
     thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
     agc_register_defaults: u64,
     ctype_table: u64,
-    tls_template_address: u64,
+    tls_template: Vec<u8>,
     tls_static_block_size: u64,
     video_out: VideoOutState,
     game_root: PathBuf,
@@ -690,7 +690,19 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.thread_handles.clear();
     state.agc_register_defaults = 0;
     state.ctype_table = 0;
-    state.tls_template_address = image.tls.thread_pointer.get() - GUEST_TLS_PREFIX_SIZE;
+    let tls_template_address = image.tls.thread_pointer.get() - GUEST_TLS_PREFIX_SIZE;
+    let tls_template_size = usize::try_from(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
+        .expect("guest TLS template size fits usize");
+    state.tls_template.resize(tls_template_size, 0);
+    // SAFETY: The linked image owns this live TLS reservation for the entire probe. Snapshot it
+    // before guest entry so later workers never inherit the main thread's mutated allocator caches.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            tls_template_address as *const u8,
+            state.tls_template.as_mut_ptr(),
+            tls_template_size,
+        );
+    }
     state.tls_static_block_size = image.tls.static_block_size;
     state.video_out = VideoOutState::default();
     game_root.clone_into(&mut state.game_root);
@@ -756,7 +768,7 @@ extern "C" fn import_dispatch(
         }
         let entry = call_args[2];
         let thread_argument = call_args[3];
-        let guest_tls = clone_guest_tls(state.tls_template_address, state.tls_static_block_size);
+        let guest_tls = clone_guest_tls(&state.tls_template, state.tls_static_block_size);
         let thread = std::thread::spawn(move || {
             set_current_guest_thread_pointer(guest_tls.thread_pointer);
             let result = run_guest_thread(entry, thread_argument);
@@ -794,18 +806,15 @@ struct GuestThreadTls {
     thread_pointer: u64,
 }
 
-fn clone_guest_tls(template_address: u64, static_block_size: u64) -> GuestThreadTls {
+fn clone_guest_tls(template: &[u8], static_block_size: u64) -> GuestThreadTls {
     let size = usize::try_from(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
         .expect("guest TLS allocation size fits usize");
-    let mut storage = vec![0_u8; size];
-    // SAFETY: The process-wide TLS template remains mapped while every guest worker is alive.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            template_address as *const u8,
-            storage.as_mut_ptr(),
-            storage.len(),
-        );
-    }
+    assert_eq!(
+        template.len(),
+        size,
+        "guest TLS template has the linked size"
+    );
+    let mut storage = template.to_vec();
     let thread_pointer = storage.as_mut_ptr() as usize as u64 + GUEST_TLS_PREFIX_SIZE;
     write_guest_u64(thread_pointer, thread_pointer);
     write_guest_u64(thread_pointer + 0x08, thread_pointer + 0x100);
