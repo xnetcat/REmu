@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 mod agc_register_defaults;
+mod audio;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -1119,12 +1120,16 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "clVvL4ZDntw" => "scePadSetMotionSensorState",
         "gjP9-KQzoUk" => "scePadGetControllerInformation",
         "YndgXqQVV7c" => "scePadReadState",
+        "JfEPXVxhFqA" => "sceAudioOutInit",
+        "ekNvsT22rsY" => "sceAudioOutOpen",
+        "s1--uE9mBFw" => "sceAudioOutClose",
+        "b+uAV89IlxE" => "sceAudioOutSetVolume",
+        "QOQtbeDqsT4" => "sceAudioOutOutput",
+        "GrQ9s4IrNaQ" => "sceAudioOutGetPortState",
         "rPo6tV8D9bM" => "sceSystemServiceGetStatus",
         "Vo5V8KAwCmk" => "sceSystemServiceHideSplashScreen",
         "uoUpLGNkygk" => "sceCommonDialogInitialize",
         "ERKzksauAJA" => "sceSaveDataDialogGetStatus",
-        "JfEPXVxhFqA" => "sceAudioOutInit",
-        "b+uAV89IlxE" => "sceAudioOutSetVolume",
         "sjaobBgqeB4" => "sceNpUniversalDataSystemInitialize",
         "m87BHxt-H60" => "sceNpGameIntentInitialize",
         "tpFJ8LIKvPw" => "sceNpUniversalDataSystemRegisterContext",
@@ -1228,6 +1233,7 @@ struct ProbeDispatchState {
     pthread_condition_attributes: BTreeSet<u64>,
     exit_callbacks: Vec<GuestExitCallback>,
     services: RuntimeServiceState,
+    audio_out: audio::AudioOutState,
     agc_primary_register_defaults: u64,
     agc_internal_register_defaults: u64,
     ctype_table: u64,
@@ -1500,6 +1506,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.pthread_condition_attributes.clear();
     state.exit_callbacks.clear();
     state.services = RuntimeServiceState::default();
+    state.audio_out = audio::AudioOutState::default();
     state.agc_primary_register_defaults = 0;
     state.agc_internal_register_defaults = 0;
     state.ctype_table = 0;
@@ -1708,12 +1715,18 @@ extern "C" fn import_dispatch(
             mutex_attributes,
         ));
     }
-    // A real AudioOut submission blocks for approximately one 256-frame buffer. Without pacing,
-    // the emulated audio worker monopolizes the import boundary and starves the render worker.
     if nid == "QOQtbeDqsT4" {
+        let output = state.audio_out.output(call_args);
         drop(state);
-        std::thread::sleep(Duration::from_micros(5_333));
-        return ProbeImportReturn::integer(0);
+        return match output {
+            Ok(delay) => {
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                ProbeImportReturn::integer(0)
+            }
+            Err(error) => ProbeImportReturn::integer(audio_out_error(error)),
+        };
     }
     if matches!(nid.as_str(), "5OqszGpy7Mg" | "VOBg+iNwB-4" | "2vDqwBlpF-o") {
         drop(state);
@@ -2264,8 +2277,29 @@ fn dispatch_probe_import(
         "waPcxYiR3WA" => pthread_condition_attr_destroy(arguments[0], state),
         // Initial single-device handles for input, video, and audio.
         "xk0AcarP3V4" => pad_open(arguments, state),
-        "Up36PTk687E" | "ekNvsT22rsY" => 1,
-        "JfEPXVxhFqA" | "b+uAV89IlxE" => 0,
+        "Up36PTk687E" => 1,
+        // libSceAudioOut owns validated ports and consumes complete configured PCM buffers through
+        // the host mixer. Output itself is handled above so pacing never holds the import lock.
+        "JfEPXVxhFqA" => {
+            state.audio_out.initialize();
+            0
+        }
+        "ekNvsT22rsY" => state
+            .audio_out
+            .open(arguments)
+            .unwrap_or_else(audio_out_error),
+        "s1--uE9mBFw" => state
+            .audio_out
+            .close(arguments[0])
+            .map_or_else(audio_out_error, |()| 0),
+        "b+uAV89IlxE" => state
+            .audio_out
+            .set_volume(arguments)
+            .map_or_else(audio_out_error, |()| 0),
+        "GrQ9s4IrNaQ" => state
+            .audio_out
+            .get_port_state(arguments)
+            .map_or_else(audio_out_error, |()| 0),
         // AGC shader construction and VideoOut mutate caller-owned descriptors. Games consume the
         // resulting pointers and command data immediately, so successful no-ops are insufficient.
         "f3dg2CSgRKY" => agc_create_shader(arguments),
@@ -5555,6 +5589,23 @@ fn sce_kernel_error(code: u32) -> u64 {
     signed_i32_return(i32::from_ne_bytes(code.to_ne_bytes()))
 }
 
+fn audio_out_error(error: audio::AudioOutError) -> u64 {
+    let code = match error {
+        audio::AudioOutError::NotOpened => 0x8026_0001,
+        audio::AudioOutError::Busy => 0x8026_0002,
+        audio::AudioOutError::InvalidPort => 0x8026_0003,
+        audio::AudioOutError::InvalidPointer => 0x8026_0004,
+        audio::AudioOutError::PortFull => 0x8026_0005,
+        audio::AudioOutError::InvalidSize => 0x8026_0006,
+        audio::AudioOutError::InvalidFormat => 0x8026_0007,
+        audio::AudioOutError::InvalidSampleFrequency => 0x8026_0008,
+        audio::AudioOutError::InvalidVolume => 0x8026_0009,
+        audio::AudioOutError::InvalidPortType => 0x8026_000a,
+        audio::AudioOutError::OutOfMemory => 0x8026_000d,
+    };
+    sce_kernel_error(code)
+}
+
 fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
@@ -5803,13 +5854,17 @@ fn guest_usleep(microseconds: u64) -> u64 {
     signed_i32_return(unsafe { libc::usleep(bounded) })
 }
 
-fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
+fn guest_clock_gettime(_clock_id: u64, output: u64) -> u64 {
     if output == 0 {
         return u64::MAX;
     }
+    // Console titles use clock ids whose numeric values do not match Darwin's constants. Passing
+    // those values through made clock id 4 return host monotonic uptime while the same title used
+    // Unix time elsewhere, producing multi-trillion-second deltas. SharpEmu's working ABI treats
+    // every accepted id as realtime, which is also what Dreaming Sarah expects here.
     // SAFETY: Darwin and the PS5 x86-64 ABI both represent timespec as two signed 64-bit fields.
     signed_i32_return(unsafe {
-        libc::clock_gettime(low_u32(clock_id), output as *mut libc::timespec)
+        libc::clock_gettime(libc::CLOCK_REALTIME, output as *mut libc::timespec)
     })
 }
 
@@ -5941,11 +5996,11 @@ mod platform_independent_tests {
         ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, create_pthread_attr, destroy_pthread_attr, dispatch_probe_import,
-        guest_qsort, kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query,
-        low_f32, low_u32, pthread_attr_get_stack, pthread_attr_set_detach_state,
-        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u64,
-        resolve_guest_path, sanitize_save_segment, sce_kernel_error, take_exit_callbacks,
-        write_guest_u32, write_guest_u64,
+        guest_clock_gettime, guest_qsort, kernel_release_direct_memory, kernel_stat_payload,
+        kernel_virtual_query, low_f32, low_u32, pthread_attr_get_stack,
+        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        pthread_attr_set_stack_size, read_guest_u64, resolve_guest_path, sanitize_save_segment,
+        sce_kernel_error, take_exit_callbacks, write_guest_u32, write_guest_u64,
     };
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -5996,6 +6051,23 @@ mod platform_independent_tests {
     #[test]
     fn sign_extends_gen5_kernel_errors() {
         assert_eq!(sce_kernel_error(0x8002_0002), 0xffff_ffff_8002_0002);
+    }
+
+    #[test]
+    fn translates_console_clock_ids_to_realtime() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut output = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(guest_clock_gettime(4, (&raw mut output).addr() as u64), 0);
+        let seconds = u64::try_from(output.tv_sec).unwrap();
+        assert!(seconds >= before);
+        assert!(seconds <= before + 2);
+        assert!((0..1_000_000_000).contains(&output.tv_nsec));
     }
 
     #[test]
