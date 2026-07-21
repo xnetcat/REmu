@@ -308,6 +308,7 @@ fn link(path: &Path) -> ExitCode {
     println!("image_base={}", linked.memory.image_base());
     println!("entry={}", linked.memory.entry_address());
     println!("import_stubs={}", linked.import_stubs.len());
+    println!("unwind_records={}", linked.unwind_record_count());
     println!("relocations={}", linked.relocation_stats.total());
     println!("tls.thread_pointer={}", linked.tls.thread_pointer);
     println!("tls.static_block_size=0x{:x}", linked.tls.static_block_size);

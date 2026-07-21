@@ -21,6 +21,8 @@ const R_X86_64_RELATIVE: u32 = 8;
 const IMPORT_STUB_SIZE: u64 = 32;
 const IMPORT_STUB_SIZE_USIZE: usize = 32;
 const PT_TLS: u32 = 7;
+const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
+const DW_EH_PE_PCREL_SDATA4: u8 = 0x1b;
 const GUEST_TLS_PREFIX_SIZE: u64 = 0x20_000;
 const GUEST_TLS_TCB_SIZE: u64 = 0x10_000;
 const TLS_HELPER_SIZE: u64 = 96;
@@ -64,6 +66,7 @@ pub struct LinkedImage {
     pub import_stubs: Vec<ImportStub>,
     pub relocation_stats: RelocationStats,
     pub tls: GuestTls,
+    unwind_fdes: Vec<GuestAddress>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +113,14 @@ pub enum LinkError {
     ProbeRequiresX86_64,
     #[error("process image name contains an interior NUL byte")]
     InvalidProcessImageName,
+    #[error("unsupported guest .eh_frame pointer encoding 0x{0:02x}")]
+    UnsupportedEhFrameEncoding(u8),
+    #[error("malformed guest .eh_frame data: {0}")]
+    MalformedEhFrame(&'static str),
+    #[error("native macOS C++ unwind runtime is unavailable")]
+    NativeCxxRuntimeUnavailable,
+    #[error("native macOS unwind symbol {0} is unavailable")]
+    MissingNativeUnwindSymbol(&'static str),
 }
 
 impl LinkedImage {
@@ -122,6 +133,7 @@ impl LinkedImage {
         let mut memory = GuestImage::map_main(executable)?;
         let (import_stubs, symbol_stubs) = create_import_stubs(&mut memory, dynamic)?;
         let relocation_stats = apply_relocations(&mut memory, dynamic, &symbol_stubs)?;
+        let unwind_fdes = collect_unwind_fdes(&memory, executable)?;
         let tls = install_tls_support(&mut memory, executable)?;
         memory.finalize_permissions()?;
         Ok(Self {
@@ -129,6 +141,7 @@ impl LinkedImage {
             import_stubs,
             relocation_stats,
             tls,
+            unwind_fdes,
         })
     }
 
@@ -146,6 +159,11 @@ impl LinkedImage {
             maximum_import_hits,
             timeout_seconds,
         )
+    }
+
+    #[must_use]
+    pub fn unwind_record_count(&self) -> usize {
+        self.unwind_fdes.len()
     }
 }
 
@@ -437,6 +455,232 @@ fn write_u64(memory: &mut GuestImage, address: GuestAddress, value: u64) -> Resu
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+struct NativeCxxRuntime {
+    cxxabi_handle: usize,
+    unwind_handle: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn native_cxx_runtime() -> Option<NativeCxxRuntime> {
+    static RUNTIME: OnceLock<Option<NativeCxxRuntime>> = OnceLock::new();
+    *RUNTIME.get_or_init(|| {
+        // SAFETY: Both paths are NUL-terminated constants naming macOS shared-cache libraries.
+        let cxxabi_handle = unsafe {
+            libc::dlopen(
+                c"/usr/lib/libc++abi.dylib".as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        };
+        // SAFETY: Same as above; the handle is intentionally retained for the process lifetime.
+        let unwind_handle = unsafe {
+            libc::dlopen(
+                c"/usr/lib/system/libunwind.dylib".as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        };
+        if cxxabi_handle.is_null() || unwind_handle.is_null() {
+            None
+        } else {
+            Some(NativeCxxRuntime {
+                cxxabi_handle: cxxabi_handle as usize,
+                unwind_handle: unwind_handle as usize,
+            })
+        }
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+impl NativeCxxRuntime {
+    fn cxxabi_symbol(self, name: &std::ffi::CStr) -> Option<u64> {
+        // SAFETY: `cxxabi_handle` is a retained live dlopen handle and `name` is NUL-terminated.
+        let address =
+            unsafe { libc::dlsym(self.cxxabi_handle as *mut libc::c_void, name.as_ptr()) };
+        (!address.is_null()).then_some(address as usize as u64)
+    }
+
+    fn unwind_symbol(self, name: &std::ffi::CStr) -> Option<u64> {
+        // SAFETY: `unwind_handle` is a retained live dlopen handle and `name` is NUL-terminated.
+        let address =
+            unsafe { libc::dlsym(self.unwind_handle as *mut libc::c_void, name.as_ptr()) };
+        (!address.is_null()).then_some(address as usize as u64)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn native_cxx_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
+    Some(match nid {
+        "XwLA5cTHjt4" => c"__gxx_personality_v0",
+        "IJKVjsmxxWI" => c"__cxa_allocate_dependent_exception",
+        "cfAXurvfl5o" => c"__cxa_allocate_exception",
+        "tsvEmnenz48" => c"__cxa_atexit",
+        "pBxafllkvt0" => c"__cxa_bad_cast",
+        "xcc6DTcL8QA" => c"__cxa_bad_typeid",
+        "3cUUypQzMiI" => c"__cxa_begin_catch",
+        "BxPeH9TTcs4" => c"__cxa_current_exception_type",
+        "lX+4FNUklF0" => c"__cxa_end_catch",
+        "kBxt5LwtLA4" => c"__cxa_free_dependent_exception",
+        "nOIEswYD4Ig" => c"__cxa_free_exception",
+        "Y6Sl4Xw7gfA" => c"__cxa_get_exception_ptr",
+        "3GPpjQdAMTw" => c"__cxa_guard_acquire",
+        "9rAeANT2tyE" => c"__cxa_guard_release",
+        "2emaaluWzUw" => c"__cxa_guard_abort",
+        "zr094EQ39Ww" => c"__cxa_pure_virtual",
+        "ZL9FV4mJXxo" => c"__cxa_rethrow",
+        "vkuuLfhnSZI" => c"__cxa_throw",
+        "XbAd9Ach9mo" => c"__cxa_throw_bad_array_new_length",
+        "cmBRQsLPqwA" => c"__cxa_uncaught_exception",
+        "7P1Wm-5KgAY" => c"_ZNSt12domain_errorD1Ev",
+        "MOBxtefPZUg" => c"_ZNSt9exceptionD2Ev",
+        "5BIbzIuDxTQ" => c"_ZTISt12domain_error",
+        "oAidKrxuUv0" => c"_ZTVSt12domain_error",
+        "udTM6Nxx-Ng" => c"_ZTVSt11logic_error",
+        "N2f485TmJms" => c"_ZNSt8ios_base7failureD1Ev",
+        "oe9tS0VztYk" => c"_ZNSt13runtime_errorD2Ev",
+        "47RvLSo2HN8" => c"_ZNSt8bad_castD1Ev",
+        "oQDS9nX05Qg" => c"_ZNSt16invalid_argumentD1Ev",
+        "Kcb+MNSzZcc" => c"_ZNSt12out_of_rangeD1Ev",
+        "BJCgW9-OxLA" => c"_ZTISt8ios_base",
+        "Bq8m04PN1zw" => c"_ZTVSt12system_error",
+        "bLPn1gfqSW8" => c"_ZTISt13runtime_error",
+        "qOD-ksTkE08" => c"_ZTISt8bad_cast",
+        "tVHE+C8vGXk" => c"_ZTVSt8bad_cast",
+        "XZzWt0ygWdw" => c"_ZTISt16invalid_argument",
+        "keXoyW-rV-0" => c"_ZTVSt16invalid_argument",
+        "dKjhNUf9FBc" => c"_ZTISt12out_of_range",
+        "n+aUKkC-3sI" => c"_ZTVSt12out_of_range",
+        "n2kx+OmFUis" => c"_ZTISt9exception",
+        "BgZcGDh7o9g" => c"_ZNSt9exceptionD1Ev",
+        "dCzeFfg9WWI" => c"_ZTVSt9exception",
+        _ => return None,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn native_unwind_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
+    Some(match nid {
+        "s62MgBhosjU" => c"_Unwind_Backtrace",
+        "GslDM6l8E7U" => c"_Unwind_DeleteException",
+        "go1LaO7f15k" => c"_Unwind_FindEnclosingFunction",
+        "Jhba7poZWZ0" => c"_Unwind_Find_FDE",
+        "zs817D8+hPA" => c"_Unwind_ForcedUnwind",
+        "uKwYpqeUkzo" => c"_Unwind_GetBSP",
+        "MmTshn7gIgU" => c"_Unwind_GetCFA",
+        "nqD9bBu-W6U" => c"_Unwind_GetDataRelBase",
+        "oQpl5qCT014" => c"_Unwind_GetGR",
+        "sETNbyWsEHs" => c"_Unwind_GetIP",
+        "5-3wdp3FVtc" => c"_Unwind_GetIPInfo",
+        "gpc4YXZffkQ" => c"_Unwind_GetLanguageSpecificData",
+        "p3BVovMPEE4" => c"_Unwind_GetRegionStart",
+        "HPlmfRhMWwo" => c"_Unwind_GetTextRelBase",
+        "wpNJwmDDtxw" => c"_Unwind_RaiseException",
+        "f1zwJ3jAI2k" => c"_Unwind_Resume",
+        "xUsJSLsdv9I" => c"_Unwind_Resume_or_Rethrow",
+        "Xr4pio56GGQ" => c"_Unwind_SetGR",
+        "BWAtsvaXToA" => c"_Unwind_SetIP",
+        _ => return None,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn native_libc_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
+    Some(match nid {
+        "8zTFvBIAIN8" => c"memset",
+        "Q3VBxCXhUHs" => c"memcpy",
+        "+P6FRGH4LfA" => c"memmove",
+        "DfivPArhucg" => c"memcmp",
+        "8u8lPzUEq+U" => c"memchr",
+        "j4ViWNHEgww" => c"strlen",
+        "Ovb2dSJOAuE" => c"strcmp",
+        "aesyjrHVWy4" => c"strncmp",
+        "kiZSXIWd9vg" => c"strcpy",
+        "6sJWiWSRuqk" => c"strncpy",
+        "Ls4tzzhimqQ" => c"strcat",
+        "AV6ipCNa4Rw" => c"strcasecmp",
+        "pXvbDfchu6k" => c"strncasecmp",
+        "viiwFMaNamA" => c"strstr",
+        "g7zzzLDYGw0" => c"strdup",
+        "SfQIZcqvvms" => c"strlcpy",
+        "5OqszGpy7Mg" => c"strtoull",
+        "VOBg+iNwB-4" => c"strtoll",
+        "2vDqwBlpF-o" => c"strtod",
+        "dhK16CKwhQg" => c"__isfinited",
+        "eLdDw6l0-bU" => c"snprintf",
+        "Q2V+iqvjgC0" => c"vsnprintf",
+        "tcVi5SivF7Q" => c"sprintf",
+        "1Pk0qZQGeWo" => c"sscanf",
+        "hcuQgD53UxM" => c"printf",
+        "YQ0navp+YIc" => c"puts",
+        "HUbZmOnT-Dg" => c"atan2",
+        "5ZkEP3Rq7As" => c"cbrt",
+        "JBcgYuW8lPU" => c"acos",
+        "7Ly52zaL44Q" => c"asin",
+        "OXmauLdQ8kY" => c"atan",
+        "T7uyNqP7vQA" => c"tan",
+        "kn0yiYeExgA" => c"ldexpf",
+        "weDug8QD-lE" => c"atanf",
+        "wuAQt-j+p4o" => c"exp2f",
+        "hsi9drzHR2k" => c"log2f",
+        "1D0H2KNjshE" => c"powf",
+        "nlaojL9hDtA" => c"round",
+        "DDHG1a6+3q0" => c"roundf",
+        "9LCjpWyQ5Zc" => c"pow",
+        "jMB7EFyu30Y" => c"sincos",
+        "pKwslsMUmSk" => c"fmod",
+        "RQXLbdT2lc4" => c"logf",
+        "pztV4AF18iI" => c"sincosf",
+        "H8ya2H00jbI" => c"sin",
+        "Q4rRL34CEeE" => c"sinf",
+        "rtV7-jWC6Yg" => c"log",
+        "WuMbPBKN1TU" => c"log10",
+        "2WE3BTYVwKM" => c"cos",
+        "Y5DhuDKGlnQ" => c"log2",
+        "NVadfnzQhHQ" => c"exp",
+        "8zsu04XNsZ4" => c"expf",
+        "-P6FNMzk2Kc" => c"cosf",
+        _ => return None,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn native_import_target(nid: &str) -> Option<u64> {
+    let runtime = native_cxx_runtime()?;
+    if let Some(name) = native_cxx_symbol_name(nid) {
+        return runtime.cxxabi_symbol(name);
+    }
+    if let Some(name) = native_unwind_symbol_name(nid) {
+        return runtime.unwind_symbol(name);
+    }
+    runtime.cxxabi_symbol(native_libc_symbol_name(nid)?)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+const fn native_import_target(_nid: &str) -> Option<u64> {
+    None
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize, LinkError> {
+    if image.unwind_fdes.is_empty() {
+        return Ok(0);
+    }
+    let runtime = native_cxx_runtime().ok_or(LinkError::NativeCxxRuntimeUnavailable)?;
+    let register_address = runtime
+        .unwind_symbol(c"__register_frame")
+        .ok_or(LinkError::MissingNativeUnwindSymbol("__register_frame"))?;
+    type RegisterFrame = unsafe extern "C" fn(*const libc::c_void);
+    // SAFETY: dlsym returned the address of libunwind's documented single-pointer function.
+    let register: RegisterFrame = unsafe { std::mem::transmute(register_address as usize) };
+    for fde in &image.unwind_fdes {
+        // SAFETY: Every address was decoded and bounds-checked from the mapped guest .eh_frame.
+        unsafe {
+            register(fde.get() as usize as *const libc::c_void);
+        }
+    }
+    Ok(image.unwind_fdes.len())
+}
+
 fn create_import_stubs(
     memory: &mut GuestImage,
     dynamic: &DynamicInfo,
@@ -464,7 +708,11 @@ fn create_import_stubs(
     let dispatcher = import_dispatch as *const () as usize as u64;
     for (index, nid) in nids.into_iter().enumerate() {
         let byte_offset = index * IMPORT_STUB_SIZE_USIZE;
-        write_import_stub(&mut bytes[byte_offset..], index, dispatcher)?;
+        if let Some(target) = native_import_target(&nid) {
+            write_native_import_stub(&mut bytes[byte_offset..], target);
+        } else {
+            write_import_stub(&mut bytes[byte_offset..], index, dispatcher)?;
+        }
         let address = GuestAddress::new(
             stub_base
                 .get()
@@ -550,6 +798,9 @@ fn resolve_symbol(
         if symbol.is_weak() {
             return Ok(0);
         }
+        if let Some(address) = native_import_target(extract_nid(&symbol.name)) {
+            return Ok(address);
+        }
         return symbol_stubs
             .get(&relocation.symbol_index)
             .map(|address| address.get())
@@ -588,6 +839,110 @@ fn runtime_address(
     ))
 }
 
+fn collect_unwind_fdes(
+    memory: &GuestImage,
+    executable: &LoadedExecutable,
+) -> Result<Vec<GuestAddress>, LinkError> {
+    let Some(header) = executable
+        .info
+        .elf
+        .as_ref()
+        .and_then(|elf| {
+            elf.program_headers
+                .iter()
+                .find(|header| header.program_type == PT_GNU_EH_FRAME)
+        })
+        .filter(|header| header.file_size >= 12)
+    else {
+        return Ok(Vec::new());
+    };
+    let header_address = runtime_address(memory, header.virtual_address, 12)?;
+    let mut header_bytes = [0_u8; 12];
+    memory.read(header_address, &mut header_bytes)?;
+    if header_bytes[0] != 1 {
+        return Err(LinkError::MalformedEhFrame(
+            "unsupported .eh_frame_hdr version",
+        ));
+    }
+    if header_bytes[1] != DW_EH_PE_PCREL_SDATA4 {
+        return Err(LinkError::UnsupportedEhFrameEncoding(header_bytes[1]));
+    }
+    if header_bytes[2] != 0x03 {
+        return Err(LinkError::MalformedEhFrame(
+            "unsupported FDE count encoding",
+        ));
+    }
+
+    let displacement = i32::from_le_bytes(
+        header_bytes[4..8]
+            .try_into()
+            .expect("fixed-width .eh_frame displacement"),
+    );
+    let frame_address = header_address
+        .get()
+        .checked_add(4)
+        .and_then(|address| address.checked_add_signed(i64::from(displacement)))
+        .ok_or(LinkError::MalformedEhFrame(".eh_frame address overflow"))?;
+    if frame_address >= header_address.get() {
+        return Err(LinkError::MalformedEhFrame(
+            ".eh_frame does not precede its header",
+        ));
+    }
+    let expected_fdes = usize::try_from(u32::from_le_bytes(
+        header_bytes[8..12]
+            .try_into()
+            .expect("fixed-width FDE count"),
+    ))
+    .map_err(|_| LinkError::MalformedEhFrame("FDE count is too large"))?;
+    let mut fdes = Vec::with_capacity(expected_fdes);
+    let mut cursor = frame_address;
+    while cursor < header_address.get() {
+        let mut length_bytes = [0_u8; 4];
+        memory.read(GuestAddress::new(cursor), &mut length_bytes)?;
+        let short_length = u32::from_le_bytes(length_bytes);
+        if short_length == 0 {
+            break;
+        }
+
+        let (length_field_size, entry_length, cie_pointer_size) = if short_length == u32::MAX {
+            let mut extended = [0_u8; 8];
+            memory.read(GuestAddress::new(cursor + 4), &mut extended)?;
+            (12_u64, u64::from_le_bytes(extended), 8_usize)
+        } else {
+            (4_u64, u64::from(short_length), 4_usize)
+        };
+        if entry_length < cie_pointer_size as u64 {
+            return Err(LinkError::MalformedEhFrame(
+                "entry is shorter than its CIE pointer",
+            ));
+        }
+        let entry_end = cursor
+            .checked_add(length_field_size)
+            .and_then(|address| address.checked_add(entry_length))
+            .ok_or(LinkError::MalformedEhFrame("entry address overflow"))?;
+        if entry_end > header_address.get() {
+            return Err(LinkError::MalformedEhFrame(
+                "entry extends beyond .eh_frame",
+            ));
+        }
+        let mut cie_pointer = [0_u8; 8];
+        memory.read(
+            GuestAddress::new(cursor + length_field_size),
+            &mut cie_pointer[..cie_pointer_size],
+        )?;
+        if u64::from_le_bytes(cie_pointer) != 0 {
+            fdes.push(GuestAddress::new(cursor));
+        }
+        cursor = entry_end;
+    }
+    if fdes.len() != expected_fdes {
+        return Err(LinkError::MalformedEhFrame(
+            "decoded FDE count differs from .eh_frame_hdr",
+        ));
+    }
+    Ok(fdes)
+}
+
 fn extract_nid(symbol_name: &str) -> &str {
     symbol_name
         .split_once('#')
@@ -610,7 +965,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "VOBg+iNwB-4" => "strtoll",
         "2vDqwBlpF-o" => "strtod",
         "8u8lPzUEq+U" => "memchr",
-        "dhK16CKwhQg" => "isnan",
+        "dhK16CKwhQg" => "__isfinite",
         "cfAXurvfl5o" => "__cxa_allocate_exception",
         "nOIEswYD4Ig" => "__cxa_free_exception",
         "vkuuLfhnSZI" => "__cxa_throw",
@@ -660,6 +1015,16 @@ fn write_import_stub(slot: &mut [u8], index: usize, dispatcher: u64) -> Result<(
     slot[17..21].copy_from_slice(&[0x48, 0x83, 0xc4, 0x08]);
     slot[21] = 0xc3;
     Ok(())
+}
+
+fn write_native_import_stub(slot: &mut [u8], target: u64) {
+    // movabs rax, target; jmp rax. The tail jump leaves no synthetic frame between the guest and
+    // libc++abi, which lets the host unwinder return directly to the guest call site.
+    slot[0] = 0x48;
+    slot[1] = 0xb8;
+    slot[2..10].copy_from_slice(&target.to_le_bytes());
+    slot[10] = 0xff;
+    slot[11] = 0xe0;
 }
 
 #[derive(Debug, Default)]
@@ -784,7 +1149,7 @@ extern "C" fn import_dispatch(
     argument5: u64,
     float_argument0: f64,
     index: u64,
-    _guest_return_address: u64,
+    guest_return_address: u64,
     stack_argument0: u64,
     stack_argument1: u64,
     stack_argument2: u64,
@@ -820,8 +1185,8 @@ extern "C" fn import_dispatch(
     if state.seen_nids.insert(nid.clone()) {
         let name = known_nid_name(&nid).unwrap_or("unknown");
         eprintln!(
-            "[REMu][IMPORT] first_hit={} nid={} name={} args={argument0:#x},{argument1:#x},{argument2:#x},{argument3:#x},{argument4:#x},{argument5:#x}",
-            state.hits, nid, name
+            "[REMu][IMPORT] first_hit={} nid={} name={} return={guest_return_address:#x} args={argument0:#x},{argument1:#x},{argument2:#x},{argument3:#x},{argument4:#x},{argument5:#x}",
+            state.hits, nid, name,
         );
     }
     if state.maximum_hits != 0 && state.hits >= state.maximum_hits {
@@ -880,7 +1245,7 @@ extern "C" fn import_dispatch(
         return dispatch_guest_numeric_parser(&nid, call_args);
     }
     if nid == "dhK16CKwhQg" {
-        return ProbeImportReturn::integer(u64::from(float_argument0.is_nan()));
+        return ProbeImportReturn::integer(u64::from(float_argument0.is_finite()));
     }
     ProbeImportReturn::integer(dispatch_probe_import(
         &nid, call_args, stack_args, &mut state,
@@ -1384,7 +1749,7 @@ fn kernel_wait_equeue(arguments: [u64; 6]) -> u64 {
     }
     // Avoid letting the temporary empty-queue implementation turn the render worker into a hot
     // spin. A real wait will be woken by the Metal submission/completion path.
-    std::thread::sleep(Duration::from_millis(1));
+    std::thread::sleep(Duration::from_micros(100));
     0
 }
 
@@ -2997,6 +3362,10 @@ fn probe_entry(
         argument1: 0,
         argument2: 0,
     };
+    let registered_fdes = register_guest_unwind_frames(image)?;
+    if registered_fdes != 0 {
+        eprintln!("[REMu][CXX] registered {registered_fdes} guest unwind records");
+    }
     configure_probe_dispatch(image, game_root, maximum_import_hits);
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     if timeout_seconds != 0 {
