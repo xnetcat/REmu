@@ -7,6 +7,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
@@ -119,6 +120,7 @@ struct MetalPresenter {
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
     logged_guest_layouts: HashSet<(u64, u32, u32, u32)>,
     captured_guest_frames: HashSet<(u64, u32, u32, u32, u64)>,
+    last_guest_capture: Option<Instant>,
     logged_fill_draw: bool,
     logged_software_draws: HashSet<(SoftwareDrawKind, u64, u64)>,
     capture_directory: Option<PathBuf>,
@@ -150,6 +152,7 @@ impl MetalPresenter {
             logged_unsupported_guest_draws: HashSet::new(),
             logged_guest_layouts: HashSet::new(),
             captured_guest_frames: HashSet::new(),
+            last_guest_capture: None,
             logged_fill_draw: false,
             logged_software_draws: HashSet::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
@@ -458,6 +461,15 @@ impl MetalPresenter {
     }
 
     fn capture_guest_frame_if_changed(&mut self, descriptor: GuestTextureDescriptor) {
+        let Some(directory) = self.capture_directory.as_deref() else {
+            return;
+        };
+        if self
+            .last_guest_capture
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
         let fingerprint = guest_frame_fingerprint(&self.guest_bgra_bytes);
         let captured_frame = (
             descriptor.address,
@@ -466,14 +478,12 @@ impl MetalPresenter {
             descriptor.tile_mode,
             fingerprint,
         );
-        if self.captured_guest_frames.len() >= 32
+        if self.captured_guest_frames.len() >= 128
             || !self.captured_guest_frames.insert(captured_frame)
         {
             return;
         }
-        let Some(directory) = self.capture_directory.as_deref() else {
-            return;
-        };
+        self.last_guest_capture = Some(Instant::now());
         match capture_guest_frame(directory, &self.guest_bgra_bytes, descriptor, fingerprint) {
             Ok(path) => eprintln!("[REMu][METAL] captured frame {}", path.display()),
             Err(error) => eprintln!("[REMu][METAL] could not capture frame: {error}"),
