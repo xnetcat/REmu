@@ -53,6 +53,7 @@ struct GuestTextureDescriptor {
     width: u32,
     height: u32,
     pitch: u32,
+    tile_mode: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -323,10 +324,7 @@ impl MetalPresenter {
         let Some((descriptor, constants)) = decode_dreaming_presenter_draw(draw) else {
             return;
         };
-        let Some(row_bytes) = u64::from(descriptor.pitch).checked_mul(4) else {
-            return;
-        };
-        let Some(byte_count) = row_bytes.checked_mul(u64::from(descriptor.height)) else {
+        let Some(byte_count) = guest_texture_byte_count(descriptor) else {
             return;
         };
         let Some(output_byte_count) = u64::from(descriptor.width)
@@ -366,11 +364,9 @@ impl MetalPresenter {
         // bounded to 128 MiB above before constructing this read-only view.
         let source_bytes =
             unsafe { std::slice::from_raw_parts(source as *const u8, source_length) };
-        convert_guest_rgba_to_bgra(
+        convert_guest_texture_to_bgra(
             source_bytes,
-            descriptor.pitch,
-            descriptor.width,
-            descriptor.height,
+            descriptor,
             constants,
             &mut self.guest_bgra_bytes,
         );
@@ -392,22 +388,11 @@ impl MetalPresenter {
             ));
         }
         if !self.logged_guest_draw {
-            let nonzero_bytes = self
-                .guest_bgra_bytes
-                .iter()
-                .filter(|&&value| value != 0)
-                .count();
-            let minimum = self.guest_bgra_bytes.iter().copied().min().unwrap_or(0);
-            let maximum = self.guest_bgra_bytes.iter().copied().max().unwrap_or(0);
-            let fingerprint = self
-                .guest_bgra_bytes
-                .iter()
-                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &value| {
-                    (hash ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01b3)
-                });
-            eprintln!(
-                "[REMu][METAL] fast-presented Dreaming Sarah source={:#x} {}x{} target={:#x} nonzero={nonzero_bytes}/{output_length} range={minimum}..={maximum} fingerprint={fingerprint:016x}",
-                descriptor.address, descriptor.width, descriptor.height, draw.color_target_address,
+            log_guest_draw_upload(
+                &self.guest_bgra_bytes,
+                descriptor,
+                draw.color_target_address,
+                output_length,
             );
             self.logged_guest_draw = true;
         }
@@ -463,6 +448,26 @@ impl MetalPresenter {
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
     }
+}
+
+fn log_guest_draw_upload(
+    bytes: &[u8],
+    descriptor: GuestTextureDescriptor,
+    target_address: u64,
+    output_length: usize,
+) {
+    let nonzero_bytes = bytes.iter().filter(|&&value| value != 0).count();
+    let minimum = bytes.iter().copied().min().unwrap_or(0);
+    let maximum = bytes.iter().copied().max().unwrap_or(0);
+    let fingerprint = bytes
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &value| {
+            (hash ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    eprintln!(
+        "[REMu][METAL] fast-presented Dreaming Sarah source={:#x} {}x{} tile={} target={target_address:#x} nonzero={nonzero_bytes}/{output_length} range={minimum}..={maximum} fingerprint={fingerprint:016x}",
+        descriptor.address, descriptor.width, descriptor.height, descriptor.tile_mode,
+    );
 }
 
 fn register_value(registers: &[GpuRegister], offset: u32) -> Option<u32> {
@@ -521,8 +526,13 @@ fn execute_dreaming_fill_draw(draw: &IndexedDraw) -> Option<ExecutedFill> {
     {
         return None;
     }
-    let pixel_count = u64::from(width).checked_mul(u64::from(height))?;
-    let byte_count = pixel_count.checked_mul(4)?;
+    let byte_count = guest_texture_byte_count(GuestTextureDescriptor {
+        address: draw.color_target_address,
+        width,
+        height,
+        pitch: width,
+        tile_mode,
+    })?;
     if byte_count > 128 * 1024 * 1024 {
         return None;
     }
@@ -581,7 +591,7 @@ fn decode_dreaming_presenter_draw(
         || height == 0
         || height > 8_192
         || unified_format != 56
-        || tile_mode != 0
+        || !matches!(tile_mode, 0 | 27)
         || texture_type != 9
     {
         return None;
@@ -609,6 +619,7 @@ fn decode_dreaming_presenter_draw(
             width,
             height,
             pitch,
+            tile_mode,
         },
         constants,
     ))
@@ -631,6 +642,89 @@ fn read_guest_present_constants(address: u64) -> Option<GuestPresentConstants> {
         multiply: values[..4].try_into().expect("four multiply constants"),
         add: values[4..].try_into().expect("four add constants"),
     })
+}
+
+fn guest_texture_byte_count(descriptor: GuestTextureDescriptor) -> Option<u64> {
+    if descriptor.tile_mode == 27 {
+        let blocks_wide = u64::from(descriptor.width).div_ceil(128);
+        let blocks_high = u64::from(descriptor.height).div_ceil(128);
+        blocks_wide.checked_mul(blocks_high)?.checked_mul(65_536)
+    } else {
+        u64::from(descriptor.pitch)
+            .checked_mul(u64::from(descriptor.height))?
+            .checked_mul(4)
+    }
+}
+
+fn mode27_source_byte_offset(x: usize, y: usize, width: usize) -> usize {
+    let bit = |value: usize, index: usize| (value >> index) & 1;
+    let blocks_per_row = width.div_ceil(128);
+    let block_index = y / 128 * blocks_per_row + x / 128;
+    let mut within = 0;
+    within |= bit(x, 0) << 2;
+    within |= bit(x, 1) << 3;
+    within |= bit(y, 0) << 4;
+    within |= bit(y, 1) << 5;
+    within |= bit(x, 2) << 6;
+    within |= bit(y, 2) << 7;
+    within |= (bit(x, 7) ^ bit(y, 4) ^ bit(y, 7)) << 8;
+    within |= (bit(x, 4) ^ bit(y, 4)) << 9;
+    within |= (bit(x, 6) ^ bit(y, 5)) << 10;
+    within |= (bit(x, 5) ^ bit(y, 6)) << 11;
+    within |= bit(x, 3) << 12;
+    within |= bit(y, 3) << 13;
+    within |= (bit(x, 6) ^ bit(y, 7)) << 14;
+    within |= (bit(x, 7) ^ bit(y, 6)) << 15;
+    block_index * 65_536 + within
+}
+
+fn convert_mode27_rgba_to_bgra(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    constants: GuestPresentConstants,
+    destination: &mut [u8],
+) {
+    let width = usize::try_from(width).expect("validated width fits");
+    let height = usize::try_from(height).expect("validated height fits");
+    for y in 0..height {
+        for x in 0..width {
+            let source_offset = mode27_source_byte_offset(x, y, width);
+            let destination_offset = (y * width + x) * 4;
+            let rgba = &source[source_offset..source_offset + 4];
+            let bgra = &mut destination[destination_offset..destination_offset + 4];
+            bgra[0] = transform_color_channel(rgba[2], constants.multiply[2], constants.add[2]);
+            bgra[1] = transform_color_channel(rgba[1], constants.multiply[1], constants.add[1]);
+            bgra[2] = transform_color_channel(rgba[0], constants.multiply[0], constants.add[0]);
+            bgra[3] = transform_color_channel(rgba[3], constants.multiply[3], constants.add[3]);
+        }
+    }
+}
+
+fn convert_guest_texture_to_bgra(
+    source: &[u8],
+    descriptor: GuestTextureDescriptor,
+    constants: GuestPresentConstants,
+    destination: &mut [u8],
+) {
+    if descriptor.tile_mode == 27 {
+        convert_mode27_rgba_to_bgra(
+            source,
+            descriptor.width,
+            descriptor.height,
+            constants,
+            destination,
+        );
+    } else {
+        convert_guest_rgba_to_bgra(
+            source,
+            descriptor.pitch,
+            descriptor.width,
+            descriptor.height,
+            constants,
+            destination,
+        );
+    }
 }
 
 fn convert_guest_rgba_to_bgra(
@@ -792,7 +886,8 @@ mod tests {
 
     use super::{
         DREAMING_FILL_ES_PREFIX, DREAMING_FILL_PS_PREFIX, GuestPresentConstants,
-        convert_guest_rgba_to_bgra, execute_dreaming_fill_draw,
+        convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra, execute_dreaming_fill_draw,
+        mode27_source_byte_offset,
     };
 
     #[test]
@@ -817,7 +912,7 @@ mod tests {
 
     #[test]
     fn executes_the_observed_constant_fill_into_guest_memory() {
-        let mut target = vec![0xcc_u8; 16];
+        let mut target = vec![0xcc_u8; 65_536];
         let draw = IndexedDraw {
             sequence: 1,
             indexed: false,
@@ -867,6 +962,53 @@ mod tests {
 
         let fill = execute_dreaming_fill_draw(&draw).expect("recognized fill draw");
         assert_eq!(fill.rgba, [255, 128, 0, 255]);
-        assert_eq!(target, [255, 128, 0, 255].repeat(4));
+        assert!(
+            target
+                .chunks_exact(4)
+                .all(|pixel| pixel == [255, 128, 0, 255])
+        );
+    }
+
+    #[test]
+    fn detiles_the_observed_mode27_rgba_layout() {
+        let width = 130_usize;
+        let height = 129_usize;
+        let mut tiled = vec![0_u8; 4 * 65_536];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = mode27_source_byte_offset(x, y, width);
+                tiled[offset..offset + 4].copy_from_slice(&[
+                    u8::try_from(x).unwrap_or(0xff),
+                    u8::try_from(y).unwrap_or(0xff),
+                    u8::try_from(x ^ y).unwrap_or(0xff),
+                    0xff,
+                ]);
+            }
+        }
+        let mut linear = vec![0_u8; width * height * 4];
+        convert_mode27_rgba_to_bgra(
+            &tiled,
+            u32::try_from(width).expect("width"),
+            u32::try_from(height).expect("height"),
+            GuestPresentConstants {
+                multiply: [1.0; 4],
+                add: [0.0; 4],
+            },
+            &mut linear,
+        );
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * width + x) * 4;
+                assert_eq!(
+                    linear[offset..offset + 4],
+                    [
+                        u8::try_from(x ^ y).unwrap_or(0xff),
+                        u8::try_from(y).unwrap_or(0xff),
+                        u8::try_from(x).unwrap_or(0xff),
+                        0xff,
+                    ]
+                );
+            }
+        }
     }
 }

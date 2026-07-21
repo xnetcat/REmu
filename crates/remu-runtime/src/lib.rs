@@ -1183,6 +1183,7 @@ struct AgcGraphicsState {
     instance_count: u32,
     draw_index_offset: u32,
     emitted_draws: u64,
+    traced_shader_pairs: BTreeSet<(u64, u64)>,
 }
 
 impl AgcGraphicsState {
@@ -3029,6 +3030,26 @@ fn agc_emit_draw(
             draw.export_shader_address,
             draw.pixel_shader_address,
             draw.color_target_address,
+        );
+    }
+    if graphics
+        .traced_shader_pairs
+        .insert((draw.export_shader_address, draw.pixel_shader_address))
+        && graphics.traced_shader_pairs.len() <= 16
+    {
+        eprintln!(
+            "[REMu][AGC][SHADER] es={:#x} ps={:#x} indexed={} count={} instances={} target={:#x} es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
+            draw.export_shader_address,
+            draw.pixel_shader_address,
+            draw.indexed,
+            draw.index_count,
+            draw.instance_count,
+            draw.color_target_address,
+            draw.export_shader_prefix,
+            draw.pixel_shader_prefix,
+            draw.context_registers,
+            draw.shader_registers,
+            draw.user_config_registers,
         );
     }
     remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(draw));
