@@ -170,6 +170,24 @@ impl LinkedImage {
     }
 }
 
+/// Returns the number of guest pthread workers that are still executing.
+///
+/// A PS5 process can return from its entry routine after handing long-lived work to pthreads. The
+/// graphical launcher uses this count to keep the mapped image and GPU event sink alive until those
+/// workers finish or the launch timeout expires.
+#[must_use]
+pub fn active_guest_thread_count() -> usize {
+    PROBE_DISPATCH.get().map_or(0, |state| {
+        state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .thread_handles
+            .values()
+            .filter(|thread| !thread.is_finished())
+            .count()
+    })
+}
+
 fn install_tls_support(
     memory: &mut GuestImage,
     executable: &LoadedExecutable,

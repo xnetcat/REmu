@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use remu_gpu::GpuProbe;
@@ -406,7 +407,20 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
     let (sender, receiver) = std::sync::mpsc::channel();
     remu_gpu::install_event_sink(sender.clone());
     let guest = std::thread::spawn(move || {
+        let started = Instant::now();
         let result = linked.probe_entry(&image_name, &game_root, import_limit, timeout_seconds);
+        let active_threads = remu_runtime::active_guest_thread_count();
+        if active_threads != 0 {
+            eprintln!(
+                "[REMu] guest entry returned with {active_threads} worker thread(s); keeping the runtime alive"
+            );
+        }
+        while remu_runtime::active_guest_thread_count() != 0
+            && (timeout_seconds == 0
+                || started.elapsed() < Duration::from_secs(u64::from(timeout_seconds)))
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = sender.send(remu_gpu::GpuEvent::Shutdown);
         result
     });

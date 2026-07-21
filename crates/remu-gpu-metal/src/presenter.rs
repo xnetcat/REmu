@@ -25,6 +25,10 @@ const DREAMING_PRESENTER_ES_PREFIX: [u32; 4] = [0xbfa0_0003, 0x93eb_ff03, 0x0008
 const DREAMING_PRESENTER_PS_PREFIX: [u32; 4] = [0xbfa0_0001, 0xbefc_0310, 0xf42c_0406, 0xfa00_0000];
 const DREAMING_FILL_ES_PREFIX: [u32; 4] = [0xbfa0_0001, 0x7e00_0000, 0x7e00_0000, 0x7e00_0000];
 const DREAMING_FILL_PS_PREFIX: [u32; 4] = [0xd52f_0000, 0x0000_0200, 0xd52f_0001, 0x0000_0602];
+const DREAMING_SOLID_PS_PREFIX: [u32; 4] = [0xf428_0100, 0xfa00_0000, 0xbf8c_c07f, 0xd52f_0000];
+const DREAMING_TEXTURE_PS_PREFIX: [u32; 4] = [0xbfa0_0001, 0xbefc_030c, 0xbeea_047e, 0xbefe_0a7e];
+const DREAMING_COMPOSITOR_PS_PREFIX: [u32; 4] =
+    [0xbfa0_0003, 0xf424_1a86, 0xfa00_0000, 0xbefc_0310];
 
 #[derive(Clone, Copy)]
 struct DisplayConfiguration {
@@ -67,6 +71,22 @@ struct ExecutedFill {
     rgba: [u8; 4],
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SoftwareDrawKind {
+    Solid,
+    Texture,
+    Compositor,
+}
+
+#[derive(Clone, Copy)]
+struct ExecutedSoftwareDraw {
+    kind: SoftwareDrawKind,
+    source: u64,
+    target: u64,
+    width: u32,
+    height: u32,
+}
+
 struct MetalPresenter {
     receiver: Receiver<GpuEvent>,
     window: Option<Window>,
@@ -89,6 +109,7 @@ struct MetalPresenter {
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
     logged_guest_layouts: HashSet<(u64, u32, u32, u32)>,
     logged_fill_draw: bool,
+    logged_software_draws: HashSet<SoftwareDrawKind>,
 }
 
 impl MetalPresenter {
@@ -117,6 +138,7 @@ impl MetalPresenter {
             logged_unsupported_guest_draws: HashSet::new(),
             logged_guest_layouts: HashSet::new(),
             logged_fill_draw: false,
+            logged_software_draws: HashSet::new(),
         })
     }
 
@@ -216,6 +238,17 @@ impl MetalPresenter {
                                 fill.rgba,
                             );
                             self.logged_fill_draw = true;
+                        }
+                    } else if let Some(executed) = execute_dreaming_software_draw(&draw) {
+                        if self.logged_software_draws.insert(executed.kind) {
+                            eprintln!(
+                                "[REMu][METAL] executed Dreaming Sarah {:?} compatibility draw source={:#x} target={:#x} {}x{}",
+                                executed.kind,
+                                executed.source,
+                                executed.target,
+                                executed.width,
+                                executed.height,
+                            );
                         }
                     } else if self.logged_unsupported_guest_draws.len() < 16
                         && self
@@ -509,6 +542,209 @@ fn pixel_scalars(draw: &IndexedDraw) -> [u32; 4] {
     })
 }
 
+fn decode_render_target(draw: &IndexedDraw) -> Option<GuestTextureDescriptor> {
+    let info = register_value(&draw.context_registers, 0x31c)?;
+    let attrib2 = register_value(&draw.context_registers, 0x3b0)?;
+    let attrib3 = register_value(&draw.context_registers, 0x3b8)?;
+    let target_mask = register_value(&draw.context_registers, 0x08e).unwrap_or(0xf);
+    let width = ((attrib2 >> 14) & 0x3fff).checked_add(1)?;
+    let height = (attrib2 & 0x3fff).checked_add(1)?;
+    let format = (info >> 2) & 0x1f;
+    let number_type = (info >> 8) & 0x7;
+    let tile_mode = (attrib3 >> 14) & 0x1f;
+    if draw.color_target_address < 0x10_000
+        || width > 8_192
+        || height > 8_192
+        || format != 10
+        || number_type != 0
+        || !matches!(tile_mode, 0 | 27)
+        || target_mask.trailing_zeros() >= 4
+    {
+        return None;
+    }
+    Some(GuestTextureDescriptor {
+        address: draw.color_target_address,
+        width,
+        height,
+        pitch: width,
+        tile_mode,
+    })
+}
+
+fn dreaming_software_draw_kind(draw: &IndexedDraw) -> Option<SoftwareDrawKind> {
+    if !draw.indexed
+        || draw.index_count == 0
+        || !shader_matches_prefix(&draw.export_shader_prefix, &DREAMING_PRESENTER_ES_PREFIX)
+    {
+        return None;
+    }
+    if shader_matches_prefix(&draw.pixel_shader_prefix, &DREAMING_SOLID_PS_PREFIX) {
+        Some(SoftwareDrawKind::Solid)
+    } else if shader_matches_prefix(&draw.pixel_shader_prefix, &DREAMING_TEXTURE_PS_PREFIX) {
+        Some(SoftwareDrawKind::Texture)
+    } else if shader_matches_prefix(&draw.pixel_shader_prefix, &DREAMING_COMPOSITOR_PS_PREFIX) {
+        Some(SoftwareDrawKind::Compositor)
+    } else {
+        None
+    }
+}
+
+fn execute_dreaming_software_draw(draw: &IndexedDraw) -> Option<ExecutedSoftwareDraw> {
+    let kind = dreaming_software_draw_kind(draw)?;
+    let target = decode_render_target(draw)?;
+    let source = match kind {
+        SoftwareDrawKind::Solid => {
+            execute_dreaming_solid_draw(draw, target)?;
+            0
+        }
+        SoftwareDrawKind::Texture => {
+            let source = decode_guest_texture(draw, 0x00c)?;
+            software_blit_guest_texture(source, target, true)?;
+            source.address
+        }
+        SoftwareDrawKind::Compositor => {
+            let source = decode_guest_texture(draw, 0x00c)?;
+            software_blit_guest_texture(source, target, false)?;
+            source.address
+        }
+    };
+    Some(ExecutedSoftwareDraw {
+        kind,
+        source,
+        target: target.address,
+        width: target.width,
+        height: target.height,
+    })
+}
+
+fn execute_dreaming_solid_draw(draw: &IndexedDraw, target: GuestTextureDescriptor) -> Option<()> {
+    let descriptor = pixel_scalars(draw);
+    let color_address = (u64::from(descriptor[1] & 0xffff) << 32) | u64::from(descriptor[0]);
+    if color_address < 0x10_000 {
+        return None;
+    }
+    let color_address = usize::try_from(color_address).ok()?;
+    let color = std::array::from_fn(|index| {
+        // SAFETY: The observed PS buffer descriptor identifies a live 16-byte uniform allocation.
+        unsafe { std::ptr::read_unaligned((color_address + index * 4) as *const f32) }
+    });
+    if !color.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let rgba = color.map(|value| transform_color_channel(255, value, 0.0));
+    fill_guest_texture(target, rgba)
+}
+
+fn fill_guest_texture(descriptor: GuestTextureDescriptor, rgba: [u8; 4]) -> Option<()> {
+    let length = usize::try_from(guest_texture_byte_count(descriptor)?).ok()?;
+    if length > 128 * 1024 * 1024 {
+        return None;
+    }
+    let address = usize::try_from(descriptor.address).ok()?;
+    // SAFETY: The validated guest render-target descriptor bounds this live direct-memory write.
+    let target = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length) };
+    for pixel in target.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&rgba);
+    }
+    Some(())
+}
+
+fn software_blit_guest_texture(
+    source: GuestTextureDescriptor,
+    target: GuestTextureDescriptor,
+    alpha_blend: bool,
+) -> Option<()> {
+    if !matches!(source.tile_mode, 0 | 27) || !matches!(target.tile_mode, 0 | 27) {
+        return None;
+    }
+    let source_length = usize::try_from(guest_texture_byte_count(source)?).ok()?;
+    let target_length = usize::try_from(guest_texture_byte_count(target)?).ok()?;
+    if source_length > 128 * 1024 * 1024 || target_length > 128 * 1024 * 1024 {
+        return None;
+    }
+    let source_address = usize::try_from(source.address).ok()?;
+    let target_address = usize::try_from(target.address).ok()?;
+    let source_end = source_address.checked_add(source_length)?;
+    let target_end = target_address.checked_add(target_length)?;
+    if source_address < target_end && target_address < source_end {
+        return None;
+    }
+    // SAFETY: Both non-overlapping ranges are bounded live guest allocations described above.
+    let source_bytes =
+        unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) };
+    let target_bytes =
+        unsafe { std::slice::from_raw_parts_mut(target_address as *mut u8, target_length) };
+    if !alpha_blend
+        && source.width == target.width
+        && source.height == target.height
+        && source.pitch == target.pitch
+        && source.tile_mode == target.tile_mode
+        && source_length == target_length
+    {
+        target_bytes.copy_from_slice(source_bytes);
+    } else {
+        blit_guest_texture_bytes(source_bytes, source, target_bytes, target, alpha_blend);
+    }
+    Some(())
+}
+
+fn blit_guest_texture_bytes(
+    source_bytes: &[u8],
+    source: GuestTextureDescriptor,
+    target_bytes: &mut [u8],
+    target: GuestTextureDescriptor,
+    alpha_blend: bool,
+) {
+    let source_width = usize::try_from(source.width).expect("validated source width");
+    let source_height = usize::try_from(source.height).expect("validated source height");
+    let target_width = usize::try_from(target.width).expect("validated target width");
+    let target_height = usize::try_from(target.height).expect("validated target height");
+    let copy_width = source_width.min(target_width);
+    let copy_height = source_height.min(target_height);
+    let source_x = source_width.saturating_sub(target_width) / 2;
+    let source_y = source_height.saturating_sub(target_height) / 2;
+    let target_x = target_width.saturating_sub(source_width) / 2;
+    let target_y = target_height.saturating_sub(source_height) / 2;
+    for y in 0..copy_height {
+        for x in 0..copy_width {
+            let source_offset = guest_pixel_byte_offset(source, source_x + x, source_y + y);
+            let target_offset = guest_pixel_byte_offset(target, target_x + x, target_y + y);
+            let source_pixel = &source_bytes[source_offset..source_offset + 4];
+            let target_pixel = &mut target_bytes[target_offset..target_offset + 4];
+            if alpha_blend {
+                alpha_blend_rgba(source_pixel, target_pixel);
+            } else {
+                target_pixel.copy_from_slice(source_pixel);
+            }
+        }
+    }
+}
+
+fn guest_pixel_byte_offset(descriptor: GuestTextureDescriptor, x: usize, y: usize) -> usize {
+    if descriptor.tile_mode == 27 {
+        mode27_source_byte_offset(
+            x,
+            y,
+            usize::try_from(descriptor.width).expect("validated width"),
+        )
+    } else {
+        (y * usize::try_from(descriptor.pitch).expect("validated pitch") + x) * 4
+    }
+}
+
+fn alpha_blend_rgba(source: &[u8], target: &mut [u8]) {
+    let alpha = u32::from(source[3]);
+    let inverse = 255 - alpha;
+    for channel in 0..3 {
+        target[channel] = u8::try_from(
+            (u32::from(source[channel]) * alpha + u32::from(target[channel]) * inverse + 127) / 255,
+        )
+        .expect("blended color channel fits in u8");
+    }
+    target[3] = u8::try_from(alpha + (u32::from(target[3]) * inverse + 127) / 255)
+        .expect("blended alpha channel fits in u8");
+}
+
 fn execute_dreaming_fill_draw(draw: &IndexedDraw) -> Option<ExecutedFill> {
     if !is_dreaming_fill_draw(draw) {
         return None;
@@ -576,11 +812,26 @@ fn decode_dreaming_presenter_draw(
     if !is_dreaming_presenter_draw(draw) {
         return None;
     }
+    let descriptor = decode_guest_texture(draw, 0x00c)?;
+    if !matches!(descriptor.tile_mode, 0 | 27) {
+        return None;
+    }
+    let constants_low = register_value(&draw.shader_registers, 0x018)?;
+    let constants_high = register_value(&draw.shader_registers, 0x019)?;
+    let constants_address = (u64::from(constants_high & 0xffff) << 32) | u64::from(constants_low);
+    let constants =
+        read_guest_present_constants(constants_address).unwrap_or(GuestPresentConstants {
+            multiply: [1.0; 4],
+            add: [0.0; 4],
+        });
+    Some((descriptor, constants))
+}
 
+fn decode_guest_texture(draw: &IndexedDraw, register_base: u32) -> Option<GuestTextureDescriptor> {
     let fields: [u32; 8] = std::array::from_fn(|index| {
         register_value(
             &draw.shader_registers,
-            0x00c + u32::try_from(index).expect("texture descriptor index fits in u32"),
+            register_base + u32::try_from(index).expect("texture descriptor index fits in u32"),
         )
         .unwrap_or_default()
     });
@@ -596,7 +847,6 @@ fn decode_dreaming_presenter_draw(
         || height == 0
         || height > 8_192
         || unified_format != 56
-        || !matches!(tile_mode, 0 | 27)
         || texture_type != 9
     {
         return None;
@@ -610,24 +860,13 @@ fn decode_dreaming_presenter_draw(
         return None;
     }
 
-    let constants_low = register_value(&draw.shader_registers, 0x018)?;
-    let constants_high = register_value(&draw.shader_registers, 0x019)?;
-    let constants_address = (u64::from(constants_high & 0xffff) << 32) | u64::from(constants_low);
-    let constants =
-        read_guest_present_constants(constants_address).unwrap_or(GuestPresentConstants {
-            multiply: [1.0; 4],
-            add: [0.0; 4],
-        });
-    Some((
-        GuestTextureDescriptor {
-            address,
-            width,
-            height,
-            pitch,
-            tile_mode,
-        },
-        constants,
-    ))
+    Some(GuestTextureDescriptor {
+        address,
+        width,
+        height,
+        pitch,
+        tile_mode,
+    })
 }
 
 fn read_guest_present_constants(address: u64) -> Option<GuestPresentConstants> {
