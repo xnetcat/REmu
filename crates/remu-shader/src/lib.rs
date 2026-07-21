@@ -3,19 +3,21 @@
 
 //! Backend-neutral Gen5/RDNA2 shader decoding, evaluation, and intermediate representation.
 
+mod decoder;
 mod format;
 mod inline_constant;
 mod ir;
 mod metadata;
 
+pub use decoder::{DecodeError, decode_program};
 pub use format::decode_unified_format;
 pub use inline_constant::decode_inline_constant;
 pub use ir::{
     BufferMemoryControl, ComputeSystemRegisters, ComputeSystemValue, DataShareControl, Dpp8Control,
     DppControl, ExportControl, GlobalMemoryBinding, GlobalMemoryControl, ImageBinding,
     ImageControl, Instruction, InstructionControl, InterpolationControl, Opcode, Operand,
-    OperandKind, PixelOutputBinding, PixelOutputKind, Program, ResourceKind, ResourceMapping,
-    ScalarMemoryControl, SdwaControl, ShaderEncoding, ShaderEvaluation, ShaderMetadata,
-    ShaderState, VertexInputBinding, Vop3Control, Vop3pControl,
+    OperandKind, PixelOutputBinding, PixelOutputKind, Program, RawOpcodeFamily, ResourceKind,
+    ResourceMapping, ScalarMemoryControl, SdwaControl, ShaderEncoding, ShaderEvaluation,
+    ShaderMetadata, ShaderState, VertexInputBinding, Vop3Control, Vop3pControl,
 };
 pub use metadata::{GuestMemoryReader, MetadataError, read_shader_metadata};

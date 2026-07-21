@@ -194,44 +194,74 @@ impl fmt::Display for Operand {
     }
 }
 
-/// A decoded opcode. Construction is private to the decoder, so unsupported bit patterns cannot
-/// enter the IR while backends retain a compact, copyable dispatch key.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RawOpcodeFamily {
+    Vop3,
+    Vop3b,
+    Vop3p,
+    Mubuf,
+}
+
+/// A decoded opcode. Known operations retain their canonical name while architecturally framed
+/// opcodes outside the semantic table retain their exact family and numeric code. Keeping those
+/// values typed is important: diagnostics can distinguish an unknown opcode from corrupt framing,
+/// and a later ISA-table expansion cannot change instruction boundaries.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Opcode(&'static str);
+pub enum Opcode {
+    Known(&'static str),
+    Raw { family: RawOpcodeFamily, code: u16 },
+}
 
 impl Opcode {
     pub const END_PROGRAM: Self = Self::from_static("SEndpgm");
     pub const EXPORT: Self = Self::from_static("Exp");
 
     pub(crate) const fn from_static(name: &'static str) -> Self {
-        Self(name)
+        Self::Known(name)
     }
 
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        self.0
+    pub(crate) const fn raw(family: RawOpcodeFamily, code: u16) -> Self {
+        Self::Raw { family, code }
+    }
+
+    #[must_use]
+    pub const fn known_name(self) -> Option<&'static str> {
+        match self {
+            Self::Known(name) => Some(name),
+            Self::Raw { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is(self, name: &str) -> bool {
+        self.known_name() == Some(name)
     }
 
     #[must_use]
     pub fn starts_with(self, prefix: &str) -> bool {
-        self.0.starts_with(prefix)
+        self.known_name()
+            .is_some_and(|name| name.starts_with(prefix))
     }
 
     #[must_use]
     pub fn contains(self, part: &str) -> bool {
-        self.0.contains(part)
+        self.known_name().is_some_and(|name| name.contains(part))
     }
 }
 
 impl fmt::Debug for Opcode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.0)
+        fmt::Display::fmt(self, formatter)
     }
 }
 
 impl fmt::Display for Opcode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.0)
+        match self {
+            Self::Known(name) => formatter.write_str(name),
+            Self::Raw { family, code } => write!(formatter, "{family:?}[0x{code:X}]"),
+        }
     }
 }
 

@@ -62,3 +62,8 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   GPL-2.0-or-later `SharpEmu.ShaderCompiler` sources in the local 2026-07-21 checkout. REmu uses
   Rust-owned immutable programs, typed control variants, bounded metadata reads, exact sparse
   format decoding, and a backend-independent compute-system-value model.
+- Gen5 instruction framing, opcode tables, literal/NSA extension rules, and typed operand/control
+  extraction were cross-checked against SharpEmu's GPL-2.0-or-later
+  `Gen5ShaderTranslator.cs` in that checkout. REmu independently uses slice-bounded decoding,
+  structured reserved-encoding errors, typed raw-family preservation, and explicit load/store/
+  atomic data-flow operands so later backends cannot silently treat writes as reads.
