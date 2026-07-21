@@ -13,14 +13,28 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use remu_core::GuestAddress;
 use remu_loader::{DynamicInfo, Elf64Rela, Elf64Symbol, LoadedExecutable};
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage, MappingError};
+use remu_shader::GuestMemoryReader;
 use thiserror::Error;
+
+#[cfg(target_os = "macos")]
+#[link(name = "System")]
+unsafe extern "C" {
+    fn mach_task_self() -> u32;
+    fn mach_vm_read_overwrite(
+        task: u32,
+        address: u64,
+        size: u64,
+        output_address: u64,
+        output_size: *mut u64,
+    ) -> i32;
+}
 
 const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
@@ -1412,6 +1426,9 @@ struct AgcGraphicsState {
     draw_index_offset: u32,
     emitted_draws: u64,
     traced_shader_pairs: BTreeSet<(u64, u64)>,
+    shader_headers: BTreeMap<u64, u64>,
+    shader_snapshots: BTreeMap<u64, remu_gpu::ShaderSnapshot>,
+    shader_decode_failures: BTreeSet<u64>,
 }
 
 impl AgcGraphicsState {
@@ -2376,7 +2393,7 @@ fn dispatch_probe_import(
             .map_or_else(audio_out_error, |()| 0),
         // AGC shader construction and VideoOut mutate caller-owned descriptors. Games consume the
         // resulting pointers and command data immediately, so successful no-ops are insufficient.
-        "f3dg2CSgRKY" => agc_create_shader(arguments),
+        "f3dg2CSgRKY" => agc_create_shader(arguments, state),
         "TRO721eVt4g" => agc_dcb_reset_queue(arguments),
         "ZvwO9euwYzc" => agc_dcb_set_registers_indirect(arguments, AGC_R_CX_REGS_INDIRECT),
         "-HOOCn0JY48" => agc_dcb_set_registers_indirect(arguments, AGC_R_SH_REGS_INDIRECT),
@@ -2975,7 +2992,7 @@ const AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET: u64 = 0x08;
 const AGC_SHADER_SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET: u64 = 0x20;
 const AGC_SHADER_SPECIAL_GE_USER_VGPR_EN_OFFSET: u64 = 0x28;
 
-fn agc_create_shader(arguments: [u64; 6]) -> u64 {
+fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let destination = arguments[0];
     let header = arguments[1];
     let code = arguments[2];
@@ -3015,6 +3032,9 @@ fn agc_create_shader(arguments: [u64; 6]) -> u64 {
     if !patch_agc_shader_program_registers(header, code) {
         return u64::MAX;
     }
+    state.agc_graphics.shader_headers.insert(code, header);
+    state.agc_graphics.shader_snapshots.remove(&code);
+    state.agc_graphics.shader_decode_failures.remove(&code);
     if destination != 0 {
         write_guest_u64(destination, header);
     }
@@ -3797,6 +3817,101 @@ fn agc_shader_prefix_snapshot(address: u64) -> [u32; 4] {
     })
 }
 
+struct ProcessGuestMemory;
+
+impl GuestMemoryReader for ProcessGuestMemory {
+    fn read(&self, address: u64, output: &mut [u8]) -> bool {
+        if output.is_empty() {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Ok(length) = u64::try_from(output.len()) else {
+                return false;
+            };
+            let mut copied = 0_u64;
+            // SAFETY: mach_vm_read_overwrite validates the source mapping in the current task and
+            // writes at most `length` bytes to the live output slice.
+            let result = unsafe {
+                mach_vm_read_overwrite(
+                    mach_task_self(),
+                    address,
+                    length,
+                    output.as_mut_ptr() as u64,
+                    &raw mut copied,
+                )
+            };
+            result == 0 && copied == length
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let local = libc::iovec {
+                iov_base: output.as_mut_ptr().cast(),
+                iov_len: output.len(),
+            };
+            let remote = libc::iovec {
+                iov_base: usize::try_from(address)
+                    .map_or(std::ptr::null_mut(), |value| value as *mut libc::c_void),
+                iov_len: output.len(),
+            };
+            if remote.iov_base.is_null() {
+                return false;
+            }
+            // SAFETY: both iovecs describe live output storage and a source in this same process;
+            // process_vm_readv returns EFAULT instead of dereferencing an unreadable guest range.
+            let copied =
+                unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+            copied == isize::try_from(output.len()).unwrap_or(-1)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = address;
+            false
+        }
+    }
+}
+
+fn agc_shader_snapshot(
+    graphics: &mut AgcGraphicsState,
+    address: u64,
+) -> Option<remu_gpu::ShaderSnapshot> {
+    if address == 0 || graphics.shader_decode_failures.contains(&address) {
+        return None;
+    }
+    if let Some(snapshot) = graphics.shader_snapshots.get(&address) {
+        return Some(snapshot.clone());
+    }
+    let memory = ProcessGuestMemory;
+    let program = match remu_shader::read_program(&memory, address) {
+        Ok(program) => Arc::new(program),
+        Err(error) => {
+            graphics.shader_decode_failures.insert(address);
+            eprintln!("[REMu][AGC][SHADER] decode failed at {address:#x}: {error}");
+            return None;
+        }
+    };
+    let header_address = graphics
+        .shader_headers
+        .get(&address)
+        .copied()
+        .unwrap_or_default();
+    let metadata = (header_address != 0)
+        .then(|| remu_shader::read_shader_metadata(&memory, header_address))
+        .transpose()
+        .map_err(|error| {
+            eprintln!("[REMu][AGC][SHADER] metadata failed at header {header_address:#x}: {error}");
+        })
+        .ok()
+        .flatten();
+    let snapshot = remu_gpu::ShaderSnapshot {
+        header_address,
+        program,
+        metadata,
+    };
+    graphics.shader_snapshots.insert(address, snapshot.clone());
+    Some(snapshot)
+}
+
 fn agc_emit_draw(
     graphics: &mut AgcGraphicsState,
     indexed: bool,
@@ -3826,6 +3941,8 @@ fn agc_emit_draw(
         .get(&AGC_VGT_PRIMITIVE_TYPE)
         .copied()
         .unwrap_or_default();
+    let export_shader = agc_shader_snapshot(graphics, export_shader_address);
+    let pixel_shader = agc_shader_snapshot(graphics, pixel_shader_address);
     let draw = remu_gpu::IndexedDraw {
         sequence: graphics.emitted_draws,
         indexed,
@@ -3842,6 +3959,8 @@ fn agc_emit_draw(
         pixel_shader_address,
         export_shader_prefix: agc_shader_prefix_snapshot(export_shader_address),
         pixel_shader_prefix: agc_shader_prefix_snapshot(pixel_shader_address),
+        export_shader,
+        pixel_shader,
         color_target_address,
         context_registers: agc_register_snapshot(&graphics.context_registers),
         shader_registers: agc_register_snapshot(&graphics.shader_registers),
@@ -3865,9 +3984,10 @@ fn agc_emit_draw(
             draw.color_target_address,
         );
     }
-    if graphics
-        .traced_shader_pairs
-        .insert((draw.export_shader_address, draw.pixel_shader_address))
+    if trace_agc_shaders()
+        && graphics
+            .traced_shader_pairs
+            .insert((draw.export_shader_address, draw.pixel_shader_address))
         && graphics.traced_shader_pairs.len() <= 16
     {
         eprintln!(
@@ -3885,7 +4005,7 @@ fn agc_emit_draw(
             draw.user_config_registers,
         );
     }
-    remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(draw));
+    remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
 }
 
 fn agc_emit_indexed_draw(packet_address: u64, graphics: &mut AgcGraphicsState) {
@@ -5494,6 +5614,13 @@ fn kernel_release_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchSt
 fn trace_guest_vm() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_VM").is_some_and(|value| value == "1"))
+}
+
+fn trace_agc_shaders() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_AGC_SHADERS").is_some_and(|value| value == "1")
+    })
 }
 
 fn trace_guest_time() -> bool {
