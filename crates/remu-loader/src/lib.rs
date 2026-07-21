@@ -17,6 +17,32 @@ const CONTAINER_HEADER_SIZE: usize = 32;
 const CONTAINER_SEGMENT_SIZE: usize = 32;
 const MAX_CONTAINER_SEGMENTS: usize = 4096;
 const MAX_PROGRAM_HEADERS: usize = 4096;
+const MAX_METADATA_TABLE_SIZE: u64 = 64 * 1024 * 1024;
+const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const DT_NULL: i64 = 0;
+const DT_NEEDED: i64 = 1;
+const DT_PLTREL_SIZE: i64 = 2;
+const DT_PLT_GOT: i64 = 3;
+const DT_STRING_TABLE: i64 = 5;
+const DT_SYMBOL_TABLE: i64 = 6;
+const DT_RELA: i64 = 7;
+const DT_RELA_SIZE: i64 = 8;
+const DT_STRING_TABLE_SIZE: i64 = 10;
+const DT_INIT: i64 = 12;
+const DT_JUMP_RELOCATION: i64 = 23;
+const DT_INIT_ARRAY: i64 = 25;
+const DT_INIT_ARRAY_SIZE: i64 = 27;
+const DT_PREINIT_ARRAY: i64 = 32;
+const DT_PREINIT_ARRAY_SIZE: i64 = 33;
+const DT_SCE_JUMP_RELOCATION: i64 = 0x6100_0029;
+const DT_SCE_PLTREL_SIZE: i64 = 0x6100_002d;
+const DT_SCE_RELA: i64 = 0x6100_002f;
+const DT_SCE_RELA_SIZE: i64 = 0x6100_0031;
+const DT_SCE_STRING_TABLE: i64 = 0x6100_0035;
+const DT_SCE_STRING_TABLE_SIZE: i64 = 0x6100_0037;
+const DT_SCE_SYMBOL_TABLE: i64 = 0x6100_0039;
+const DT_SCE_SYMBOL_TABLE_SIZE: i64 = 0x6100_003f;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutableKind {
@@ -136,11 +162,38 @@ pub struct Elf64ProgramHeader {
     pub alignment: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DynamicEntry {
+    pub tag: i64,
+    pub value: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicInfo {
+    pub entries: Vec<DynamicEntry>,
+    pub needed_libraries: Vec<String>,
+    pub string_table_address: u64,
+    pub string_table_size: u64,
+    pub symbol_table_address: u64,
+    pub symbol_table_size: u64,
+    pub rela_address: u64,
+    pub rela_size: u64,
+    pub jump_relocation_address: u64,
+    pub jump_relocation_size: u64,
+    pub plt_got_address: u64,
+    pub init_address: u64,
+    pub init_array_address: u64,
+    pub init_array_size: u64,
+    pub preinit_array_address: u64,
+    pub preinit_array_size: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Elf64Info {
     pub file_offset: u64,
     pub header: Elf64Header,
     pub program_headers: Vec<Elf64ProgramHeader>,
+    pub dynamic: Option<DynamicInfo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,6 +230,26 @@ pub enum InspectError {
     MissingEmbeddedElf { offset: u64, found: [u8; 4] },
     #[error("offset arithmetic overflow while parsing executable")]
     OffsetOverflow,
+    #[error("{table} table size 0x{size:x} exceeds the parser safety limit")]
+    MetadataTableTooLarge { table: &'static str, size: u64 },
+    #[error("ELF file range 0x{offset:x}..0x{end:x} is not backed by a usable input segment")]
+    UnmappedElfFileRange { offset: u64, end: u64 },
+    #[error("ELF virtual range 0x{address:x}..0x{end:x} is not backed by a file segment")]
+    UnmappedVirtualRange { address: u64, end: u64 },
+    #[error(
+        "container payload for program {program_index} is not directly usable (encrypted={encrypted}, compressed={compressed})"
+    )]
+    UnsupportedContainerPayload {
+        program_index: usize,
+        encrypted: bool,
+        compressed: bool,
+    },
+    #[error("dynamic string offset 0x{offset:x} is outside the string table")]
+    DynamicStringOutOfBounds { offset: u64 },
+    #[error("dynamic string at offset 0x{offset:x} is not NUL terminated")]
+    UnterminatedDynamicString { offset: u64 },
+    #[error("dynamic string at offset 0x{offset:x} is not valid UTF-8")]
+    InvalidDynamicString { offset: u64 },
 }
 
 pub fn inspect_path(path: impl AsRef<Path>) -> Result<ExecutableInfo, InspectError> {
@@ -195,12 +268,16 @@ pub fn inspect_reader(reader: &mut (impl Read + Seek)) -> Result<ExecutableInfo,
     };
 
     match kind {
-        ExecutableKind::Elf64 => Ok(ExecutableInfo {
-            kind,
-            file_size,
-            container: None,
-            elf: Some(parse_elf(reader, 0, file_size)?),
-        }),
+        ExecutableKind::Elf64 => {
+            let mut elf = parse_elf(reader, 0, file_size)?;
+            elf.dynamic = parse_dynamic(reader, file_size, None, &elf)?;
+            Ok(ExecutableInfo {
+                kind,
+                file_size,
+                container: None,
+                elf: Some(elf),
+            })
+        }
         ExecutableKind::Ps5Container | ExecutableKind::Ps5RetailContainer => {
             let container = parse_container(reader, file_size)?;
             let elf_offset = container.header.embedded_elf_offset;
@@ -212,11 +289,13 @@ pub fn inspect_reader(reader: &mut (impl Read + Seek)) -> Result<ExecutableInfo,
                 });
             }
 
+            let mut elf = parse_elf(reader, elf_offset, file_size)?;
+            elf.dynamic = parse_dynamic(reader, file_size, Some(&container), &elf)?;
             Ok(ExecutableInfo {
                 kind,
                 file_size,
                 container: Some(container),
-                elf: Some(parse_elf(reader, elf_offset, file_size)?),
+                elf: Some(elf),
             })
         }
         ExecutableKind::Unknown(_) => Ok(ExecutableInfo {
@@ -371,7 +450,270 @@ fn parse_elf(
         file_offset,
         header,
         program_headers,
+        dynamic: None,
     })
+}
+
+fn parse_dynamic(
+    reader: &mut (impl Read + Seek),
+    file_size: u64,
+    container: Option<&ContainerInfo>,
+    elf: &Elf64Info,
+) -> Result<Option<DynamicInfo>, InspectError> {
+    let Some(dynamic_program) = elf
+        .program_headers
+        .iter()
+        .find(|program| program.program_type == PT_DYNAMIC)
+    else {
+        return Ok(None);
+    };
+    if dynamic_program.file_size == 0 {
+        return Ok(None);
+    }
+
+    let dynamic_bytes = read_elf_file_range(
+        reader,
+        file_size,
+        container,
+        elf,
+        dynamic_program.file_offset,
+        dynamic_program.file_size,
+        "dynamic",
+    )?;
+    let mut entries = Vec::with_capacity(dynamic_bytes.len() / 16);
+    for entry in dynamic_bytes.chunks_exact(16) {
+        let tag = read_i64_slice(entry, 0);
+        let value = read_u64_slice(entry, 8);
+        entries.push(DynamicEntry { tag, value });
+        if tag == DT_NULL {
+            break;
+        }
+    }
+
+    let mut info = summarize_dynamic_entries(entries);
+
+    if info.string_table_address != 0 && info.string_table_size != 0 {
+        let string_table = read_elf_virtual_range(
+            reader,
+            file_size,
+            container,
+            elf,
+            info.string_table_address,
+            info.string_table_size,
+            "dynamic string",
+        )?;
+        for entry in &info.entries {
+            if entry.tag == DT_NEEDED {
+                info.needed_libraries
+                    .push(read_dynamic_string(&string_table, entry.value)?);
+            }
+        }
+    }
+
+    Ok(Some(info))
+}
+
+fn summarize_dynamic_entries(entries: Vec<DynamicEntry>) -> DynamicInfo {
+    let mut info = DynamicInfo {
+        entries,
+        needed_libraries: Vec::new(),
+        string_table_address: 0,
+        string_table_size: 0,
+        symbol_table_address: 0,
+        symbol_table_size: 0,
+        rela_address: 0,
+        rela_size: 0,
+        jump_relocation_address: 0,
+        jump_relocation_size: 0,
+        plt_got_address: 0,
+        init_address: 0,
+        init_array_address: 0,
+        init_array_size: 0,
+        preinit_array_address: 0,
+        preinit_array_size: 0,
+    };
+
+    for entry in &info.entries {
+        match entry.tag {
+            DT_STRING_TABLE if info.string_table_address == 0 => {
+                info.string_table_address = entry.value;
+            }
+            DT_STRING_TABLE_SIZE if info.string_table_size == 0 => {
+                info.string_table_size = entry.value;
+            }
+            DT_SYMBOL_TABLE if info.symbol_table_address == 0 => {
+                info.symbol_table_address = entry.value;
+            }
+            DT_RELA if info.rela_address == 0 => info.rela_address = entry.value,
+            DT_RELA_SIZE if info.rela_size == 0 => info.rela_size = entry.value,
+            DT_JUMP_RELOCATION if info.jump_relocation_address == 0 => {
+                info.jump_relocation_address = entry.value;
+            }
+            DT_PLTREL_SIZE if info.jump_relocation_size == 0 => {
+                info.jump_relocation_size = entry.value;
+            }
+            DT_PLT_GOT if info.plt_got_address == 0 => info.plt_got_address = entry.value,
+            DT_INIT if info.init_address == 0 => info.init_address = entry.value,
+            DT_INIT_ARRAY if info.init_array_address == 0 => {
+                info.init_array_address = entry.value;
+            }
+            DT_INIT_ARRAY_SIZE if info.init_array_size == 0 => {
+                info.init_array_size = entry.value;
+            }
+            DT_PREINIT_ARRAY if info.preinit_array_address == 0 => {
+                info.preinit_array_address = entry.value;
+            }
+            DT_PREINIT_ARRAY_SIZE if info.preinit_array_size == 0 => {
+                info.preinit_array_size = entry.value;
+            }
+            DT_SCE_STRING_TABLE => info.string_table_address = entry.value,
+            DT_SCE_STRING_TABLE_SIZE => info.string_table_size = entry.value,
+            DT_SCE_SYMBOL_TABLE => info.symbol_table_address = entry.value,
+            DT_SCE_SYMBOL_TABLE_SIZE => info.symbol_table_size = entry.value,
+            DT_SCE_RELA => info.rela_address = entry.value,
+            DT_SCE_RELA_SIZE => info.rela_size = entry.value,
+            DT_SCE_JUMP_RELOCATION => info.jump_relocation_address = entry.value,
+            DT_SCE_PLTREL_SIZE => info.jump_relocation_size = entry.value,
+            _ => {}
+        }
+    }
+
+    info
+}
+
+fn read_elf_virtual_range(
+    reader: &mut (impl Read + Seek),
+    file_size: u64,
+    container: Option<&ContainerInfo>,
+    elf: &Elf64Info,
+    address: u64,
+    size: u64,
+    table: &'static str,
+) -> Result<Vec<u8>, InspectError> {
+    let end = address
+        .checked_add(size)
+        .ok_or(InspectError::OffsetOverflow)?;
+    let Some(program) = elf.program_headers.iter().find(|program| {
+        if program.program_type != PT_LOAD {
+            return false;
+        }
+        let Some(program_end) = program.virtual_address.get().checked_add(program.file_size) else {
+            return false;
+        };
+        address >= program.virtual_address.get() && end <= program_end
+    }) else {
+        return Err(InspectError::UnmappedVirtualRange { address, end });
+    };
+    let delta = address - program.virtual_address.get();
+    let logical_offset = program
+        .file_offset
+        .checked_add(delta)
+        .ok_or(InspectError::OffsetOverflow)?;
+    read_elf_file_range(
+        reader,
+        file_size,
+        container,
+        elf,
+        logical_offset,
+        size,
+        table,
+    )
+}
+
+fn read_elf_file_range(
+    reader: &mut (impl Read + Seek),
+    file_size: u64,
+    container: Option<&ContainerInfo>,
+    elf: &Elf64Info,
+    logical_offset: u64,
+    size: u64,
+    table: &'static str,
+) -> Result<Vec<u8>, InspectError> {
+    if size > MAX_METADATA_TABLE_SIZE {
+        return Err(InspectError::MetadataTableTooLarge { table, size });
+    }
+    let logical_end = logical_offset
+        .checked_add(size)
+        .ok_or(InspectError::OffsetOverflow)?;
+
+    let physical_offset = if let Some(container) = container {
+        let mut matched = None;
+        for segment in &container.segments {
+            if !segment.properties.has_blocks() {
+                continue;
+            }
+            let program_index = segment.properties.program_index();
+            let Some(program) = elf.program_headers.get(program_index) else {
+                continue;
+            };
+            let Some(program_end) = program.file_offset.checked_add(program.file_size) else {
+                continue;
+            };
+            if logical_offset < program.file_offset || logical_end > program_end {
+                continue;
+            }
+            let compressed = segment.stored_size != segment.expanded_size;
+            if segment.properties.is_encrypted() || compressed {
+                return Err(InspectError::UnsupportedContainerPayload {
+                    program_index,
+                    encrypted: segment.properties.is_encrypted(),
+                    compressed,
+                });
+            }
+            let delta = logical_offset - program.file_offset;
+            let stored_end = delta
+                .checked_add(size)
+                .ok_or(InspectError::OffsetOverflow)?;
+            if stored_end <= segment.stored_size {
+                matched = Some(
+                    segment
+                        .file_offset
+                        .checked_add(delta)
+                        .ok_or(InspectError::OffsetOverflow)?,
+                );
+                break;
+            }
+        }
+        matched.ok_or(InspectError::UnmappedElfFileRange {
+            offset: logical_offset,
+            end: logical_end,
+        })?
+    } else {
+        elf.file_offset
+            .checked_add(logical_offset)
+            .ok_or(InspectError::OffsetOverflow)?
+    };
+
+    read_vec_at(reader, physical_offset, size, file_size)
+}
+
+fn read_dynamic_string(bytes: &[u8], offset: u64) -> Result<String, InspectError> {
+    let offset_usize =
+        usize::try_from(offset).map_err(|_| InspectError::DynamicStringOutOfBounds { offset })?;
+    let suffix = bytes
+        .get(offset_usize..)
+        .ok_or(InspectError::DynamicStringOutOfBounds { offset })?;
+    let length = suffix
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(InspectError::UnterminatedDynamicString { offset })?;
+    let value = std::str::from_utf8(&suffix[..length])
+        .map_err(|_| InspectError::InvalidDynamicString { offset })?;
+    Ok(value.to_owned())
+}
+
+fn read_vec_at(
+    reader: &mut (impl Read + Seek),
+    offset: u64,
+    size: u64,
+    file_size: u64,
+) -> Result<Vec<u8>, InspectError> {
+    checked_end(offset, size, file_size)?;
+    let size = usize::try_from(size).map_err(|_| InspectError::OffsetOverflow)?;
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0_u8; size];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn read_array_at<const N: usize>(
@@ -425,13 +767,40 @@ fn read_u64<const N: usize>(bytes: &[u8; N], offset: usize) -> u64 {
     ])
 }
 
+fn read_i64_slice(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn read_u64_slice(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
     use super::{
-        CONTAINER_HEADER_SIZE, CONTAINER_SEGMENT_SIZE, ELF64_HEADER_SIZE,
-        ELF64_PROGRAM_HEADER_SIZE, ExecutableKind, InspectError, inspect_reader,
+        CONTAINER_HEADER_SIZE, CONTAINER_SEGMENT_SIZE, DT_NEEDED, DT_NULL, DT_STRING_TABLE,
+        DT_STRING_TABLE_SIZE, ELF64_HEADER_SIZE, ELF64_PROGRAM_HEADER_SIZE, ExecutableKind,
+        InspectError, inspect_reader,
     };
 
     #[test]
@@ -500,6 +869,24 @@ mod tests {
         assert!(info.elf.is_none());
     }
 
+    #[test]
+    fn reads_needed_libraries_from_a_dynamic_table() {
+        let mut bytes = vec![0_u8; 0x180];
+        write_elf_header(&mut bytes, 2);
+        write_program_header(&mut bytes, 0, 1, 4, 0x100, 0x1000, 0x80, 0x80);
+        write_program_header(&mut bytes, 1, 2, 4, 0x100, 0x1000, 0x40, 0x40);
+        write_dynamic_entry(&mut bytes[0x100..], 0, DT_NEEDED, 1);
+        write_dynamic_entry(&mut bytes[0x100..], 1, DT_STRING_TABLE, 0x1040);
+        write_dynamic_entry(&mut bytes[0x100..], 2, DT_STRING_TABLE_SIZE, 0x20);
+        write_dynamic_entry(&mut bytes[0x100..], 3, DT_NULL, 0);
+        bytes[0x140..0x14c].copy_from_slice(b"\0libFoo.prx\0");
+
+        let info = inspect_reader(&mut Cursor::new(bytes)).unwrap();
+        let dynamic = info.elf.unwrap().dynamic.unwrap();
+        assert_eq!(dynamic.string_table_address, 0x1040);
+        assert_eq!(dynamic.needed_libraries, ["libFoo.prx"]);
+    }
+
     fn write_elf_header(bytes: &mut [u8], program_count: u16) {
         bytes[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
         bytes[4] = 2;
@@ -514,5 +901,32 @@ mod tests {
         bytes[0x34..0x36].copy_from_slice(&64_u16.to_le_bytes());
         bytes[0x36..0x38].copy_from_slice(&56_u16.to_le_bytes());
         bytes[0x38..0x3a].copy_from_slice(&program_count.to_le_bytes());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_program_header(
+        bytes: &mut [u8],
+        index: usize,
+        program_type: u32,
+        flags: u32,
+        file_offset: u64,
+        virtual_address: u64,
+        file_size: u64,
+        memory_size: u64,
+    ) {
+        let offset = ELF64_HEADER_SIZE + index * ELF64_PROGRAM_HEADER_SIZE;
+        bytes[offset..offset + 4].copy_from_slice(&program_type.to_le_bytes());
+        bytes[offset + 4..offset + 8].copy_from_slice(&flags.to_le_bytes());
+        bytes[offset + 8..offset + 16].copy_from_slice(&file_offset.to_le_bytes());
+        bytes[offset + 16..offset + 24].copy_from_slice(&virtual_address.to_le_bytes());
+        bytes[offset + 32..offset + 40].copy_from_slice(&file_size.to_le_bytes());
+        bytes[offset + 40..offset + 48].copy_from_slice(&memory_size.to_le_bytes());
+        bytes[offset + 48..offset + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
+    }
+
+    fn write_dynamic_entry(bytes: &mut [u8], index: usize, tag: i64, value: u64) {
+        let offset = index * 16;
+        bytes[offset..offset + 8].copy_from_slice(&tag.to_le_bytes());
+        bytes[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
     }
 }

@@ -115,6 +115,28 @@ fn inspect(path: &Path) -> ExitCode {
                         program.alignment,
                     );
                 }
+                if let Some(dynamic) = elf.dynamic {
+                    println!("dynamic.entries={}", dynamic.entries.len());
+                    println!(
+                        "dynamic.string_table=0x{:x}:0x{:x}",
+                        dynamic.string_table_address, dynamic.string_table_size
+                    );
+                    println!(
+                        "dynamic.symbol_table=0x{:x}:0x{:x}",
+                        dynamic.symbol_table_address, dynamic.symbol_table_size
+                    );
+                    println!(
+                        "dynamic.rela=0x{:x}:0x{:x}",
+                        dynamic.rela_address, dynamic.rela_size
+                    );
+                    println!(
+                        "dynamic.jump_relocations=0x{:x}:0x{:x}",
+                        dynamic.jump_relocation_address, dynamic.jump_relocation_size
+                    );
+                    for library in dynamic.needed_libraries {
+                        println!("dynamic.needed={library}");
+                    }
+                }
             }
             ExitCode::SUCCESS
         }

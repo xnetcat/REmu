@@ -6,7 +6,8 @@ legally dumped games directly on desktop operating systems without emulating the
 The project is at the infrastructure stage. It does not run games yet.
 
 See the [architecture](docs/architecture.md), [implementation roadmap](docs/roadmap.md), and
-[reference audit](docs/reference-audit.md).
+[reference audit](docs/reference-audit.md). Adapted implementation sources are tracked in
+[provenance](docs/provenance.md).
 
 ## Direction
 
