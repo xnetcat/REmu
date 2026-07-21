@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
 use remu_gpu::GpuProbe;
 use remu_gpu_metal::MetalProbe;
 
@@ -30,6 +31,16 @@ enum Command {
     Map { path: PathBuf },
     /// Map and relocate an executable, creating import trap stubs without executing it.
     Link { path: PathBuf },
+    /// Disassemble bytes from a materialized guest load segment.
+    Disassemble {
+        path: PathBuf,
+        /// Guest virtual address or mapped main-image address (hex accepts a 0x prefix).
+        #[arg(value_parser = parse_integer)]
+        address: u64,
+        /// Maximum number of bytes to decode.
+        #[arg(long, default_value_t = 128)]
+        length: usize,
+    },
     /// Execute a bounded native probe and print the first imported calls.
     Probe {
         path: PathBuf,
@@ -74,6 +85,11 @@ fn main() -> ExitCode {
         Command::Imports { path } => imports(&path),
         Command::Map { path } => map(&path),
         Command::Link { path } => link(&path),
+        Command::Disassemble {
+            path,
+            address,
+            length,
+        } => disassemble(&path, address, length),
         Command::Probe {
             path,
             import_limit,
@@ -270,6 +286,64 @@ fn imports(path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn parse_integer(value: &str) -> Result<u64, String> {
+    let compact = value.replace('_', "");
+    if let Some(hex) = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).map_err(|error| error.to_string())
+    } else {
+        compact.parse::<u64>().map_err(|error| error.to_string())
+    }
+}
+
+fn disassemble(path: &Path, address: u64, length: usize) -> ExitCode {
+    if length == 0 || length > 4096 {
+        eprintln!("error: disassembly length must be between 1 and 4096 bytes");
+        return ExitCode::FAILURE;
+    }
+    let executable = match remu_loader::load_path(path) {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let image_base = remu_memory::PS5_MAIN_IMAGE_BASE.get();
+    let virtual_address = address.checked_sub(image_base).unwrap_or(address);
+    let Some(segment) = executable.load_segments.iter().find(|segment| {
+        let start = segment.virtual_address.get();
+        let end = start.saturating_add(u64::try_from(segment.data.len()).unwrap_or(u64::MAX));
+        virtual_address >= start && virtual_address < end
+    }) else {
+        eprintln!("error: address {address:#x} is not backed by a file load segment");
+        return ExitCode::FAILURE;
+    };
+    let offset = usize::try_from(virtual_address - segment.virtual_address.get())
+        .expect("the selected segment offset fits usize");
+    let bytes = &segment.data[offset..segment.data.len().min(offset.saturating_add(length))];
+    let mapped_address = image_base.saturating_add(virtual_address);
+    let mut decoder = Decoder::with_ip(64, bytes, mapped_address, DecoderOptions::NONE);
+    let mut formatter = IntelFormatter::new();
+    let mut text = String::new();
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        text.clear();
+        formatter.format(&instruction, &mut text);
+        let byte_offset = usize::try_from(instruction.ip() - mapped_address)
+            .expect("decoded byte offset fits usize");
+        let instruction_bytes = &bytes[byte_offset..][..instruction.len()];
+        let hex = instruction_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{:#018x} {hex:<44} {text}", instruction.ip());
+    }
+    ExitCode::SUCCESS
+}
+
 fn map(path: &Path) -> ExitCode {
     let executable = match remu_loader::load_path(path) {
         Ok(executable) => executable,
@@ -404,7 +478,9 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
         .unwrap_or("eboot.bin")
         .to_owned();
     let game_root = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-    let (sender, receiver) = std::sync::mpsc::channel();
+    // Bound translated GPU work so the guest cannot run hundreds of frames ahead of Metal. This
+    // also keeps the AppKit loop responsive enough to publish keyboard/controller state.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(64);
     remu_gpu::install_event_sink(sender.clone());
     let guest = std::thread::spawn(move || {
         let started = Instant::now();

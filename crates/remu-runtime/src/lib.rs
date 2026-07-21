@@ -1129,6 +1129,19 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "eV9wAD2riIA" => "sceKernelStat",
         "Cg4srZ6TKbU" => "sceKernelRead",
         "UK2Tl2DWUns" => "sceKernelClose",
+        "TywrFKCoLGY" => "sceSaveDataInitialize3",
+        "dyIhnXq-0SM" => "sceSaveDataDirNameSearch",
+        "ZP4e7rlzOUk" => "sceSaveDataMount3",
+        "gjRZNnw0JPE" => "sceSaveDataCreateTransactionResource",
+        "uW4vfTwMQVo" => "sceSaveDataUmount2",
+        "sDCBrmc61XU" => "sceSaveDataPrepare",
+        "85zul--eGXs" => "sceSaveDataSetParam",
+        "c88Yy54Mx0w" => "sceSaveDataSaveIcon",
+        "ie7qhZ4X0Cc" => "sceSaveDataCommit",
+        "pztV4AF18iI" => "sincosf",
+        "AEJdIVZTEmo" => "qsort",
+        "sUP1hBaouOw" => "_Getpctype",
+        "rcQCUr0EaRU" => "_Getptoupper",
         _ => return None,
     })
 }
@@ -1162,6 +1175,7 @@ fn write_native_import_stub(slot: &mut [u8], target: u64) {
 struct ProbeDispatchState {
     nids: Vec<String>,
     seen_nids: BTreeSet<String>,
+    unimplemented_nids: BTreeSet<String>,
     import_counts: BTreeMap<String, usize>,
     hits: usize,
     maximum_hits: usize,
@@ -1173,6 +1187,7 @@ struct ProbeDispatchState {
     agc_primary_register_defaults: u64,
     agc_internal_register_defaults: u64,
     ctype_table: u64,
+    toupper_table: u64,
     tls_template: Vec<u8>,
     tls_static_block_size: u64,
     video_out: VideoOutState,
@@ -1184,6 +1199,9 @@ struct ProbeDispatchState {
     pending_events: VecDeque<KernelQueuedEvent>,
     next_kernel_fd: i32,
     kernel_files: BTreeMap<i32, std::fs::File>,
+    save_root: PathBuf,
+    save_mounts: BTreeMap<String, PathBuf>,
+    next_save_transaction_resource: u32,
 }
 
 #[derive(Debug, Default)]
@@ -1284,6 +1302,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .map(|stub| stub.nid.clone())
         .collect();
     state.seen_nids.clear();
+    state.unimplemented_nids.clear();
     state.import_counts.clear();
     state.hits = 0;
     state.maximum_hits = maximum_hits;
@@ -1295,6 +1314,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.agc_primary_register_defaults = 0;
     state.agc_internal_register_defaults = 0;
     state.ctype_table = 0;
+    state.toupper_table = 0;
     let tls_template_address = image.tls.thread_pointer.get() - GUEST_TLS_PREFIX_SIZE;
     let tls_template_size = usize::try_from(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
         .expect("guest TLS template size fits usize");
@@ -1318,6 +1338,9 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.pending_events.clear();
     state.next_kernel_fd = 3;
     state.kernel_files.clear();
+    state.save_root = save_data_root(game_root);
+    state.save_mounts.clear();
+    state.next_save_transaction_resource = 1;
     let sync = GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()));
     *sync
         .0
@@ -1325,7 +1348,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .unwrap_or_else(std::sync::PoisonError::into_inner) = GuestSyncState::default();
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 extern "C" fn import_dispatch(
     argument0: u64,
     argument1: u64,
@@ -1429,6 +1452,18 @@ extern "C" fn import_dispatch(
     if matches!(nid.as_str(), "5OqszGpy7Mg" | "VOBg+iNwB-4" | "2vDqwBlpF-o") {
         drop(state);
         return dispatch_guest_numeric_parser(&nid, call_args);
+    }
+    if nid == "pztV4AF18iI" {
+        drop(state);
+        return ProbeImportReturn::integer(guest_sincosf(
+            low_f32(float_argument0),
+            call_args[0],
+            call_args[1],
+        ));
+    }
+    if nid == "AEJdIVZTEmo" {
+        drop(state);
+        return ProbeImportReturn::integer(guest_qsort(call_args));
     }
     if nid == "dhK16CKwhQg" {
         return ProbeImportReturn::integer(u64::from(float_argument0.is_finite()));
@@ -1787,6 +1822,11 @@ fn low_i32(value: u64) -> i32 {
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+fn low_f32(value: f64) -> f32 {
+    let bytes = value.to_bits().to_le_bytes();
+    f32::from_bits(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 fn guest_atomic_fetch_4(address: u64, value: u64, subtract: bool) -> u64 {
     if address == 0 || !address.is_multiple_of(std::mem::align_of::<AtomicU32>() as u64) {
         return u64::MAX;
@@ -1874,6 +1914,14 @@ fn dispatch_probe_import(
         "Qazy8LmXTvw" => guest_ftell(arguments[0]),
         "uodLYyUip20" => guest_fclose(arguments[0]),
         "lbB+UlZqVG0" => guest_fread(arguments[0], arguments[1], arguments[2], arguments[3]),
+        // Dinkumware's locale helpers are used by the save-error formatting path. The character
+        // table accessor must return a live table; its lock and lifetime helpers are process-local
+        // bookkeeping in the single-process HLE runtime.
+        "sUP1hBaouOw" | "1uJgoVq3bQU" => guest_ctype_table(state),
+        "rcQCUr0EaRU" => guest_toupper_table(state),
+        "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" | "sDCBrmc61XU" | "85zul--eGXs"
+        | "c88Yy54Mx0w" | "ie7qhZ4X0Cc" => 0,
+        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => arguments[0],
         // Preserve the SysV variadic register layout for the integer/pointer formats used by the
         // game's asset path builder. Floating-point varargs require a wider import frame later.
         "tcVi5SivF7Q" => guest_sprintf(arguments),
@@ -1941,6 +1989,13 @@ fn dispatch_probe_import(
         "YndgXqQVV7c" => pad_read_state(arguments),
         // libSceSystemService status used by the foreground/background state machine.
         "rPo6tV8D9bM" => system_service_get_status(arguments),
+        // libSceSaveData. Returning success without filling the mount result leaves the game's
+        // mount point empty, which turns `/savedata0/-saveindex` into the invalid `/-saveindex`.
+        "TywrFKCoLGY" => save_data_initialize(state),
+        "dyIhnXq-0SM" => save_data_dir_name_search(arguments),
+        "ZP4e7rlzOUk" => save_data_mount3(arguments, state),
+        "gjRZNnw0JPE" => save_data_create_transaction_resource(arguments, state),
+        "uW4vfTwMQVo" => save_data_umount2(arguments, state),
         // User-service IDs use the retail slot encoding expected by the game's controller layer.
         "CdWp0oHWGr0" => write_output_i32(arguments[0], 0x1000_0000),
         "fPhymKNvK-A" => user_service_get_login_user_id_list(arguments),
@@ -1957,8 +2012,6 @@ fn dispatch_probe_import(
         // Exact Gen5 register-default descriptors consumed by indirect AGC state packets.
         "2JtWUUiYBXs" => agc_register_defaults(arguments[0], false, state),
         "wRbq6ZjNop4" => agc_register_defaults(arguments[0], true, state),
-        // Inferred from the immediate two-byte character-class lookup at every call site.
-        "1uJgoVq3bQU" => guest_ctype_table(state),
         // sceKernelUsleep
         "1jfXLRVzisc" => guest_usleep(arguments[0]),
         // POSIX clock_gettime. Darwin's timespec layout matches the x86-64 guest ABI.
@@ -1970,8 +2023,23 @@ fn dispatch_probe_import(
             eprintln!("[REMu][PROBE] guest requested exit({status})");
             terminate_probe(status);
         }
-        // Unimplemented calls are successful no-ops in the bounded discovery probe.
-        _ => 0,
+        // Keep discovery moving, but identify the exact calls that reached the fallback. The
+        // general first-hit log also includes known imports whose implementation lives above this
+        // dispatcher, so it cannot distinguish a missing ABI from an incomplete name table.
+        _ => {
+            if state.unimplemented_nids.insert(nid.to_owned()) {
+                eprintln!(
+                    "[REMu][IMPORT] unimplemented nid={nid} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
+                    arguments[5]
+                );
+            }
+            0
+        }
     }
 }
 
@@ -2087,6 +2155,7 @@ fn pad_read_state(arguments: [u64; 6]) -> u64 {
 fn auto_cross_active() -> bool {
     static START: OnceLock<Instant> = OnceLock::new();
     static TIMES: OnceLock<Vec<Duration>> = OnceLock::new();
+    static HOLD: OnceLock<Duration> = OnceLock::new();
     let times = TIMES.get_or_init(|| {
         std::env::var("REMU_AUTO_CROSS")
             .unwrap_or_default()
@@ -2099,10 +2168,16 @@ fn auto_cross_active() -> bool {
     if times.is_empty() {
         return false;
     }
+    let hold = *HOLD.get_or_init(|| {
+        std::env::var("REMU_AUTO_CROSS_HOLD_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Duration::from_millis(400), Duration::from_millis)
+    });
     let elapsed = START.get_or_init(Instant::now).elapsed();
     times
         .iter()
-        .any(|&time| elapsed >= time && elapsed < time.saturating_add(Duration::from_millis(400)))
+        .any(|&time| elapsed >= time && elapsed < time.saturating_add(hold))
 }
 
 fn system_service_get_status(arguments: [u64; 6]) -> u64 {
@@ -3311,6 +3386,28 @@ fn guest_ctype_table(state: &mut ProbeDispatchState) -> u64 {
     state.ctype_table
 }
 
+fn guest_toupper_table(state: &mut ProbeDispatchState) -> u64 {
+    if state.toupper_table == 0 {
+        // Dinkumware indexes the signed-char range as well as 0..=255. Each entry is a 32-bit
+        // character value and the exported pointer addresses the c == 0 element.
+        let storage = guest_calloc(384, 4);
+        if storage == 0 {
+            return 0;
+        }
+        state.toupper_table = storage + 128 * 4;
+        for index in 0_u32..384 {
+            let character = i32::try_from(index).expect("ctype index fits i32") - 128;
+            let mapped = if (i32::from(b'a')..=i32::from(b'z')).contains(&character) {
+                character - i32::from(b'a') + i32::from(b'A')
+            } else {
+                character
+            };
+            write_guest_u32(storage + u64::from(index) * 4, mapped.cast_unsigned());
+        }
+    }
+    state.toupper_table
+}
+
 fn guest_ctype_flags(character: u16) -> u16 {
     const XDIGIT: u16 = 0x001;
     const UPPER: u16 = 0x002;
@@ -3903,6 +4000,197 @@ fn guest_strstr(haystack: u64, needle: u64) -> u64 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn save_data_root(game_root: &Path) -> PathBuf {
+    let base = std::env::var_os("REMU_SAVEDATA_DIR")
+        .map_or_else(|| std::env::temp_dir().join("remu-savedata"), PathBuf::from);
+    let title = game_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix("-app0").or(Some(name)))
+        .unwrap_or("unknown-title");
+    base.join(sanitize_save_segment(title))
+}
+
+fn sanitize_save_segment(value: &str) -> String {
+    let value = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if value.trim_matches('_').is_empty() {
+        "default".to_owned()
+    } else {
+        value
+    }
+}
+
+fn save_data_initialize(state: &ProbeDispatchState) -> u64 {
+    match std::fs::create_dir_all(&state.save_root) {
+        Ok(()) => {
+            eprintln!(
+                "[REMu][SAVEDATA] initialized root={:?}",
+                state.save_root.display()
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("[REMu][SAVEDATA] initialize failed: {error}");
+            sce_kernel_error(0x809f_000b)
+        }
+    }
+}
+
+fn save_data_dir_name_search(arguments: [u64; 6]) -> u64 {
+    let result = arguments[1];
+    if arguments[0] == 0 || result == 0 {
+        return sce_kernel_error(0x809f_0000);
+    }
+    // The launch path only needs an empty initial search result. These are the hitNum and setNum
+    // fields of SceSaveDataDirNameSearchResult; all caller-owned output buffers remain untouched.
+    write_guest_u32(result, 0);
+    write_guest_u32(result + 0x14, 0);
+    0
+}
+
+fn save_data_create_transaction_resource(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let id = state.next_save_transaction_resource.max(1);
+    state.next_save_transaction_resource = id.saturating_add(1);
+    let output = if arguments[2] == 0 {
+        0
+    } else if u16::try_from(arguments[2]).is_ok() {
+        arguments[3]
+    } else {
+        arguments[2]
+    };
+    if output != 0 {
+        write_guest_u32(output, id);
+    }
+    eprintln!("[REMu][SAVEDATA] transaction resource={id} output={output:#x}");
+    0
+}
+
+fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    const MOUNT_RESULT_SIZE: usize = 0x40;
+    const MOUNT_POINT: &str = "/savedata0";
+    let (mount, result) = (arguments[0], arguments[1]);
+    if mount == 0 || result == 0 {
+        return sce_kernel_error(0x809f_0000);
+    }
+    let user_id = low_i32(u64::from(read_guest_u32(mount)));
+    let dir_name_address = read_guest_u64(mount + 0x08);
+    let blocks = read_guest_u64(mount + 0x10);
+    let system_blocks = read_guest_u64(mount + 0x18);
+    let mount_mode = read_guest_u32(mount + 0x20);
+    let resource = read_guest_u32(mount + 0x24);
+    let mode = read_guest_u32(mount + 0x28);
+    let Some(dir_name) = read_guest_cstring(dir_name_address) else {
+        return sce_kernel_error(0x809f_0000);
+    };
+    if user_id < 0 || dir_name.is_empty() {
+        return sce_kernel_error(0x809f_0000);
+    }
+
+    let slot = state.save_root.join(sanitize_save_segment(&dir_name));
+    let existed = slot.is_dir();
+    if let Err(error) = std::fs::create_dir_all(&slot) {
+        eprintln!(
+            "[REMu][SAVEDATA] mount failed path={:?}: {error}",
+            slot.display()
+        );
+        return sce_kernel_error(0x809f_000b);
+    }
+
+    // SAFETY: sceSaveDataMount3 supplies a writable 0x40-byte result structure.
+    unsafe {
+        std::ptr::write_bytes(result as *mut u8, 0, MOUNT_RESULT_SIZE);
+        std::ptr::copy_nonoverlapping(MOUNT_POINT.as_ptr(), result as *mut u8, MOUNT_POINT.len());
+    }
+    write_guest_u32(result + 0x1c, u32::from(!existed));
+    state
+        .save_mounts
+        .insert(MOUNT_POINT.to_owned(), slot.clone());
+    eprintln!(
+        "[REMu][SAVEDATA] mount3 user={user_id} dir={dir_name:?} blocks={blocks:#x} system_blocks={system_blocks:#x} mount_mode={mount_mode:#x} resource={resource} mode={mode:#x} mount={MOUNT_POINT:?} host={:?}",
+        slot.display()
+    );
+    0
+}
+
+fn save_data_umount2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(mount_point) = read_guest_cstring(arguments[0]) else {
+        return 0;
+    };
+    state.save_mounts.remove(&mount_point);
+    eprintln!("[REMu][SAVEDATA] unmounted {mount_point:?}");
+    0
+}
+
+fn guest_sincosf(value: f32, sin_address: u64, cos_address: u64) -> u64 {
+    let (sin, cos) = value.sin_cos();
+    if sin_address != 0 {
+        write_guest_u32(sin_address, sin.to_bits());
+    }
+    if cos_address != 0 {
+        write_guest_u32(cos_address, cos.to_bits());
+    }
+    0
+}
+
+fn guest_qsort(arguments: [u64; 6]) -> u64 {
+    let (base, count, size, comparator) = (arguments[0], arguments[1], arguments[2], arguments[3]);
+    let (Ok(count), Ok(size), Ok(comparator)) = (
+        usize::try_from(count),
+        usize::try_from(size),
+        usize::try_from(comparator),
+    ) else {
+        return 0;
+    };
+    if base == 0
+        || comparator == 0
+        || count < 2
+        || size == 0
+        || count > 1_000_000
+        || size > 1_048_576
+    {
+        return 0;
+    }
+    let Ok(base) = usize::try_from(base) else {
+        return 0;
+    };
+    // The guest comparator is native x86-64 code in this Rosetta process. Dropping the dispatcher
+    // lock before entering this function permits a comparator that itself crosses an import stub.
+    let compare: unsafe extern "C" fn(*const u8, *const u8) -> i32 =
+        unsafe { std::mem::transmute(comparator) };
+    let mut key = vec![0_u8; size];
+    for index in 1..count {
+        // SAFETY: qsort's ABI guarantees a writable `count * size` byte range at `base`.
+        unsafe {
+            let current = (base + index * size) as *mut u8;
+            std::ptr::copy_nonoverlapping(current, key.as_mut_ptr(), size);
+            let mut insertion = index;
+            while insertion > 0 {
+                let previous = (base + (insertion - 1) * size) as *mut u8;
+                if compare(previous, key.as_ptr()) <= 0 {
+                    break;
+                }
+                std::ptr::copy(previous, previous.add(size), size);
+                insertion -= 1;
+            }
+            std::ptr::copy_nonoverlapping(key.as_ptr(), (base + insertion * size) as *mut u8, size);
+        }
+    }
+    0
+}
+
 fn guest_fopen(path_address: u64, mode_address: u64, state: &ProbeDispatchState) -> u64 {
     let (Some(guest_path), Some(mode)) = (
         read_guest_cstring(path_address),
@@ -3910,13 +4198,19 @@ fn guest_fopen(path_address: u64, mode_address: u64, state: &ProbeDispatchState)
     ) else {
         return 0;
     };
-    let Some(host_path) = resolve_guest_path(&state.game_root, &guest_path) else {
+    let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
         eprintln!("[REMu][VFS] rejected path {guest_path:?}");
         return 0;
     };
-    // The bring-up VFS is intentionally read-only; saves receive a separate writable mount later.
-    if !mode.starts_with('r') {
+    if !mode.starts_with('r') && !writable {
         eprintln!("[REMu][VFS] rejected write mode {mode:?} for {guest_path:?}");
+        return 0;
+    }
+    if writable
+        && !mode.starts_with('r')
+        && let Some(parent) = host_path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
         return 0;
     }
     let (Ok(host_path), Ok(mode)) = (
@@ -3947,7 +4241,27 @@ fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<PathBuf> {
     } else {
         normalized.as_str()
     };
-    let mut host = game_root.to_owned();
+    resolve_path_beneath(game_root, relative)
+}
+
+fn resolve_probe_guest_path(
+    state: &ProbeDispatchState,
+    guest_path: &str,
+) -> Option<(PathBuf, bool)> {
+    let normalized = guest_path.replace('\\', "/");
+    for (mount_point, host_root) in &state.save_mounts {
+        if normalized == *mount_point {
+            return Some((host_root.clone(), true));
+        }
+        if let Some(relative) = normalized.strip_prefix(&format!("{mount_point}/")) {
+            return resolve_path_beneath(host_root, relative).map(|path| (path, true));
+        }
+    }
+    resolve_guest_path(&state.game_root, &normalized).map(|path| (path, false))
+}
+
+fn resolve_path_beneath(root: &Path, relative: &str) -> Option<PathBuf> {
+    let mut host = root.to_owned();
     // Console paths routinely contain duplicate separators (for example
     // `/app0//shaders/presenter.vert`). Treat them like POSIX does while keeping parent traversal
     // outside the read-only game root impossible.
@@ -4033,17 +4347,32 @@ fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
     let flags = low_i32(arguments[1]);
-    if flags & 0x3 != 0 {
+    let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
+        eprintln!("[REMu][VFS] sceKernelOpen rejected guest={guest_path:?}");
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    if flags & 0x3 != 0 && !writable {
         eprintln!(
             "[REMu][VFS] sceKernelOpen rejected write access guest={guest_path:?} flags={flags:#x}"
         );
         return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
     }
-    let Some(host_path) = resolve_guest_path(&state.game_root, &guest_path) else {
-        eprintln!("[REMu][VFS] sceKernelOpen rejected guest={guest_path:?}");
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    };
-    let Ok(file) = std::fs::File::open(&host_path) else {
+    let access = flags & 0x3;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(access != 1)
+        .write(access != 0)
+        .append(flags & 0x8 != 0)
+        .create(writable && flags & 0x200 != 0)
+        .truncate(writable && flags & 0x400 != 0);
+    if writable
+        && flags & 0x200 != 0
+        && let Some(parent) = host_path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
+    }
+    let Ok(file) = options.open(&host_path) else {
         eprintln!(
             "[REMu][VFS] sceKernelOpen missing guest={guest_path:?} host={:?}",
             host_path.display()
@@ -4067,7 +4396,7 @@ fn guest_kernel_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
-    let Some(host_path) = resolve_guest_path(&state.game_root, &guest_path) else {
+    let Some((host_path, _)) = resolve_probe_guest_path(state, &guest_path) else {
         eprintln!("[REMu][VFS] sceKernelStat rejected guest={guest_path:?}");
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
@@ -4385,9 +4714,22 @@ mod platform_independent_tests {
     use super::{
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
         AGC_R_DRAW_INDEX_AUTO, ProbeDispatchState, agc_dcb_draw_index_auto,
-        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4, kernel_stat_payload, low_u32,
-        read_guest_u64, resolve_guest_path, sce_kernel_error, write_guest_u32, write_guest_u64,
+        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4, guest_qsort,
+        kernel_stat_payload, low_f32, low_u32, read_guest_u64, resolve_guest_path,
+        sanitize_save_segment, sce_kernel_error, write_guest_u32, write_guest_u64,
     };
+
+    unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
+        // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
+        let left = unsafe { std::ptr::read_unaligned(left.cast::<i32>()) };
+        // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
+        let right = unsafe { std::ptr::read_unaligned(right.cast::<i32>()) };
+        match left.cmp(&right) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
 
     #[test]
     fn resolves_duplicate_console_path_separators() {
@@ -4425,6 +4767,36 @@ mod platform_independent_tests {
     #[test]
     fn sign_extends_gen5_kernel_errors() {
         assert_eq!(sce_kernel_error(0x8002_0002), 0xffff_ffff_8002_0002);
+    }
+
+    #[test]
+    fn decodes_float_argument_from_low_xmm_bits() {
+        let expected = -1.25_f32;
+        assert_eq!(
+            low_f32(f64::from_bits(u64::from(expected.to_bits()))),
+            expected
+        );
+    }
+
+    #[test]
+    fn sorts_guest_elements_with_the_guest_comparator() {
+        let mut values = [7_i32, -2, 11, 0, 4];
+        guest_qsort([
+            u64::try_from(values.as_mut_ptr().addr()).unwrap(),
+            u64::try_from(values.len()).unwrap(),
+            u64::try_from(std::mem::size_of::<i32>()).unwrap(),
+            u64::try_from(compare_i32 as usize).unwrap(),
+            0,
+            0,
+        ]);
+        assert_eq!(values, [-2, 0, 4, 7, 11]);
+    }
+
+    #[test]
+    fn sanitizes_save_slot_path_segments() {
+        assert_eq!(sanitize_save_segment("SAVEDATA00"), "SAVEDATA00");
+        assert_eq!(sanitize_save_segment("../outside"), "___outside");
+        assert_eq!(sanitize_save_segment("///"), "default");
     }
 
     #[test]

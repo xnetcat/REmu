@@ -211,7 +211,9 @@ impl MetalPresenter {
     }
 
     fn receive_events(&mut self, event_loop: &ActiveEventLoop) {
-        loop {
+        // A bounded batch prevents a continuously producing guest from starving redraw and input
+        // delivery. The bounded sender applies backpressure until the next AppKit iteration.
+        for _ in 0..16 {
             match self.receiver.try_recv() {
                 Ok(GpuEvent::DisplayRegistered {
                     width,

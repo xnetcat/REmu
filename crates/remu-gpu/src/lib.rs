@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::{Mutex, OnceLock};
 
 use thiserror::Error;
@@ -159,9 +159,9 @@ pub enum GpuEvent {
     Shutdown,
 }
 
-static GPU_EVENT_SINK: OnceLock<Mutex<Option<Sender<GpuEvent>>>> = OnceLock::new();
+static GPU_EVENT_SINK: OnceLock<Mutex<Option<SyncSender<GpuEvent>>>> = OnceLock::new();
 
-pub fn install_event_sink(sender: Sender<GpuEvent>) {
+pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
     let sink = GPU_EVENT_SINK.get_or_init(|| Mutex::new(None));
     *sink
         .lock()

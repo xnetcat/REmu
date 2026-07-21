@@ -20,6 +20,7 @@ license = "GPL-2.0-or-later"
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
 core-graphics-types = "0.2"
+iced-x86 = "1.21"
 libc = "0.2"
 metal = "0.33"
 objc = "0.2"
