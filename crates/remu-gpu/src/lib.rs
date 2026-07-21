@@ -3,8 +3,9 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use remu_shader::{Program, ShaderMetadata};
 use thiserror::Error;
 
 pub const PAD_BUTTON_L3: u32 = 0x0002;
@@ -106,6 +107,13 @@ pub struct GpuRegister {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShaderSnapshot {
+    pub header_address: u64,
+    pub program: Arc<Program>,
+    pub metadata: Option<ShaderMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedDraw {
     pub sequence: u64,
     pub indexed: bool,
@@ -122,6 +130,8 @@ pub struct IndexedDraw {
     pub pixel_shader_address: u64,
     pub export_shader_prefix: [u32; 4],
     pub pixel_shader_prefix: [u32; 4],
+    pub export_shader: Option<ShaderSnapshot>,
+    pub pixel_shader: Option<ShaderSnapshot>,
     pub color_target_address: u64,
     pub context_registers: Vec<GpuRegister>,
     pub shader_registers: Vec<GpuRegister>,
@@ -155,7 +165,7 @@ pub enum GpuEvent {
         buffer_index: u32,
         flip_argument: u64,
     },
-    IndexedDraw(IndexedDraw),
+    IndexedDraw(Box<IndexedDraw>),
     Shutdown,
 }
 

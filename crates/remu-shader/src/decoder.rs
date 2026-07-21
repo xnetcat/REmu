@@ -7,6 +7,7 @@ use crate::ir::{
     Opcode, Operand, OperandKind, Program, RawOpcodeFamily, ScalarMemoryControl, SdwaControl,
     ShaderEncoding, Vop3Control, Vop3pControl,
 };
+use crate::metadata::GuestMemoryReader;
 
 const MAX_INSTRUCTIONS: usize = 4096;
 
@@ -37,6 +38,10 @@ pub enum DecodeError {
     Unterminated,
     #[error("shader program counter exceeds the 32-bit Gen5 address space")]
     ProgramCounterOverflow,
+    #[error("shader address arithmetic overflowed at pc 0x{pc:X}")]
+    AddressOverflow { pc: u32 },
+    #[error("shader memory is not readable at {address:#x} (pc 0x{pc:X})")]
+    MemoryFault { pc: u32, address: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +89,69 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
         }
     }
     Err(DecodeError::Unterminated)
+}
+
+/// Reads and decodes a program through a fault-reporting guest-memory interface. Only the words
+/// required by each decoded frame are touched, so an `S_ENDPGM` at the end of a mapping does not
+/// cause speculative reads into the following page.
+pub fn read_program(memory: &impl GuestMemoryReader, address: u64) -> Result<Program, DecodeError> {
+    let mut raw_words = Vec::new();
+    for _ in 0..MAX_INSTRUCTIONS {
+        let pc = u32::try_from(
+            raw_words
+                .len()
+                .checked_mul(4)
+                .ok_or(DecodeError::ProgramCounterOverflow)?,
+        )
+        .map_err(|_| DecodeError::ProgramCounterOverflow)?;
+        let first = read_memory_word(memory, address, pc, 0)?;
+        let mut prefix = vec![first];
+        let frame = match decode_frame(pc, &prefix) {
+            Err(DecodeError::Truncated {
+                needed_dwords: 2, ..
+            }) => {
+                prefix.push(read_memory_word(memory, address, pc, 1)?);
+                decode_frame(pc, &prefix)?
+            }
+            result => result?,
+        };
+        for index in prefix.len()..frame.dwords {
+            prefix.push(read_memory_word(memory, address, pc, index)?);
+        }
+        let ended = frame.opcode == Opcode::END_PROGRAM;
+        raw_words.extend(prefix);
+        if ended {
+            return decode_program(address, &raw_words);
+        }
+    }
+    Err(DecodeError::Unterminated)
+}
+
+fn read_memory_word(
+    memory: &impl GuestMemoryReader,
+    base: u64,
+    pc: u32,
+    word_index: usize,
+) -> Result<u32, DecodeError> {
+    let offset = u64::from(pc)
+        .checked_add(
+            u64::try_from(word_index)
+                .map_err(|_| DecodeError::AddressOverflow { pc })?
+                .checked_mul(4)
+                .ok_or(DecodeError::AddressOverflow { pc })?,
+        )
+        .ok_or(DecodeError::AddressOverflow { pc })?;
+    let word_address = base
+        .checked_add(offset)
+        .ok_or(DecodeError::AddressOverflow { pc })?;
+    let mut bytes = [0_u8; 4];
+    if !memory.read(word_address, &mut bytes) {
+        return Err(DecodeError::MemoryFault {
+            pc,
+            address: word_address,
+        });
+    }
+    Ok(u32::from_le_bytes(bytes))
 }
 
 fn decode_frame(pc: u32, words: &[u32]) -> Result<Frame, DecodeError> {
@@ -1598,6 +1666,33 @@ const fn sign_extend(value: u32, bits: u32) -> i32 {
 mod tests {
     use super::*;
 
+    struct SliceMemory {
+        base: u64,
+        words: Vec<u32>,
+    }
+
+    impl GuestMemoryReader for SliceMemory {
+        fn read(&self, address: u64, output: &mut [u8]) -> bool {
+            if output.len() != 4 {
+                return false;
+            }
+            let Some(offset) = address.checked_sub(self.base) else {
+                return false;
+            };
+            if offset & 3 != 0 {
+                return false;
+            }
+            let Ok(index) = usize::try_from(offset / 4) else {
+                return false;
+            };
+            let Some(word) = self.words.get(index) else {
+                return false;
+            };
+            output.copy_from_slice(&word.to_le_bytes());
+            true
+        }
+    }
+
     #[test]
     fn decodes_known_pixel_program_through_architectural_terminator() {
         let program = decode_program(
@@ -1674,5 +1769,16 @@ mod tests {
         };
         assert_eq!(image.address_registers, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(program.instructions[1].pc, 16);
+    }
+
+    #[test]
+    fn memory_reader_stops_exactly_at_endpgm() {
+        let memory = SliceMemory {
+            base: 0x8000,
+            words: vec![0xbf81_0000],
+        };
+        let program = read_program(&memory, memory.base).expect("single-word program");
+        assert_eq!(program.instructions.len(), 1);
+        assert_eq!(program.instructions[0].opcode, Opcode::END_PROGRAM);
     }
 }

@@ -9,7 +9,7 @@ mod inline_constant;
 mod ir;
 mod metadata;
 
-pub use decoder::{DecodeError, decode_program};
+pub use decoder::{DecodeError, decode_program, read_program};
 pub use format::decode_unified_format;
 pub use inline_constant::decode_inline_constant;
 pub use ir::{

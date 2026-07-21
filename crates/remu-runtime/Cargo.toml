@@ -11,6 +11,7 @@ remu-core = { path = "../remu-core" }
 remu-gpu = { path = "../remu-gpu" }
 remu-loader = { path = "../remu-loader" }
 remu-memory = { path = "../remu-memory" }
+remu-shader = { path = "../remu-shader" }
 thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

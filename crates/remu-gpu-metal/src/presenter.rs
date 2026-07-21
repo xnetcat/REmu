@@ -251,7 +251,7 @@ impl MetalPresenter {
                 }
                 Ok(GpuEvent::IndexedDraw(draw)) => {
                     if is_dreaming_presenter_draw(&draw) {
-                        self.pending_guest_draw = Some(draw);
+                        self.pending_guest_draw = Some(*draw);
                     } else if let Some(fill) = execute_dreaming_fill_draw(&draw) {
                         if !self.logged_fill_draw {
                             eprintln!(
@@ -1712,6 +1712,8 @@ mod tests {
             pixel_shader_address: 0,
             export_shader_prefix: [0; 4],
             pixel_shader_prefix: [0; 4],
+            export_shader: None,
+            pixel_shader: None,
             color_target_address: 0,
             context_registers: Vec::new(),
             shader_registers: Vec::new(),
@@ -1776,6 +1778,8 @@ mod tests {
             pixel_shader_address: 0,
             export_shader_prefix: DREAMING_FILL_ES_PREFIX,
             pixel_shader_prefix: DREAMING_FILL_PS_PREFIX,
+            export_shader: None,
+            pixel_shader: None,
             color_target_address: u64::try_from(target.as_mut_ptr().addr())
                 .expect("target address"),
             context_registers: vec![
