@@ -87,7 +87,7 @@ struct MetalPresenter {
     startup_error: Option<String>,
     logged_unsupported_layout: bool,
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
-    logged_guest_draw: bool,
+    logged_guest_layouts: HashSet<(u64, u32, u32, u32)>,
     logged_fill_draw: bool,
 }
 
@@ -115,7 +115,7 @@ impl MetalPresenter {
             startup_error: None,
             logged_unsupported_layout: false,
             logged_unsupported_guest_draws: HashSet::new(),
-            logged_guest_draw: false,
+            logged_guest_layouts: HashSet::new(),
             logged_fill_draw: false,
         })
     }
@@ -387,14 +387,19 @@ impl MetalPresenter {
                 f64::from(descriptor.height),
             ));
         }
-        if !self.logged_guest_draw {
+        let layout = (
+            descriptor.address,
+            descriptor.width,
+            descriptor.height,
+            descriptor.tile_mode,
+        );
+        if self.logged_guest_layouts.len() < 8 && self.logged_guest_layouts.insert(layout) {
             log_guest_draw_upload(
                 &self.guest_bgra_bytes,
                 descriptor,
                 draw.color_target_address,
                 output_length,
             );
-            self.logged_guest_draw = true;
         }
     }
 
