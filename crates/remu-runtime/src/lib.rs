@@ -1,6 +1,8 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+mod agc_register_defaults;
+
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
@@ -1143,7 +1145,8 @@ struct ProbeDispatchState {
     mapped_allocations: Vec<(u64, u64)>,
     next_thread_handle: u64,
     thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
-    agc_register_defaults: u64,
+    agc_primary_register_defaults: u64,
+    agc_internal_register_defaults: u64,
     ctype_table: u64,
     tls_template: Vec<u8>,
     tls_static_block_size: u64,
@@ -1231,7 +1234,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.mapped_allocations.clear();
     state.next_thread_handle = 1;
     state.thread_handles.clear();
-    state.agc_register_defaults = 0;
+    state.agc_primary_register_defaults = 0;
+    state.agc_internal_register_defaults = 0;
     state.ctype_table = 0;
     let tls_template_address = image.tls.thread_pointer.get() - GUEST_TLS_PREFIX_SIZE;
     let tls_template_size = usize::try_from(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
@@ -1867,8 +1871,9 @@ fn dispatch_probe_import(
         "fzyMKs9kim0" => kernel_wait_equeue(arguments, state),
         // Minimal offline NP identities. These services only require stable nonzero IDs at boot.
         "hT0IAEvN+M0" => np_create_handle(arguments, state),
-        // Minimal AGC register-default descriptor; zero groups select the game's fallback path.
-        "2JtWUUiYBXs" | "wRbq6ZjNop4" => agc_register_defaults(state),
+        // Exact Gen5 register-default descriptors consumed by indirect AGC state packets.
+        "2JtWUUiYBXs" => agc_register_defaults(arguments[0], false, state),
+        "wRbq6ZjNop4" => agc_register_defaults(arguments[0], true, state),
         // Inferred from the immediate two-byte character-class lookup at every call site.
         "1uJgoVq3bQU" => guest_ctype_table(state),
         // sceKernelUsleep
@@ -1996,11 +2001,50 @@ fn system_service_get_status(arguments: [u64; 6]) -> u64 {
     0
 }
 
-fn agc_register_defaults(state: &mut ProbeDispatchState) -> u64 {
-    if state.agc_register_defaults == 0 {
-        state.agc_register_defaults = guest_calloc(1, 0x40);
+fn agc_register_defaults(version: u64, internal: bool, state: &mut ProbeDispatchState) -> u64 {
+    if !matches!(low_u32(version), 7 | 8 | 10 | 13) {
+        return 0;
     }
-    state.agc_register_defaults
+
+    let cached = if internal {
+        &mut state.agc_internal_register_defaults
+    } else {
+        &mut state.agc_primary_register_defaults
+    };
+    if *cached != 0 {
+        return *cached;
+    }
+
+    let layout = if internal {
+        agc_register_defaults::RegisterDefaultsLayout::internal()
+    } else {
+        agc_register_defaults::RegisterDefaultsLayout::primary()
+    };
+    let blob_length = layout.blob_length();
+    let Ok(blob_length_u64) = u64::try_from(blob_length) else {
+        return 0;
+    };
+    let address = guest_calloc(1, blob_length_u64);
+    if address == 0 {
+        return 0;
+    }
+    let Some(blob) = layout.build(address) else {
+        guest_free(address);
+        return 0;
+    };
+    debug_assert_eq!(blob.len(), blob_length);
+    // SAFETY: `address` owns a live allocation of exactly `blob_length` bytes and the source is a
+    // separate Vec allocation. The descriptor remains cached for the lifetime of the probe.
+    unsafe {
+        std::ptr::copy_nonoverlapping(blob.as_ptr(), address as *mut u8, blob.len());
+    }
+    *cached = address;
+    eprintln!(
+        "[REMu][AGC] register defaults internal={internal} version={} groups={} address=0x{address:016x}",
+        low_u32(version),
+        layout.group_count()
+    );
+    address
 }
 
 const AGC_SHADER_FILE_HEADER: u32 = 0x3433_3231;
