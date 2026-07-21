@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use core_graphics_types::geometry::CGSize;
@@ -89,6 +90,13 @@ struct ExecutedSoftwareDraw {
     height: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SpriteVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+    opacity: f32,
+}
+
 struct MetalPresenter {
     receiver: Receiver<GpuEvent>,
     window: Option<Window>,
@@ -110,8 +118,9 @@ struct MetalPresenter {
     logged_unsupported_layout: bool,
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
     logged_guest_layouts: HashSet<(u64, u32, u32, u32)>,
+    captured_guest_frames: HashSet<(u64, u32, u32, u32, u64)>,
     logged_fill_draw: bool,
-    logged_software_draws: HashSet<SoftwareDrawKind>,
+    logged_software_draws: HashSet<(SoftwareDrawKind, u64, u64)>,
     capture_directory: Option<PathBuf>,
 }
 
@@ -140,6 +149,7 @@ impl MetalPresenter {
             logged_unsupported_layout: false,
             logged_unsupported_guest_draws: HashSet::new(),
             logged_guest_layouts: HashSet::new(),
+            captured_guest_frames: HashSet::new(),
             logged_fill_draw: false,
             logged_software_draws: HashSet::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
@@ -244,7 +254,13 @@ impl MetalPresenter {
                             self.logged_fill_draw = true;
                         }
                     } else if let Some(executed) = execute_dreaming_software_draw(&draw) {
-                        if self.logged_software_draws.insert(executed.kind) {
+                        if self.logged_software_draws.len() < 32
+                            && self.logged_software_draws.insert((
+                                executed.kind,
+                                executed.source,
+                                executed.target,
+                            ))
+                        {
                             eprintln!(
                                 "[REMu][METAL] executed Dreaming Sarah {:?} compatibility draw source={:#x} target={:#x} {}x{}",
                                 executed.kind,
@@ -437,12 +453,30 @@ impl MetalPresenter {
                 draw.color_target_address,
                 output_length,
             );
-            if let Some(directory) = self.capture_directory.as_deref() {
-                match capture_guest_frame(directory, &self.guest_bgra_bytes, descriptor) {
-                    Ok(path) => eprintln!("[REMu][METAL] captured frame {}", path.display()),
-                    Err(error) => eprintln!("[REMu][METAL] could not capture frame: {error}"),
-                }
-            }
+        }
+        self.capture_guest_frame_if_changed(descriptor);
+    }
+
+    fn capture_guest_frame_if_changed(&mut self, descriptor: GuestTextureDescriptor) {
+        let fingerprint = guest_frame_fingerprint(&self.guest_bgra_bytes);
+        let captured_frame = (
+            descriptor.address,
+            descriptor.width,
+            descriptor.height,
+            descriptor.tile_mode,
+            fingerprint,
+        );
+        if self.captured_guest_frames.len() >= 32
+            || !self.captured_guest_frames.insert(captured_frame)
+        {
+            return;
+        }
+        let Some(directory) = self.capture_directory.as_deref() else {
+            return;
+        };
+        match capture_guest_frame(directory, &self.guest_bgra_bytes, descriptor, fingerprint) {
+            Ok(path) => eprintln!("[REMu][METAL] captured frame {}", path.display()),
+            Err(error) => eprintln!("[REMu][METAL] could not capture frame: {error}"),
         }
     }
 
@@ -507,26 +541,31 @@ fn log_guest_draw_upload(
     let nonzero_bytes = bytes.iter().filter(|&&value| value != 0).count();
     let minimum = bytes.iter().copied().min().unwrap_or(0);
     let maximum = bytes.iter().copied().max().unwrap_or(0);
-    let fingerprint = bytes
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &value| {
-            (hash ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
+    let fingerprint = guest_frame_fingerprint(bytes);
     eprintln!(
         "[REMu][METAL] fast-presented Dreaming Sarah source={:#x} {}x{} tile={} target={target_address:#x} nonzero={nonzero_bytes}/{output_length} range={minimum}..={maximum} fingerprint={fingerprint:016x}",
         descriptor.address, descriptor.width, descriptor.height, descriptor.tile_mode,
     );
 }
 
+fn guest_frame_fingerprint(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &value| {
+            (hash ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
 fn capture_guest_frame(
     directory: &Path,
     bgra: &[u8],
     descriptor: GuestTextureDescriptor,
+    fingerprint: u64,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(directory)
         .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
     let path = directory.join(format!(
-        "remu-{:x}-{}x{}-tile{}.ppm",
+        "remu-{:x}-{}x{}-tile{}-{fingerprint:016x}.ppm",
         descriptor.address, descriptor.width, descriptor.height, descriptor.tile_mode
     ));
     let file = std::fs::File::create(&path)
@@ -646,7 +685,9 @@ fn execute_dreaming_software_draw(draw: &IndexedDraw) -> Option<ExecutedSoftware
         }
         SoftwareDrawKind::Texture => {
             let source = decode_guest_texture(draw, 0x00c)?;
-            software_blit_guest_texture(source, target, true)?;
+            if software_rasterize_sprite(draw, source, target).is_none() {
+                software_blit_guest_texture(source, target, true)?;
+            }
             source.address
         }
         SoftwareDrawKind::Compositor => {
@@ -694,6 +735,343 @@ fn fill_guest_texture(descriptor: GuestTextureDescriptor, rgba: [u8; 4]) -> Opti
         pixel.copy_from_slice(&rgba);
     }
     Some(())
+}
+
+fn software_rasterize_sprite(
+    draw: &IndexedDraw,
+    source: GuestTextureDescriptor,
+    target: GuestTextureDescriptor,
+) -> Option<()> {
+    let vertices = decode_sprite_vertices(draw, target)?;
+    if vertices.len() < 3 || !matches!(source.tile_mode, 0 | 27) {
+        return None;
+    }
+    let source_length = usize::try_from(guest_texture_byte_count(source)?).ok()?;
+    let target_length = usize::try_from(guest_texture_byte_count(target)?).ok()?;
+    if source_length > 128 * 1024 * 1024 || target_length > 128 * 1024 * 1024 {
+        return None;
+    }
+    let source_address = usize::try_from(source.address).ok()?;
+    let target_address = usize::try_from(target.address).ok()?;
+    let source_end = source_address.checked_add(source_length)?;
+    let target_end = target_address.checked_add(target_length)?;
+    if source_address < target_end && target_address < source_end {
+        return None;
+    }
+    // SAFETY: The decoded, bounded texture and target descriptors identify non-overlapping live
+    // guest allocations for the duration of this synchronous compatibility draw.
+    let source_bytes =
+        unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) };
+    let target_bytes =
+        unsafe { std::slice::from_raw_parts_mut(target_address as *mut u8, target_length) };
+    rasterize_sprite_triangles(source_bytes, source, target_bytes, target, &vertices);
+    Some(())
+}
+
+fn decode_sprite_vertices(
+    draw: &IndexedDraw,
+    target: GuestTextureDescriptor,
+) -> Option<Vec<SpriteVertex>> {
+    let descriptor_table = shader_buffer_address(draw, 0x090)?;
+    let attribute_table = shader_pointer_address(draw, 0x092)?;
+    let matrix_address = shader_buffer_address(draw, 0x08c)?;
+    let matrices: [f32; 32] = std::array::from_fn(|index| {
+        read_address_f32(matrix_address + u64::try_from(index).unwrap_or(0) * 4)
+    });
+    if !matrices.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let attribute_entries: [u32; 3] = std::array::from_fn(|attribute| {
+        read_address_u32(attribute_table + u64::try_from(attribute).unwrap_or(0) * 4)
+    });
+    let attribute_descriptors: [u64; 3] = std::array::from_fn(|attribute| {
+        let entry = attribute_entries[attribute];
+        let descriptor_address = descriptor_table + u64::from((entry << 4) & 0x1f0);
+        let low = read_address_u32(descriptor_address);
+        let high = read_address_u32(descriptor_address + 4);
+        (u64::from(high & 0xffff) << 32) | u64::from(low)
+    });
+    if attribute_descriptors
+        .iter()
+        .any(|&address| address < 0x10_000)
+    {
+        return None;
+    }
+    let indices = read_draw_indices(draw)?;
+    let mut vertices = Vec::with_capacity(indices.len());
+    for index in indices {
+        let byte_offset = u64::from(index).checked_mul(24)?;
+        let position_address = attribute_descriptors[0].checked_add(byte_offset)?;
+        let opacity_address = attribute_descriptors[1].checked_add(byte_offset)?;
+        let uv_address = attribute_descriptors[2].checked_add(byte_offset)?;
+        let position = [
+            read_address_f32(position_address),
+            read_address_f32(position_address + 4),
+            read_address_f32(position_address + 8),
+        ];
+        let vertex = SpriteVertex {
+            position: transform_sprite_position(position, &matrices, target)?,
+            uv: [
+                read_address_f32(uv_address),
+                read_address_f32(uv_address + 4),
+            ],
+            opacity: read_address_f32(opacity_address),
+        };
+        if !vertex
+            .position
+            .into_iter()
+            .chain(vertex.uv)
+            .chain([vertex.opacity])
+            .all(f32::is_finite)
+        {
+            return None;
+        }
+        vertices.push(vertex);
+    }
+    trace_sprite_vertices(
+        draw,
+        descriptor_table,
+        attribute_table,
+        attribute_entries,
+        attribute_descriptors,
+        &vertices,
+    );
+    Some(vertices)
+}
+
+fn transform_sprite_position(
+    position: [f32; 3],
+    matrices: &[f32; 32],
+    target: GuestTextureDescriptor,
+) -> Option<[f32; 2]> {
+    if !position.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let model = transform_column_major(
+        [position[0], position[1], position[2], 1.0],
+        matrices[16..].try_into().ok()?,
+    );
+    let clip = transform_column_major(model, matrices[..16].try_into().ok()?);
+    if !clip.iter().all(|value| value.is_finite()) || clip[3].abs() < f32::EPSILON {
+        return None;
+    }
+    let width = f32::from(u16::try_from(target.width).ok()?);
+    let height = f32::from(u16::try_from(target.height).ok()?);
+    Some([
+        (clip[0] / clip[3] + 1.0) * width * 0.5,
+        (1.0 - clip[1] / clip[3]) * height * 0.5,
+    ])
+}
+
+fn transform_column_major(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
+    std::array::from_fn(|row| {
+        vector[0] * matrix[row]
+            + vector[1] * matrix[4 + row]
+            + vector[2] * matrix[8 + row]
+            + vector[3] * matrix[12 + row]
+    })
+}
+
+fn trace_sprite_vertices(
+    draw: &IndexedDraw,
+    descriptor_table: u64,
+    attribute_table: u64,
+    attribute_entries: [u32; 3],
+    attribute_descriptors: [u64; 3],
+    vertices: &[SpriteVertex],
+) {
+    static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    if std::env::var_os("REMU_TRACE_SPRITES").is_none()
+        || TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 12
+    {
+        return;
+    }
+    let matrix_address = shader_buffer_address(draw, 0x08c).unwrap_or_default();
+    let matrices: [f32; 32] = if matrix_address >= 0x10_000 {
+        std::array::from_fn(|index| {
+            read_address_f32(matrix_address + u64::try_from(index).unwrap_or(0) * 4)
+        })
+    } else {
+        [0.0; 32]
+    };
+    eprintln!(
+        "[REMu][METAL][SPRITE] descriptors={descriptor_table:#x}/{attribute_table:#x} entries={attribute_entries:?} bases={attribute_descriptors:x?} indices={} vertices={vertices:?} matrix={matrix_address:#x}/{matrices:?} viewport=[{:08x}, {:08x}, {:08x}, {:08x}]",
+        vertices.len(),
+        register_value(&draw.context_registers, 0x10f).unwrap_or_default(),
+        register_value(&draw.context_registers, 0x110).unwrap_or_default(),
+        register_value(&draw.context_registers, 0x111).unwrap_or_default(),
+        register_value(&draw.context_registers, 0x112).unwrap_or_default(),
+    );
+}
+
+fn shader_buffer_address(draw: &IndexedDraw, register_base: u32) -> Option<u64> {
+    let low = register_value(&draw.shader_registers, register_base)?;
+    let high = register_value(&draw.shader_registers, register_base + 1)?;
+    let address = (u64::from(high & 0xffff) << 32) | u64::from(low);
+    (address >= 0x10_000).then_some(address)
+}
+
+fn shader_pointer_address(draw: &IndexedDraw, register_base: u32) -> Option<u64> {
+    let low = register_value(&draw.shader_registers, register_base)?;
+    let high = register_value(&draw.shader_registers, register_base + 1)?;
+    let address = (u64::from(high) << 32) | u64::from(low);
+    (address >= 0x10_000).then_some(address)
+}
+
+fn read_draw_indices(draw: &IndexedDraw) -> Option<Vec<u32>> {
+    if draw.index_buffer_address < 0x10_000 || draw.index_count > 65_536 {
+        return None;
+    }
+    // AGC encodes zero as 16-bit and every observed nonzero index type as 32-bit. This matches
+    // SharpEmu's `CreateGuestIndexBuffer` handling and, importantly, is not a byte-size enum.
+    let element_size = if draw.index_size == 0 { 2_u64 } else { 4 };
+    let first = u64::from(draw.index_offset).checked_mul(element_size)?;
+    let base = draw.index_buffer_address.checked_add(first)?;
+    Some(
+        (0..draw.index_count)
+            .map(|index| {
+                let address = base + u64::from(index) * element_size;
+                let address = usize::try_from(address).expect("validated index address");
+                // SAFETY: The draw snapshot retains a live index allocation containing the
+                // bounded index range used by this synchronous software draw.
+                unsafe {
+                    match element_size {
+                        1 => u32::from(std::ptr::read_unaligned(address as *const u8)),
+                        2 => u32::from(std::ptr::read_unaligned(address as *const u16)),
+                        _ => std::ptr::read_unaligned(address as *const u32),
+                    }
+                }
+            })
+            .collect(),
+    )
+}
+
+fn read_address_u32(address: u64) -> u32 {
+    let address = usize::try_from(address).expect("validated guest address");
+    // SAFETY: Callers derive this address from a live, validated guest resource descriptor.
+    unsafe { std::ptr::read_unaligned(address as *const u32) }
+}
+
+fn read_address_f32(address: u64) -> f32 {
+    f32::from_bits(read_address_u32(address))
+}
+
+fn rasterize_sprite_triangles(
+    source_bytes: &[u8],
+    source: GuestTextureDescriptor,
+    target_bytes: &mut [u8],
+    target: GuestTextureDescriptor,
+    vertices: &[SpriteVertex],
+) {
+    for triangle in vertices.chunks_exact(3) {
+        rasterize_sprite_triangle(source_bytes, source, target_bytes, target, triangle);
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn rasterize_sprite_triangle(
+    source_bytes: &[u8],
+    source: GuestTextureDescriptor,
+    target_bytes: &mut [u8],
+    target: GuestTextureDescriptor,
+    vertices: &[SpriteVertex],
+) {
+    let edge = |a: [f32; 2], b: [f32; 2], point: [f32; 2]| {
+        (point[0] - a[0]) * (b[1] - a[1]) - (point[1] - a[1]) * (b[0] - a[0])
+    };
+    let area = edge(
+        vertices[1].position,
+        vertices[2].position,
+        vertices[0].position,
+    );
+    if area.abs() < f32::EPSILON {
+        return;
+    }
+    let (Ok(target_width), Ok(target_height)) =
+        (i32::try_from(target.width), i32::try_from(target.height))
+    else {
+        return;
+    };
+    let minimum_x = vertices
+        .iter()
+        .map(|vertex| vertex.position[0])
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i32;
+    let maximum_x = vertices
+        .iter()
+        .map(|vertex| vertex.position[0])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(target_width as f32) as i32;
+    let minimum_y = vertices
+        .iter()
+        .map(|vertex| vertex.position[1])
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i32;
+    let maximum_y = vertices
+        .iter()
+        .map(|vertex| vertex.position[1])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(target_height as f32) as i32;
+    for y in minimum_y..maximum_y {
+        for x in minimum_x..maximum_x {
+            let point = [x as f32 + 0.5, y as f32 + 0.5];
+            let weights = [
+                edge(vertices[1].position, vertices[2].position, point) / area,
+                edge(vertices[2].position, vertices[0].position, point) / area,
+                edge(vertices[0].position, vertices[1].position, point) / area,
+            ];
+            if weights.iter().any(|&weight| weight < -0.000_1) {
+                continue;
+            }
+            let uv = [
+                weights[0] * vertices[0].uv[0]
+                    + weights[1] * vertices[1].uv[0]
+                    + weights[2] * vertices[2].uv[0],
+                weights[0] * vertices[0].uv[1]
+                    + weights[1] * vertices[1].uv[1]
+                    + weights[2] * vertices[2].uv[1],
+            ];
+            let opacity = (weights[0] * vertices[0].opacity
+                + weights[1] * vertices[1].opacity
+                + weights[2] * vertices[2].opacity)
+                .clamp(0.0, 1.0);
+            let source_x =
+                (uv[0].clamp(0.0, 1.0) * (source.width.saturating_sub(1)) as f32).round() as usize;
+            let source_y =
+                (uv[1].clamp(0.0, 1.0) * (source.height.saturating_sub(1)) as f32).round() as usize;
+            let source_offset = guest_pixel_byte_offset(source, source_x, source_y);
+            let target_offset = guest_pixel_byte_offset(target, x as usize, y as usize);
+            let source_pixel = &source_bytes[source_offset..source_offset + 4];
+            let mut modulated = [0_u8; 4];
+            for channel in 0..4 {
+                modulated[channel] = transform_color_channel(source_pixel[channel], opacity, 0.0);
+            }
+            blend_premultiplied_rgba(
+                &modulated,
+                &mut target_bytes[target_offset..target_offset + 4],
+            );
+        }
+    }
+}
+
+fn blend_premultiplied_rgba(source: &[u8], target: &mut [u8]) {
+    let inverse = 255 - u32::from(source[3]);
+    for channel in 0..4 {
+        target[channel] = u8::try_from(
+            u32::from(source[channel])
+                .saturating_add((u32::from(target[channel]) * inverse + 127) / 255)
+                .min(255),
+        )
+        .expect("clamped premultiplied blend channel fits in u8");
+    }
 }
 
 fn software_blit_guest_texture(
@@ -1177,9 +1555,45 @@ mod tests {
 
     use super::{
         DREAMING_FILL_ES_PREFIX, DREAMING_FILL_PS_PREFIX, GuestPresentConstants,
-        GuestTextureDescriptor, blit_guest_texture_bytes, convert_guest_rgba_to_bgra,
-        convert_mode27_rgba_to_bgra, execute_dreaming_fill_draw, mode27_source_byte_offset,
+        GuestTextureDescriptor, blend_premultiplied_rgba, blit_guest_texture_bytes,
+        convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra, execute_dreaming_fill_draw,
+        mode27_source_byte_offset, read_draw_indices, transform_sprite_position,
     };
+
+    fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
+        IndexedDraw {
+            sequence: 1,
+            indexed: true,
+            instance_count: 1,
+            index_buffer_address: address,
+            index_resource_address: 0,
+            index_buffer_count: index_count,
+            index_size,
+            index_offset: 0,
+            index_count,
+            draw_flags: 0,
+            primitive_type: 4,
+            export_shader_address: 0,
+            pixel_shader_address: 0,
+            export_shader_prefix: [0; 4],
+            pixel_shader_prefix: [0; 4],
+            color_target_address: 0,
+            context_registers: Vec::new(),
+            shader_registers: Vec::new(),
+            user_config_registers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn decodes_agc_16_and_32_bit_index_types() {
+        let indices_16 = [0_u16, 1, 2, 0, 2, 3];
+        let draw_16 = indexed_draw(indices_16.as_ptr().addr() as u64, 0, 6);
+        assert_eq!(read_draw_indices(&draw_16), Some(vec![0, 1, 2, 0, 2, 3]));
+
+        let indices_32 = [0_u32, 1, 2, 0, 2, 3];
+        let draw_32 = indexed_draw(indices_32.as_ptr().addr() as u64, 1, 6);
+        assert_eq!(read_draw_indices(&draw_32), Some(vec![0, 1, 2, 0, 2, 3]));
+    }
 
     #[test]
     fn converts_pitched_rgba_and_applies_presenter_constants() {
@@ -1338,5 +1752,67 @@ mod tests {
         assert_eq!(target[top_left..top_left + 4], [100, 0, 0, 255]);
         assert_eq!(target[top_right..top_right + 4], [5, 60, 15, 255]);
         assert_eq!(target[untouched..untouched + 4], [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn transforms_dreaming_sarah_fullscreen_composite_vertices() {
+        let matrices = [
+            1.357_995_2,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            2.414_213_4,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -1.002_002,
+            -1.0,
+            0.0,
+            0.0,
+            -2.002_002,
+            0.0,
+            0.115_059_41,
+            0.0,
+            0.0,
+            0.0,
+            -0.0,
+            -0.115_059_41,
+            -0.0,
+            -0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            -100.0,
+            1.0,
+        ];
+        let target = GuestTextureDescriptor {
+            address: 0,
+            width: 1280,
+            height: 720,
+            pitch: 1280,
+            tile_mode: 27,
+        };
+
+        let top_left = transform_sprite_position([-640.0, -360.0, 0.0], &matrices, target)
+            .expect("observed transform is valid");
+        let bottom_right = transform_sprite_position([640.0, 360.0, 0.0], &matrices, target)
+            .expect("observed transform is valid");
+
+        assert!(top_left[0].abs() < 0.001);
+        assert!(top_left[1].abs() < 0.001);
+        assert!((bottom_right[0] - 1280.0).abs() < 0.001);
+        assert!((bottom_right[1] - 720.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn blends_the_observed_premultiplied_sprite_mode() {
+        let mut target = [20, 40, 60, 127];
+        blend_premultiplied_rgba(&[100, 50, 25, 128], &mut target);
+        assert_eq!(target, [110, 70, 55, 191]);
     }
 }
