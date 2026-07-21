@@ -3,8 +3,9 @@
 REmu is an experimental PlayStation 5 compatibility layer written in Rust. Its goal is to run
 legally dumped games directly on desktop operating systems without emulating the PlayStation shell.
 
-The project is at the early boot-probing stage. It maps and enters authorized game dumps under
-Rosetta, but does not reach a game loop yet.
+The project maps and runs authorized x86-64 game dumps under Rosetta. Dreaming Sarah currently
+boots through resource loading and renders its title through the Metal presentation path; title-to-
+menu transition work is in progress.
 
 See the [architecture](docs/architecture.md), [implementation roadmap](docs/roadmap.md), and
 [reference audit](docs/reference-audit.md). Adapted implementation sources are tracked in
@@ -27,7 +28,17 @@ cargo run -p remu-cli -- imports /path/to/eboot.bin
 cargo run -p remu-cli -- map /path/to/eboot.bin
 cargo run -p remu-cli -- link /path/to/eboot.bin
 cargo run -p remu-cli -- probe /path/to/eboot.bin
+cargo run -p remu-cli -- run /path/to/eboot.bin
 cargo run -p remu-cli -- gpu-info
+```
+
+For repeatable Apple Silicon game runs, use the bounded runner. It builds the x86-64 release,
+injects periodic Cross presses, captures changed frames, records unresolved NIDs, and always cleans
+up its exact child process:
+
+```sh
+scripts/run-game.sh DREAMING 120
+scripts/run-game.sh SUPERLIMINAL 120
 ```
 
 On Apple Silicon, use the crash-capturing probe wrapper during game bring-up. It builds the

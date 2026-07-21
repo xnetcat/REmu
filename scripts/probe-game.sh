@@ -28,7 +28,7 @@ if [ ! -f "$game_path" ]; then
     exit 66
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 run_dir="$repo_dir/.remu/runs/$run_id"
@@ -42,8 +42,10 @@ cargo build --manifest-path "$repo_dir/Cargo.toml" \
 echo "[REMu] launching under LLDB; artifacts: $run_dir"
 set +e
 env TERM=dumb arch -x86_64 /usr/bin/lldb --no-lldbinit -b \
+    -o 'process handle SIGALRM -n false -p true -s false' \
     -o 'target stop-hook add -I false -o "thread backtrace all -c 24" -o "register read"' \
     -o "process launch -o '$run_dir/guest.stdout' -e '$run_dir/guest.stderr'" \
+    -o 'quit' \
     -- "$binary" probe "$game_path" \
     --import-limit "$import_limit" --timeout-seconds "$timeout_seconds" \
     > "$run_dir/debugger.log" 2>&1
