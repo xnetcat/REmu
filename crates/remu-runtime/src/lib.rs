@@ -1154,6 +1154,8 @@ struct ProbeDispatchState {
     game_root: PathBuf,
     next_np_handle: i32,
     agc_submission_count: u64,
+    agc_graphics: AgcGraphicsState,
+    agc_index_resources: BTreeMap<u64, u64>,
     pending_events: VecDeque<KernelQueuedEvent>,
 }
 
@@ -1165,6 +1167,32 @@ struct VideoOutState {
     height: u32,
     display_buffers: Vec<u64>,
     flip_events: BTreeMap<u64, u64>,
+}
+
+#[derive(Debug, Default)]
+struct AgcGraphicsState {
+    context_registers: BTreeMap<u32, u32>,
+    shader_registers: BTreeMap<u32, u32>,
+    user_config_registers: BTreeMap<u32, u32>,
+    index_buffer_address: u64,
+    index_resource_address: u64,
+    index_buffer_count: u32,
+    index_size: u32,
+    draw_index_offset: u32,
+    emitted_draws: u64,
+}
+
+impl AgcGraphicsState {
+    fn reset_pipeline(&mut self) {
+        self.context_registers.clear();
+        self.shader_registers.clear();
+        self.user_config_registers.clear();
+        self.index_buffer_address = 0;
+        self.index_resource_address = 0;
+        self.index_buffer_count = 0;
+        self.index_size = 0;
+        self.draw_index_offset = 0;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1255,6 +1283,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     game_root.clone_into(&mut state.game_root);
     state.next_np_handle = 1;
     state.agc_submission_count = 0;
+    state.agc_graphics = AgcGraphicsState::default();
+    state.agc_index_resources.clear();
     state.pending_events.clear();
     let sync = GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()));
     *sync
@@ -1841,7 +1871,7 @@ fn dispatch_probe_import(
         "3KDcnM3lrcU" => agc_wait_reg_mem_patch_address(arguments),
         "0fWWK5uG9rQ" => agc_release_mem_patch_address(arguments),
         "57labkp+rSQ" => agc_dcb_acquire_mem(arguments, stack_arguments),
-        "l4fM9K-Lyks" => agc_dcb_set_index_buffer(arguments),
+        "l4fM9K-Lyks" => agc_dcb_set_index_buffer(arguments, state),
         "GIIW2J37e70" => agc_dcb_set_index_size(arguments),
         "B+aG9DUnTKA" => agc_dcb_draw_index_offset(arguments),
         "YUeqkyT7mEQ" => agc_dcb_set_flip(arguments),
@@ -2072,7 +2102,9 @@ const AGC_IT_INDEX_TYPE: u32 = 0x2a;
 const AGC_IT_DRAW_INDEX_OFFSET: u32 = 0x35;
 const AGC_IT_WAIT_REG_MEM: u32 = 0x3c;
 const AGC_IT_EVENT_WRITE: u32 = 0x46;
+const AGC_IT_SET_CONTEXT_REG: u32 = 0x69;
 const AGC_IT_SET_SH_REG: u32 = 0x76;
+const AGC_IT_SET_UCONFIG_REG: u32 = 0x79;
 const AGC_R_ZERO: u32 = 0x00;
 const AGC_R_DRAW_RESET: u32 = 0x05;
 const AGC_R_WAIT_MEM_32: u32 = 0x0a;
@@ -2088,6 +2120,12 @@ const AGC_CB_SET_SH_REGISTER_RANGE_MARKER: u32 = 0x6875_000d;
 
 const AGC_SPI_PS_INPUT_CNTL_0: u32 = 0x191;
 const AGC_VGT_PRIMITIVE_TYPE: u32 = 0x242;
+const AGC_SPI_SHADER_PGM_LO_PS: u32 = 0x008;
+const AGC_SPI_SHADER_PGM_HI_PS: u32 = 0x009;
+const AGC_SPI_SHADER_PGM_LO_ES: u32 = 0x0c8;
+const AGC_SPI_SHADER_PGM_HI_ES: u32 = 0x0c9;
+const AGC_CB_COLOR0_BASE: u32 = 0x318;
+const AGC_CB_COLOR0_BASE_EXT: u32 = 0x390;
 
 const AGC_SHADER_SPECIAL_GE_CNTL_OFFSET: u64 = 0x00;
 const AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET: u64 = 0x08;
@@ -2726,15 +2764,24 @@ fn agc_dcb_set_flip(arguments: [u64; 6]) -> u64 {
     command
 }
 
-fn agc_dcb_set_index_buffer(arguments: [u64; 6]) -> u64 {
+fn agc_dcb_set_index_buffer(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let Some(command) = agc_allocate_command_dwords(arguments[0], 5) else {
         return 0;
     };
+    // Gen5's four-argument form carries a CPU-readable index pointer, its GPU resource address,
+    // and the element capacity. Keep the association so the host renderer can read the indices
+    // while preserving the resource address needed for later descriptor translation.
+    let index_buffer_address = arguments[1];
+    let index_resource_address = arguments[2];
+    let index_count = low_u32(arguments[3]);
+    state
+        .agc_index_resources
+        .insert(index_buffer_address, index_resource_address);
     write_guest_u32(command, agc_pm4(3, AGC_IT_INDEX_BASE, 0));
-    write_guest_u32(command + 4, low_u32(arguments[1]));
-    write_guest_u32(command + 8, low_u32(arguments[1] >> 32));
+    write_guest_u32(command + 4, low_u32(index_buffer_address));
+    write_guest_u32(command + 8, low_u32(index_buffer_address >> 32));
     write_guest_u32(command + 12, agc_pm4(2, AGC_IT_INDEX_BUFFER_SIZE, 0));
-    write_guest_u32(command + 16, low_u32(arguments[2]));
+    write_guest_u32(command + 16, index_count);
     command
 }
 
@@ -2796,6 +2843,146 @@ fn queue_video_out_flip(
     }
 }
 
+fn agc_apply_submission_registers(
+    packet_address: u64,
+    length: u32,
+    opcode: u32,
+    register: u32,
+    graphics: &mut AgcGraphicsState,
+) {
+    if matches!(
+        opcode,
+        AGC_IT_SET_CONTEXT_REG | AGC_IT_SET_SH_REG | AGC_IT_SET_UCONFIG_REG
+    ) {
+        if length < 3 {
+            return;
+        }
+        let first_register = read_guest_u32(packet_address + 4);
+        let destination = match opcode {
+            AGC_IT_SET_CONTEXT_REG => &mut graphics.context_registers,
+            AGC_IT_SET_SH_REG => &mut graphics.shader_registers,
+            _ => &mut graphics.user_config_registers,
+        };
+        for index in 0..length - 2 {
+            destination.insert(
+                first_register + index,
+                read_guest_u32(packet_address + u64::from(index + 2) * 4),
+            );
+        }
+        return;
+    }
+
+    if opcode != AGC_IT_NOP
+        || !matches!(
+            register,
+            AGC_R_SH_REGS_INDIRECT | AGC_R_CX_REGS_INDIRECT | AGC_R_UC_REGS_INDIRECT
+        )
+        || length < 4
+    {
+        return;
+    }
+    let register_count = read_guest_u32(packet_address + 4).min(4_096);
+    let registers_address = read_guest_u64(packet_address + 8);
+    if registers_address == 0 {
+        return;
+    }
+    let destination = match register {
+        AGC_R_CX_REGS_INDIRECT => &mut graphics.context_registers,
+        AGC_R_SH_REGS_INDIRECT => &mut graphics.shader_registers,
+        _ => &mut graphics.user_config_registers,
+    };
+    for index in 0..register_count {
+        let entry = registers_address + u64::from(index) * 8;
+        destination.insert(read_guest_u32(entry), read_guest_u32(entry + 4));
+    }
+}
+
+fn agc_program_address(registers: &BTreeMap<u32, u32>, low: u32, high: u32) -> u64 {
+    let Some((&low, &high)) = registers.get(&low).zip(registers.get(&high)) else {
+        return 0;
+    };
+    (u64::from(high) << 40) | (u64::from(low) << 8)
+}
+
+fn agc_color_target_address(registers: &BTreeMap<u32, u32>) -> u64 {
+    let Some((&low, &high)) = registers
+        .get(&AGC_CB_COLOR0_BASE)
+        .zip(registers.get(&AGC_CB_COLOR0_BASE_EXT))
+    else {
+        return 0;
+    };
+    (u64::from(high & 0xff) << 40) | (u64::from(low) << 8)
+}
+
+fn agc_register_snapshot(registers: &BTreeMap<u32, u32>) -> Vec<remu_gpu::GpuRegister> {
+    registers
+        .iter()
+        .map(|(&offset, &value)| remu_gpu::GpuRegister { offset, value })
+        .collect()
+}
+
+fn agc_emit_indexed_draw(packet_address: u64, graphics: &mut AgcGraphicsState) {
+    let index_offset = read_guest_u32(packet_address + 8);
+    let index_count = read_guest_u32(packet_address + 12);
+    if index_count == 0 {
+        return;
+    }
+    let draw_flags = read_guest_u32(packet_address + 16);
+    graphics.draw_index_offset = index_offset;
+    graphics.emitted_draws = graphics.emitted_draws.saturating_add(1);
+
+    let export_shader_address = agc_program_address(
+        &graphics.shader_registers,
+        AGC_SPI_SHADER_PGM_LO_ES,
+        AGC_SPI_SHADER_PGM_HI_ES,
+    );
+    let pixel_shader_address = agc_program_address(
+        &graphics.shader_registers,
+        AGC_SPI_SHADER_PGM_LO_PS,
+        AGC_SPI_SHADER_PGM_HI_PS,
+    );
+    let color_target_address = agc_color_target_address(&graphics.context_registers);
+    let primitive_type = graphics
+        .user_config_registers
+        .get(&AGC_VGT_PRIMITIVE_TYPE)
+        .copied()
+        .unwrap_or_default();
+    let draw = remu_gpu::IndexedDraw {
+        sequence: graphics.emitted_draws,
+        index_buffer_address: graphics.index_buffer_address,
+        index_resource_address: graphics.index_resource_address,
+        index_buffer_count: graphics.index_buffer_count,
+        index_size: graphics.index_size,
+        index_offset,
+        index_count,
+        draw_flags,
+        primitive_type,
+        export_shader_address,
+        pixel_shader_address,
+        color_target_address,
+        context_registers: agc_register_snapshot(&graphics.context_registers),
+        shader_registers: agc_register_snapshot(&graphics.shader_registers),
+        user_config_registers: agc_register_snapshot(&graphics.user_config_registers),
+    };
+    if draw.sequence <= 8 {
+        eprintln!(
+            "[REMu][AGC] draw={} indexed count={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x}",
+            draw.sequence,
+            draw.index_count,
+            draw.index_offset,
+            draw.index_buffer_address,
+            draw.index_buffer_count,
+            draw.index_resource_address,
+            draw.index_size,
+            draw.primitive_type,
+            draw.export_shader_address,
+            draw.pixel_shader_address,
+            draw.color_target_address,
+        );
+    }
+    remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(draw));
+}
+
 fn agc_parse_submission(command_address: u64, dword_count: u32, state: &mut ProbeDispatchState) {
     let mut offset = 0_u32;
     let mut packets = BTreeMap::<(u32, u32), u32>::new();
@@ -2825,39 +3012,33 @@ fn agc_parse_submission(command_address: u64, dword_count: u32, state: &mut Prob
         let opcode = (header >> 8) & 0xff;
         let register = (header >> 2) & 0x3f;
         *packets.entry((opcode, register)).or_default() += 1;
-        if state.agc_submission_count == 0
-            && opcode == AGC_IT_NOP
-            && matches!(
-                register,
-                AGC_R_SH_REGS_INDIRECT | AGC_R_CX_REGS_INDIRECT | AGC_R_UC_REGS_INDIRECT
-            )
-            && length >= 4
-        {
-            let register_count = read_guest_u32(packet_address + 4).min(256);
-            let registers_address = read_guest_u64(packet_address + 8);
-            let space = match register {
-                AGC_R_SH_REGS_INDIRECT => "sh",
-                AGC_R_CX_REGS_INDIRECT => "cx",
-                _ => "uc",
-            };
-            for index in 0..register_count {
-                let entry = registers_address + u64::from(index) * 8;
-                eprintln!(
-                    "[REMu][AGC] reg space={space} offset={:#05x} value={:#010x}",
-                    read_guest_u32(entry),
-                    read_guest_u32(entry + 4),
-                );
-            }
+        if opcode == AGC_IT_NOP && register == AGC_R_DRAW_RESET && length >= 2 {
+            state.agc_graphics.reset_pipeline();
         }
-        if state.agc_submission_count == 0 && opcode == AGC_IT_SET_SH_REG && length >= 3 {
-            let first_register = read_guest_u32(packet_address + 4);
-            for index in 0..length - 2 {
-                eprintln!(
-                    "[REMu][AGC] reg space=sh-direct offset={:#05x} value={:#010x}",
-                    first_register + index,
-                    read_guest_u32(packet_address + u64::from(index + 2) * 4),
-                );
-            }
+        agc_apply_submission_registers(
+            packet_address,
+            length,
+            opcode,
+            register,
+            &mut state.agc_graphics,
+        );
+        if opcode == AGC_IT_INDEX_BASE && length >= 3 {
+            state.agc_graphics.index_buffer_address = u64::from(read_guest_u32(packet_address + 4))
+                | (u64::from(read_guest_u32(packet_address + 8)) << 32);
+            state.agc_graphics.index_resource_address = state
+                .agc_index_resources
+                .get(&state.agc_graphics.index_buffer_address)
+                .copied()
+                .unwrap_or_default();
+        }
+        if opcode == AGC_IT_INDEX_BUFFER_SIZE && length >= 2 {
+            state.agc_graphics.index_buffer_count = read_guest_u32(packet_address + 4);
+        }
+        if opcode == AGC_IT_INDEX_TYPE && length >= 2 {
+            state.agc_graphics.index_size = read_guest_u32(packet_address + 4) & 0x3;
+        }
+        if opcode == AGC_IT_DRAW_INDEX_OFFSET && length >= 5 {
+            agc_emit_indexed_draw(packet_address, &mut state.agc_graphics);
         }
         if opcode == AGC_IT_NOP && register == AGC_R_FLIP && length >= 6 {
             let handle = read_guest_u32(packet_address + 4);
@@ -3877,7 +4058,10 @@ fn terminate_probe(code: i32) -> ! {
 mod platform_independent_tests {
     use std::path::Path;
 
-    use super::resolve_guest_path;
+    use super::{
+        AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, ProbeDispatchState, agc_dcb_set_index_buffer,
+        agc_pm4, low_u32, read_guest_u64, resolve_guest_path, write_guest_u32, write_guest_u64,
+    };
 
     #[test]
     fn resolves_duplicate_console_path_separators() {
@@ -3892,6 +4076,51 @@ mod platform_independent_tests {
         assert_eq!(
             resolve_guest_path(Path::new("/games/title"), "/app0/../outside.bin"),
             None
+        );
+    }
+
+    #[test]
+    fn builds_the_four_argument_gen5_index_buffer_packets() {
+        let mut command_buffer = vec![0_u8; 0x40];
+        let mut commands = vec![0_u32; 16];
+        let indices = [0_u32, 1, 2, 1, 2, 3];
+        let command_buffer_address =
+            u64::try_from(command_buffer.as_mut_ptr().addr()).expect("command buffer address");
+        let commands_address =
+            u64::try_from(commands.as_mut_ptr().addr()).expect("command storage address");
+        let index_buffer_address =
+            u64::try_from(indices.as_ptr().addr()).expect("index buffer address");
+        let index_resource_address = 0x70_0007_3030;
+        write_guest_u64(command_buffer_address + 0x10, commands_address);
+        write_guest_u64(command_buffer_address + 0x18, commands_address + 64);
+        write_guest_u32(command_buffer_address + 0x30, 0);
+
+        let mut state = ProbeDispatchState::default();
+        let command = agc_dcb_set_index_buffer(
+            [
+                command_buffer_address,
+                index_buffer_address,
+                index_resource_address,
+                16,
+                0,
+                0,
+            ],
+            &mut state,
+        );
+
+        assert_eq!(command, commands_address);
+        assert_eq!(commands[0], agc_pm4(3, AGC_IT_INDEX_BASE, 0));
+        assert_eq!(commands[1], low_u32(index_buffer_address));
+        assert_eq!(commands[2], low_u32(index_buffer_address >> 32));
+        assert_eq!(commands[3], agc_pm4(2, AGC_IT_INDEX_BUFFER_SIZE, 0));
+        assert_eq!(commands[4], 16);
+        assert_eq!(
+            read_guest_u64(command_buffer_address + 0x10),
+            commands_address + 20
+        );
+        assert_eq!(
+            state.agc_index_resources.get(&index_buffer_address),
+            Some(&index_resource_address)
         );
     }
 }

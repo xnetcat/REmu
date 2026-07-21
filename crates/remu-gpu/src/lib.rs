@@ -29,6 +29,31 @@ pub struct GpuAdapter {
     pub name: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuRegister {
+    pub offset: u32,
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexedDraw {
+    pub sequence: u64,
+    pub index_buffer_address: u64,
+    pub index_resource_address: u64,
+    pub index_buffer_count: u32,
+    pub index_size: u32,
+    pub index_offset: u32,
+    pub index_count: u32,
+    pub draw_flags: u32,
+    pub primitive_type: u32,
+    pub export_shader_address: u64,
+    pub pixel_shader_address: u64,
+    pub color_target_address: u64,
+    pub context_registers: Vec<GpuRegister>,
+    pub shader_registers: Vec<GpuRegister>,
+    pub user_config_registers: Vec<GpuRegister>,
+}
+
 #[derive(Debug, Error)]
 pub enum GpuProbeError {
     #[error("{0} is unavailable on this host")]
@@ -56,6 +81,7 @@ pub enum GpuEvent {
         buffer_index: u32,
         flip_argument: u64,
     },
+    IndexedDraw(IndexedDraw),
     Shutdown,
 }
 

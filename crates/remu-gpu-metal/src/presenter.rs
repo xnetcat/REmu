@@ -6,12 +6,10 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
-    CompileOptions, Device, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRegion,
-    MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MetalLayer,
-    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, Texture,
-    TextureDescriptor,
+    Device, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
+    MTLTextureUsage, MetalLayer, Texture, TextureDescriptor,
 };
-use objc::runtime::{Object, YES};
+use objc::runtime::{Class, Object, YES};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::GpuEvent;
 use winit::application::ApplicationHandler;
@@ -21,32 +19,6 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
-
-const PRESENT_SHADER: &str = r"
-#include <metal_stdlib>
-using namespace metal;
-
-struct PresentVertex {
-    float4 position [[position]];
-    float2 uv;
-};
-
-vertex PresentVertex remu_present_vertex(uint vertex_id [[vertex_id]]) {
-    const float2 positions[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
-    const float2 uvs[3] = { float2(0.0, 1.0), float2(2.0, 1.0), float2(0.0, -1.0) };
-    PresentVertex output;
-    output.position = float4(positions[vertex_id], 0.0, 1.0);
-    output.uv = uvs[vertex_id];
-    return output;
-}
-
-fragment float4 remu_present_fragment(
-    PresentVertex input [[stage_in]],
-    texture2d<float> frame [[texture(0)]]) {
-    constexpr sampler frame_sampler(coord::normalized, address::clamp_to_edge, filter::linear);
-    return frame.sample(frame_sampler, input.uv);
-}
-";
 
 #[derive(Clone, Copy)]
 struct DisplayConfiguration {
@@ -69,7 +41,6 @@ struct MetalPresenter {
     device: Option<Device>,
     layer: Option<MetalLayer>,
     command_queue: Option<metal::CommandQueue>,
-    pipeline: Option<RenderPipelineState>,
     frame_texture: Option<Texture>,
     frame_texture_size: (u32, u32),
     display: Option<DisplayConfiguration>,
@@ -81,14 +52,15 @@ struct MetalPresenter {
 }
 
 impl MetalPresenter {
-    fn new(receiver: Receiver<GpuEvent>) -> Self {
-        Self {
+    fn new(receiver: Receiver<GpuEvent>) -> Result<Self, String> {
+        let device = Device::system_default().ok_or("no Metal device is available")?;
+        let command_queue = device.new_command_queue();
+        Ok(Self {
             receiver,
             window: None,
-            device: None,
+            device: Some(device),
             layer: None,
-            command_queue: None,
-            pipeline: None,
+            command_queue: Some(command_queue),
             frame_texture: None,
             frame_texture_size: (0, 0),
             display: None,
@@ -97,22 +69,27 @@ impl MetalPresenter {
             uploaded_flip_sequence: 0,
             startup_error: None,
             logged_unsupported_layout: false,
-        }
+        })
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         let window = event_loop
-            .create_window(
-                Window::default_attributes()
-                    .with_title("REmu — Dreaming Sarah")
-                    .with_inner_size(LogicalSize::new(1280, 720)),
-            )
+            .create_window(presenter_window_attributes())
             .map_err(|error| format!("could not create the macOS window: {error}"))?;
-        let device = Device::system_default().ok_or("no Metal device is available")?;
+        self.initialize_window(window)
+    }
+
+    fn initialize_window(&mut self, window: Window) -> Result<(), String> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal presenter resources are unavailable")?;
         let mut layer = MetalLayer::new();
-        layer.set_device(&device);
+        layer.set_device(device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        layer.set_framebuffer_only(true);
+        // The compiler-free presenter blits into each drawable instead of running a fullscreen
+        // shader, so the drawable must permit blit writes.
+        layer.set_framebuffer_only(false);
         layer.set_presents_with_transaction(false);
 
         // SAFETY: Winit owns a live NSView on the main thread. NSView retains the CAMetalLayer;
@@ -131,15 +108,10 @@ impl MetalPresenter {
 
         let size = window.inner_size();
         layer.set_drawable_size(CGSize::new(f64::from(size.width), f64::from(size.height)));
-        let pipeline = create_present_pipeline(&device)?;
-        let command_queue = device.new_command_queue();
         eprintln!("[REMu][METAL] presenter started on {}", device.name());
 
         self.window = Some(window);
-        self.device = Some(device);
         self.layer = Some(layer);
-        self.command_queue = Some(command_queue);
-        self.pipeline = Some(pipeline);
         Ok(())
     }
 
@@ -162,6 +134,11 @@ impl MetalPresenter {
                         tiling_mode,
                     });
                     self.frame_texture = None;
+                    if let Some(layer) = self.layer.as_ref() {
+                        // Keep the drawable at guest resolution. Core Animation scales it into the
+                        // window while Metal performs a simple one-to-one copy.
+                        layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
+                    }
                     eprintln!(
                         "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode}"
                     );
@@ -172,6 +149,10 @@ impl MetalPresenter {
                         address,
                         sequence: self.next_flip_sequence,
                     });
+                }
+                Ok(GpuEvent::IndexedDraw(_)) => {
+                    // The next renderer milestone consumes these snapshots after translating the
+                    // referenced GFX10 programs to MSL. Flip presentation remains independent.
                 }
                 Ok(GpuEvent::Shutdown) | Err(TryRecvError::Disconnected) => {
                     event_loop.exit();
@@ -247,36 +228,40 @@ impl MetalPresenter {
 
     fn render(&mut self) {
         self.upload_pending_frame();
-        let (Some(layer), Some(queue), Some(pipeline)) = (
+        let (Some(display), Some(layer), Some(queue), Some(texture)) = (
+            self.display,
             self.layer.as_ref(),
             self.command_queue.as_ref(),
-            self.pipeline.as_ref(),
+            self.frame_texture.as_ref(),
         ) else {
             return;
         };
         let Some(drawable) = layer.next_drawable() else {
             return;
         };
-        let pass = RenderPassDescriptor::new();
-        let Some(color) = pass.color_attachments().object_at(0) else {
-            return;
-        };
-        color.set_texture(Some(drawable.texture()));
-        color.set_load_action(MTLLoadAction::Clear);
-        color.set_clear_color(metal::MTLClearColor::new(0.015, 0.02, 0.04, 1.0));
-        color.set_store_action(MTLStoreAction::Store);
-
         let command_buffer = queue.new_command_buffer();
-        let encoder = command_buffer.new_render_command_encoder(pass);
-        if let Some(texture) = self.frame_texture.as_ref() {
-            encoder.set_render_pipeline_state(pipeline);
-            encoder.set_fragment_texture(0, Some(texture));
-            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
-        }
+        let encoder = command_buffer.new_blit_command_encoder();
+        encoder.copy_from_texture(
+            texture,
+            0,
+            0,
+            MTLOrigin::default(),
+            MTLSize::new(u64::from(display.width), u64::from(display.height), 1),
+            drawable.texture(),
+            0,
+            0,
+            MTLOrigin::default(),
+        );
         encoder.end_encoding();
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
     }
+}
+
+fn presenter_window_attributes() -> winit::window::WindowAttributes {
+    Window::default_attributes()
+        .with_title("REmu — Dreaming Sarah")
+        .with_inner_size(LogicalSize::new(1280, 720))
 }
 
 impl ApplicationHandler for MetalPresenter {
@@ -304,10 +289,11 @@ impl ApplicationHandler for MetalPresenter {
                     && size.height != 0
                     && let Some(layer) = self.layer.as_ref()
                 {
-                    layer.set_drawable_size(CGSize::new(
-                        f64::from(size.width),
-                        f64::from(size.height),
-                    ));
+                    let (width, height) =
+                        self.display.map_or((size.width, size.height), |display| {
+                            (display.width, display.height)
+                        });
+                    layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
                 }
             }
             WindowEvent::RedrawRequested => self.render(),
@@ -323,31 +309,9 @@ impl ApplicationHandler for MetalPresenter {
     }
 }
 
-fn create_present_pipeline(device: &metal::DeviceRef) -> Result<RenderPipelineState, String> {
-    let options = CompileOptions::new();
-    let library = device
-        .new_library_with_source(PRESENT_SHADER, &options)
-        .map_err(|error| format!("could not compile the Metal presenter shader: {error}"))?;
-    let vertex = library
-        .get_function("remu_present_vertex", None)
-        .map_err(|error| format!("missing presenter vertex function: {error}"))?;
-    let fragment = library
-        .get_function("remu_present_fragment", None)
-        .map_err(|error| format!("missing presenter fragment function: {error}"))?;
-    let descriptor = RenderPipelineDescriptor::new();
-    descriptor.set_vertex_function(Some(&vertex));
-    descriptor.set_fragment_function(Some(&fragment));
-    let Some(color) = descriptor.color_attachments().object_at(0) else {
-        return Err("Metal did not expose color attachment zero".to_owned());
-    };
-    color.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-    device
-        .new_render_pipeline_state(&descriptor)
-        .map_err(|error| format!("could not create the Metal presenter pipeline: {error}"))
-}
-
 pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     eprintln!("[REMu][METAL] starting AppKit event loop");
+    let mut presenter = MetalPresenter::new(receiver)?;
     let mut builder = EventLoop::builder();
     builder
         .with_activation_policy(ActivationPolicy::Regular)
@@ -355,9 +319,48 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     let event_loop = builder
         .build()
         .map_err(|error| format!("event loop failed: {error}"))?;
-    eprintln!("[REMu][METAL] AppKit event loop ready");
+    // A Rosetta-hosted command-line binary is not launched through an application bundle, and
+    // LaunchServices does not reliably deliver NSApplicationDidFinishLaunching. Complete the
+    // AppKit launch explicitly, as SharpEmu's bare Metal presenter does. Winit sees the launched
+    // application when `run_app` installs its handler and then emits the normal init/resume events.
+    unsafe {
+        let application_class =
+            Class::get("NSApplication").ok_or("could not find the NSApplication class")?;
+        let application: *mut Object = msg_send![application_class, sharedApplication];
+        if application.is_null() {
+            return Err("could not create the shared NSApplication".to_owned());
+        }
+        let _: () = msg_send![application, finishLaunching];
+        // LaunchServices can still omit the delegate notification for an unbundled translated
+        // executable. Deliver the standard callback to Winit's installed application delegate so
+        // its `run_app` path knows AppKit is launched and dispatches `Resumed`.
+        let delegate: *mut Object = msg_send![application, delegate];
+        if delegate.is_null() {
+            return Err("AppKit did not install an application delegate".to_owned());
+        }
+        let string_class = Class::get("NSString").ok_or("could not find the NSString class")?;
+        let notification_class =
+            Class::get("NSNotification").ok_or("could not find the NSNotification class")?;
+        let notification_name: *mut Object =
+            msg_send![string_class, stringWithUTF8String: c"REMuDidFinishLaunching".as_ptr()];
+        let notification: *mut Object = msg_send![notification_class,
+            notificationWithName: notification_name
+            object: application
+        ];
+        if notification.is_null() {
+            return Err("could not create the AppKit launch notification".to_owned());
+        }
+        let _: () = msg_send![delegate, applicationDidFinishLaunching: notification];
+    }
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut presenter = MetalPresenter::new(receiver);
+    // Build the window outside Winit's launch/resume callback. This keeps AppKit lifecycle work
+    // out of the callback and lets the compiler-free blit presenter start immediately.
+    #[allow(deprecated)]
+    let window = event_loop
+        .create_window(presenter_window_attributes())
+        .map_err(|error| format!("could not create the macOS window: {error}"))?;
+    presenter.initialize_window(window)?;
+    eprintln!("[REMu][METAL] AppKit event loop ready");
     event_loop
         .run_app(&mut presenter)
         .map_err(|error| format!("event loop failed: {error}"))?;
