@@ -1104,6 +1104,12 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "VOBg+iNwB-4" => "strtoll",
         "2vDqwBlpF-o" => "strtod",
         "8u8lPzUEq+U" => "memchr",
+        "fL3O02ypZFE" => "wmemcpy",
+        "Noj9PsJrsa8" => "wmemmove",
+        "fnUEjBCNRVU" => "wmemchr",
+        "QJ5xVfKkni0" => "wmemcmp",
+        "9rMML086SEE" => "std::locale::_Init",
+        "hEQ2Yi4PJXA" => "std::locale::_Getgloballocale",
         "dhK16CKwhQg" => "__isfinite",
         "cfAXurvfl5o" => "__cxa_allocate_exception",
         "nOIEswYD4Ig" => "__cxa_free_exception",
@@ -1272,6 +1278,8 @@ struct ProbeDispatchState {
     ctype_table: u64,
     tolower_table: u64,
     toupper_table: u64,
+    locale_object: u64,
+    locale_vtable: u64,
     tls_template: Vec<u8>,
     tls_static_block_size: u64,
     video_out: VideoOutState,
@@ -1551,6 +1559,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.ctype_table = 0;
     state.tolower_table = 0;
     state.toupper_table = 0;
+    state.locale_object = 0;
+    state.locale_vtable = 0;
     let tls_template_address = image.tls.thread_pointer.get() - GUEST_TLS_PREFIX_SIZE;
     let tls_template_size = usize::try_from(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
         .expect("guest TLS template size fits usize");
@@ -2333,6 +2343,7 @@ fn dispatch_probe_import(
         "sUP1hBaouOw" => guest_ctype_table(state),
         "1uJgoVq3bQU" => guest_tolower_table(state),
         "rcQCUr0EaRU" => guest_toupper_table(state),
+        "9rMML086SEE" | "hEQ2Yi4PJXA" => guest_global_locale(state),
         "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" | "sDCBrmc61XU" | "85zul--eGXs"
         | "c88Yy54Mx0w" | "ie7qhZ4X0Cc" => 0,
         "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => arguments[0],
@@ -4389,6 +4400,37 @@ fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
         }
     }
     0
+}
+
+extern "C" fn guest_locale_virtual_noop(locale: u64) -> u64 {
+    locale
+}
+
+fn guest_global_locale(state: &mut ProbeDispatchState) -> u64 {
+    if state.locale_object != 0 {
+        return state.locale_object;
+    }
+
+    let vtable = guest_calloc(1, 0x80);
+    if vtable == 0 {
+        return 0;
+    }
+    let object = guest_calloc(1, 0x80);
+    if object == 0 {
+        guest_free(vtable);
+        return 0;
+    }
+    let noop = guest_locale_virtual_noop as *const () as usize as u64;
+    for offset in (0_u64..0x60).step_by(8) {
+        write_guest_u64(vtable + offset, noop);
+    }
+    write_guest_u64(object, vtable);
+    // Dinkumware's locale implementation begins with a vptr and reference count. The title only
+    // invokes the virtual retain/release slots, so a process-lifetime classic locale is sufficient.
+    write_guest_u64(object + 8, 1);
+    state.locale_vtable = vtable;
+    state.locale_object = object;
+    object
 }
 
 fn guest_ctype_table(state: &mut ProbeDispatchState) -> u64 {
@@ -6882,10 +6924,10 @@ mod platform_independent_tests {
         ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, create_pthread_attr, destroy_pthread_attr, dispatch_probe_import,
-        guest_clock_gettime, guest_free, guest_qsort, guest_tolower_table, guest_toupper_table,
-        guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory,
-        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_stack,
-        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        guest_clock_gettime, guest_free, guest_global_locale, guest_qsort, guest_tolower_table,
+        guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
+        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
+        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
         pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
         sanitize_save_segment, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
         write_guest_u32, write_guest_u64,
@@ -6936,6 +6978,24 @@ mod platform_independent_tests {
         assert_eq!(guest_wmemcmp(left_address, left_address, 4), 0);
         assert_eq!(guest_wmemcmp(left_address, right_address, 4), u64::MAX);
         assert_eq!(guest_wmemcmp(right_address, left_address, 4), 1);
+    }
+
+    #[test]
+    fn exposes_a_stable_dinkumware_global_locale() {
+        let mut state = ProbeDispatchState::default();
+        let locale = guest_global_locale(&mut state);
+        let vtable = read_guest_u64(locale);
+        let retain = read_guest_u64(vtable + 0x10);
+        // SAFETY: guest_global_locale installs this exact process-local C ABI function pointer.
+        let retain: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(retain as usize) };
+
+        assert_ne!(locale, 0);
+        assert_ne!(vtable, 0);
+        assert_eq!(retain(locale), locale);
+        assert_eq!(guest_global_locale(&mut state), locale);
+
+        guest_free(state.locale_object);
+        guest_free(state.locale_vtable);
     }
 
     #[test]
