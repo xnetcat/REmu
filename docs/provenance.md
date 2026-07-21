@@ -32,5 +32,9 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   from SharpEmu `GuestTlsTemplate.cs` and `DirectExecutionBackend.cs` at snapshot `ada67a19`.
   REmu emits small register-preserving helpers in guest auxiliary memory and keeps the macOS host
   thread pointer untouched.
+- Per-worker TLS cloning/rebasing, native-thread scheduling, direct-memory allocation, libc/C++
+  startup behavior, and the first mutex/condition/semaphore services follow the corresponding
+  SharpEmu CPU and HLE implementations at snapshot `ada67a19`. The Rust implementation uses host
+  threads and condition variables while retaining guest-visible handles and ownership state.
 - REmu applies the four relocation types present in the first two authorized test titles before
   finalizing memory protections: `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE`.

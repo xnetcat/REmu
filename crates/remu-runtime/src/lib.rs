@@ -1,10 +1,13 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(target_arch = "x86_64")]
 use std::ffi::CString;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Condvar, Mutex, OnceLock, RwLock};
+use std::thread::ThreadId;
+use std::time::Duration;
 
 use remu_core::GuestAddress;
 use remu_loader::{DynamicInfo, Elf64Rela, Elf64Symbol, LoadedExecutable};
@@ -20,8 +23,8 @@ const IMPORT_STUB_SIZE_USIZE: usize = 32;
 const PT_TLS: u32 = 7;
 const GUEST_TLS_PREFIX_SIZE: u64 = 0x20_000;
 const GUEST_TLS_TCB_SIZE: u64 = 0x10_000;
-const TLS_HELPER_SIZE: u64 = 16;
-const TLS_HELPER_SIZE_USIZE: usize = 16;
+const TLS_HELPER_SIZE: u64 = 96;
+const TLS_HELPER_SIZE_USIZE: usize = 96;
 const TLS_HELPER_COUNT: u64 = 16;
 const TLS_HELPER_REGION_SIZE: u64 = TLS_HELPER_SIZE * TLS_HELPER_COUNT;
 const TLS_HELPER_REGION_SIZE_USIZE: usize = 16 * TLS_HELPER_SIZE_USIZE;
@@ -143,11 +146,8 @@ fn install_tls_support(
     executable: &LoadedExecutable,
 ) -> Result<GuestTls, LinkError> {
     // Keep helpers beside the image so every rewritten load can use a five-byte rel32 call.
-    let helper_base = memory.allocate_staging(
-        TLS_HELPER_REGION_SIZE,
-        TLS_HELPER_SIZE,
-        GUEST_READ | GUEST_EXECUTE,
-    )?;
+    let helper_base =
+        memory.allocate_staging(TLS_HELPER_REGION_SIZE, 16, GUEST_READ | GUEST_EXECUTE)?;
     // Keep writable TLS on a separate host page from executable import/TLS helpers.
     let allocation_base = memory.allocate_staging(
         GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE,
@@ -212,7 +212,7 @@ fn install_tls_support(
 
     seed_tls_thread_control(memory, thread_pointer, static_block_size)?;
 
-    write_tls_helpers(memory, helper_base, thread_pointer)?;
+    write_tls_helpers(memory, helper_base)?;
     let patched_loads = patch_tls_loads(memory, helper_base)?;
     Ok(GuestTls {
         thread_pointer,
@@ -278,36 +278,70 @@ fn calculate_static_tls_offset(
     Ok(result - (biased & (alignment - 1)))
 }
 
-fn write_tls_helpers(
-    memory: &mut GuestImage,
-    helper_base: GuestAddress,
-    thread_pointer: GuestAddress,
-) -> Result<(), LinkError> {
+fn write_tls_helpers(memory: &mut GuestImage, helper_base: GuestAddress) -> Result<(), LinkError> {
     let mut helpers = vec![0x90_u8; TLS_HELPER_REGION_SIZE_USIZE];
+    let saved_registers = [0_u8, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let dispatcher = current_guest_thread_pointer as *const () as usize as u64;
     for destination in 0_u8..16 {
         let offset = usize::from(destination) * TLS_HELPER_SIZE_USIZE;
         let slot = &mut helpers[offset..offset + TLS_HELPER_SIZE_USIZE];
         let mut cursor = 0;
-        if destination != 0 {
-            // Preserve RAX because the original `mov destination, fs:[0]` did not change it.
-            slot[cursor] = 0x50;
-            cursor += 1;
+        slot[cursor] = 0x9c; // pushfq
+        cursor += 1;
+        for register in saved_registers {
+            emit_push_register(slot, &mut cursor, register);
         }
+        slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x08]);
+        cursor += 4;
         slot[cursor..cursor + 2].copy_from_slice(&[0x48, 0xb8]);
-        slot[cursor + 2..cursor + 10].copy_from_slice(&thread_pointer.get().to_le_bytes());
+        slot[cursor + 2..cursor + 10].copy_from_slice(&dispatcher.to_le_bytes());
         cursor += 10;
-        if destination != 0 {
-            slot[cursor] = if destination >= 8 { 0x49 } else { 0x48 };
-            slot[cursor + 1] = 0x89;
-            slot[cursor + 2] = 0xc0 | (destination & 7);
-            cursor += 3;
-            slot[cursor] = 0x58;
-            cursor += 1;
+        slot[cursor..cursor + 2].copy_from_slice(&[0xff, 0xd0]);
+        cursor += 2;
+        slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xc4, 0x08]);
+        cursor += 4;
+        let saved_index = saved_registers
+            .iter()
+            .position(|register| *register == destination)
+            .unwrap_or(0);
+        let saved_offset = (saved_registers.len() - 1 - saved_index) * 8;
+        slot[cursor..cursor + 5].copy_from_slice(&[
+            0x48,
+            0x89,
+            0x44,
+            0x24,
+            u8::try_from(saved_offset).map_err(|_| LinkError::AddressOverflow)?,
+        ]);
+        cursor += 5;
+        for register in saved_registers.into_iter().rev() {
+            emit_pop_register(slot, &mut cursor, register);
         }
+        slot[cursor] = 0x9d; // popfq
+        cursor += 1;
         slot[cursor] = 0xc3;
     }
     memory.write(helper_base, &helpers)?;
     Ok(())
+}
+
+fn emit_push_register(slot: &mut [u8], cursor: &mut usize, register: u8) {
+    if register < 8 {
+        slot[*cursor] = 0x50 + register;
+        *cursor += 1;
+    } else {
+        slot[*cursor..*cursor + 2].copy_from_slice(&[0x41, 0x50 + (register - 8)]);
+        *cursor += 2;
+    }
+}
+
+fn emit_pop_register(slot: &mut [u8], cursor: &mut usize, register: u8) {
+    if register < 8 {
+        slot[*cursor] = 0x58 + register;
+        *cursor += 1;
+    } else {
+        slot[*cursor..*cursor + 2].copy_from_slice(&[0x41, 0x58 + (register - 8)]);
+        *cursor += 2;
+    }
 }
 
 fn patch_tls_loads(memory: &mut GuestImage, helper_base: GuestAddress) -> Result<usize, LinkError> {
@@ -570,27 +604,86 @@ fn write_import_stub(slot: &mut [u8], index: usize, dispatcher: u64) -> Result<(
 #[derive(Debug, Default)]
 struct ProbeDispatchState {
     nids: Vec<String>,
+    seen_nids: BTreeSet<String>,
+    import_counts: BTreeMap<String, usize>,
     hits: usize,
     maximum_hits: usize,
     next_direct_offset: u64,
     next_virtual_hint: u64,
     mapped_allocations: Vec<(u64, u64)>,
+    next_thread_handle: u64,
+    thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
+    agc_register_defaults: u64,
+    ctype_table: u64,
+    tls_template_address: u64,
+    tls_static_block_size: u64,
 }
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
 
+#[derive(Debug, Default)]
+struct GuestSyncState {
+    mutexes: HashMap<u64, GuestMutexState>,
+    conditions: HashMap<u64, u64>,
+    semaphores: HashMap<u32, GuestSemaphoreState>,
+    next_semaphore_handle: u32,
+}
+
+#[derive(Debug, Default)]
+struct GuestMutexState {
+    owner: Option<ThreadId>,
+    recursion: u32,
+}
+
+#[derive(Debug)]
+struct GuestSemaphoreState {
+    count: i32,
+    maximum: i32,
+}
+
+static GUEST_SYNC: OnceLock<(Mutex<GuestSyncState>, Condvar)> = OnceLock::new();
+
+thread_local! {
+    static CURRENT_GUEST_THREAD_POINTER: Cell<u64> = const { Cell::new(0) };
+}
+
+extern "C" fn current_guest_thread_pointer() -> u64 {
+    CURRENT_GUEST_THREAD_POINTER.get()
+}
+
+fn set_current_guest_thread_pointer(thread_pointer: u64) {
+    CURRENT_GUEST_THREAD_POINTER.set(thread_pointer);
+}
+
 #[cfg(target_arch = "x86_64")]
-fn configure_probe_dispatch(stubs: &[ImportStub], maximum_hits: usize) {
+fn configure_probe_dispatch(image: &LinkedImage, maximum_hits: usize) {
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = state
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.nids = stubs.iter().map(|stub| stub.nid.clone()).collect();
+    state.nids = image
+        .import_stubs
+        .iter()
+        .map(|stub| stub.nid.clone())
+        .collect();
+    state.seen_nids.clear();
+    state.import_counts.clear();
     state.hits = 0;
     state.maximum_hits = maximum_hits;
     state.next_direct_offset = 0;
     state.next_virtual_hint = 0x20_0000_0000;
     state.mapped_allocations.clear();
+    state.next_thread_handle = 1;
+    state.thread_handles.clear();
+    state.agc_register_defaults = 0;
+    state.ctype_table = 0;
+    state.tls_template_address = image.tls.thread_pointer.get() - GUEST_TLS_PREFIX_SIZE;
+    state.tls_static_block_size = image.tls.static_block_size;
+    let sync = GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()));
+    *sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = GuestSyncState::default();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -603,6 +696,9 @@ extern "C" fn import_dispatch(
     argument5: u64,
     index: u64,
 ) -> u64 {
+    let call_args = [
+        argument0, argument1, argument2, argument3, argument4, argument5,
+    ];
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = state
         .write()
@@ -616,21 +712,390 @@ extern "C" fn import_dispatch(
         terminate_probe(87);
     };
     state.hits += 1;
-    eprintln!(
-        "[REMu][IMPORT] hit={} nid={} args={argument0:#x},{argument1:#x},{argument2:#x},{argument3:#x},{argument4:#x},{argument5:#x}",
-        state.hits, nid
-    );
+    *state.import_counts.entry(nid.clone()).or_default() += 1;
+    if state.seen_nids.insert(nid.clone()) {
+        eprintln!(
+            "[REMu][IMPORT] first_hit={} nid={} args={argument0:#x},{argument1:#x},{argument2:#x},{argument3:#x},{argument4:#x},{argument5:#x}",
+            state.hits, nid
+        );
+    }
     if state.maximum_hits != 0 && state.hits >= state.maximum_hits {
-        eprintln!("[REMu][PROBE] import hit limit reached");
+        eprintln!("[REMu][PROBE] import hit limit reached at nid={nid}");
+        let mut counts = state
+            .import_counts
+            .iter()
+            .map(|(nid, count)| (nid, *count))
+            .collect::<Vec<_>>();
+        counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+        for (nid, count) in counts.into_iter().take(8) {
+            eprintln!("[REMu][PROBE] hot_import nid={nid} hits={count}");
+        }
         terminate_probe(86);
     }
-    dispatch_probe_import(
-        &nid,
-        [
-            argument0, argument1, argument2, argument3, argument4, argument5,
-        ],
-        &mut state,
+    if nid == "6UgtwV+0zb4" {
+        let handle = state.next_thread_handle;
+        state.next_thread_handle = state.next_thread_handle.saturating_add(1);
+        if call_args[0] != 0 {
+            write_guest_u64(call_args[0], handle);
+        }
+        let entry = call_args[2];
+        let thread_argument = call_args[3];
+        let guest_tls = clone_guest_tls(state.tls_template_address, state.tls_static_block_size);
+        let thread = std::thread::spawn(move || {
+            set_current_guest_thread_pointer(guest_tls.thread_pointer);
+            let result = run_guest_thread(entry, thread_argument);
+            drop(guest_tls);
+            result
+        });
+        state.thread_handles.insert(handle, thread);
+        return 0;
+    }
+    if nid == "onNY9Byn-W8" {
+        let handle = state.thread_handles.remove(&call_args[0]);
+        drop(state);
+        let return_value = handle.map_or(0, |thread| thread.join().unwrap_or(0));
+        if call_args[1] != 0 {
+            write_guest_u64(call_args[1], return_value);
+        }
+        return 0;
+    }
+    if is_guest_sync_import(&nid) {
+        drop(state);
+        return dispatch_guest_sync_import(&nid, call_args);
+    }
+    dispatch_probe_import(&nid, call_args, &mut state)
+}
+
+struct GuestThreadTls {
+    _storage: Vec<u8>,
+    thread_pointer: u64,
+}
+
+fn clone_guest_tls(template_address: u64, static_block_size: u64) -> GuestThreadTls {
+    let size = usize::try_from(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
+        .expect("guest TLS allocation size fits usize");
+    let mut storage = vec![0_u8; size];
+    // SAFETY: The process-wide TLS template remains mapped while every guest worker is alive.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            template_address as *const u8,
+            storage.as_mut_ptr(),
+            storage.len(),
+        );
+    }
+    let thread_pointer = storage.as_mut_ptr() as usize as u64 + GUEST_TLS_PREFIX_SIZE;
+    write_guest_u64(thread_pointer, thread_pointer);
+    write_guest_u64(thread_pointer + 0x08, thread_pointer + 0x100);
+    write_guest_u64(thread_pointer + 0x10, thread_pointer);
+    write_guest_u64(thread_pointer + 0x60, thread_pointer);
+    write_guest_u64(thread_pointer + 0x100, 1);
+    write_guest_u64(
+        thread_pointer + 0x108,
+        usize::from(static_block_size != 0) as u64,
+    );
+    if static_block_size != 0 {
+        write_guest_u64(thread_pointer + 0x110, thread_pointer - static_block_size);
+    }
+    GuestThreadTls {
+        _storage: storage,
+        thread_pointer,
+    }
+}
+
+fn is_guest_sync_import(nid: &str) -> bool {
+    matches!(
+        nid,
+        "cmo1RIYva9o"
+            | "2Of0f+3mhhE"
+            | "9UK1vLZQft4"
+            | "upoVrzMHFeE"
+            | "tn3VlD0hG60"
+            | "ttHNfU+qDBU"
+            | "ltCfaGr2JGE"
+            | "7H0iTOciTLo"
+            | "K-jXhbt2gn4"
+            | "2Z+PpY6CaJg"
+            | "2Tb92quprl0"
+            | "0TyVk4MSLt0"
+            | "g+PZd2hiacg"
+            | "RXXqi4CtF8w"
+            | "WKAXJ4XBPQ4"
+            | "BmMjYxmew1w"
+            | "kDh-NfxgMtE"
+            | "JGgj7Uvrl+A"
+            | "188x57JYp0g"
+            | "Zxa0VhQVTsk"
+            | "4czppHBiriw"
     )
+}
+
+fn dispatch_guest_sync_import(nid: &str, arguments: [u64; 6]) -> u64 {
+    match nid {
+        "cmo1RIYva9o" | "ttHNfU+qDBU" => guest_mutex_init(arguments[0]),
+        "2Of0f+3mhhE" | "ltCfaGr2JGE" => guest_mutex_destroy(arguments[0]),
+        "9UK1vLZQft4" | "7H0iTOciTLo" => guest_mutex_lock(arguments[0], false),
+        "upoVrzMHFeE" | "K-jXhbt2gn4" => guest_mutex_lock(arguments[0], true),
+        "tn3VlD0hG60" | "2Z+PpY6CaJg" => guest_mutex_unlock(arguments[0]),
+        "2Tb92quprl0" | "0TyVk4MSLt0" => guest_condition_init(arguments[0]),
+        "g+PZd2hiacg" | "RXXqi4CtF8w" => guest_condition_destroy(arguments[0]),
+        "WKAXJ4XBPQ4" => guest_condition_wait(arguments[0], arguments[1], None),
+        "BmMjYxmew1w" => guest_condition_wait(
+            arguments[0],
+            arguments[1],
+            Some(u64::from(low_u32(arguments[2]))),
+        ),
+        "kDh-NfxgMtE" | "JGgj7Uvrl+A" => guest_condition_signal(arguments[0]),
+        "188x57JYp0g" => guest_semaphore_create(arguments),
+        "Zxa0VhQVTsk" => guest_semaphore_wait(arguments),
+        "4czppHBiriw" => guest_semaphore_signal(arguments),
+        _ => 0,
+    }
+}
+
+fn guest_sync() -> &'static (Mutex<GuestSyncState>, Condvar) {
+    GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()))
+}
+
+fn guest_mutex_init(address: u64) -> u64 {
+    if address == 0 {
+        return u64::MAX;
+    }
+    let sync = guest_sync();
+    sync.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mutexes
+        .entry(address)
+        .or_default();
+    0
+}
+
+fn guest_mutex_destroy(address: u64) -> u64 {
+    let sync = guest_sync();
+    sync.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mutexes
+        .remove(&address);
+    0
+}
+
+fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
+    if address == 0 {
+        return u64::MAX;
+    }
+    let sync = guest_sync();
+    let current = std::thread::current().id();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let mutex = state.mutexes.entry(address).or_default();
+        match mutex.owner.as_ref() {
+            None => {
+                mutex.owner = Some(current);
+                mutex.recursion = 1;
+                return 0;
+            }
+            Some(owner) if *owner == current => {
+                mutex.recursion = mutex.recursion.saturating_add(1);
+                return 0;
+            }
+            Some(_) if try_only => return u64::from(libc::EBUSY as u32),
+            Some(_) => {
+                state = sync
+                    .1
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+}
+
+fn guest_mutex_unlock(address: u64) -> u64 {
+    let sync = guest_sync();
+    let current = std::thread::current().id();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(mutex) = state.mutexes.get_mut(&address)
+        && mutex.owner.as_ref().is_some_and(|owner| *owner == current)
+    {
+        if mutex.recursion > 1 {
+            mutex.recursion -= 1;
+        } else {
+            mutex.owner = None;
+            mutex.recursion = 0;
+            sync.1.notify_all();
+        }
+    }
+    0
+}
+
+fn guest_condition_init(address: u64) -> u64 {
+    let sync = guest_sync();
+    sync.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .conditions
+        .entry(address)
+        .or_default();
+    0
+}
+
+fn guest_condition_destroy(address: u64) -> u64 {
+    let sync = guest_sync();
+    sync.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .conditions
+        .remove(&address);
+    0
+}
+
+fn guest_condition_wait(condition: u64, mutex_address: u64, timeout_usec: Option<u64>) -> u64 {
+    let sync = guest_sync();
+    let current = std::thread::current().id();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let generation = *state.conditions.entry(condition).or_default();
+    if let Some(mutex) = state.mutexes.get_mut(&mutex_address)
+        && mutex.owner.as_ref().is_some_and(|owner| *owner == current)
+    {
+        mutex.owner = None;
+        mutex.recursion = 0;
+    }
+    sync.1.notify_all();
+
+    if let Some(timeout) = timeout_usec {
+        let duration = Duration::from_micros(timeout);
+        let (next_state, _) = sync
+            .1
+            .wait_timeout_while(state, duration, |state| {
+                state.conditions.get(&condition).copied().unwrap_or(0) == generation
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state = next_state;
+    } else {
+        state = sync
+            .1
+            .wait_while(state, |state| {
+                state.conditions.get(&condition).copied().unwrap_or(0) == generation
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+
+    loop {
+        let mutex = state.mutexes.entry(mutex_address).or_default();
+        if mutex.owner.is_none() {
+            mutex.owner = Some(current);
+            mutex.recursion = 1;
+            return 0;
+        }
+        state = sync
+            .1
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+fn guest_condition_signal(condition: u64) -> u64 {
+    let sync = guest_sync();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let generation = state.conditions.entry(condition).or_default();
+    *generation = generation.wrapping_add(1);
+    sync.1.notify_all();
+    0
+}
+
+fn guest_semaphore_create(arguments: [u64; 6]) -> u64 {
+    let output = arguments[0];
+    let initial = low_i32(arguments[3]);
+    let maximum = low_i32(arguments[4]);
+    if output == 0 || initial < 0 || maximum <= 0 || initial > maximum {
+        return u64::MAX;
+    }
+    let sync = guest_sync();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.next_semaphore_handle = state.next_semaphore_handle.wrapping_add(1).max(1);
+    let handle = state.next_semaphore_handle;
+    state.semaphores.insert(
+        handle,
+        GuestSemaphoreState {
+            count: initial,
+            maximum,
+        },
+    );
+    // SAFETY: sceKernelCreateSema supplies a writable 32-bit handle output.
+    unsafe {
+        std::ptr::write_unaligned(output as *mut u32, handle);
+    }
+    0
+}
+
+fn guest_semaphore_wait(arguments: [u64; 6]) -> u64 {
+    let handle = low_u32(arguments[0]);
+    let needed = low_i32(arguments[1]);
+    if needed <= 0 {
+        return u64::MAX;
+    }
+    let sync = guest_sync();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let Some(semaphore) = state.semaphores.get_mut(&handle) else {
+            return u64::MAX;
+        };
+        if semaphore.count >= needed {
+            semaphore.count -= needed;
+            return 0;
+        }
+        state = sync
+            .1
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+fn guest_semaphore_signal(arguments: [u64; 6]) -> u64 {
+    let handle = low_u32(arguments[0]);
+    let amount = low_i32(arguments[1]);
+    let sync = guest_sync();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(semaphore) = state.semaphores.get_mut(&handle) else {
+        return u64::MAX;
+    };
+    semaphore.count = semaphore
+        .count
+        .saturating_add(amount)
+        .min(semaphore.maximum);
+    sync.1.notify_all();
+    0
+}
+
+fn low_u32(value: u64) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn low_i32(value: u64) -> i32 {
+    let bytes = value.to_le_bytes();
+    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -643,10 +1108,45 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "L-Q3LEjIbgA" => map_direct_memory(arguments, state),
         // libc memset
         "8zTFvBIAIN8" => guest_memset(arguments[0], arguments[1], arguments[2]),
+        // libc memcpy
+        "Q3VBxCXhUHs" => guest_memcpy(arguments[0], arguments[1], arguments[2]),
+        // libc memmove
+        "+P6FRGH4LfA" => guest_memmove(arguments[0], arguments[1], arguments[2]),
+        // The native x86-64 process and guest share the libc allocation ABI.
+        "gQX+4GDQjpM" => guest_malloc(arguments[0]),
+        "tIhsqj0qsFE" => guest_free(arguments[0]),
+        "2X5agFjKxMc" => guest_calloc(arguments[0], arguments[1]),
+        "Y7aJ1uydPMo" => guest_realloc(arguments[0], arguments[1]),
+        "Ujf3KzMvRmI" | "2Btkg8k24Zg" => guest_aligned_alloc(arguments[0], arguments[1]),
+        "cVSk9y8URbc" => guest_posix_memalign(arguments[0], arguments[1], arguments[2]),
         // libc strlen
         "j4ViWNHEgww" => guest_strlen(arguments[0]),
+        "Ovb2dSJOAuE" => guest_strcmp(arguments[0], arguments[1]),
+        "aesyjrHVWy4" => guest_strncmp(arguments[0], arguments[1], arguments[2]),
+        "kiZSXIWd9vg" => guest_strcpy(arguments[0], arguments[1]),
+        "6sJWiWSRuqk" => guest_strncpy(arguments[0], arguments[1], arguments[2]),
+        "Ls4tzzhimqQ" => guest_strcat(arguments[0], arguments[1]),
         // libc fputs
         "QrZZdJ8XsX0" => guest_fputs(arguments[0]),
+        // Itanium C++ one-time initialization guards.
+        "3GPpjQdAMTw" => guest_guard_acquire(arguments[0]),
+        "9rAeANT2tyE" => guest_guard_release(arguments[0]),
+        "2emaaluWzUw" => guest_guard_abort(arguments[0]),
+        // The single-thread bootstrap uses these attributes only to configure the first worker.
+        "F8bUHwAG284" | "nsYoNRywwNg" => initialize_synthetic_handle(arguments[0]),
+        "smWEktiyyG0" | "62KCwEMmzcM" => destroy_synthetic_handle(arguments[0]),
+        // Initial single-device handles for input, video, and audio.
+        "xk0AcarP3V4" | "Up36PTk687E" | "ekNvsT22rsY" => 1,
+        // sceUserServiceGetInitialUser
+        "CdWp0oHWGr0" => write_output_i32(arguments[0], 1),
+        // sceKernelCreateEqueue
+        "D0OdFMjp46I" => write_output_u64(arguments[0], 1),
+        // Minimal AGC register-default descriptor; zero groups select the game's fallback path.
+        "2JtWUUiYBXs" | "wRbq6ZjNop4" => agc_register_defaults(state),
+        // Inferred from the immediate two-byte character-class lookup at every call site.
+        "1uJgoVq3bQU" => guest_ctype_table(state),
+        // sceKernelUsleep
+        "1jfXLRVzisc" => guest_usleep(arguments[0]),
         // libKernel exit
         "uMei1W9uyNo" => {
             let bytes = arguments[0].to_le_bytes();
@@ -654,8 +1154,105 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
             eprintln!("[REMu][PROBE] guest requested exit({status})");
             terminate_probe(status);
         }
+        // Unimplemented calls are successful no-ops in the bounded discovery probe.
         _ => 0,
     }
+}
+
+fn agc_register_defaults(state: &mut ProbeDispatchState) -> u64 {
+    if state.agc_register_defaults == 0 {
+        state.agc_register_defaults = guest_calloc(1, 0x40);
+    }
+    state.agc_register_defaults
+}
+
+fn guest_ctype_table(state: &mut ProbeDispatchState) -> u64 {
+    if state.ctype_table == 0 {
+        state.ctype_table = guest_calloc(256, 2);
+    }
+    state.ctype_table
+}
+
+fn run_guest_thread(entry: u64, argument: u64) -> u64 {
+    type GuestThreadEntry = unsafe extern "C" fn(u64) -> u64;
+
+    if entry == 0 {
+        return 0;
+    }
+    // SAFETY: The guest supplied a mapped executable entry point through scePthreadCreate. Rosetta
+    // executes it on a native host thread while the import boundary provides HLE synchronization.
+    let entry: GuestThreadEntry = unsafe { std::mem::transmute(entry) };
+    // SAFETY: The guest owns the argument and execution contract for its thread entry.
+    unsafe { entry(argument) }
+}
+
+fn initialize_synthetic_handle(address: u64) -> u64 {
+    if address == 0 {
+        return u64::MAX;
+    }
+    write_guest_u64(address, address);
+    0
+}
+
+fn destroy_synthetic_handle(address: u64) -> u64 {
+    if address == 0 {
+        return u64::MAX;
+    }
+    write_guest_u64(address, 0);
+    0
+}
+
+fn guest_guard_acquire(address: u64) -> u64 {
+    if address == 0 {
+        return 0;
+    }
+    // SAFETY: C++ emits a writable eight-byte guard object and passes its live address.
+    let value = unsafe { std::ptr::read_unaligned(address as *const u64) };
+    if value & 1 != 0 || value & 0xff00 != 0 {
+        return 0;
+    }
+    write_guest_u64(address, 0x100);
+    1
+}
+
+fn guest_guard_release(address: u64) -> u64 {
+    if address != 0 {
+        write_guest_u64(address, 1);
+    }
+    0
+}
+
+fn guest_guard_abort(address: u64) -> u64 {
+    if address != 0 {
+        write_guest_u64(address, 0);
+    }
+    0
+}
+
+fn write_guest_u64(address: u64, value: u64) {
+    // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
+    unsafe {
+        std::ptr::write_unaligned(address as *mut u64, value);
+    }
+}
+
+fn write_output_u64(address: u64, value: u64) -> u64 {
+    if address == 0 {
+        return u64::MAX;
+    }
+    write_guest_u64(address, value);
+    0
+}
+
+fn write_output_i32(address: u64, value: i32) -> u64 {
+    if address == 0 {
+        return u64::MAX;
+    }
+    // SAFETY: The HLE ABI identifies `address` as a writable 32-bit output field.
+    unsafe {
+        std::ptr::write_unaligned(address as *mut i32, value);
+    }
+    0
 }
 
 fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -767,12 +1364,199 @@ fn guest_memset(destination: u64, value: u64, length: u64) -> u64 {
     destination
 }
 
+fn guest_memcpy(destination: u64, source: u64, length: u64) -> u64 {
+    if length == 0 {
+        return destination;
+    }
+    if destination == 0 || source == 0 {
+        return 0;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return 0;
+    };
+    // SAFETY: memcpy's guest ABI contract requires two valid non-overlapping ranges.
+    unsafe {
+        std::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, length);
+    }
+    destination
+}
+
+fn guest_memmove(destination: u64, source: u64, length: u64) -> u64 {
+    if length == 0 {
+        return destination;
+    }
+    if destination == 0 || source == 0 {
+        return 0;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return 0;
+    };
+    // SAFETY: memmove's guest ABI contract supplies two valid ranges; `copy` permits overlap.
+    unsafe {
+        std::ptr::copy(source as *const u8, destination as *mut u8, length);
+    }
+    destination
+}
+
+fn guest_malloc(size: u64) -> u64 {
+    let Ok(size) = usize::try_from(size) else {
+        return 0;
+    };
+    // SAFETY: The returned allocation is process-local and uses the same x86-64 pointer ABI.
+    unsafe { libc::malloc(size) as usize as u64 }
+}
+
+fn guest_free(address: u64) -> u64 {
+    if address != 0 {
+        // SAFETY: The guest passes an allocation previously returned by this libc HLE family.
+        unsafe {
+            libc::free(address as *mut std::ffi::c_void);
+        }
+    }
+    0
+}
+
+fn guest_calloc(count: u64, size: u64) -> u64 {
+    let (Ok(count), Ok(size)) = (usize::try_from(count), usize::try_from(size)) else {
+        return 0;
+    };
+    // SAFETY: libc validates the allocation-size multiplication and returns process-local memory.
+    unsafe { libc::calloc(count, size) as usize as u64 }
+}
+
+fn guest_realloc(address: u64, size: u64) -> u64 {
+    let Ok(size) = usize::try_from(size) else {
+        return 0;
+    };
+    // SAFETY: `address` is null or belongs to the same libc allocation family.
+    unsafe { libc::realloc(address as *mut std::ffi::c_void, size) as usize as u64 }
+}
+
+fn guest_aligned_alloc(alignment: u64, size: u64) -> u64 {
+    let (Ok(alignment), Ok(size)) = (usize::try_from(alignment), usize::try_from(size)) else {
+        return 0;
+    };
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return 0;
+    }
+    let mut output = std::ptr::null_mut();
+    // SAFETY: `output` is writable and alignment/size are represented in the host ABI.
+    let result = unsafe { libc::posix_memalign(&raw mut output, alignment, size) };
+    if result == 0 {
+        output as usize as u64
+    } else {
+        0
+    }
+}
+
+fn guest_posix_memalign(output: u64, alignment: u64, size: u64) -> u64 {
+    if output == 0 {
+        return libc::EINVAL as u64;
+    }
+    let (Ok(alignment), Ok(size)) = (usize::try_from(alignment), usize::try_from(size)) else {
+        return libc::ENOMEM as u64;
+    };
+    let mut allocation = std::ptr::null_mut();
+    // SAFETY: `allocation` is writable and libc validates the requested alignment.
+    let result = unsafe { libc::posix_memalign(&raw mut allocation, alignment, size) };
+    if result == 0 {
+        write_guest_u64(output, allocation as usize as u64);
+    }
+    u64::try_from(result).unwrap_or(u64::MAX)
+}
+
 fn guest_strlen(address: u64) -> u64 {
     if address == 0 {
         return 0;
     }
     // SAFETY: The guest libc call contract supplies a valid NUL-terminated string.
     unsafe { libc::strlen(address as *const libc::c_char) as u64 }
+}
+
+fn guest_strcmp(left: u64, right: u64) -> u64 {
+    if left == 0 || right == 0 {
+        return u64::MAX;
+    }
+    // SAFETY: strcmp's guest ABI contract supplies two NUL-terminated strings.
+    let result = unsafe { libc::strcmp(left as *const libc::c_char, right as *const libc::c_char) };
+    signed_i32_return(result)
+}
+
+fn guest_strncmp(left: u64, right: u64, length: u64) -> u64 {
+    if left == 0 || right == 0 {
+        return u64::MAX;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return u64::MAX;
+    };
+    // SAFETY: strncmp's guest ABI contract supplies readable ranges through `length`.
+    let result = unsafe {
+        libc::strncmp(
+            left as *const libc::c_char,
+            right as *const libc::c_char,
+            length,
+        )
+    };
+    signed_i32_return(result)
+}
+
+fn guest_strcpy(destination: u64, source: u64) -> u64 {
+    if destination == 0 || source == 0 {
+        return 0;
+    }
+    // SAFETY: strcpy's guest ABI contract supplies a large-enough destination and C string source.
+    unsafe {
+        libc::strcpy(
+            destination as *mut libc::c_char,
+            source as *const libc::c_char,
+        );
+    }
+    destination
+}
+
+fn guest_strncpy(destination: u64, source: u64, length: u64) -> u64 {
+    if destination == 0 || source == 0 {
+        return 0;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return 0;
+    };
+    // SAFETY: strncpy's guest ABI contract supplies readable/writable ranges through `length`.
+    unsafe {
+        libc::strncpy(
+            destination as *mut libc::c_char,
+            source as *const libc::c_char,
+            length,
+        );
+    }
+    destination
+}
+
+fn guest_strcat(destination: u64, source: u64) -> u64 {
+    if destination == 0 || source == 0 {
+        return 0;
+    }
+    // SAFETY: strcat's guest ABI contract supplies a large-enough destination and C string source.
+    unsafe {
+        libc::strcat(
+            destination as *mut libc::c_char,
+            source as *const libc::c_char,
+        );
+    }
+    destination
+}
+
+fn signed_i32_return(value: i32) -> u64 {
+    u64::from_ne_bytes(i64::from(value).to_ne_bytes())
+}
+
+fn guest_usleep(microseconds: u64) -> u64 {
+    let bounded = microseconds.min(u64::from(u32::MAX));
+    let Ok(bounded) = u32::try_from(bounded) else {
+        return u64::MAX;
+    };
+    // SAFETY: usleep has no pointer arguments and the duration is bounded to its host ABI width.
+    signed_i32_return(unsafe { libc::usleep(bounded) })
 }
 
 fn guest_fputs(address: u64) -> u64 {
@@ -818,7 +1602,8 @@ fn probe_entry(
         argument1: 0,
         argument2: 0,
     };
-    configure_probe_dispatch(&image.import_stubs, maximum_import_hits);
+    configure_probe_dispatch(image, maximum_import_hits);
+    set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     // SAFETY: Alarm only bounds this diagnostic process; the default SIGALRM action terminates it.
     unsafe {
         libc::alarm(10);
@@ -828,6 +1613,7 @@ fn probe_entry(
     let entry: GuestEntry = unsafe { std::mem::transmute(image.memory.entry_address().get()) };
     // SAFETY: `parameters` and its image-name pointer stay live for the duration of the call.
     let return_value = unsafe { entry(&raw const parameters, guest_exit) };
+    set_current_guest_thread_pointer(0);
     // SAFETY: Cancels the diagnostic alarm after a normal return.
     unsafe {
         libc::alarm(0);
@@ -877,7 +1663,9 @@ mod tests {
     use remu_core::GuestAddress;
     use remu_loader::load_reader;
 
-    use super::LinkedImage;
+    use super::{LinkedImage, set_current_guest_thread_pointer};
+
+    type TlsHelper = unsafe extern "C" fn() -> u64;
 
     #[test]
     fn links_relative_and_import_relocations_into_fixed_memory() {
@@ -926,6 +1714,18 @@ mod tests {
             .unwrap();
         assert_eq!(patched_tls_load[0], 0xe8);
         assert_eq!(&patched_tls_load[5..], &[0x90; 4]);
+        let displacement = i32::from_le_bytes(
+            patched_tls_load[1..5]
+                .try_into()
+                .expect("fixed-width call displacement"),
+        );
+        let helper_address = (base + 0x4145).wrapping_add_signed(i64::from(displacement));
+        set_current_guest_thread_pointer(0x1234_5678_9abc_def0);
+        // SAFETY: The linker emitted and finalized the tested helper as executable x86-64 code.
+        let helper: TlsHelper = unsafe { std::mem::transmute(helper_address) };
+        // SAFETY: The helper takes no arguments and returns the configured pointer in RAX.
+        assert_eq!(unsafe { helper() }, 0x1234_5678_9abc_def0);
+        set_current_guest_thread_pointer(0);
         let mut tls_template = [0_u8; 2];
         linked
             .memory
