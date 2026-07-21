@@ -18,6 +18,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
@@ -346,7 +347,15 @@ fn create_present_pipeline(device: &metal::DeviceRef) -> Result<RenderPipelineSt
 }
 
 pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
-    let event_loop = EventLoop::new().map_err(|error| format!("event loop failed: {error}"))?;
+    eprintln!("[REMu][METAL] starting AppKit event loop");
+    let mut builder = EventLoop::builder();
+    builder
+        .with_activation_policy(ActivationPolicy::Regular)
+        .with_activate_ignoring_other_apps(true);
+    let event_loop = builder
+        .build()
+        .map_err(|error| format!("event loop failed: {error}"))?;
+    eprintln!("[REMu][METAL] AppKit event loop ready");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut presenter = MetalPresenter::new(receiver);
     event_loop
