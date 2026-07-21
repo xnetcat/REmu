@@ -2113,6 +2113,7 @@ fn pad_get_controller_information(arguments: [u64; 6]) -> u64 {
 }
 
 fn pad_read_state(arguments: [u64; 6]) -> u64 {
+    static LAST_LOGGED_BUTTONS: AtomicU32 = AtomicU32::new(u32::MAX);
     let output = arguments[1];
     if output == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
@@ -2124,6 +2125,10 @@ fn pad_read_state(arguments: [u64; 6]) -> u64 {
     } else {
         host.buttons
     };
+    let previous_buttons = LAST_LOGGED_BUTTONS.swap(buttons, Ordering::Relaxed);
+    if previous_buttons != buttons {
+        eprintln!("[REMu][PAD] buttons={buttons:#010x}");
+    }
     write_guest_u32(output, buttons);
     write_guest_u8(output + 0x04, host.left_x);
     write_guest_u8(output + 0x05, host.left_y);
@@ -2156,6 +2161,7 @@ fn auto_cross_active() -> bool {
     static START: OnceLock<Instant> = OnceLock::new();
     static TIMES: OnceLock<Vec<Duration>> = OnceLock::new();
     static HOLD: OnceLock<Duration> = OnceLock::new();
+    static PULSE: OnceLock<Mutex<(usize, Option<Instant>)>> = OnceLock::new();
     let times = TIMES.get_or_init(|| {
         std::env::var("REMU_AUTO_CROSS")
             .unwrap_or_default()
@@ -2174,10 +2180,26 @@ fn auto_cross_active() -> bool {
             .and_then(|value| value.parse::<u64>().ok())
             .map_or(Duration::from_millis(400), Duration::from_millis)
     });
-    let elapsed = START.get_or_init(Instant::now).elapsed();
-    times
-        .iter()
-        .any(|&time| elapsed >= time && elapsed < time.saturating_add(hold))
+    let start = *START.get_or_init(Instant::now);
+    let now = Instant::now();
+    let elapsed = now.saturating_duration_since(start);
+    let mut pulse = PULSE
+        .get_or_init(|| Mutex::new((0, None)))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pulse.1.is_some_and(|active_until| now < active_until) {
+        return true;
+    }
+    pulse.1 = None;
+    if times
+        .get(pulse.0)
+        .is_some_and(|scheduled| elapsed >= *scheduled)
+    {
+        pulse.0 += 1;
+        pulse.1 = Some(now + hold);
+        return true;
+    }
+    false
 }
 
 fn system_service_get_status(arguments: [u64; 6]) -> u64 {
