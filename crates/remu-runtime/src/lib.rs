@@ -538,7 +538,6 @@ fn native_cxx_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
         "XwLA5cTHjt4" => c"__gxx_personality_v0",
         "IJKVjsmxxWI" => c"__cxa_allocate_dependent_exception",
         "cfAXurvfl5o" => c"__cxa_allocate_exception",
-        "tsvEmnenz48" => c"__cxa_atexit",
         "pBxafllkvt0" => c"__cxa_bad_cast",
         "xcc6DTcL8QA" => c"__cxa_bad_typeid",
         "3cUUypQzMiI" => c"__cxa_begin_catch",
@@ -1073,8 +1072,13 @@ fn extract_nid(symbol_name: &str) -> &str {
 
 /// Returns the service name for NIDs whose ABI is currently implemented or under active bring-up.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn known_nid_name(nid: &str) -> Option<&'static str> {
     Some(match nid {
+        "bzQExy189ZI" => "_init_env",
+        "8G2LB+A3rzg" => "atexit",
+        "tsvEmnenz48" => "__cxa_atexit",
+        "H2e8t5ScQGc" => "__cxa_finalize",
         "pO96TwzOm5E" => "sceKernelGetDirectMemorySize",
         "rTXw65xmLIA" => "sceKernelAllocateDirectMemory",
         "L-Q3LEjIbgA" => "sceKernelMapDirectMemory",
@@ -1082,6 +1086,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "fzyMKs9kim0" => "sceKernelWaitEqueue",
         "lLMT9vJAck0" => "clock_gettime",
         "n88vx3C5nW8" => "gettimeofday",
+        "wLlFkwG9UcQ" => "time",
         "9BcDykPmo1I" => "__error",
         "5OqszGpy7Mg" => "strtoull",
         "VOBg+iNwB-4" => "strtoll",
@@ -1091,13 +1096,42 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "cfAXurvfl5o" => "__cxa_allocate_exception",
         "nOIEswYD4Ig" => "__cxa_free_exception",
         "vkuuLfhnSZI" => "__cxa_throw",
+        "F8bUHwAG284" => "scePthreadMutexattrInit",
+        "smWEktiyyG0" => "scePthreadMutexattrDestroy",
+        "iMp8QpE+XO4" => "scePthreadMutexattrSettype",
+        "nsYoNRywwNg" => "scePthreadAttrInit",
+        "62KCwEMmzcM" => "scePthreadAttrDestroy",
+        "-Wreprtu0Qs" => "scePthreadAttrSetdetachstate",
+        "UTXzJbWhhTE" => "scePthreadAttrSetstacksize",
+        "DzES9hQF4f4" => "scePthreadAttrSetschedparam",
+        "x1X76arYMxU" => "scePthreadAttrGet",
+        "-quPa4SEJUw" => "scePthreadAttrGetstack",
+        "m5-2bsNfv7s" => "scePthreadCondattrInit",
+        "waPcxYiR3WA" => "scePthreadCondattrDestroy",
+        "4qGrR6eoP9Y" => "scePthreadDetach",
+        "g8cM39EUZ6o" => "sceSysmoduleLoadModule",
+        "hZIg1EWGsHM" => "sceUltInitialize",
         "CdWp0oHWGr0" => "sceUserServiceGetInitialUser",
         "fPhymKNvK-A" => "sceUserServiceGetLoginUserIdList",
+        "j3YMu1MVNNo" => "sceUserServiceInitialize",
+        "hv1luiJrqQM" => "scePadInit",
         "xk0AcarP3V4" => "scePadOpen",
         "clVvL4ZDntw" => "scePadSetMotionSensorState",
         "gjP9-KQzoUk" => "scePadGetControllerInformation",
         "YndgXqQVV7c" => "scePadReadState",
         "rPo6tV8D9bM" => "sceSystemServiceGetStatus",
+        "Vo5V8KAwCmk" => "sceSystemServiceHideSplashScreen",
+        "uoUpLGNkygk" => "sceCommonDialogInitialize",
+        "ERKzksauAJA" => "sceSaveDataDialogGetStatus",
+        "JfEPXVxhFqA" => "sceAudioOutInit",
+        "b+uAV89IlxE" => "sceAudioOutSetVolume",
+        "sjaobBgqeB4" => "sceNpUniversalDataSystemInitialize",
+        "m87BHxt-H60" => "sceNpGameIntentInitialize",
+        "tpFJ8LIKvPw" => "sceNpUniversalDataSystemRegisterContext",
+        "AUIHb7jUX3I" => "sceNpUniversalDataSystemDestroyHandle",
+        "sUXGfNMalIo" => "sceNpTrophy2RegisterUnlockCallback",
+        "vSMAm3cxYTY" => "sceKernelMprotect",
+        "23LRUSvYu1M" => "sceAgcInit",
         "TRO721eVt4g" => "sceAgcDcbResetQueue",
         "ZvwO9euwYzc" => "sceAgcDcbSetCxRegistersIndirect",
         "-HOOCn0JY48" => "sceAgcDcbSetShRegistersIndirect",
@@ -1187,6 +1221,13 @@ struct ProbeDispatchState {
     mapped_allocations: Vec<MappedAllocation>,
     next_thread_handle: u64,
     thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
+    thread_attributes: BTreeMap<u64, PthreadAttrState>,
+    detached_threads: BTreeSet<u64>,
+    pthread_attributes: BTreeMap<u64, PthreadAttrObject>,
+    pthread_mutex_attributes: BTreeMap<u64, PthreadMutexAttrObject>,
+    pthread_condition_attributes: BTreeSet<u64>,
+    exit_callbacks: Vec<GuestExitCallback>,
+    services: RuntimeServiceState,
     agc_primary_register_defaults: u64,
     agc_internal_register_defaults: u64,
     ctype_table: u64,
@@ -1205,6 +1246,100 @@ struct ProbeDispatchState {
     save_root: PathBuf,
     save_mounts: BTreeMap<String, PathBuf>,
     next_save_transaction_resource: u32,
+}
+
+const DEFAULT_THREAD_AFFINITY_MASK: u64 = 0x7f;
+const DEFAULT_THREAD_STACK_SIZE: u64 = 0x10_0000;
+const DEFAULT_THREAD_GUARD_SIZE: u64 = 0x1000;
+const DEFAULT_THREAD_PRIORITY: i32 = 700;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PthreadAttrState {
+    affinity_mask: u64,
+    detach_state: i32,
+    stack_address: u64,
+    stack_size: u64,
+    guard_size: u64,
+    inherit_schedule: i32,
+    schedule_policy: i32,
+    schedule_priority: i32,
+}
+
+impl Default for PthreadAttrState {
+    fn default() -> Self {
+        Self {
+            affinity_mask: DEFAULT_THREAD_AFFINITY_MASK,
+            detach_state: 0,
+            stack_address: 0,
+            stack_size: DEFAULT_THREAD_STACK_SIZE,
+            guard_size: DEFAULT_THREAD_GUARD_SIZE,
+            inherit_schedule: 4,
+            schedule_policy: 1,
+            schedule_priority: DEFAULT_THREAD_PRIORITY,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PthreadAttrObject {
+    handle: u64,
+    attributes: PthreadAttrState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PthreadMutexAttrState {
+    mutex_type: i32,
+    protocol: i32,
+}
+
+impl Default for PthreadMutexAttrState {
+    fn default() -> Self {
+        // Gen5's default mutex attribute is error-checking rather than host-pthread's normal type.
+        Self {
+            mutex_type: 1,
+            protocol: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PthreadMutexAttrObject {
+    handle: u64,
+    attributes: PthreadMutexAttrState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestExitCallback {
+    function: u64,
+    argument: Option<u64>,
+    module: u64,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeServiceState {
+    libc_environment: Option<u64>,
+    loaded_sysmodules: BTreeSet<i32>,
+    ult_runtime: Option<u64>,
+    splash: SplashState,
+    user_service: InitializationState,
+    pad: InitializationState,
+    common_dialog: InitializationState,
+    save_data_dialog_status: i32,
+    agc_states: BTreeMap<u64, u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InitializationState {
+    #[default]
+    Uninitialized,
+    Initialized,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SplashState {
+    #[default]
+    Visible,
+    Hidden,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1282,10 +1417,22 @@ struct GuestSyncState {
     next_semaphore_handle: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct GuestMutexState {
     owner: Option<ThreadId>,
     recursion: u32,
+    mutex_type: i32,
+}
+
+impl Default for GuestMutexState {
+    fn default() -> Self {
+        let attributes = PthreadMutexAttrState::default();
+        Self {
+            owner: None,
+            recursion: 0,
+            mutex_type: attributes.mutex_type,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1298,6 +1445,7 @@ static GUEST_SYNC: OnceLock<(Mutex<GuestSyncState>, Condvar)> = OnceLock::new();
 
 thread_local! {
     static CURRENT_GUEST_THREAD_POINTER: Cell<u64> = const { Cell::new(0) };
+    static CURRENT_GUEST_THREAD_HANDLE: Cell<u64> = const { Cell::new(0) };
 }
 
 extern "C" fn current_guest_thread_pointer() -> u64 {
@@ -1306,6 +1454,14 @@ extern "C" fn current_guest_thread_pointer() -> u64 {
 
 fn set_current_guest_thread_pointer(thread_pointer: u64) {
     CURRENT_GUEST_THREAD_POINTER.set(thread_pointer);
+}
+
+fn current_guest_thread_handle() -> u64 {
+    CURRENT_GUEST_THREAD_HANDLE.get()
+}
+
+fn set_current_guest_thread_handle(thread_handle: u64) {
+    CURRENT_GUEST_THREAD_HANDLE.set(thread_handle);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1328,8 +1484,22 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.direct_memory_backing = None;
     state.next_virtual_hint = 0x20_0000_0000;
     state.mapped_allocations.clear();
-    state.next_thread_handle = 1;
+    state.next_thread_handle = 2;
     state.thread_handles.clear();
+    state.thread_attributes.clear();
+    state
+        .thread_attributes
+        .insert(1, PthreadAttrState::default());
+    state.detached_threads.clear();
+    for object in std::mem::take(&mut state.pthread_attributes).into_values() {
+        guest_free(object.handle);
+    }
+    for object in std::mem::take(&mut state.pthread_mutex_attributes).into_values() {
+        guest_free(object.handle);
+    }
+    state.pthread_condition_attributes.clear();
+    state.exit_callbacks.clear();
+    state.services = RuntimeServiceState::default();
     state.agc_primary_register_defaults = 0;
     state.agc_internal_register_defaults = 0;
     state.ctype_table = 0;
@@ -1365,6 +1535,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = GuestSyncState::default();
+    set_current_guest_thread_handle(1);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1430,36 +1601,112 @@ extern "C" fn import_dispatch(
         }
         terminate_probe(86);
     }
+    if nid == "H2e8t5ScQGc" {
+        let callbacks = take_exit_callbacks(&mut state, Some(call_args[0]));
+        drop(state);
+        invoke_guest_exit_callbacks(callbacks);
+        return ProbeImportReturn::integer(0);
+    }
+    if matches!(nid.as_str(), "uMei1W9uyNo" | "6Z83sYWFlA8") {
+        let status = low_i32(call_args[0]);
+        let run_callbacks = nid == "uMei1W9uyNo";
+        drop(state);
+        if run_callbacks {
+            run_all_guest_exit_callbacks();
+        }
+        eprintln!(
+            "[REMu][PROBE] guest requested {}({status})",
+            if run_callbacks { "exit" } else { "_exit" }
+        );
+        terminate_probe(status);
+    }
     if nid == "6UgtwV+0zb4" {
         let handle = state.next_thread_handle;
         state.next_thread_handle = state.next_thread_handle.saturating_add(1);
-        if call_args[0] != 0 {
-            write_guest_u64(call_args[0], handle);
+        if call_args[0] == 0 || call_args[2] == 0 {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
         }
+        let attributes = pthread_attr_state(call_args[1], &state).unwrap_or_default();
         let entry = call_args[2];
         let thread_argument = call_args[3];
         let guest_tls = clone_guest_tls(&state.tls_template, state.tls_static_block_size);
-        let thread = std::thread::spawn(move || {
+        let mut builder = std::thread::Builder::new();
+        if let Ok(stack_size) = usize::try_from(attributes.stack_size)
+            && stack_size >= usize::try_from(MACOS_GUEST_PAGE_ALIGNMENT).unwrap_or(0x4000)
+        {
+            builder = builder.stack_size(stack_size);
+        }
+        if let Some(name) = read_guest_cstring(call_args[4])
+            && !name.is_empty()
+        {
+            builder = builder.name(name);
+        }
+        let Ok(thread) = builder.spawn(move || {
+            set_current_guest_thread_handle(handle);
             set_current_guest_thread_pointer(guest_tls.thread_pointer);
             let result = run_guest_thread(entry, thread_argument);
+            set_current_guest_thread_pointer(0);
+            set_current_guest_thread_handle(0);
             drop(guest_tls);
             result
-        });
-        state.thread_handles.insert(handle, thread);
+        }) else {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN));
+        };
+        write_guest_u64(call_args[0], handle);
+        state.thread_attributes.insert(handle, attributes);
+        if attributes.detach_state == 0 {
+            state.thread_handles.insert(handle, thread);
+        } else {
+            state.detached_threads.insert(handle);
+            drop(thread);
+        }
         return ProbeImportReturn::integer(0);
     }
     if nid == "onNY9Byn-W8" {
+        if call_args[0] == 0 || state.detached_threads.contains(&call_args[0]) {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        }
         let handle = state.thread_handles.remove(&call_args[0]);
+        state.thread_attributes.remove(&call_args[0]);
         drop(state);
-        let return_value = handle.map_or(0, |thread| thread.join().unwrap_or(0));
+        let Some(handle) = handle else {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
+        };
+        let return_value = handle.join().unwrap_or(u64::MAX);
         if call_args[1] != 0 {
             write_guest_u64(call_args[1], return_value);
         }
         return ProbeImportReturn::integer(0);
     }
+    if nid == "4qGrR6eoP9Y" {
+        let handle = call_args[0];
+        if handle == 0 || state.detached_threads.contains(&handle) {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        }
+        let Some(thread) = state.thread_handles.remove(&handle) else {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
+        };
+        state.detached_threads.insert(handle);
+        if let Some(attributes) = state.thread_attributes.get_mut(&handle) {
+            attributes.detach_state = 1;
+        }
+        drop(thread);
+        return ProbeImportReturn::integer(0);
+    }
     if is_guest_sync_import(&nid) {
+        let is_mutex_init = matches!(nid.as_str(), "cmo1RIYva9o" | "ttHNfU+qDBU");
+        let mutex_attributes = is_mutex_init
+            .then(|| pthread_mutex_attr_state(call_args[1], &state))
+            .flatten();
+        if is_mutex_init && call_args[1] != 0 && mutex_attributes.is_none() {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        }
         drop(state);
-        return ProbeImportReturn::integer(dispatch_guest_sync_import(&nid, call_args));
+        return ProbeImportReturn::integer(dispatch_guest_sync_import(
+            &nid,
+            call_args,
+            mutex_attributes,
+        ));
     }
     // A real AudioOut submission blocks for approximately one 256-frame buffer. Without pacing,
     // the emulated audio worker monopolizes the import boundary and starves the render worker.
@@ -1572,9 +1819,15 @@ fn is_guest_sync_import(nid: &str) -> bool {
     )
 }
 
-fn dispatch_guest_sync_import(nid: &str, arguments: [u64; 6]) -> u64 {
+fn dispatch_guest_sync_import(
+    nid: &str,
+    arguments: [u64; 6],
+    mutex_attributes: Option<PthreadMutexAttrState>,
+) -> u64 {
     match nid {
-        "cmo1RIYva9o" | "ttHNfU+qDBU" => guest_mutex_init(arguments[0]),
+        "cmo1RIYva9o" | "ttHNfU+qDBU" => {
+            guest_mutex_init(arguments[0], mutex_attributes.unwrap_or_default())
+        }
         "2Of0f+3mhhE" | "ltCfaGr2JGE" => guest_mutex_destroy(arguments[0]),
         "9UK1vLZQft4" | "7H0iTOciTLo" => guest_mutex_lock(arguments[0], false),
         "upoVrzMHFeE" | "K-jXhbt2gn4" => guest_mutex_lock(arguments[0], true),
@@ -1599,28 +1852,45 @@ fn guest_sync() -> &'static (Mutex<GuestSyncState>, Condvar) {
     GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()))
 }
 
-fn guest_mutex_init(address: u64) -> u64 {
+fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) -> u64 {
     if address == 0 {
-        return u64::MAX;
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let sync = guest_sync();
-    sync.0
+    let mut state = sync
+        .0
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .mutexes
-        .entry(address)
-        .or_default();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.mutexes.contains_key(&address) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    state.mutexes.insert(
+        address,
+        GuestMutexState {
+            mutex_type: attributes.mutex_type,
+            ..GuestMutexState::default()
+        },
+    );
     0
 }
 
 fn guest_mutex_destroy(address: u64) -> u64 {
+    if address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
     let sync = guest_sync();
-    sync.0
+    let mut state = sync
+        .0
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .mutexes
-        .remove(&address);
-    0
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match state.mutexes.get(&address) {
+        Some(mutex) if mutex.owner.is_some() => u64::from(libc::EBUSY.cast_unsigned()),
+        Some(_) => {
+            state.mutexes.remove(&address);
+            0
+        }
+        None => sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND),
+    }
 }
 
 fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
@@ -1642,8 +1912,15 @@ fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
                 return 0;
             }
             Some(owner) if *owner == current => {
-                mutex.recursion = mutex.recursion.saturating_add(1);
-                return 0;
+                return match mutex.mutex_type {
+                    2 | 3 => {
+                        mutex.recursion = mutex.recursion.saturating_add(1);
+                        0
+                    }
+                    4 if !try_only => 0,
+                    _ if try_only => u64::from(libc::EBUSY.cast_unsigned()),
+                    _ => u64::from(libc::EDEADLK.cast_unsigned()),
+                };
             }
             Some(_) if try_only => return u64::from(libc::EBUSY as u32),
             Some(_) => {
@@ -1881,7 +2158,7 @@ fn dispatch_kernel_file_import(
     })
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn dispatch_probe_import(
     nid: &str,
     arguments: [u64; 6],
@@ -1892,6 +2169,13 @@ fn dispatch_probe_import(
         return result;
     }
     match nid {
+        // Process-runtime initialization and destructor registration are observable lifecycle
+        // operations. Both C and Itanium callbacks are retained in one registration-order list.
+        "bzQExy189ZI" => initialize_guest_libc(arguments[0], state),
+        "8G2LB+A3rzg" => register_guest_exit_callback(arguments[0], None, 0, state),
+        "tsvEmnenz48" => {
+            register_guest_exit_callback(arguments[0], Some(arguments[1]), arguments[2], state)
+        }
         // sceKernelGetDirectMemorySize
         "pO96TwzOm5E" => 16 * 1024 * 1024 * 1024,
         // sceKernelAllocateDirectMemory
@@ -1946,6 +2230,8 @@ fn dispatch_probe_import(
         "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" | "sDCBrmc61XU" | "85zul--eGXs"
         | "c88Yy54Mx0w" | "ie7qhZ4X0Cc" => 0,
         "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => arguments[0],
+        // libc time returns Unix seconds and optionally stores the same value through its pointer.
+        "wLlFkwG9UcQ" => guest_time(arguments[0]),
         // Preserve the SysV variadic register layout for the integer/pointer formats used by the
         // game's asset path builder. Floating-point varargs require a wider import frame later.
         "tcVi5SivF7Q" => guest_sprintf(arguments),
@@ -1962,13 +2248,24 @@ fn dispatch_probe_import(
         "vkuuLfhnSZI" => guest_cxa_throw(arguments),
         // libc __error returns a stable, writable errno cell owned by the current guest thread.
         "9BcDykPmo1I" => guest_errno_address(),
-        // The single-thread bootstrap uses these attributes only to configure the first worker.
-        "F8bUHwAG284" | "nsYoNRywwNg" => initialize_synthetic_handle(arguments[0]),
-        "smWEktiyyG0" | "62KCwEMmzcM" => destroy_synthetic_handle(arguments[0]),
-        // scePthreadAttrGetstack returns both values through caller-owned outputs.
-        "-quPa4SEJUw" => pthread_attr_get_stack(arguments),
+        // libKernel pthread attributes are opaque allocated objects. Their scheduling, stack, and
+        // detach values feed thread creation and remain observable through the matching getters.
+        "F8bUHwAG284" => create_pthread_mutex_attr(arguments[0], state),
+        "smWEktiyyG0" => destroy_pthread_mutex_attr(arguments[0], state),
+        "iMp8QpE+XO4" => pthread_mutex_attr_set_type(arguments, state),
+        "nsYoNRywwNg" => create_pthread_attr(arguments[0], PthreadAttrState::default(), state),
+        "62KCwEMmzcM" => destroy_pthread_attr(arguments[0], state),
+        "-Wreprtu0Qs" => pthread_attr_set_detach_state(arguments, state),
+        "UTXzJbWhhTE" => pthread_attr_set_stack_size(arguments, state),
+        "DzES9hQF4f4" => pthread_attr_set_schedule_param(arguments, state),
+        "x1X76arYMxU" => pthread_attr_get(arguments, state),
+        "-quPa4SEJUw" => pthread_attr_get_stack(arguments, state),
+        "m5-2bsNfv7s" => pthread_condition_attr_init(arguments[0], state),
+        "waPcxYiR3WA" => pthread_condition_attr_destroy(arguments[0], state),
         // Initial single-device handles for input, video, and audio.
-        "xk0AcarP3V4" | "Up36PTk687E" | "ekNvsT22rsY" => 1,
+        "xk0AcarP3V4" => pad_open(arguments, state),
+        "Up36PTk687E" | "ekNvsT22rsY" => 1,
+        "JfEPXVxhFqA" | "b+uAV89IlxE" => 0,
         // AGC shader construction and VideoOut mutate caller-owned descriptors. Games consume the
         // resulting pointers and command data immediately, so successful no-ops are insufficient.
         "f3dg2CSgRKY" => agc_create_shader(arguments),
@@ -2008,11 +2305,13 @@ fn dispatch_probe_import(
         // libScePad. Dreaming Sarah consumes these structures during controller discovery and
         // subsequently on every frame, so leaving them as successful no-ops exposes stale stack
         // contents as controller capabilities and button state.
-        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments),
-        "gjP9-KQzoUk" => pad_get_controller_information(arguments),
-        "YndgXqQVV7c" => pad_read_state(arguments),
+        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments, state),
+        "gjP9-KQzoUk" => pad_get_controller_information(arguments, state),
+        "YndgXqQVV7c" => pad_read_state(arguments, state),
+        "hv1luiJrqQM" => pad_initialize(state),
         // libSceSystemService status used by the foreground/background state machine.
         "rPo6tV8D9bM" => system_service_get_status(arguments),
+        "Vo5V8KAwCmk" => system_service_hide_splash(state),
         // libSceSaveData. Returning success without filling the mount result leaves the game's
         // mount point empty, which turns `/savedata0/-saveindex` into the invalid `/-saveindex`.
         "TywrFKCoLGY" => save_data_initialize(state),
@@ -2023,6 +2322,17 @@ fn dispatch_probe_import(
         // User-service IDs use the retail slot encoding expected by the game's controller layer.
         "CdWp0oHWGr0" => write_output_i32(arguments[0], 0x1000_0000),
         "fPhymKNvK-A" => user_service_get_login_user_id_list(arguments),
+        "j3YMu1MVNNo" => user_service_initialize(state),
+        // Runtime services retain initialization and loaded-module state instead of accepting
+        // unrelated calls through the unknown-import fallback.
+        "g8cM39EUZ6o" => sysmodule_load(arguments[0], state),
+        "hZIg1EWGsHM" => ult_initialize(arguments[0], state),
+        "uoUpLGNkygk" => common_dialog_initialize(state),
+        "ERKzksauAJA" => state
+            .services
+            .save_data_dialog_status
+            .cast_unsigned()
+            .into(),
         // Initial NP and trophy context IDs.
         "5zBnau1uIEo" | "Bagshr7OQ6Q" => write_output_i32(arguments[0], 1),
         // sceKernelCreateEqueue
@@ -2033,20 +2343,21 @@ fn dispatch_probe_import(
         "fzyMKs9kim0" => kernel_wait_equeue(arguments, state),
         // Minimal offline NP identities. These services only require stable nonzero IDs at boot.
         "hT0IAEvN+M0" => np_create_handle(arguments, state),
+        "sjaobBgqeB4" => np_universal_data_initialize(arguments[0]),
+        "m87BHxt-H60" | "tpFJ8LIKvPw" | "AUIHb7jUX3I" | "sUXGfNMalIo" => 0,
         // Exact Gen5 register-default descriptors consumed by indirect AGC state packets.
         "2JtWUUiYBXs" => agc_register_defaults(arguments[0], false, state),
         "wRbq6ZjNop4" => agc_register_defaults(arguments[0], true, state),
+        "23LRUSvYu1M" => agc_initialize(arguments, state),
+        "h9z6+0hEydk" => {
+            std::thread::yield_now();
+            0
+        }
+        "vSMAm3cxYTY" => kernel_mprotect(arguments, state),
         // sceKernelUsleep
         "1jfXLRVzisc" => guest_usleep(arguments[0]),
         // POSIX clock_gettime. Darwin's timespec layout matches the x86-64 guest ABI.
         "lLMT9vJAck0" => guest_clock_gettime(arguments[0], arguments[1]),
-        // libKernel exit
-        "uMei1W9uyNo" => {
-            let bytes = arguments[0].to_le_bytes();
-            let status = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            eprintln!("[REMu][PROBE] guest requested exit({status})");
-            terminate_probe(status);
-        }
         // Keep discovery moving, but identify the exact calls that reached the fallback. The
         // general first-hit log also includes known imports whose implementation lives above this
         // dispatcher, so it cannot distinguish a missing ABI from an incomplete name table.
@@ -2062,7 +2373,7 @@ fn dispatch_probe_import(
                     arguments[5]
                 );
             }
-            0
+            sce_kernel_error(SCE_KERNEL_ERROR_NOT_IMPLEMENTED)
         }
     }
 }
@@ -2104,6 +2415,139 @@ fn kernel_wait_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u6
     0
 }
 
+fn initialize_guest_libc(environment: u64, state: &mut ProbeDispatchState) -> u64 {
+    match state.services.libc_environment {
+        Some(previous) if previous != environment => {
+            sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        }
+        Some(_) => 0,
+        None => {
+            state.services.libc_environment = Some(environment);
+            0
+        }
+    }
+}
+
+fn register_guest_exit_callback(
+    function: u64,
+    argument: Option<u64>,
+    module: u64,
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    if function == 0 {
+        return u64::MAX;
+    }
+    state.exit_callbacks.push(GuestExitCallback {
+        function,
+        argument,
+        module,
+    });
+    0
+}
+
+fn take_exit_callbacks(
+    state: &mut ProbeDispatchState,
+    module: Option<u64>,
+) -> Vec<GuestExitCallback> {
+    let mut callbacks = Vec::new();
+    let mut index = state.exit_callbacks.len();
+    while index != 0 {
+        index -= 1;
+        let callback = state.exit_callbacks[index];
+        let matches = module.is_none_or(|module| {
+            module == 0 || (callback.argument.is_some() && callback.module == module)
+        });
+        if matches {
+            callbacks.push(state.exit_callbacks.remove(index));
+        }
+    }
+    callbacks
+}
+
+fn invoke_guest_exit_callbacks(callbacks: Vec<GuestExitCallback>) {
+    for callback in callbacks {
+        if let Some(argument) = callback.argument {
+            type Destructor = unsafe extern "C" fn(u64);
+            // SAFETY: The guest registered a live Itanium destructor function and its opaque
+            // argument. It remains executable until the corresponding module is finalized.
+            let destructor: Destructor = unsafe { std::mem::transmute(callback.function) };
+            // SAFETY: The registration defines the function and argument ABI above.
+            unsafe { destructor(argument) };
+        } else {
+            type Callback = unsafe extern "C" fn();
+            // SAFETY: C atexit registers a live no-argument callback in guest executable memory.
+            let callback: Callback = unsafe { std::mem::transmute(callback.function) };
+            // SAFETY: The registration defines the no-argument callback ABI above.
+            unsafe { callback() };
+        }
+    }
+}
+
+fn run_all_guest_exit_callbacks() {
+    loop {
+        let callbacks = PROBE_DISPATCH.get().map_or_else(Vec::new, |state| {
+            let mut state = state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            take_exit_callbacks(&mut state, None)
+        });
+        if callbacks.is_empty() {
+            return;
+        }
+        invoke_guest_exit_callbacks(callbacks);
+    }
+}
+
+fn sysmodule_load(module: u64, state: &mut ProbeDispatchState) -> u64 {
+    let module = low_i32(module);
+    if module < 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    state.services.loaded_sysmodules.insert(module);
+    0
+}
+
+fn ult_initialize(runtime: u64, state: &mut ProbeDispatchState) -> u64 {
+    if runtime == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    match state.services.ult_runtime {
+        Some(previous) if previous != runtime => {
+            sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        }
+        Some(_) => 0,
+        None => {
+            state.services.ult_runtime = Some(runtime);
+            0
+        }
+    }
+}
+
+fn system_service_hide_splash(state: &mut ProbeDispatchState) -> u64 {
+    state.services.splash = SplashState::Hidden;
+    0
+}
+
+fn user_service_initialize(state: &mut ProbeDispatchState) -> u64 {
+    state.services.user_service = InitializationState::Initialized;
+    0
+}
+
+fn common_dialog_initialize(state: &mut ProbeDispatchState) -> u64 {
+    state.services.common_dialog = InitializationState::Initialized;
+    0
+}
+
+fn agc_initialize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let agc_state = arguments[0];
+    let version = low_u32(arguments[1]);
+    if agc_state == 0 || !matches!(version, 7 | 8 | 10 | 13) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    state.services.agc_states.insert(agc_state, version);
+    0
+}
+
 fn user_service_get_login_user_id_list(arguments: [u64; 6]) -> u64 {
     let output = arguments[0];
     if output == 0 {
@@ -2116,11 +2560,52 @@ fn user_service_get_login_user_id_list(arguments: [u64; 6]) -> u64 {
     0
 }
 
-fn pad_set_motion_sensor_state(arguments: [u64; 6]) -> u64 {
-    usize::from(!matches!(low_i32(arguments[0]), 0 | 1)) as u64
+const SCE_PAD_ERROR_INVALID_HANDLE: u32 = 0x8092_0003;
+const SCE_PAD_ERROR_NOT_INITIALIZED: u32 = 0x8092_0005;
+const SCE_PAD_ERROR_DEVICE_NOT_CONNECTED: u32 = 0x8092_0007;
+
+fn pad_initialize(state: &mut ProbeDispatchState) -> u64 {
+    state.services.pad = InitializationState::Initialized;
+    0
 }
 
-fn pad_get_controller_information(arguments: [u64; 6]) -> u64 {
+fn pad_open(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if state.services.pad != InitializationState::Initialized {
+        return sce_kernel_error(SCE_PAD_ERROR_NOT_INITIALIZED);
+    }
+    let user = low_i32(arguments[0]);
+    let port_type = low_i32(arguments[1]);
+    let index = low_i32(arguments[2]);
+    if user != 0x1000_0000 || port_type != 0 || index != 0 {
+        return sce_kernel_error(SCE_PAD_ERROR_DEVICE_NOT_CONNECTED);
+    }
+    1
+}
+
+fn validate_pad_handle(handle: u64, state: &ProbeDispatchState) -> Result<(), u64> {
+    if state.services.pad != InitializationState::Initialized {
+        return Err(sce_kernel_error(SCE_PAD_ERROR_NOT_INITIALIZED));
+    }
+    if !matches!(low_i32(handle), 0 | 1) {
+        return Err(sce_kernel_error(SCE_PAD_ERROR_INVALID_HANDLE));
+    }
+    Ok(())
+}
+
+fn pad_set_motion_sensor_state(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0], state) {
+        return error;
+    }
+    if !matches!(low_i32(arguments[1]), 0 | 1) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    0
+}
+
+fn pad_get_controller_information(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0], state) {
+        return error;
+    }
     let output = arguments[1];
     if output == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
@@ -2136,8 +2621,11 @@ fn pad_get_controller_information(arguments: [u64; 6]) -> u64 {
     0
 }
 
-fn pad_read_state(arguments: [u64; 6]) -> u64 {
+fn pad_read_state(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     static LAST_LOGGED_BUTTONS: AtomicU32 = AtomicU32::new(u32::MAX);
+    if let Err(error) = validate_pad_handle(arguments[0], state) {
+        return error;
+    }
     let output = arguments[1];
     if output == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
@@ -3520,28 +4008,267 @@ fn run_guest_thread(entry: u64, argument: u64) -> u64 {
     unsafe { entry(argument) }
 }
 
-fn initialize_synthetic_handle(address: u64) -> u64 {
+fn create_pthread_attr(
+    address: u64,
+    attributes: PthreadAttrState,
+    state: &mut ProbeDispatchState,
+) -> u64 {
     if address == 0 {
-        return u64::MAX;
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    write_guest_u64(address, address);
+    if let Some(previous) = state.pthread_attributes.remove(&address) {
+        guest_free(previous.handle);
+    }
+    let handle = guest_calloc(1, 0x40);
+    if handle == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
+    }
+    write_pthread_attr_object(handle, attributes);
+    write_guest_u64(address, handle);
+    state
+        .pthread_attributes
+        .insert(address, PthreadAttrObject { handle, attributes });
     0
 }
 
-fn destroy_synthetic_handle(address: u64) -> u64 {
+fn resolve_pthread_attr_key(address: u64, state: &ProbeDispatchState) -> Option<u64> {
     if address == 0 {
-        return u64::MAX;
+        return None;
+    }
+    if state.pthread_attributes.contains_key(&address) {
+        return Some(address);
+    }
+    state
+        .pthread_attributes
+        .iter()
+        .find_map(|(key, object)| (object.handle == address).then_some(*key))
+}
+
+fn pthread_attr_state(address: u64, state: &ProbeDispatchState) -> Option<PthreadAttrState> {
+    let key = resolve_pthread_attr_key(address, state)?;
+    state
+        .pthread_attributes
+        .get(&key)
+        .map(|object| object.attributes)
+}
+
+fn write_pthread_attr_object(address: u64, attributes: PthreadAttrState) {
+    write_guest_u64(address, attributes.affinity_mask);
+    write_guest_u32(address + 0x08, attributes.detach_state.cast_unsigned());
+    write_guest_u64(address + 0x10, attributes.stack_address);
+    write_guest_u64(address + 0x18, attributes.stack_size);
+    write_guest_u64(address + 0x20, attributes.guard_size);
+    write_guest_u32(address + 0x28, attributes.inherit_schedule.cast_unsigned());
+    write_guest_u32(address + 0x2c, attributes.schedule_policy.cast_unsigned());
+    write_guest_u32(address + 0x30, attributes.schedule_priority.cast_unsigned());
+}
+
+fn update_pthread_attr(
+    address: u64,
+    state: &mut ProbeDispatchState,
+    update: impl FnOnce(&mut PthreadAttrState),
+) -> u64 {
+    let Some(key) = resolve_pthread_attr_key(address, state) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let object = state
+        .pthread_attributes
+        .get_mut(&key)
+        .expect("the pthread attribute key was just resolved");
+    update(&mut object.attributes);
+    write_pthread_attr_object(object.handle, object.attributes);
+    0
+}
+
+fn destroy_pthread_attr(address: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(key) = resolve_pthread_attr_key(address, state) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let object = state
+        .pthread_attributes
+        .remove(&key)
+        .expect("the pthread attribute key was just resolved");
+    write_guest_u64(key, 0);
+    guest_free(object.handle);
+    0
+}
+
+fn pthread_attr_get(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let thread = arguments[0];
+    let output = arguments[1];
+    if thread == 0 || output == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(mut attributes) = state.thread_attributes.get(&thread).copied() else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    if thread == current_guest_thread_handle()
+        && let Some((stack_address, stack_size)) = current_native_stack_range()
+    {
+        attributes.stack_address = stack_address;
+        attributes.stack_size = stack_size;
+        state.thread_attributes.insert(thread, attributes);
+    }
+    create_pthread_attr(output, attributes, state)
+}
+
+#[cfg(target_os = "macos")]
+fn current_native_stack_range() -> Option<(u64, u64)> {
+    // SAFETY: pthread_self returns the current live pthread; the two query functions only inspect
+    // its immutable stack bounds.
+    let thread = unsafe { libc::pthread_self() };
+    // SAFETY: `thread` is the current live pthread.
+    let top = unsafe { libc::pthread_get_stackaddr_np(thread) } as usize;
+    // SAFETY: `thread` is the current live pthread.
+    let size = unsafe { libc::pthread_get_stacksize_np(thread) };
+    let base = top.checked_sub(size)?;
+    Some((u64::try_from(base).ok()?, u64::try_from(size).ok()?))
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn current_native_stack_range() -> Option<(u64, u64)> {
+    None
+}
+
+fn pthread_attr_get_stack(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if arguments[1] == 0 || arguments[2] == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(attributes) = pthread_attr_state(arguments[0], state) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    write_guest_u64(arguments[1], attributes.stack_address);
+    write_guest_u64(arguments[2], attributes.stack_size);
+    0
+}
+
+fn pthread_attr_set_detach_state(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let detach_state = low_i32(arguments[1]);
+    if !matches!(detach_state, 0 | 1) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    update_pthread_attr(arguments[0], state, |attributes| {
+        attributes.detach_state = detach_state;
+    })
+}
+
+fn pthread_attr_set_stack_size(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let stack_size = arguments[1];
+    if stack_size < MACOS_GUEST_PAGE_ALIGNMENT || usize::try_from(stack_size).is_err() {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    update_pthread_attr(arguments[0], state, |attributes| {
+        attributes.stack_size = stack_size;
+        attributes.stack_address = 0;
+    })
+}
+
+fn pthread_attr_set_schedule_param(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[1] == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let priority = read_guest_u32(arguments[1]).cast_signed();
+    update_pthread_attr(arguments[0], state, |attributes| {
+        attributes.schedule_priority = priority;
+    })
+}
+
+fn create_pthread_mutex_attr(address: u64, state: &mut ProbeDispatchState) -> u64 {
+    if address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    if let Some(previous) = state.pthread_mutex_attributes.remove(&address) {
+        guest_free(previous.handle);
+    }
+    let handle = guest_calloc(1, 0x40);
+    if handle == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
+    }
+    let attributes = PthreadMutexAttrState::default();
+    write_pthread_mutex_attr_object(handle, attributes);
+    write_guest_u64(address, handle);
+    state
+        .pthread_mutex_attributes
+        .insert(address, PthreadMutexAttrObject { handle, attributes });
+    0
+}
+
+fn resolve_pthread_mutex_attr_key(address: u64, state: &ProbeDispatchState) -> Option<u64> {
+    if address == 0 {
+        return None;
+    }
+    if state.pthread_mutex_attributes.contains_key(&address) {
+        return Some(address);
+    }
+    state
+        .pthread_mutex_attributes
+        .iter()
+        .find_map(|(key, object)| (object.handle == address).then_some(*key))
+}
+
+fn pthread_mutex_attr_state(
+    address: u64,
+    state: &ProbeDispatchState,
+) -> Option<PthreadMutexAttrState> {
+    let key = resolve_pthread_mutex_attr_key(address, state)?;
+    state
+        .pthread_mutex_attributes
+        .get(&key)
+        .map(|object| object.attributes)
+}
+
+fn write_pthread_mutex_attr_object(address: u64, attributes: PthreadMutexAttrState) {
+    write_guest_u32(address, attributes.mutex_type.cast_unsigned());
+    write_guest_u32(address + 4, attributes.protocol.cast_unsigned());
+}
+
+fn destroy_pthread_mutex_attr(address: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(key) = resolve_pthread_mutex_attr_key(address, state) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let object = state
+        .pthread_mutex_attributes
+        .remove(&key)
+        .expect("the pthread mutex attribute key was just resolved");
+    write_guest_u64(key, 0);
+    guest_free(object.handle);
+    0
+}
+
+fn pthread_mutex_attr_set_type(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let mutex_type = match low_i32(arguments[1]) {
+        0 | 1 => 1,
+        value @ 2..=4 => value,
+        _ => return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT),
+    };
+    let Some(key) = resolve_pthread_mutex_attr_key(arguments[0], state) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let object = state
+        .pthread_mutex_attributes
+        .get_mut(&key)
+        .expect("the pthread mutex attribute key was just resolved");
+    object.attributes.mutex_type = mutex_type;
+    write_pthread_mutex_attr_object(object.handle, object.attributes);
+    0
+}
+
+fn pthread_condition_attr_init(address: u64, state: &mut ProbeDispatchState) -> u64 {
+    if address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    if !state.pthread_condition_attributes.insert(address) {
+        return u64::from(libc::EBUSY.cast_unsigned());
     }
     write_guest_u64(address, 0);
     0
 }
 
-fn pthread_attr_get_stack(arguments: [u64; 6]) -> u64 {
-    if arguments[0] == 0 || arguments[1] == 0 || arguments[2] == 0 {
-        return u64::MAX;
+fn pthread_condition_attr_destroy(address: u64, state: &mut ProbeDispatchState) -> u64 {
+    if address == 0 || !state.pthread_condition_attributes.remove(&address) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    write_guest_u64(arguments[1], 0);
-    write_guest_u64(arguments[2], 0x80000);
+    write_guest_u64(address, 0);
     0
 }
 
@@ -3557,6 +4284,14 @@ fn np_create_handle(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 
     let handle = state.next_np_handle;
     state.next_np_handle = state.next_np_handle.saturating_add(1);
     write_output_i32(output, handle)
+}
+
+fn np_universal_data_initialize(parameter: u64) -> u64 {
+    const SCE_NP_UNIVERSAL_DATA_ERROR_INVALID_ARGUMENT: u32 = 0x8055_3102;
+    if parameter == 0 {
+        return sce_kernel_error(SCE_NP_UNIVERSAL_DATA_ERROR_INVALID_ARGUMENT);
+    }
+    0
 }
 
 fn guest_guard_acquire(address: u64) -> u64 {
@@ -4054,6 +4789,82 @@ fn host_memory_protection(protection: i32) -> i32 {
         result |= libc::PROT_EXEC;
     }
     result
+}
+
+#[cfg(unix)]
+fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let address = arguments[0];
+    let length = arguments[1];
+    let protection = low_i32(arguments[2]);
+    if address == 0 || length == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let aligned_address = address & !(MACOS_GUEST_PAGE_ALIGNMENT - 1);
+    let Some(raw_end) = address.checked_add(length) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let Some(aligned_end) = align_up_u64(raw_end, MACOS_GUEST_PAGE_ALIGNMENT) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let aligned_length = aligned_end - aligned_address;
+    let Ok(aligned_length_usize) = usize::try_from(aligned_length) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    // SAFETY: The guest asks the kernel to change protection on its own page-aligned mapped range.
+    // mprotect validates that the full host range is mapped before changing it.
+    if unsafe {
+        libc::mprotect(
+            aligned_address as *mut std::ffi::c_void,
+            aligned_length_usize,
+            host_memory_protection(protection),
+        )
+    } != 0
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    }
+
+    let mut updated = Vec::with_capacity(state.mapped_allocations.len() + 2);
+    for allocation in state.mapped_allocations.drain(..) {
+        let allocation_end = allocation.address.saturating_add(allocation.length);
+        let overlap_start = allocation.address.max(aligned_address);
+        let overlap_end = allocation_end.min(aligned_end);
+        if overlap_start >= overlap_end {
+            updated.push(allocation);
+            continue;
+        }
+        if allocation.address < overlap_start {
+            updated.push(MappedAllocation {
+                length: overlap_start - allocation.address,
+                ..allocation
+            });
+        }
+        updated.push(MappedAllocation {
+            address: overlap_start,
+            length: overlap_end - overlap_start,
+            direct_start: allocation.direct_start + (overlap_start - allocation.address),
+            protection,
+        });
+        if overlap_end < allocation_end {
+            updated.push(MappedAllocation {
+                address: overlap_end,
+                length: allocation_end - overlap_end,
+                direct_start: allocation.direct_start + (overlap_end - allocation.address),
+                protection: allocation.protection,
+            });
+        }
+    }
+    state.mapped_allocations = updated;
+    if trace_guest_vm() {
+        eprintln!(
+            "[REMu][VM] protected address={aligned_address:#x} length={aligned_length:#x} protection={protection:#x}"
+        );
+    }
+    0
+}
+
+#[cfg(not(unix))]
+fn kernel_mprotect(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
 fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
@@ -4737,6 +5548,7 @@ const SCE_KERNEL_ERROR_NOT_FOUND: u32 = 0x8002_0002;
 const SCE_KERNEL_ERROR_INVALID_ARGUMENT: u32 = 0x8002_0003;
 const SCE_KERNEL_ERROR_TRY_AGAIN: u32 = 0x8002_0023;
 const SCE_KERNEL_ERROR_MEMORY_FAULT: u32 = 0x8002_0101;
+const SCE_KERNEL_ERROR_NOT_IMPLEMENTED: u32 = 0x8002_ffff;
 const SCE_KERNEL_STAT_SIZE: usize = 120;
 
 fn sce_kernel_error(code: u32) -> u64 {
@@ -5001,6 +5813,16 @@ fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
     })
 }
 
+fn guest_time(output: u64) -> u64 {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    if output != 0 {
+        write_guest_u64(output, seconds);
+    }
+    seconds
+}
+
 fn guest_fputs(address: u64) -> u64 {
     if address == 0 {
         return u64::MAX;
@@ -5094,6 +5916,7 @@ const fn probe_entry(
 #[cfg(target_arch = "x86_64")]
 extern "C" fn guest_exit(code: i32) {
     eprintln!("[REMu][PROBE] guest exit handler called with code {code}");
+    run_all_guest_exit_callbacks();
     terminate_probe(code);
 }
 
@@ -5114,11 +5937,15 @@ mod platform_independent_tests {
 
     use super::{
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
-        AGC_R_DRAW_INDEX_AUTO, DirectAllocation, MappedAllocation, ProbeDispatchState,
+        AGC_R_DRAW_INDEX_AUTO, DirectAllocation, GuestExitCallback, MappedAllocation,
+        ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
-        allocate_direct_memory, guest_qsort, kernel_release_direct_memory, kernel_stat_payload,
-        kernel_virtual_query, low_f32, low_u32, read_guest_u64, resolve_guest_path,
-        sanitize_save_segment, sce_kernel_error, write_guest_u32, write_guest_u64,
+        allocate_direct_memory, create_pthread_attr, destroy_pthread_attr, dispatch_probe_import,
+        guest_qsort, kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query,
+        low_f32, low_u32, pthread_attr_get_stack, pthread_attr_set_detach_state,
+        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u64,
+        resolve_guest_path, sanitize_save_segment, sce_kernel_error, take_exit_callbacks,
+        write_guest_u32, write_guest_u64,
     };
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -5169,6 +5996,120 @@ mod platform_independent_tests {
     #[test]
     fn sign_extends_gen5_kernel_errors() {
         assert_eq!(sce_kernel_error(0x8002_0002), 0xffff_ffff_8002_0002);
+    }
+
+    #[test]
+    fn unknown_imports_return_the_gen5_not_implemented_error() {
+        let mut state = ProbeDispatchState::default();
+        assert_eq!(
+            dispatch_probe_import("not-a-real-nid", [0; 6], [0; 6], &mut state),
+            sce_kernel_error(SCE_KERNEL_ERROR_NOT_IMPLEMENTED)
+        );
+        assert_eq!(state.unimplemented_nids.len(), 1);
+    }
+
+    #[test]
+    fn pthread_attributes_preserve_observable_thread_creation_values() {
+        let mut state = ProbeDispatchState::default();
+        let mut opaque_attribute = 0_u64;
+        let attribute_address = (&raw mut opaque_attribute).addr() as u64;
+        assert_eq!(
+            create_pthread_attr(attribute_address, PthreadAttrState::default(), &mut state),
+            0
+        );
+        assert_ne!(opaque_attribute, 0);
+        assert_eq!(
+            pthread_attr_set_detach_state([attribute_address, 1, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(
+            pthread_attr_set_stack_size([attribute_address, 0x20_0000, 0, 0, 0, 0], &mut state),
+            0
+        );
+        let priority = 512_i32;
+        assert_eq!(
+            pthread_attr_set_schedule_param(
+                [
+                    attribute_address,
+                    (&raw const priority).addr() as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        let mut stack_address = u64::MAX;
+        let mut stack_size = 0_u64;
+        assert_eq!(
+            pthread_attr_get_stack(
+                [
+                    attribute_address,
+                    (&raw mut stack_address).addr() as u64,
+                    (&raw mut stack_size).addr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &state,
+            ),
+            0
+        );
+        let attributes = state.pthread_attributes[&attribute_address].attributes;
+        assert_eq!(attributes.detach_state, 1);
+        assert_eq!(attributes.stack_size, 0x20_0000);
+        assert_eq!(attributes.schedule_priority, priority);
+        assert_eq!(stack_address, 0);
+        assert_eq!(stack_size, 0x20_0000);
+        assert_eq!(destroy_pthread_attr(attribute_address, &mut state), 0);
+        assert_eq!(opaque_attribute, 0);
+    }
+
+    #[test]
+    fn finalization_selects_callbacks_in_reverse_registration_order() {
+        let mut state = ProbeDispatchState {
+            exit_callbacks: vec![
+                GuestExitCallback {
+                    function: 1,
+                    argument: None,
+                    module: 0,
+                },
+                GuestExitCallback {
+                    function: 2,
+                    argument: Some(20),
+                    module: 7,
+                },
+                GuestExitCallback {
+                    function: 3,
+                    argument: Some(30),
+                    module: 8,
+                },
+                GuestExitCallback {
+                    function: 4,
+                    argument: Some(40),
+                    module: 7,
+                },
+            ],
+            ..ProbeDispatchState::default()
+        };
+        let callbacks = take_exit_callbacks(&mut state, Some(7));
+        assert_eq!(
+            callbacks
+                .iter()
+                .map(|callback| callback.function)
+                .collect::<Vec<_>>(),
+            [4, 2]
+        );
+        assert_eq!(
+            state
+                .exit_callbacks
+                .iter()
+                .map(|callback| callback.function)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
     }
 
     #[test]
