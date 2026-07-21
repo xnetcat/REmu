@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -26,6 +27,8 @@ enum Command {
     Imports { path: PathBuf },
     /// Materialize load segments at the PS5 guest base without executing code.
     Map { path: PathBuf },
+    /// Map and relocate an executable, creating import trap stubs without executing it.
+    Link { path: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -51,6 +54,7 @@ fn main() -> ExitCode {
         },
         Command::Imports { path } => imports(&path),
         Command::Map { path } => map(&path),
+        Command::Link { path } => link(&path),
     }
 }
 
@@ -180,6 +184,15 @@ fn imports(path: &Path) -> ExitCode {
         "relocations={}",
         dynamic.relocations.len() + dynamic.jump_relocations.len()
     );
+    let mut relocation_types = BTreeMap::<u32, usize>::new();
+    for relocation in dynamic.relocations.iter().chain(&dynamic.jump_relocations) {
+        *relocation_types
+            .entry(relocation.relocation_type)
+            .or_default() += 1;
+    }
+    for (relocation_type, count) in relocation_types {
+        println!("relocation_type[{relocation_type}]={count}");
+    }
     println!("imports={}", dynamic.imports.len());
     for import in dynamic.imports {
         let relocation_types = import
@@ -230,6 +243,40 @@ fn map(path: &Path) -> ExitCode {
         eprintln!("error: {}: {error}", path.display());
         return ExitCode::FAILURE;
     }
+    println!("permissions=finalized");
+    ExitCode::SUCCESS
+}
+
+fn link(path: &Path) -> ExitCode {
+    let executable = match remu_loader::load_path(path) {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let linked = match remu_runtime::LinkedImage::link_main(&executable) {
+        Ok(linked) => linked,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("path={}", path.display());
+    println!("image_base={}", linked.memory.image_base());
+    println!("entry={}", linked.memory.entry_address());
+    println!("import_stubs={}", linked.import_stubs.len());
+    println!("relocations={}", linked.relocation_stats.total());
+    println!("relocations.relative={}", linked.relocation_stats.relative);
+    println!("relocations.absolute={}", linked.relocation_stats.absolute);
+    println!(
+        "relocations.global_data={}",
+        linked.relocation_stats.global_data
+    );
+    println!(
+        "relocations.jump_slots={}",
+        linked.relocation_stats.jump_slots
+    );
     println!("permissions=finalized");
     ExitCode::SUCCESS
 }

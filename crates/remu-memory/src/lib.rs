@@ -12,9 +12,10 @@ use thiserror::Error;
 
 pub const PS5_MAIN_IMAGE_BASE: GuestAddress = GuestAddress::new(0x0000_0008_0000_0000);
 
-const ELF_EXECUTE: u32 = 0x1;
-const ELF_WRITE: u32 = 0x2;
-const ELF_READ: u32 = 0x4;
+pub const GUEST_EXECUTE: u32 = 0x1;
+pub const GUEST_WRITE: u32 = 0x2;
+pub const GUEST_READ: u32 = 0x4;
+const AUXILIARY_RESERVE_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuestRegion {
@@ -59,6 +60,10 @@ pub enum MappingError {
     },
     #[error("guest memory permissions have already been finalized")]
     AlreadyFinalized,
+    #[error("allocation alignment 0x{0:x} is not a nonzero power of two")]
+    InvalidAlignment(u64),
+    #[error("guest auxiliary allocation of 0x{size:x} bytes exceeds the reserved range")]
+    AuxiliaryRangeExhausted { size: u64 },
     #[error("fixed guest mappings are currently implemented only on macOS")]
     UnsupportedPlatform,
 }
@@ -71,6 +76,8 @@ pub struct GuestImage {
     page_size: u64,
     page_flags: BTreeMap<u64, u32>,
     regions: Vec<GuestRegion>,
+    auxiliary_cursor: u64,
+    auxiliary_end: u64,
     finalized: bool,
 }
 
@@ -102,7 +109,10 @@ impl GuestImage {
         }
 
         let mapping_start = align_down(minimum, page_size);
-        let mapping_end = align_up(maximum, page_size)?;
+        let image_end = align_up(maximum, page_size)?;
+        let mapping_end = image_end
+            .checked_add(AUXILIARY_RESERVE_SIZE)
+            .ok_or(MappingError::AddressOverflow)?;
         let mapping_size = mapping_end
             .checked_sub(mapping_start)
             .ok_or(MappingError::AddressOverflow)?;
@@ -126,6 +136,8 @@ impl GuestImage {
             page_size,
             page_flags: BTreeMap::new(),
             regions: Vec::with_capacity(executable.load_segments.len()),
+            auxiliary_cursor: image_end,
+            auxiliary_end: mapping_end,
             finalized: false,
         };
 
@@ -184,6 +196,43 @@ impl GuestImage {
     #[must_use]
     pub fn regions(&self) -> &[GuestRegion] {
         &self.regions
+    }
+
+    #[must_use]
+    pub fn contains(&self, address: GuestAddress, length: usize) -> bool {
+        self.checked_offset(address, length).is_ok()
+    }
+
+    pub fn allocate_staging(
+        &mut self,
+        size: u64,
+        alignment: u64,
+        flags: u32,
+    ) -> Result<GuestAddress, MappingError> {
+        if self.finalized {
+            return Err(MappingError::AlreadyFinalized);
+        }
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(MappingError::InvalidAlignment(alignment));
+        }
+        let start = align_up(self.auxiliary_cursor, alignment)?;
+        let end = start
+            .checked_add(size)
+            .ok_or(MappingError::AddressOverflow)?;
+        if end > self.auxiliary_end {
+            return Err(MappingError::AuxiliaryRangeExhausted { size });
+        }
+        let page_start = align_down(start, self.page_size);
+        let page_end = align_up(end, self.page_size)?;
+        let mut page = page_start;
+        while page < page_end {
+            *self.page_flags.entry(page).or_default() |= flags;
+            page = page
+                .checked_add(self.page_size)
+                .ok_or(MappingError::AddressOverflow)?;
+        }
+        self.auxiliary_cursor = end;
+        Ok(GuestAddress::new(start))
     }
 
     pub fn read(&self, address: GuestAddress, destination: &mut [u8]) -> Result<(), MappingError> {
@@ -413,13 +462,13 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, MappingError> {
 
 fn protect(address: u64, size: u64, flags: u32) -> Result<(), MappingError> {
     let mut protection = libc::PROT_NONE;
-    if flags & ELF_READ != 0 || flags & ELF_EXECUTE != 0 {
+    if flags & GUEST_READ != 0 || flags & GUEST_EXECUTE != 0 {
         protection |= libc::PROT_READ;
     }
-    if flags & ELF_WRITE != 0 {
+    if flags & GUEST_WRITE != 0 {
         protection |= libc::PROT_WRITE;
     }
-    if flags & ELF_EXECUTE != 0 {
+    if flags & GUEST_EXECUTE != 0 {
         protection |= libc::PROT_EXEC;
     }
     let address_ptr =

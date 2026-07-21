@@ -16,6 +16,7 @@ remu-gpu-metal = { path = "../remu-gpu-metal" }
 remu-loader = { path = "../remu-loader" }
 remu-memory = { path = "../remu-memory" }
 remu-platform = { path = "../remu-platform" }
+remu-runtime = { path = "../remu-runtime" }
 
 [lints]
 workspace = true

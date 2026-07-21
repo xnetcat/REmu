@@ -1,0 +1,15 @@
+[package]
+name = "remu-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+remu-core = { path = "../remu-core" }
+remu-loader = { path = "../remu-loader" }
+remu-memory = { path = "../remu-memory" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

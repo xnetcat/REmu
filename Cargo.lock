@@ -261,6 +261,7 @@ dependencies = [
  "remu-loader",
  "remu-memory",
  "remu-platform",
+ "remu-runtime",
 ]
 
 [[package]]
@@ -305,6 +306,16 @@ name = "remu-platform"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "remu-runtime"
+version = "0.1.0"
+dependencies = [
+ "remu-core",
+ "remu-loader",
+ "remu-memory",
+ "thiserror",
 ]
 
 [[package]]
