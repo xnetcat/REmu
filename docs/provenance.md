@@ -67,3 +67,10 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   `Gen5ShaderTranslator.cs` in that checkout. REmu independently uses slice-bounded decoding,
   structured reserved-encoding errors, typed raw-family preservation, and explicit load/store/
   atomic data-flow operands so later backends cannot silently treat writes as reads.
+- Scalar-state evaluation, hardware user-SGPR count decoding, buffer descriptor layout, image/
+  sampler descriptor discovery, scalar/global/buffer memory binding capture, and vertex-fetch
+  classification were cross-checked against SharpEmu's GPL-2.0-or-later
+  `Gen5ShaderScalarEvaluator.cs` and `Gen5ShaderTranslator.cs`. REmu's implementation uses typed
+  failures, exact conditional-branch evaluation, bounded alternate-CFG discovery, strict non-null
+  memory reads, and a backend-neutral guest-memory trait; it does not inherit SharpEmu's
+  title-specific tracing or permissive zero-buffer fallbacks.

@@ -492,20 +492,43 @@ impl Program {
                 masks
             }
         });
-        let mut runtime_scalar_registers = BTreeSet::new();
+        let mut runtime_scalar_registers = BTreeSet::from([106, 107, 124, 125, 126, 127]);
         for instruction in &instructions {
-            for operand in instruction.sources.iter().chain(&instruction.destinations) {
-                if operand.kind == OperandKind::ScalarRegister && operand.value < 256 {
-                    runtime_scalar_registers.insert(operand.value);
+            for operand in &instruction.sources {
+                if operand.kind == OperandKind::ScalarRegister {
+                    insert_scalar_range(&mut runtime_scalar_registers, operand.value, 2);
                 }
             }
-            if let Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
-                dynamic_offset_register: Some(register),
-                ..
-            })) = instruction.control
-                && register < 256
-            {
-                runtime_scalar_registers.insert(register);
+            for operand in &instruction.destinations {
+                if operand.kind == OperandKind::ScalarRegister {
+                    insert_scalar_range(&mut runtime_scalar_registers, operand.value, 1);
+                }
+            }
+            match instruction.control.as_ref() {
+                Some(InstructionControl::Image(image)) => {
+                    insert_scalar_range(&mut runtime_scalar_registers, image.scalar_resource, 8);
+                    insert_scalar_range(&mut runtime_scalar_registers, image.scalar_sampler, 4);
+                }
+                Some(InstructionControl::GlobalMemory(global)) => {
+                    insert_scalar_range(&mut runtime_scalar_registers, global.scalar_address, 2);
+                }
+                Some(InstructionControl::BufferMemory(buffer)) => {
+                    insert_scalar_range(&mut runtime_scalar_registers, buffer.scalar_resource, 4);
+                }
+                Some(InstructionControl::ScalarMemory(scalar)) => {
+                    if matches!(
+                        instruction.encoding,
+                        ShaderEncoding::Smem | ShaderEncoding::Smrd
+                    ) && let Some(base) = instruction.sources.first()
+                        && base.kind == OperandKind::ScalarRegister
+                    {
+                        insert_scalar_range(&mut runtime_scalar_registers, base.value, 4);
+                    }
+                    if let Some(register) = scalar.dynamic_offset_register {
+                        insert_scalar_range(&mut runtime_scalar_registers, register, 2);
+                    }
+                }
+                _ => {}
             }
         }
         Self {
@@ -533,6 +556,14 @@ impl Program {
     #[must_use]
     pub const fn runtime_scalar_registers(&self) -> &BTreeSet<u32> {
         &self.runtime_scalar_registers
+    }
+}
+
+fn insert_scalar_range(registers: &mut BTreeSet<u32>, first: u32, count: u32) {
+    for register in first..first.saturating_add(count) {
+        if register < 256 {
+            registers.insert(register);
+        }
     }
 }
 
@@ -601,6 +632,10 @@ mod tests {
             ],
         );
         assert_eq!(program.pixel_color_export_masks(), 0x0b00);
-        assert_eq!(program.runtime_scalar_registers(), &BTreeSet::from([4, 5]));
+        assert!(
+            program
+                .runtime_scalar_registers()
+                .is_superset(&BTreeSet::from([4, 5, 106, 107, 124, 125, 126, 127,]))
+        );
     }
 }

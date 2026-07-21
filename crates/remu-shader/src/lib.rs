@@ -4,12 +4,15 @@
 //! Backend-neutral Gen5/RDNA2 shader decoding, evaluation, and intermediate representation.
 
 mod decoder;
+mod evaluator;
 mod format;
 mod inline_constant;
 mod ir;
 mod metadata;
+mod state;
 
 pub use decoder::{DecodeError, decode_program, read_program};
+pub use evaluator::{EvaluationError, EvaluationOptions, evaluate_shader};
 pub use format::decode_unified_format;
 pub use inline_constant::decode_inline_constant;
 pub use ir::{
@@ -21,3 +24,4 @@ pub use ir::{
     ShaderMetadata, ShaderState, VertexInputBinding, Vop3Control, Vop3pControl,
 };
 pub use metadata::{GuestMemoryReader, MetadataError, read_shader_metadata};
+pub use state::{ShaderStateError, build_shader_state};
