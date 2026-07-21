@@ -312,6 +312,7 @@ dependencies = [
 name = "remu-runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "remu-core",
  "remu-loader",
  "remu-memory",

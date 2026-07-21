@@ -29,6 +29,12 @@ enum Command {
     Map { path: PathBuf },
     /// Map and relocate an executable, creating import trap stubs without executing it.
     Link { path: PathBuf },
+    /// Execute a bounded native probe and print the first imported calls.
+    Probe {
+        path: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        import_limit: usize,
+    },
 }
 
 fn main() -> ExitCode {
@@ -55,6 +61,7 @@ fn main() -> ExitCode {
         Command::Imports { path } => imports(&path),
         Command::Map { path } => map(&path),
         Command::Link { path } => link(&path),
+        Command::Probe { path, import_limit } => probe(&path, import_limit),
     }
 }
 
@@ -267,6 +274,9 @@ fn link(path: &Path) -> ExitCode {
     println!("entry={}", linked.memory.entry_address());
     println!("import_stubs={}", linked.import_stubs.len());
     println!("relocations={}", linked.relocation_stats.total());
+    println!("tls.thread_pointer={}", linked.tls.thread_pointer);
+    println!("tls.static_block_size=0x{:x}", linked.tls.static_block_size);
+    println!("tls.patched_loads={}", linked.tls.patched_loads);
     println!("relocations.relative={}", linked.relocation_stats.relative);
     println!("relocations.absolute={}", linked.relocation_stats.absolute);
     println!(
@@ -279,4 +289,44 @@ fn link(path: &Path) -> ExitCode {
     );
     println!("permissions=finalized");
     ExitCode::SUCCESS
+}
+
+fn probe(path: &Path, import_limit: usize) -> ExitCode {
+    let executable = match remu_loader::load_path(path) {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let linked = match remu_runtime::LinkedImage::link_main(&executable) {
+        Ok(linked) => linked,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "[REMu][PROBE] entering {} at {} with {} import stubs, TLS {} ({} patched loads)",
+        path.display(),
+        linked.memory.entry_address(),
+        linked.import_stubs.len(),
+        linked.tls.thread_pointer,
+        linked.tls.patched_loads,
+    );
+    let image_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("eboot.bin");
+    match linked.probe_entry(image_name, import_limit) {
+        Ok(outcome) => {
+            println!("return_value={}", outcome.return_value);
+            println!("import_hits={}", outcome.import_hits);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            ExitCode::FAILURE
+        }
+    }
 }

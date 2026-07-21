@@ -28,5 +28,9 @@ synthetic tests. No game bytes or proprietary SDK material are included.
 
 - The relocation set, unresolved-import trap-stub model, NID extraction, and symbol resolution
   semantics were adapted from SharpEmu `SelfLoader.cs` at snapshot `ada67a19`.
+- The FreeBSD/AMD64 Variant-II startup TLS layout and `%fs:[0]` load-rewriting strategy were adapted
+  from SharpEmu `GuestTlsTemplate.cs` and `DirectExecutionBackend.cs` at snapshot `ada67a19`.
+  REmu emits small register-preserving helpers in guest auxiliary memory and keeps the macOS host
+  thread pointer untouched.
 - REmu applies the four relocation types present in the first two authorized test titles before
   finalizing memory protections: `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE`.

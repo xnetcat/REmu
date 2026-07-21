@@ -3,7 +3,8 @@
 REmu is an experimental PlayStation 5 compatibility layer written in Rust. Its goal is to run
 legally dumped games directly on desktop operating systems without emulating the PlayStation shell.
 
-The project is at the infrastructure stage. It does not run games yet.
+The project is at the early boot-probing stage. It maps and enters authorized game dumps under
+Rosetta, but does not reach a game loop yet.
 
 See the [architecture](docs/architecture.md), [implementation roadmap](docs/roadmap.md), and
 [reference audit](docs/reference-audit.md). Adapted implementation sources are tracked in
@@ -25,6 +26,7 @@ cargo run -p remu-cli -- inspect /path/to/eboot.bin
 cargo run -p remu-cli -- imports /path/to/eboot.bin
 cargo run -p remu-cli -- map /path/to/eboot.bin
 cargo run -p remu-cli -- link /path/to/eboot.bin
+cargo run -p remu-cli -- probe /path/to/eboot.bin
 cargo run -p remu-cli -- gpu-info
 ```
 

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+libc.workspace = true
 remu-core = { path = "../remu-core" }
 remu-loader = { path = "../remu-loader" }
 remu-memory = { path = "../remu-memory" }
