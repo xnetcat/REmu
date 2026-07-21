@@ -137,8 +137,15 @@ impl LinkedImage {
         process_image_name: &str,
         game_root: &Path,
         maximum_import_hits: usize,
+        timeout_seconds: u32,
     ) -> Result<ProbeOutcome, LinkError> {
-        probe_entry(self, process_image_name, game_root, maximum_import_hits)
+        probe_entry(
+            self,
+            process_image_name,
+            game_root,
+            maximum_import_hits,
+            timeout_seconds,
+        )
     }
 }
 
@@ -587,6 +594,59 @@ fn extract_nid(symbol_name: &str) -> &str {
         .map_or(symbol_name, |(nid, _)| nid)
 }
 
+/// Returns the service name for NIDs whose ABI is currently implemented or under active bring-up.
+#[must_use]
+pub fn known_nid_name(nid: &str) -> Option<&'static str> {
+    Some(match nid {
+        "pO96TwzOm5E" => "sceKernelGetDirectMemorySize",
+        "rTXw65xmLIA" => "sceKernelAllocateDirectMemory",
+        "L-Q3LEjIbgA" => "sceKernelMapDirectMemory",
+        "D0OdFMjp46I" => "sceKernelCreateEqueue",
+        "fzyMKs9kim0" => "sceKernelWaitEqueue",
+        "lLMT9vJAck0" => "clock_gettime",
+        "n88vx3C5nW8" => "gettimeofday",
+        "9BcDykPmo1I" => "__error",
+        "5OqszGpy7Mg" => "strtoull",
+        "VOBg+iNwB-4" => "strtoll",
+        "2vDqwBlpF-o" => "strtod",
+        "8u8lPzUEq+U" => "memchr",
+        "dhK16CKwhQg" => "isnan",
+        "cfAXurvfl5o" => "__cxa_allocate_exception",
+        "nOIEswYD4Ig" => "__cxa_free_exception",
+        "vkuuLfhnSZI" => "__cxa_throw",
+        "CdWp0oHWGr0" => "sceUserServiceGetInitialUser",
+        "fPhymKNvK-A" => "sceUserServiceGetLoginUserIdList",
+        "xk0AcarP3V4" => "scePadOpen",
+        "clVvL4ZDntw" => "scePadSetMotionSensorState",
+        "gjP9-KQzoUk" => "scePadGetControllerInformation",
+        "YndgXqQVV7c" => "scePadReadState",
+        "rPo6tV8D9bM" => "sceSystemServiceGetStatus",
+        "TRO721eVt4g" => "sceAgcDcbResetQueue",
+        "ZvwO9euwYzc" => "sceAgcDcbSetCxRegistersIndirect",
+        "-HOOCn0JY48" => "sceAgcDcbSetShRegistersIndirect",
+        "hvUfkUIQcOE" => "sceAgcDcbSetUcRegistersIndirect",
+        "D9sr1xGUriE" => "sceAgcCreatePrimitiveState",
+        "HV4j+E0MBHE" => "sceAgcCreateInterpolantMapping",
+        "n2fD4A+pb+g" => "sceAgcCbSetShRegisterRangeDirect",
+        "V++UgBtQhn0" => "sceAgcGetDataPacketPayloadAddress",
+        "aJf+j5yntiU" => "sceAgcDcbEventWrite",
+        "LtTouSCZjHM" => "sceAgcCbNop",
+        "WmAc2MEj6Io" => "sceAgcDcbDmaData",
+        "wr23dPKyWc0" => "sceAgcCbReleaseMem",
+        "VmW0Tdpy420" => "sceAgcDcbWaitRegMem",
+        "IxYiarKlXxM" => "sceAgcDmaDataPatchSetDstAddressOrOffset",
+        "3KDcnM3lrcU" => "sceAgcWaitRegMemPatchAddress",
+        "0fWWK5uG9rQ" => "sceAgcQueueEndOfPipeActionPatchAddress",
+        "57labkp+rSQ" => "sceAgcDcbAcquireMem",
+        "HXzjK9yI30k" => "sceVideoOutAddFlipEvent",
+        "PjS5uASwcV8" => "sceVideoOutSetBufferAttribute2",
+        "rKBUtgRrtbk" => "sceVideoOutRegisterBuffers2",
+        "UglJIZjGssM" => "sceAgcDriverSubmitDcb",
+        "h9z6+0hEydk" => "sceAgcSuspendPoint",
+        _ => return None,
+    })
+}
+
 fn write_import_stub(slot: &mut [u8], index: usize, dispatcher: u64) -> Result<(), LinkError> {
     let index = u32::try_from(index).map_err(|_| LinkError::StubAllocationOverflow)?;
     // push imm32; movabs rax, dispatcher; call rax; add rsp, 8; ret
@@ -722,10 +782,26 @@ extern "C" fn import_dispatch(
     argument3: u64,
     argument4: u64,
     argument5: u64,
+    float_argument0: f64,
     index: u64,
-) -> u64 {
+    _guest_return_address: u64,
+    stack_argument0: u64,
+    stack_argument1: u64,
+    stack_argument2: u64,
+    stack_argument3: u64,
+    stack_argument4: u64,
+    stack_argument5: u64,
+) -> ProbeImportReturn {
     let call_args = [
         argument0, argument1, argument2, argument3, argument4, argument5,
+    ];
+    let stack_args = [
+        stack_argument0,
+        stack_argument1,
+        stack_argument2,
+        stack_argument3,
+        stack_argument4,
+        stack_argument5,
     ];
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = state
@@ -742,9 +818,10 @@ extern "C" fn import_dispatch(
     state.hits += 1;
     *state.import_counts.entry(nid.clone()).or_default() += 1;
     if state.seen_nids.insert(nid.clone()) {
+        let name = known_nid_name(&nid).unwrap_or("unknown");
         eprintln!(
-            "[REMu][IMPORT] first_hit={} nid={} args={argument0:#x},{argument1:#x},{argument2:#x},{argument3:#x},{argument4:#x},{argument5:#x}",
-            state.hits, nid
+            "[REMu][IMPORT] first_hit={} nid={} name={} args={argument0:#x},{argument1:#x},{argument2:#x},{argument3:#x},{argument4:#x},{argument5:#x}",
+            state.hits, nid, name
         );
     }
     if state.maximum_hits != 0 && state.hits >= state.maximum_hits {
@@ -776,7 +853,7 @@ extern "C" fn import_dispatch(
             result
         });
         state.thread_handles.insert(handle, thread);
-        return 0;
+        return ProbeImportReturn::integer(0);
     }
     if nid == "onNY9Byn-W8" {
         let handle = state.thread_handles.remove(&call_args[0]);
@@ -785,20 +862,49 @@ extern "C" fn import_dispatch(
         if call_args[1] != 0 {
             write_guest_u64(call_args[1], return_value);
         }
-        return 0;
+        return ProbeImportReturn::integer(0);
     }
     if is_guest_sync_import(&nid) {
         drop(state);
-        return dispatch_guest_sync_import(&nid, call_args);
+        return ProbeImportReturn::integer(dispatch_guest_sync_import(&nid, call_args));
     }
     // A real AudioOut submission blocks for approximately one 256-frame buffer. Without pacing,
     // the emulated audio worker monopolizes the import boundary and starves the render worker.
     if nid == "QOQtbeDqsT4" {
         drop(state);
         std::thread::sleep(Duration::from_micros(5_333));
-        return 0;
+        return ProbeImportReturn::integer(0);
     }
-    dispatch_probe_import(&nid, call_args, &mut state)
+    if matches!(nid.as_str(), "5OqszGpy7Mg" | "VOBg+iNwB-4" | "2vDqwBlpF-o") {
+        drop(state);
+        return dispatch_guest_numeric_parser(&nid, call_args);
+    }
+    if nid == "dhK16CKwhQg" {
+        return ProbeImportReturn::integer(u64::from(float_argument0.is_nan()));
+    }
+    ProbeImportReturn::integer(dispatch_probe_import(
+        &nid, call_args, stack_args, &mut state,
+    ))
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ProbeImportReturn {
+    integer: u64,
+    float: f64,
+}
+
+impl ProbeImportReturn {
+    const fn integer(integer: u64) -> Self {
+        Self {
+            integer,
+            float: 0.0,
+        }
+    }
+
+    const fn float(float: f64) -> Self {
+        Self { integer: 0, float }
+    }
 }
 
 struct GuestThreadTls {
@@ -1130,7 +1236,12 @@ fn low_i32(value: u64) -> i32 {
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+fn dispatch_probe_import(
+    nid: &str,
+    arguments: [u64; 6],
+    stack_arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
     match nid {
         // sceKernelGetDirectMemorySize
         "pO96TwzOm5E" => 16 * 1024 * 1024 * 1024,
@@ -1146,6 +1257,8 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "+P6FRGH4LfA" => guest_memmove(arguments[0], arguments[1], arguments[2]),
         // libc memcmp
         "DfivPArhucg" => guest_memcmp(arguments[0], arguments[1], arguments[2]),
+        // libc memchr
+        "8u8lPzUEq+U" => guest_memchr(arguments[0], arguments[1], arguments[2]),
         // The native x86-64 process and guest share the libc allocation ABI.
         "gQX+4GDQjpM" => guest_malloc(arguments[0]),
         "tIhsqj0qsFE" => guest_free(arguments[0]),
@@ -1177,6 +1290,13 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "3GPpjQdAMTw" => guest_guard_acquire(arguments[0]),
         "9rAeANT2tyE" => guest_guard_release(arguments[0]),
         "2emaaluWzUw" => guest_guard_abort(arguments[0]),
+        // libc++abi exception storage. Throwing currently ends the probe with a decoded diagnostic
+        // until guest unwind metadata is registered with the host unwinder.
+        "cfAXurvfl5o" => guest_cxa_allocate_exception(arguments[0]),
+        "nOIEswYD4Ig" => guest_cxa_free_exception(arguments[0]),
+        "vkuuLfhnSZI" => guest_cxa_throw(arguments),
+        // libc __error returns a stable, writable errno cell owned by the current guest thread.
+        "9BcDykPmo1I" => guest_errno_address(),
         // The single-thread bootstrap uses these attributes only to configure the first worker.
         "F8bUHwAG284" | "nsYoNRywwNg" => initialize_synthetic_handle(arguments[0]),
         "smWEktiyyG0" | "62KCwEMmzcM" => destroy_synthetic_handle(arguments[0]),
@@ -1199,12 +1319,37 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "HV4j+E0MBHE" => agc_create_interpolant_mapping(arguments),
         "n2fD4A+pb+g" => agc_cb_set_sh_register_range_direct(arguments),
         "V++UgBtQhn0" => agc_get_data_packet_payload_address(arguments),
+        "qj7QZpgr9Uw" => agc_type_two_packet(arguments),
+        "aJf+j5yntiU" => agc_dcb_event_write(arguments),
+        "LtTouSCZjHM" => agc_cb_nop(arguments),
+        "WmAc2MEj6Io" => agc_dcb_dma_data(arguments, stack_arguments),
+        "wr23dPKyWc0" => agc_cb_release_mem(arguments, stack_arguments),
+        "VmW0Tdpy420" => agc_dcb_wait_reg_mem(arguments, stack_arguments),
+        "IxYiarKlXxM" => agc_dma_data_patch_destination(arguments),
+        "3KDcnM3lrcU" => agc_wait_reg_mem_patch_address(arguments),
+        "0fWWK5uG9rQ" => agc_release_mem_patch_address(arguments),
+        "57labkp+rSQ" => agc_dcb_acquire_mem(arguments, stack_arguments),
         "PjS5uASwcV8" => video_out_set_buffer_attribute2(arguments, state),
         "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
-        // Initial user, NP context, and trophy context IDs.
-        "CdWp0oHWGr0" | "5zBnau1uIEo" | "Bagshr7OQ6Q" => write_output_i32(arguments[0], 1),
+        // libScePad. Dreaming Sarah consumes these structures during controller discovery and
+        // subsequently on every frame, so leaving them as successful no-ops exposes stale stack
+        // contents as controller capabilities and button state.
+        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments),
+        "gjP9-KQzoUk" => pad_get_controller_information(arguments),
+        "YndgXqQVV7c" => pad_read_state(arguments),
+        // libSceSystemService status used by the foreground/background state machine.
+        "rPo6tV8D9bM" => system_service_get_status(arguments),
+        // User-service IDs use the retail slot encoding expected by the game's controller layer.
+        "CdWp0oHWGr0" => write_output_i32(arguments[0], 0x1000_0000),
+        "fPhymKNvK-A" => user_service_get_login_user_id_list(arguments),
+        // Initial NP and trophy context IDs.
+        "5zBnau1uIEo" | "Bagshr7OQ6Q" => write_output_i32(arguments[0], 1),
         // sceKernelCreateEqueue
         "D0OdFMjp46I" => write_output_u64(arguments[0], 1),
+        // sceKernelWaitEqueue. Until GPU completion events are connected, report an empty wait
+        // deterministically. Not writing outCount made the game interpret old stack bytes as user
+        // login events and overflow its four-controller table.
+        "fzyMKs9kim0" => kernel_wait_equeue(arguments),
         // Minimal offline NP identities. These services only require stable nonzero IDs at boot.
         "hT0IAEvN+M0" => np_create_handle(arguments, state),
         // Minimal AGC register-default descriptor; zero groups select the game's fallback path.
@@ -1225,6 +1370,94 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         // Unimplemented calls are successful no-ops in the bounded discovery probe.
         _ => 0,
     }
+}
+
+fn kernel_wait_equeue(arguments: [u64; 6]) -> u64 {
+    let events = arguments[1];
+    let event_capacity = low_u32(arguments[2]);
+    let out_count = arguments[3];
+    if events == 0 || event_capacity == 0 {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    if out_count != 0 {
+        write_guest_u32(out_count, 0);
+    }
+    // Avoid letting the temporary empty-queue implementation turn the render worker into a hot
+    // spin. A real wait will be woken by the Metal submission/completion path.
+    std::thread::sleep(Duration::from_millis(1));
+    0
+}
+
+fn user_service_get_login_user_id_list(arguments: [u64; 6]) -> u64 {
+    let output = arguments[0];
+    if output == 0 {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    write_guest_u32(output, 0x1000_0000);
+    for offset in [0x04, 0x08, 0x0c] {
+        write_guest_u32(output + offset, u32::MAX);
+    }
+    0
+}
+
+fn pad_set_motion_sensor_state(arguments: [u64; 6]) -> u64 {
+    usize::from(!matches!(low_i32(arguments[0]), 0 | 1)) as u64
+}
+
+fn pad_get_controller_information(arguments: [u64; 6]) -> u64 {
+    let output = arguments[1];
+    if output == 0 {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    guest_memset(output, 0, 0x1c);
+    write_guest_u32(output, 44.86_f32.to_bits());
+    write_guest_u16(output + 0x04, 1920);
+    write_guest_u16(output + 0x06, 943);
+    write_guest_u8(output + 0x08, 30);
+    write_guest_u8(output + 0x09, 30);
+    write_guest_u8(output + 0x0b, 1);
+    write_guest_u8(output + 0x0c, 1);
+    0
+}
+
+fn pad_read_state(arguments: [u64; 6]) -> u64 {
+    let output = arguments[1];
+    if output == 0 {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    guest_memset(output, 0, 0x78);
+    for offset in 0x04..=0x07 {
+        write_guest_u8(output + offset, 128);
+    }
+    write_guest_u32(output + 0x18, 1.0_f32.to_bits());
+    write_guest_u8(output + 0x4c, 1);
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: timestamp is a valid writable host timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut timestamp) } == 0 {
+        let seconds = u64::try_from(timestamp.tv_sec).unwrap_or(0);
+        let nanoseconds = u64::try_from(timestamp.tv_nsec).unwrap_or(0);
+        write_guest_u64(
+            output + 0x50,
+            seconds
+                .saturating_mul(1_000_000)
+                .saturating_add(nanoseconds / 1_000),
+        );
+    }
+    write_guest_u8(output + 0x68, 1);
+    0
+}
+
+fn system_service_get_status(arguments: [u64; 6]) -> u64 {
+    let output = arguments[0];
+    if output == 0 {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    guest_memset(output, 0, 0x0c);
+    write_guest_u8(output + 0x06, 1);
+    0
 }
 
 fn agc_register_defaults(state: &mut ProbeDispatchState) -> u64 {
@@ -1253,12 +1486,19 @@ const AGC_COMMAND_BUFFER_CURSOR_DOWN_OFFSET: u64 = 0x18;
 const AGC_COMMAND_BUFFER_RESERVED_DWORDS_OFFSET: u64 = 0x30;
 
 const AGC_IT_NOP: u32 = 0x10;
+const AGC_IT_WAIT_REG_MEM: u32 = 0x3c;
+const AGC_IT_EVENT_WRITE: u32 = 0x46;
 const AGC_IT_SET_SH_REG: u32 = 0x76;
 const AGC_R_ZERO: u32 = 0x00;
 const AGC_R_DRAW_RESET: u32 = 0x05;
+const AGC_R_WAIT_MEM_32: u32 = 0x0a;
 const AGC_R_SH_REGS_INDIRECT: u32 = 0x11;
 const AGC_R_CX_REGS_INDIRECT: u32 = 0x12;
 const AGC_R_UC_REGS_INDIRECT: u32 = 0x13;
+const AGC_R_ACQUIRE_MEM: u32 = 0x14;
+const AGC_R_WAIT_MEM_64: u32 = 0x16;
+const AGC_R_RELEASE_MEM: u32 = 0x18;
+const AGC_R_DMA_DATA: u32 = 0x19;
 const AGC_CB_SET_SH_REGISTER_RANGE_MARKER: u32 = 0x6875_000d;
 
 const AGC_SPI_PS_INPUT_CNTL_0: u32 = 0x191;
@@ -1522,6 +1762,260 @@ fn agc_get_data_packet_payload_address(arguments: [u64; 6]) -> u64 {
     0
 }
 
+fn agc_type_two_packet(arguments: [u64; 6]) -> u64 {
+    let Some(command) = agc_allocate_command_dwords(arguments[0], 1) else {
+        return 0;
+    };
+    write_guest_u32(command, 0x8000_0000);
+    command
+}
+
+fn agc_dcb_event_write(arguments: [u64; 6]) -> u64 {
+    let event_type = low_u32(arguments[1]) & 0xff;
+    if event_type > 0x3f || arguments[2] != 0 {
+        return 0;
+    }
+    let Some(command) = agc_allocate_command_dwords(arguments[0], 2) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(2, AGC_IT_EVENT_WRITE, 0));
+    write_guest_u32(command + 4, event_type);
+    command
+}
+
+fn agc_cb_nop(arguments: [u64; 6]) -> u64 {
+    let dword_count = low_u32(arguments[1]);
+    if !(2..=0x4001).contains(&dword_count) {
+        return 0;
+    }
+    let Some(command) = agc_allocate_command_dwords(arguments[0], dword_count) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(dword_count, AGC_IT_NOP, AGC_R_ZERO));
+    for index in 1..dword_count {
+        write_guest_u32(command + u64::from(index) * 4, 0);
+    }
+    command
+}
+
+fn agc_dcb_dma_data(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
+    let byte_count = low_u32(stack_arguments[2]);
+    if arguments[0] == 0 || byte_count == 0 || byte_count & 3 != 0 {
+        return 0;
+    }
+    let Some(command) = agc_allocate_command_dwords(arguments[0], 8) else {
+        return 0;
+    };
+    let destination = low_u32(arguments[1]) & 0xff;
+    let destination_cache_policy = low_u32(arguments[2]) & 0xff;
+    let source = low_u32(arguments[3]) & 0xff;
+    let source_cache_policy = low_u32(arguments[5]) & 0xff;
+    let control4 = low_u32(stack_arguments[0]) & 0xff;
+    let source_address = stack_arguments[1];
+    let control7 = low_u32(stack_arguments[3]) & 0xff;
+    let control8 = low_u32(stack_arguments[4]) & 0xff;
+    let control9 = low_u32(stack_arguments[5]) & 0xff;
+    write_guest_u32(command, agc_pm4(8, AGC_IT_NOP, AGC_R_DMA_DATA));
+    write_guest_u32(
+        command + 4,
+        destination
+            | (destination_cache_policy << 8)
+            | (source << 16)
+            | (source_cache_policy << 24),
+    );
+    write_guest_u32(
+        command + 8,
+        control4 | (control7 << 8) | (control8 << 16) | (control9 << 24),
+    );
+    write_guest_u32(command + 12, byte_count);
+    write_guest_u64(command + 16, arguments[4]);
+    write_guest_u64(command + 24, source_address);
+    command
+}
+
+fn agc_cb_release_mem(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
+    let destination = low_u32(arguments[3]) & 0xff;
+    let data_selection = low_u32(stack_arguments[0]) & 0xff;
+    let gds_offset = low_u32(stack_arguments[2]) & 0xffff;
+    let gds_size = low_u32(stack_arguments[3]) & 0xffff;
+    let interrupt = low_u32(stack_arguments[4]) & 0xff;
+    if arguments[0] == 0
+        || destination > 1
+        || data_selection > 3
+        || gds_offset != 0
+        || gds_size > 2
+        || interrupt > 3
+    {
+        return 0;
+    }
+    let Some(command) = agc_allocate_command_dwords(arguments[0], 8) else {
+        return 0;
+    };
+    let action = low_u32(arguments[1]) & 0xff;
+    let gcr_control = low_u32(arguments[2]) & 0xffff;
+    let cache_policy = low_u32(arguments[4]) & 0xff;
+    let destination_address = arguments[5];
+    let data = stack_arguments[1];
+    write_guest_u32(command, agc_pm4(8, AGC_IT_NOP, AGC_R_RELEASE_MEM));
+    write_guest_u32(command + 4, action | (cache_policy << 8));
+    write_guest_u32(
+        command + 8,
+        gcr_control | (data_selection << 16) | (interrupt << 24),
+    );
+    write_guest_u32(command + 12, low_u32(destination_address));
+    write_guest_u32(command + 16, (destination_address >> 32) as u32);
+    write_guest_u32(command + 20, low_u32(data));
+    write_guest_u32(command + 24, (data >> 32) as u32);
+    write_guest_u32(command + 28, low_u32(stack_arguments[5]));
+    command
+}
+
+fn agc_dcb_wait_reg_mem(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
+    let size = low_u32(arguments[1]) & 0xff;
+    let compare_function = low_u32(arguments[2]) & 0xff;
+    let operation = low_u32(arguments[3]) & 0xff;
+    let cache_policy = low_u32(arguments[4]) & 0xff;
+    if arguments[0] == 0 || size > 1 || compare_function > 7 || operation > 4 || cache_policy > 3 {
+        return 0;
+    }
+    let standard_wait = matches!(operation, 2 | 3);
+    let packet_dwords = if standard_wait {
+        7
+    } else if size == 0 {
+        6
+    } else {
+        9
+    };
+    let Some(command) = agc_allocate_command_dwords(arguments[0], packet_dwords) else {
+        return 0;
+    };
+    let address = arguments[5];
+    let reference = stack_arguments[0];
+    let mask = stack_arguments[1];
+    let poll_cycles = low_u32(stack_arguments[2]);
+    if standard_wait {
+        write_guest_u32(command, agc_pm4(packet_dwords, AGC_IT_WAIT_REG_MEM, 0));
+        write_guest_u32(command + 4, compare_function | ((operation & 1) << 8));
+        write_guest_u32(command + 8, low_u32(address));
+        write_guest_u32(command + 12, (address >> 32) as u32);
+        write_guest_u32(command + 16, low_u32(reference));
+        write_guest_u32(command + 20, low_u32(mask));
+        write_guest_u32(command + 24, poll_cycles / 40);
+    } else {
+        let packet_register = if size == 0 {
+            AGC_R_WAIT_MEM_32
+        } else {
+            AGC_R_WAIT_MEM_64
+        };
+        write_guest_u32(command, agc_pm4(packet_dwords, AGC_IT_NOP, packet_register));
+        write_guest_u32(command + 4, low_u32(address));
+        write_guest_u32(command + 8, (address >> 32) as u32);
+        write_guest_u32(command + 12, low_u32(mask));
+        if size == 0 {
+            write_guest_u32(command + 16, compare_function | (operation << 8));
+            write_guest_u32(command + 20, low_u32(reference));
+        } else {
+            write_guest_u32(command + 16, (mask >> 32) as u32);
+            write_guest_u32(command + 20, low_u32(reference));
+            write_guest_u32(command + 24, (reference >> 32) as u32);
+            write_guest_u32(command + 28, compare_function | (operation << 8));
+            write_guest_u32(command + 32, poll_cycles / 40);
+        }
+    }
+    command
+}
+
+fn agc_packet_identity(command: u64) -> Option<(u32, u32, u32)> {
+    if command == 0 {
+        return None;
+    }
+    let header = read_guest_u32(command);
+    if header >> 30 != 3 {
+        return None;
+    }
+    Some((
+        ((header >> 8) & 0xff),
+        (header >> 2) & 0x3f,
+        ((header >> 16) & 0x3fff) + 2,
+    ))
+}
+
+fn agc_dma_data_patch_destination(arguments: [u64; 6]) -> u64 {
+    let command = arguments[0];
+    let destination = arguments[1];
+    let Some((opcode, register, length)) = agc_packet_identity(command) else {
+        return u64::MAX;
+    };
+    if opcode != AGC_IT_NOP || register != AGC_R_DMA_DATA {
+        return u64::MAX;
+    }
+    let destination_offset = if length == 7 { 4 } else { 16 };
+    write_guest_u64(command + destination_offset, destination);
+    0
+}
+
+fn agc_wait_reg_mem_patch_address(arguments: [u64; 6]) -> u64 {
+    let command = arguments[0];
+    let address = arguments[1];
+    let Some((opcode, register, _)) = agc_packet_identity(command) else {
+        return u64::MAX;
+    };
+    let offset = if opcode == AGC_IT_WAIT_REG_MEM {
+        8
+    } else if opcode == AGC_IT_NOP && matches!(register, AGC_R_WAIT_MEM_32 | AGC_R_WAIT_MEM_64) {
+        4
+    } else {
+        return u64::MAX;
+    };
+    write_guest_u64(command + offset, address);
+    0
+}
+
+fn agc_release_mem_patch_address(arguments: [u64; 6]) -> u64 {
+    let command = arguments[0];
+    let Some((opcode, register, _)) = agc_packet_identity(command) else {
+        return u64::MAX;
+    };
+    if opcode != AGC_IT_NOP || register != AGC_R_RELEASE_MEM {
+        return u64::MAX;
+    }
+    write_guest_u64(command + 12, arguments[1]);
+    0
+}
+
+fn agc_dcb_acquire_mem(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
+    let command_buffer = arguments[0];
+    let engine = low_u32(arguments[1]) & 0xff;
+    let cb_db_operation = low_u32(arguments[2]);
+    let gcr_control = low_u32(arguments[3]);
+    let base_address = arguments[4];
+    let size_bytes = arguments[5];
+    let no_size = size_bytes == u64::MAX;
+    if command_buffer == 0
+        || engine > 1
+        || (!no_size && (size_bytes & 0xff != 0 || size_bytes >> 40 != 0))
+        || base_address & 0xff != 0
+        || base_address >> 40 != 0
+    {
+        return 0;
+    }
+    let Some(command) = agc_allocate_command_dwords(command_buffer, 8) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(8, AGC_IT_NOP, AGC_R_ACQUIRE_MEM));
+    write_guest_u32(command + 4, (engine << 31) | cb_db_operation);
+    write_guest_u32(
+        command + 8,
+        if no_size { 0 } else { low_u32(size_bytes >> 8) },
+    );
+    write_guest_u32(command + 12, 0);
+    write_guest_u32(command + 16, low_u32(base_address >> 8));
+    write_guest_u32(command + 20, 0);
+    write_guest_u32(command + 24, low_u32(stack_arguments[0]) / 40);
+    write_guest_u32(command + 28, gcr_control);
+    command
+}
+
 fn relocate_guest_pointer(field: u64) {
     let relative = read_guest_u64(field);
     if relative != 0 {
@@ -1763,6 +2257,132 @@ fn guest_guard_abort(address: u64) -> u64 {
     0
 }
 
+fn guest_cxa_allocate_exception(size: u64) -> u64 {
+    let Some(allocation_size) = size.checked_add(0x80) else {
+        return 0;
+    };
+    let allocation = guest_calloc(1, allocation_size);
+    if allocation == 0 {
+        0
+    } else {
+        allocation.checked_add(0x80).unwrap_or(0)
+    }
+}
+
+fn guest_cxa_free_exception(exception: u64) -> u64 {
+    if let Some(allocation) = exception.checked_sub(0x80) {
+        guest_free(allocation);
+    }
+    0
+}
+
+fn guest_cxa_throw(arguments: [u64; 6]) -> u64 {
+    let exception = arguments[0];
+    let type_info = arguments[1];
+    eprintln!(
+        "[REMu][CXX] guest exception object={exception:#x} type_info={type_info:#x} destructor={:#x} object_word0={:#x} object_word1={:#x}",
+        arguments[2],
+        read_guest_u64(exception),
+        read_guest_u64(exception + 8),
+    );
+    terminate_probe(88);
+}
+
+fn guest_errno_address() -> u64 {
+    let thread_pointer = current_guest_thread_pointer();
+    if thread_pointer == 0 {
+        0
+    } else {
+        thread_pointer.checked_add(0x40).unwrap_or(0)
+    }
+}
+
+fn dispatch_guest_numeric_parser(nid: &str, arguments: [u64; 6]) -> ProbeImportReturn {
+    if arguments[0] == 0 {
+        return ProbeImportReturn::integer(0);
+    }
+    set_host_errno(0);
+    if guest_errno_address() != 0 {
+        write_guest_u32(guest_errno_address(), 0);
+    }
+    let end_pointer = arguments[1] as *mut *mut libc::c_char;
+    let result = match nid {
+        // libc strtoull
+        "5OqszGpy7Mg" => {
+            // SAFETY: The guest supplies a NUL-terminated string and optional writable end pointer.
+            ProbeImportReturn::integer(unsafe {
+                libc::strtoull(
+                    arguments[0] as *const libc::c_char,
+                    end_pointer,
+                    low_i32(arguments[2]),
+                )
+            })
+        }
+        // libc strtoll
+        "VOBg+iNwB-4" => {
+            // SAFETY: The guest supplies a NUL-terminated string and optional writable end pointer.
+            ProbeImportReturn::integer(unsafe {
+                libc::strtoll(
+                    arguments[0] as *const libc::c_char,
+                    end_pointer,
+                    low_i32(arguments[2]),
+                )
+                .cast_unsigned()
+            })
+        }
+        // libc strtod. ProbeImportReturn's mixed INTEGER/SSE ABI returns this through XMM0 while
+        // preserving RAX for every ordinary import.
+        "2vDqwBlpF-o" => {
+            // SAFETY: The guest supplies a NUL-terminated string and optional writable end pointer.
+            ProbeImportReturn::float(unsafe {
+                libc::strtod(arguments[0] as *const libc::c_char, end_pointer)
+            })
+        }
+        _ => ProbeImportReturn::integer(0),
+    };
+    let guest_errno = guest_errno_address();
+    if guest_errno != 0 {
+        write_guest_u32(guest_errno, host_errno().cast_unsigned());
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn set_host_errno(value: i32) {
+    // SAFETY: __error returns this host thread's writable errno cell.
+    unsafe {
+        *libc::__error() = value;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_errno() -> i32 {
+    // SAFETY: __error returns this host thread's live errno cell.
+    unsafe { *libc::__error() }
+}
+
+#[cfg(target_os = "linux")]
+fn set_host_errno(value: i32) {
+    // SAFETY: __errno_location returns this host thread's writable errno cell.
+    unsafe {
+        *libc::__errno_location() = value;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn host_errno() -> i32 {
+    // SAFETY: __errno_location returns this host thread's live errno cell.
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn set_host_errno(_value: i32) {}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_errno() -> i32 {
+    0
+}
+
 fn write_guest_u64(address: u64, value: u64) {
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe {
@@ -1783,6 +2403,13 @@ fn read_guest_u32(address: u64) -> u32 {
 fn read_guest_u64(address: u64) -> u64 {
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u64) }
+}
+
+fn write_guest_u8(address: u64, value: u8) {
+    // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
+    unsafe {
+        std::ptr::write_unaligned(address as *mut u8, value);
+    }
 }
 
 fn write_guest_u32(address: u64, value: u32) {
@@ -2225,6 +2852,19 @@ fn guest_memcmp(left: u64, right: u64, length: u64) -> u64 {
     })
 }
 
+fn guest_memchr(address: u64, character: u64, length: u64) -> u64 {
+    if address == 0 || length == 0 {
+        return 0;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return 0;
+    };
+    // SAFETY: memchr's guest ABI contract supplies a readable range through `length`.
+    unsafe {
+        libc::memchr(address as *const libc::c_void, low_i32(character), length) as usize as u64
+    }
+}
+
 fn guest_sprintf(arguments: [u64; 6]) -> u64 {
     if arguments[0] == 0 || arguments[1] == 0 {
         return u64::MAX;
@@ -2336,6 +2976,7 @@ fn probe_entry(
     process_image_name: &str,
     game_root: &Path,
     maximum_import_hits: usize,
+    timeout_seconds: u32,
 ) -> Result<ProbeOutcome, LinkError> {
     #[repr(C)]
     struct EntryParameters {
@@ -2358,9 +2999,11 @@ fn probe_entry(
     };
     configure_probe_dispatch(image, game_root, maximum_import_hits);
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
-    // SAFETY: Alarm only bounds this diagnostic process; the default SIGALRM action terminates it.
-    unsafe {
-        libc::alarm(10);
+    if timeout_seconds != 0 {
+        // SAFETY: Alarm only bounds this diagnostic process; its default action terminates it.
+        unsafe {
+            libc::alarm(timeout_seconds);
+        }
     }
     // SAFETY: The linker validated and mapped the ELF entry in executable guest memory. The process
     // entry ABI is the same System V x86-64 convention used by this Rosetta process.
@@ -2390,6 +3033,7 @@ const fn probe_entry(
     _process_image_name: &str,
     _game_root: &Path,
     _maximum_import_hits: usize,
+    _timeout_seconds: u32,
 ) -> Result<ProbeOutcome, LinkError> {
     Err(LinkError::ProbeRequiresX86_64)
 }

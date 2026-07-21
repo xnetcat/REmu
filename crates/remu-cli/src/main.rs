@@ -34,6 +34,9 @@ enum Command {
         path: PathBuf,
         #[arg(long, default_value_t = 32)]
         import_limit: usize,
+        /// Stop the process after this many seconds; zero disables the timer.
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u32,
     },
 }
 
@@ -61,7 +64,11 @@ fn main() -> ExitCode {
         Command::Imports { path } => imports(&path),
         Command::Map { path } => map(&path),
         Command::Link { path } => link(&path),
-        Command::Probe { path, import_limit } => probe(&path, import_limit),
+        Command::Probe {
+            path,
+            import_limit,
+            timeout_seconds,
+        } => probe(&path, import_limit, timeout_seconds),
     }
 }
 
@@ -200,6 +207,34 @@ fn imports(path: &Path) -> ExitCode {
     for (relocation_type, count) in relocation_types {
         println!("relocation_type[{relocation_type}]={count}");
     }
+    println!("plt_entries={}", dynamic.jump_relocations.len());
+    for (index, relocation) in dynamic.jump_relocations.iter().enumerate() {
+        let symbol_name = usize::try_from(relocation.symbol_index)
+            .ok()
+            .and_then(|index| dynamic.symbols.get(index))
+            .map_or("<missing>", |symbol| symbol.name.as_str());
+        let nid = symbol_name
+            .split_once('#')
+            .map_or(symbol_name, |(nid, _)| nid);
+        let resolved_name = remu_runtime::known_nid_name(nid).unwrap_or("unknown");
+        println!(
+            "plt[{index}]=offset:{} symbol:{} nid:{} resolved:{} name:{}",
+            relocation.offset, relocation.symbol_index, nid, resolved_name, symbol_name
+        );
+    }
+    let exports = dynamic
+        .symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| !symbol.is_undefined())
+        .collect::<Vec<_>>();
+    println!("exports={}", exports.len());
+    for (index, symbol) in exports {
+        println!(
+            "export={} symbol={} value:{} size:0x{:x}",
+            symbol.name, index, symbol.value, symbol.size
+        );
+    }
     println!("imports={}", dynamic.imports.len());
     for import in dynamic.imports {
         let relocation_types = import
@@ -291,7 +326,7 @@ fn link(path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn probe(path: &Path, import_limit: usize) -> ExitCode {
+fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
     let executable = match remu_loader::load_path(path) {
         Ok(executable) => executable,
         Err(error) => {
@@ -319,7 +354,7 @@ fn probe(path: &Path, import_limit: usize) -> ExitCode {
         .and_then(|name| name.to_str())
         .unwrap_or("eboot.bin");
     let game_root = path.parent().unwrap_or_else(|| Path::new("."));
-    match linked.probe_entry(image_name, game_root, import_limit) {
+    match linked.probe_entry(image_name, game_root, import_limit, timeout_seconds) {
         Ok(outcome) => {
             println!("return_value={}", outcome.return_value);
             println!("import_hits={}", outcome.import_hits);

@@ -30,6 +30,17 @@ cargo run -p remu-cli -- probe /path/to/eboot.bin
 cargo run -p remu-cli -- gpu-info
 ```
 
+On Apple Silicon, use the crash-capturing probe wrapper during game bring-up. It builds the
+x86-64 release binary, launches it under Rosetta and LLDB, and keeps the guest logs, backtraces,
+registers, revision, and launch settings together under `.remu/runs/`:
+
+```sh
+scripts/probe-game.sh /path/to/eboot.bin 2000000 120
+```
+
+The final argument is the diagnostic timeout in seconds; pass `0` for an interactive run with no
+timer.
+
 Build the initial Rosetta target on Apple Silicon with:
 
 ```sh
