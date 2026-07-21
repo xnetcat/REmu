@@ -764,8 +764,42 @@ fn software_rasterize_sprite(
         unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) };
     let target_bytes =
         unsafe { std::slice::from_raw_parts_mut(target_address as *mut u8, target_length) };
+    capture_sampled_texture_if_requested(source_bytes, source);
     rasterize_sprite_triangles(source_bytes, source, target_bytes, target, &vertices);
     Some(())
+}
+
+fn capture_sampled_texture_if_requested(source: &[u8], descriptor: GuestTextureDescriptor) {
+    static CAPTURE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let Some(directory) = std::env::var_os("REMU_CAPTURE_TEXTURE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    if CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    let Some(pixel_count) = u64::from(descriptor.width)
+        .checked_mul(u64::from(descriptor.height))
+        .and_then(|pixels| usize::try_from(pixels).ok())
+    else {
+        return;
+    };
+    let mut bgra = vec![0_u8; pixel_count.saturating_mul(4)];
+    let width = usize::try_from(descriptor.width).expect("validated texture width");
+    let height = usize::try_from(descriptor.height).expect("validated texture height");
+    for y in 0..height {
+        for x in 0..width {
+            let source_offset = guest_pixel_byte_offset(descriptor, x, y);
+            let target_offset = (y * width + x) * 4;
+            let pixel = &source[source_offset..source_offset + 4];
+            bgra[target_offset..target_offset + 4]
+                .copy_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+    }
+    let fingerprint = guest_frame_fingerprint(&bgra);
+    match capture_guest_frame(&directory, &bgra, descriptor, fingerprint) {
+        Ok(path) => eprintln!("[REMu][METAL] captured sampled texture {}", path.display()),
+        Err(error) => eprintln!("[REMu][METAL] could not capture sampled texture: {error}"),
+    }
 }
 
 fn decode_sprite_vertices(
@@ -1276,10 +1310,15 @@ fn decode_guest_texture(draw: &IndexedDraw, register_base: u32) -> Option<GuestT
     {
         return None;
     }
-    let pitch = if fields[4] == 0 {
+    let descriptor_pitch = if fields[4] == 0 {
         width
     } else {
         (fields[4] & 0x3fff).checked_add(1)?
+    };
+    let pitch = if tile_mode == 0 {
+        effective_linear_rgba_pitch(width.max(descriptor_pitch))?
+    } else {
+        descriptor_pitch
     };
     if pitch < width || pitch > 8_192 {
         return None;
@@ -1292,6 +1331,13 @@ fn decode_guest_texture(draw: &IndexedDraw, register_base: u32) -> Option<GuestT
         pitch,
         tile_mode,
     })
+}
+
+fn effective_linear_rgba_pitch(pitch: u32) -> Option<u32> {
+    // GNM linear surfaces align RGBA8 rows to 256 bytes. This is implicit for common 128-bit
+    // texture descriptors, so widths such as 980 and 250 must be read with 1024- and 256-pixel
+    // strides even when the descriptor's extended pitch word is zero.
+    pitch.checked_add(63).map(|value| value & !63)
 }
 
 fn read_guest_present_constants(address: u64) -> Option<GuestPresentConstants> {
@@ -1556,8 +1602,9 @@ mod tests {
     use super::{
         DREAMING_FILL_ES_PREFIX, DREAMING_FILL_PS_PREFIX, GuestPresentConstants,
         GuestTextureDescriptor, blend_premultiplied_rgba, blit_guest_texture_bytes,
-        convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra, execute_dreaming_fill_draw,
-        mode27_source_byte_offset, read_draw_indices, transform_sprite_position,
+        convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra, effective_linear_rgba_pitch,
+        execute_dreaming_fill_draw, mode27_source_byte_offset, read_draw_indices,
+        transform_sprite_position,
     };
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
@@ -1593,6 +1640,13 @@ mod tests {
         let indices_32 = [0_u32, 1, 2, 0, 2, 3];
         let draw_32 = indexed_draw(indices_32.as_ptr().addr() as u64, 1, 6);
         assert_eq!(read_draw_indices(&draw_32), Some(vec![0, 1, 2, 0, 2, 3]));
+    }
+
+    #[test]
+    fn aligns_implicit_linear_rgba_texture_pitch() {
+        assert_eq!(effective_linear_rgba_pitch(320), Some(320));
+        assert_eq!(effective_linear_rgba_pitch(980), Some(1024));
+        assert_eq!(effective_linear_rgba_pitch(250), Some(256));
     }
 
     #[test]
