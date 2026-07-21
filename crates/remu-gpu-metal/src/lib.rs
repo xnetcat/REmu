@@ -1,4 +1,4 @@
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 use remu_gpu::{GpuAdapter, GpuProbe, GpuProbeError, GraphicsApi};
 

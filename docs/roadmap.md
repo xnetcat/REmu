@@ -7,7 +7,7 @@ opt-in and never become repository fixtures.
 
 Status: complete.
 
-- Apache-2.0 Rust workspace and clean-room rules.
+- GPL-2.0-or-later Rust workspace and source-provenance rules.
 - Native and Rosetta host detection.
 - Direct Metal device probe.
 - Standard ELF64 and observed executable-container identification.

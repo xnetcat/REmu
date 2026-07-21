@@ -1,4 +1,4 @@
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -53,22 +53,68 @@ fn inspect(path: &Path) -> ExitCode {
         Ok(info) => {
             println!("path={}", path.display());
             println!("kind={}", info.kind);
+            println!("file_size=0x{:x}", info.file_size);
+            if let Some(container) = info.container {
+                let header = container.header;
+                println!("container.version={}", header.version);
+                println!("container.mode={}", header.mode);
+                println!("container.endian={}", header.endian);
+                println!("container.attributes=0x{:02x}", header.attributes);
+                println!("container.key_type=0x{:08x}", header.key_type);
+                println!("container.header_size=0x{:x}", header.header_size);
+                println!("container.metadata_size=0x{:x}", header.metadata_size);
+                println!(
+                    "container.declared_file_size=0x{:x}",
+                    header.declared_file_size
+                );
+                println!("container.flags=0x{:04x}", header.flags);
+                println!(
+                    "container.embedded_elf_offset=0x{:x}",
+                    header.embedded_elf_offset
+                );
+                for (index, segment) in container.segments.iter().enumerate() {
+                    println!(
+                        "container.segment[{index}]=program:{} properties:0x{:x} offset:0x{:x} stored:0x{:x} expanded:0x{:x} encrypted:{} blocks:{}",
+                        segment.properties.program_index(),
+                        segment.properties.bits(),
+                        segment.file_offset,
+                        segment.stored_size,
+                        segment.expanded_size,
+                        segment.properties.is_encrypted(),
+                        segment.properties.has_blocks(),
+                    );
+                }
+            }
             if let Some(elf) = info.elf {
-                println!("elf.os_abi={}", elf.os_abi);
-                println!("elf.abi_version={}", elf.abi_version);
-                println!("elf.object_type=0x{:04x}", elf.object_type);
-                println!("elf.machine=0x{:04x}", elf.machine);
-                println!("elf.entry={}", elf.entry);
-                println!("elf.program_headers={}", elf.program_header_count);
+                let header = elf.header;
+                println!("elf.file_offset=0x{:x}", elf.file_offset);
+                println!("elf.os_abi={}", header.os_abi);
+                println!("elf.abi_version={}", header.abi_version);
+                println!("elf.object_type=0x{:04x}", header.object_type);
+                println!("elf.machine=0x{:04x}", header.machine);
+                println!("elf.entry={}", header.entry);
+                println!("elf.program_headers={}", header.program_header_count);
                 println!(
                     "elf.program_header_offset=0x{:x}",
-                    elf.program_header_offset
+                    header.program_header_offset
                 );
-                println!("elf.section_headers={}", elf.section_header_count);
+                println!("elf.section_headers={}", header.section_header_count);
                 println!(
                     "elf.section_header_offset=0x{:x}",
-                    elf.section_header_offset
+                    header.section_header_offset
                 );
+                for (index, program) in elf.program_headers.iter().enumerate() {
+                    println!(
+                        "elf.program[{index}]=type:0x{:08x} flags:0x{:x} offset:0x{:x} vaddr:{} filesz:0x{:x} memsz:0x{:x} align:0x{:x}",
+                        program.program_type,
+                        program.flags,
+                        program.file_offset,
+                        program.virtual_address,
+                        program.file_size,
+                        program.memory_size,
+                        program.alignment,
+                    );
+                }
             }
             ExitCode::SUCCESS
         }

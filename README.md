@@ -30,16 +30,16 @@ Build the initial Rosetta target on Apple Silicon with:
 cargo build --workspace --target x86_64-apple-darwin
 ```
 
-## Legal and clean-room policy
+## Legal and source policy
 
 REmu contains no games, console keys, firmware, or proprietary system software. Contributors must
-test only material they are legally entitled to use. GPL-licensed emulator projects may be studied
-for externally observable behavior, but their source code must not be copied, translated, or adapted
-into REmu. See [docs/clean-room.md](docs/clean-room.md).
+test only material they are legally entitled to use. Compatible GPL and permissively licensed
+emulator code may be adapted when its provenance, notices, and license obligations are preserved.
+See [docs/source-policy.md](docs/source-policy.md).
 
 REmu is not affiliated with or endorsed by Sony Interactive Entertainment. PlayStation is a
 trademark of Sony Interactive Entertainment Inc.
 
 ## License
 
-Apache-2.0.
+GPL-2.0-or-later.

@@ -7,16 +7,16 @@ version control.
 | Project | Snapshot | Relevant lesson | License consequence |
 | --- | --- | --- | --- |
 | Kyty | `4733b7e1` | Older PS4/PS5 HLE design with native x86-64 execution and Vulkan | MIT; permissive, but obsolete assumptions require independent validation |
-| KytyPS5 | `8a4600c5` | Current PS5-oriented RDNA2 decoding, custom shader IR, and Vulkan path | GPL-2.0-only; behavior reference only |
-| SharpEmu upstream / linked fork | `ada67a19` / `30fdd8d6` | Cross-platform native x86-64 HLE, host-fault recovery, and backend-neutral guest GPU boundary | GPL-2.0-or-later; behavior reference only |
-| SharpEmu Metal branch | `2ee32b89` | A direct Metal backend is practical without a Vulkan translation layer | GPL-2.0-or-later; architecture may be compared, implementation may not be adapted |
+| KytyPS5 | `8a4600c5` | Current PS5-oriented RDNA2 decoding, custom shader IR, and Vulkan path | GPL-2.0-only; reuse requires an explicit GPL-version compatibility decision |
+| SharpEmu upstream / linked fork | `ada67a19` / `30fdd8d6` | Cross-platform native x86-64 HLE, host-fault recovery, and backend-neutral guest GPU boundary | GPL-2.0-or-later; may be adapted with provenance and notices |
+| SharpEmu Metal branch | `2ee32b89` | A direct Metal backend is practical without a Vulkan translation layer | GPL-2.0-or-later; may be adapted with provenance and notices |
 | Obliteration | `16e981ec` | Useful Rust organization and host virtualization experiments, but virtualization is not the shortest route to games | MIT OR Apache-2.0; evaluate individual dependencies before reuse |
-| shadPS4 | `4c72de07` | Mature PS4 HLE, testing, and compatibility workflows | GPL-2.0-or-later; behavior reference only and PS4 semantics must not be assumed to be PS5 semantics |
-| RPCSX | `e8ae1481` | Additional PS4/PS5 graphics and HLE experiments | GPL-2.0; behavior reference only |
+| shadPS4 | `4c72de07` | Mature PS4 HLE, testing, and compatibility workflows | GPL-2.0-or-later; reusable with provenance, but PS4 semantics must not be assumed to be PS5 semantics |
+| RPCSX | `e8ae1481` | Additional PS4/PS5 graphics and HLE experiments | GPL-2.0; reuse requires an explicit GPL-version compatibility decision |
 
 The linked `galvesribeiro/sharpemu` Metal branch and the corresponding current direct-Metal source
-areas were also compared. Their Metal implementation is a useful feasibility result, not source
-material for REmu.
+areas were also compared. REmu can now adapt compatible GPL-2.0-or-later implementation work from
+these trees as long as provenance and notices remain recorded.
 
 ## Decisions resulting from the audit
 
