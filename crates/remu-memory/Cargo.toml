@@ -1,0 +1,15 @@
+[package]
+name = "remu-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+remu-core = { path = "../remu-core" }
+remu-loader = { path = "../remu-loader" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

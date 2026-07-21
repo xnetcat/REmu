@@ -259,6 +259,7 @@ dependencies = [
  "remu-gpu",
  "remu-gpu-metal",
  "remu-loader",
+ "remu-memory",
  "remu-platform",
 ]
 
@@ -286,6 +287,16 @@ name = "remu-loader"
 version = "0.1.0"
 dependencies = [
  "remu-core",
+ "thiserror",
+]
+
+[[package]]
+name = "remu-memory"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "remu-core",
+ "remu-loader",
  "thiserror",
 ]
 

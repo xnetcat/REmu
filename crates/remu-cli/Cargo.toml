@@ -14,8 +14,8 @@ clap.workspace = true
 remu-gpu = { path = "../remu-gpu" }
 remu-gpu-metal = { path = "../remu-gpu-metal" }
 remu-loader = { path = "../remu-loader" }
+remu-memory = { path = "../remu-memory" }
 remu-platform = { path = "../remu-platform" }
 
 [lints]
 workspace = true
-

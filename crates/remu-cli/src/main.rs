@@ -24,6 +24,8 @@ enum Command {
     GpuInfo,
     /// List module dependencies and imported symbols without executing the game.
     Imports { path: PathBuf },
+    /// Materialize load segments at the PS5 guest base without executing code.
+    Map { path: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -48,6 +50,7 @@ fn main() -> ExitCode {
             }
         },
         Command::Imports { path } => imports(&path),
+        Command::Map { path } => map(&path),
     }
 }
 
@@ -194,5 +197,39 @@ fn imports(path: &Path) -> ExitCode {
             relocation_types
         );
     }
+    ExitCode::SUCCESS
+}
+
+fn map(path: &Path) -> ExitCode {
+    let executable = match remu_loader::load_path(path) {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut image = match remu_memory::GuestImage::map_main(&executable) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("path={}", path.display());
+    println!("image_base={}", image.image_base());
+    println!("mapping_start={}", image.mapping_start());
+    println!("mapping_size=0x{:x}", image.mapping_size());
+    println!("entry={}", image.entry_address());
+    for (index, region) in image.regions().iter().enumerate() {
+        println!(
+            "region[{index}]=start:{} file:0x{:x} memory:0x{:x} flags:0x{:x}",
+            region.start, region.file_size, region.memory_size, region.flags
+        );
+    }
+    if let Err(error) = image.finalize_permissions() {
+        eprintln!("error: {}: {error}", path.display());
+        return ExitCode::FAILURE;
+    }
+    println!("permissions=finalized");
     ExitCode::SUCCESS
 }

@@ -14,3 +14,12 @@ This file records upstream implementation material used to accelerate REmu.
 
 The Rust parser adds independent bounded-input validation, checked arithmetic, streaming reads, and
 synthetic tests. No game bytes or proprietary SDK material are included.
+
+## `remu-memory`
+
+- Fixed-address macOS allocation, safe hint validation, Mach fixed-allocation fallback, staged
+  writes, and merged page protections were adapted from SharpEmu snapshot `ada67a19`, particularly
+  `SharpEmu.HLE/Host/Posix/PosixHostMemory.cs` and
+  `SharpEmu.Core/Memory/PhysicalVirtualMemory.cs`.
+- REmu reserves one contiguous main-image range before copying segments, avoiding partial mapping
+  state and handling shared host pages deterministically.

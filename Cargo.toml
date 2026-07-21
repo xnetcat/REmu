@@ -5,6 +5,7 @@ members = [
     "crates/remu-gpu",
     "crates/remu-gpu-metal",
     "crates/remu-loader",
+    "crates/remu-memory",
     "crates/remu-platform",
 ]
 resolver = "2"

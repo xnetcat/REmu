@@ -21,6 +21,7 @@ const CONTAINER_SEGMENT_SIZE: usize = 32;
 const MAX_CONTAINER_SEGMENTS: usize = 4096;
 const MAX_PROGRAM_HEADERS: usize = 4096;
 const MAX_METADATA_TABLE_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_LOAD_SEGMENT_SIZE: u64 = 512 * 1024 * 1024;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const DT_NULL: i64 = 0;
@@ -261,6 +262,22 @@ pub struct ExecutableInfo {
     pub elf: Option<Elf64Info>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadSegmentImage {
+    pub program_index: usize,
+    pub virtual_address: GuestAddress,
+    pub memory_size: u64,
+    pub flags: u32,
+    pub alignment: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadedExecutable {
+    pub info: ExecutableInfo,
+    pub load_segments: Vec<LoadSegmentImage>,
+}
+
 #[derive(Debug, Error)]
 pub enum InspectError {
     #[error("failed to read executable: {0}")]
@@ -315,11 +332,74 @@ pub enum InspectError {
     },
     #[error("relocation references symbol {index}, but the symbol table has {count} entries")]
     RelocationSymbolOutOfBounds { index: u32, count: usize },
+    #[error(
+        "load segment {program_index} file size 0x{file_size:x} exceeds memory size 0x{memory_size:x}"
+    )]
+    SegmentFileLargerThanMemory {
+        program_index: usize,
+        file_size: u64,
+        memory_size: u64,
+    },
 }
 
 pub fn inspect_path(path: impl AsRef<Path>) -> Result<ExecutableInfo, InspectError> {
     let mut file = File::open(path)?;
     inspect_reader(&mut file)
+}
+
+pub fn load_path(path: impl AsRef<Path>) -> Result<LoadedExecutable, InspectError> {
+    let mut file = File::open(path)?;
+    load_reader(&mut file)
+}
+
+pub fn load_reader(reader: &mut (impl Read + Seek)) -> Result<LoadedExecutable, InspectError> {
+    let info = inspect_reader(reader)?;
+    let Some(elf) = info.elf.as_ref() else {
+        return Ok(LoadedExecutable {
+            info,
+            load_segments: Vec::new(),
+        });
+    };
+    let mut load_segments = Vec::new();
+    for (program_index, program) in elf.program_headers.iter().enumerate() {
+        if program.program_type != PT_LOAD || program.memory_size == 0 {
+            continue;
+        }
+        if program.file_size > program.memory_size {
+            return Err(InspectError::SegmentFileLargerThanMemory {
+                program_index,
+                file_size: program.file_size,
+                memory_size: program.memory_size,
+            });
+        }
+        let data = if program.file_size == 0 {
+            Vec::new()
+        } else {
+            read_elf_file_range_bounded(
+                reader,
+                info.file_size,
+                info.container.as_ref(),
+                elf,
+                program.file_offset,
+                program.file_size,
+                "load segment",
+                MAX_LOAD_SEGMENT_SIZE,
+            )?
+        };
+        load_segments.push(LoadSegmentImage {
+            program_index,
+            virtual_address: program.virtual_address,
+            memory_size: program.memory_size,
+            flags: program.flags,
+            alignment: program.alignment,
+            data,
+        });
+    }
+
+    Ok(LoadedExecutable {
+        info,
+        load_segments,
+    })
 }
 
 pub fn inspect_reader(reader: &mut (impl Read + Seek)) -> Result<ExecutableInfo, InspectError> {
@@ -877,7 +957,30 @@ fn read_elf_file_range(
     size: u64,
     table: &'static str,
 ) -> Result<Vec<u8>, InspectError> {
-    if size > MAX_METADATA_TABLE_SIZE {
+    read_elf_file_range_bounded(
+        reader,
+        file_size,
+        container,
+        elf,
+        logical_offset,
+        size,
+        table,
+        MAX_METADATA_TABLE_SIZE,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_elf_file_range_bounded(
+    reader: &mut (impl Read + Seek),
+    file_size: u64,
+    container: Option<&ContainerInfo>,
+    elf: &Elf64Info,
+    logical_offset: u64,
+    size: u64,
+    table: &'static str,
+    maximum_size: u64,
+) -> Result<Vec<u8>, InspectError> {
+    if size > maximum_size {
         return Err(InspectError::MetadataTableTooLarge { table, size });
     }
     let logical_end = logical_offset
@@ -1062,6 +1165,7 @@ mod tests {
         CONTAINER_HEADER_SIZE, CONTAINER_SEGMENT_SIZE, DT_NEEDED, DT_NULL, DT_RELA, DT_RELA_SIZE,
         DT_SCE_SYMBOL_TABLE_SIZE, DT_STRING_TABLE, DT_STRING_TABLE_SIZE, DT_SYMBOL_TABLE,
         ELF64_HEADER_SIZE, ELF64_PROGRAM_HEADER_SIZE, ExecutableKind, InspectError, inspect_reader,
+        load_reader,
     };
 
     #[test]
@@ -1160,6 +1264,22 @@ mod tests {
         assert_eq!(dynamic.imports.len(), 1);
         assert_eq!(dynamic.imports[0].name, "foo#nid");
         assert_eq!(dynamic.imports[0].relocation_types, [7]);
+    }
+
+    #[test]
+    fn materializes_load_segments_and_preserves_zero_fill_size() {
+        let mut bytes = vec![0_u8; 0x180];
+        write_elf_header(&mut bytes, 1);
+        write_program_header(&mut bytes, 0, 1, 5, 0x100, 0x4000, 4, 16);
+        bytes[0x100..0x104].copy_from_slice(&[1, 2, 3, 4]);
+
+        let loaded = load_reader(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(loaded.load_segments.len(), 1);
+        let segment = &loaded.load_segments[0];
+        assert_eq!(segment.virtual_address.get(), 0x4000);
+        assert_eq!(segment.memory_size, 16);
+        assert_eq!(segment.flags, 5);
+        assert_eq!(segment.data, [1, 2, 3, 4]);
     }
 
     fn write_elf_header(bytes: &mut [u8], program_count: u16) {
