@@ -48,6 +48,8 @@ pub struct IndexedDraw {
     pub primitive_type: u32,
     pub export_shader_address: u64,
     pub pixel_shader_address: u64,
+    pub export_shader_prefix: Vec<u32>,
+    pub pixel_shader_prefix: Vec<u32>,
     pub color_target_address: u64,
     pub context_registers: Vec<GpuRegister>,
     pub shader_registers: Vec<GpuRegister>,

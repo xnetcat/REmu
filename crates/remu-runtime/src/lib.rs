@@ -2921,6 +2921,15 @@ fn agc_register_snapshot(registers: &BTreeMap<u32, u32>) -> Vec<remu_gpu::GpuReg
         .collect()
 }
 
+fn agc_shader_prefix_snapshot(address: u64) -> Vec<u32> {
+    if address == 0 {
+        return Vec::new();
+    }
+    (0..4_u64)
+        .map(|index| read_guest_u32(address + index * 4))
+        .collect()
+}
+
 fn agc_emit_indexed_draw(packet_address: u64, graphics: &mut AgcGraphicsState) {
     let index_offset = read_guest_u32(packet_address + 8);
     let index_count = read_guest_u32(packet_address + 12);
@@ -2959,6 +2968,8 @@ fn agc_emit_indexed_draw(packet_address: u64, graphics: &mut AgcGraphicsState) {
         primitive_type,
         export_shader_address,
         pixel_shader_address,
+        export_shader_prefix: agc_shader_prefix_snapshot(export_shader_address),
+        pixel_shader_prefix: agc_shader_prefix_snapshot(pixel_shader_address),
         color_target_address,
         context_registers: agc_register_snapshot(&graphics.context_registers),
         shader_registers: agc_register_snapshot(&graphics.shader_registers),

@@ -6,12 +6,14 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
-    Device, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
-    MTLTextureUsage, MetalLayer, Texture, TextureDescriptor,
+    CompileOptions, Device, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion,
+    MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MetalLayer,
+    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, Texture,
+    TextureDescriptor,
 };
 use objc::runtime::{Class, Object, YES};
 use objc::{msg_send, sel, sel_impl};
-use remu_gpu::GpuEvent;
+use remu_gpu::{GpuEvent, GpuRegister, IndexedDraw};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -19,6 +21,46 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
+
+const GUEST_PRESENTER_SHADER: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+
+struct GuestPresentVertex {
+    float4 position [[position]];
+    float2 uv;
+};
+
+struct GuestPresentConstants {
+    float4 multiply;
+    float4 add;
+};
+
+vertex GuestPresentVertex remu_guest_present_vertex(uint vertex_id [[vertex_id]]) {
+    const float2 positions[3] = {
+        float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)
+    };
+    const float2 uvs[3] = {
+        float2(0.0, 1.0), float2(2.0, 1.0), float2(0.0, -1.0)
+    };
+    GuestPresentVertex output;
+    output.position = float4(positions[vertex_id], 0.0, 1.0);
+    output.uv = uvs[vertex_id];
+    return output;
+}
+
+fragment float4 remu_guest_present_fragment(
+    GuestPresentVertex input [[stage_in]],
+    texture2d<float> source [[texture(0)]],
+    constant GuestPresentConstants& constants [[buffer(0)]]) {
+    constexpr sampler source_sampler(
+        coord::normalized, address::clamp_to_edge, filter::linear);
+    return source.sample(source_sampler, input.uv) * constants.multiply + constants.add;
+}
+";
+
+const DREAMING_PRESENTER_ES_PREFIX: [u32; 4] = [0xbfa0_0003, 0x93eb_ff03, 0x0008_0008, 0x8f6a_8c6b];
+const DREAMING_PRESENTER_PS_PREFIX: [u32; 4] = [0xbfa0_0001, 0xbefc_0310, 0xf42c_0406, 0xfa00_0000];
 
 #[derive(Clone, Copy)]
 struct DisplayConfiguration {
@@ -35,12 +77,32 @@ struct PendingFlip {
     sequence: u64,
 }
 
+#[derive(Clone, Copy)]
+struct GuestPresentConstants {
+    multiply: [f32; 4],
+    add: [f32; 4],
+}
+
+#[derive(Clone, Copy)]
+struct GuestTextureDescriptor {
+    address: u64,
+    width: u32,
+    height: u32,
+    pitch: u32,
+}
+
 struct MetalPresenter {
     receiver: Receiver<GpuEvent>,
     window: Option<Window>,
     device: Option<Device>,
     layer: Option<MetalLayer>,
     command_queue: Option<metal::CommandQueue>,
+    guest_present_pipeline: RenderPipelineState,
+    guest_texture: Option<Texture>,
+    guest_texture_size: (u32, u32),
+    pending_guest_draw: Option<IndexedDraw>,
+    guest_present_constants: Option<GuestPresentConstants>,
+    uploaded_guest_draw_sequence: u64,
     frame_texture: Option<Texture>,
     frame_texture_size: (u32, u32),
     display: Option<DisplayConfiguration>,
@@ -49,18 +111,26 @@ struct MetalPresenter {
     uploaded_flip_sequence: u64,
     startup_error: Option<String>,
     logged_unsupported_layout: bool,
+    logged_unsupported_guest_draw: bool,
 }
 
 impl MetalPresenter {
     fn new(receiver: Receiver<GpuEvent>) -> Result<Self, String> {
         let device = Device::system_default().ok_or("no Metal device is available")?;
         let command_queue = device.new_command_queue();
+        let guest_present_pipeline = create_guest_present_pipeline(&device)?;
         Ok(Self {
             receiver,
             window: None,
             device: Some(device),
             layer: None,
             command_queue: Some(command_queue),
+            guest_present_pipeline,
+            guest_texture: None,
+            guest_texture_size: (0, 0),
+            pending_guest_draw: None,
+            guest_present_constants: None,
+            uploaded_guest_draw_sequence: 0,
             frame_texture: None,
             frame_texture_size: (0, 0),
             display: None,
@@ -69,6 +139,7 @@ impl MetalPresenter {
             uploaded_flip_sequence: 0,
             startup_error: None,
             logged_unsupported_layout: false,
+            logged_unsupported_guest_draw: false,
         })
     }
 
@@ -150,9 +221,8 @@ impl MetalPresenter {
                         sequence: self.next_flip_sequence,
                     });
                 }
-                Ok(GpuEvent::IndexedDraw(_)) => {
-                    // The next renderer milestone consumes these snapshots after translating the
-                    // referenced GFX10 programs to MSL. Flip presentation remains independent.
+                Ok(GpuEvent::IndexedDraw(draw)) => {
+                    self.pending_guest_draw = Some(draw);
                 }
                 Ok(GpuEvent::Shutdown) | Err(TryRecvError::Disconnected) => {
                     event_loop.exit();
@@ -226,36 +296,239 @@ impl MetalPresenter {
         }
     }
 
+    fn upload_pending_guest_draw(&mut self) {
+        let (Some(draw), Some(device)) = (self.pending_guest_draw.as_ref(), self.device.as_ref())
+        else {
+            return;
+        };
+        if draw.sequence == self.uploaded_guest_draw_sequence {
+            return;
+        }
+        self.uploaded_guest_draw_sequence = draw.sequence;
+        let Some((descriptor, constants)) = decode_dreaming_presenter_draw(draw) else {
+            if !self.logged_unsupported_guest_draw {
+                eprintln!(
+                    "[REMu][METAL] no translated Metal path for es={:#x} ps={:#x}",
+                    draw.export_shader_address, draw.pixel_shader_address
+                );
+                self.logged_unsupported_guest_draw = true;
+            }
+            return;
+        };
+        let Some(row_bytes) = u64::from(descriptor.pitch).checked_mul(4) else {
+            return;
+        };
+        let Some(byte_count) = row_bytes.checked_mul(u64::from(descriptor.height)) else {
+            return;
+        };
+        if descriptor.address < 0x10_000 || byte_count > 128 * 1024 * 1024 {
+            return;
+        }
+        if self.guest_texture_size != (descriptor.width, descriptor.height) {
+            let texture_descriptor = TextureDescriptor::new();
+            texture_descriptor.set_texture_type(MTLTextureType::D2);
+            texture_descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+            texture_descriptor.set_width(u64::from(descriptor.width));
+            texture_descriptor.set_height(u64::from(descriptor.height));
+            texture_descriptor.set_storage_mode(MTLStorageMode::Shared);
+            texture_descriptor.set_usage(MTLTextureUsage::ShaderRead);
+            self.guest_texture = Some(device.new_texture(&texture_descriptor));
+            self.guest_texture_size = (descriptor.width, descriptor.height);
+        }
+        let (Some(texture), Ok(source)) = (
+            self.guest_texture.as_ref(),
+            usize::try_from(descriptor.address),
+        ) else {
+            return;
+        };
+        texture.replace_region(
+            MTLRegion::new_2d(
+                0,
+                0,
+                u64::from(descriptor.width),
+                u64::from(descriptor.height),
+            ),
+            0,
+            source as *const c_void,
+            row_bytes,
+        );
+        self.guest_present_constants = Some(constants);
+        if draw.sequence == 1 {
+            eprintln!(
+                "[REMu][METAL] translated Dreaming Sarah presenter draw source={:#x} {}x{} target={:#x}",
+                descriptor.address, descriptor.width, descriptor.height, draw.color_target_address
+            );
+        }
+    }
+
     fn render(&mut self) {
         self.upload_pending_frame();
-        let (Some(display), Some(layer), Some(queue), Some(texture)) = (
-            self.display,
-            self.layer.as_ref(),
-            self.command_queue.as_ref(),
-            self.frame_texture.as_ref(),
-        ) else {
+        self.upload_pending_guest_draw();
+        let (Some(layer), Some(queue)) = (self.layer.as_ref(), self.command_queue.as_ref()) else {
             return;
         };
         let Some(drawable) = layer.next_drawable() else {
             return;
         };
         let command_buffer = queue.new_command_buffer();
-        let encoder = command_buffer.new_blit_command_encoder();
-        encoder.copy_from_texture(
-            texture,
-            0,
-            0,
-            MTLOrigin::default(),
-            MTLSize::new(u64::from(display.width), u64::from(display.height), 1),
-            drawable.texture(),
-            0,
-            0,
-            MTLOrigin::default(),
-        );
-        encoder.end_encoding();
+        if let (Some(texture), Some(constants)) =
+            (self.guest_texture.as_ref(), self.guest_present_constants)
+        {
+            let pass = RenderPassDescriptor::new();
+            let Some(color) = pass.color_attachments().object_at(0) else {
+                return;
+            };
+            color.set_texture(Some(drawable.texture()));
+            color.set_load_action(MTLLoadAction::Clear);
+            color.set_clear_color(metal::MTLClearColor::new(0.015, 0.02, 0.04, 1.0));
+            color.set_store_action(MTLStoreAction::Store);
+            let encoder = command_buffer.new_render_command_encoder(pass);
+            encoder.set_render_pipeline_state(&self.guest_present_pipeline);
+            encoder.set_fragment_texture(0, Some(texture));
+            let constant_values = [constants.multiply, constants.add];
+            encoder.set_fragment_bytes(
+                0,
+                u64::try_from(std::mem::size_of_val(&constant_values))
+                    .expect("guest presenter constants fit in Metal's length type"),
+                constant_values.as_ptr().cast::<c_void>(),
+            );
+            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+            encoder.end_encoding();
+        } else if let (Some(display), Some(texture)) = (self.display, self.frame_texture.as_ref()) {
+            let encoder = command_buffer.new_blit_command_encoder();
+            encoder.copy_from_texture(
+                texture,
+                0,
+                0,
+                MTLOrigin::default(),
+                MTLSize::new(u64::from(display.width), u64::from(display.height), 1),
+                drawable.texture(),
+                0,
+                0,
+                MTLOrigin::default(),
+            );
+            encoder.end_encoding();
+        } else {
+            return;
+        }
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
     }
+}
+
+fn create_guest_present_pipeline(device: &metal::DeviceRef) -> Result<RenderPipelineState, String> {
+    let options = CompileOptions::new();
+    let library = device
+        .new_library_with_source(GUEST_PRESENTER_SHADER, &options)
+        .map_err(|error| format!("could not compile the Dreaming Sarah Metal shader: {error}"))?;
+    let vertex = library
+        .get_function("remu_guest_present_vertex", None)
+        .map_err(|error| format!("could not load the guest presenter vertex shader: {error}"))?;
+    let fragment = library
+        .get_function("remu_guest_present_fragment", None)
+        .map_err(|error| format!("could not load the guest presenter fragment shader: {error}"))?;
+    let descriptor = RenderPipelineDescriptor::new();
+    descriptor.set_vertex_function(Some(&vertex));
+    descriptor.set_fragment_function(Some(&fragment));
+    let color = descriptor
+        .color_attachments()
+        .object_at(0)
+        .ok_or("Metal did not provide color attachment zero")?;
+    color.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| format!("could not create the guest presenter pipeline: {error}"))
+}
+
+fn register_value(registers: &[GpuRegister], offset: u32) -> Option<u32> {
+    registers
+        .binary_search_by_key(&offset, |register| register.offset)
+        .ok()
+        .map(|index| registers[index].value)
+}
+
+fn shader_matches_prefix(code: &[u32], prefix: &[u32]) -> bool {
+    code.get(..prefix.len()) == Some(prefix)
+}
+
+fn decode_dreaming_presenter_draw(
+    draw: &IndexedDraw,
+) -> Option<(GuestTextureDescriptor, GuestPresentConstants)> {
+    if !shader_matches_prefix(&draw.export_shader_prefix, &DREAMING_PRESENTER_ES_PREFIX)
+        || !shader_matches_prefix(&draw.pixel_shader_prefix, &DREAMING_PRESENTER_PS_PREFIX)
+    {
+        return None;
+    }
+
+    let fields: [u32; 8] = std::array::from_fn(|index| {
+        register_value(
+            &draw.shader_registers,
+            0x00c + u32::try_from(index).expect("texture descriptor index fits in u32"),
+        )
+        .unwrap_or_default()
+    });
+    let address = ((u64::from(fields[1] & 0xff) << 32) | u64::from(fields[0])) << 8;
+    let width = ((fields[1] >> 30) | ((fields[2] & 0x3fff) << 2)).checked_add(1)?;
+    let height = ((fields[2] >> 14) & 0xffff).checked_add(1)?;
+    let unified_format = (fields[1] >> 20) & 0x1ff;
+    let tile_mode = (fields[3] >> 20) & 0x1f;
+    let texture_type = fields[3] >> 28;
+    if address < 0x10_000
+        || width == 0
+        || width > 8_192
+        || height == 0
+        || height > 8_192
+        || unified_format != 56
+        || tile_mode != 0
+        || texture_type != 9
+    {
+        return None;
+    }
+    let pitch = if fields[4] == 0 {
+        width
+    } else {
+        (fields[4] & 0x3fff).checked_add(1)?
+    };
+    if pitch < width || pitch > 8_192 {
+        return None;
+    }
+
+    let constants_low = register_value(&draw.shader_registers, 0x018)?;
+    let constants_high = register_value(&draw.shader_registers, 0x019)?;
+    let constants_address = (u64::from(constants_high & 0xffff) << 32) | u64::from(constants_low);
+    let constants =
+        read_guest_present_constants(constants_address).unwrap_or(GuestPresentConstants {
+            multiply: [1.0; 4],
+            add: [0.0; 4],
+        });
+    Some((
+        GuestTextureDescriptor {
+            address,
+            width,
+            height,
+            pitch,
+        },
+        constants,
+    ))
+}
+
+fn read_guest_present_constants(address: u64) -> Option<GuestPresentConstants> {
+    if address < 0x10_000 {
+        return None;
+    }
+    let address = usize::try_from(address).ok()?;
+    let values: [f32; 8] = std::array::from_fn(|index| {
+        // SAFETY: The AGC user-data descriptor references a live, CPU-visible guest allocation.
+        // The runtime owns that mapping for the duration of the presenter thread.
+        unsafe { std::ptr::read_unaligned((address + index * 4) as *const f32) }
+    });
+    if !values.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    Some(GuestPresentConstants {
+        multiply: values[..4].try_into().expect("four multiply constants"),
+        add: values[4..].try_into().expect("four add constants"),
+    })
 }
 
 fn presenter_window_attributes() -> winit::window::WindowAttributes {
