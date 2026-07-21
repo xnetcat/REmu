@@ -7,6 +7,8 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
@@ -1179,9 +1181,10 @@ struct ProbeDispatchState {
     import_counts: BTreeMap<String, usize>,
     hits: usize,
     maximum_hits: usize,
-    next_direct_offset: u64,
+    direct_allocations: BTreeMap<u64, DirectAllocation>,
+    direct_memory_backing: Option<std::fs::File>,
     next_virtual_hint: u64,
-    mapped_allocations: Vec<(u64, u64)>,
+    mapped_allocations: Vec<MappedAllocation>,
     next_thread_handle: u64,
     thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
     agc_primary_register_defaults: u64,
@@ -1202,6 +1205,21 @@ struct ProbeDispatchState {
     save_root: PathBuf,
     save_mounts: BTreeMap<String, PathBuf>,
     next_save_transaction_resource: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MappedAllocation {
+    address: u64,
+    length: u64,
+    direct_start: u64,
+    protection: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectAllocation {
+    start: u64,
+    length: u64,
+    memory_type: i32,
 }
 
 #[derive(Debug, Default)]
@@ -1306,7 +1324,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.import_counts.clear();
     state.hits = 0;
     state.maximum_hits = maximum_hits;
-    state.next_direct_offset = 0;
+    state.direct_allocations.clear();
+    state.direct_memory_backing = None;
     state.next_virtual_hint = 0x20_0000_0000;
     state.mapped_allocations.clear();
     state.next_thread_handle = 1;
@@ -1879,6 +1898,11 @@ fn dispatch_probe_import(
         "rTXw65xmLIA" => allocate_direct_memory(arguments, state),
         // sceKernelMapDirectMemory
         "L-Q3LEjIbgA" => map_direct_memory(arguments, state),
+        // Kernel VM ownership calls must describe and retire the mappings created above. Returning
+        // success without filling VirtualQuery makes libc feed uninitialized lengths into munmap.
+        "rVjRvHJ0X6c" => kernel_virtual_query(arguments, state),
+        "cQke9UuBQOk" => kernel_munmap(arguments, state),
+        "MBuItvba6z8" => kernel_release_direct_memory(arguments, state),
         // libc memset
         "8zTFvBIAIN8" => guest_memset(arguments[0], arguments[1], arguments[2]),
         // libc memcpy
@@ -3751,61 +3775,168 @@ fn write_output_i32(address: u64, value: i32) -> u64 {
 }
 
 fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    const DIRECT_MEMORY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+    let search_start = i64::from_ne_bytes(arguments[0].to_ne_bytes())
+        .max(0)
+        .cast_unsigned();
+    let raw_search_end = i64::from_ne_bytes(arguments[1].to_ne_bytes());
     let length = arguments[2];
-    let alignment = arguments[3].max(0x4000);
+    let alignment = if arguments[3] == 0 {
+        MACOS_GUEST_PAGE_ALIGNMENT
+    } else {
+        arguments[3]
+    };
+    let memory_type = low_i32(arguments[4]);
     let output = arguments[5];
-    if length == 0 || output == 0 || !alignment.is_power_of_two() {
-        return u64::MAX;
+    if length == 0
+        || output == 0
+        || !alignment.is_power_of_two()
+        || alignment < MACOS_GUEST_PAGE_ALIGNMENT
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(offset) = align_up_u64(state.next_direct_offset, alignment) else {
-        return u64::MAX;
+    let search_end = if raw_search_end <= 0 {
+        DIRECT_MEMORY_SIZE
+    } else {
+        raw_search_end.cast_unsigned().min(DIRECT_MEMORY_SIZE)
     };
-    let Some(next) = offset.checked_add(length) else {
-        return u64::MAX;
+    let search_start = if search_start >= search_end {
+        0
+    } else {
+        search_start
     };
-    if next > 16 * 1024 * 1024 * 1024 {
-        return u64::MAX;
-    }
-    // SAFETY: The guest supplied an ABI output pointer in its live stack/image mapping.
-    unsafe {
-        std::ptr::write_unaligned(output as *mut u64, offset);
-    }
-    state.next_direct_offset = next;
+    let Some(offset) = find_free_direct_range(
+        &state.direct_allocations,
+        search_start,
+        search_end,
+        length,
+        alignment,
+    ) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
+    };
+    state.direct_allocations.insert(
+        offset,
+        DirectAllocation {
+            start: offset,
+            length,
+            memory_type,
+        },
+    );
+    write_guest_u64(output, offset);
+    eprintln!(
+        "[REMu][VM] allocated direct start={offset:#x} length={length:#x} alignment={alignment:#x} type={memory_type:#x}"
+    );
     0
 }
 
+fn find_free_direct_range(
+    allocations: &BTreeMap<u64, DirectAllocation>,
+    search_start: u64,
+    search_end: u64,
+    length: u64,
+    alignment: u64,
+) -> Option<u64> {
+    let mut candidate = align_up_u64(search_start, alignment)?;
+    for allocation in allocations.values() {
+        let allocation_end = allocation.start.checked_add(allocation.length)?;
+        if allocation_end <= candidate {
+            continue;
+        }
+        let gap_end = allocation.start.min(search_end);
+        if candidate.checked_add(length)? <= gap_end {
+            return Some(candidate);
+        }
+        if allocation.start >= search_end {
+            return None;
+        }
+        candidate = align_up_u64(candidate.max(allocation_end), alignment)?;
+    }
+    if candidate.checked_add(length)? <= search_end {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)]
 fn map_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let output = arguments[0];
-    let length = arguments[1];
-    let alignment = arguments[5].max(0x4000);
-    if output == 0 || length == 0 || !alignment.is_power_of_two() {
-        return u64::MAX;
+    let (output, length, protection, flags, direct_start) = (
+        arguments[0],
+        arguments[1],
+        low_i32(arguments[2]),
+        arguments[3],
+        arguments[4],
+    );
+    let alignment = if arguments[5] == 0 {
+        MACOS_GUEST_PAGE_ALIGNMENT
+    } else {
+        arguments[5]
+    };
+    if output == 0
+        || length == 0
+        || !alignment.is_power_of_two()
+        || alignment < MACOS_GUEST_PAGE_ALIGNMENT
+        || !direct_start.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
+        || !length.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(direct_end) = direct_start.checked_add(length) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if !state.direct_allocations.values().any(|allocation| {
+        allocation.start <= direct_start
+            && allocation
+                .start
+                .checked_add(allocation.length)
+                .is_some_and(|end| direct_end <= end)
+    }) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     let Ok(length_usize) = usize::try_from(length) else {
-        return u64::MAX;
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     let Ok(alignment_usize) = usize::try_from(alignment) else {
-        return u64::MAX;
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     let Some(reservation_size) = length_usize.checked_add(alignment_usize) else {
-        return u64::MAX;
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    let hint = align_up_u64(state.next_virtual_hint, alignment).unwrap_or(0);
-    // SAFETY: Anonymous mmap creates a new process-local reservation. The hint is non-destructive
-    // because MAP_FIXED is deliberately absent.
+    if state.direct_memory_backing.is_none() {
+        state.direct_memory_backing = create_direct_memory_backing();
+    }
+    let Some(backing) = state.direct_memory_backing.as_ref() else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
+    };
+    let requested = read_guest_u64(output);
+    let fixed = flags & 0x10 != 0 && requested != 0;
+    let hint = if requested != 0 {
+        requested
+    } else {
+        align_up_u64(state.next_virtual_hint, alignment).unwrap_or(0)
+    };
+    // Reserve an anonymous range first. MAP_FIXED below only replaces pages owned by this
+    // reservation, so a fixed guest request can never overwrite the Rosetta stack or host image.
     let reservation = unsafe {
         libc::mmap(
             hint as *mut std::ffi::c_void,
             reservation_size,
-            libc::PROT_READ | libc::PROT_WRITE,
+            libc::PROT_NONE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
             -1,
             0,
         )
     };
     if reservation == libc::MAP_FAILED {
-        return u64::MAX;
+        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
+    }
+    if fixed && reservation.addr() != usize::try_from(requested).unwrap_or(0) {
+        // SAFETY: reservation and size are the exact range returned by mmap above.
+        unsafe {
+            libc::munmap(reservation, reservation_size);
+        }
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     let reservation_address = reservation as usize;
     let Some(aligned_address) = reservation_address
@@ -3816,11 +3947,38 @@ fn map_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         unsafe {
             libc::munmap(reservation, reservation_size);
         }
-        return u64::MAX;
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     let prefix = aligned_address - reservation_address;
     let suffix = reservation_size - prefix - length_usize;
-    // SAFETY: Prefix/suffix are page-aligned subranges of the live anonymous reservation.
+    let host_protection = host_memory_protection(protection);
+    let Ok(file_offset) = libc::off_t::try_from(direct_start) else {
+        // SAFETY: reservation and size are the exact range returned by mmap above.
+        unsafe {
+            libc::munmap(reservation, reservation_size);
+        }
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    // SAFETY: MAP_FIXED replaces only the aligned subrange of our private reservation with a
+    // shared view of the sparse direct-memory backing object.
+    let mapped = unsafe {
+        libc::mmap(
+            aligned_address as *mut std::ffi::c_void,
+            length_usize,
+            host_protection,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            backing.as_raw_fd(),
+            file_offset,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        // SAFETY: reservation and size are the exact range returned by mmap above.
+        unsafe {
+            libc::munmap(reservation, reservation_size);
+        }
+        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
+    }
+    // SAFETY: Prefix/suffix are page-aligned subranges of the reservation around the file view.
     unsafe {
         if prefix != 0 {
             libc::munmap(reservation, prefix);
@@ -3831,18 +3989,223 @@ fn map_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
                 suffix,
             );
         }
-        std::ptr::write_unaligned(output as *mut u64, aligned_address as u64);
     }
+    write_guest_u64(output, aligned_address as u64);
     state.next_virtual_hint = (aligned_address as u64).saturating_add(length);
-    state
-        .mapped_allocations
-        .push((aligned_address as u64, length));
+    state.mapped_allocations.push(MappedAllocation {
+        address: aligned_address as u64,
+        length,
+        direct_start,
+        protection,
+    });
+    eprintln!(
+        "[REMu][VM] mapped direct={direct_start:#x} address={aligned_address:#x} length={length:#x} protection={protection:#x}"
+    );
     0
 }
 
 #[cfg(not(unix))]
 fn map_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
-    u64::MAX
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+#[cfg(unix)]
+fn create_direct_memory_backing() -> Option<std::fs::File> {
+    const DIRECT_MEMORY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+    for _ in 0..32 {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "remu-direct-memory-{}-{sequence}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let Ok(file) = file else {
+            continue;
+        };
+        if file.set_len(DIRECT_MEMORY_SIZE).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        let _ = std::fs::remove_file(&path);
+        return Some(file);
+    }
+    None
+}
+
+#[cfg(unix)]
+fn host_memory_protection(protection: i32) -> i32 {
+    let mut result = libc::PROT_NONE;
+    if protection & (0x01 | 0x10) != 0 {
+        result |= libc::PROT_READ;
+    }
+    if protection & (0x02 | 0x20) != 0 {
+        result |= libc::PROT_WRITE;
+    }
+    if protection & 0x04 != 0 {
+        result |= libc::PROT_EXEC;
+    }
+    result
+}
+
+fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    const VIRTUAL_QUERY_INFO_SIZE: u64 = 72;
+    let (query, flags, output, output_size) = (
+        arguments[0],
+        low_i32(arguments[1]),
+        arguments[2],
+        arguments[3],
+    );
+    if output == 0 || output_size < VIRTUAL_QUERY_INFO_SIZE {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let allocation = state
+        .mapped_allocations
+        .iter()
+        .filter(|allocation| {
+            let end = allocation.address.saturating_add(allocation.length);
+            (query >= allocation.address && query < end)
+                || (flags & 1 != 0 && allocation.address >= query)
+        })
+        .min_by_key(|allocation| {
+            let contains = query >= allocation.address
+                && query < allocation.address.saturating_add(allocation.length);
+            (!contains, allocation.address)
+        });
+    let Some(allocation) = allocation else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let end = allocation.address.saturating_add(allocation.length);
+    guest_memset(output, 0, VIRTUAL_QUERY_INFO_SIZE);
+    write_guest_u64(output, allocation.address);
+    write_guest_u64(output + 0x08, end);
+    write_guest_u64(output + 0x10, allocation.direct_start);
+    write_guest_u32(output + 0x18, allocation.protection.cast_unsigned());
+    // Direct and currently mapped, matching the Gen5 SceKernelVirtualQueryInfo flags.
+    write_guest_u8(output + 0x20, 0x12);
+    for (index, byte) in b"direct".iter().copied().enumerate() {
+        write_guest_u8(output + 0x21 + u64::try_from(index).unwrap_or(0), byte);
+    }
+    eprintln!(
+        "[REMu][VM] query={query:#x} start={:#x} end={end:#x} direct={:#x}",
+        allocation.address, allocation.direct_start
+    );
+    0
+}
+
+#[cfg(unix)]
+fn kernel_munmap(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let (address, length) = (arguments[0], arguments[1]);
+    if address == 0
+        || length == 0
+        || !address.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
+        || !length.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(end) = address.checked_add(length) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let overlaps = state.mapped_allocations.iter().any(|allocation| {
+        let allocation_end = allocation.address.saturating_add(allocation.length);
+        address < allocation_end && end > allocation.address
+    });
+    if !overlaps {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    }
+    let (Ok(host_address), Ok(host_length)) = (usize::try_from(address), usize::try_from(length))
+    else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    // SAFETY: every overlapping page belongs to a tracked mmap created above.
+    if unsafe { libc::munmap(host_address as *mut std::ffi::c_void, host_length) } != 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let mut replacement = Vec::new();
+    for allocation in state.mapped_allocations.drain(..) {
+        let allocation_end = allocation.address.saturating_add(allocation.length);
+        if address >= allocation_end || end <= allocation.address {
+            replacement.push(allocation);
+            continue;
+        }
+        if address > allocation.address {
+            replacement.push(MappedAllocation {
+                length: address - allocation.address,
+                ..allocation
+            });
+        }
+        if end < allocation_end {
+            replacement.push(MappedAllocation {
+                address: end,
+                length: allocation_end - end,
+                direct_start: allocation.direct_start + (end - allocation.address),
+                protection: allocation.protection,
+            });
+        }
+    }
+    state.mapped_allocations = replacement;
+    eprintln!("[REMu][VM] unmapped address={address:#x} length={length:#x}");
+    0
+}
+
+#[cfg(not(unix))]
+fn kernel_munmap(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+fn kernel_release_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let (start, length) = (arguments[0], arguments[1]);
+    if !start.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
+        || !length.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    if length == 0 {
+        return 0;
+    }
+    let Some(end) = start.checked_add(length) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let owner = state
+        .direct_allocations
+        .values()
+        .copied()
+        .find(|allocation| {
+            allocation.start <= start
+                && allocation
+                    .start
+                    .checked_add(allocation.length)
+                    .is_some_and(|allocation_end| end <= allocation_end)
+        });
+    if let Some(owner) = owner {
+        let owner_end = owner.start + owner.length;
+        state.direct_allocations.remove(&owner.start);
+        if start > owner.start {
+            state.direct_allocations.insert(
+                owner.start,
+                DirectAllocation {
+                    length: start - owner.start,
+                    ..owner
+                },
+            );
+        }
+        if end < owner_end {
+            state.direct_allocations.insert(
+                end,
+                DirectAllocation {
+                    start: end,
+                    length: owner_end - end,
+                    memory_type: owner.memory_type,
+                },
+            );
+        }
+    }
+    eprintln!("[REMu][VM] released direct start={start:#x} length={length:#x}");
+    0
 }
 
 fn guest_memset(destination: u64, value: u64, length: u64) -> u64 {
@@ -4357,6 +4720,7 @@ fn guest_fread(destination: u64, size: u64, count: u64, handle: u64) -> u64 {
 const SCE_KERNEL_ERROR_PERMISSION_DENIED: u32 = 0x8002_0001;
 const SCE_KERNEL_ERROR_NOT_FOUND: u32 = 0x8002_0002;
 const SCE_KERNEL_ERROR_INVALID_ARGUMENT: u32 = 0x8002_0003;
+const SCE_KERNEL_ERROR_TRY_AGAIN: u32 = 0x8002_0023;
 const SCE_KERNEL_ERROR_MEMORY_FAULT: u32 = 0x8002_0101;
 const SCE_KERNEL_STAT_SIZE: usize = 120;
 
@@ -4735,9 +5099,10 @@ mod platform_independent_tests {
 
     use super::{
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
-        AGC_R_DRAW_INDEX_AUTO, ProbeDispatchState, agc_dcb_draw_index_auto,
-        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4, guest_qsort,
-        kernel_stat_payload, low_f32, low_u32, read_guest_u64, resolve_guest_path,
+        AGC_R_DRAW_INDEX_AUTO, DirectAllocation, MappedAllocation, ProbeDispatchState,
+        agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
+        allocate_direct_memory, guest_qsort, kernel_release_direct_memory, kernel_stat_payload,
+        kernel_virtual_query, low_f32, low_u32, read_guest_u64, resolve_guest_path,
         sanitize_save_segment, sce_kernel_error, write_guest_u32, write_guest_u64,
     };
 
@@ -4819,6 +5184,132 @@ mod platform_independent_tests {
         assert_eq!(sanitize_save_segment("SAVEDATA00"), "SAVEDATA00");
         assert_eq!(sanitize_save_segment("../outside"), "___outside");
         assert_eq!(sanitize_save_segment("///"), "default");
+    }
+
+    #[test]
+    fn describes_a_tracked_direct_mapping_to_the_guest() {
+        let mut state = ProbeDispatchState::default();
+        state.mapped_allocations.push(MappedAllocation {
+            address: 0x0070_0014_0000,
+            length: 0x1_0000,
+            direct_start: 0x20_0000,
+            protection: 0x33,
+        });
+        let mut output = [0xa5_u8; 72];
+        let result = kernel_virtual_query(
+            [
+                0x0070_0014_0000,
+                0,
+                output.as_mut_ptr().addr() as u64,
+                output.len() as u64,
+                0,
+                0,
+            ],
+            &state,
+        );
+        assert_eq!(result, 0);
+        assert_eq!(
+            u64::from_le_bytes(output[0..8].try_into().unwrap()),
+            0x0070_0014_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(output[8..16].try_into().unwrap()),
+            0x0070_0015_0000
+        );
+        assert_eq!(
+            u64::from_le_bytes(output[16..24].try_into().unwrap()),
+            0x20_0000
+        );
+        assert_eq!(u32::from_le_bytes(output[24..28].try_into().unwrap()), 0x33);
+        assert_eq!(output[32], 0x12);
+        assert_eq!(&output[33..39], b"direct");
+    }
+
+    #[test]
+    fn allocates_direct_memory_from_real_free_ranges() {
+        let mut state = ProbeDispatchState::default();
+        state.direct_allocations.insert(
+            0x4000,
+            DirectAllocation {
+                start: 0x4000,
+                length: 0x4000,
+                memory_type: 3,
+            },
+        );
+        let mut output = u64::MAX;
+        let result = allocate_direct_memory(
+            [
+                0,
+                0x1_0000,
+                0x4000,
+                0x4000,
+                12,
+                (&raw mut output).addr() as u64,
+            ],
+            &mut state,
+        );
+        assert_eq!(result, 0);
+        assert_eq!(output, 0);
+        assert_eq!(state.direct_allocations[&0].memory_type, 12);
+    }
+
+    #[test]
+    fn release_direct_memory_splits_the_owned_physical_range() {
+        let mut state = ProbeDispatchState::default();
+        state.direct_allocations.insert(
+            0,
+            DirectAllocation {
+                start: 0,
+                length: 0xc000,
+                memory_type: 7,
+            },
+        );
+        assert_eq!(
+            kernel_release_direct_memory([0x4000, 0x4000, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(state.direct_allocations[&0].length, 0x4000);
+        assert_eq!(state.direct_allocations[&0x8000].length, 0x4000);
+        assert_eq!(state.direct_allocations[&0x8000].memory_type, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_memory_mappings_alias_the_same_physical_bytes() {
+        use super::{kernel_munmap, map_direct_memory};
+
+        let mut state = ProbeDispatchState::default();
+        state.direct_allocations.insert(
+            0,
+            DirectAllocation {
+                start: 0,
+                length: 0x4000,
+                memory_type: 12,
+            },
+        );
+        let mut first = 0_u64;
+        let mut second = 0_u64;
+        assert_eq!(
+            map_direct_memory(
+                [(&raw mut first).addr() as u64, 0x4000, 0x33, 0, 0, 0x4000,],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(
+            map_direct_memory(
+                [(&raw mut second).addr() as u64, 0x4000, 0x33, 0, 0, 0x4000,],
+                &mut state,
+            ),
+            0
+        );
+        // SAFETY: both pointers are live read/write mappings created immediately above.
+        unsafe {
+            (first as *mut u8).write_volatile(0x5a);
+            assert_eq!((second as *const u8).read_volatile(), 0x5a);
+        }
+        assert_eq!(kernel_munmap([first, 0x4000, 0, 0, 0, 0], &mut state), 0);
+        assert_eq!(kernel_munmap([second, 0x4000, 0, 0, 0, 0], &mut state), 0);
     }
 
     #[test]
