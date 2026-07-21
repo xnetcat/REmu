@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -13,6 +14,8 @@ const PS5_CONTAINER_MAGIC: [u8; 4] = [0x4f, 0x15, 0x3d, 0x1d];
 const PS5_RETAIL_CONTAINER_MAGIC: [u8; 4] = [0x54, 0x14, 0xf5, 0xee];
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
+const ELF64_SYMBOL_SIZE: usize = 24;
+const ELF64_RELA_SIZE: usize = 24;
 const CONTAINER_HEADER_SIZE: usize = 32;
 const CONTAINER_SEGMENT_SIZE: usize = 32;
 const MAX_CONTAINER_SEGMENTS: usize = 4096;
@@ -169,6 +172,56 @@ pub struct DynamicEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Elf64Symbol {
+    pub name_offset: u32,
+    pub info: u8,
+    pub other: u8,
+    pub section_index: u16,
+    pub value: GuestAddress,
+    pub size: u64,
+    pub name: String,
+}
+
+impl Elf64Symbol {
+    #[must_use]
+    pub const fn binding(&self) -> u8 {
+        self.info >> 4
+    }
+
+    #[must_use]
+    pub const fn symbol_type(&self) -> u8 {
+        self.info & 0x0f
+    }
+
+    #[must_use]
+    pub const fn is_undefined(&self) -> bool {
+        self.section_index == 0
+    }
+
+    #[must_use]
+    pub const fn is_weak(&self) -> bool {
+        self.binding() == 2
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Elf64Rela {
+    pub offset: GuestAddress,
+    pub symbol_index: u32,
+    pub relocation_type: u32,
+    pub addend: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedSymbol {
+    pub symbol_index: u32,
+    pub name: String,
+    pub relocation_count: usize,
+    pub relocation_types: Vec<u32>,
+    pub weak: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DynamicInfo {
     pub entries: Vec<DynamicEntry>,
     pub needed_libraries: Vec<String>,
@@ -186,6 +239,10 @@ pub struct DynamicInfo {
     pub init_array_size: u64,
     pub preinit_array_address: u64,
     pub preinit_array_size: u64,
+    pub symbols: Vec<Elf64Symbol>,
+    pub relocations: Vec<Elf64Rela>,
+    pub jump_relocations: Vec<Elf64Rela>,
+    pub imports: Vec<ImportedSymbol>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,6 +307,14 @@ pub enum InspectError {
     UnterminatedDynamicString { offset: u64 },
     #[error("dynamic string at offset 0x{offset:x} is not valid UTF-8")]
     InvalidDynamicString { offset: u64 },
+    #[error("{table} table size 0x{size:x} is not a multiple of entry size {entry_size}")]
+    InvalidMetadataTableSize {
+        table: &'static str,
+        size: u64,
+        entry_size: usize,
+    },
+    #[error("relocation references symbol {index}, but the symbol table has {count} entries")]
+    RelocationSymbolOutOfBounds { index: u32, count: usize },
 }
 
 pub fn inspect_path(path: impl AsRef<Path>) -> Result<ExecutableInfo, InspectError> {
@@ -492,8 +557,9 @@ fn parse_dynamic(
 
     let mut info = summarize_dynamic_entries(entries);
 
+    let mut string_table = Vec::new();
     if info.string_table_address != 0 && info.string_table_size != 0 {
-        let string_table = read_elf_virtual_range(
+        string_table = read_elf_virtual_range(
             reader,
             file_size,
             container,
@@ -509,6 +575,8 @@ fn parse_dynamic(
             }
         }
     }
+
+    populate_linker_metadata(reader, file_size, container, elf, &string_table, &mut info)?;
 
     Ok(Some(info))
 }
@@ -531,6 +599,10 @@ fn summarize_dynamic_entries(entries: Vec<DynamicEntry>) -> DynamicInfo {
         init_array_size: 0,
         preinit_array_address: 0,
         preinit_array_size: 0,
+        symbols: Vec::new(),
+        relocations: Vec::new(),
+        jump_relocations: Vec::new(),
+        imports: Vec::new(),
     };
 
     for entry in &info.entries {
@@ -579,6 +651,182 @@ fn summarize_dynamic_entries(entries: Vec<DynamicEntry>) -> DynamicInfo {
     }
 
     info
+}
+
+fn populate_linker_metadata(
+    reader: &mut (impl Read + Seek),
+    file_size: u64,
+    container: Option<&ContainerInfo>,
+    elf: &Elf64Info,
+    string_table: &[u8],
+    info: &mut DynamicInfo,
+) -> Result<(), InspectError> {
+    info.relocations = read_relocation_table(
+        reader,
+        file_size,
+        container,
+        elf,
+        info.rela_address,
+        info.rela_size,
+        "RELA",
+    )?;
+    info.jump_relocations = read_relocation_table(
+        reader,
+        file_size,
+        container,
+        elf,
+        info.jump_relocation_address,
+        info.jump_relocation_size,
+        "jump relocation",
+    )?;
+
+    let max_symbol_index = info
+        .relocations
+        .iter()
+        .chain(&info.jump_relocations)
+        .map(|relocation| relocation.symbol_index)
+        .max()
+        .unwrap_or(0);
+    let symbol_table_size = if info.symbol_table_size != 0 {
+        info.symbol_table_size
+    } else if max_symbol_index != 0 {
+        u64::from(max_symbol_index + 1)
+            .checked_mul(ELF64_SYMBOL_SIZE as u64)
+            .ok_or(InspectError::OffsetOverflow)?
+    } else {
+        0
+    };
+    if info.symbol_table_address != 0 && symbol_table_size != 0 {
+        let symbol_bytes = read_elf_virtual_range(
+            reader,
+            file_size,
+            container,
+            elf,
+            info.symbol_table_address,
+            symbol_table_size,
+            "dynamic symbol",
+        )?;
+        info.symbols = parse_symbol_table(&symbol_bytes, string_table)?;
+    }
+
+    info.imports = build_import_inventory(
+        &info.symbols,
+        info.relocations.iter().chain(&info.jump_relocations),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_relocation_table(
+    reader: &mut (impl Read + Seek),
+    file_size: u64,
+    container: Option<&ContainerInfo>,
+    elf: &Elf64Info,
+    address: u64,
+    size: u64,
+    table: &'static str,
+) -> Result<Vec<Elf64Rela>, InspectError> {
+    if address == 0 || size == 0 {
+        return Ok(Vec::new());
+    }
+    if !size.is_multiple_of(ELF64_RELA_SIZE as u64) {
+        return Err(InspectError::InvalidMetadataTableSize {
+            table,
+            size,
+            entry_size: ELF64_RELA_SIZE,
+        });
+    }
+    let bytes = read_elf_virtual_range(reader, file_size, container, elf, address, size, table)?;
+    Ok(bytes
+        .chunks_exact(ELF64_RELA_SIZE)
+        .map(|entry| {
+            let info = read_u64_slice(entry, 8);
+            let info_bytes = info.to_le_bytes();
+            Elf64Rela {
+                offset: GuestAddress::new(read_u64_slice(entry, 0)),
+                symbol_index: (info >> 32) as u32,
+                relocation_type: u32::from_le_bytes([
+                    info_bytes[0],
+                    info_bytes[1],
+                    info_bytes[2],
+                    info_bytes[3],
+                ]),
+                addend: read_i64_slice(entry, 16),
+            }
+        })
+        .collect())
+}
+
+fn parse_symbol_table(bytes: &[u8], string_table: &[u8]) -> Result<Vec<Elf64Symbol>, InspectError> {
+    if !bytes.len().is_multiple_of(ELF64_SYMBOL_SIZE) {
+        return Err(InspectError::InvalidMetadataTableSize {
+            table: "dynamic symbol",
+            size: bytes.len() as u64,
+            entry_size: ELF64_SYMBOL_SIZE,
+        });
+    }
+    bytes
+        .chunks_exact(ELF64_SYMBOL_SIZE)
+        .map(|entry| {
+            let name_offset = read_u32_slice(entry, 0);
+            Ok(Elf64Symbol {
+                name_offset,
+                info: entry[4],
+                other: entry[5],
+                section_index: read_u16_slice(entry, 6),
+                value: GuestAddress::new(read_u64_slice(entry, 8)),
+                size: read_u64_slice(entry, 16),
+                name: if name_offset == 0 {
+                    String::new()
+                } else {
+                    read_dynamic_string(string_table, u64::from(name_offset))?
+                },
+            })
+        })
+        .collect()
+}
+
+fn build_import_inventory<'a>(
+    symbols: &[Elf64Symbol],
+    relocations: impl Iterator<Item = &'a Elf64Rela>,
+) -> Result<Vec<ImportedSymbol>, InspectError> {
+    let mut imports: BTreeMap<u32, (usize, BTreeSet<u32>)> = BTreeMap::new();
+    for relocation in relocations {
+        if relocation.symbol_index == 0 {
+            continue;
+        }
+        let symbol_index =
+            usize::try_from(relocation.symbol_index).map_err(|_| InspectError::OffsetOverflow)?;
+        let Some(symbol) = symbols.get(symbol_index) else {
+            return Err(InspectError::RelocationSymbolOutOfBounds {
+                index: relocation.symbol_index,
+                count: symbols.len(),
+            });
+        };
+        if !symbol.is_undefined() || symbol.name.is_empty() {
+            continue;
+        }
+        let entry = imports
+            .entry(relocation.symbol_index)
+            .or_insert_with(|| (0, BTreeSet::new()));
+        entry.0 += 1;
+        entry.1.insert(relocation.relocation_type);
+    }
+
+    imports
+        .into_iter()
+        .map(|(symbol_index, (relocation_count, relocation_types))| {
+            let index = usize::try_from(symbol_index).map_err(|_| InspectError::OffsetOverflow)?;
+            let symbol = &symbols[index];
+            Ok(ImportedSymbol {
+                symbol_index,
+                name: symbol.name.clone(),
+                relocation_count,
+                relocation_types: relocation_types.into_iter().collect(),
+                weak: symbol.is_weak(),
+            })
+        })
+        .collect()
 }
 
 fn read_elf_virtual_range(
@@ -780,6 +1028,19 @@ fn read_i64_slice(bytes: &[u8], offset: usize) -> i64 {
     ])
 }
 
+fn read_u16_slice(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn read_u32_slice(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
 fn read_u64_slice(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes([
         bytes[offset],
@@ -798,9 +1059,9 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        CONTAINER_HEADER_SIZE, CONTAINER_SEGMENT_SIZE, DT_NEEDED, DT_NULL, DT_STRING_TABLE,
-        DT_STRING_TABLE_SIZE, ELF64_HEADER_SIZE, ELF64_PROGRAM_HEADER_SIZE, ExecutableKind,
-        InspectError, inspect_reader,
+        CONTAINER_HEADER_SIZE, CONTAINER_SEGMENT_SIZE, DT_NEEDED, DT_NULL, DT_RELA, DT_RELA_SIZE,
+        DT_SCE_SYMBOL_TABLE_SIZE, DT_STRING_TABLE, DT_STRING_TABLE_SIZE, DT_SYMBOL_TABLE,
+        ELF64_HEADER_SIZE, ELF64_PROGRAM_HEADER_SIZE, ExecutableKind, InspectError, inspect_reader,
     };
 
     #[test]
@@ -871,20 +1132,34 @@ mod tests {
 
     #[test]
     fn reads_needed_libraries_from_a_dynamic_table() {
-        let mut bytes = vec![0_u8; 0x180];
+        let mut bytes = vec![0_u8; 0x300];
         write_elf_header(&mut bytes, 2);
-        write_program_header(&mut bytes, 0, 1, 4, 0x100, 0x1000, 0x80, 0x80);
-        write_program_header(&mut bytes, 1, 2, 4, 0x100, 0x1000, 0x40, 0x40);
+        write_program_header(&mut bytes, 0, 1, 4, 0x100, 0x1000, 0x200, 0x200);
+        write_program_header(&mut bytes, 1, 2, 4, 0x100, 0x1000, 0x80, 0x80);
         write_dynamic_entry(&mut bytes[0x100..], 0, DT_NEEDED, 1);
-        write_dynamic_entry(&mut bytes[0x100..], 1, DT_STRING_TABLE, 0x1040);
-        write_dynamic_entry(&mut bytes[0x100..], 2, DT_STRING_TABLE_SIZE, 0x20);
-        write_dynamic_entry(&mut bytes[0x100..], 3, DT_NULL, 0);
-        bytes[0x140..0x14c].copy_from_slice(b"\0libFoo.prx\0");
+        write_dynamic_entry(&mut bytes[0x100..], 1, DT_STRING_TABLE, 0x1080);
+        write_dynamic_entry(&mut bytes[0x100..], 2, DT_STRING_TABLE_SIZE, 0x40);
+        write_dynamic_entry(&mut bytes[0x100..], 3, DT_SYMBOL_TABLE, 0x10c0);
+        write_dynamic_entry(&mut bytes[0x100..], 4, DT_SCE_SYMBOL_TABLE_SIZE, 0x30);
+        write_dynamic_entry(&mut bytes[0x100..], 5, DT_RELA, 0x10f0);
+        write_dynamic_entry(&mut bytes[0x100..], 6, DT_RELA_SIZE, 0x18);
+        write_dynamic_entry(&mut bytes[0x100..], 7, DT_NULL, 0);
+        bytes[0x180..0x194].copy_from_slice(b"\0libFoo.prx\0foo#nid\0");
+        bytes[0x1d8..0x1dc].copy_from_slice(&12_u32.to_le_bytes());
+        bytes[0x1dc] = 0x12;
+        bytes[0x1f0..0x1f8].copy_from_slice(&0x2000_u64.to_le_bytes());
+        bytes[0x1f8..0x200].copy_from_slice(&((1_u64 << 32) | 7).to_le_bytes());
 
         let info = inspect_reader(&mut Cursor::new(bytes)).unwrap();
         let dynamic = info.elf.unwrap().dynamic.unwrap();
-        assert_eq!(dynamic.string_table_address, 0x1040);
+        assert_eq!(dynamic.string_table_address, 0x1080);
         assert_eq!(dynamic.needed_libraries, ["libFoo.prx"]);
+        assert_eq!(dynamic.symbols.len(), 2);
+        assert_eq!(dynamic.symbols[1].name, "foo#nid");
+        assert_eq!(dynamic.relocations.len(), 1);
+        assert_eq!(dynamic.imports.len(), 1);
+        assert_eq!(dynamic.imports[0].name, "foo#nid");
+        assert_eq!(dynamic.imports[0].relocation_types, [7]);
     }
 
     fn write_elf_header(bytes: &mut [u8], program_count: u16) {

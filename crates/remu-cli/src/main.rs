@@ -22,6 +22,8 @@ enum Command {
     HostInfo,
     /// Probe the native graphics backend selected for this host.
     GpuInfo,
+    /// List module dependencies and imported symbols without executing the game.
+    Imports { path: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -45,6 +47,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Imports { path } => imports(&path),
     }
 }
 
@@ -133,6 +136,10 @@ fn inspect(path: &Path) -> ExitCode {
                         "dynamic.jump_relocations=0x{:x}:0x{:x}",
                         dynamic.jump_relocation_address, dynamic.jump_relocation_size
                     );
+                    println!("dynamic.symbols={}", dynamic.symbols.len());
+                    println!("dynamic.relocations={}", dynamic.relocations.len());
+                    println!("dynamic.plt_relocations={}", dynamic.jump_relocations.len());
+                    println!("dynamic.imports={}", dynamic.imports.len());
                     for library in dynamic.needed_libraries {
                         println!("dynamic.needed={library}");
                     }
@@ -145,4 +152,47 @@ fn inspect(path: &Path) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn imports(path: &Path) -> ExitCode {
+    let info = match remu_loader::inspect_path(path) {
+        Ok(info) => info,
+        Err(error) => {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(dynamic) = info.elf.and_then(|elf| elf.dynamic) else {
+        eprintln!("error: {} has no dynamic-linker metadata", path.display());
+        return ExitCode::FAILURE;
+    };
+
+    println!("path={}", path.display());
+    println!("dependencies={}", dynamic.needed_libraries.len());
+    for library in dynamic.needed_libraries {
+        println!("dependency={library}");
+    }
+    println!("symbols={}", dynamic.symbols.len());
+    println!(
+        "relocations={}",
+        dynamic.relocations.len() + dynamic.jump_relocations.len()
+    );
+    println!("imports={}", dynamic.imports.len());
+    for import in dynamic.imports {
+        let relocation_types = import
+            .relocation_types
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "import={} symbol={} weak={} relocations={} types={}",
+            import.name,
+            import.symbol_index,
+            import.weak,
+            import.relocation_count,
+            relocation_types
+        );
+    }
+    ExitCode::SUCCESS
 }

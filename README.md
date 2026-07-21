@@ -22,6 +22,7 @@ See the [architecture](docs/architecture.md), [implementation roadmap](docs/road
 ```sh
 cargo run -p remu-cli -- host-info
 cargo run -p remu-cli -- inspect /path/to/eboot.bin
+cargo run -p remu-cli -- imports /path/to/eboot.bin
 cargo run -p remu-cli -- gpu-info
 ```
 
