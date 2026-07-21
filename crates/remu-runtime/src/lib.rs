@@ -1161,6 +1161,7 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "6sJWiWSRuqk" => guest_strncpy(arguments[0], arguments[1], arguments[2]),
         "Ls4tzzhimqQ" => guest_strcat(arguments[0], arguments[1]),
         "AV6ipCNa4Rw" => guest_strcasecmp(arguments[0], arguments[1]),
+        "viiwFMaNamA" => guest_strstr(arguments[0], arguments[1]),
         // libc stdio uses host FILE objects after resolving console paths inside the game dump.
         "xeYO4u7uyJ0" => guest_fopen(arguments[0], arguments[1], state),
         "rQFVBXp-Cxg" => guest_fseek(arguments[0], arguments[1], arguments[2]),
@@ -1186,6 +1187,18 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         // AGC shader construction and VideoOut mutate caller-owned descriptors. Games consume the
         // resulting pointers and command data immediately, so successful no-ops are insufficient.
         "f3dg2CSgRKY" => agc_create_shader(arguments),
+        "TRO721eVt4g" => agc_dcb_reset_queue(arguments),
+        "ZvwO9euwYzc" => agc_dcb_set_registers_indirect(arguments, AGC_R_CX_REGS_INDIRECT),
+        "-HOOCn0JY48" => agc_dcb_set_registers_indirect(arguments, AGC_R_SH_REGS_INDIRECT),
+        "hvUfkUIQcOE" => agc_dcb_set_registers_indirect(arguments, AGC_R_UC_REGS_INDIRECT),
+        "vcmNN+AAXnY" | "Qrj4c+61z4A" | "6lNcCp+fxi4" => agc_set_indirect_patch_address(arguments),
+        "d-6uF9sZDIU" | "z2duB-hHQSM" | "vRoArM9zaIk" => {
+            agc_add_indirect_patch_registers(arguments)
+        }
+        "D9sr1xGUriE" => agc_create_primitive_state(arguments),
+        "HV4j+E0MBHE" => agc_create_interpolant_mapping(arguments),
+        "n2fD4A+pb+g" => agc_cb_set_sh_register_range_direct(arguments),
+        "V++UgBtQhn0" => agc_get_data_packet_payload_address(arguments),
         "PjS5uASwcV8" => video_out_set_buffer_attribute2(arguments, state),
         "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
         // Initial user, NP context, and trophy context IDs.
@@ -1200,6 +1213,8 @@ fn dispatch_probe_import(nid: &str, arguments: [u64; 6], state: &mut ProbeDispat
         "1uJgoVq3bQU" => guest_ctype_table(state),
         // sceKernelUsleep
         "1jfXLRVzisc" => guest_usleep(arguments[0]),
+        // POSIX clock_gettime. Darwin's timespec layout matches the x86-64 guest ABI.
+        "lLMT9vJAck0" => guest_clock_gettime(arguments[0], arguments[1]),
         // libKernel exit
         "uMei1W9uyNo" => {
             let bytes = arguments[0].to_le_bytes();
@@ -1230,6 +1245,29 @@ const AGC_SHADER_INPUT_SEMANTICS_OFFSET: u64 = 0x30;
 const AGC_SHADER_OUTPUT_SEMANTICS_OFFSET: u64 = 0x38;
 const AGC_SHADER_TYPE_OFFSET: u64 = 0x5a;
 const AGC_SHADER_SH_REGISTER_COUNT_OFFSET: u64 = 0x5c;
+const AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET: u64 = 0x50;
+const AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET: u64 = 0x56;
+
+const AGC_COMMAND_BUFFER_CURSOR_UP_OFFSET: u64 = 0x10;
+const AGC_COMMAND_BUFFER_CURSOR_DOWN_OFFSET: u64 = 0x18;
+const AGC_COMMAND_BUFFER_RESERVED_DWORDS_OFFSET: u64 = 0x30;
+
+const AGC_IT_NOP: u32 = 0x10;
+const AGC_IT_SET_SH_REG: u32 = 0x76;
+const AGC_R_ZERO: u32 = 0x00;
+const AGC_R_DRAW_RESET: u32 = 0x05;
+const AGC_R_SH_REGS_INDIRECT: u32 = 0x11;
+const AGC_R_CX_REGS_INDIRECT: u32 = 0x12;
+const AGC_R_UC_REGS_INDIRECT: u32 = 0x13;
+const AGC_CB_SET_SH_REGISTER_RANGE_MARKER: u32 = 0x6875_000d;
+
+const AGC_SPI_PS_INPUT_CNTL_0: u32 = 0x191;
+const AGC_VGT_PRIMITIVE_TYPE: u32 = 0x242;
+
+const AGC_SHADER_SPECIAL_GE_CNTL_OFFSET: u64 = 0x00;
+const AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET: u64 = 0x08;
+const AGC_SHADER_SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET: u64 = 0x20;
+const AGC_SHADER_SPECIAL_GE_USER_VGPR_EN_OFFSET: u64 = 0x28;
 
 fn agc_create_shader(arguments: [u64; 6]) -> u64 {
     let destination = arguments[0];
@@ -1274,6 +1312,213 @@ fn agc_create_shader(arguments: [u64; 6]) -> u64 {
     if destination != 0 {
         write_guest_u64(destination, header);
     }
+    0
+}
+
+fn agc_pm4(length_dwords: u32, opcode: u32, register: u32) -> u32 {
+    0xc000_0000
+        | ((length_dwords.wrapping_sub(2) & 0x3fff) << 16)
+        | ((opcode & 0xff) << 8)
+        | ((register & 0x3f) << 2)
+}
+
+fn agc_allocate_command_dwords(command_buffer: u64, size_dwords: u32) -> Option<u64> {
+    if command_buffer == 0 || size_dwords == 0 {
+        return None;
+    }
+    let cursor_up = read_guest_u64(command_buffer + AGC_COMMAND_BUFFER_CURSOR_UP_OFFSET);
+    let cursor_down = read_guest_u64(command_buffer + AGC_COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
+    let reserved_dwords =
+        read_guest_u32(command_buffer + AGC_COMMAND_BUFFER_RESERVED_DWORDS_OFFSET);
+    let available_dwords = cursor_down
+        .checked_sub(cursor_up)
+        .map_or(0, |bytes| bytes / 4);
+    let usable_dwords = available_dwords.saturating_sub(u64::from(reserved_dwords));
+    if u64::from(size_dwords) > usable_dwords {
+        eprintln!(
+            "[REMu][AGC] command buffer full at {command_buffer:#x}: need={size_dwords} available={usable_dwords}"
+        );
+        return None;
+    }
+    let size_bytes = u64::from(size_dwords).checked_mul(4)?;
+    let next_cursor = cursor_up.checked_add(size_bytes)?;
+    write_guest_u64(
+        command_buffer + AGC_COMMAND_BUFFER_CURSOR_UP_OFFSET,
+        next_cursor,
+    );
+    Some(cursor_up)
+}
+
+fn agc_dcb_reset_queue(arguments: [u64; 6]) -> u64 {
+    let command_buffer = arguments[0];
+    if low_u32(arguments[1]) != 0x3ff || low_u32(arguments[2]) != 0 {
+        return 0;
+    }
+    let Some(command) = agc_allocate_command_dwords(command_buffer, 2) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(2, AGC_IT_NOP, AGC_R_DRAW_RESET));
+    write_guest_u32(command + 4, 0);
+    command
+}
+
+fn agc_dcb_set_registers_indirect(arguments: [u64; 6], packet_register: u32) -> u64 {
+    let command_buffer = arguments[0];
+    let registers = arguments[1];
+    let register_count = low_u32(arguments[2]);
+    let Some(command) = agc_allocate_command_dwords(command_buffer, 4) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(4, AGC_IT_NOP, packet_register));
+    write_guest_u32(command + 4, register_count);
+    write_guest_u32(command + 8, low_u32(registers));
+    write_guest_u32(command + 12, (registers >> 32) as u32);
+    command
+}
+
+fn agc_set_indirect_patch_address(arguments: [u64; 6]) -> u64 {
+    let command = arguments[0];
+    let registers = arguments[1];
+    if command == 0 || registers == 0 {
+        return u64::MAX;
+    }
+    write_guest_u32(command + 8, low_u32(registers));
+    write_guest_u32(command + 12, (registers >> 32) as u32);
+    0
+}
+
+fn agc_add_indirect_patch_registers(arguments: [u64; 6]) -> u64 {
+    let command = arguments[0];
+    if command == 0 {
+        return u64::MAX;
+    }
+    let register_count = low_u32(arguments[1]);
+    let current_count = read_guest_u32(command + 4);
+    write_guest_u32(command + 4, current_count.wrapping_add(register_count));
+    0
+}
+
+fn agc_copy_shader_register(source: u64, destination: u64) {
+    write_guest_u32(destination, read_guest_u32(source));
+    write_guest_u32(destination + 4, read_guest_u32(source + 4));
+}
+
+fn agc_create_primitive_state(arguments: [u64; 6]) -> u64 {
+    let cx_registers = arguments[0];
+    let uc_registers = arguments[1];
+    let hull_shader = arguments[2];
+    let geometry_shader = arguments[3];
+    let primitive_type = low_u32(arguments[4]);
+    if cx_registers == 0 || uc_registers == 0 || hull_shader != 0 || geometry_shader == 0 {
+        return u64::MAX;
+    }
+    let shader_type = read_guest_u8(geometry_shader + AGC_SHADER_TYPE_OFFSET);
+    if !matches!(shader_type, 2 | 6) {
+        return u64::MAX;
+    }
+    let specials = read_guest_u64(geometry_shader + AGC_SHADER_SPECIALS_OFFSET);
+    if specials == 0 {
+        return u64::MAX;
+    }
+    agc_copy_shader_register(
+        specials + AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET,
+        cx_registers,
+    );
+    agc_copy_shader_register(
+        specials + AGC_SHADER_SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET,
+        cx_registers + 8,
+    );
+    agc_copy_shader_register(specials + AGC_SHADER_SPECIAL_GE_CNTL_OFFSET, uc_registers);
+    agc_copy_shader_register(
+        specials + AGC_SHADER_SPECIAL_GE_USER_VGPR_EN_OFFSET,
+        uc_registers + 8,
+    );
+    write_guest_u32(uc_registers + 16, AGC_VGT_PRIMITIVE_TYPE);
+    write_guest_u32(uc_registers + 20, primitive_type);
+    0
+}
+
+fn agc_create_interpolant_mapping(arguments: [u64; 6]) -> u64 {
+    let registers = arguments[0];
+    let geometry_shader = arguments[1];
+    let pixel_shader = arguments[2];
+    if registers == 0 || geometry_shader == 0 {
+        return u64::MAX;
+    }
+    let output_semantics = read_guest_u64(geometry_shader + AGC_SHADER_OUTPUT_SEMANTICS_OFFSET);
+    let output_count = read_guest_u32(geometry_shader + AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET);
+    let input_semantics = if pixel_shader == 0 {
+        0
+    } else {
+        // Reading the count matches the API's descriptor validation even though only the pointer
+        // is needed to construct the fixed 32-register mapping.
+        let _ = read_guest_u32(pixel_shader + AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET);
+        read_guest_u64(pixel_shader + AGC_SHADER_INPUT_SEMANTICS_OFFSET)
+    };
+    for index in 0_u32..32 {
+        let mut value = 0;
+        if index < output_count && output_semantics != 0 {
+            let flat = input_semantics != 0
+                && (read_guest_u32(input_semantics + u64::from(index) * 4) >> 22) & 1 != 0;
+            value = index | if flat { 0x400 } else { 0 };
+        }
+        let destination = registers + u64::from(index) * 8;
+        write_guest_u32(destination, AGC_SPI_PS_INPUT_CNTL_0 + index);
+        write_guest_u32(destination + 4, value);
+    }
+    0
+}
+
+fn agc_cb_set_sh_register_range_direct(arguments: [u64; 6]) -> u64 {
+    let command_buffer = arguments[0];
+    let offset = low_u32(arguments[1]);
+    let values = arguments[2];
+    let value_count = low_u32(arguments[3]);
+    if command_buffer == 0 || offset == 0 || offset > 0x3ff || value_count == 0 {
+        return 0;
+    }
+    let Some(marker) = agc_allocate_command_dwords(command_buffer, 2) else {
+        return 0;
+    };
+    write_guest_u32(marker, agc_pm4(2, AGC_IT_NOP, AGC_R_ZERO));
+    write_guest_u32(marker + 4, AGC_CB_SET_SH_REGISTER_RANGE_MARKER);
+    let Some(command) = agc_allocate_command_dwords(command_buffer, value_count.saturating_add(2))
+    else {
+        return 0;
+    };
+    write_guest_u32(
+        command,
+        agc_pm4(value_count.saturating_add(2), AGC_IT_SET_SH_REG, 0),
+    );
+    write_guest_u32(command + 4, offset);
+    for index in 0..value_count {
+        let value = if values == 0 {
+            0
+        } else {
+            read_guest_u32(values + u64::from(index) * 4)
+        };
+        write_guest_u32(command + 8 + u64::from(index) * 4, value);
+    }
+    command
+}
+
+fn agc_get_data_packet_payload_address(arguments: [u64; 6]) -> u64 {
+    let output = arguments[0];
+    let command = arguments[1];
+    if output == 0 || command == 0 {
+        return u64::MAX;
+    }
+    let payload = if low_i32(arguments[2]) == 0 {
+        let header = read_guest_u32(command);
+        if header & 0x3fff_0000 == 0x3fff_0000 {
+            0
+        } else {
+            command + 4
+        }
+    } else {
+        command + 8
+    };
+    write_guest_u64(output, payload);
     0
 }
 
@@ -1831,6 +2076,20 @@ fn guest_strcasecmp(left: u64, right: u64) -> u64 {
     signed_i32_return(result)
 }
 
+fn guest_strstr(haystack: u64, needle: u64) -> u64 {
+    if haystack == 0 || needle == 0 {
+        return 0;
+    }
+    // SAFETY: strstr's guest ABI contract supplies two NUL-terminated strings. Its result points
+    // into the unchanged haystack, which is already process-addressable guest memory.
+    unsafe {
+        libc::strstr(
+            haystack as *const libc::c_char,
+            needle as *const libc::c_char,
+        ) as usize as u64
+    }
+}
+
 fn guest_fopen(path_address: u64, mode_address: u64, state: &ProbeDispatchState) -> u64 {
     let (Some(guest_path), Some(mode)) = (
         read_guest_cstring(path_address),
@@ -2041,6 +2300,16 @@ fn guest_usleep(microseconds: u64) -> u64 {
     };
     // SAFETY: usleep has no pointer arguments and the duration is bounded to its host ABI width.
     signed_i32_return(unsafe { libc::usleep(bounded) })
+}
+
+fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
+    if output == 0 {
+        return u64::MAX;
+    }
+    // SAFETY: Darwin and the PS5 x86-64 ABI both represent timespec as two signed 64-bit fields.
+    signed_i32_return(unsafe {
+        libc::clock_gettime(low_u32(clock_id), output as *mut libc::timespec)
+    })
 }
 
 fn guest_fputs(address: u64) -> u64 {
