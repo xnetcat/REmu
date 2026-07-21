@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -627,6 +627,7 @@ fn native_libc_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
         "Noj9PsJrsa8" => c"wmemmove",
         "fnUEjBCNRVU" => c"wmemchr",
         "QJ5xVfKkni0" => c"wmemcmp",
+        "n88vx3C5nW8" => c"gettimeofday",
         "eLdDw6l0-bU" => c"snprintf",
         "Q2V+iqvjgC0" => c"vsnprintf",
         "tcVi5SivF7Q" => c"sprintf",
@@ -1080,6 +1081,9 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "hvUfkUIQcOE" => "sceAgcDcbSetUcRegistersIndirect",
         "D9sr1xGUriE" => "sceAgcCreatePrimitiveState",
         "HV4j+E0MBHE" => "sceAgcCreateInterpolantMapping",
+        "l4fM9K-Lyks" => "sceAgcDcbSetIndexBuffer",
+        "GIIW2J37e70" => "sceAgcDcbSetIndexSize",
+        "B+aG9DUnTKA" => "sceAgcDcbDrawIndexOffset",
         "n2fD4A+pb+g" => "sceAgcCbSetShRegisterRangeDirect",
         "V++UgBtQhn0" => "sceAgcGetDataPacketPayloadAddress",
         "aJf+j5yntiU" => "sceAgcDcbEventWrite",
@@ -1095,6 +1099,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "PjS5uASwcV8" => "sceVideoOutSetBufferAttribute2",
         "rKBUtgRrtbk" => "sceVideoOutRegisterBuffers2",
         "UglJIZjGssM" => "sceAgcDriverSubmitDcb",
+        "6UzEidRZwkg" => "sceAgcDriverSubmitMultiDcbs",
+        "YUeqkyT7mEQ" => "sceAgcDcbSetFlip",
         "h9z6+0hEydk" => "sceAgcSuspendPoint",
         _ => return None,
     })
@@ -1144,6 +1150,8 @@ struct ProbeDispatchState {
     video_out: VideoOutState,
     game_root: PathBuf,
     next_np_handle: i32,
+    agc_submission_count: u64,
+    pending_events: VecDeque<KernelQueuedEvent>,
 }
 
 #[derive(Debug, Default)]
@@ -1153,6 +1161,18 @@ struct VideoOutState {
     width: u32,
     height: u32,
     display_buffers: Vec<u64>,
+    flip_events: BTreeMap<u64, u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KernelQueuedEvent {
+    equeue: u64,
+    ident: u64,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: u64,
+    user_data: u64,
 }
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
@@ -1230,6 +1250,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.video_out = VideoOutState::default();
     game_root.clone_into(&mut state.game_root);
     state.next_np_handle = 1;
+    state.agc_submission_count = 0;
+    state.pending_events.clear();
     let sync = GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()));
     *sync
         .0
@@ -1815,8 +1837,15 @@ fn dispatch_probe_import(
         "3KDcnM3lrcU" => agc_wait_reg_mem_patch_address(arguments),
         "0fWWK5uG9rQ" => agc_release_mem_patch_address(arguments),
         "57labkp+rSQ" => agc_dcb_acquire_mem(arguments, stack_arguments),
+        "l4fM9K-Lyks" => agc_dcb_set_index_buffer(arguments),
+        "GIIW2J37e70" => agc_dcb_set_index_size(arguments),
+        "B+aG9DUnTKA" => agc_dcb_draw_index_offset(arguments),
+        "YUeqkyT7mEQ" => agc_dcb_set_flip(arguments),
+        "UglJIZjGssM" => agc_driver_submit_dcb(arguments, state),
+        "6UzEidRZwkg" => agc_driver_submit_multi_dcbs(arguments, state),
         "PjS5uASwcV8" => video_out_set_buffer_attribute2(arguments, state),
         "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
+        "HXzjK9yI30k" => video_out_add_flip_event(arguments, state),
         // libScePad. Dreaming Sarah consumes these structures during controller discovery and
         // subsequently on every frame, so leaving them as successful no-ops exposes stale stack
         // contents as controller capabilities and button state.
@@ -1835,7 +1864,7 @@ fn dispatch_probe_import(
         // sceKernelWaitEqueue. Until GPU completion events are connected, report an empty wait
         // deterministically. Not writing outCount made the game interpret old stack bytes as user
         // login events and overflow its four-controller table.
-        "fzyMKs9kim0" => kernel_wait_equeue(arguments),
+        "fzyMKs9kim0" => kernel_wait_equeue(arguments, state),
         // Minimal offline NP identities. These services only require stable nonzero IDs at boot.
         "hT0IAEvN+M0" => np_create_handle(arguments, state),
         // Minimal AGC register-default descriptor; zero groups select the game's fallback path.
@@ -1858,12 +1887,33 @@ fn dispatch_probe_import(
     }
 }
 
-fn kernel_wait_equeue(arguments: [u64; 6]) -> u64 {
+fn kernel_wait_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let handle = arguments[0];
     let events = arguments[1];
     let event_capacity = low_u32(arguments[2]);
     let out_count = arguments[3];
     if events == 0 || event_capacity == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    if let Some(index) = state
+        .pending_events
+        .iter()
+        .position(|event| event.equeue == handle)
+    {
+        let event = state
+            .pending_events
+            .remove(index)
+            .expect("the queued event index was just found");
+        write_guest_u64(events, event.ident);
+        write_guest_u16(events + 0x08, event.filter.cast_unsigned());
+        write_guest_u16(events + 0x0a, event.flags);
+        write_guest_u32(events + 0x0c, event.fflags);
+        write_guest_u64(events + 0x10, event.data);
+        write_guest_u64(events + 0x18, event.user_data);
+        if out_count != 0 {
+            write_guest_u32(out_count, 1);
+        }
+        return 0;
     }
     if out_count != 0 {
         write_guest_u32(out_count, 0);
@@ -1972,6 +2022,10 @@ const AGC_COMMAND_BUFFER_CURSOR_DOWN_OFFSET: u64 = 0x18;
 const AGC_COMMAND_BUFFER_RESERVED_DWORDS_OFFSET: u64 = 0x30;
 
 const AGC_IT_NOP: u32 = 0x10;
+const AGC_IT_INDEX_BUFFER_SIZE: u32 = 0x13;
+const AGC_IT_INDEX_BASE: u32 = 0x26;
+const AGC_IT_INDEX_TYPE: u32 = 0x2a;
+const AGC_IT_DRAW_INDEX_OFFSET: u32 = 0x35;
 const AGC_IT_WAIT_REG_MEM: u32 = 0x3c;
 const AGC_IT_EVENT_WRITE: u32 = 0x46;
 const AGC_IT_SET_SH_REG: u32 = 0x76;
@@ -1983,6 +2037,7 @@ const AGC_R_CX_REGS_INDIRECT: u32 = 0x12;
 const AGC_R_UC_REGS_INDIRECT: u32 = 0x13;
 const AGC_R_ACQUIRE_MEM: u32 = 0x14;
 const AGC_R_WAIT_MEM_64: u32 = 0x16;
+const AGC_R_FLIP: u32 = 0x17;
 const AGC_R_RELEASE_MEM: u32 = 0x18;
 const AGC_R_DMA_DATA: u32 = 0x19;
 const AGC_CB_SET_SH_REGISTER_RANGE_MARKER: u32 = 0x6875_000d;
@@ -2590,6 +2645,188 @@ fn video_out_register_buffers2(arguments: [u64; 6], state: &mut ProbeDispatchSta
         state.video_out.display_buffers
     );
     u64::from(set_index)
+}
+
+fn video_out_add_flip_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let equeue = arguments[0];
+    let handle = low_i32(arguments[1]);
+    if equeue == 0 || handle != 1 {
+        return u64::MAX;
+    }
+    state.video_out.flip_events.insert(equeue, arguments[2]);
+    0
+}
+
+fn agc_dcb_set_flip(arguments: [u64; 6]) -> u64 {
+    let command_buffer = arguments[0];
+    if command_buffer == 0 {
+        return 0;
+    }
+    let Some(command) = agc_allocate_command_dwords(command_buffer, 6) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(6, AGC_IT_NOP, AGC_R_FLIP));
+    write_guest_u32(command + 4, low_u32(arguments[1]));
+    write_guest_u32(command + 8, low_u32(arguments[2]));
+    write_guest_u32(command + 12, low_u32(arguments[3]));
+    write_guest_u32(command + 16, low_u32(arguments[4]));
+    write_guest_u32(command + 20, low_u32(arguments[4] >> 32));
+    command
+}
+
+fn agc_dcb_set_index_buffer(arguments: [u64; 6]) -> u64 {
+    let Some(command) = agc_allocate_command_dwords(arguments[0], 5) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(3, AGC_IT_INDEX_BASE, 0));
+    write_guest_u32(command + 4, low_u32(arguments[1]));
+    write_guest_u32(command + 8, low_u32(arguments[1] >> 32));
+    write_guest_u32(command + 12, agc_pm4(2, AGC_IT_INDEX_BUFFER_SIZE, 0));
+    write_guest_u32(command + 16, low_u32(arguments[2]));
+    command
+}
+
+fn agc_dcb_set_index_size(arguments: [u64; 6]) -> u64 {
+    if low_u32(arguments[2]) != 0 {
+        return 0;
+    }
+    let Some(command) = agc_allocate_command_dwords(arguments[0], 2) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(2, AGC_IT_INDEX_TYPE, 0));
+    write_guest_u32(command + 4, low_u32(arguments[1]) & 0xff);
+    command
+}
+
+fn agc_dcb_draw_index_offset(arguments: [u64; 6]) -> u64 {
+    let Some(command) = agc_allocate_command_dwords(arguments[0], 5) else {
+        return 0;
+    };
+    write_guest_u32(command, agc_pm4(5, AGC_IT_DRAW_INDEX_OFFSET, 0));
+    write_guest_u32(command + 4, low_u32(arguments[2]));
+    write_guest_u32(command + 8, low_u32(arguments[1]));
+    write_guest_u32(command + 12, low_u32(arguments[2]));
+    write_guest_u32(command + 16, low_u32(arguments[3]) & 0xe000_0001);
+    command
+}
+
+fn queue_video_out_flip(
+    state: &mut ProbeDispatchState,
+    handle: u32,
+    buffer_index: u32,
+    flip_argument: u64,
+) {
+    let Some(&display_address) = state.video_out.display_buffers.get(buffer_index as usize) else {
+        eprintln!("[REMu][VIDEO] ignored flip for unregistered buffer index {buffer_index}");
+        return;
+    };
+    let event_data = 6 | ((flip_argument & 0x0000_ffff_ffff_ffff) << 16);
+    for (&equeue, &user_data) in &state.video_out.flip_events {
+        state.pending_events.push_back(KernelQueuedEvent {
+            equeue,
+            ident: 6,
+            filter: -13,
+            flags: 0,
+            fflags: 0,
+            data: event_data,
+            user_data,
+        });
+        if state.agc_submission_count <= 8 {
+            eprintln!(
+                "[REMu][VIDEO] queued flip handle={handle} index={buffer_index} address={display_address:#x} equeue={equeue:#x}"
+            );
+        }
+    }
+}
+
+fn agc_parse_submission(command_address: u64, dword_count: u32, state: &mut ProbeDispatchState) {
+    let mut offset = 0_u32;
+    let mut packets = BTreeMap::<(u32, u32), u32>::new();
+    let mut flips = Vec::new();
+    while offset < dword_count {
+        let packet_address = command_address + u64::from(offset) * 4;
+        let header = read_guest_u32(packet_address);
+        let packet_type = header >> 30;
+        if packet_type == 2 {
+            offset += 1;
+            continue;
+        }
+        if packet_type != 3 {
+            eprintln!(
+                "[REMu][AGC] stopped submission parse at dw={offset}: unsupported packet type {packet_type} header={header:#010x}"
+            );
+            break;
+        }
+        let length = ((header >> 16) & 0x3fff) + 2;
+        if length == 0 || length > dword_count - offset {
+            eprintln!(
+                "[REMu][AGC] stopped submission parse at dw={offset}: length={length} remaining={}",
+                dword_count - offset
+            );
+            break;
+        }
+        let opcode = (header >> 8) & 0xff;
+        let register = (header >> 2) & 0x3f;
+        *packets.entry((opcode, register)).or_default() += 1;
+        if opcode == AGC_IT_NOP && register == AGC_R_FLIP && length >= 6 {
+            let handle = read_guest_u32(packet_address + 4);
+            let buffer_index = read_guest_u32(packet_address + 8);
+            let flip_argument = u64::from(read_guest_u32(packet_address + 16))
+                | (u64::from(read_guest_u32(packet_address + 20)) << 32);
+            flips.push((handle, buffer_index, flip_argument));
+        }
+        offset += length;
+    }
+
+    state.agc_submission_count = state.agc_submission_count.saturating_add(1);
+    if state.agc_submission_count <= 8 {
+        let packet_summary = packets
+            .iter()
+            .map(|(&(opcode, register), &count)| {
+                format!("op={opcode:#04x}/reg={register:#04x}:{count}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "[REMu][AGC] submit={} address={command_address:#x} dwords={dword_count} parsed={offset} packets=[{packet_summary}] flips={}",
+            state.agc_submission_count,
+            flips.len()
+        );
+    }
+    for (handle, buffer_index, flip_argument) in flips {
+        queue_video_out_flip(state, handle, buffer_index, flip_argument);
+    }
+}
+
+fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let packet = arguments[0];
+    if packet == 0 {
+        return u64::MAX;
+    }
+    let command_address = read_guest_u64(packet);
+    let dword_count = read_guest_u32(packet + 8);
+    if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+        return u64::MAX;
+    }
+    agc_parse_submission(command_address, dword_count, state);
+    0
+}
+
+fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let addresses = arguments[0];
+    let sizes = arguments[1];
+    let count = low_u32(arguments[2]);
+    if addresses == 0 || sizes == 0 || count == 0 || count > 4096 {
+        return u64::MAX;
+    }
+    for index in 0..count {
+        let command_address = read_guest_u64(addresses + u64::from(index) * 8);
+        let dword_count = read_guest_u32(sizes + u64::from(index) * 4);
+        if command_address != 0 && dword_count != 0 && dword_count <= 1_000_000 {
+            agc_parse_submission(command_address, dword_count, state);
+        }
+    }
+    0
 }
 
 fn guest_ctype_table(state: &mut ProbeDispatchState) -> u64 {
