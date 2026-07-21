@@ -6,11 +6,12 @@ mod agc_register_defaults;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use remu_core::GuestAddress;
 use remu_loader::{DynamicInfo, Elf64Rela, Elf64Symbol, LoadedExecutable};
@@ -1124,6 +1125,10 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "6UzEidRZwkg" => "sceAgcDriverSubmitMultiDcbs",
         "YUeqkyT7mEQ" => "sceAgcDcbSetFlip",
         "h9z6+0hEydk" => "sceAgcSuspendPoint",
+        "1G3lF1Gg1k8" => "sceKernelOpen",
+        "eV9wAD2riIA" => "sceKernelStat",
+        "Cg4srZ6TKbU" => "sceKernelRead",
+        "UK2Tl2DWUns" => "sceKernelClose",
         _ => return None,
     })
 }
@@ -1177,6 +1182,8 @@ struct ProbeDispatchState {
     agc_graphics: AgcGraphicsState,
     agc_index_resources: BTreeMap<u64, u64>,
     pending_events: VecDeque<KernelQueuedEvent>,
+    next_kernel_fd: i32,
+    kernel_files: BTreeMap<i32, std::fs::File>,
 }
 
 #[derive(Debug, Default)]
@@ -1309,6 +1316,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.agc_graphics = AgcGraphicsState::default();
     state.agc_index_resources.clear();
     state.pending_events.clear();
+    state.next_kernel_fd = 3;
+    state.kernel_files.clear();
     let sync = GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()));
     *sync
         .0
@@ -1798,12 +1807,31 @@ fn guest_atomic_fetch_4(address: u64, value: u64, subtract: bool) -> u64 {
     u64::from(previous)
 }
 
+fn dispatch_kernel_file_import(
+    nid: &str,
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> Option<u64> {
+    // These raw libKernel calls use Gen5 kernel errors, not POSIX -1/errno semantics.
+    Some(match nid {
+        "1G3lF1Gg1k8" => guest_kernel_open(arguments, state),
+        "eV9wAD2riIA" => guest_kernel_stat(arguments, state),
+        "Cg4srZ6TKbU" => guest_kernel_read(arguments, state),
+        "UK2Tl2DWUns" => guest_kernel_close(arguments, state),
+        _ => return None,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
 fn dispatch_probe_import(
     nid: &str,
     arguments: [u64; 6],
     stack_arguments: [u64; 6],
     state: &mut ProbeDispatchState,
 ) -> u64 {
+    if let Some(result) = dispatch_kernel_file_import(nid, arguments, state) {
+        return result;
+    }
     match nid {
         // sceKernelGetDirectMemorySize
         "pO96TwzOm5E" => 16 * 1024 * 1024 * 1024,
@@ -2022,9 +2050,19 @@ fn pad_read_state(arguments: [u64; 6]) -> u64 {
         return u64::from(libc::EINVAL.cast_unsigned());
     }
     guest_memset(output, 0, 0x78);
-    for offset in 0x04..=0x07 {
-        write_guest_u8(output + offset, 128);
-    }
+    let host = remu_gpu::host_pad_state();
+    let buttons = if auto_cross_active() {
+        host.buttons | remu_gpu::PAD_BUTTON_CROSS
+    } else {
+        host.buttons
+    };
+    write_guest_u32(output, buttons);
+    write_guest_u8(output + 0x04, host.left_x);
+    write_guest_u8(output + 0x05, host.left_y);
+    write_guest_u8(output + 0x06, host.right_x);
+    write_guest_u8(output + 0x07, host.right_y);
+    write_guest_u8(output + 0x08, host.l2);
+    write_guest_u8(output + 0x09, host.r2);
     write_guest_u32(output + 0x18, 1.0_f32.to_bits());
     write_guest_u8(output + 0x4c, 1);
     let mut timestamp = libc::timespec {
@@ -2044,6 +2082,27 @@ fn pad_read_state(arguments: [u64; 6]) -> u64 {
     }
     write_guest_u8(output + 0x68, 1);
     0
+}
+
+fn auto_cross_active() -> bool {
+    static START: OnceLock<Instant> = OnceLock::new();
+    static TIMES: OnceLock<Vec<Duration>> = OnceLock::new();
+    let times = TIMES.get_or_init(|| {
+        std::env::var("REMU_AUTO_CROSS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.trim().parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(Duration::from_secs_f64)
+            .collect()
+    });
+    if times.is_empty() {
+        return false;
+    }
+    let elapsed = START.get_or_init(Instant::now).elapsed();
+    times
+        .iter()
+        .any(|&time| elapsed >= time && elapsed < time.saturating_add(Duration::from_millis(400)))
 }
 
 fn system_service_get_status(arguments: [u64; 6]) -> u64 {
@@ -3959,6 +4018,139 @@ fn guest_fread(destination: u64, size: u64, count: u64, handle: u64) -> u64 {
     }
 }
 
+const SCE_KERNEL_ERROR_PERMISSION_DENIED: u32 = 0x8002_0001;
+const SCE_KERNEL_ERROR_NOT_FOUND: u32 = 0x8002_0002;
+const SCE_KERNEL_ERROR_INVALID_ARGUMENT: u32 = 0x8002_0003;
+const SCE_KERNEL_ERROR_MEMORY_FAULT: u32 = 0x8002_0101;
+const SCE_KERNEL_STAT_SIZE: usize = 120;
+
+fn sce_kernel_error(code: u32) -> u64 {
+    signed_i32_return(i32::from_ne_bytes(code.to_ne_bytes()))
+}
+
+fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(guest_path) = read_guest_cstring(arguments[0]) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    };
+    let flags = low_i32(arguments[1]);
+    if flags & 0x3 != 0 {
+        eprintln!(
+            "[REMu][VFS] sceKernelOpen rejected write access guest={guest_path:?} flags={flags:#x}"
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
+    }
+    let Some(host_path) = resolve_guest_path(&state.game_root, &guest_path) else {
+        eprintln!("[REMu][VFS] sceKernelOpen rejected guest={guest_path:?}");
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let Ok(file) = std::fs::File::open(&host_path) else {
+        eprintln!(
+            "[REMu][VFS] sceKernelOpen missing guest={guest_path:?} host={:?}",
+            host_path.display()
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let fd = state.next_kernel_fd.max(3);
+    state.next_kernel_fd = fd.saturating_add(1);
+    state.kernel_files.insert(fd, file);
+    eprintln!(
+        "[REMu][VFS] sceKernelOpen guest={guest_path:?} host={:?} flags={flags:#x} fd={fd}",
+        host_path.display()
+    );
+    signed_i32_return(fd)
+}
+
+fn guest_kernel_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if arguments[1] == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(guest_path) = read_guest_cstring(arguments[0]) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    };
+    let Some(host_path) = resolve_guest_path(&state.game_root, &guest_path) else {
+        eprintln!("[REMu][VFS] sceKernelStat rejected guest={guest_path:?}");
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let Ok(metadata) = std::fs::metadata(&host_path) else {
+        eprintln!(
+            "[REMu][VFS] sceKernelStat missing guest={guest_path:?} host={:?}",
+            host_path.display()
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let payload = kernel_stat_payload(metadata.len(), metadata.is_dir(), guest_path.as_bytes());
+    // SAFETY: sceKernelStat supplies a writable 120-byte Gen5 stat object in live guest memory.
+    unsafe {
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), arguments[1] as *mut u8, payload.len());
+    }
+    eprintln!(
+        "[REMu][VFS] sceKernelStat guest={guest_path:?} host={:?} size={}",
+        host_path.display(),
+        metadata.len()
+    );
+    0
+}
+
+fn guest_kernel_read(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let fd = low_i32(arguments[0]);
+    let destination = arguments[1];
+    let requested = arguments[2];
+    if requested == 0 {
+        return 0;
+    }
+    if destination == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Ok(requested) = usize::try_from(requested) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if requested > 128 * 1024 * 1024 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(file) = state.kernel_files.get_mut(&fd) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    // SAFETY: sceKernelRead supplies a writable range of exactly `requested` bytes in live guest
+    // memory, and the global import dispatcher serializes access to the associated File.
+    let destination = unsafe { std::slice::from_raw_parts_mut(destination as *mut u8, requested) };
+    let Ok(read) = file.read(destination) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    eprintln!("[REMu][VFS] sceKernelRead fd={fd} requested={requested} read={read}");
+    u64::try_from(read).expect("read byte count fits u64")
+}
+
+fn guest_kernel_close(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let fd = low_i32(arguments[0]);
+    if state.kernel_files.remove(&fd).is_none() {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    }
+    eprintln!("[REMu][VFS] sceKernelClose fd={fd}");
+    0
+}
+
+fn kernel_stat_payload(size: u64, is_directory: bool, inode_seed: &[u8]) -> [u8; 120] {
+    let mut payload = [0_u8; SCE_KERNEL_STAT_SIZE];
+    let inode = inode_seed.iter().fold(0x811c_9dc5_u32, |hash, &byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    payload[4..8].copy_from_slice(&inode.to_le_bytes());
+    payload[8..10]
+        .copy_from_slice(&(if is_directory { 0x41ff_u16 } else { 0x81ff_u16 }).to_le_bytes());
+    payload[10..12].copy_from_slice(&1_u16.to_le_bytes());
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
+    payload[72..80].copy_from_slice(&size.to_le_bytes());
+    let blocks = if is_directory {
+        128
+    } else {
+        (size + 511) / 512
+    };
+    payload[80..88].copy_from_slice(&blocks.to_le_bytes());
+    payload[88..92]
+        .copy_from_slice(&(if is_directory { 65_536_u32 } else { 512_u32 }).to_le_bytes());
+    payload
+}
+
 fn guest_memcmp(left: u64, right: u64, length: u64) -> u64 {
     if length == 0 {
         return 0;
@@ -4193,8 +4385,8 @@ mod platform_independent_tests {
     use super::{
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
         AGC_R_DRAW_INDEX_AUTO, ProbeDispatchState, agc_dcb_draw_index_auto,
-        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4, low_u32, read_guest_u64,
-        resolve_guest_path, write_guest_u32, write_guest_u64,
+        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4, kernel_stat_payload, low_u32,
+        read_guest_u64, resolve_guest_path, sce_kernel_error, write_guest_u32, write_guest_u64,
     };
 
     #[test]
@@ -4211,6 +4403,28 @@ mod platform_independent_tests {
             resolve_guest_path(Path::new("/games/title"), "/app0/../outside.bin"),
             None
         );
+    }
+
+    #[test]
+    fn builds_the_gen5_kernel_stat_layout() {
+        let payload = kernel_stat_payload(1_025, false, b"/app0/data.bin");
+
+        assert_eq!(
+            u16::from_le_bytes(payload[8..10].try_into().unwrap()),
+            0x81ff
+        );
+        assert_eq!(u16::from_le_bytes(payload[10..12].try_into().unwrap()), 1);
+        assert_eq!(
+            i64::from_le_bytes(payload[72..80].try_into().unwrap()),
+            1_025
+        );
+        assert_eq!(i64::from_le_bytes(payload[80..88].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(payload[88..92].try_into().unwrap()), 512);
+    }
+
+    #[test]
+    fn sign_extends_gen5_kernel_errors() {
+        assert_eq!(sce_kernel_error(0x8002_0002), 0xffff_ffff_8002_0002);
     }
 
     #[test]

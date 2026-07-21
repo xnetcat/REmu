@@ -16,11 +16,17 @@ use metal::{
 };
 use objc::runtime::{Class, Object, YES};
 use objc::{msg_send, sel, sel_impl};
-use remu_gpu::{GpuEvent, GpuRegister, IndexedDraw};
+use remu_gpu::{
+    GpuEvent, GpuRegister, HostPadState, IndexedDraw, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS,
+    PAD_BUTTON_DOWN, PAD_BUTTON_L1, PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS,
+    PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE,
+    PAD_BUTTON_UP, set_host_pad_state,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
@@ -124,6 +130,7 @@ struct MetalPresenter {
     logged_fill_draw: bool,
     logged_software_draws: HashSet<(SoftwareDrawKind, u64, u64)>,
     capture_directory: Option<PathBuf>,
+    pressed_keys: HashSet<KeyCode>,
 }
 
 impl MetalPresenter {
@@ -156,6 +163,7 @@ impl MetalPresenter {
             logged_fill_draw: false,
             logged_software_draws: HashSet::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
+            pressed_keys: HashSet::new(),
         })
     }
 
@@ -488,6 +496,65 @@ impl MetalPresenter {
             Ok(path) => eprintln!("[REMu][METAL] captured frame {}", path.display()),
             Err(error) => eprintln!("[REMu][METAL] could not capture frame: {error}"),
         }
+    }
+
+    fn update_keyboard_input(&mut self, code: KeyCode, state: ElementState) {
+        match state {
+            ElementState::Pressed => {
+                self.pressed_keys.insert(code);
+            }
+            ElementState::Released => {
+                self.pressed_keys.remove(&code);
+            }
+        }
+        self.publish_pad_state();
+    }
+
+    fn publish_pad_state(&self) {
+        let down = |code| self.pressed_keys.contains(&code);
+        let mut buttons = 0;
+        for (pressed, button) in [
+            (down(KeyCode::ArrowUp), PAD_BUTTON_UP),
+            (down(KeyCode::ArrowRight), PAD_BUTTON_RIGHT),
+            (down(KeyCode::ArrowDown), PAD_BUTTON_DOWN),
+            (down(KeyCode::ArrowLeft), PAD_BUTTON_LEFT),
+            (
+                down(KeyCode::Enter) || down(KeyCode::NumpadEnter) || down(KeyCode::KeyZ),
+                PAD_BUTTON_CROSS,
+            ),
+            (
+                down(KeyCode::Escape) || down(KeyCode::KeyX),
+                PAD_BUTTON_CIRCLE,
+            ),
+            (down(KeyCode::KeyC), PAD_BUTTON_SQUARE),
+            (down(KeyCode::KeyV), PAD_BUTTON_TRIANGLE),
+            (down(KeyCode::KeyQ), PAD_BUTTON_L1),
+            (down(KeyCode::KeyE), PAD_BUTTON_R1),
+            (down(KeyCode::KeyR), PAD_BUTTON_L2),
+            (down(KeyCode::KeyF), PAD_BUTTON_R2),
+            (
+                down(KeyCode::Tab) || down(KeyCode::Backspace),
+                PAD_BUTTON_OPTIONS,
+            ),
+        ] {
+            if pressed {
+                buttons |= button;
+            }
+        }
+        let axis = |negative, positive| match (down(negative), down(positive)) {
+            (true, false) => 0,
+            (false, true) => 255,
+            _ => 128,
+        };
+        set_host_pad_state(HostPadState {
+            buttons,
+            left_x: axis(KeyCode::KeyA, KeyCode::KeyD),
+            left_y: axis(KeyCode::KeyW, KeyCode::KeyS),
+            right_x: axis(KeyCode::KeyJ, KeyCode::KeyL),
+            right_y: axis(KeyCode::KeyI, KeyCode::KeyK),
+            l2: if down(KeyCode::KeyR) { 255 } else { 0 },
+            r2: if down(KeyCode::KeyF) { 255 } else { 0 },
+        });
     }
 
     fn render(&mut self) {
@@ -1515,6 +1582,15 @@ impl ApplicationHandler for MetalPresenter {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => {
+                self.pressed_keys.clear();
+                self.publish_pad_state();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.update_keyboard_input(code, event.state);
+                }
+            }
             WindowEvent::Resized(size) => {
                 if size.width != 0
                     && size.height != 0
