@@ -3,6 +3,7 @@
 
 mod agc_register_defaults;
 mod audio;
+mod np;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -1131,10 +1132,31 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "uoUpLGNkygk" => "sceCommonDialogInitialize",
         "ERKzksauAJA" => "sceSaveDataDialogGetStatus",
         "sjaobBgqeB4" => "sceNpUniversalDataSystemInitialize",
-        "m87BHxt-H60" => "sceNpGameIntentInitialize",
-        "tpFJ8LIKvPw" => "sceNpUniversalDataSystemRegisterContext",
+        "47UAEuQl+iI" => "sceNpUniversalDataSystemTerminate",
+        "5zBnau1uIEo" => "sceNpUniversalDataSystemCreateContext",
+        "wB7IWzGp2v0" => "sceNpUniversalDataSystemDestroyContext",
+        "hT0IAEvN+M0" => "sceNpUniversalDataSystemCreateHandle",
+        "jZCqWFgMehE" => "sceNpUniversalDataSystemAbortHandle",
         "AUIHb7jUX3I" => "sceNpUniversalDataSystemDestroyHandle",
+        "tpFJ8LIKvPw" => "sceNpUniversalDataSystemRegisterContext",
+        "p+GcLqwpL9M" => "sceNpUniversalDataSystemCreateEvent",
+        "wG+84pnNIuo" => "sceNpUniversalDataSystemDestroyEvent",
+        "YE4dbtbz6OE" => "sceNpUniversalDataSystemEventPropertyObjectSetInt32",
+        "MfDb+4Nln64" => "sceNpUniversalDataSystemEventPropertyObjectSetString",
+        "Wxbg5x3pTXA" => "sceNpUniversalDataSystemEventPropertyObjectSetArray",
+        "4llLk7YJRTE" => "sceNpUniversalDataSystemEventPropertyArraySetString",
+        "CzkKf7ahIyU" => "sceNpUniversalDataSystemPostEvent",
+        "m87BHxt-H60" => "sceNpGameIntentInitialize",
+        "jEIXUAr9XE8" => "sceNpGameIntentReceiveIntent",
+        "rPl0INNc-M8" => "sceNpGameIntentGetPropertyValueString",
+        "Bagshr7OQ6Q" => "sceNpTrophy2CreateContext",
+        "Gz1rmUZpROM" => "sceNpTrophy2CreateHandle",
+        "sysY2FHYff4" => "sceNpTrophy2DestroyContext",
+        "d8P11CI40KE" => "sceNpTrophy2DestroyHandle",
+        "fYapWA9xVmA" => "sceNpTrophy2AbortHandle",
+        "bIDov3wBu5Q" => "sceNpTrophy2RegisterContext",
         "sUXGfNMalIo" => "sceNpTrophy2RegisterUnlockCallback",
+        "wVqxM58sIKs" => "sceNpTrophy2UnregisterUnlockCallback",
         "vSMAm3cxYTY" => "sceKernelMprotect",
         "23LRUSvYu1M" => "sceAgcInit",
         "TRO721eVt4g" => "sceAgcDcbResetQueue",
@@ -1242,7 +1264,9 @@ struct ProbeDispatchState {
     tls_static_block_size: u64,
     video_out: VideoOutState,
     game_root: PathBuf,
-    next_np_handle: i32,
+    np_universal_data: np::UniversalDataState,
+    np_game_intent: np::GameIntentState,
+    np_trophy: np::TrophyState,
     agc_submission_count: u64,
     agc_graphics: AgcGraphicsState,
     agc_index_resources: BTreeMap<u64, u64>,
@@ -1527,7 +1551,9 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.tls_static_block_size = image.tls.static_block_size;
     state.video_out = VideoOutState::default();
     game_root.clone_into(&mut state.game_root);
-    state.next_np_handle = 1;
+    state.np_universal_data = np::UniversalDataState::default();
+    state.np_game_intent = np::GameIntentState::default();
+    state.np_trophy = np::TrophyState::default();
     state.agc_submission_count = 0;
     state.agc_graphics = AgcGraphicsState::default();
     state.agc_index_resources.clear();
@@ -1643,18 +1669,38 @@ extern "C" fn import_dispatch(
         {
             builder = builder.stack_size(stack_size);
         }
-        if let Some(name) = read_guest_cstring(call_args[4])
-            && !name.is_empty()
-        {
-            builder = builder.name(name);
+        let thread_name = read_guest_cstring(call_args[4]).filter(|name| !name.is_empty());
+        if let Some(name) = thread_name.as_ref() {
+            builder = builder.name(name.clone());
         }
+        if trace_guest_sync() {
+            eprintln!(
+                "[REMu][THREAD] create handle={handle} name={:?} entry={entry:#x} arg={thread_argument:#x} detach={} stack={:#x}",
+                thread_name.as_deref().unwrap_or(""),
+                attributes.detach_state,
+                attributes.stack_size
+            );
+        }
+        let trace_name = thread_name.clone();
         let Ok(thread) = builder.spawn(move || {
+            if trace_guest_sync() {
+                eprintln!(
+                    "[REMu][THREAD] start handle={handle} name={:?}",
+                    trace_name.as_deref().unwrap_or("")
+                );
+            }
             set_current_guest_thread_handle(handle);
             set_current_guest_thread_pointer(guest_tls.thread_pointer);
             let result = run_guest_thread(entry, thread_argument);
             set_current_guest_thread_pointer(0);
             set_current_guest_thread_handle(0);
             drop(guest_tls);
+            if trace_guest_sync() {
+                eprintln!(
+                    "[REMu][THREAD] exit handle={handle} name={:?} result={result:#x}",
+                    trace_name.as_deref().unwrap_or("")
+                );
+            }
             result
         }) else {
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN));
@@ -2073,6 +2119,12 @@ fn guest_semaphore_create(arguments: [u64; 6]) -> u64 {
     unsafe {
         std::ptr::write_unaligned(output as *mut u32, handle);
     }
+    if trace_guest_sync() {
+        eprintln!(
+            "[REMu][SEMA] create handle={handle} name={:?} initial={initial} maximum={maximum}",
+            read_guest_cstring(arguments[1]).unwrap_or_default()
+        );
+    }
     0
 }
 
@@ -2093,7 +2145,19 @@ fn guest_semaphore_wait(arguments: [u64; 6]) -> u64 {
         };
         if semaphore.count >= needed {
             semaphore.count -= needed;
+            if trace_guest_sync() {
+                eprintln!(
+                    "[REMu][SEMA] acquire handle={handle} needed={needed} remaining={}",
+                    semaphore.count
+                );
+            }
             return 0;
+        }
+        if trace_guest_sync() {
+            eprintln!(
+                "[REMu][SEMA] wait handle={handle} needed={needed} available={}",
+                semaphore.count
+            );
         }
         state = sync
             .1
@@ -2117,6 +2181,12 @@ fn guest_semaphore_signal(arguments: [u64; 6]) -> u64 {
         .count
         .saturating_add(amount)
         .min(semaphore.maximum);
+    if trace_guest_sync() {
+        eprintln!(
+            "[REMu][SEMA] signal handle={handle} amount={amount} available={}",
+            semaphore.count
+        );
+    }
     sync.1.notify_all();
     0
 }
@@ -2367,18 +2437,41 @@ fn dispatch_probe_import(
             .save_data_dialog_status
             .cast_unsigned()
             .into(),
-        // Initial NP and trophy context IDs.
-        "5zBnau1uIEo" | "Bagshr7OQ6Q" => write_output_i32(arguments[0], 1),
         // sceKernelCreateEqueue
         "D0OdFMjp46I" => write_output_u64(arguments[0], 1),
         // sceKernelWaitEqueue. Until GPU completion events are connected, report an empty wait
         // deterministically. Not writing outCount made the game interpret old stack bytes as user
         // login events and overflow its four-controller table.
         "fzyMKs9kim0" => kernel_wait_equeue(arguments, state),
-        // Minimal offline NP identities. These services only require stable nonzero IDs at boot.
-        "hT0IAEvN+M0" => np_create_handle(arguments, state),
-        "sjaobBgqeB4" => np_universal_data_initialize(arguments[0]),
-        "m87BHxt-H60" | "tpFJ8LIKvPw" | "AUIHb7jUX3I" | "sUXGfNMalIo" => 0,
+        // Stateful offline NP services. Context, handle, event/property, intent and callback
+        // ownership follow the guest ABI even though REmu deliberately does not upload telemetry
+        // or connect a dumped title to PlayStation Network.
+        "sjaobBgqeB4" => np_universal_data_initialize(arguments[0], state),
+        "47UAEuQl+iI" => np_universal_data_terminate(state),
+        "5zBnau1uIEo" => np_universal_data_create_context(arguments, state),
+        "wB7IWzGp2v0" => np_universal_data_destroy_context(arguments[0], state),
+        "hT0IAEvN+M0" => np_universal_data_create_handle(arguments, state),
+        "jZCqWFgMehE" => np_universal_data_abort_handle(arguments[0], state),
+        "AUIHb7jUX3I" => np_universal_data_destroy_handle(arguments[0], state),
+        "tpFJ8LIKvPw" => np_universal_data_register_context(arguments, state),
+        "p+GcLqwpL9M" => np_universal_data_create_event(arguments, state),
+        "wG+84pnNIuo" => np_universal_data_destroy_event(arguments[0], state),
+        "YE4dbtbz6OE" => np_universal_data_object_set_i32(arguments, state),
+        "MfDb+4Nln64" => np_universal_data_object_set_string(arguments, state),
+        "Wxbg5x3pTXA" => np_universal_data_object_set_array(arguments, state),
+        "4llLk7YJRTE" => np_universal_data_array_set_string(arguments, state),
+        "CzkKf7ahIyU" => np_universal_data_post_event(arguments, state),
+        "m87BHxt-H60" => np_game_intent_initialize(arguments[0], state),
+        "jEIXUAr9XE8" => np_game_intent_receive(arguments[0], state),
+        "rPl0INNc-M8" => np_game_intent_get_property_string(arguments, state),
+        "Bagshr7OQ6Q" => np_trophy_create_context(arguments, state),
+        "Gz1rmUZpROM" => np_trophy_create_handle(arguments, state),
+        "sysY2FHYff4" => np_trophy_destroy_context(arguments[0], state),
+        "d8P11CI40KE" => np_trophy_destroy_handle(arguments[0], state),
+        "fYapWA9xVmA" => np_trophy_abort_handle(arguments[0], state),
+        "bIDov3wBu5Q" => np_trophy_register_context(arguments, state),
+        "sUXGfNMalIo" => np_trophy_register_unlock_callback(arguments, state),
+        "wVqxM58sIKs" => np_trophy_unregister_unlock_callback(state),
         // Exact Gen5 register-default descriptors consumed by indirect AGC state packets.
         "2JtWUUiYBXs" => agc_register_defaults(arguments[0], false, state),
         "wRbq6ZjNop4" => agc_register_defaults(arguments[0], true, state),
@@ -4306,26 +4399,303 @@ fn pthread_condition_attr_destroy(address: u64, state: &mut ProbeDispatchState) 
     0
 }
 
-fn np_create_handle(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let output = if arguments[0] != 0 {
-        arguments[0]
-    } else {
-        arguments[1]
-    };
-    if output == 0 {
-        return u64::MAX;
-    }
-    let handle = state.next_np_handle;
-    state.next_np_handle = state.next_np_handle.saturating_add(1);
-    write_output_i32(output, handle)
+fn np_error(result: Result<(), u32>) -> u64 {
+    result.map_or_else(sce_kernel_error, |()| 0)
 }
 
-fn np_universal_data_initialize(parameter: u64) -> u64 {
-    const SCE_NP_UNIVERSAL_DATA_ERROR_INVALID_ARGUMENT: u32 = 0x8055_3102;
-    if parameter == 0 {
-        return sce_kernel_error(SCE_NP_UNIVERSAL_DATA_ERROR_INVALID_ARGUMENT);
+fn read_sized_guest_parameters(
+    address: u64,
+    minimum_size: usize,
+    maximum_size: usize,
+) -> Option<Vec<u8>> {
+    if address == 0 {
+        return None;
+    }
+    let size = usize::try_from(read_guest_u64(address)).ok()?;
+    if !(minimum_size..=maximum_size).contains(&size) {
+        return None;
+    }
+    // SAFETY: the ABI's leading size field describes a readable initialization structure owned by
+    // the caller. The bounded copy means NP state never retains a guest pointer past this call.
+    Some(unsafe { std::slice::from_raw_parts(address as *const u8, size) }.to_vec())
+}
+
+fn np_universal_data_initialize(parameter: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(parameters) = read_sized_guest_parameters(parameter, 16, 0x1000) else {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_ARGUMENT);
+    };
+    np_error(state.np_universal_data.initialize(parameters))
+}
+
+fn np_universal_data_terminate(state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_universal_data.terminate())
+}
+
+fn np_universal_data_create_context(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[0] == 0 {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_ARGUMENT);
+    }
+    match state
+        .np_universal_data
+        .create_context(low_i32(arguments[1]), arguments[2])
+    {
+        Ok(context) => write_output_i32(arguments[0], context),
+        Err(error) => sce_kernel_error(error),
+    }
+}
+
+fn np_universal_data_destroy_context(context: u64, state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_universal_data.destroy_context(low_i32(context)))
+}
+
+fn np_universal_data_create_handle(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[0] == 0 {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_ARGUMENT);
+    }
+    match state.np_universal_data.create_handle() {
+        Ok(handle) => write_output_i32(arguments[0], handle),
+        Err(error) => sce_kernel_error(error),
+    }
+}
+
+fn np_universal_data_abort_handle(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_universal_data.abort_handle(low_i32(handle)))
+}
+
+fn np_universal_data_destroy_handle(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_universal_data.destroy_handle(low_i32(handle)))
+}
+
+fn np_universal_data_register_context(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    np_error(
+        state
+            .np_universal_data
+            .register_context(low_i32(arguments[0]), low_i32(arguments[1])),
+    )
+}
+
+fn np_universal_data_create_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[2] == 0 || arguments[3] == 0 {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(name) = read_guest_cstring(arguments[0]) else {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_EVENT_NAME);
+    };
+    match state.np_universal_data.create_event(name, arguments[1]) {
+        Ok((event, root_object)) => {
+            write_guest_u64(arguments[2], event);
+            write_guest_u64(arguments[3], root_object);
+            0
+        }
+        Err(error) => sce_kernel_error(error),
+    }
+}
+
+fn np_universal_data_destroy_event(event: u64, state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_universal_data.destroy_event(event))
+}
+
+fn np_universal_data_object_set_i32(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(key) = read_guest_cstring(arguments[1]) else {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_EVENT_PROPERTY_KEY);
+    };
+    np_error(
+        state
+            .np_universal_data
+            .object_set_i32(arguments[0], key, low_i32(arguments[2])),
+    )
+}
+
+fn np_universal_data_object_set_string(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(key) = read_guest_cstring(arguments[1]) else {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_EVENT_PROPERTY_KEY);
+    };
+    let Some(value) = read_guest_cstring(arguments[2]) else {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_EVENT_PROPERTY_VALUE);
+    };
+    np_error(
+        state
+            .np_universal_data
+            .object_set_string(arguments[0], key, value),
+    )
+}
+
+fn np_universal_data_object_set_array(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[3] == 0 {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(key) = read_guest_cstring(arguments[1]) else {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_EVENT_PROPERTY_KEY);
+    };
+    match state
+        .np_universal_data
+        .object_set_array(arguments[0], key, arguments[2])
+    {
+        Ok(array) => write_output_u64(arguments[3], array),
+        Err(error) => sce_kernel_error(error),
+    }
+}
+
+fn np_universal_data_array_set_string(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(value) = read_guest_cstring(arguments[1]) else {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_EVENT_PROPERTY_VALUE);
+    };
+    np_error(
+        state
+            .np_universal_data
+            .array_append_string(arguments[0], value),
+    )
+}
+
+fn np_universal_data_post_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    match state.np_universal_data.post_event(
+        low_i32(arguments[0]),
+        low_i32(arguments[1]),
+        arguments[2],
+        arguments[3],
+    ) {
+        Ok(posted) => {
+            eprintln!(
+                "[REMu][NP] committed universal-data event sequence={} context={} user={:#x} name={:?} bytes={} options={:#x}/{:#x}/{:#x}",
+                posted.sequence,
+                posted.context,
+                posted.user_id,
+                posted.event_name,
+                posted.payload_size,
+                posted.context_option,
+                posted.event_option,
+                posted.post_option,
+            );
+            0
+        }
+        Err(error) => sce_kernel_error(error),
+    }
+}
+
+fn np_game_intent_initialize(parameter: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(parameters) = read_sized_guest_parameters(parameter, 0x28, 0x1000) else {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INVALID_ARGUMENT);
+    };
+    np_error(state.np_game_intent.initialize(parameters))
+}
+
+fn np_game_intent_receive(output: u64, state: &mut ProbeDispatchState) -> u64 {
+    const GAME_INTENT_OUTPUT_SIZE: usize = 0x4140;
+    const INTENT_TYPE_OFFSET: u64 = 0x0c;
+    const INTENT_TYPE_CAPACITY: usize = 0x100;
+    const PROPERTY_OBJECT_OFFSET: u64 = 0x134;
+    if output == 0 {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INVALID_ARGUMENT);
+    }
+    let Ok(output_size) = usize::try_from(read_guest_u64(output)) else {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INVALID_ARGUMENT);
+    };
+    if output_size < GAME_INTENT_OUTPUT_SIZE {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INSUFFICIENT_BUFFER);
+    }
+    let intent = match state.np_game_intent.receive() {
+        Ok(intent) => intent,
+        Err(error) => return sce_kernel_error(error),
+    };
+    if intent.intent_type.is_empty()
+        || intent.intent_type.len() >= INTENT_TYPE_CAPACITY
+        || intent.intent_type.as_bytes().contains(&0)
+    {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INVALID_ARGUMENT);
+    }
+    guest_memset(
+        output + 8,
+        0,
+        u64::try_from(GAME_INTENT_OUTPUT_SIZE - 8).expect("fixed intent size fits u64"),
+    );
+    write_guest_u32(output + 8, 0);
+    for (index, byte) in intent.intent_type.bytes().enumerate() {
+        write_guest_u8(
+            output + INTENT_TYPE_OFFSET + u64::try_from(index).expect("intent type index fits u64"),
+            byte,
+        );
+    }
+    let property_object = output + PROPERTY_OBJECT_OFFSET;
+    state
+        .np_game_intent
+        .retain_received_properties(property_object, intent.properties);
+    0
+}
+
+fn np_game_intent_get_property_string(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[2] == 0 || arguments[3] == 0 {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(key) = read_guest_cstring(arguments[1]) else {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INVALID_ARGUMENT);
+    };
+    let value = match state.np_game_intent.property(arguments[0], &key) {
+        Ok(value) => value.to_owned(),
+        Err(error) => return sce_kernel_error(error),
+    };
+    let Some(required) = value.len().checked_add(1) else {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INSUFFICIENT_BUFFER);
+    };
+    if u64::try_from(required).unwrap_or(u64::MAX) > arguments[3] {
+        return sce_kernel_error(np::GAME_INTENT_ERROR_INSUFFICIENT_BUFFER);
+    }
+    for (index, byte) in value.bytes().chain(std::iter::once(0)).enumerate() {
+        write_guest_u8(
+            arguments[2] + u64::try_from(index).expect("property string index fits u64"),
+            byte,
+        );
     }
     0
+}
+
+fn np_trophy_create_context(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[0] == 0 {
+        return sce_kernel_error(np::TROPHY2_ERROR_INVALID_ARGUMENT);
+    }
+    let context = state
+        .np_trophy
+        .create_context(low_i32(arguments[1]), arguments[2]);
+    write_output_i32(arguments[0], context)
+}
+
+fn np_trophy_destroy_context(context: u64, state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_trophy.destroy_context(low_i32(context)))
+}
+
+fn np_trophy_create_handle(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[0] == 0 {
+        return sce_kernel_error(np::TROPHY2_ERROR_INVALID_ARGUMENT);
+    }
+    let handle = state.np_trophy.create_handle();
+    write_output_i32(arguments[0], handle)
+}
+
+fn np_trophy_destroy_handle(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_trophy.destroy_handle(low_i32(handle)))
+}
+
+fn np_trophy_abort_handle(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_trophy.abort_handle(low_i32(handle)))
+}
+
+fn np_trophy_register_context(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    np_error(
+        state
+            .np_trophy
+            .register_context(low_i32(arguments[0]), low_i32(arguments[1])),
+    )
+}
+
+fn np_trophy_register_unlock_callback(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    np_error(
+        state
+            .np_trophy
+            .register_unlock_callback(arguments[0], arguments[1]),
+    )
+}
+
+fn np_trophy_unregister_unlock_callback(state: &mut ProbeDispatchState) -> u64 {
+    np_error(state.np_trophy.unregister_unlock_callback())
 }
 
 fn guest_guard_acquire(address: u64) -> u64 {
@@ -5066,6 +5436,16 @@ fn kernel_release_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchSt
 fn trace_guest_vm() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_VM").is_some_and(|value| value == "1"))
+}
+
+fn trace_guest_time() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_TIME").is_some_and(|value| value == "1"))
+}
+
+fn trace_guest_sync() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_SYNC").is_some_and(|value| value == "1"))
 }
 
 fn guest_memset(destination: u64, value: u64, length: u64) -> u64 {
@@ -5854,7 +6234,7 @@ fn guest_usleep(microseconds: u64) -> u64 {
     signed_i32_return(unsafe { libc::usleep(bounded) })
 }
 
-fn guest_clock_gettime(_clock_id: u64, output: u64) -> u64 {
+fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
     if output == 0 {
         return u64::MAX;
     }
@@ -5862,10 +6242,23 @@ fn guest_clock_gettime(_clock_id: u64, output: u64) -> u64 {
     // those values through made clock id 4 return host monotonic uptime while the same title used
     // Unix time elsewhere, producing multi-trillion-second deltas. SharpEmu's working ABI treats
     // every accepted id as realtime, which is also what Dreaming Sarah expects here.
-    // SAFETY: Darwin and the PS5 x86-64 ABI both represent timespec as two signed 64-bit fields.
-    signed_i32_return(unsafe {
-        libc::clock_gettime(libc::CLOCK_REALTIME, output as *mut libc::timespec)
-    })
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: timestamp is a valid writable host timespec.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut timestamp) };
+    if status == 0 {
+        write_guest_u64(output, u64::try_from(timestamp.tv_sec).unwrap_or(0));
+        write_guest_u64(output + 8, u64::try_from(timestamp.tv_nsec).unwrap_or(0));
+    }
+    if trace_guest_time() {
+        eprintln!(
+            "[REMu][TIME] clock_gettime id={} output={output:#x} status={status} sec={} nsec={}",
+            clock_id, timestamp.tv_sec, timestamp.tv_nsec
+        );
+    }
+    signed_i32_return(status)
 }
 
 fn guest_time(output: u64) -> u64 {
@@ -5874,6 +6267,9 @@ fn guest_time(output: u64) -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs());
     if output != 0 {
         write_guest_u64(output, seconds);
+    }
+    if trace_guest_time() {
+        eprintln!("[REMu][TIME] time output={output:#x} sec={seconds}");
     }
     seconds
 }

@@ -46,5 +46,11 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   behavior were cross-checked against SharpEmu's GPL-2.0-or-later `AudioOutExports.cs` and
   `KernelMemoryCompatExports.cs` in the local 2026-07-21 checkout. REmu implements its own Rust
   mixer, CPAL/CoreAudio output path, stereo downmixing, resampling, and bounded queues.
+- Universal Data System, Game Intent, and Trophy2 export names and initial argument positions were
+  cross-checked against SharpEmu's GPL-2.0-or-later `NpUniversalDataSystemExports.cs`,
+  `NpGameIntentExports.cs`, and `NpTrophy2Exports.cs`. Exact Gen5 call shapes were then recovered
+  from the authorized Dreaming Sarah executable's import call sites. REmu's Rust implementation
+  adds independent context/request ownership, transactional typed event graphs, committed local
+  posts, intent-buffer/property behavior, trophy lifecycle validation, and callback retention.
 - REmu applies the four relocation types present in the first two authorized test titles before
   finalizing memory protections: `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE`.
