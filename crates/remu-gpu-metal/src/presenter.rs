@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use core_graphics_types::geometry::CGSize;
@@ -110,6 +112,7 @@ struct MetalPresenter {
     logged_guest_layouts: HashSet<(u64, u32, u32, u32)>,
     logged_fill_draw: bool,
     logged_software_draws: HashSet<SoftwareDrawKind>,
+    capture_directory: Option<PathBuf>,
 }
 
 impl MetalPresenter {
@@ -139,6 +142,7 @@ impl MetalPresenter {
             logged_guest_layouts: HashSet::new(),
             logged_fill_draw: false,
             logged_software_draws: HashSet::new(),
+            capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
         })
     }
 
@@ -433,6 +437,12 @@ impl MetalPresenter {
                 draw.color_target_address,
                 output_length,
             );
+            if let Some(directory) = self.capture_directory.as_deref() {
+                match capture_guest_frame(directory, &self.guest_bgra_bytes, descriptor) {
+                    Ok(path) => eprintln!("[REMu][METAL] captured frame {}", path.display()),
+                    Err(error) => eprintln!("[REMu][METAL] could not capture frame: {error}"),
+                }
+            }
         }
     }
 
@@ -506,6 +516,43 @@ fn log_guest_draw_upload(
         "[REMu][METAL] fast-presented Dreaming Sarah source={:#x} {}x{} tile={} target={target_address:#x} nonzero={nonzero_bytes}/{output_length} range={minimum}..={maximum} fingerprint={fingerprint:016x}",
         descriptor.address, descriptor.width, descriptor.height, descriptor.tile_mode,
     );
+}
+
+fn capture_guest_frame(
+    directory: &Path,
+    bgra: &[u8],
+    descriptor: GuestTextureDescriptor,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+    let path = directory.join(format!(
+        "remu-{:x}-{}x{}-tile{}.ppm",
+        descriptor.address, descriptor.width, descriptor.height, descriptor.tile_mode
+    ));
+    let file = std::fs::File::create(&path)
+        .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "P6\n{} {}\n255",
+        descriptor.width, descriptor.height
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    let pixel_count = u64::from(descriptor.width)
+        .checked_mul(u64::from(descriptor.height))
+        .and_then(|pixels| usize::try_from(pixels).ok())
+        .ok_or("captured frame dimensions overflow")?;
+    if bgra.len() < pixel_count.saturating_mul(4) {
+        return Err("captured frame buffer is truncated".to_owned());
+    }
+    let mut rgb = Vec::with_capacity(pixel_count.saturating_mul(3));
+    for pixel in bgra.chunks_exact(4).take(pixel_count) {
+        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+    }
+    writer
+        .write_all(&rgb)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    Ok(path)
 }
 
 fn register_value(registers: &[GpuRegister], offset: u32) -> Option<u32> {
@@ -1130,8 +1177,8 @@ mod tests {
 
     use super::{
         DREAMING_FILL_ES_PREFIX, DREAMING_FILL_PS_PREFIX, GuestPresentConstants,
-        convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra, execute_dreaming_fill_draw,
-        mode27_source_byte_offset,
+        GuestTextureDescriptor, blit_guest_texture_bytes, convert_guest_rgba_to_bgra,
+        convert_mode27_rgba_to_bgra, execute_dreaming_fill_draw, mode27_source_byte_offset,
     };
 
     #[test]
@@ -1254,5 +1301,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn alpha_blits_a_linear_sprite_into_a_mode27_target() {
+        let source = [
+            100, 0, 0, 255, 0, 100, 0, 128, 0, 0, 100, 255, 200, 100, 50, 0,
+        ];
+        let source_descriptor = GuestTextureDescriptor {
+            address: 0,
+            width: 2,
+            height: 2,
+            pitch: 2,
+            tile_mode: 0,
+        };
+        let target_descriptor = GuestTextureDescriptor {
+            address: 0,
+            width: 4,
+            height: 4,
+            pitch: 4,
+            tile_mode: 27,
+        };
+        let mut target = [10, 20, 30, 255].repeat(65_536 / 4);
+
+        blit_guest_texture_bytes(
+            &source,
+            source_descriptor,
+            &mut target,
+            target_descriptor,
+            true,
+        );
+
+        let top_left = mode27_source_byte_offset(1, 1, 4);
+        let top_right = mode27_source_byte_offset(2, 1, 4);
+        let untouched = mode27_source_byte_offset(0, 0, 4);
+        assert_eq!(target[top_left..top_left + 4], [100, 0, 0, 255]);
+        assert_eq!(target[top_right..top_right + 4], [5, 60, 15, 255]);
+        assert_eq!(target[untouched..untouched + 4], [10, 20, 30, 255]);
     }
 }
