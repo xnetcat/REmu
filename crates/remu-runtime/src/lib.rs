@@ -3990,22 +3990,45 @@ fn agc_emit_draw(
             .insert((draw.export_shader_address, draw.pixel_shader_address))
         && graphics.traced_shader_pairs.len() <= 16
     {
-        eprintln!(
-            "[REMu][AGC][SHADER] es={:#x} ps={:#x} indexed={} count={} instances={} target={:#x} es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
-            draw.export_shader_address,
-            draw.pixel_shader_address,
-            draw.indexed,
-            draw.index_count,
-            draw.instance_count,
-            draw.color_target_address,
-            draw.export_shader_prefix,
-            draw.pixel_shader_prefix,
-            draw.context_registers,
-            draw.shader_registers,
-            draw.user_config_registers,
-        );
+        trace_agc_shader_draw(&draw);
     }
     remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
+}
+
+fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
+    let instruction_counts = [&draw.export_shader, &draw.pixel_shader].map(|shader| {
+        shader
+            .as_ref()
+            .map_or(0, |shader| shader.program.instructions.len())
+    });
+    let raw_counts = [&draw.export_shader, &draw.pixel_shader].map(|shader| {
+        shader.as_ref().map_or(0, |shader| {
+            shader
+                .program
+                .instructions
+                .iter()
+                .filter(|instruction| instruction.opcode.known_name().is_none())
+                .count()
+        })
+    });
+    eprintln!(
+        "[REMu][AGC][SHADER] es={:#x} ps={:#x} indexed={} count={} instances={} target={:#x} es_ir={}/{} ps_ir={}/{} es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
+        draw.export_shader_address,
+        draw.pixel_shader_address,
+        draw.indexed,
+        draw.index_count,
+        draw.instance_count,
+        draw.color_target_address,
+        instruction_counts[0],
+        raw_counts[0],
+        instruction_counts[1],
+        raw_counts[1],
+        draw.export_shader_prefix,
+        draw.pixel_shader_prefix,
+        draw.context_registers,
+        draw.shader_registers,
+        draw.user_config_registers,
+    );
 }
 
 fn agc_emit_indexed_draw(packet_address: u64, graphics: &mut AgcGraphicsState) {
