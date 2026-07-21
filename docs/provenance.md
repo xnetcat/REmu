@@ -54,3 +54,11 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   posts, intent-buffer/property behavior, trophy lifecycle validation, and callback retention.
 - REmu applies the four relocation types present in the first two authorized test titles before
   finalizing memory protections: `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE`.
+
+## `remu-shader`
+
+- The backend-neutral Gen5 instruction/control model, shader resource metadata layout, GFX10
+  unified-format table, and inline-constant table were adapted from SharpEmu's
+  GPL-2.0-or-later `SharpEmu.ShaderCompiler` sources in the local 2026-07-21 checkout. REmu uses
+  Rust-owned immutable programs, typed control variants, bounded metadata reads, exact sparse
+  format decoding, and a backend-independent compute-system-value model.

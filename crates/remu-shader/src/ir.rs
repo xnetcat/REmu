@@ -1,0 +1,576 @@
+// Copyright (C) 2026 REmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShaderEncoding {
+    Sop1,
+    Sop2,
+    Sopc,
+    Sopp,
+    Sopk,
+    Smrd,
+    Smem,
+    Mubuf,
+    Mtbuf,
+    Vop1,
+    Vop2,
+    Vopc,
+    Vop3,
+    Vintrp,
+    Ds,
+    Flat,
+    Vop3p,
+    Mimg,
+    Exp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OperandKind {
+    ScalarRegister,
+    VectorRegister,
+    EncodedConstant,
+    LiteralConstant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ResourceKind {
+    ReadOnlyTexture,
+    ReadWriteTexture,
+    Sampler,
+    ConstantBuffer,
+}
+
+impl TryFrom<usize> for ResourceKind {
+    type Error = ();
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ReadOnlyTexture),
+            1 => Ok(Self::ReadWriteTexture),
+            2 => Ok(Self::Sampler),
+            3 => Ok(Self::ConstantBuffer),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PixelOutputKind {
+    Float,
+    Uint,
+    Sint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PixelOutputBinding {
+    pub guest_slot: u32,
+    pub host_location: u32,
+    pub kind: PixelOutputKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResourceMapping {
+    pub kind: ResourceKind,
+    pub slot: u32,
+    pub offset_dwords: u32,
+    pub size_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShaderMetadata {
+    pub extended_user_data_size_dwords: u32,
+    pub shader_resource_table_size_dwords: u32,
+    pub direct_resources: BTreeMap<u32, u32>,
+    pub resources: Vec<ResourceMapping>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ComputeSystemRegisters {
+    pub work_group_x: Option<u32>,
+    pub work_group_y: Option<u32>,
+    pub work_group_z: Option<u32>,
+    pub thread_group_size: Option<u32>,
+}
+
+impl ComputeSystemRegisters {
+    #[must_use]
+    pub fn value_for_register(self, scalar_register: u32) -> Option<ComputeSystemValue> {
+        if self.work_group_x == Some(scalar_register) {
+            Some(ComputeSystemValue::WorkGroupX)
+        } else if self.work_group_y == Some(scalar_register) {
+            Some(ComputeSystemValue::WorkGroupY)
+        } else if self.work_group_z == Some(scalar_register) {
+            Some(ComputeSystemValue::WorkGroupZ)
+        } else if self.thread_group_size == Some(scalar_register) {
+            Some(ComputeSystemValue::ThreadGroupSize)
+        } else {
+            None
+        }
+    }
+
+    pub fn clear_static_values(self, scalar_registers: &mut [u32]) {
+        for register in [
+            self.work_group_x,
+            self.work_group_y,
+            self.work_group_z,
+            self.thread_group_size,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(value) = scalar_registers.get_mut(register as usize) {
+                *value = 0;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ComputeSystemValue {
+    WorkGroupX,
+    WorkGroupY,
+    WorkGroupZ,
+    ThreadGroupSize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Operand {
+    pub kind: OperandKind,
+    pub value: u32,
+}
+
+impl Operand {
+    #[must_use]
+    pub const fn scalar(index: u32) -> Self {
+        Self {
+            kind: OperandKind::ScalarRegister,
+            value: index,
+        }
+    }
+
+    #[must_use]
+    pub const fn vector(index: u32) -> Self {
+        Self {
+            kind: OperandKind::VectorRegister,
+            value: index,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(encoded: u32, literal: Option<u32>) -> Self {
+        if encoded >= 256 {
+            return Self::vector(encoded - 256);
+        }
+        if matches!(encoded, 249 | 255)
+            && let Some(literal) = literal
+        {
+            return Self {
+                kind: OperandKind::LiteralConstant,
+                value: literal,
+            };
+        }
+        if encoded <= 105 || matches!(encoded, 106 | 107 | 124 | 126 | 127) {
+            return Self::scalar(encoded);
+        }
+        Self {
+            kind: OperandKind::EncodedConstant,
+            value: encoded,
+        }
+    }
+}
+
+impl fmt::Display for Operand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            OperandKind::ScalarRegister => write!(formatter, "s{}", self.value),
+            OperandKind::VectorRegister => write!(formatter, "v{}", self.value),
+            OperandKind::LiteralConstant => write!(formatter, "0x{:08X}", self.value),
+            OperandKind::EncodedConstant => write!(formatter, "src[{}]", self.value),
+        }
+    }
+}
+
+/// A decoded opcode. Construction is private to the decoder, so unsupported bit patterns cannot
+/// enter the IR while backends retain a compact, copyable dispatch key.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Opcode(&'static str);
+
+impl Opcode {
+    pub const END_PROGRAM: Self = Self::from_static("SEndpgm");
+    pub const EXPORT: Self = Self::from_static("Exp");
+
+    pub(crate) const fn from_static(name: &'static str) -> Self {
+        Self(name)
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    #[must_use]
+    pub fn starts_with(self, prefix: &str) -> bool {
+        self.0.starts_with(prefix)
+    }
+
+    #[must_use]
+    pub fn contains(self, part: &str) -> bool {
+        self.0.contains(part)
+    }
+}
+
+impl fmt::Debug for Opcode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl fmt::Display for Opcode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ImageControl {
+    pub dmask: u32,
+    pub vector_address: u32,
+    pub address_registers: Vec<u32>,
+    pub vector_data: u32,
+    pub scalar_resource: u32,
+    pub scalar_sampler: u32,
+    pub dimension: u32,
+    pub is_array: bool,
+    pub glc: bool,
+    pub slc: bool,
+    pub a16: bool,
+    pub d16: bool,
+}
+
+impl ImageControl {
+    #[must_use]
+    pub fn address_register(&self, component: usize) -> u32 {
+        self.address_registers
+            .get(component)
+            .copied()
+            .unwrap_or_else(|| {
+                self.vector_address
+                    .saturating_add(u32::try_from(component).unwrap_or(u32::MAX))
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlobalMemoryControl {
+    pub dword_count: u32,
+    pub vector_address: u32,
+    pub vector_data: u32,
+    pub scalar_address: u32,
+    pub offset_bytes: i32,
+    pub glc: bool,
+    pub slc: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct BufferMemoryControl {
+    pub dword_count: u32,
+    pub vector_address: u32,
+    pub vector_data: u32,
+    pub scalar_resource: u32,
+    pub offset_bytes: i32,
+    pub index_enabled: bool,
+    pub offset_enabled: bool,
+    pub glc: bool,
+    pub slc: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExportControl {
+    pub target: u32,
+    pub enable_mask: u32,
+    pub compressed: bool,
+    pub done: bool,
+    pub valid_mask: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterpolationControl {
+    pub attribute: u32,
+    pub channel: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Vop3Control {
+    pub absolute_mask: u32,
+    pub negate_mask: u32,
+    pub output_modifier: u32,
+    pub clamp: bool,
+    pub operand_select: u32,
+    pub scalar_destination: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SdwaControl {
+    pub destination_select: u32,
+    pub destination_unused: u32,
+    pub source0_select: u32,
+    pub source1_select: u32,
+    pub source0_sign_extend: bool,
+    pub source1_sign_extend: bool,
+    pub absolute_mask: u32,
+    pub negate_mask: u32,
+    pub output_modifier: u32,
+    pub clamp: bool,
+    pub scalar_destination: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Vop3pControl {
+    pub operand_select_mask: u32,
+    pub operand_select_high_mask: u32,
+    pub negate_low_mask: u32,
+    pub negate_high_mask: u32,
+    pub clamp: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DppControl {
+    pub control: u32,
+    pub fetch_inactive: bool,
+    pub bound_control: bool,
+    pub absolute_mask: u32,
+    pub negate_mask: u32,
+    pub bank_mask: u32,
+    pub row_mask: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Dpp8Control {
+    pub lane_selectors: u32,
+    pub fetch_inactive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScalarMemoryControl {
+    pub destination_count: u32,
+    pub immediate_offset_bytes: i32,
+    pub dynamic_offset_register: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataShareControl {
+    pub offset0: u32,
+    pub offset1: u32,
+    pub gds: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InstructionControl {
+    Image(ImageControl),
+    GlobalMemory(GlobalMemoryControl),
+    BufferMemory(BufferMemoryControl),
+    Export(ExportControl),
+    Interpolation(InterpolationControl),
+    Vop3(Vop3Control),
+    Sdwa(SdwaControl),
+    Vop3p(Vop3pControl),
+    Dpp(DppControl),
+    Dpp8(Dpp8Control),
+    ScalarMemory(ScalarMemoryControl),
+    DataShare(DataShareControl),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageBinding {
+    pub pc: u32,
+    pub opcode: Opcode,
+    pub control: ImageControl,
+    pub resource_descriptor: Vec<u32>,
+    pub sampler_descriptor: Vec<u32>,
+    pub mip_level: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalMemoryBinding {
+    pub scalar_address: u32,
+    pub base_address: u64,
+    pub instruction_pcs: Vec<u32>,
+    pub data: Vec<u8>,
+    pub writable: bool,
+    pub write_back_to_guest: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VertexInputBinding {
+    pub pc: u32,
+    pub location: u32,
+    pub component_count: u32,
+    pub data_format: u32,
+    pub number_format: u32,
+    pub base_address: u64,
+    pub stride: u32,
+    pub offset_bytes: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShaderEvaluation {
+    pub initial_scalar_registers: Vec<u32>,
+    pub scalar_registers: Vec<u32>,
+    pub image_bindings: Vec<ImageBinding>,
+    pub global_memory_bindings: Vec<GlobalMemoryBinding>,
+    pub compute_system_registers: Option<ComputeSystemRegisters>,
+    pub runtime_scalar_registers: BTreeSet<u32>,
+    pub vertex_inputs: Vec<VertexInputBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Instruction {
+    pub pc: u32,
+    pub encoding: ShaderEncoding,
+    pub opcode: Opcode,
+    pub words: Vec<u32>,
+    pub sources: Vec<Operand>,
+    pub destinations: Vec<Operand>,
+    pub control: Option<InstructionControl>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Program {
+    pub address: u64,
+    pub instructions: Vec<Instruction>,
+    pixel_color_export_masks: u32,
+    runtime_scalar_registers: BTreeSet<u32>,
+}
+
+impl Program {
+    #[must_use]
+    pub fn new(address: u64, instructions: Vec<Instruction>) -> Self {
+        let pixel_color_export_masks = instructions.iter().fold(0, |masks, instruction| {
+            let Some(InstructionControl::Export(export)) = instruction.control else {
+                return masks;
+            };
+            if export.target < 8 {
+                masks | ((export.enable_mask & 0x0f) << (export.target * 4))
+            } else {
+                masks
+            }
+        });
+        let mut runtime_scalar_registers = BTreeSet::new();
+        for instruction in &instructions {
+            for operand in instruction.sources.iter().chain(&instruction.destinations) {
+                if operand.kind == OperandKind::ScalarRegister && operand.value < 256 {
+                    runtime_scalar_registers.insert(operand.value);
+                }
+            }
+            if let Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                dynamic_offset_register: Some(register),
+                ..
+            })) = instruction.control
+                && register < 256
+            {
+                runtime_scalar_registers.insert(register);
+            }
+        }
+        Self {
+            address,
+            instructions,
+            pixel_color_export_masks,
+            runtime_scalar_registers,
+        }
+    }
+
+    #[must_use]
+    pub const fn pixel_color_export_masks(&self) -> u32 {
+        self.pixel_color_export_masks
+    }
+
+    pub fn image_resources(&self) -> impl Iterator<Item = &ImageControl> {
+        self.instructions.iter().filter_map(|instruction| {
+            let InstructionControl::Image(control) = instruction.control.as_ref()? else {
+                return None;
+            };
+            Some(control)
+        })
+    }
+
+    #[must_use]
+    pub const fn runtime_scalar_registers(&self) -> &BTreeSet<u32> {
+        &self.runtime_scalar_registers
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShaderState {
+    pub program: Arc<Program>,
+    pub user_data: Vec<u32>,
+    pub metadata: Option<ShaderMetadata>,
+    pub compute_system_registers: Option<ComputeSystemRegisters>,
+    pub user_data_scalar_register_base: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_operands_without_conflating_literals_and_inline_constants() {
+        assert_eq!(Operand::source(12, None), Operand::scalar(12));
+        assert_eq!(Operand::source(256, None), Operand::vector(0));
+        assert_eq!(
+            Operand::source(249, Some(0xdead_beef)),
+            Operand {
+                kind: OperandKind::LiteralConstant,
+                value: 0xdead_beef,
+            }
+        );
+        assert_eq!(
+            Operand::source(242, None),
+            Operand {
+                kind: OperandKind::EncodedConstant,
+                value: 242,
+            }
+        );
+    }
+
+    #[test]
+    fn computes_pixel_masks_and_runtime_scalar_registers_once() {
+        let program = Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Sop2,
+                    opcode: Opcode::from_static("SAddU32"),
+                    words: vec![0],
+                    sources: vec![Operand::scalar(4), Operand::vector(1)],
+                    destinations: vec![Operand::scalar(5)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Exp,
+                    opcode: Opcode::EXPORT,
+                    words: vec![0, 0],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::Export(ExportControl {
+                        target: 2,
+                        enable_mask: 0b1011,
+                        compressed: false,
+                        done: true,
+                        valid_mask: false,
+                    })),
+                },
+            ],
+        );
+        assert_eq!(program.pixel_color_export_masks(), 0x0b00);
+        assert_eq!(program.runtime_scalar_registers(), &BTreeSet::from([4, 5]));
+    }
+}

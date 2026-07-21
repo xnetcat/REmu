@@ -1422,6 +1422,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "remu-shader"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
