@@ -661,10 +661,6 @@ fn native_libc_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
         "2vDqwBlpF-o" => c"strtod",
         "dhK16CKwhQg" => c"__isfinited",
         "GfxAp9Xyiqs" => c"__isnand",
-        "fL3O02ypZFE" => c"wmemcpy",
-        "Noj9PsJrsa8" => c"wmemmove",
-        "fnUEjBCNRVU" => c"wmemchr",
-        "QJ5xVfKkni0" => c"wmemcmp",
         "n88vx3C5nW8" => c"gettimeofday",
         "eLdDw6l0-bU" => c"snprintf",
         "Q2V+iqvjgC0" => c"vsnprintf",
@@ -2300,6 +2296,12 @@ fn dispatch_probe_import(
         "DfivPArhucg" => guest_memcmp(arguments[0], arguments[1], arguments[2]),
         // libc memchr
         "8u8lPzUEq+U" => guest_memchr(arguments[0], arguments[1], arguments[2]),
+        // Gen5 uses two-byte wchar_t values. macOS uses four-byte wchar_t values, so these
+        // functions must not be bound directly to the host libc wide-memory family.
+        "fL3O02ypZFE" => guest_wmemcpy(arguments[0], arguments[1], arguments[2]),
+        "Noj9PsJrsa8" => guest_wmemmove(arguments[0], arguments[1], arguments[2]),
+        "fnUEjBCNRVU" => guest_wmemchr(arguments[0], arguments[1], arguments[2]),
+        "QJ5xVfKkni0" => guest_wmemcmp(arguments[0], arguments[1], arguments[2]),
         // The guest ABI returns the previous four-byte value; the third argument is memory order.
         "2HnmKiLmV6s" => guest_atomic_fetch_4(arguments[0], arguments[1], true),
         "iPBqs+YUUFw" => guest_atomic_fetch_4(arguments[0], arguments[1], false),
@@ -4034,8 +4036,9 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
         trace_shader_evaluation(draw, draw.export_shader.as_ref(), export_user_data_base, 8),
         trace_shader_evaluation(draw, draw.pixel_shader.as_ref(), 0x00c, 0),
     ];
+    let msl_summary = trace_msl_pair(draw, export_user_data_base);
     eprintln!(
-        "[REMu][AGC][SHADER] es={:#x} ps={:#x} indexed={} count={} instances={} target={:#x} es_ir={}/{} ps_ir={}/{} es_eval={} ps_eval={} es_ops=[{}] ps_ops=[{}] es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
+        "[REMu][AGC][SHADER] es={:#x} ps={:#x} indexed={} count={} instances={} target={:#x} es_ir={}/{} ps_ir={}/{} es_eval={} ps_eval={} msl={} es_ops=[{}] ps_ops=[{}] es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
         draw.export_shader_address,
         draw.pixel_shader_address,
         draw.indexed,
@@ -4048,6 +4051,7 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
         raw_counts[1],
         evaluation_summaries[0],
         evaluation_summaries[1],
+        msl_summary,
         opcode_lists[0],
         opcode_lists[1],
         draw.export_shader_prefix,
@@ -4058,16 +4062,13 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
     );
 }
 
-fn trace_shader_evaluation(
+fn evaluate_shader_snapshot(
     draw: &remu_gpu::IndexedDraw,
-    snapshot: Option<&remu_gpu::ShaderSnapshot>,
+    snapshot: &remu_gpu::ShaderSnapshot,
     user_data_register: u32,
     scalar_register_base: u32,
-) -> String {
-    let Some(snapshot) = snapshot else {
-        return "missing".to_owned();
-    };
-    let state = match remu_shader::build_shader_state(
+) -> Result<remu_shader::ShaderEvaluation, String> {
+    let state = remu_shader::build_shader_state(
         Arc::clone(&snapshot.program),
         snapshot.metadata.clone(),
         user_data_register,
@@ -4079,15 +4080,147 @@ fn trace_shader_evaluation(
                 .find(|register| register.offset == offset)
                 .map(|register| register.value)
         },
-    ) {
-        Ok(state) => state,
-        Err(error) => return format!("state-error({error})"),
-    };
-    match remu_shader::evaluate_shader(
+    )
+    .map_err(|error| format!("state-error({error})"))?;
+    remu_shader::evaluate_shader(
         &ProcessGuestMemory,
         &state,
         remu_shader::EvaluationOptions::default(),
+    )
+    .map_err(|error| format!("evaluation-error({error})"))
+}
+
+fn trace_msl_pair(draw: &remu_gpu::IndexedDraw, export_user_data_base: u32) -> String {
+    let Some(export_snapshot) = draw.export_shader.as_ref() else {
+        return "missing-es".to_owned();
+    };
+    let Some(pixel_snapshot) = draw.pixel_shader.as_ref() else {
+        return "missing-ps".to_owned();
+    };
+    let export_evaluation =
+        match evaluate_shader_snapshot(draw, export_snapshot, export_user_data_base, 8) {
+            Ok(evaluation) => evaluation,
+            Err(error) => return format!("es-{error}"),
+        };
+    let pixel_evaluation = match evaluate_shader_snapshot(draw, pixel_snapshot, 0x00c, 0) {
+        Ok(evaluation) => evaluation,
+        Err(error) => return format!("ps-{error}"),
+    };
+    let mut host_location = 0_u32;
+    let pixel_outputs = (0..8)
+        .filter_map(|guest_slot| {
+            let mask =
+                (pixel_snapshot.program.pixel_color_export_masks() >> (guest_slot * 4)) & 0xf;
+            (mask != 0).then(|| {
+                let binding = remu_shader::PixelOutputBinding {
+                    guest_slot,
+                    host_location,
+                    kind: remu_shader::PixelOutputKind::Float,
+                };
+                host_location += 1;
+                binding
+            })
+        })
+        .collect();
+    let pixel_options = remu_shader_metal::MetalCompileOptions::pixel(
+        pixel_outputs,
+        draw.context_registers
+            .iter()
+            .find(|register| register.offset == 0x1b3)
+            .map_or(0, |register| register.value),
+        draw.context_registers
+            .iter()
+            .find(|register| register.offset == 0x1b4)
+            .map_or(0, |register| register.value),
+    );
+    let pixel = match remu_shader_metal::compile_msl(
+        &pixel_snapshot.program,
+        &pixel_evaluation,
+        &pixel_options,
     ) {
+        Ok(shader) => shader,
+        Err(error) => {
+            dump_shader_trace(draw, export_snapshot, pixel_snapshot, None, None);
+            return format!("ps-error({error})");
+        }
+    };
+    let vertex_options =
+        remu_shader_metal::MetalCompileOptions::vertex(pixel.interpolated_attribute_count);
+    let vertex = match remu_shader_metal::compile_msl(
+        &export_snapshot.program,
+        &export_evaluation,
+        &vertex_options,
+    ) {
+        Ok(shader) => shader,
+        Err(error) => {
+            dump_shader_trace(draw, export_snapshot, pixel_snapshot, None, Some(&pixel));
+            return format!("es-error({error})");
+        }
+    };
+    dump_shader_trace(
+        draw,
+        export_snapshot,
+        pixel_snapshot,
+        Some(&vertex),
+        Some(&pixel),
+    );
+    format!(
+        "ok(es={}B/{}b/{}t,ps={}B/{}b/{}t)",
+        vertex.source.len(),
+        vertex.bindings.global_buffer_count,
+        vertex.bindings.texture_count,
+        pixel.source.len(),
+        pixel.bindings.global_buffer_count,
+        pixel.bindings.texture_count,
+    )
+}
+
+fn dump_shader_trace(
+    draw: &remu_gpu::IndexedDraw,
+    export_snapshot: &remu_gpu::ShaderSnapshot,
+    pixel_snapshot: &remu_gpu::ShaderSnapshot,
+    vertex: Option<&remu_shader_metal::MetalShader>,
+    pixel: Option<&remu_shader_metal::MetalShader>,
+) {
+    let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR").map(PathBuf::from) else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        eprintln!("[REMu][AGC][SHADER] could not create MSL dump directory: {error}");
+        return;
+    }
+    let stem = format!(
+        "{:016x}-{:016x}",
+        draw.export_shader_address, draw.pixel_shader_address
+    );
+    let ir = format!(
+        "export={:#?}\n\npixel={:#?}\n",
+        export_snapshot.program.instructions, pixel_snapshot.program.instructions
+    );
+    for (suffix, contents) in [
+        ("ir.txt", Some(ir.as_str())),
+        ("vertex.metal", vertex.map(|shader| shader.source.as_str())),
+        ("pixel.metal", pixel.map(|shader| shader.source.as_str())),
+    ] {
+        let Some(contents) = contents else {
+            continue;
+        };
+        if let Err(error) = std::fs::write(directory.join(format!("{stem}-{suffix}")), contents) {
+            eprintln!("[REMu][AGC][SHADER] could not write MSL trace: {error}");
+        }
+    }
+}
+
+fn trace_shader_evaluation(
+    draw: &remu_gpu::IndexedDraw,
+    snapshot: Option<&remu_gpu::ShaderSnapshot>,
+    user_data_register: u32,
+    scalar_register_base: u32,
+) -> String {
+    let Some(snapshot) = snapshot else {
+        return "missing".to_owned();
+    };
+    match evaluate_shader_snapshot(draw, snapshot, user_data_register, scalar_register_base) {
         Ok(evaluation) => format!(
             "ok(i={},g={},v={})",
             evaluation.image_bindings.len(),
@@ -6432,6 +6565,88 @@ fn guest_memchr(address: u64, character: u64, length: u64) -> u64 {
     }
 }
 
+const GUEST_WCHAR_SIZE: usize = std::mem::size_of::<u16>();
+
+fn guest_wide_byte_length(count: u64) -> Option<usize> {
+    usize::try_from(count).ok()?.checked_mul(GUEST_WCHAR_SIZE)
+}
+
+fn guest_wmemcpy(destination: u64, source: u64, count: u64) -> u64 {
+    guest_wide_copy(destination, source, count)
+}
+
+fn guest_wmemmove(destination: u64, source: u64, count: u64) -> u64 {
+    guest_wide_copy(destination, source, count)
+}
+
+fn guest_wide_copy(destination: u64, source: u64, count: u64) -> u64 {
+    let Some(length) = guest_wide_byte_length(count) else {
+        return 0;
+    };
+    if length == 0 {
+        return destination;
+    }
+    if destination == 0 || source == 0 {
+        return 0;
+    }
+    // SAFETY: the guest ABI supplies readable and writable ranges for `count` two-byte wide
+    // characters. Gen5's libc copy is overlap-tolerant in the basic_string path used by this
+    // title, so both wide-copy entry points intentionally use `copy`.
+    unsafe {
+        std::ptr::copy(source as *const u8, destination as *mut u8, length);
+    }
+    destination
+}
+
+fn guest_wmemchr(address: u64, character: u64, count: u64) -> u64 {
+    if address == 0 || count == 0 {
+        return 0;
+    }
+    let Ok(count) = usize::try_from(count) else {
+        return 0;
+    };
+    let needle =
+        u16::try_from(character & u64::from(u16::MAX)).expect("masked wide character fits u16");
+    for index in 0..count {
+        let offset = index * GUEST_WCHAR_SIZE;
+        // SAFETY: wmemchr's guest ABI supplies `count` readable two-byte elements. Unaligned
+        // reads keep the HLE correct even when a guest passes packed storage.
+        let value: u16 =
+            unsafe { std::ptr::read_unaligned((address as *const u8).add(offset).cast()) };
+        if value == needle {
+            return address + u64::try_from(offset).unwrap_or(u64::MAX);
+        }
+    }
+    0
+}
+
+fn guest_wmemcmp(left: u64, right: u64, count: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    if left == 0 || right == 0 {
+        return u64::MAX;
+    }
+    let Ok(count) = usize::try_from(count) else {
+        return u64::MAX;
+    };
+    for index in 0..count {
+        let offset = index * GUEST_WCHAR_SIZE;
+        // SAFETY: wmemcmp's guest ABI supplies `count` readable two-byte elements on each side.
+        let left_value =
+            unsafe { std::ptr::read_unaligned((left as *const u8).add(offset).cast::<u16>()) };
+        // SAFETY: same contract as the left-side read above.
+        let right_value =
+            unsafe { std::ptr::read_unaligned((right as *const u8).add(offset).cast::<u16>()) };
+        match left_value.cmp(&right_value) {
+            std::cmp::Ordering::Less => return signed_i32_return(-1),
+            std::cmp::Ordering::Greater => return signed_i32_return(1),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    0
+}
+
 fn guest_sprintf(arguments: [u64; 6]) -> u64 {
     if arguments[0] == 0 || arguments[1] == 0 {
         return u64::MAX;
@@ -6668,8 +6883,9 @@ mod platform_independent_tests {
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, create_pthread_attr, destroy_pthread_attr, dispatch_probe_import,
         guest_clock_gettime, guest_free, guest_qsort, guest_tolower_table, guest_toupper_table,
-        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
-        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory,
+        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_stack,
+        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
         pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
         sanitize_save_segment, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
         write_guest_u32, write_guest_u64,
@@ -6685,6 +6901,41 @@ mod platform_independent_tests {
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => 1,
         }
+    }
+
+    #[test]
+    fn copies_gen5_wide_characters_as_two_byte_elements() {
+        let mut words = [
+            0x41_u16, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0xaaaa, 0xbbbb, 0xcccc, 0xdddd,
+            0xeeee,
+        ];
+        let base = u64::try_from(words.as_mut_ptr().addr()).unwrap();
+        let destination = base + 4 * 2;
+
+        assert_eq!(guest_wmemcpy(destination, base, 8), destination);
+        assert_eq!(
+            words,
+            [
+                0x41, 0x42, 0x43, 0x44, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0xeeee,
+            ]
+        );
+
+        assert_eq!(guest_wmemmove(base, destination, 4), base);
+        assert_eq!(&words[..4], &[0x41, 0x42, 0x43, 0x44]);
+    }
+
+    #[test]
+    fn searches_and_compares_gen5_wide_characters() {
+        let left = [0x0061_u16, 0x0062, 0x20ac, 0x0064];
+        let right = [0x0061_u16, 0x0062, 0x20ad, 0x0064];
+        let left_address = u64::try_from(left.as_ptr().addr()).unwrap();
+        let right_address = u64::try_from(right.as_ptr().addr()).unwrap();
+
+        assert_eq!(guest_wmemchr(left_address, 0x20ac, 4), left_address + 4);
+        assert_eq!(guest_wmemchr(left_address, 0x9999, 4), 0);
+        assert_eq!(guest_wmemcmp(left_address, left_address, 4), 0);
+        assert_eq!(guest_wmemcmp(left_address, right_address, 4), u64::MAX);
+        assert_eq!(guest_wmemcmp(right_address, left_address, 4), 1);
     }
 
     #[test]

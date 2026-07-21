@@ -74,3 +74,15 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   failures, exact conditional-branch evaluation, bounded alternate-CFG discovery, strict non-null
   memory reads, and a backend-neutral guest-memory trait; it does not inherit SharpEmu's
   title-specific tracing or permissive zero-buffer fallbacks.
+
+## `remu-shader-metal`
+
+- The register-file execution model, scalar/vector operation semantics, export mapping, pixel
+  interpolation, image sampling operand order, and descriptor-driven GFX10 buffer-format conversion
+  were adapted from SharpEmu's GPL-2.0-or-later `Gen5MslTranslator.cs`,
+  `Gen5MslTranslator.Alu.cs`, `Gen5MslTranslator.Pixel.cs`, and Metal templates in the local
+  2026-07-21 checkout.
+- REmu's Rust lowering operates exclusively on the backend-neutral typed IR, produces structured
+  PC/opcode failures instead of substitute shaders, uses draw-evaluated resource bindings, and is
+  validated against complete live shader pairs from the authorized local dumps. No game shader
+  bytes, game fingerprints, or proprietary SDK material are included in the source tree.

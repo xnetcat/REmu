@@ -1,0 +1,13 @@
+[package]
+name = "remu-shader-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+remu-shader = { path = "../remu-shader" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -9,6 +9,7 @@ members = [
     "crates/remu-platform",
     "crates/remu-runtime",
     "crates/remu-shader",
+    "crates/remu-shader-metal",
 ]
 resolver = "2"
 

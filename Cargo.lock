@@ -1420,6 +1420,7 @@ dependencies = [
  "remu-loader",
  "remu-memory",
  "remu-shader",
+ "remu-shader-metal",
  "thiserror 2.0.19",
 ]
 
@@ -1427,6 +1428,14 @@ dependencies = [
 name = "remu-shader"
 version = "0.1.0"
 dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "remu-shader-metal"
+version = "0.1.0"
+dependencies = [
+ "remu-shader",
  "thiserror 2.0.19",
 ]
 
