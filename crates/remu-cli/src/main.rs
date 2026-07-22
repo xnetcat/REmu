@@ -188,6 +188,15 @@ fn inspect(path: &Path) -> ExitCode {
                         "dynamic.jump_relocations=0x{:x}:0x{:x}",
                         dynamic.jump_relocation_address, dynamic.jump_relocation_size
                     );
+                    println!("dynamic.init=0x{:x}", dynamic.init_address);
+                    println!(
+                        "dynamic.init_array=0x{:x}:0x{:x}",
+                        dynamic.init_array_address, dynamic.init_array_size
+                    );
+                    println!(
+                        "dynamic.preinit_array=0x{:x}:0x{:x}",
+                        dynamic.preinit_array_address, dynamic.preinit_array_size
+                    );
                     println!("dynamic.symbols={}", dynamic.symbols.len());
                     println!("dynamic.relocations={}", dynamic.relocations.len());
                     println!("dynamic.plt_relocations={}", dynamic.jump_relocations.len());
@@ -386,7 +395,19 @@ fn link(path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let linked = match remu_runtime::LinkedImage::link_main(&executable) {
+    let modules = match load_bundled_runtime_modules(path) {
+        Ok(modules) => modules,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let module_refs = modules
+        .iter()
+        .map(|(name, executable)| (name.as_str(), executable))
+        .collect::<Vec<_>>();
+    let linked = match remu_runtime::LinkedImage::link_main_with_modules(&executable, &module_refs)
+    {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("error: {}: {error}", path.display());
@@ -424,7 +445,19 @@ fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let linked = match remu_runtime::LinkedImage::link_main(&executable) {
+    let modules = match load_bundled_runtime_modules(path) {
+        Ok(modules) => modules,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let module_refs = modules
+        .iter()
+        .map(|(name, executable)| (name.as_str(), executable))
+        .collect::<Vec<_>>();
+    let linked = match remu_runtime::LinkedImage::link_main_with_modules(&executable, &module_refs)
+    {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("error: {}: {error}", path.display());
@@ -465,7 +498,19 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
-    let linked = match remu_runtime::LinkedImage::link_main(&executable) {
+    let modules = match load_bundled_runtime_modules(path) {
+        Ok(modules) => modules,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let module_refs = modules
+        .iter()
+        .map(|(name, executable)| (name.as_str(), executable))
+        .collect::<Vec<_>>();
+    let linked = match remu_runtime::LinkedImage::link_main_with_modules(&executable, &module_refs)
+    {
         Ok(linked) => linked,
         Err(error) => {
             eprintln!("error: {}: {error}", path.display());
@@ -527,4 +572,21 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
             ExitCode::FAILURE
         }
     }
+}
+
+fn load_bundled_runtime_modules(
+    executable_path: &Path,
+) -> Result<Vec<(String, remu_loader::LoadedExecutable)>, String> {
+    let Some(game_root) = executable_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut modules = Vec::new();
+    let libc_path = game_root.join("sce_module/libc.prx");
+    if libc_path.is_file() {
+        let executable = remu_loader::load_path(&libc_path)
+            .map_err(|error| format!("{}: {error}", libc_path.display()))?;
+        eprintln!("[REMu][MODULE] loading {}", libc_path.display());
+        modules.push(("libc.prx".to_owned(), executable));
+    }
+    Ok(modules)
 }

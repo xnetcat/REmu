@@ -8,7 +8,7 @@ mod np;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -40,9 +40,11 @@ const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
 const R_X86_64_JUMP_SLOT: u32 = 7;
 const R_X86_64_RELATIVE: u32 = 8;
+const R_X86_64_DTPMOD64: u32 = 16;
 const IMPORT_STUB_SIZE: u64 = 32;
 const IMPORT_STUB_SIZE_USIZE: usize = 32;
 const PT_TLS: u32 = 7;
+const PT_SCE_PROC_PARAM: u32 = 0x6100_0001;
 const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 const DW_EH_PE_PCREL_SDATA4: u8 = 0x1b;
 const GUEST_TLS_PREFIX_SIZE: u64 = 0x20_000;
@@ -88,7 +90,9 @@ pub struct LinkedImage {
     pub import_stubs: Vec<ImportStub>,
     pub relocation_stats: RelocationStats,
     pub tls: GuestTls,
+    pub process_param: Option<GuestAddress>,
     unwind_fdes: Vec<GuestAddress>,
+    module_initializers: Vec<GuestAddress>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,23 +151,112 @@ pub enum LinkError {
 
 impl LinkedImage {
     pub fn link_main(executable: &LoadedExecutable) -> Result<Self, LinkError> {
+        Self::link_main_with_modules(executable, &[])
+    }
+
+    /// Links the main executable and selected game-bundled PRX modules into one guest address
+    /// space. Module exports are currently preferred only for ABI families that must share hidden
+    /// runtime state, such as all libc allocators.
+    pub fn link_main_with_modules(
+        executable: &LoadedExecutable,
+        modules: &[(&str, &LoadedExecutable)],
+    ) -> Result<Self, LinkError> {
         let elf = executable.info.elf.as_ref().ok_or(LinkError::MissingElf)?;
         let dynamic = elf
             .dynamic
             .as_ref()
             .ok_or(LinkError::MissingDynamicMetadata)?;
         let mut memory = GuestImage::map_main(executable)?;
-        let (import_stubs, symbol_stubs) = create_import_stubs(&mut memory, dynamic)?;
-        let relocation_stats = apply_relocations(&mut memory, dynamic, &symbol_stubs)?;
-        let unwind_fdes = collect_unwind_fdes(&memory, executable)?;
-        let tls = install_tls_support(&mut memory, executable)?;
+        let mut linked_modules = Vec::with_capacity(modules.len());
+        for (index, (name, module)) in modules.iter().enumerate() {
+            let dynamic = module
+                .info
+                .elf
+                .as_ref()
+                .ok_or(LinkError::MissingElf)?
+                .dynamic
+                .as_ref()
+                .ok_or(LinkError::MissingDynamicMetadata)?;
+            let base = memory.map_module(module, MACOS_GUEST_PAGE_ALIGNMENT)?;
+            linked_modules.push(LinkedModuleInput {
+                name,
+                executable: module,
+                dynamic,
+                base,
+                tls_module_id: u64::try_from(index + 2).map_err(|_| LinkError::AddressOverflow)?,
+            });
+        }
+
+        let module_exports = selected_module_exports(&linked_modules)?;
+        let mut import_stubs = Vec::new();
+        let mut relocation_stats = RelocationStats::default();
+        let mut unwind_fdes = Vec::new();
+        let mut module_initializers = Vec::new();
+        for module in &linked_modules {
+            let (module_stubs, symbol_stubs) = create_import_stubs(
+                &mut memory,
+                module.dynamic,
+                import_stubs.len(),
+                &BTreeMap::new(),
+            )?;
+            import_stubs.extend(module_stubs);
+            add_relocation_stats(
+                &mut relocation_stats,
+                apply_relocations_at(
+                    &mut memory,
+                    module.base,
+                    module.tls_module_id,
+                    module.dynamic,
+                    &symbol_stubs,
+                )?,
+            );
+            unwind_fdes.extend(collect_unwind_fdes_at(
+                &memory,
+                module.base,
+                module.executable,
+            )?);
+            if module.dynamic.init_address != 0 {
+                module_initializers.push(GuestAddress::new(
+                    module
+                        .base
+                        .get()
+                        .checked_add(module.dynamic.init_address)
+                        .ok_or(LinkError::AddressOverflow)?,
+                ));
+            }
+        }
+
+        let (main_stubs, symbol_stubs) =
+            create_import_stubs(&mut memory, dynamic, import_stubs.len(), &module_exports)?;
+        import_stubs.extend(main_stubs);
+        let main_base = memory.image_base();
+        let process_param = resolve_process_param(elf, main_base)?;
+        add_relocation_stats(
+            &mut relocation_stats,
+            apply_relocations_at(&mut memory, main_base, 1, dynamic, &symbol_stubs)?,
+        );
+        unwind_fdes.extend(collect_unwind_fdes_at(&memory, main_base, executable)?);
+        let tls_inputs = std::iter::once(TlsImageInput {
+            executable,
+            base: main_base,
+            module_id: 1,
+        })
+        .chain(linked_modules.iter().map(|module| TlsImageInput {
+            executable: module.executable,
+            base: module.base,
+            module_id: module.tls_module_id,
+        }))
+        .collect::<Vec<_>>();
+        let tls = install_tls_support(&mut memory, &tls_inputs)?;
         memory.finalize_permissions()?;
         Ok(Self {
             memory,
             import_stubs,
             relocation_stats,
             tls,
+            process_param,
             unwind_fdes,
+            module_initializers,
         })
     }
 
@@ -189,6 +282,84 @@ impl LinkedImage {
     }
 }
 
+fn resolve_process_param(
+    elf: &remu_loader::Elf64Info,
+    image_base: GuestAddress,
+) -> Result<Option<GuestAddress>, LinkError> {
+    elf.program_headers
+        .iter()
+        .find(|header| header.program_type == PT_SCE_PROC_PARAM)
+        .map(|header| {
+            image_base
+                .get()
+                .checked_add(header.virtual_address.get())
+                .map(GuestAddress::new)
+                .ok_or(LinkError::AddressOverflow)
+        })
+        .transpose()
+}
+
+struct LinkedModuleInput<'a> {
+    name: &'a str,
+    executable: &'a LoadedExecutable,
+    dynamic: &'a DynamicInfo,
+    base: GuestAddress,
+    tls_module_id: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TlsImageInput<'a> {
+    executable: &'a LoadedExecutable,
+    base: GuestAddress,
+    module_id: u64,
+}
+
+fn add_relocation_stats(total: &mut RelocationStats, addition: RelocationStats) {
+    total.absolute += addition.absolute;
+    total.global_data += addition.global_data;
+    total.jump_slots += addition.jump_slots;
+    total.relative += addition.relative;
+}
+
+const LLE_LIBC_ALLOCATOR_NIDS: [&str; 8] = [
+    "bzQExy189ZI",
+    "gQX+4GDQjpM",
+    "tIhsqj0qsFE",
+    "2X5agFjKxMc",
+    "Y7aJ1uydPMo",
+    "Ujf3KzMvRmI",
+    "2Btkg8k24Zg",
+    "cVSk9y8URbc",
+];
+
+fn selected_module_exports(
+    modules: &[LinkedModuleInput<'_>],
+) -> Result<BTreeMap<String, u64>, LinkError> {
+    let mut exports = BTreeMap::new();
+    for module in modules {
+        if module.name != "libc.prx" {
+            continue;
+        }
+        for symbol in module
+            .dynamic
+            .symbols
+            .iter()
+            .filter(|symbol| !symbol.is_undefined())
+        {
+            let nid = extract_nid(&symbol.name);
+            if LLE_LIBC_ALLOCATOR_NIDS.contains(&nid) {
+                let address = module
+                    .base
+                    .get()
+                    .checked_add(symbol.value.get())
+                    .ok_or(LinkError::AddressOverflow)?;
+                exports.insert(nid.to_owned(), address);
+            }
+        }
+    }
+    Ok(exports)
+}
+
 /// Returns the number of guest pthread workers that are still executing.
 ///
 /// A PS5 process can return from its entry routine after handing long-lived work to pthreads. The
@@ -209,7 +380,7 @@ pub fn active_guest_thread_count() -> usize {
 
 fn install_tls_support(
     memory: &mut GuestImage,
-    executable: &LoadedExecutable,
+    images: &[TlsImageInput<'_>],
 ) -> Result<GuestTls, LinkError> {
     // Keep helpers beside the image so every rewritten load can use a five-byte rel32 call.
     let helper_base =
@@ -228,17 +399,22 @@ fn install_tls_support(
     );
 
     let mut static_block_size = 0;
-    if let Some(tls_header) = executable
-        .info
-        .elf
-        .as_ref()
-        .and_then(|elf| {
-            elf.program_headers
-                .iter()
-                .find(|header| header.program_type == PT_TLS)
-        })
-        .filter(|header| header.memory_size != 0)
-    {
+    let mut module_blocks = Vec::new();
+    for image in images {
+        let Some(tls_header) = image
+            .executable
+            .info
+            .elf
+            .as_ref()
+            .and_then(|elf| {
+                elf.program_headers
+                    .iter()
+                    .find(|header| header.program_type == PT_TLS)
+            })
+            .filter(|header| header.memory_size != 0)
+        else {
+            continue;
+        };
         let alignment = if tls_header.alignment == 0 {
             1
         } else {
@@ -248,7 +424,7 @@ fn install_tls_support(
             return Err(LinkError::InvalidTlsAlignment(alignment));
         }
         static_block_size = calculate_static_tls_offset(
-            0,
+            static_block_size,
             tls_header.memory_size,
             alignment,
             tls_header.virtual_address.get(),
@@ -269,14 +445,20 @@ fn install_tls_support(
         if initialized_size != 0 {
             let initialized_size = usize::try_from(initialized_size)
                 .map_err(|_| LinkError::ExecutableRegionTooLarge)?;
-            let source = runtime_address(memory, tls_header.virtual_address, initialized_size)?;
+            let source = runtime_address_at(
+                memory,
+                image.base,
+                tls_header.virtual_address,
+                initialized_size,
+            )?;
             let mut template = vec![0_u8; initialized_size];
             memory.read(source, &mut template)?;
             memory.write(block, &template)?;
         }
+        module_blocks.push((image.module_id, block));
     }
 
-    seed_tls_thread_control(memory, thread_pointer, static_block_size)?;
+    seed_tls_thread_control(memory, thread_pointer, &module_blocks)?;
 
     write_tls_helpers(memory, helper_base)?;
     let patched_loads = patch_tls_loads(memory, helper_base)?;
@@ -290,7 +472,7 @@ fn install_tls_support(
 fn seed_tls_thread_control(
     memory: &mut GuestImage,
     thread_pointer: GuestAddress,
-    static_block_size: u64,
+    module_blocks: &[(u64, GuestAddress)],
 ) -> Result<(), LinkError> {
     let dtv = add_address(thread_pointer, 0x100)?;
     write_u64(memory, thread_pointer, thread_pointer.get())?;
@@ -311,19 +493,19 @@ fn seed_tls_thread_control(
         thread_pointer.get(),
     )?;
     write_u64(memory, subtract_address(thread_pointer, 0xf0)?, 0)?;
-    // One startup module: generation, maximum module ID, and module-1 block address.
+    // DTV generation, maximum module ID, and one two-word entry per TLS-bearing module.
     write_u64(memory, dtv, 1)?;
-    write_u64(
-        memory,
-        add_address(dtv, 8)?,
-        usize::from(static_block_size != 0) as u64,
-    )?;
-    if static_block_size != 0 {
-        write_u64(
-            memory,
-            add_address(dtv, 16)?,
-            thread_pointer.get() - static_block_size,
-        )?;
+    let maximum_module_id = module_blocks
+        .iter()
+        .map(|(module_id, _)| *module_id)
+        .max()
+        .unwrap_or(0);
+    write_u64(memory, add_address(dtv, 8)?, maximum_module_id)?;
+    for (module_id, block) in module_blocks {
+        let entry_offset = module_id
+            .checked_mul(16)
+            .ok_or(LinkError::AddressOverflow)?;
+        write_u64(memory, add_address(dtv, entry_offset)?, block.get())?;
     }
     Ok(())
 }
@@ -814,6 +996,8 @@ fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize, LinkError>
 fn create_import_stubs(
     memory: &mut GuestImage,
     dynamic: &DynamicInfo,
+    first_dispatch_index: usize,
+    module_targets: &BTreeMap<String, u64>,
 ) -> Result<(Vec<ImportStub>, BTreeMap<u32, GuestAddress>), LinkError> {
     let nids = dynamic
         .imports
@@ -838,10 +1022,15 @@ fn create_import_stubs(
     let dispatcher = import_dispatch as *const () as usize as u64;
     for (index, nid) in nids.into_iter().enumerate() {
         let byte_offset = index * IMPORT_STUB_SIZE_USIZE;
-        if let Some(target) = native_import_target(&nid) {
+        if let Some(target) = module_targets.get(&nid).copied() {
+            write_native_import_stub(&mut bytes[byte_offset..], target);
+        } else if let Some(target) = native_import_target(&nid) {
             write_native_import_stub(&mut bytes[byte_offset..], target);
         } else {
-            write_import_stub(&mut bytes[byte_offset..], index, dispatcher)?;
+            let dispatch_index = first_dispatch_index
+                .checked_add(index)
+                .ok_or(LinkError::StubAllocationOverflow)?;
+            write_import_stub(&mut bytes[byte_offset..], dispatch_index, dispatcher)?;
         }
         let address = GuestAddress::new(
             stub_base
@@ -871,35 +1060,35 @@ fn create_import_stubs(
     Ok((import_stubs, symbol_stubs))
 }
 
-fn apply_relocations(
+fn apply_relocations_at(
     memory: &mut GuestImage,
+    image_base: GuestAddress,
+    tls_module_id: u64,
     dynamic: &DynamicInfo,
     symbol_stubs: &BTreeMap<u32, GuestAddress>,
 ) -> Result<RelocationStats, LinkError> {
     let mut stats = RelocationStats::default();
     for relocation in dynamic.relocations.iter().chain(&dynamic.jump_relocations) {
-        let target = runtime_address(memory, relocation.offset, 8)?;
+        let target = runtime_address_at(memory, image_base, relocation.offset, 8)?;
         let value = match relocation.relocation_type {
             R_X86_64_RELATIVE => {
                 stats.relative += 1;
-                memory
-                    .image_base()
-                    .get()
-                    .wrapping_add_signed(relocation.addend)
+                image_base.get().wrapping_add_signed(relocation.addend)
             }
             R_X86_64_64 => {
                 stats.absolute += 1;
-                resolve_symbol(memory, dynamic, symbol_stubs, relocation)?
+                resolve_symbol_at(memory, image_base, dynamic, symbol_stubs, relocation)?
                     .wrapping_add_signed(relocation.addend)
             }
             R_X86_64_GLOB_DAT => {
                 stats.global_data += 1;
-                resolve_symbol(memory, dynamic, symbol_stubs, relocation)?
+                resolve_symbol_at(memory, image_base, dynamic, symbol_stubs, relocation)?
             }
             R_X86_64_JUMP_SLOT => {
                 stats.jump_slots += 1;
-                resolve_symbol(memory, dynamic, symbol_stubs, relocation)?
+                resolve_symbol_at(memory, image_base, dynamic, symbol_stubs, relocation)?
             }
+            R_X86_64_DTPMOD64 => tls_module_id,
             relocation_type => {
                 return Err(LinkError::UnsupportedRelocation {
                     relocation_type,
@@ -912,8 +1101,9 @@ fn apply_relocations(
     Ok(stats)
 }
 
-fn resolve_symbol(
+fn resolve_symbol_at(
     memory: &GuestImage,
+    image_base: GuestAddress,
     dynamic: &DynamicInfo,
     symbol_stubs: &BTreeMap<u32, GuestAddress>,
     relocation: &Elf64Rela,
@@ -941,22 +1131,26 @@ fn resolve_symbol(
                 index: relocation.symbol_index,
             });
     }
-    defined_symbol_address(memory, symbol)
+    defined_symbol_address_at(memory, image_base, symbol)
 }
 
-fn defined_symbol_address(memory: &GuestImage, symbol: &Elf64Symbol) -> Result<u64, LinkError> {
+fn defined_symbol_address_at(
+    memory: &GuestImage,
+    image_base: GuestAddress,
+    symbol: &Elf64Symbol,
+) -> Result<u64, LinkError> {
     if memory.contains(symbol.value, 1) {
         return Ok(symbol.value.get());
     }
-    memory
-        .image_base()
+    image_base
         .get()
         .checked_add(symbol.value.get())
         .ok_or(LinkError::AddressOverflow)
 }
 
-fn runtime_address(
+fn runtime_address_at(
     memory: &GuestImage,
+    image_base: GuestAddress,
     value: GuestAddress,
     length: usize,
 ) -> Result<GuestAddress, LinkError> {
@@ -964,16 +1158,16 @@ fn runtime_address(
         return Ok(value);
     }
     Ok(GuestAddress::new(
-        memory
-            .image_base()
+        image_base
             .get()
             .checked_add(value.get())
             .ok_or(LinkError::AddressOverflow)?,
     ))
 }
 
-fn collect_unwind_fdes(
+fn collect_unwind_fdes_at(
     memory: &GuestImage,
+    image_base: GuestAddress,
     executable: &LoadedExecutable,
 ) -> Result<Vec<GuestAddress>, LinkError> {
     let Some(header) = executable
@@ -989,7 +1183,7 @@ fn collect_unwind_fdes(
     else {
         return Ok(Vec::new());
     };
-    let header_address = runtime_address(memory, header.virtual_address, 12)?;
+    let header_address = runtime_address_at(memory, image_base, header.virtual_address, 12)?;
     let mut header_bytes = [0_u8; 12];
     memory.read(header_address, &mut header_bytes)?;
     if header_bytes[0] != 1 {
@@ -1091,6 +1285,15 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "8G2LB+A3rzg" => "atexit",
         "tsvEmnenz48" => "__cxa_atexit",
         "H2e8t5ScQGc" => "__cxa_finalize",
+        "rNhWz+lvOMU" => "_sceKernelSetThreadDtors",
+        "pB-yGZ2nQ9o" => "_sceKernelSetThreadAtexitCount",
+        "WhCc1w3EhSI" => "_sceKernelSetThreadAtexitReport",
+        "959qrazPIrg" => "sceKernelGetProcParam",
+        "p5EcQeEeJAE" => "_sceKernelRtldSetApplicationHeapAPI",
+        "bnZxYgAFeA0" => "sceKernelGetSanitizerNewReplaceExternal",
+        "NWtTN10cJzE" => "sceLibcHeapGetTraceInfo",
+        "mkx2fVhNMsg" => "pthread_cond_broadcast",
+        "FxVZqBAA7ks" => "_write",
         "pO96TwzOm5E" => "sceKernelGetDirectMemorySize",
         "rTXw65xmLIA" => "sceKernelAllocateDirectMemory",
         "L-Q3LEjIbgA" => "sceKernelMapDirectMemory",
@@ -1271,6 +1474,12 @@ struct ProbeDispatchState {
     pthread_mutex_attributes: BTreeMap<u64, PthreadMutexAttrObject>,
     pthread_condition_attributes: BTreeSet<u64>,
     exit_callbacks: Vec<GuestExitCallback>,
+    process_param_address: u64,
+    thread_atexit_count_callback: u64,
+    thread_atexit_report_callback: u64,
+    thread_dtors_callback: u64,
+    application_heap_api_address: u64,
+    heap_trace_storage: Vec<u64>,
     services: RuntimeServiceState,
     audio_out: audio::AudioOutState,
     agc_primary_register_defaults: u64,
@@ -1281,7 +1490,6 @@ struct ProbeDispatchState {
     locale_object: u64,
     locale_vtable: u64,
     tls_template: Vec<u8>,
-    tls_static_block_size: u64,
     video_out: VideoOutState,
     game_root: PathBuf,
     np_universal_data: np::UniversalDataState,
@@ -1552,6 +1760,13 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     }
     state.pthread_condition_attributes.clear();
     state.exit_callbacks.clear();
+    state.process_param_address = image.process_param.map_or(0, GuestAddress::get);
+    state.thread_atexit_count_callback = 0;
+    state.thread_atexit_report_callback = 0;
+    state.thread_dtors_callback = 0;
+    state.application_heap_api_address = 0;
+    state.heap_trace_storage.clear();
+    state.heap_trace_storage.resize(65, 0);
     state.services = RuntimeServiceState::default();
     state.audio_out = audio::AudioOutState::default();
     state.agc_primary_register_defaults = 0;
@@ -1574,7 +1789,6 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
             tls_template_size,
         );
     }
-    state.tls_static_block_size = image.tls.static_block_size;
     state.video_out = VideoOutState::default();
     game_root.clone_into(&mut state.game_root);
     state.np_universal_data = np::UniversalDataState::default();
@@ -1688,7 +1902,7 @@ extern "C" fn import_dispatch(
         let attributes = pthread_attr_state(call_args[1], &state).unwrap_or_default();
         let entry = call_args[2];
         let thread_argument = call_args[3];
-        let guest_tls = clone_guest_tls(&state.tls_template, state.tls_static_block_size);
+        let guest_tls = clone_guest_tls(&state.tls_template);
         let mut builder = std::thread::Builder::new();
         if let Ok(stack_size) = usize::try_from(attributes.stack_size)
             && stack_size >= usize::try_from(MACOS_GUEST_PAGE_ALIGNMENT).unwrap_or(0x4000)
@@ -1849,7 +2063,7 @@ struct GuestThreadTls {
     thread_pointer: u64,
 }
 
-fn clone_guest_tls(template: &[u8], static_block_size: u64) -> GuestThreadTls {
+fn clone_guest_tls(template: &[u8]) -> GuestThreadTls {
     let size = usize::try_from(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
         .expect("guest TLS allocation size fits usize");
     assert_eq!(
@@ -1858,19 +2072,44 @@ fn clone_guest_tls(template: &[u8], static_block_size: u64) -> GuestThreadTls {
         "guest TLS template has the linked size"
     );
     let mut storage = template.to_vec();
+    let thread_pointer_offset =
+        usize::try_from(GUEST_TLS_PREFIX_SIZE).expect("guest TLS prefix size fits usize");
+    let original_thread_pointer = u64::from_le_bytes(
+        storage[thread_pointer_offset..thread_pointer_offset + 8]
+            .try_into()
+            .expect("thread pointer word is present in TLS template"),
+    );
     let thread_pointer = storage.as_mut_ptr() as usize as u64 + GUEST_TLS_PREFIX_SIZE;
+    let dtv_offset = thread_pointer_offset + 0x100;
+    let maximum_module_id = u64::from_le_bytes(
+        storage[dtv_offset + 8..dtv_offset + 16]
+            .try_into()
+            .expect("DTV module count is present in TLS template"),
+    );
+    for module_id in 1..=maximum_module_id {
+        let Ok(entry_offset) = usize::try_from(module_id.saturating_mul(16)) else {
+            continue;
+        };
+        let entry_offset = dtv_offset + entry_offset;
+        let original_block = u64::from_le_bytes(
+            storage[entry_offset..entry_offset + 8]
+                .try_into()
+                .expect("DTV module entry is present in TLS template"),
+        );
+        if original_block == 0 {
+            continue;
+        }
+        let displacement = i128::from(original_block) - i128::from(original_thread_pointer);
+        let rebased = i128::from(thread_pointer) + displacement;
+        if let Ok(rebased) = u64::try_from(rebased) {
+            storage[entry_offset..entry_offset + 8].copy_from_slice(&rebased.to_le_bytes());
+        }
+    }
     write_guest_u64(thread_pointer, thread_pointer);
     write_guest_u64(thread_pointer + 0x08, thread_pointer + 0x100);
     write_guest_u64(thread_pointer + 0x10, thread_pointer);
     write_guest_u64(thread_pointer + 0x60, thread_pointer);
     write_guest_u64(thread_pointer + 0x100, 1);
-    write_guest_u64(
-        thread_pointer + 0x108,
-        usize::from(static_block_size != 0) as u64,
-    );
-    if static_block_size != 0 {
-        write_guest_u64(thread_pointer + 0x110, thread_pointer - static_block_size);
-    }
     GuestThreadTls {
         _storage: storage,
         thread_pointer,
@@ -1898,6 +2137,7 @@ fn is_guest_sync_import(nid: &str) -> bool {
             | "BmMjYxmew1w"
             | "kDh-NfxgMtE"
             | "JGgj7Uvrl+A"
+            | "mkx2fVhNMsg"
             | "188x57JYp0g"
             | "Zxa0VhQVTsk"
             | "4czppHBiriw"
@@ -1925,7 +2165,7 @@ fn dispatch_guest_sync_import(
             arguments[1],
             Some(u64::from(low_u32(arguments[2]))),
         ),
-        "kDh-NfxgMtE" | "JGgj7Uvrl+A" => guest_condition_signal(arguments[0]),
+        "kDh-NfxgMtE" | "JGgj7Uvrl+A" | "mkx2fVhNMsg" => guest_condition_signal(arguments[0]),
         "188x57JYp0g" => guest_semaphore_create(arguments),
         "Zxa0VhQVTsk" => guest_semaphore_wait(arguments),
         "4czppHBiriw" => guest_semaphore_signal(arguments),
@@ -2285,6 +2525,28 @@ fn dispatch_probe_import(
         "tsvEmnenz48" => {
             register_guest_exit_callback(arguments[0], Some(arguments[1]), arguments[2], state)
         }
+        // The game-bundled C runtime registers its per-thread cleanup hooks during DT_INIT and
+        // reads the main executable's PT_SCE_PROCPARAM block to configure its allocator.
+        "rNhWz+lvOMU" => {
+            state.thread_dtors_callback = arguments[0];
+            0
+        }
+        "pB-yGZ2nQ9o" => {
+            state.thread_atexit_count_callback = arguments[0];
+            0
+        }
+        "WhCc1w3EhSI" => {
+            state.thread_atexit_report_callback = arguments[0];
+            0
+        }
+        "959qrazPIrg" => state.process_param_address,
+        "p5EcQeEeJAE" => {
+            state.application_heap_api_address = arguments[0];
+            0
+        }
+        "bnZxYgAFeA0" => sanitizer_new_replace_external(),
+        "NWtTN10cJzE" => libc_heap_get_trace_info(arguments[0], state),
+        "FxVZqBAA7ks" => guest_kernel_write(arguments, state),
         // sceKernelGetDirectMemorySize
         "pO96TwzOm5E" => 16 * 1024 * 1024 * 1024,
         // sceKernelAllocateDirectMemory
@@ -5975,6 +6237,38 @@ fn guest_memmove(destination: u64, source: u64, length: u64) -> u64 {
     destination
 }
 
+fn sanitizer_new_replace_external() -> u64 {
+    const TLS_NEW_REPLACE_OFFSET: u64 = 0x300;
+    const NEW_REPLACE_SIZE: usize = 0x68;
+    let thread_pointer = current_guest_thread_pointer();
+    if thread_pointer == 0 {
+        return 0;
+    }
+    let address = thread_pointer + TLS_NEW_REPLACE_OFFSET;
+    // SAFETY: every guest thread reserves a writable TCB region after its thread pointer, and this
+    // kernel-owned compatibility structure fits entirely within that reservation.
+    unsafe {
+        std::ptr::write_bytes(address as *mut u8, 0, NEW_REPLACE_SIZE);
+    }
+    write_guest_u64(address, NEW_REPLACE_SIZE as u64);
+    address
+}
+
+fn libc_heap_get_trace_info(info_address: u64, state: &mut ProbeDispatchState) -> u64 {
+    const HEAP_TRACE_INFO_SIZE: u64 = 32;
+    const HEAP_TRACE_STORAGE_WORDS: usize = 65;
+    if info_address == 0 || read_guest_u64(info_address) != HEAP_TRACE_INFO_SIZE {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    if state.heap_trace_storage.len() != HEAP_TRACE_STORAGE_WORDS {
+        state.heap_trace_storage.resize(HEAP_TRACE_STORAGE_WORDS, 0);
+    }
+    let storage_address = state.heap_trace_storage.as_mut_ptr() as usize as u64;
+    write_guest_u64(info_address + 16, storage_address);
+    write_guest_u64(info_address + 24, storage_address + 8);
+    0
+}
+
 fn guest_malloc(size: u64) -> u64 {
     let Ok(size) = usize::try_from(size) else {
         return 0;
@@ -6572,6 +6866,36 @@ fn guest_kernel_read(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
     u64::try_from(read).expect("read byte count fits u64")
 }
 
+fn guest_kernel_write(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let fd = low_i32(arguments[0]);
+    let Ok(length) = usize::try_from(arguments[2]) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if length != 0 && arguments[1] == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let payload = if length == 0 {
+        &[]
+    } else {
+        // SAFETY: `_write` supplies a readable guest buffer of exactly `length` bytes.
+        unsafe { std::slice::from_raw_parts(arguments[1] as *const u8, length) }
+    };
+    let result = match fd {
+        1 => std::io::stdout().write_all(payload),
+        2 => std::io::stderr().write_all(payload),
+        _ => state
+            .kernel_files
+            .get_mut(&fd)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+            .and_then(|file| file.write_all(payload)),
+    };
+    if result.is_ok() {
+        length as u64
+    } else {
+        sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+    }
+}
+
 fn guest_kernel_close(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let fd = low_i32(arguments[0]);
     if state.kernel_files.remove(&fd).is_none() {
@@ -6886,6 +7210,18 @@ fn probe_entry(
     }
     configure_probe_dispatch(image, game_root, maximum_import_hits);
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
+    type GuestModuleInitializer = unsafe extern "C" fn(u64, u64, u64);
+    for initializer in &image.module_initializers {
+        eprintln!("[REMu][MODULE] initializing runtime at {initializer}");
+        // SAFETY: The module linker relocated this DT_INIT address in executable guest memory.
+        // Gen5 runtime initializers use the SysV three-argument module-entry convention.
+        let initializer: GuestModuleInitializer = unsafe { std::mem::transmute(initializer.get()) };
+        // SAFETY: Runtime initializers accept null process-vector arguments and initialize their
+        // own module-local data before the main executable starts.
+        unsafe {
+            initializer(0, 0, 0);
+        }
+    }
     if timeout_seconds != 0 {
         // SAFETY: Alarm only bounds this diagnostic process; its default action terminates it.
         unsafe {

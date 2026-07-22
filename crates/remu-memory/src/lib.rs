@@ -173,6 +173,66 @@ impl GuestImage {
         Ok(image)
     }
 
+    /// Maps a secondary PRX into this image's reserved auxiliary range.
+    ///
+    /// The returned address is the module's zero virtual-address base, so callers can apply the
+    /// module's ELF relocations with `base + virtual_address`. Secondary modules must be installed
+    /// before permissions are finalized.
+    pub fn map_module(
+        &mut self,
+        executable: &LoadedExecutable,
+        alignment: u64,
+    ) -> Result<GuestAddress, MappingError> {
+        if self.finalized {
+            return Err(MappingError::AlreadyFinalized);
+        }
+        let maximum = executable
+            .load_segments
+            .iter()
+            .try_fold(0_u64, |maximum, segment| {
+                segment
+                    .virtual_address
+                    .get()
+                    .checked_add(segment.memory_size)
+                    .map(|end| maximum.max(end))
+                    .ok_or(MappingError::AddressOverflow)
+            })?;
+        if maximum == 0 {
+            return Err(MappingError::NoLoadSegments);
+        }
+
+        let module_base = self.allocate_staging(maximum, alignment, 0)?;
+        for segment in &executable.load_segments {
+            let start = module_base
+                .get()
+                .checked_add(segment.virtual_address.get())
+                .ok_or(MappingError::AddressOverflow)?;
+            self.write(GuestAddress::new(start), &segment.data)?;
+            self.regions.push(GuestRegion {
+                start: GuestAddress::new(start),
+                memory_size: segment.memory_size,
+                file_size: segment.data.len() as u64,
+                flags: segment.flags,
+            });
+
+            let page_start = align_down(start, self.page_size);
+            let page_end = align_up(
+                start
+                    .checked_add(segment.memory_size)
+                    .ok_or(MappingError::AddressOverflow)?,
+                self.page_size,
+            )?;
+            let mut page = page_start;
+            while page < page_end {
+                *self.page_flags.entry(page).or_default() |= segment.flags;
+                page = page
+                    .checked_add(self.page_size)
+                    .ok_or(MappingError::AddressOverflow)?;
+            }
+        }
+        Ok(module_base)
+    }
+
     #[must_use]
     pub const fn image_base(&self) -> GuestAddress {
         self.image_base
