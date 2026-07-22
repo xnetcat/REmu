@@ -12,8 +12,8 @@ use std::fmt::Write as _;
 
 use remu_shader::{
     ExportControl, ImageBinding, ImageControl, Instruction, InstructionControl, Opcode, Operand,
-    OperandKind, PixelOutputBinding, PixelOutputKind, Program, ShaderEncoding, ShaderEvaluation,
-    VertexInputBinding, decode_inline_constant, decode_unified_format,
+    OperandKind, PixelOutputBinding, PixelOutputKind, Program, SdwaControl, ShaderEncoding,
+    ShaderEvaluation, VertexInputBinding, decode_inline_constant, decode_unified_format,
 };
 
 const SCALAR_REGISTER_COUNT: u32 = 128;
@@ -664,14 +664,23 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    #[allow(clippy::unused_self)]
     fn raw_source(&self, instruction: &Instruction, index: usize) -> Result<String, String> {
+        self.raw_source_with_sdwa_modifiers(instruction, index, true)
+    }
+
+    #[allow(clippy::unused_self)]
+    fn raw_source_with_sdwa_modifiers(
+        &self,
+        instruction: &Instruction,
+        index: usize,
+        apply_integer_modifiers: bool,
+    ) -> Result<String, String> {
         let operand = instruction
             .sources
             .get(index)
             .copied()
             .ok_or_else(|| format!("missing source operand {index}"))?;
-        match operand.kind {
+        let mut value = match operand.kind {
             OperandKind::ScalarRegister if operand.value < SCALAR_REGISTER_COUNT => {
                 Ok(format!("s[{}]", operand.value))
             }
@@ -690,7 +699,43 @@ impl<'a> Compiler<'a> {
             _ => Err(format!(
                 "register operand is outside the architectural file: {operand}"
             )),
+        }?;
+        let Some(InstructionControl::Sdwa(control)) = instruction.control.as_ref() else {
+            return Ok(value);
+        };
+        let selector = match index {
+            0 => control.source0_select,
+            1 => control.source1_select,
+            _ => 6,
+        };
+        value = match selector {
+            0 => format!("(({value}) & 0xFFu)"),
+            1 => format!("((({value}) >> 8) & 0xFFu)"),
+            2 => format!("((({value}) >> 16) & 0xFFu)"),
+            3 => format!("((({value}) >> 24) & 0xFFu)"),
+            4 => format!("(({value}) & 0xFFFFu)"),
+            5 => format!("((({value}) >> 16) & 0xFFFFu)"),
+            6 => value,
+            _ => return Err(format!("reserved SDWA source {index} selector {selector}")),
+        };
+        let sign_extend = match index {
+            0 => control.source0_sign_extend,
+            1 => control.source1_sign_extend,
+            _ => false,
+        };
+        if sign_extend && selector != 6 {
+            let width = if selector <= 3 { 8 } else { 16 };
+            value = format!("(uint)extract_bits(as_type<int>({value}), 0u, {width}u)");
         }
+        if apply_integer_modifiers {
+            if control.absolute_mask & (1 << index) != 0 {
+                value = format!("(uint)abs(as_type<int>({value}))");
+            }
+            if control.negate_mask & (1 << index) != 0 {
+                value = format!("(0u - ({value}))");
+            }
+        }
+        Ok(value)
     }
 
     #[allow(clippy::unused_self)]
@@ -717,7 +762,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn float_source(&self, instruction: &Instruction, index: usize) -> Result<String, String> {
-        let mut value = format!("as_type<float>({})", self.raw_source(instruction, index)?);
+        let mut value = format!(
+            "as_type<float>({})",
+            self.raw_source_with_sdwa_modifiers(instruction, index, false)?
+        );
         let (absolute_mask, negate_mask) = match instruction.control.as_ref() {
             Some(InstructionControl::Vop3(control)) => (control.absolute_mask, control.negate_mask),
             Some(InstructionControl::Sdwa(control)) => (control.absolute_mask, control.negate_mask),
@@ -752,19 +800,26 @@ impl<'a> Compiler<'a> {
         format!("as_type<uint>({value})")
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_vector_alu(&mut self, instruction: &Instruction) -> Result<(), String> {
+        if let Some(InstructionControl::Sdwa(control)) = instruction.control.as_ref()
+            && (control.source0_select == 7
+                || control.source1_select == 7
+                || control.destination_select == 7
+                || control.destination_unused == 3)
+        {
+            return Err("reserved SDWA selector or destination-unused mode".to_owned());
+        }
         if matches!(
             instruction.control,
             Some(
-                InstructionControl::Sdwa(_)
-                    | InstructionControl::Dpp(_)
+                InstructionControl::Dpp(_)
                     | InstructionControl::Dpp8(_)
                     | InstructionControl::Vop3p(_)
             )
         ) {
             return Err(
-                "SDWA, DPP, DPP8, and packed VOP3 controls require their dedicated lowering"
-                    .to_owned(),
+                "DPP, DPP8, and packed VOP3 controls require their dedicated lowering".to_owned(),
             );
         }
         let name = instruction
@@ -950,8 +1005,59 @@ impl<'a> Compiler<'a> {
                 ),
             _ => return Err(format!("unsupported vector opcode {name}")),
         };
+        let expression = if let Some(InstructionControl::Sdwa(control)) =
+            instruction.control.as_ref()
+            && control.scalar_destination.is_none()
+        {
+            let result = self.temp("uint", &expression);
+            self.apply_sdwa_destination(control, &result, &format!("v[{destination}]"))?
+        } else {
+            expression
+        };
         self.store_vector(destination, &expression);
         Ok(())
+    }
+
+    fn apply_sdwa_destination(
+        &mut self,
+        control: &SdwaControl,
+        value: &str,
+        previous: &str,
+    ) -> Result<String, String> {
+        let (shift, width) = match control.destination_select {
+            0 => (0, 8),
+            1 => (8, 8),
+            2 => (16, 8),
+            3 => (24, 8),
+            4 => (0, 16),
+            5 => (16, 16),
+            6 => (0, 32),
+            selector => return Err(format!("reserved SDWA destination selector {selector}")),
+        };
+        if width == 32 {
+            return Ok(value.to_owned());
+        }
+        let low_mask = if width == 8 { 0xff_u32 } else { 0xffff_u32 };
+        let field_mask = low_mask << shift;
+        let upper_start = shift + width;
+        let upper_mask = if upper_start == 32 {
+            0
+        } else {
+            u32::MAX << upper_start
+        };
+        let sign_bit = 1_u32 << (shift + width - 1);
+        let positioned = self.temp("uint", &format!("(({value}) & 0x{low_mask:X}u) << {shift}"));
+        match control.destination_unused {
+            0 => Ok(positioned),
+            1 => Ok(format!(
+                "{positioned} | ((({positioned} & 0x{sign_bit:X}u) != 0u) ? 0x{upper_mask:X}u : 0u)"
+            )),
+            2 => Ok(format!(
+                "(({previous}) & 0x{:X}u) | {positioned}",
+                !field_mask
+            )),
+            mode => Err(format!("reserved SDWA destination-unused mode {mode}")),
+        }
     }
 
     #[allow(clippy::unused_self)]
@@ -1954,5 +2060,45 @@ mod tests {
                 .contains("fma(as_type<float>(v[3]), as_type<float>(v[4]), as_type<float>(v[0]))")
         );
         assert!(shader.source.contains("1.0f / as_type<float>(v[0])"));
+    }
+
+    #[test]
+    fn lowers_sdwa_source_and_destination_controls() {
+        let program = Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop2,
+                opcode: Opcode::Known("VMulF32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(1), Operand::vector(2)],
+                destinations: vec![Operand::vector(3)],
+                control: Some(InstructionControl::Sdwa(SdwaControl {
+                    destination_select: 1,
+                    destination_unused: 2,
+                    source0_select: 4,
+                    source1_select: 6,
+                    source0_sign_extend: false,
+                    source1_sign_extend: false,
+                    absolute_mask: 1,
+                    negate_mask: 0,
+                    output_modifier: 2,
+                    clamp: true,
+                    scalar_destination: None,
+                })),
+            }],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::vertex(0),
+        )
+        .expect("SDWA float arithmetic should lower");
+        assert!(shader.source.contains("(v[1]) & 0xFFFFu"));
+        assert!(shader.source.contains("fabs(as_type<float>"));
+        assert!(shader.source.contains("* 4.0f"));
+        assert!(shader.source.contains("clamp("));
+        assert!(shader.source.contains("& 0xFFFF00FFu"));
+        assert!(shader.source.contains("<< 8"));
     }
 }
