@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Build a deterministic static import-coverage inventory for local game dumps.
+
+The audit deliberately separates four facts which runtime first-hit logs conflate:
+
+* an executable imports a NID;
+* REmu knows a human-readable name for that NID;
+* a REmu dispatch path exists for it; and
+* another emulator registers the same NID.
+
+Reference registrations are evidence to inspect, not proof that an implementation is complete.
+The default paths point at the two local regression titles and the read-only reference snapshots
+used by this repository. Every path can be overridden for other machines and titles.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import collections
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_GAMES = (
+    (
+        "dreaming-sarah",
+        Path("/Volumes/Untitled/sharpemu/games/test-game/PPSA02929-app0/eboot.bin"),
+    ),
+    (
+        "superliminal",
+        Path(
+            "/Volumes/Untitled/sharpemu/games/PPSA06084-app/"
+            "PPSA06084-app0/decrypted/eboot.bin"
+        ),
+    ),
+)
+DEFAULT_SHARPEMU = Path("/Volumes/Untitled/sharpemu/repo")
+DEFAULT_SHADPS4 = REPO_ROOT / "research/upstreams/shadPS4"
+DEFAULT_KYTY = REPO_ROOT / "research/upstreams/Kyty"
+DEFAULT_KYTY_PS5 = REPO_ROOT / "research/upstreams/KytyPS5"
+NID_SUFFIX = bytes.fromhex("518d64a635ded8c1e6b039b1c3e55230")
+NID_PATTERN = re.compile(r"^[A-Za-z0-9+-]{11}$")
+QUOTED_NID_PATTERN = re.compile(r'"([A-Za-z0-9+-]{11})"')
+IMPORT_PATTERN = re.compile(
+    r"^import=(?P<symbol>\S+) symbol=(?P<index>\d+) weak=(?P<weak>true|false) "
+    r"relocations=(?P<count>\d+) types=(?P<types>[0-9,]*)$"
+)
+PLT_PATTERN = re.compile(
+    r"^plt\[\d+\]=.* nid:(?P<nid>[A-Za-z0-9+-]{11}) "
+    r"resolved:(?P<name>\S+) name:"
+)
+
+
+@dataclass
+class ImportedNid:
+    nid: str
+    symbols: set[str] = field(default_factory=set)
+    relocation_types: set[int] = field(default_factory=set)
+    relocation_count: int = 0
+    weak: bool = True
+    remu_name: str | None = None
+
+    @property
+    def callable(self) -> bool:
+        return 7 in self.relocation_types
+
+
+@dataclass(frozen=True)
+class RuntimeCoverage:
+    names: dict[str, str]
+    statuses: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ReferenceCoverage:
+    names: dict[str, str]
+    sharpemu: frozenset[str]
+    shadps4: frozenset[str]
+    kyty: frozenset[str]
+    kyty_ps5: frozenset[str]
+
+
+def compute_nid(export_name: str) -> str:
+    digest = hashlib.sha1(export_name.encode("utf-8") + NID_SUFFIX).digest()
+    return base64.b64encode(digest[:8][::-1]).decode("ascii").rstrip("=").replace("/", "-")
+
+
+def parse_game_argument(value: str) -> tuple[str, Path]:
+    try:
+        label, raw_path = value.split("=", 1)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("games must use LABEL=/path/to/eboot.bin") from error
+    if not label or not raw_path:
+        raise argparse.ArgumentTypeError("games must use a non-empty label and path")
+    return label, Path(raw_path)
+
+
+def function_slice(source: str, name: str) -> str:
+    """Return a Rust function through the next top-level function declaration.
+
+    This is intentionally a small source inventory parser, not a Rust parser. REmu keeps the NID
+    registries in named functions, and stopping on a column-zero declaration avoids accidentally
+    attributing NIDs from tests or later handlers.
+    """
+
+    declaration = re.search(
+        rf"(?m)^(?:pub\s+)?(?:const\s+)?(?:unsafe\s+)?"
+        rf'(?:extern\s+"C"\s+)?fn\s+{re.escape(name)}\s*\(',
+        source,
+    )
+    if declaration is None:
+        raise ValueError(f"Rust function not found: {name}")
+    following = re.search(
+        r"(?m)^((?:pub\s+)?(?:const\s+)?(?:unsafe\s+)?"
+        r'(?:extern\s+"C"\s+)?fn\s+[A-Za-z0-9_]+\s*\()',
+        source[declaration.end() :],
+    )
+    end = len(source) if following is None else declaration.end() + following.start()
+    return source[declaration.start() : end]
+
+
+def constant_slice(source: str, name: str) -> str:
+    declaration = re.search(rf"(?m)^const\s+{re.escape(name)}\b", source)
+    if declaration is None:
+        raise ValueError(f"Rust constant not found: {name}")
+    # Registry constants are fixed-size arrays, whose type itself contains a semicolon (`[T; N]`).
+    # Stop at the array initializer terminator instead of that type-level semicolon.
+    end = source.find("];", declaration.end())
+    if end < 0:
+        raise ValueError(f"unterminated Rust constant: {name}")
+    return source[declaration.start() : end + 2]
+
+
+def quoted_nids(source: str) -> set[str]:
+    return set(QUOTED_NID_PATTERN.findall(source))
+
+
+def parse_known_names(source: str) -> dict[str, str]:
+    body = function_slice(source, "known_nid_name")
+    return dict(re.findall(r'"([A-Za-z0-9+-]{11})"\s*=>\s*"([^"]+)"', body))
+
+
+def parse_flat_stub_arms(dispatch_source: str, return_expression: str) -> set[str]:
+    alternatives = r'((?:"[A-Za-z0-9+-]{11}"\s*(?:\|\s*)?)+)'
+    matches = re.finditer(
+        alternatives + r"\s*=>\s*" + re.escape(return_expression) + r"\s*,",
+        dispatch_source,
+        re.MULTILINE,
+    )
+    result: set[str] = set()
+    for match in matches:
+        result.update(quoted_nids(match.group(1)))
+    return result
+
+
+def inspect_runtime_source(path: Path) -> RuntimeCoverage:
+    source = path.read_text(encoding="utf-8")
+    names = parse_known_names(source)
+    status_sets: list[tuple[str, set[str]]] = [
+        (
+            "guest-module",
+            quoted_nids(constant_slice(source, "LLE_LIBC_RUNTIME_NIDS")),
+        ),
+        (
+            "native-host",
+            set().union(
+                *(quoted_nids(function_slice(source, function)) for function in (
+                    "native_cxx_symbol_name",
+                    "native_unwind_symbol_name",
+                    "native_libc_symbol_name",
+                ))
+            ),
+        ),
+        (
+            "synthetic-data",
+            quoted_nids(function_slice(source, "synthetic_data_imports"))
+            | quoted_nids(function_slice(source, "synthetic_data_import_target")),
+        ),
+    ]
+
+    probe_dispatch = function_slice(source, "dispatch_probe_import")
+    stubs = parse_flat_stub_arms(probe_dispatch, "0")
+    passthrough_stubs = parse_flat_stub_arms(probe_dispatch, "arguments[0]")
+    constant_stubs = parse_flat_stub_arms(probe_dispatch, "1")
+    status_sets.extend(
+        (
+            ("stub-success", stubs),
+            ("stub-passthrough", passthrough_stubs),
+            ("stub-constant", constant_stubs),
+            (
+                "hle-lock-aware",
+                quoted_nids(function_slice(source, "import_dispatch")),
+            ),
+            (
+                "hle",
+                quoted_nids(probe_dispatch)
+                | quoted_nids(function_slice(source, "dispatch_kernel_file_import"))
+                | quoted_nids(function_slice(source, "is_guest_sync_import"))
+                | quoted_nids(function_slice(source, "dispatch_guest_sync_import")),
+            ),
+        )
+    )
+
+    # The list above is ordered from strongest/specialized binding to broadest dispatch. Preserve
+    # the first classification so a native guest-module binding is not mislabeled as a fallback.
+    statuses: dict[str, str] = {}
+    for status, nids in status_sets:
+        for nid in nids:
+            statuses.setdefault(nid, status)
+    for nid in names:
+        statuses.setdefault(nid, "named-only")
+    return RuntimeCoverage(names=names, statuses=statuses)
+
+
+def run_import_inventory(command: Sequence[str], path: Path) -> str:
+    result = subprocess.run(
+        [*command, "imports", str(path)],
+        cwd=REPO_ROOT,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"import inventory failed for {path} (status {result.returncode}):\n{result.stderr}"
+        )
+    return result.stdout
+
+
+def parse_import_inventory(output: str) -> tuple[list[str], dict[str, ImportedNid]]:
+    dependencies: list[str] = []
+    names: dict[str, str] = {}
+    inventory: dict[str, ImportedNid] = {}
+    for line in output.splitlines():
+        if line.startswith("dependency="):
+            dependencies.append(line.removeprefix("dependency="))
+            continue
+        if match := PLT_PATTERN.match(line):
+            if match.group("name") != "unknown":
+                names[match.group("nid")] = match.group("name")
+            continue
+        match = IMPORT_PATTERN.match(line)
+        if match is None:
+            continue
+        symbol = match.group("symbol")
+        nid = symbol.partition("#")[0]
+        if not NID_PATTERN.fullmatch(nid):
+            continue
+        imported = inventory.setdefault(nid, ImportedNid(nid=nid))
+        imported.symbols.add(symbol)
+        imported.relocation_types.update(
+            int(value) for value in match.group("types").split(",") if value
+        )
+        imported.relocation_count += int(match.group("count"))
+        imported.weak &= match.group("weak") == "true"
+    for nid, name in names.items():
+        if nid in inventory:
+            inventory[nid].remu_name = name
+    return dependencies, inventory
+
+
+def iter_source_files(root: Path, suffixes: tuple[str, ...]) -> Iterable[Path]:
+    if not root.is_dir():
+        return ()
+    return (
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in suffixes and ".git" not in path.parts
+    )
+
+
+def scan_pattern(root: Path, suffixes: tuple[str, ...], pattern: re.Pattern[str]) -> set[str]:
+    result: set[str] = set()
+    for path in iter_source_files(root, suffixes):
+        try:
+            source = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        result.update(pattern.findall(source))
+    return result
+
+
+def read_reference_names(sharpemu: Path) -> dict[str, str]:
+    names_file = sharpemu / "scripts/ps5_names.txt"
+    if not names_file.is_file():
+        return {}
+    result: dict[str, str] = {}
+    for raw_name in names_file.read_text(encoding="utf-8").splitlines():
+        name = raw_name.strip()
+        if name:
+            result.setdefault(compute_nid(name), name)
+    return result
+
+
+def inspect_references(
+    sharpemu: Path, shadps4: Path, kyty: Path, kyty_ps5: Path
+) -> ReferenceCoverage:
+    sharp_pattern = re.compile(r'Nid\s*=\s*"([A-Za-z0-9+-]{11})"')
+    cpp_pattern = re.compile(
+        r'LIB_(?:FUNCTION|FUNC|OBJECT)\s*\(\s*"([A-Za-z0-9+-]{11})"'
+    )
+    return ReferenceCoverage(
+        names=read_reference_names(sharpemu),
+        sharpemu=frozenset(
+            scan_pattern(sharpemu / "src/SharpEmu.Libs", (".cs",), sharp_pattern)
+        ),
+        shadps4=frozenset(scan_pattern(shadps4 / "src", (".c", ".cc", ".cpp", ".h"), cpp_pattern)),
+        kyty=frozenset(
+            scan_pattern(kyty / "source/emulator", (".c", ".cc", ".cpp", ".h"), cpp_pattern)
+        ),
+        kyty_ps5=frozenset(
+            scan_pattern(kyty_ps5 / "src", (".c", ".cc", ".cpp", ".h"), cpp_pattern)
+        ),
+    )
+
+
+def resolve_command(explicit: Path | None) -> list[str]:
+    if explicit is not None:
+        return [str(explicit)]
+    candidates = (
+        REPO_ROOT / "target/debug/remu",
+        REPO_ROOT / "target/x86_64-apple-darwin/release/remu",
+        REPO_ROOT / "target/release/remu",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return [str(candidate)]
+    return ["cargo", "run", "--quiet", "-p", "remu-cli", "--"]
+
+
+def inventory_row(
+    title: str,
+    imported: ImportedNid,
+    runtime: RuntimeCoverage,
+    references: ReferenceCoverage,
+) -> dict[str, object]:
+    nid = imported.nid
+    return {
+        "title": title,
+        "nid": nid,
+        "name": runtime.names.get(nid) or imported.remu_name or references.names.get(nid),
+        "status": runtime.statuses.get(nid, "unknown"),
+        "callable": imported.callable,
+        "weak": imported.weak,
+        "symbols": sorted(imported.symbols),
+        "relocation_types": sorted(imported.relocation_types),
+        "relocation_count": imported.relocation_count,
+        "references": [
+            name
+            for name, values in (
+                ("sharpemu", references.sharpemu),
+                ("shadps4", references.shadps4),
+                ("kyty", references.kyty),
+                ("kyty-ps5", references.kyty_ps5),
+            )
+            if nid in values
+        ],
+    }
+
+
+def build_report(
+    games: Sequence[tuple[str, Path]],
+    command: Sequence[str],
+    runtime: RuntimeCoverage,
+    references: ReferenceCoverage,
+) -> dict[str, object]:
+    titles = []
+    all_rows: list[dict[str, object]] = []
+    for label, path in games:
+        if not path.is_file():
+            raise FileNotFoundError(f"game executable not found: {path}")
+        dependencies, inventory = parse_import_inventory(run_import_inventory(command, path))
+        rows = [
+            inventory_row(label, imported, runtime, references)
+            for imported in sorted(inventory.values(), key=lambda value: value.nid)
+        ]
+        all_rows.extend(rows)
+        counts = collections.Counter(str(row["status"]) for row in rows)
+        callable_rows = [row for row in rows if row["callable"]]
+        callable_counts = collections.Counter(str(row["status"]) for row in callable_rows)
+        unknown_rows = [row for row in callable_rows if row["status"] == "unknown"]
+        titles.append(
+            {
+                "title": label,
+                "dependencies": sorted(dependencies),
+                "unique_nids": len(rows),
+                "callable_nids": len(callable_rows),
+                "status_counts": dict(sorted(counts.items())),
+                "callable_status_counts": dict(sorted(callable_counts.items())),
+                "callable_unknown_named": sum(bool(row["name"]) for row in unknown_rows),
+                "callable_unknown_in_reference": sum(
+                    bool(row["references"]) for row in unknown_rows
+                ),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "titles": titles,
+        "imports": all_rows,
+    }
+
+
+def print_text_report(report: dict[str, object], details: bool) -> None:
+    titles = report["titles"]
+    assert isinstance(titles, list)
+    for title in titles:
+        assert isinstance(title, dict)
+        print(
+            f"title={title['title']} dependencies={len(title['dependencies'])} "
+            f"unique_nids={title['unique_nids']} callable_nids={title['callable_nids']}"
+        )
+        counts = title["callable_status_counts"]
+        assert isinstance(counts, dict)
+        print("callable_status=" + ",".join(f"{key}:{counts[key]}" for key in sorted(counts)))
+        print(
+            f"callable_unknown_named={title['callable_unknown_named']} "
+            f"callable_unknown_in_reference={title['callable_unknown_in_reference']}"
+        )
+
+    imports = report["imports"]
+    assert isinstance(imports, list)
+    gaps = [
+        row
+        for row in imports
+        if isinstance(row, dict)
+        and row["callable"]
+        and row["status"] in {"unknown", "named-only", "stub-success", "stub-passthrough", "stub-constant"}
+    ]
+    gaps.sort(
+        key=lambda row: (
+            {"stub-success": 0, "stub-passthrough": 0, "stub-constant": 0, "named-only": 1, "unknown": 2}.get(str(row["status"]), 3),
+            str(row["title"]),
+            str(row["name"] or "~"),
+            str(row["nid"]),
+        )
+    )
+    print(f"priority_callable_gaps={len(gaps)}")
+    if details:
+        for row in gaps:
+            references = ",".join(row["references"]) if row["references"] else "-"
+            print(
+                f"gap title={row['title']} status={row['status']} nid={row['nid']} "
+                f"name={row['name'] or 'unknown'} references={references}"
+            )
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--game",
+        action="append",
+        type=parse_game_argument,
+        help="title and executable as LABEL=/path/to/eboot.bin; repeatable",
+    )
+    parser.add_argument("--remu-binary", type=Path, help="existing remu CLI binary")
+    parser.add_argument(
+        "--runtime-source",
+        type=Path,
+        default=REPO_ROOT / "crates/remu-runtime/src/lib.rs",
+    )
+    parser.add_argument("--sharpemu", type=Path, default=DEFAULT_SHARPEMU)
+    parser.add_argument("--shadps4", type=Path, default=DEFAULT_SHADPS4)
+    parser.add_argument("--kyty", type=Path, default=DEFAULT_KYTY)
+    parser.add_argument("--kyty-ps5", type=Path, default=DEFAULT_KYTY_PS5)
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument("--details", action="store_true", help="print every callable gap")
+    parser.add_argument("--output", type=Path, help="write the report instead of stdout")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = create_parser().parse_args(argv)
+    games = args.game if args.game else list(DEFAULT_GAMES)
+    try:
+        runtime = inspect_runtime_source(args.runtime_source)
+        references = inspect_references(args.sharpemu, args.shadps4, args.kyty, args.kyty_ps5)
+        report = build_report(games, resolve_command(args.remu_binary), runtime, references)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    else:
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        output = StringIO()
+        with redirect_stdout(output):
+            print_text_report(report, args.details)
+        rendered = output.getvalue()
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered, encoding="utf-8")
+    else:
+        sys.stdout.write(rendered)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
