@@ -517,6 +517,10 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
         {
             std::thread::sleep(Duration::from_millis(10));
         }
+        eprintln!(
+            "[REMu] guest runtime stopped; requesting presenter shutdown (entry_result={})",
+            if result.is_ok() { "returned" } else { "failed" }
+        );
         let _ = sender.send(remu_gpu::GpuEvent::Shutdown);
         result
     });
@@ -528,6 +532,7 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
         return ExitCode::FAILURE;
     }
     if !guest.is_finished() {
+        eprintln!("[REMu] presenter closed while guest threads were active; ending this REmu run");
         return ExitCode::SUCCESS;
     }
     match guest.join() {

@@ -51,8 +51,8 @@ such as `1920x1080` selects a fixed drawable size. These options scale only pres
 keeps the display-buffer dimensions it requested.
 
 Enable Apple's in-window Metal Performance HUD with `REMU_METAL_HUD=1`; add
-`REMU_METAL_HUD_LOG=1` to record its metrics. Override the comma-separated input schedule with
-`REMU_AUTO_CROSS`; detailed first-seen shader register dumps are opt-in through
+`REMU_METAL_HUD_LOG=1` to record its metrics. Automated input is disabled by default; opt into a
+comma-separated Cross-button schedule with `REMU_AUTO_CROSS`. Detailed first-seen shader register dumps are opt-in through
 `REMU_TRACE_AGC_SHADERS=1`.
 
 On Apple Silicon, use the crash-capturing probe wrapper during game bring-up. It builds the

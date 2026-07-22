@@ -60,7 +60,8 @@ if [ ! -x "$binary" ]; then
     exit 69
 fi
 
-auto_cross=${REMU_AUTO_CROSS:-8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,100,102,104,106,108,110,112,114,116,118}
+# Interactive runs never inject controller input unless the caller explicitly supplies a schedule.
+auto_cross=${REMU_AUTO_CROSS:-}
 # Capturing a 4K PPM writes roughly 32 MiB per image and fingerprints the full frame on the
 # presenter thread. Keep it explicit so ordinary game runs measure the emulator rather than the
 # diagnostic I/O path.
