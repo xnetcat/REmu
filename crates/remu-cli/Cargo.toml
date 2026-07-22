@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 iced-x86.workspace = true
+libc.workspace = true
 remu-gpu = { path = "../remu-gpu" }
 remu-gpu-metal = { path = "../remu-gpu-metal" }
 remu-loader = { path = "../remu-loader" }

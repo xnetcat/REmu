@@ -61,7 +61,32 @@ enum Command {
     },
 }
 
+#[cfg(unix)]
+extern "C" fn diagnostic_sigterm_handler(_signal: i32) {
+    const MESSAGE: &[u8] = b"[REMu][DIAG] ignored external SIGTERM\n";
+    // SAFETY: `write` is async-signal-safe and the message has static storage.
+    unsafe {
+        libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len());
+    }
+}
+
+fn install_diagnostic_signal_policy() {
+    #[cfg(unix)]
+    if matches!(std::env::var("REMU_IGNORE_SIGTERM").as_deref(), Ok("1")) {
+        // SAFETY: the handler performs only an async-signal-safe write and remains valid for the
+        // process lifetime. This opt-in exists solely for isolated compatibility runs.
+        unsafe {
+            libc::signal(
+                libc::SIGTERM,
+                diagnostic_sigterm_handler as *const () as libc::sighandler_t,
+            );
+        }
+        eprintln!("[REMu][DIAG] external SIGTERM will be ignored for this run");
+    }
+}
+
 fn main() -> ExitCode {
+    install_diagnostic_signal_policy();
     match Arguments::parse().command {
         Command::Inspect { path } => inspect(&path),
         Command::HostInfo => {

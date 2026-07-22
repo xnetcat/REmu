@@ -1353,6 +1353,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "iced-x86",
+ "libc",
  "remu-gpu",
  "remu-gpu-metal",
  "remu-loader",
