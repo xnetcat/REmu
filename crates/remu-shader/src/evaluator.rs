@@ -70,6 +70,7 @@ pub enum EvaluationError {
 struct BufferDescriptor {
     base_address: u64,
     stride: u32,
+    swizzle_enabled: bool,
     record_count: u32,
     size_bytes: u64,
     number_format: u32,
@@ -397,23 +398,37 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         registers: &[u32; SCALAR_REGISTER_COUNT],
         supplemental: bool,
     ) -> Result<(), EvaluationError> {
-        let Some(base_address) = read_scalar_pair(registers, control.scalar_address) else {
+        let Some(scalar_address) = control.scalar_address else {
+            // With SADDR=NULL the complete 64-bit address is supplied per lane by VGPRs.
+            // There is no scalar value to resolve statically; Metal lowering selects from the
+            // guest ranges discovered by the other memory instructions at run time.
+            return Ok(());
+        };
+        let Some(base_address) = read_scalar_pair(registers, scalar_address) else {
             return Err(invalid(instruction, "global-memory scalar address pair"));
         };
         if base_address == 0 && !supplemental {
             return Err(EvaluationError::NullGlobalAddress {
                 pc: instruction.pc,
-                register: control.scalar_address,
+                register: scalar_address,
             });
         }
+        let minimum_address = if control.offset_bytes.is_negative() {
+            base_address.wrapping_sub(u64::from(control.offset_bytes.unsigned_abs()))
+        } else {
+            base_address
+        };
+        let binding_base = minimum_address & !3;
+        let prefix_bytes = base_address.wrapping_sub(binding_base);
         let writable = instruction.opcode.starts_with("GlobalStore")
             || instruction.opcode.starts_with("GlobalAtomic");
         self.record_global_binding(
             instruction,
             BindingRequest {
-                scalar_address: control.scalar_address,
-                base_address,
-                requested_bytes: self.options.maximum_binding_bytes as u64,
+                scalar_address,
+                base_address: binding_base,
+                requested_bytes: (self.options.maximum_binding_bytes as u64)
+                    .saturating_add(prefix_bytes),
                 writable,
                 supplemental,
                 allow_shorter: true,
@@ -487,12 +502,14 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             });
             return Ok(());
         }
+        let binding_base = descriptor.base_address & !3;
+        let prefix_bytes = descriptor.base_address - binding_base;
         self.record_global_binding(
             instruction,
             BindingRequest {
                 scalar_address: control.scalar_resource,
-                base_address: descriptor.base_address,
-                requested_bytes: descriptor.size_bytes,
+                base_address: binding_base,
+                requested_bytes: descriptor.size_bytes.saturating_add(prefix_bytes),
                 writable,
                 supplemental,
                 allow_shorter: false,
@@ -1483,6 +1500,7 @@ fn decode_buffer_descriptor(
         return Ok(BufferDescriptor {
             base_address: 0,
             stride: 0,
+            swizzle_enabled: false,
             record_count: 0,
             size_bytes: 0,
             number_format: 0,
@@ -1496,6 +1514,7 @@ fn decode_buffer_descriptor(
         return Ok(BufferDescriptor {
             base_address: 0,
             stride: 0,
+            swizzle_enabled: false,
             record_count: 0,
             size_bytes: 0,
             number_format: 0,
@@ -1504,16 +1523,19 @@ fn decode_buffer_descriptor(
     }
     let base_address = u64::from(word0) | (u64::from(word1 & 0xffff) << 32);
     let stride = (word1 >> 16) & 0x3fff;
+    let swizzle_enabled = word1 >> 31 != 0;
+    let oob_select = (word3 >> 28) & 0x3;
     let unified_format = (word3 >> 12) & 0x7f;
     let (data_format, number_format) = decode_unified_format(unified_format).ok_or(())?;
-    let size_bytes = if stride == 0 {
-        u64::from(word2)
-    } else {
+    let size_bytes = if stride != 0 && (swizzle_enabled || oob_select != 3) {
         u64::from(stride) * u64::from(word2)
+    } else {
+        u64::from(word2)
     };
     Ok(BufferDescriptor {
         base_address,
         stride,
+        swizzle_enabled,
         record_count: word2,
         size_bytes,
         number_format,
@@ -1667,6 +1689,47 @@ mod tests {
             compute_system_registers: None,
             user_data_scalar_register_base: 0,
         }
+    }
+
+    #[test]
+    fn sizes_structured_buffer_descriptors_in_records() {
+        let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+        registers[..4].copy_from_slice(&[0x2000, 16 << 16, 32, 0]);
+
+        let descriptor = decode_buffer_descriptor(&registers, 0, true).expect("descriptor");
+
+        assert_eq!(descriptor.base_address, 0x2000);
+        assert_eq!(descriptor.stride, 16);
+        assert_eq!(descriptor.record_count, 32);
+        assert_eq!(descriptor.size_bytes, 512);
+    }
+
+    #[test]
+    fn sizes_raw_buffer_descriptors_in_bytes() {
+        let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+        registers[..4].copy_from_slice(&[0x2000, 16 << 16, 512, 3 << 28]);
+
+        let descriptor = decode_buffer_descriptor(&registers, 0, true).expect("descriptor");
+
+        assert_eq!(descriptor.stride, 16);
+        assert_eq!(descriptor.record_count, 512);
+        assert_eq!(descriptor.size_bytes, 512);
+    }
+
+    #[test]
+    fn sizes_swizzled_buffers_in_records_even_with_raw_oob_selection() {
+        let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+        registers[..4].copy_from_slice(&[
+            0x2000,
+            (16 << 16) | (1 << 31),
+            32,
+            3 << 28,
+        ]);
+
+        let descriptor = decode_buffer_descriptor(&registers, 0, true).expect("descriptor");
+
+        assert!(descriptor.swizzle_enabled);
+        assert_eq!(descriptor.size_bytes, 512);
     }
 
     #[test]

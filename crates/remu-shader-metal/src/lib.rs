@@ -353,6 +353,13 @@ impl<'a> Compiler<'a> {
             {
                 self.emit_buffer_memory(instruction)?;
             }
+            _ if matches!(
+                instruction.control,
+                Some(InstructionControl::GlobalMemory(_))
+            ) =>
+            {
+                self.emit_global_memory(instruction)?;
+            }
             _ if matches!(instruction.control, Some(InstructionControl::DataShare(_))) => {
                 self.emit_data_share(instruction)?;
             }
@@ -379,15 +386,34 @@ impl<'a> Compiler<'a> {
             .count();
         let mut source = String::from(
             "#include <metal_stdlib>\nusing namespace metal;\n\n\
+             inline bool remu_range_valid(uint offset, uint size, uint length) {\n\
+             \x20   return offset <= length && size <= length - offset;\n\
+             }\n\n\
+             inline uint remu_load_u8(const device uchar* data, uint offset, uint length) {\n\
+             \x20   return remu_range_valid(offset, 1u, length) ? (uint)data[offset] : 0u;\n\
+             }\n\n\
+             inline uint remu_load_u16(const device uchar* data, uint offset, uint length) {\n\
+             \x20   if (!remu_range_valid(offset, 2u, length)) return 0u;\n\
+             \x20   return (uint)data[offset] | ((uint)data[offset + 1u] << 8u);\n\
+             }\n\n\
              inline uint remu_load_u32(const device uchar* data, uint offset, uint length) {\n\
+             \x20   if (!remu_range_valid(offset, 4u, length)) return 0u;\n\
              \x20   uint value = 0u;\n\
              \x20   for (uint i = 0u; i < 4u; ++i) {\n\
-             \x20       if (offset + i < length) value |= (uint)data[offset + i] << (i * 8u);\n\
+             \x20       value |= (uint)data[offset + i] << (i * 8u);\n\
              \x20   }\n\
              \x20   return value;\n}\n\n",
         );
-        if self.program.instructions.iter().any(is_format_buffer_load) {
+        if self
+            .program
+            .instructions
+            .iter()
+            .any(is_format_buffer_memory)
+        {
             emit_format_prelude(&mut source);
+        }
+        if self.program.instructions.iter().any(is_writable_memory) {
+            emit_global_memory_prelude(&mut source);
         }
         if self
             .program
@@ -429,8 +455,13 @@ impl<'a> Compiler<'a> {
             MetalShaderStage::Pixel => parameters.push("RemuPsIn remu_in [[stage_in]]".to_owned()),
             MetalShaderStage::Compute => {}
         }
-        for index in 0..global_count {
-            parameters.push(format!("const device uchar* b{index} [[buffer({index})]]"));
+        for (index, binding) in self.evaluation.global_memory_bindings.iter().enumerate() {
+            let qualifier = if binding.writable {
+                "device"
+            } else {
+                "const device"
+            };
+            parameters.push(format!("{qualifier} uchar* b{index} [[buffer({index})]]"));
         }
         parameters.push(format!(
             "constant uint* remu_initial_s [[buffer({initial_index})]]"
@@ -1889,10 +1920,21 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
     fn emit_buffer_memory(&mut self, instruction: &Instruction) -> Result<(), String> {
         let Some(InstructionControl::BufferMemory(control)) = instruction.control.as_ref() else {
             return Err("missing buffer-memory control".to_owned());
         };
+        let name = instruction
+            .opcode
+            .known_name()
+            .ok_or_else(|| "raw buffer opcode".to_owned())?;
+        if control.lds && (!name.starts_with("BufferLoad") || control.tfe) {
+            return Err("MUBUF LDS transfer is legal only for non-TFE buffer loads".to_owned());
+        }
+        if control.lds && control.vector_data != 124 {
+            return Err("MUBUF LDS transfer must encode M0 in VDATA".to_owned());
+        }
         if self.options.stage == MetalShaderStage::Vertex
             && let Some(input) = self
                 .evaluation
@@ -1925,9 +1967,9 @@ impl<'a> Compiler<'a> {
             .iter()
             .position(|binding| binding.instruction_pcs.contains(&instruction.pc))
             .ok_or_else(|| format!("{} has no evaluated buffer binding", instruction.opcode))?;
-        let binding_length = self.evaluation.global_memory_bindings[binding_index]
-            .data
-            .len();
+        let binding = &self.evaluation.global_memory_bindings[binding_index];
+        let binding_length = binding.data.len();
+        let binding_base = binding.base_address;
         let scalar_offset = self.raw_source(instruction, 2)?;
         let vector_index = if control.index_enabled {
             format!("v[{}]", control.vector_address)
@@ -1942,33 +1984,171 @@ impl<'a> Compiler<'a> {
         } else {
             "0u".to_owned()
         };
-        let stride = format!("((s[{}] >> 16) & 0x3FFFu)", control.scalar_resource + 1);
-        let address = self.temp(
+        let resource0 = format!("s[{}]", control.scalar_resource);
+        let resource1 = format!("s[{}]", control.scalar_resource + 1);
+        let resource2 = format!("s[{}]", control.scalar_resource + 2);
+        let resource3 = format!("s[{}]", control.scalar_resource + 3);
+        let resource_base = self.temp(
+            "ulong",
+            &format!("(ulong){resource0} | (((ulong){resource1} & 0xFFFFul) << 32)"),
+        );
+        let resource_bias = self.temp(
+            "uint",
+            &format!("(uint)({resource_base} - 0x{binding_base:X}ul)"),
+        );
+        let stride = self.temp("uint", &format!("({resource1} >> 16) & 0x3FFFu"));
+        let swizzled = self.temp("bool", &format!("({resource1} & 0x80000000u) != 0u"));
+        let add_tid = self.temp("bool", &format!("({resource3} & 0x00800000u) != 0u"));
+        let index = self.temp(
+            "uint",
+            &format!("{vector_index} + ({add_tid} ? (remu_lane & 63u) : 0u)"),
+        );
+        let offset = self.temp(
             "uint",
             &format!(
-                "({} + {scalar_offset} + {vector_offset} + ({vector_index} * {stride}))",
+                "{vector_offset} + {}",
                 format_u32(control.offset_bytes.cast_unsigned())
             ),
         );
-        if is_format_buffer_load(instruction) {
-            return self.emit_format_buffer_load(control, binding_index, binding_length, &address);
-        }
-        let Some(name) = instruction.opcode.known_name() else {
-            return Err("raw buffer opcode".to_owned());
+        let index_stride = self.temp("uint", &format!("8u << (({resource3} >> 21) & 3u)"));
+        let element_size = "4u";
+        let index_msb = self.temp("uint", &format!("{index} / {index_stride}"));
+        let index_lsb = self.temp("uint", &format!("{index} % {index_stride}"));
+        let offset_msb = self.temp("uint", &format!("{offset} / {element_size}"));
+        let offset_lsb = self.temp("uint", &format!("{offset} % {element_size}"));
+        let linear_offset = self.temp("uint", &format!("{index} * {stride} + {offset}"));
+        let swizzled_offset = self.temp(
+            "uint",
+            &format!(
+                "({index_msb} * {stride} + {offset_msb} * {element_size}) * {index_stride} + {index_lsb} * {element_size} + {offset_lsb}"
+            ),
+        );
+        let buffer_offset = self.temp(
+            "uint",
+            &format!("{swizzled} ? {swizzled_offset} : {linear_offset}"),
+        );
+        let address = self.temp(
+            "uint",
+            &format!("{resource_bias} + {scalar_offset} + {buffer_offset}"),
+        );
+        let payload = if is_format_buffer_memory(instruction) {
+            let unified = control
+                .instruction_format
+                .map_or_else(|| format!("({resource3} >> 12) & 0x7Fu"), format_u32);
+            let table = self.temp("uint", &format!("remu_gfx10_formats[{unified}]"));
+            let data_format = self.temp("uint", &format!("{table} & 0xFFu"));
+            self.temp("uint", &format!("remu_format_size({data_format})"))
+        } else {
+            format_u32(memory_payload_bytes(name, control.dword_count)?)
         };
-        if name.starts_with("BufferLoad") {
-            for component in 0..control.dword_count {
-                self.store_vector(
-                    control.vector_data + component,
-                    &format!(
-                        "remu_load_u32(b{binding_index}, {address} + {}u, {binding_length}u)",
-                        component * 4
-                    ),
-                );
-            }
-            return Ok(());
+        let record_count = self.temp("uint", &resource2);
+        let oob_select = self.temp("uint", &format!("({resource3} >> 28) & 3u"));
+        let descriptor_null = self.temp(
+            "bool",
+            &format!("({resource0} | {resource1} | {resource2} | {resource3}) == 0u"),
+        );
+        let reduced_records = self.temp(
+            "uint",
+            &format!("{record_count} > {scalar_offset} ? {record_count} - {scalar_offset} : 0u"),
+        );
+        let oob = self.temp(
+            "bool",
+            &format!(
+                "{descriptor_null} || ({oob_select} == 0u ? ({index} >= {record_count} || {offset} >= {stride}) : {oob_select} == 1u ? ({index} >= {record_count}) : {oob_select} == 2u ? ({record_count} == 0u) : ({swizzled} && {stride} != 0u ? ({index} >= {record_count} || !remu_range_valid({offset}, {payload}, {stride})) : !remu_range_valid({buffer_offset}, {payload}, {reduced_records})))"
+            ),
+        );
+        if is_format_buffer_memory(instruction) {
+            return self.emit_format_buffer_memory(
+                instruction,
+                control,
+                binding_index,
+                binding_length,
+                &address,
+                &oob,
+            );
         }
-        Err(format!("unsupported generic buffer opcode {name}"))
+        self.emit_raw_memory_operation(
+            name,
+            control.vector_data,
+            control.vector_data,
+            control.dword_count,
+            binding_index,
+            binding_length,
+            &address,
+            &oob,
+            control.glc,
+            control.lds,
+            control.tfe,
+        )
+    }
+
+    fn emit_global_memory(&mut self, instruction: &Instruction) -> Result<(), String> {
+        let Some(InstructionControl::GlobalMemory(control)) = instruction.control.as_ref() else {
+            return Err("missing global-memory control".to_owned());
+        };
+        let name = instruction
+            .opcode
+            .known_name()
+            .ok_or_else(|| "raw global opcode".to_owned())?;
+        let guest_address = if let Some(scalar_address) = control.scalar_address {
+            self.temp(
+                "ulong",
+                &format!(
+                    "((ulong)s[{}] | ((ulong)s[{}] << 32)) + (ulong)v[{}] + (ulong)(long){}",
+                    scalar_address,
+                    scalar_address + 1,
+                    control.vector_address,
+                    control.offset_bytes
+                ),
+            )
+        } else {
+            self.temp(
+                "ulong",
+                &format!(
+                    "((ulong)v[{}] | ((ulong)v[{}] << 32)) + (ulong)(long){}",
+                    control.vector_address,
+                    control.vector_address + 1,
+                    control.offset_bytes
+                ),
+            )
+        };
+        let binding_index = self
+            .evaluation
+            .global_memory_bindings
+            .iter()
+            .position(|binding| binding.instruction_pcs.contains(&instruction.pc))
+            .or_else(|| {
+                (control.scalar_address.is_none()
+                    && self.evaluation.global_memory_bindings.len() == 1)
+                    .then_some(0)
+            })
+            .ok_or_else(|| {
+                "GLOBAL with a VGPR-only address has no statically resolved guest memory range"
+                    .to_owned()
+            })?;
+        let binding = &self.evaluation.global_memory_bindings[binding_index];
+        let local_address = self.temp(
+            "uint",
+            &format!("(uint)({guest_address} - 0x{:X}ul)", binding.base_address),
+        );
+        let before = self.temp(
+            "bool",
+            &format!("{guest_address} < 0x{:X}ul", binding.base_address),
+        );
+        let oob = self.temp("bool", &before);
+        self.emit_raw_memory_operation(
+            name,
+            control.vector_data,
+            control.vector_destination,
+            control.dword_count,
+            binding_index,
+            binding.data.len(),
+            &local_address,
+            &oob,
+            control.glc,
+            control.lds,
+            false,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2258,12 +2438,189 @@ impl<'a> Compiler<'a> {
         );
     }
 
-    fn emit_format_buffer_load(
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn emit_raw_memory_operation(
         &mut self,
+        name: &str,
+        vector_data: u32,
+        vector_destination: u32,
+        dword_count: u32,
+        binding_index: usize,
+        binding_length: usize,
+        address: &str,
+        descriptor_oob: &str,
+        glc: bool,
+        lds: bool,
+        tfe: bool,
+    ) -> Result<(), String> {
+        let load = name.contains("Load");
+        let store = name.contains("Store");
+        let atomic = name.contains("Atomic");
+        if !load && !store && !atomic {
+            return Err(format!("unsupported memory opcode {name}"));
+        }
+        let subdword = name.contains("Byte")
+            || name.contains("Ubyte")
+            || name.contains("Sbyte")
+            || name.contains("Short")
+            || name.contains("Ushort")
+            || name.contains("Sshort");
+        let aligned_address = if subdword {
+            address.to_owned()
+        } else {
+            self.temp("uint", &format!("{address} & ~3u"))
+        };
+
+        if load {
+            let (width, signed, d16, high) = raw_load_shape(name)?;
+            if lds {
+                if self.options.stage != MetalShaderStage::Compute {
+                    return Err("memory-to-LDS transfers require a Metal compute stage".to_owned());
+                }
+                if dword_count != 1 || tfe {
+                    return Err(
+                        "memory-to-LDS transfer must return exactly one non-TFE dword".to_owned(),
+                    );
+                }
+            }
+            for component in 0..dword_count {
+                let component_address = if component == 0 {
+                    aligned_address.clone()
+                } else {
+                    format!("{aligned_address} + {}u", component * 4)
+                };
+                let loaded = match width {
+                    1 => format!(
+                        "remu_load_u8(b{binding_index}, {component_address}, {binding_length}u)"
+                    ),
+                    2 => format!(
+                        "remu_load_u16(b{binding_index}, {component_address}, {binding_length}u)"
+                    ),
+                    4 => format!(
+                        "remu_load_u32(b{binding_index}, {component_address}, {binding_length}u)"
+                    ),
+                    _ => unreachable!("raw load widths are fixed"),
+                };
+                let in_range = format!(
+                    "!{descriptor_oob} && remu_range_valid({component_address}, {width}u, {binding_length}u)"
+                );
+                let raw = self.temp("uint", &format!("{in_range} ? {loaded} : 0u"));
+                let converted = if signed && width == 1 {
+                    format!("({raw} & 0x80u) != 0u ? ({raw} | 0xFFFFFF00u) : {raw}")
+                } else if signed && width == 2 {
+                    format!("({raw} & 0x8000u) != 0u ? ({raw} | 0xFFFF0000u) : {raw}")
+                } else {
+                    raw.clone()
+                };
+                let value = self.temp("uint", &converted);
+                if lds {
+                    let lds_index = self.temp("uint", "((s[124] & 0xFFFFu) >> 2) + remu_lane");
+                    self.line(
+                        3,
+                        &format!(
+                            "if (exec && {lds_index} < {}u) atomic_store_explicit(remu_lds + {lds_index}, {value}, memory_order_relaxed);",
+                            self.options.lds_size_bytes / 4
+                        ),
+                    );
+                } else if d16 {
+                    let register = vector_destination + component;
+                    let merged = if high {
+                        format!("(v[{register}] & 0xFFFFu) | (({value} & 0xFFFFu) << 16)")
+                    } else {
+                        format!("(v[{register}] & 0xFFFF0000u) | ({value} & 0xFFFFu)")
+                    };
+                    self.store_vector(register, &merged);
+                } else {
+                    self.store_vector(vector_destination + component, &value);
+                }
+            }
+            if tfe {
+                self.store_vector(vector_destination + dword_count, "0u");
+            }
+            return Ok(());
+        }
+
+        if store {
+            let (width, high) = raw_store_shape(name)?;
+            for component in 0..dword_count {
+                let component_address = if component == 0 {
+                    aligned_address.clone()
+                } else {
+                    format!("{aligned_address} + {}u", component * 4)
+                };
+                let source = format!("v[{}]", vector_data + component);
+                let value = if high {
+                    format!("{source} >> 16")
+                } else {
+                    source
+                };
+                self.line(
+                    3,
+                    &format!(
+                        "if (exec && !{descriptor_oob} && remu_range_valid({component_address}, {width}u, {binding_length}u)) remu_store_u{bits}(b{binding_index}, {component_address}, {value});",
+                        bits = width * 8
+                    ),
+                );
+            }
+            return Ok(());
+        }
+
+        let atomic_address = aligned_address;
+        let old = self.temp("uint", "0u");
+        let source = format!("v[{vector_data}]");
+        let operation = match name
+            .strip_prefix("BufferAtomic")
+            .or_else(|| name.strip_prefix("GlobalAtomic"))
+        {
+            Some("Swap") => {
+                format!("remu_atomic_swap(b{binding_index}, {atomic_address}, {source})")
+            }
+            Some("Cmpswap") => format!(
+                "remu_atomic_cmpswap(b{binding_index}, {atomic_address}, {source}, v[{}])",
+                vector_data + 1
+            ),
+            Some("Add") => format!("remu_atomic_add(b{binding_index}, {atomic_address}, {source})"),
+            Some("Sub") => format!("remu_atomic_sub(b{binding_index}, {atomic_address}, {source})"),
+            Some("Smin") => {
+                format!("remu_atomic_smin(b{binding_index}, {atomic_address}, {source})")
+            }
+            Some("Umin") => {
+                format!("remu_atomic_umin(b{binding_index}, {atomic_address}, {source})")
+            }
+            Some("Smax") => {
+                format!("remu_atomic_smax(b{binding_index}, {atomic_address}, {source})")
+            }
+            Some("Umax" | "UMax") => {
+                format!("remu_atomic_umax(b{binding_index}, {atomic_address}, {source})")
+            }
+            Some("And") => format!("remu_atomic_and(b{binding_index}, {atomic_address}, {source})"),
+            Some("Or") => format!("remu_atomic_or(b{binding_index}, {atomic_address}, {source})"),
+            Some("Xor") => format!("remu_atomic_xor(b{binding_index}, {atomic_address}, {source})"),
+            Some("Inc") => format!("remu_atomic_inc(b{binding_index}, {atomic_address}, {source})"),
+            Some("Dec") => format!("remu_atomic_dec(b{binding_index}, {atomic_address}, {source})"),
+            _ => return Err(format!("unsupported atomic opcode {name}")),
+        };
+        self.line(
+            3,
+            &format!(
+                "if (exec && !{descriptor_oob} && remu_range_valid({atomic_address}, 4u, {binding_length}u)) {old} = {operation};"
+            ),
+        );
+        if glc {
+            self.store_vector(vector_destination, &old);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_format_buffer_memory(
+        &mut self,
+        instruction: &Instruction,
         control: &remu_shader::BufferMemoryControl,
         binding_index: usize,
         binding_length: usize,
         address: &str,
+        descriptor_oob: &str,
     ) -> Result<(), String> {
         if control.dword_count == 0 || control.dword_count > 4 {
             return Err(format!(
@@ -2272,12 +2629,35 @@ impl<'a> Compiler<'a> {
             ));
         }
         let descriptor_word = self.temp("uint", &format!("s[{}]", control.scalar_resource + 3));
-        let table_entry = self.temp(
-            "uint",
-            &format!("remu_gfx10_formats[({descriptor_word} >> 12) & 0x7Fu]"),
-        );
+        let unified_format = control
+            .instruction_format
+            .map_or_else(|| format!("({descriptor_word} >> 12) & 0x7Fu"), format_u32);
+        let table_entry = self.temp("uint", &format!("remu_gfx10_formats[{unified_format}]"));
         let data_format = self.temp("uint", &format!("{table_entry} & 0xFFu"));
         let number_format = self.temp("uint", &format!("({table_entry} >> 8) & 0xFFu"));
+        let element_size = self.temp("uint", &format!("remu_format_size({data_format})"));
+        let aligned = self.temp(
+            "bool",
+            &format!("{element_size} != 0u && ({address} % {element_size}) == 0u"),
+        );
+        let oob = self.temp(
+            "bool",
+            &format!(
+                "{descriptor_oob} || !{aligned} || !remu_range_valid({address}, {element_size}, {binding_length}u)"
+            ),
+        );
+        if instruction.opcode.contains("Store") {
+            return self.emit_format_buffer_store(
+                instruction,
+                control,
+                binding_index,
+                address,
+                &descriptor_word,
+                &data_format,
+                &number_format,
+                &oob,
+            );
+        }
         let mut canonical = Vec::with_capacity(4);
         for component in 0..4 {
             let byte_offset = self.temp("uint", "0u");
@@ -2289,15 +2669,11 @@ impl<'a> Compiler<'a> {
                     "remu_format_layout({data_format}, {component}u, {byte_offset}, {bit_offset}, {bits});"
                 ),
             );
-            let packed = self.temp(
-                "uint",
-                &format!(
-                    "remu_load_u32(b{binding_index}, {address} + {byte_offset}, {binding_length}u)"
-                ),
-            );
             let raw = self.temp(
                 "uint",
-                &format!("{bits} == 0u ? 0u : extract_bits({packed}, {bit_offset}, {bits})"),
+                &format!(
+                    "{oob} || {bits} == 0u ? 0u : remu_load_format_bits(b{binding_index}, {address}, {byte_offset}, {bit_offset}, {bits})"
+                ),
             );
             let missing = if component == 3 {
                 format!("remu_format_one({number_format})")
@@ -2311,16 +2687,190 @@ impl<'a> Compiler<'a> {
                 ),
             ));
         }
-        for destination in 0..control.dword_count {
-            let selector = self.temp(
+        let component_count = format_component_count(
+            instruction
+                .opcode
+                .known_name()
+                .ok_or_else(|| "raw format opcode".to_owned())?,
+        );
+        let mut selected = Vec::with_capacity(component_count as usize);
+        for destination in 0..component_count {
+            let selector = if control.instruction_format.is_some() {
+                format_u32(destination + 4)
+            } else {
+                self.temp(
+                    "uint",
+                    &format!("({descriptor_word} >> {}u) & 7u", destination * 3),
+                )
+            };
+            selected.push(self.temp(
                 "uint",
-                &format!("({descriptor_word} >> {}u) & 7u", destination * 3),
+                &format!(
+                    "{selector} == 1u ? remu_format_one({number_format}) : {oob} ? 0u : {selector} == 4u ? {} : {selector} == 5u ? {} : {selector} == 6u ? {} : {selector} == 7u ? {} : 0u",
+                    canonical[0], canonical[1], canonical[2], canonical[3]
+                ),
+            ));
+        }
+        let d16 = instruction.opcode.contains("FormatD16");
+        let d16_hi = instruction.opcode.contains("FormatD16Hi");
+        if control.lds {
+            if self.options.stage != MetalShaderStage::Compute
+                || component_count != 1
+                || d16
+                || control.tfe
+            {
+                return Err(
+                    "formatted memory-to-LDS requires a non-D16 FORMAT_X compute load".to_owned(),
+                );
+            }
+            let lds_index = self.temp("uint", "((s[124] & 0xFFFFu) >> 2) + remu_lane");
+            self.line(
+                3,
+                &format!(
+                    "if (exec && {lds_index} < {}u) atomic_store_explicit(remu_lds + {lds_index}, {}, memory_order_relaxed);",
+                    self.options.lds_size_bytes / 4,
+                    selected[0]
+                ),
+            );
+        } else if d16_hi {
+            let converted = self.temp(
+                "uint",
+                &format!("remu_format_to_d16({}, {number_format})", selected[0]),
             );
             self.store_vector(
-                control.vector_data + destination,
+                control.vector_data,
                 &format!(
-                    "{selector} == 1u ? remu_format_one({number_format}) : {selector} == 4u ? {} : {selector} == 5u ? {} : {selector} == 6u ? {} : {selector} == 7u ? {} : 0u",
-                    canonical[0], canonical[1], canonical[2], canonical[3]
+                    "(v[{}] & 0xFFFFu) | ({converted} << 16)",
+                    control.vector_data
+                ),
+            );
+        } else if d16 {
+            for register in 0..control.dword_count {
+                let low_index = register * 2;
+                let low = self.temp(
+                    "uint",
+                    &format!(
+                        "remu_format_to_d16({}, {number_format})",
+                        selected[low_index as usize]
+                    ),
+                );
+                let expression = if low_index + 1 < component_count {
+                    let high = self.temp(
+                        "uint",
+                        &format!(
+                            "remu_format_to_d16({}, {number_format})",
+                            selected[(low_index + 1) as usize]
+                        ),
+                    );
+                    format!("{low} | ({high} << 16)")
+                } else {
+                    format!(
+                        "(v[{}] & 0xFFFF0000u) | {low}",
+                        control.vector_data + register
+                    )
+                };
+                self.store_vector(control.vector_data + register, &expression);
+            }
+        } else {
+            for (destination, value) in selected.iter().enumerate() {
+                self.store_vector(
+                    control.vector_data
+                        + u32::try_from(destination)
+                            .map_err(|_| "format destination overflow".to_owned())?,
+                    value,
+                );
+            }
+        }
+        if control.tfe {
+            self.store_vector(control.vector_data + control.dword_count, "0u");
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_format_buffer_store(
+        &mut self,
+        instruction: &Instruction,
+        control: &remu_shader::BufferMemoryControl,
+        binding_index: usize,
+        address: &str,
+        descriptor_word: &str,
+        data_format: &str,
+        number_format: &str,
+        oob: &str,
+    ) -> Result<(), String> {
+        let name = instruction
+            .opcode
+            .known_name()
+            .ok_or_else(|| "raw format store opcode".to_owned())?;
+        let component_count = format_component_count(name);
+        let d16 = name.contains("FormatD16");
+        let d16_hi = name.contains("FormatD16Hi");
+        for memory_component in 0..4_u32 {
+            let byte_offset = self.temp("uint", "0u");
+            let bit_offset = self.temp("uint", "0u");
+            let bits = self.temp("uint", "0u");
+            self.line(
+                3,
+                &format!(
+                    "remu_format_layout({data_format}, {memory_component}u, {byte_offset}, {bit_offset}, {bits});"
+                ),
+            );
+            let enabled = self.temp("bool", "false");
+            let canonical = self.temp("uint", "0u");
+            if control.instruction_format.is_some() {
+                if memory_component < component_count {
+                    let register = control.vector_data + memory_component / if d16 { 2 } else { 1 };
+                    let source = if d16_hi {
+                        format!("v[{register}] >> 16")
+                    } else if d16 {
+                        format!("v[{register}] >> {}u", (memory_component & 1) * 16)
+                    } else {
+                        format!("v[{register}]")
+                    };
+                    let expanded = if d16 {
+                        format!("remu_format_from_d16({source} & 0xFFFFu, {number_format})")
+                    } else {
+                        source
+                    };
+                    self.line(3, &format!("{enabled} = true; {canonical} = {expanded};"));
+                }
+            } else {
+                for source_component in 0..component_count {
+                    let selector = self.temp(
+                        "uint",
+                        &format!("({descriptor_word} >> {}u) & 7u", source_component * 3),
+                    );
+                    let register = control.vector_data + source_component / if d16 { 2 } else { 1 };
+                    let source = if d16_hi {
+                        format!("v[{register}] >> 16")
+                    } else if d16 {
+                        format!("v[{register}] >> {}u", (source_component & 1) * 16)
+                    } else {
+                        format!("v[{register}]")
+                    };
+                    let expanded = if d16 {
+                        format!("remu_format_from_d16({source} & 0xFFFFu, {number_format})")
+                    } else {
+                        source
+                    };
+                    self.line(
+                        3,
+                        &format!(
+                            "if ({selector} == {}u) {{ {enabled} = true; {canonical} = {expanded}; }}",
+                            memory_component + 4
+                        ),
+                    );
+                }
+            }
+            let packed = self.temp(
+                "uint",
+                &format!("remu_format_pack({canonical}, {bits}, {number_format}, {data_format})"),
+            );
+            self.line(
+                3,
+                &format!(
+                    "if (exec && !{oob} && {enabled} && {bits} != 0u) remu_store_format_bits(b{binding_index}, {address}, {byte_offset}, {bit_offset}, {bits}, {packed});"
                 ),
             );
         }
@@ -2585,9 +3135,73 @@ fn format_u32(value: u32) -> String {
     }
 }
 
+fn raw_load_shape(name: &str) -> Result<(u32, bool, bool, bool), String> {
+    if !name.contains("Load") {
+        return Err(format!("{name} is not a raw load"));
+    }
+    let width = if name.contains("Ubyte") || name.contains("Sbyte") {
+        1
+    } else if name.contains("Ushort") || name.contains("Sshort") || name.contains("ShortD16") {
+        2
+    } else if name.contains("Dword") {
+        4
+    } else {
+        return Err(format!("unsupported raw load width for {name}"));
+    };
+    Ok((
+        width,
+        name.contains("Sbyte") || name.contains("Sshort"),
+        name.contains("D16"),
+        name.ends_with("D16Hi"),
+    ))
+}
+
+fn raw_store_shape(name: &str) -> Result<(u32, bool), String> {
+    if !name.contains("Store") {
+        return Err(format!("{name} is not a raw store"));
+    }
+    if name.contains("Byte") {
+        Ok((1, name.ends_with("D16Hi")))
+    } else if name.contains("Short") {
+        Ok((2, name.ends_with("D16Hi")))
+    } else if name.contains("Dword") {
+        Ok((4, false))
+    } else {
+        Err(format!("unsupported raw store width for {name}"))
+    }
+}
+
+fn memory_payload_bytes(name: &str, _dword_count: u32) -> Result<u32, String> {
+    if name.contains("Atomic") || name.contains("Dword") {
+        Ok(4)
+    } else if name.contains("Byte") || name.contains("Ubyte") || name.contains("Sbyte") {
+        Ok(1)
+    } else if name.contains("Short") || name.contains("Ushort") || name.contains("Sshort") {
+        Ok(2)
+    } else {
+        Err(format!("unknown memory payload width for {name}"))
+    }
+}
+
+fn format_component_count(name: &str) -> u32 {
+    if name.ends_with("Xyzw") {
+        4
+    } else if name.ends_with("Xyz") {
+        3
+    } else if name.ends_with("Xy") {
+        2
+    } else {
+        1
+    }
+}
+
 fn is_lds_memory_instruction(instruction: &Instruction) -> bool {
-    matches!(instruction.control, Some(InstructionControl::DataShare(_)))
-        && !instruction.opcode.is("DsSwizzleB32")
+    match instruction.control {
+        Some(InstructionControl::DataShare(_)) => !instruction.opcode.is("DsSwizzleB32"),
+        Some(InstructionControl::BufferMemory(control)) => control.lds,
+        Some(InstructionControl::GlobalMemory(control)) => control.lds,
+        _ => false,
+    }
 }
 
 fn is_lds_atomic_name(name: &str) -> bool {
@@ -2728,9 +3342,161 @@ inline uint remu_ds_cmpst(threadgroup atomic_uint* location, uint comparator,
     );
 }
 
-fn is_format_buffer_load(instruction: &Instruction) -> bool {
+fn is_format_buffer_memory(instruction: &Instruction) -> bool {
     instruction.opcode.starts_with("BufferLoadFormat")
+        || instruction.opcode.starts_with("BufferStoreFormat")
         || instruction.opcode.starts_with("TBufferLoadFormat")
+        || instruction.opcode.starts_with("TBufferStoreFormat")
+}
+
+fn is_writable_memory(instruction: &Instruction) -> bool {
+    instruction.opcode.contains("Store") || instruction.opcode.contains("Atomic")
+}
+
+#[allow(clippy::too_many_lines)]
+fn emit_global_memory_prelude(source: &mut String) {
+    source.push_str(
+        r"inline void remu_store_u8(device uchar* data, uint offset, uint value) {
+    data[offset] = (uchar)value;
+}
+
+inline void remu_store_u16(device uchar* data, uint offset, uint value) {
+    data[offset] = (uchar)value;
+    data[offset + 1u] = (uchar)(value >> 8u);
+}
+
+inline void remu_store_u32(device uchar* data, uint offset, uint value) {
+    for (uint i = 0u; i < 4u; ++i) data[offset + i] = (uchar)(value >> (i * 8u));
+}
+
+inline device atomic_uint* remu_atomic_pointer(device uchar* data, uint offset) {
+    return (device atomic_uint*)(data + offset);
+}
+
+inline uint remu_atomic_swap(device uchar* data, uint offset, uint value) {
+    return atomic_exchange_explicit(remu_atomic_pointer(data, offset), value,
+                                    memory_order_relaxed);
+}
+
+inline uint remu_atomic_add(device uchar* data, uint offset, uint value) {
+    return atomic_fetch_add_explicit(remu_atomic_pointer(data, offset), value,
+                                     memory_order_relaxed);
+}
+
+inline uint remu_atomic_sub(device uchar* data, uint offset, uint value) {
+    return atomic_fetch_sub_explicit(remu_atomic_pointer(data, offset), value,
+                                     memory_order_relaxed);
+}
+
+inline uint remu_atomic_and(device uchar* data, uint offset, uint value) {
+    return atomic_fetch_and_explicit(remu_atomic_pointer(data, offset), value,
+                                     memory_order_relaxed);
+}
+
+inline uint remu_atomic_or(device uchar* data, uint offset, uint value) {
+    return atomic_fetch_or_explicit(remu_atomic_pointer(data, offset), value,
+                                    memory_order_relaxed);
+}
+
+inline uint remu_atomic_xor(device uchar* data, uint offset, uint value) {
+    return atomic_fetch_xor_explicit(remu_atomic_pointer(data, offset), value,
+                                     memory_order_relaxed);
+}
+
+inline uint remu_atomic_cmpswap(device uchar* data, uint offset, uint replacement,
+                                uint comparator) {
+    device atomic_uint* location = remu_atomic_pointer(data, offset);
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (observed == comparator) {
+        uint expected = observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, replacement,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+    return observed;
+}
+
+inline uint remu_atomic_umin(device uchar* data, uint offset, uint value) {
+    device atomic_uint* location = remu_atomic_pointer(data, offset);
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint expected = observed;
+        uint desired = min(observed, value);
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_atomic_umax(device uchar* data, uint offset, uint value) {
+    device atomic_uint* location = remu_atomic_pointer(data, offset);
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint expected = observed;
+        uint desired = max(observed, value);
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_atomic_smin(device uchar* data, uint offset, uint value) {
+    device atomic_uint* location = remu_atomic_pointer(data, offset);
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint expected = observed;
+        uint desired = as_type<int>(value) < as_type<int>(observed) ? value : observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_atomic_smax(device uchar* data, uint offset, uint value) {
+    device atomic_uint* location = remu_atomic_pointer(data, offset);
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint expected = observed;
+        uint desired = as_type<int>(value) > as_type<int>(observed) ? value : observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_atomic_inc(device uchar* data, uint offset, uint limit) {
+    device atomic_uint* location = remu_atomic_pointer(data, offset);
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint expected = observed;
+        uint desired = observed >= limit ? 0u : observed + 1u;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_atomic_dec(device uchar* data, uint offset, uint limit) {
+    device atomic_uint* location = remu_atomic_pointer(data, offset);
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint expected = observed;
+        uint desired = observed == 0u || observed > limit ? limit : observed - 1u;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+",
+    );
 }
 
 fn emit_vop3p_prelude(source: &mut String) {
@@ -2822,6 +3588,7 @@ inline uint remu_f16_fma_rto_bits(float left, float right, float addend) {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_format_prelude(source: &mut String) {
     source.push_str("static constant uint remu_gfx10_formats[128] = {\n    ");
     for unified in 0..128 {
@@ -2877,6 +3644,108 @@ fn emit_format_prelude(source: &mut String) {
          \x20       return raw;\n\
          \x20   default: return raw;\n\
          \x20   }\n}\n\n",
+    );
+    source.push_str("static inline uint remu_format_size(uint dfmt) {\n    switch (dfmt) {\n");
+    for format in 1..=14_u32 {
+        let size = FORMAT_COMPONENT_LAYOUTS
+            .iter()
+            .filter(|(_, candidate, _, _, _)| *candidate == format)
+            .map(|(_, _, byte_offset, bit_offset, bits)| {
+                byte_offset + (bit_offset + bits).div_ceil(8)
+            })
+            .max()
+            .unwrap_or(0);
+        let _ = writeln!(source, "    case {format}u: return {size}u;");
+    }
+    source.push_str(
+        r"    default: return 0u;
+    }
+}
+
+static inline uint remu_load_format_bits(const device uchar* data, uint address,
+                                         uint byte_off, uint bit_off, uint bits) {
+    uint value = 0u;
+    for (uint bit = 0u; bit < bits; ++bit) {
+        uint source_bit = bit_off + bit;
+        uint source_byte = address + byte_off + source_bit / 8u;
+        value |= (((uint)data[source_byte] >> (source_bit & 7u)) & 1u) << bit;
+    }
+    return value;
+}
+
+static inline void remu_store_format_bits(device uchar* data, uint address, uint byte_off,
+                                          uint bit_off, uint bits, uint value) {
+    for (uint bit = 0u; bit < bits; ++bit) {
+        uint destination_bit = bit_off + bit;
+        uint destination_byte = address + byte_off + destination_bit / 8u;
+        uint mask = 1u << (destination_bit & 7u);
+        uint byte_value = (uint)data[destination_byte];
+        byte_value = (byte_value & ~mask) | (((value >> bit) & 1u) * mask);
+        data[destination_byte] = (uchar)byte_value;
+    }
+}
+
+static inline uint remu_format_minifloat_pack(uint value, uint bits) {
+    float converted = fmax(as_type<float>(value), 0.0f);
+    uint half_bits = (uint)as_type<ushort>(half(converted));
+    uint exponent = (half_bits >> 10) & 0x1Fu;
+    uint mantissa = half_bits & 0x3FFu;
+    uint mantissa_bits = bits - 5u;
+    uint shift = 10u - mantissa_bits;
+    uint truncated = mantissa >> shift;
+    uint remainder = mantissa & ((1u << shift) - 1u);
+    uint halfway = 1u << (shift - 1u);
+    if (remainder > halfway || (remainder == halfway && (truncated & 1u) != 0u)) {
+        truncated += 1u;
+        if (truncated == (1u << mantissa_bits)) {
+            truncated = 0u;
+            exponent = min(exponent + 1u, 31u);
+        }
+    }
+    return (exponent << mantissa_bits) | truncated;
+}
+
+static inline uint remu_format_pack(uint value, uint bits, uint nfmt, uint dfmt) {
+    uint mask = bits >= 32u ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+    float floating = as_type<float>(value);
+    switch (nfmt) {
+    case 0u:
+        return (uint)rint(clamp(floating, 0.0f, 1.0f) * (float)mask) & mask;
+    case 1u: {
+        int maximum = (int)(mask >> 1);
+        int packed = (int)rint(clamp(floating, -1.0f, 1.0f) * (float)maximum);
+        return (uint)packed & mask;
+    }
+    case 2u:
+        return (uint)rint(clamp(floating, 0.0f, (float)mask)) & mask;
+    case 3u: {
+        int maximum = (int)(mask >> 1);
+        int minimum = -maximum - 1;
+        return (uint)(int)rint(clamp(floating, (float)minimum, (float)maximum)) & mask;
+    }
+    case 4u: return value & mask;
+    case 5u: return (uint)as_type<int>(value) & mask;
+    case 7u:
+        if (dfmt == 6u || dfmt == 7u) return remu_format_minifloat_pack(value, bits);
+        if (bits == 16u) return (uint)as_type<ushort>(half(floating));
+        return value;
+    default: return value & mask;
+    }
+}
+
+static inline uint remu_format_from_d16(uint value, uint nfmt) {
+    value &= 0xFFFFu;
+    if (nfmt == 4u) return value;
+    if (nfmt == 5u) return (value & 0x8000u) != 0u ? value | 0xFFFF0000u : value;
+    return as_type<uint>((float)as_type<half>((ushort)value));
+}
+
+static inline uint remu_format_to_d16(uint value, uint nfmt) {
+    if (nfmt == 4u || nfmt == 5u) return value & 0xFFFFu;
+    return (uint)as_type<ushort>(half(as_type<float>(value)));
+}
+
+",
     );
 }
 
@@ -3248,6 +4117,302 @@ mod tests {
             },
         )
         .expect("vector instruction should lower")
+    }
+
+    const BUFFER_MEMORY_OPCODES: [&str; 60] = [
+        "BufferLoadFormatX",
+        "BufferLoadFormatXy",
+        "BufferLoadFormatXyz",
+        "BufferLoadFormatXyzw",
+        "BufferStoreFormatX",
+        "BufferStoreFormatXy",
+        "BufferStoreFormatXyz",
+        "BufferStoreFormatXyzw",
+        "BufferLoadUbyte",
+        "BufferLoadSbyte",
+        "BufferLoadUshort",
+        "BufferLoadSshort",
+        "BufferLoadDword",
+        "BufferLoadDwordx2",
+        "BufferLoadDwordx4",
+        "BufferLoadDwordx3",
+        "BufferStoreByte",
+        "BufferStoreByteD16Hi",
+        "BufferStoreShort",
+        "BufferStoreShortD16Hi",
+        "BufferStoreDword",
+        "BufferStoreDwordx2",
+        "BufferStoreDwordx4",
+        "BufferStoreDwordx3",
+        "BufferLoadUbyteD16",
+        "BufferLoadUbyteD16Hi",
+        "BufferLoadSbyteD16",
+        "BufferLoadSbyteD16Hi",
+        "BufferLoadShortD16",
+        "BufferLoadShortD16Hi",
+        "BufferLoadFormatD16HiX",
+        "BufferStoreFormatD16HiX",
+        "BufferAtomicSwap",
+        "BufferAtomicCmpswap",
+        "BufferAtomicAdd",
+        "BufferAtomicSub",
+        "BufferAtomicSmin",
+        "BufferAtomicUmin",
+        "BufferAtomicSmax",
+        "BufferAtomicUmax",
+        "BufferAtomicAnd",
+        "BufferAtomicOr",
+        "BufferAtomicXor",
+        "BufferAtomicInc",
+        "BufferAtomicDec",
+        "BufferLoadFormatD16X",
+        "BufferLoadFormatD16Xy",
+        "BufferLoadFormatD16Xyz",
+        "BufferLoadFormatD16Xyzw",
+        "BufferStoreFormatD16X",
+        "BufferStoreFormatD16Xy",
+        "BufferStoreFormatD16Xyz",
+        "BufferStoreFormatD16Xyzw",
+        "TBufferLoadFormatX",
+        "TBufferLoadFormatXy",
+        "TBufferLoadFormatXyz",
+        "TBufferLoadFormatXyzw",
+        "TBufferStoreFormatX",
+        "TBufferStoreFormatXy",
+        "TBufferStoreFormatXyz",
+    ];
+
+    const EXTRA_BUFFER_MEMORY_OPCODE: &str = "TBufferStoreFormatXyzw";
+    const TYPED_D16_MEMORY_OPCODES: [&str; 8] = [
+        "TBufferLoadFormatD16X",
+        "TBufferLoadFormatD16Xy",
+        "TBufferLoadFormatD16Xyz",
+        "TBufferLoadFormatD16Xyzw",
+        "TBufferStoreFormatD16X",
+        "TBufferStoreFormatD16Xy",
+        "TBufferStoreFormatD16Xyz",
+        "TBufferStoreFormatD16Xyzw",
+    ];
+
+    const GLOBAL_MEMORY_OPCODES: [&str; 24] = [
+        "GlobalLoadUbyte",
+        "GlobalLoadSbyte",
+        "GlobalLoadUshort",
+        "GlobalLoadSshort",
+        "GlobalLoadDword",
+        "GlobalLoadDwordx2",
+        "GlobalLoadDwordx4",
+        "GlobalLoadDwordx3",
+        "GlobalStoreByte",
+        "GlobalStoreByteD16Hi",
+        "GlobalStoreShort",
+        "GlobalStoreShortD16Hi",
+        "GlobalStoreDword",
+        "GlobalStoreDwordx2",
+        "GlobalStoreDwordx4",
+        "GlobalStoreDwordx3",
+        "GlobalLoadUbyteD16",
+        "GlobalLoadUbyteD16Hi",
+        "GlobalLoadSbyteD16",
+        "GlobalLoadSbyteD16Hi",
+        "GlobalLoadShortD16",
+        "GlobalLoadShortD16Hi",
+        "GlobalAtomicAdd",
+        "GlobalAtomicUMax",
+    ];
+
+    fn memory_dword_count_for_test(name: &str) -> u32 {
+        if name.contains("FormatD16") {
+            if name.ends_with("Xyz") || name.ends_with("Xyzw") {
+                2
+            } else {
+                1
+            }
+        } else if name.ends_with("Xyzw") || name.ends_with("Dwordx4") {
+            4
+        } else if name.ends_with("Xyz") || name.ends_with("Dwordx3") {
+            3
+        } else if name.ends_with("Xy") || name.ends_with("Dwordx2") || name.ends_with("Cmpswap") {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn complete_memory_program() -> (Program, ShaderEvaluation) {
+        let names = BUFFER_MEMORY_OPCODES
+            .into_iter()
+            .chain([EXTRA_BUFFER_MEMORY_OPCODE])
+            .chain(TYPED_D16_MEMORY_OPCODES)
+            .chain(GLOBAL_MEMORY_OPCODES);
+        let mut pcs = Vec::new();
+        let mut instructions = names
+            .enumerate()
+            .map(|(index, name)| {
+                let pc = u32::try_from(index * 8).expect("small memory test program");
+                pcs.push(pc);
+                let dword_count = memory_dword_count_for_test(name);
+                let (encoding, control) = if name.starts_with("Global") {
+                    (
+                        ShaderEncoding::Flat,
+                        InstructionControl::GlobalMemory(remu_shader::GlobalMemoryControl {
+                            dword_count,
+                            vector_address: 1,
+                            vector_data: 16,
+                            vector_destination: 32,
+                            scalar_address: Some(8),
+                            offset_bytes: -4,
+                            dlc: true,
+                            lds: false,
+                            glc: true,
+                            slc: true,
+                        }),
+                    )
+                } else {
+                    (
+                        if name.starts_with("TBuffer") {
+                            ShaderEncoding::Mtbuf
+                        } else {
+                            ShaderEncoding::Mubuf
+                        },
+                        InstructionControl::BufferMemory(remu_shader::BufferMemoryControl {
+                            dword_count,
+                            vector_address: 1,
+                            vector_data: 16,
+                            scalar_resource: 0,
+                            instruction_format: name.starts_with("TBuffer").then_some(60),
+                            offset_bytes: 4,
+                            index_enabled: true,
+                            offset_enabled: true,
+                            dlc: true,
+                            lds: false,
+                            glc: true,
+                            slc: true,
+                            tfe: name.contains("Load") && !name.contains("Atomic"),
+                        }),
+                    )
+                };
+                Instruction {
+                    pc,
+                    encoding,
+                    opcode: Opcode::Known(name),
+                    words: vec![0, 0],
+                    sources: vec![Operand::vector(1), Operand::scalar(0), Operand::source(128, None)],
+                    destinations: Vec::new(),
+                    control: Some(control),
+                }
+            })
+            .collect::<Vec<_>>();
+        let end_pc = u32::try_from(instructions.len() * 8).expect("small memory test program");
+        instructions.push(Instruction {
+            pc: end_pc,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0xbf81_0000],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        });
+        let mut evaluation = empty_evaluation();
+        let selectors = 4 | (5 << 3) | (6 << 6) | (7 << 9);
+        evaluation.initial_scalar_registers[0] = 0x1000;
+        evaluation.initial_scalar_registers[1] = 16 << 16;
+        evaluation.initial_scalar_registers[2] = 64 * 1024;
+        evaluation.initial_scalar_registers[3] = selectors | (60 << 12) | (1 << 24) | (3 << 28);
+        evaluation.initial_scalar_registers[8] = 0x1000;
+        evaluation.scalar_registers = evaluation.initial_scalar_registers.clone();
+        evaluation.global_memory_bindings.push(remu_shader::GlobalMemoryBinding {
+            scalar_address: 0,
+            base_address: 0x1000,
+            instruction_pcs: pcs,
+            data: vec![0; 64 * 1024],
+            writable: true,
+            write_back_to_guest: true,
+        });
+        (Program::new(0x1000, instructions), evaluation)
+    }
+
+    #[test]
+    fn lowers_complete_decoded_global_mubuf_and_mtbuf_memory_surface() {
+        let (program, evaluation) = complete_memory_program();
+        let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+            .expect("complete decoded VMEM surface should lower");
+        for operation in [
+            "remu_atomic_cmpswap",
+            "remu_atomic_inc",
+            "remu_store_format_bits",
+            "remu_load_format_bits",
+            "remu_format_to_d16",
+            "remu_format_from_d16",
+        ] {
+            assert!(shader.source.contains(operation), "missing {operation}");
+        }
+        assert!(shader.source.contains("0xFFFF0000u"));
+        assert!(shader.source.contains("0xFFFFFF00u"));
+        assert!(shader.source.contains("remu_range_valid"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_memory_msl_compiles_with_apple_metal() {
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+        fn find_metal_compiler() -> Option<PathBuf> {
+            if let Some(path) = std::env::var_os("REMU_METAL_COMPILER").map(PathBuf::from)
+                && path.is_file()
+            {
+                return Some(path);
+            }
+            let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.remu/toolchains/Metal.xctoolchain/usr/bin/metal");
+            if bundled.is_file() {
+                return Some(bundled);
+            }
+            let output = Command::new("xcrun")
+                .args(["--find", "metal"])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+        }
+
+        let Some(compiler) = find_metal_compiler() else {
+            eprintln!("skipping Apple Metal memory compile test: no metal compiler found");
+            return;
+        };
+        let (program, evaluation) = complete_memory_program();
+        let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+            .expect("complete decoded VMEM surface should lower");
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "remu-memory-metal-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create Metal memory test directory");
+        let source = directory.join("memory.metal");
+        let air = directory.join("memory.air");
+        std::fs::write(&source, shader.source).expect("write generated memory MSL");
+        let output = Command::new(&compiler)
+            .args(["-c", "-target", "air64-apple-macosx15.0"])
+            .arg("-fmetal-math-mode=safe")
+            .arg("-o")
+            .arg(&air)
+            .arg(&source)
+            .output()
+            .expect("run Apple Metal compiler");
+        assert!(
+            output.status.success(),
+            "memory MSL failed to compile:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(directory).expect("remove Metal memory test directory");
     }
 
     #[test]

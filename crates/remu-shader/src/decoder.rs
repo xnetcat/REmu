@@ -805,7 +805,7 @@ fn decode_ds(pc: u32, word: u32) -> Result<Frame, DecodeError> {
 }
 
 fn decode_mtbuf(word: u32, extra: u32) -> Frame {
-    let code = (word >> 16) & 0x7;
+    let code = ((extra >> 21) & 1) << 3 | ((word >> 16) & 0x7);
     let name = match code {
         0x00 => "TBufferLoadFormatX",
         0x01 => "TBufferLoadFormatXy",
@@ -815,7 +815,15 @@ fn decode_mtbuf(word: u32, extra: u32) -> Frame {
         0x05 => "TBufferStoreFormatXy",
         0x06 => "TBufferStoreFormatXyz",
         0x07 => "TBufferStoreFormatXyzw",
-        _ => unreachable!("three-bit opcode"),
+        0x08 => "TBufferLoadFormatD16X",
+        0x09 => "TBufferLoadFormatD16Xy",
+        0x0a => "TBufferLoadFormatD16Xyz",
+        0x0b => "TBufferLoadFormatD16Xyzw",
+        0x0c => "TBufferStoreFormatD16X",
+        0x0d => "TBufferStoreFormatD16Xy",
+        0x0e => "TBufferStoreFormatD16Xyz",
+        0x0f => "TBufferStoreFormatD16Xyzw",
+        _ => unreachable!("four-bit opcode"),
     };
     Frame {
         encoding: ShaderEncoding::Mtbuf,
@@ -825,7 +833,7 @@ fn decode_mtbuf(word: u32, extra: u32) -> Frame {
 }
 
 fn decode_mubuf(word: u32, extra: u32) -> Frame {
-    let code = (word >> 18) & 0x7f;
+    let code = (word >> 18) & 0xff;
     let name = match code {
         0x00 => Some("BufferLoadFormatX"),
         0x01 => Some("BufferLoadFormatXy"),
@@ -857,6 +865,8 @@ fn decode_mubuf(word: u32, extra: u32) -> Frame {
         0x23 => Some("BufferLoadSbyteD16Hi"),
         0x24 => Some("BufferLoadShortD16"),
         0x25 => Some("BufferLoadShortD16Hi"),
+        0x26 => Some("BufferLoadFormatD16HiX"),
+        0x27 => Some("BufferStoreFormatD16HiX"),
         0x30 => Some("BufferAtomicSwap"),
         0x31 => Some("BufferAtomicCmpswap"),
         0x32 => Some("BufferAtomicAdd"),
@@ -870,6 +880,14 @@ fn decode_mubuf(word: u32, extra: u32) -> Frame {
         0x3b => Some("BufferAtomicXor"),
         0x3c => Some("BufferAtomicInc"),
         0x3d => Some("BufferAtomicDec"),
+        0x80 => Some("BufferLoadFormatD16X"),
+        0x81 => Some("BufferLoadFormatD16Xy"),
+        0x82 => Some("BufferLoadFormatD16Xyz"),
+        0x83 => Some("BufferLoadFormatD16Xyzw"),
+        0x84 => Some("BufferStoreFormatD16X"),
+        0x85 => Some("BufferStoreFormatD16Xy"),
+        0x86 => Some("BufferStoreFormatD16Xyz"),
+        0x87 => Some("BufferStoreFormatD16Xyzw"),
         _ => None,
     };
     Frame {
@@ -1402,26 +1420,36 @@ fn decode_global_memory(
 ) -> InstructionControl {
     let vector_address = extra & 0xff;
     let vector_data = (extra >> 8) & 0xff;
-    let scalar_address = (extra >> 16) & 0x7f;
+    let scalar_address_field = (extra >> 16) & 0x7f;
+    let scalar_address = (scalar_address_field != 0x7f).then_some(scalar_address_field);
+    let vector_destination = extra >> 24;
     let dword_count = memory_dword_count(opcode);
-    sources.extend([
-        Operand::vector(vector_address),
-        Operand::scalar(scalar_address),
-    ]);
+    sources.push(Operand::vector(vector_address));
+    if let Some(scalar_address) = scalar_address {
+        sources.push(Operand::scalar(scalar_address));
+    } else {
+        sources.push(Operand::vector(vector_address.saturating_add(1)));
+    }
+    let lds = word >> 13 & 1 != 0;
     if opcode.starts_with("GlobalLoad") {
-        push_vector_range(destinations, vector_data, dword_count);
+        if !lds {
+            push_vector_range(destinations, vector_destination, dword_count);
+        }
     } else {
         push_vector_range(sources, vector_data, dword_count);
         if opcode.starts_with("GlobalAtomic") && word >> 16 & 1 != 0 {
-            destinations.push(Operand::vector(vector_data));
+            destinations.push(Operand::vector(vector_destination));
         }
     }
     InstructionControl::GlobalMemory(GlobalMemoryControl {
         dword_count,
         vector_address,
         vector_data,
+        vector_destination,
         scalar_address,
-        offset_bytes: sign_extend(word & 0x1fff, 13),
+        offset_bytes: sign_extend(word & 0xfff, 12),
+        dlc: word >> 12 & 1 != 0,
+        lds,
         glc: word >> 16 & 1 != 0,
         slc: word >> 17 & 1 != 0,
     })
@@ -1445,8 +1473,15 @@ fn decode_buffer_memory(
         Operand::scalar(scalar_resource),
         Operand::source(scalar_offset, literal),
     ]);
+    let lds = !opcode.starts_with("TBuffer") && word >> 16 & 1 != 0;
+    let tfe = extra >> 23 & 1 != 0;
     if opcode.contains("Load") {
-        push_vector_range(destinations, vector_data, dword_count);
+        if !lds {
+            push_vector_range(destinations, vector_data, dword_count);
+            if tfe {
+                destinations.push(Operand::vector(vector_data.saturating_add(dword_count)));
+            }
+        }
     } else {
         push_vector_range(sources, vector_data, dword_count);
         if opcode.starts_with("BufferAtomic") && word >> 14 & 1 != 0 {
@@ -1458,11 +1493,15 @@ fn decode_buffer_memory(
         vector_address,
         vector_data,
         scalar_resource,
+        instruction_format: opcode.starts_with("TBuffer").then_some((word >> 19) & 0x7f),
         offset_bytes: i32::try_from(word & 0xfff).expect("12-bit buffer offset fits i32"),
         index_enabled: word >> 13 & 1 != 0,
         offset_enabled: word >> 12 & 1 != 0,
+        dlc: word >> 15 & 1 != 0,
+        lds,
         glc: word >> 14 & 1 != 0,
         slc: extra >> 22 & 1 != 0,
+        tfe,
     })
 }
 
@@ -1598,7 +1637,13 @@ fn memory_dword_count(opcode: Opcode) -> u32 {
     let Some(name) = opcode.known_name() else {
         return 0;
     };
-    if name.ends_with("Xyzw") || name.ends_with("Dwordx4") {
+    if name.contains("FormatD16") {
+        if name.ends_with("Xyz") || name.ends_with("Xyzw") {
+            2
+        } else {
+            1
+        }
+    } else if name.ends_with("Xyzw") || name.ends_with("Dwordx4") {
         4
     } else if name.ends_with("Xyz") || name.ends_with("Dwordx3") {
         3
@@ -1881,6 +1926,138 @@ mod tests {
                 "incorrect DS control for packed bits 0x{bits:05X}"
             );
         }
+    }
+
+    #[test]
+    fn decodes_complete_mubuf_and_mtbuf_surfaces_with_all_control_fields() {
+        const MUBUF: &[(u32, &str)] = &[
+            (0x00, "BufferLoadFormatX"),
+            (0x01, "BufferLoadFormatXy"),
+            (0x02, "BufferLoadFormatXyz"),
+            (0x03, "BufferLoadFormatXyzw"),
+            (0x04, "BufferStoreFormatX"),
+            (0x05, "BufferStoreFormatXy"),
+            (0x06, "BufferStoreFormatXyz"),
+            (0x07, "BufferStoreFormatXyzw"),
+            (0x08, "BufferLoadUbyte"),
+            (0x09, "BufferLoadSbyte"),
+            (0x0a, "BufferLoadUshort"),
+            (0x0b, "BufferLoadSshort"),
+            (0x0c, "BufferLoadDword"),
+            (0x0d, "BufferLoadDwordx2"),
+            (0x0e, "BufferLoadDwordx4"),
+            (0x0f, "BufferLoadDwordx3"),
+            (0x18, "BufferStoreByte"),
+            (0x19, "BufferStoreByteD16Hi"),
+            (0x1a, "BufferStoreShort"),
+            (0x1b, "BufferStoreShortD16Hi"),
+            (0x1c, "BufferStoreDword"),
+            (0x1d, "BufferStoreDwordx2"),
+            (0x1e, "BufferStoreDwordx4"),
+            (0x1f, "BufferStoreDwordx3"),
+            (0x20, "BufferLoadUbyteD16"),
+            (0x21, "BufferLoadUbyteD16Hi"),
+            (0x22, "BufferLoadSbyteD16"),
+            (0x23, "BufferLoadSbyteD16Hi"),
+            (0x24, "BufferLoadShortD16"),
+            (0x25, "BufferLoadShortD16Hi"),
+            (0x26, "BufferLoadFormatD16HiX"),
+            (0x27, "BufferStoreFormatD16HiX"),
+            (0x30, "BufferAtomicSwap"),
+            (0x31, "BufferAtomicCmpswap"),
+            (0x32, "BufferAtomicAdd"),
+            (0x33, "BufferAtomicSub"),
+            (0x35, "BufferAtomicSmin"),
+            (0x36, "BufferAtomicUmin"),
+            (0x37, "BufferAtomicSmax"),
+            (0x38, "BufferAtomicUmax"),
+            (0x39, "BufferAtomicAnd"),
+            (0x3a, "BufferAtomicOr"),
+            (0x3b, "BufferAtomicXor"),
+            (0x3c, "BufferAtomicInc"),
+            (0x3d, "BufferAtomicDec"),
+            (0x80, "BufferLoadFormatD16X"),
+            (0x81, "BufferLoadFormatD16Xy"),
+            (0x82, "BufferLoadFormatD16Xyz"),
+            (0x83, "BufferLoadFormatD16Xyzw"),
+            (0x84, "BufferStoreFormatD16X"),
+            (0x85, "BufferStoreFormatD16Xy"),
+            (0x86, "BufferStoreFormatD16Xyz"),
+            (0x87, "BufferStoreFormatD16Xyzw"),
+        ];
+        const MTBUF: [&str; 16] = [
+            "TBufferLoadFormatX",
+            "TBufferLoadFormatXy",
+            "TBufferLoadFormatXyz",
+            "TBufferLoadFormatXyzw",
+            "TBufferStoreFormatX",
+            "TBufferStoreFormatXy",
+            "TBufferStoreFormatXyz",
+            "TBufferStoreFormatXyzw",
+            "TBufferLoadFormatD16X",
+            "TBufferLoadFormatD16Xy",
+            "TBufferLoadFormatD16Xyz",
+            "TBufferLoadFormatD16Xyzw",
+            "TBufferStoreFormatD16X",
+            "TBufferStoreFormatD16Xy",
+            "TBufferStoreFormatD16Xyz",
+            "TBufferStoreFormatD16Xyzw",
+        ];
+        let extra = 1u32 | (16u32 << 8) | (1u32 << 22) | (1u32 << 23) | (128u32 << 24);
+        for &(opcode, name) in MUBUF {
+            let word = 0xe000_0000 | (opcode << 18) | 0x0000_fabc;
+            let frame = decode_frame(0, &[word, extra]).expect("MUBUF frame");
+            assert_eq!(frame.encoding, ShaderEncoding::Mubuf);
+            assert!(frame.opcode.is(name), "opcode 0x{opcode:02X}");
+        }
+        for (opcode, name) in MTBUF.into_iter().enumerate() {
+            let opcode = u32::try_from(opcode).expect("small MTBUF opcode");
+            let word = 0xe800_0000 | ((opcode & 7) << 16) | (60 << 19) | 0x0000_cabc;
+            let extra = extra | ((opcode >> 3) << 21);
+            let frame = decode_frame(0, &[word, extra]).expect("MTBUF frame");
+            assert_eq!(frame.encoding, ShaderEncoding::Mtbuf);
+            assert!(frame.opcode.is(name), "opcode 0x{opcode:02X}");
+            let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+            let Some(InstructionControl::BufferMemory(control)) = instruction.control else {
+                panic!("expected MTBUF control");
+            };
+            assert_eq!(control.instruction_format, Some(60));
+            assert!(!control.lds, "MTBUF OP bits must not alias MUBUF LDS");
+            assert!(control.dlc && control.glc && control.slc && control.tfe);
+        }
+    }
+
+    #[test]
+    fn decodes_global_vdst_vdata_address_modes_and_twelve_bit_offset() {
+        let word = 0xdc00_0000
+            | (0x32 << 18)
+            | (2 << 14)
+            | (1 << 12)
+            | (1 << 16)
+            | (1 << 17)
+            | 0x800;
+        let extra = 1 | (16 << 8) | (0x7f << 16) | (32 << 24);
+        let frame = decode_frame(0, &[word, extra]).expect("GLOBAL frame");
+        let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+        assert_eq!(instruction.sources[0], Operand::vector(1));
+        assert_eq!(instruction.sources[1], Operand::vector(2));
+        assert_eq!(instruction.sources[2], Operand::vector(16));
+        assert_eq!(instruction.destinations, [Operand::vector(32)]);
+        assert_eq!(
+            instruction.control,
+            Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                dword_count: 1,
+                vector_address: 1,
+                vector_data: 16,
+                vector_destination: 32,
+                scalar_address: None,
+                offset_bytes: -2048,
+                dlc: true,
+                lds: false,
+                glc: true,
+                slc: true,
+            }))
+        );
     }
 
     #[test]

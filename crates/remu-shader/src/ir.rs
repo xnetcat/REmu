@@ -296,12 +296,16 @@ impl ImageControl {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GlobalMemoryControl {
     pub dword_count: u32,
     pub vector_address: u32,
     pub vector_data: u32,
-    pub scalar_address: u32,
+    pub vector_destination: u32,
+    pub scalar_address: Option<u32>,
     pub offset_bytes: i32,
+    pub dlc: bool,
+    pub lds: bool,
     pub glc: bool,
     pub slc: bool,
 }
@@ -313,11 +317,15 @@ pub struct BufferMemoryControl {
     pub vector_address: u32,
     pub vector_data: u32,
     pub scalar_resource: u32,
+    pub instruction_format: Option<u32>,
     pub offset_bytes: i32,
     pub index_enabled: bool,
     pub offset_enabled: bool,
+    pub dlc: bool,
+    pub lds: bool,
     pub glc: bool,
     pub slc: bool,
+    pub tfe: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -510,7 +518,9 @@ impl Program {
                     insert_scalar_range(&mut runtime_scalar_registers, image.scalar_sampler, 4);
                 }
                 Some(InstructionControl::GlobalMemory(global)) => {
-                    insert_scalar_range(&mut runtime_scalar_registers, global.scalar_address, 2);
+                    if let Some(scalar_address) = global.scalar_address {
+                        insert_scalar_range(&mut runtime_scalar_registers, scalar_address, 2);
+                    }
                 }
                 Some(InstructionControl::BufferMemory(buffer)) => {
                     insert_scalar_range(&mut runtime_scalar_registers, buffer.scalar_resource, 4);
