@@ -150,6 +150,7 @@ struct MetalPresenter {
     compiling_shader_pairs: HashSet<(u64, u64)>,
     failed_shader_pairs: HashSet<(u64, u64)>,
     failed_draw_execution: HashSet<(u64, u64)>,
+    pending_shader_draws: HashMap<(u64, u64), Box<IndexedDraw>>,
     resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     resident_content_version: u64,
@@ -210,6 +211,7 @@ impl MetalPresenter {
             compiling_shader_pairs: HashSet::new(),
             failed_shader_pairs: HashSet::new(),
             failed_draw_execution: HashSet::new(),
+            pending_shader_draws: HashMap::new(),
             resident_guest_textures: HashMap::new(),
             sampled_texture_cache: HashMap::new(),
             resident_content_version: 0,
@@ -316,37 +318,19 @@ impl MetalPresenter {
                     }
                 }
                 Ok(GpuEvent::IndexedDraw(draw)) => {
+                    let key = (draw.export_shader_address, draw.pixel_shader_address);
                     self.compile_draw_shaders(&draw);
+                    if !self.compiled_shader_pairs.contains_key(&key)
+                        && self.compiling_shader_pairs.contains(&key)
+                    {
+                        // Compilation is asynchronous so the AppKit event loop remains responsive.
+                        // Retain the latest draw for a new pair: static screens may submit only
+                        // once, and dropping that draw leaves the already-flipped buffer black.
+                        self.pending_shader_draws.insert(key, draw);
+                        continue;
+                    }
                     if let Err(error) = self.execute_compiled_draw(&draw) {
-                        let key = (draw.export_shader_address, draw.pixel_shader_address);
-                        if self.failed_draw_execution.insert(key) {
-                            eprintln!(
-                                "[REMu][METAL] Gen5 draw es={:#x} ps={:#x} could not execute: {error}",
-                                key.0, key.1
-                            );
-                        }
-                        if self.logged_unsupported_guest_draws.len() < 16
-                            && self
-                                .logged_unsupported_guest_draws
-                                .insert((draw.export_shader_prefix, draw.pixel_shader_prefix))
-                        {
-                            let pixel_scalars = pixel_scalars(&draw);
-                            eprintln!(
-                                "[REMu][METAL] no translated Metal path for es={:#x}/{:x?} ps={:#x}/{:x?} indexed={} count={} instances={} target={:#x} cb_info={:#x} cb_attrib2={:#x} cb_attrib3={:#x} target_mask={:#x} ps_scalars={pixel_scalars:x?}",
-                                draw.export_shader_address,
-                                draw.export_shader_prefix,
-                                draw.pixel_shader_address,
-                                draw.pixel_shader_prefix,
-                                draw.indexed,
-                                draw.index_count,
-                                draw.instance_count,
-                                draw.color_target_address,
-                                register_value(&draw.context_registers, 0x31c).unwrap_or_default(),
-                                register_value(&draw.context_registers, 0x3b0).unwrap_or_default(),
-                                register_value(&draw.context_registers, 0x3b8).unwrap_or_default(),
-                                register_value(&draw.context_registers, 0x08e).unwrap_or_default(),
-                            );
-                        }
+                        self.log_draw_execution_failure(&draw, &error);
                     }
                 }
                 Ok(GpuEvent::Shutdown) | Err(TryRecvError::Disconnected) => {
@@ -393,8 +377,15 @@ impl MetalPresenter {
                         pixel_bytes = compiled.pixel.source.len(),
                     );
                     self.compiled_shader_pairs.insert(result.key, compiled);
+                    if let Some(draw) = self.pending_shader_draws.remove(&result.key) {
+                        match self.execute_compiled_draw(&draw) {
+                            Ok(()) => self.refresh_deferred_flip(&draw),
+                            Err(error) => self.log_draw_execution_failure(&draw, &error),
+                        }
+                    }
                 }
                 Err(error) => {
+                    self.pending_shader_draws.remove(&result.key);
                     self.failed_shader_pairs.insert(result.key);
                     eprintln!(
                         "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
@@ -402,6 +393,55 @@ impl MetalPresenter {
                     );
                 }
             }
+        }
+    }
+
+    fn refresh_deferred_flip(&mut self, draw: &IndexedDraw) {
+        let address = draw.color_target_address;
+        if self.pending_flip.is_none_or(|flip| flip.address != address) {
+            return;
+        }
+        if let Err(error) = self.synchronize_flip_target(address) {
+            eprintln!("[REMu][METAL] deferred flip synchronization failed: {error}");
+            return;
+        }
+        self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
+        self.pending_flip = Some(PendingFlip {
+            address,
+            sequence: self.next_flip_sequence,
+        });
+        self.redraw_pending = true;
+    }
+
+    fn log_draw_execution_failure(&mut self, draw: &IndexedDraw, error: &str) {
+        let key = (draw.export_shader_address, draw.pixel_shader_address);
+        if self.failed_draw_execution.insert(key) {
+            eprintln!(
+                "[REMu][METAL] Gen5 draw es={:#x} ps={:#x} could not execute: {error}",
+                key.0, key.1
+            );
+        }
+        if self.logged_unsupported_guest_draws.len() < 16
+            && self
+                .logged_unsupported_guest_draws
+                .insert((draw.export_shader_prefix, draw.pixel_shader_prefix))
+        {
+            let pixel_scalars = pixel_scalars(draw);
+            eprintln!(
+                "[REMu][METAL] no translated Metal path for es={:#x}/{:x?} ps={:#x}/{:x?} indexed={} count={} instances={} target={:#x} cb_info={:#x} cb_attrib2={:#x} cb_attrib3={:#x} target_mask={:#x} ps_scalars={pixel_scalars:x?}",
+                draw.export_shader_address,
+                draw.export_shader_prefix,
+                draw.pixel_shader_address,
+                draw.pixel_shader_prefix,
+                draw.indexed,
+                draw.index_count,
+                draw.instance_count,
+                draw.color_target_address,
+                register_value(&draw.context_registers, 0x31c).unwrap_or_default(),
+                register_value(&draw.context_registers, 0x3b0).unwrap_or_default(),
+                register_value(&draw.context_registers, 0x3b8).unwrap_or_default(),
+                register_value(&draw.context_registers, 0x08e).unwrap_or_default(),
+            );
         }
     }
 
