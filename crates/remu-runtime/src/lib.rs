@@ -92,6 +92,7 @@ pub struct LinkedImage {
     pub tls: GuestTls,
     pub process_param: Option<GuestAddress>,
     unwind_fdes: Vec<GuestAddress>,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     module_initializers: Vec<GuestAddress>,
 }
 
@@ -981,6 +982,9 @@ fn synthetic_data_import_target(nid: &str) -> Option<u64> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+type RegisterFrame = unsafe extern "C" fn(*const libc::c_void);
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize, LinkError> {
     if image.unwind_fdes.is_empty() {
         return Ok(0);
@@ -989,13 +993,19 @@ fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize, LinkError>
     let register_address = runtime
         .unwind_symbol(c"__register_frame")
         .ok_or(LinkError::MissingNativeUnwindSymbol("__register_frame"))?;
-    type RegisterFrame = unsafe extern "C" fn(*const libc::c_void);
     // SAFETY: dlsym returned the address of libunwind's documented single-pointer function.
-    let register: RegisterFrame = unsafe { std::mem::transmute(register_address as usize) };
+    let register: RegisterFrame = unsafe {
+        std::mem::transmute(
+            usize::try_from(register_address).expect("x86-64 unwind address fits usize"),
+        )
+    };
     for fde in &image.unwind_fdes {
         // SAFETY: Every address was decoded and bounds-checked from the mapped guest .eh_frame.
         unsafe {
-            register(fde.get() as usize as *const libc::c_void);
+            register(
+                usize::try_from(fde.get()).expect("x86-64 guest address fits usize")
+                    as *const libc::c_void,
+            );
         }
     }
     Ok(image.unwind_fdes.len())
@@ -1319,6 +1329,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "wLlFkwG9UcQ" => "time",
         "9BcDykPmo1I" => "__error",
         "5OqszGpy7Mg" => "strtoull",
+        "zlfEH8FmyUA" => "_Stoul",
         "VOBg+iNwB-4" => "strtoll",
         "2vDqwBlpF-o" => "strtod",
         "8u8lPzUEq+U" => "memchr",
@@ -1520,8 +1531,12 @@ struct ProbeDispatchState {
     next_kernel_fd: i32,
     kernel_files: BTreeMap<i32, std::fs::File>,
     save_root: PathBuf,
-    save_mounts: BTreeMap<String, PathBuf>,
+    save_data_initialized: bool,
+    save_mounts: BTreeMap<String, SaveDataMount>,
     next_save_transaction_resource: u32,
+    save_transaction_resources: BTreeSet<u32>,
+    prepared_save_resources: BTreeSet<u32>,
+    save_transactions: BTreeMap<u32, SaveDataTransaction>,
 }
 
 const DEFAULT_THREAD_AFFINITY_MASK: u64 = 0x7f;
@@ -1640,6 +1655,23 @@ struct DirectAllocation {
     start: u64,
     length: u64,
     memory_type: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SaveDataMount {
+    path: PathBuf,
+    committed_path: PathBuf,
+    dir_name: String,
+    user_id: i32,
+    resource: u32,
+    read_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SaveDataTransaction {
+    mount_point: String,
+    committed_path: PathBuf,
+    staging_path: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -1875,8 +1907,12 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.next_kernel_fd = 3;
     state.kernel_files.clear();
     state.save_root = save_data_root(game_root);
+    state.save_data_initialized = false;
     state.save_mounts.clear();
     state.next_save_transaction_resource = 1;
+    state.save_transaction_resources.clear();
+    state.prepared_save_resources.clear();
+    state.save_transactions.clear();
     let sync = GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()));
     *sync
         .0
@@ -2115,7 +2151,10 @@ extern "C" fn import_dispatch(
             Err(error) => ProbeImportReturn::integer(audio_out_error(error)),
         };
     }
-    if matches!(nid.as_str(), "5OqszGpy7Mg" | "VOBg+iNwB-4" | "2vDqwBlpF-o") {
+    if matches!(
+        nid.as_str(),
+        "5OqszGpy7Mg" | "zlfEH8FmyUA" | "VOBg+iNwB-4" | "2vDqwBlpF-o"
+    ) {
         drop(state);
         return dispatch_guest_numeric_parser(&nid, call_args);
     }
@@ -2708,8 +2747,7 @@ fn dispatch_probe_import(
         "1uJgoVq3bQU" => guest_tolower_table(state),
         "rcQCUr0EaRU" => guest_toupper_table(state),
         "9rMML086SEE" | "hEQ2Yi4PJXA" => guest_global_locale(state),
-        "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" | "sDCBrmc61XU" | "85zul--eGXs"
-        | "c88Yy54Mx0w" | "ie7qhZ4X0Cc" => 0,
+        "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" => 0,
         "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => arguments[0],
         // libc time returns Unix seconds and optionally stores the same value through its pointer.
         "wLlFkwG9UcQ" => guest_time(arguments[0]),
@@ -2805,9 +2843,8 @@ fn dispatch_probe_import(
         "PjS5uASwcV8" => video_out_set_buffer_attribute2(arguments, state),
         "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
         "HXzjK9yI30k" => video_out_add_flip_event(arguments, state),
-        // libScePad. Dreaming Sarah consumes these structures during controller discovery and
-        // subsequently on every frame, so leaving them as successful no-ops exposes stale stack
-        // contents as controller capabilities and button state.
+        // libScePad output structures must always be initialized; successful no-ops would expose
+        // stale guest stack contents as controller capabilities and button state.
         "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments, state),
         "gjP9-KQzoUk" => pad_get_controller_information(arguments, state),
         "YndgXqQVV7c" => pad_read_state(arguments, state),
@@ -2816,13 +2853,16 @@ fn dispatch_probe_import(
         "rPo6tV8D9bM" => system_service_get_status(arguments),
         "fZo48un7LK4" => system_service_param_get_int(arguments),
         "Vo5V8KAwCmk" => system_service_hide_splash(state),
-        // libSceSaveData. Returning success without filling the mount result leaves the game's
-        // mount point empty, which turns `/savedata0/-saveindex` into the invalid `/-saveindex`.
+        // libSceSaveData uses durable host-side transactions while preserving the guest ABI.
         "TywrFKCoLGY" => save_data_initialize(state),
-        "dyIhnXq-0SM" => save_data_dir_name_search(arguments),
+        "dyIhnXq-0SM" => save_data_dir_name_search(arguments, state),
         "ZP4e7rlzOUk" => save_data_mount3(arguments, state),
         "gjRZNnw0JPE" => save_data_create_transaction_resource(arguments, state),
         "uW4vfTwMQVo" => save_data_umount2(arguments, state),
+        "sDCBrmc61XU" => save_data_prepare(arguments, state),
+        "85zul--eGXs" => save_data_set_param(arguments, state),
+        "c88Yy54Mx0w" => save_data_save_icon(arguments, state),
+        "ie7qhZ4X0Cc" => save_data_commit(arguments, state),
         // User-service IDs use the retail slot encoding expected by the game's controller layer.
         "CdWp0oHWGr0" => write_output_i32(arguments[0], 0x1000_0000),
         "fPhymKNvK-A" => user_service_get_login_user_id_list(arguments),
@@ -5618,6 +5658,18 @@ fn dispatch_guest_numeric_parser(nid: &str, arguments: [u64; 6]) -> ProbeImportR
     }
     let end_pointer = arguments[1] as *mut *mut libc::c_char;
     let result = match nid {
+        // Dinkumware _Stoul uses the target's unsigned-long parser and the same three-argument
+        // signature as strtoul. Gen5 and the macOS x86-64 host both use a 64-bit unsigned long.
+        "zlfEH8FmyUA" => {
+            // SAFETY: The guest supplies a NUL-terminated string and optional writable end pointer.
+            ProbeImportReturn::integer(unsafe {
+                libc::strtoul(
+                    arguments[0] as *const libc::c_char,
+                    end_pointer,
+                    low_i32(arguments[2]),
+                )
+            })
+        }
         // libc strtoull
         "5OqszGpy7Mg" => {
             // SAFETY: The guest supplies a NUL-terminated string and optional writable end pointer.
@@ -6543,9 +6595,41 @@ fn sanitize_save_segment(value: &str) -> String {
     }
 }
 
-fn save_data_initialize(state: &ProbeDispatchState) -> u64 {
+const SAVE_DATA_ERROR_PARAMETER: u32 = 0x809f_0000;
+const SAVE_DATA_ERROR_NOT_INITIALIZED: u32 = 0x809f_0001;
+const SAVE_DATA_ERROR_OUT_OF_MEMORY: u32 = 0x809f_0002;
+const SAVE_DATA_ERROR_BUSY: u32 = 0x809f_0003;
+const SAVE_DATA_ERROR_NOT_MOUNTED: u32 = 0x809f_0004;
+const SAVE_DATA_ERROR_EXISTS: u32 = 0x809f_0007;
+const SAVE_DATA_ERROR_NOT_FOUND: u32 = 0x809f_0008;
+const SAVE_DATA_ERROR_INTERNAL: u32 = 0x809f_000b;
+const SAVE_DATA_ERROR_MOUNT_FULL: u32 = 0x809f_000c;
+const SAVE_DATA_ERROR_BAD_MOUNTED: u32 = 0x809f_000d;
+const SAVE_DATA_DIR_NAME_SIZE: usize = 32;
+const SAVE_DATA_PARAM_SIZE: usize = 0x530;
+const SAVE_DATA_SEARCH_INFO_SIZE: usize = 0x30;
+const SAVE_DATA_BLOCK_SIZE: u64 = 32 * 1024;
+const SAVE_DATA_MIN_BLOCKS: u64 = 96;
+const SAVE_DATA_MAX_ICON_SIZE: u64 = 16 * 1024 * 1024;
+const SAVE_DATA_MOUNT_MODE_READ_ONLY: u32 = 1 << 0;
+const SAVE_DATA_MOUNT_MODE_READ_WRITE: u32 = 1 << 1;
+const SAVE_DATA_MOUNT_MODE_CREATE: u32 = 1 << 2;
+const SAVE_DATA_MOUNT_MODE_CREATE_IF_MISSING: u32 = 1 << 5;
+
+#[derive(Debug)]
+struct SaveDataSearchEntry {
+    name: String,
+    param: [u8; SAVE_DATA_PARAM_SIZE],
+    blocks: u64,
+    free_blocks: u64,
+    modified_seconds: i64,
+    user_param: u32,
+}
+
+fn save_data_initialize(state: &mut ProbeDispatchState) -> u64 {
     match std::fs::create_dir_all(&state.save_root) {
         Ok(()) => {
+            state.save_data_initialized = true;
             eprintln!(
                 "[REMu][SAVEDATA] initialized root={:?}",
                 state.save_root.display()
@@ -6554,20 +6638,100 @@ fn save_data_initialize(state: &ProbeDispatchState) -> u64 {
         }
         Err(error) => {
             eprintln!("[REMu][SAVEDATA] initialize failed: {error}");
-            sce_kernel_error(0x809f_000b)
+            sce_kernel_error(SAVE_DATA_ERROR_INTERNAL)
         }
     }
 }
 
-fn save_data_dir_name_search(arguments: [u64; 6]) -> u64 {
-    let result = arguments[1];
-    if arguments[0] == 0 || result == 0 {
-        return sce_kernel_error(0x809f_0000);
+fn save_data_dir_name_search(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
     }
-    // The launch path only needs an empty initial search result. These are the hitNum and setNum
-    // fields of SceSaveDataDirNameSearchResult; all caller-owned output buffers remain untouched.
-    write_guest_u32(result, 0);
-    write_guest_u32(result + 0x14, 0);
+    let (condition, result) = (arguments[0], arguments[1]);
+    if condition == 0 || result == 0 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+
+    let user_id = low_i32(u64::from(read_guest_u32(condition)));
+    let title_id_address = read_guest_u64(condition + 0x08);
+    let pattern_address = read_guest_u64(condition + 0x10);
+    let sort_key = read_guest_u32(condition + 0x18);
+    let sort_order = read_guest_u32(condition + 0x1c);
+    if user_id < 0 || !matches!(sort_key, 0 | 1 | 2 | 3 | 5) || sort_order > 1 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let pattern = if pattern_address == 0 {
+        String::new()
+    } else {
+        let Some(pattern) = read_guest_fixed_ascii(pattern_address, SAVE_DATA_DIR_NAME_SIZE) else {
+            return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        };
+        pattern
+    };
+    let title_root = if title_id_address == 0 {
+        state.save_root.clone()
+    } else {
+        let Some(title_id) = read_guest_fixed_ascii(title_id_address, 10) else {
+            return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        };
+        if title_id.is_empty() {
+            return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        }
+        state
+            .save_root
+            .parent()
+            .unwrap_or(&state.save_root)
+            .join(sanitize_save_segment(&title_id))
+    };
+
+    let mut entries = match enumerate_save_data_entries(&title_root, &pattern) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "[REMu][SAVEDATA] search failed root={:?}: {error}",
+                title_root.display()
+            );
+            return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+        }
+    };
+    sort_save_data_entries(&mut entries, sort_key, sort_order);
+
+    let dir_names_address = read_guest_u64(result + 0x08);
+    let dir_names_capacity = read_guest_u32(result + 0x10) as usize;
+    let params_address = read_guest_u64(result + 0x18);
+    let infos_address = read_guest_u64(result + 0x20);
+    let set_count = dir_names_capacity.min(entries.len());
+    if set_count != 0 && dir_names_address == 0 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    write_guest_u32(result, u32::try_from(entries.len()).unwrap_or(u32::MAX));
+    write_guest_u32(
+        result + 0x14,
+        u32::try_from(set_count).expect("set count is bounded by a u32 capacity"),
+    );
+    for (index, entry) in entries.iter().take(set_count).enumerate() {
+        let name_address = dir_names_address
+            + u64::try_from(index * SAVE_DATA_DIR_NAME_SIZE).expect("save result offset fits u64");
+        write_guest_fixed_ascii(name_address, SAVE_DATA_DIR_NAME_SIZE, &entry.name);
+        if params_address != 0 {
+            let address = params_address
+                + u64::try_from(index * SAVE_DATA_PARAM_SIZE).expect("param offset fits u64");
+            write_guest_bytes(address, &entry.param);
+        }
+        if infos_address != 0 {
+            let address = infos_address
+                + u64::try_from(index * SAVE_DATA_SEARCH_INFO_SIZE)
+                    .expect("search info offset fits u64");
+            // SAFETY: the ABI supplies one writable 0x30-byte info record per requested result.
+            unsafe { std::ptr::write_bytes(address as *mut u8, 0, SAVE_DATA_SEARCH_INFO_SIZE) };
+            write_guest_u64(address, entry.blocks);
+            write_guest_u64(address + 0x08, entry.free_blocks);
+        }
+    }
+    eprintln!(
+        "[REMu][SAVEDATA] search user={user_id} pattern={pattern:?} sort={sort_key}/{sort_order} hits={} set={set_count}",
+        entries.len()
+    );
     0
 }
 
@@ -6575,76 +6739,664 @@ fn save_data_create_transaction_resource(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
 ) -> u64 {
-    let id = state.next_save_transaction_resource.max(1);
-    state.next_save_transaction_resource = id.saturating_add(1);
-    let output = if arguments[2] == 0 {
-        0
-    } else if u16::try_from(arguments[2]).is_ok() {
-        arguments[3]
-    } else {
-        arguments[2]
-    };
-    if output != 0 {
-        write_guest_u32(output, id);
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
     }
-    eprintln!("[REMu][SAVEDATA] transaction resource={id} output={output:#x}");
-    0
+    if arguments[0] == 0 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let id = state.next_save_transaction_resource.max(1);
+    let Some(next) = id.checked_add(1) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_OUT_OF_MEMORY);
+    };
+    state.next_save_transaction_resource = next;
+    state.save_transaction_resources.insert(id);
+    eprintln!(
+        "[REMu][SAVEDATA] transaction resource={id} memory_size={:#x}",
+        arguments[0]
+    );
+    u64::from(id)
 }
 
 fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     const MOUNT_RESULT_SIZE: usize = 0x40;
-    const MOUNT_POINT: &str = "/savedata0";
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
     let (mount, result) = (arguments[0], arguments[1]);
     if mount == 0 || result == 0 {
-        return sce_kernel_error(0x809f_0000);
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
     }
     let user_id = low_i32(u64::from(read_guest_u32(mount)));
     let dir_name_address = read_guest_u64(mount + 0x08);
     let blocks = read_guest_u64(mount + 0x10);
     let system_blocks = read_guest_u64(mount + 0x18);
     let mount_mode = read_guest_u32(mount + 0x20);
-    let resource = read_guest_u32(mount + 0x24);
-    let mode = read_guest_u32(mount + 0x28);
-    let Some(dir_name) = read_guest_cstring(dir_name_address) else {
-        return sce_kernel_error(0x809f_0000);
+    let mode = read_guest_u32(mount + 0x24);
+    let resource = read_guest_u32(mount + 0x28);
+    let Some(dir_name) = read_guest_fixed_ascii(dir_name_address, SAVE_DATA_DIR_NAME_SIZE) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
     };
     if user_id < 0 || dir_name.is_empty() {
-        return sce_kernel_error(0x809f_0000);
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    if resource != 0 && !state.save_transaction_resources.contains(&resource) {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
     }
 
     let slot = state.save_root.join(sanitize_save_segment(&dir_name));
     let existed = slot.is_dir();
-    if let Err(error) = std::fs::create_dir_all(&slot) {
+    let create = mount_mode & SAVE_DATA_MOUNT_MODE_CREATE != 0;
+    let create_if_missing = mount_mode & SAVE_DATA_MOUNT_MODE_CREATE_IF_MISSING != 0;
+    if !existed && !create && !create_if_missing {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_FOUND);
+    }
+    if existed && create {
+        return sce_kernel_error(SAVE_DATA_ERROR_EXISTS);
+    }
+    if state
+        .save_mounts
+        .values()
+        .any(|mounted| mounted.path == slot)
+    {
+        return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+    }
+    if !existed && let Err(error) = create_save_data_slot(&slot, &dir_name, blocks) {
         eprintln!(
-            "[REMu][SAVEDATA] mount failed path={:?}: {error}",
+            "[REMu][SAVEDATA] mount creation failed path={:?}: {error}",
             slot.display()
         );
-        return sce_kernel_error(0x809f_000b);
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
     }
+
+    let Some(mount_index) =
+        (0_u8..16).find(|index| !state.save_mounts.contains_key(&format!("/savedata{index}")))
+    else {
+        return sce_kernel_error(SAVE_DATA_ERROR_MOUNT_FULL);
+    };
+    let mount_point = format!("/savedata{mount_index}");
 
     // SAFETY: sceSaveDataMount3 supplies a writable 0x40-byte result structure.
     unsafe {
         std::ptr::write_bytes(result as *mut u8, 0, MOUNT_RESULT_SIZE);
-        std::ptr::copy_nonoverlapping(MOUNT_POINT.as_ptr(), result as *mut u8, MOUNT_POINT.len());
     }
-    write_guest_u32(result + 0x1c, u32::from(!existed));
-    state
-        .save_mounts
-        .insert(MOUNT_POINT.to_owned(), slot.clone());
+    write_guest_fixed_ascii(result, 16, &mount_point);
+    write_guest_u32(result + 0x1c, u32::from(create_if_missing && !existed));
+    state.save_mounts.insert(
+        mount_point.clone(),
+        SaveDataMount {
+            path: slot.clone(),
+            committed_path: slot.clone(),
+            dir_name: dir_name.clone(),
+            user_id,
+            resource,
+            read_only: mount_mode & SAVE_DATA_MOUNT_MODE_READ_ONLY != 0
+                && mount_mode & SAVE_DATA_MOUNT_MODE_READ_WRITE == 0,
+        },
+    );
     eprintln!(
-        "[REMu][SAVEDATA] mount3 user={user_id} dir={dir_name:?} blocks={blocks:#x} system_blocks={system_blocks:#x} mount_mode={mount_mode:#x} resource={resource} mode={mode:#x} mount={MOUNT_POINT:?} host={:?}",
+        "[REMu][SAVEDATA] mount3 user={user_id} dir={dir_name:?} blocks={blocks:#x} system_blocks={system_blocks:#x} mount_mode={mount_mode:#x} resource={resource} mode={mode:#x} mount={mount_point:?} host={:?}",
         slot.display()
     );
     0
 }
 
 fn save_data_umount2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let Some(mount_point) = read_guest_cstring(arguments[0]) else {
-        return 0;
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
+    // Gen5's Umount2 places the mount-point pointer in RSI; retain RDI as a compatibility fallback
+    // for the older ABI that used the same export name.
+    let mount_point_address = if arguments[1] != 0 {
+        arguments[1]
+    } else {
+        arguments[0]
     };
+    let Some(mount_point) = read_guest_fixed_ascii(mount_point_address, 16) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    };
+    let Some(mounted) = state.save_mounts.get(&mount_point) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_FOUND);
+    };
+    if mounted.resource != 0 && state.prepared_save_resources.contains(&mounted.resource) {
+        return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+    }
     state.save_mounts.remove(&mount_point);
     eprintln!("[REMu][SAVEDATA] unmounted {mount_point:?}");
     0
+}
+
+fn save_data_prepare(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
+    let (mount_point_address, prepare_address) = (arguments[0], arguments[1]);
+    if mount_point_address == 0 || prepare_address == 0 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let Some(mount_point) = read_guest_fixed_ascii(mount_point_address, 16) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    };
+    let resource = read_guest_u32(prepare_address);
+    if resource == 0 || !state.save_transaction_resources.contains(&resource) {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let Some(mounted) = state.save_mounts.get(&mount_point) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
+    };
+    if mounted.read_only {
+        return sce_kernel_error(SAVE_DATA_ERROR_BAD_MOUNTED);
+    }
+    if mounted.resource != resource {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    if state.prepared_save_resources.contains(&resource) {
+        return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+    }
+
+    let committed_path = mounted.committed_path.clone();
+    let staging_path = state.save_root.join(format!(
+        "sce_transaction_{}_{}",
+        std::process::id(),
+        resource
+    ));
+    if staging_path.exists() {
+        return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+    }
+    if let Err(error) = copy_save_data_tree(&committed_path, &staging_path) {
+        eprintln!(
+            "[REMu][SAVEDATA] prepare failed resource={resource} staging={:?}: {error}",
+            staging_path.display()
+        );
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
+    let mounted = state
+        .save_mounts
+        .get_mut(&mount_point)
+        .expect("validated save mount remains live under dispatcher lock");
+    mounted.path.clone_from(&staging_path);
+    state.prepared_save_resources.insert(resource);
+    state.save_transactions.insert(
+        resource,
+        SaveDataTransaction {
+            mount_point: mount_point.clone(),
+            committed_path,
+            staging_path,
+        },
+    );
+    eprintln!("[REMu][SAVEDATA] prepared mount={mount_point:?} resource={resource}");
+    0
+}
+
+fn save_data_set_param(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
+    let (mount_point_address, param_type, param_address, param_size) =
+        (arguments[0], arguments[1], arguments[2], arguments[3]);
+    if mount_point_address == 0 || param_address == 0 || param_type > 4 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let Some(mount_point) = read_guest_fixed_ascii(mount_point_address, 16) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    };
+    let Some(mounted) = state.save_mounts.get(&mount_point) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
+    };
+    if mounted.read_only {
+        return sce_kernel_error(SAVE_DATA_ERROR_BAD_MOUNTED);
+    }
+    let mut param = match read_save_data_param(&mounted.path, &mounted.dir_name) {
+        Ok(param) => param,
+        Err(error) => {
+            eprintln!("[REMu][SAVEDATA] read param failed: {error}");
+            return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+        }
+    };
+
+    match param_type {
+        0 => {
+            if param_size != SAVE_DATA_PARAM_SIZE as u64 {
+                return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+            }
+            read_guest_bytes(param_address, &mut param);
+        }
+        1 => {
+            if !replace_save_data_string_field(&mut param[0x00..0x80], param_address, param_size) {
+                return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+            }
+        }
+        2 => {
+            if !replace_save_data_string_field(&mut param[0x80..0x100], param_address, param_size) {
+                return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+            }
+        }
+        3 => {
+            if !replace_save_data_string_field(&mut param[0x100..0x500], param_address, param_size)
+            {
+                return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+            }
+        }
+        4 => {
+            if param_size != 4 {
+                return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+            }
+            param[0x500..0x504].copy_from_slice(&read_guest_u32(param_address).to_le_bytes());
+        }
+        _ => unreachable!("validated save-data parameter type"),
+    }
+    param[0x508..0x510].copy_from_slice(&current_unix_seconds().to_le_bytes());
+    if let Err(error) = write_save_data_param(&mounted.path, &param) {
+        eprintln!("[REMu][SAVEDATA] write param failed: {error}");
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
+    eprintln!(
+        "[REMu][SAVEDATA] set_param mount={mount_point:?} type={param_type} size={param_size:#x}"
+    );
+    0
+}
+
+fn save_data_save_icon(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
+    let (mount_point_address, icon_address) = (arguments[0], arguments[1]);
+    if mount_point_address == 0 || icon_address == 0 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let Some(mount_point) = read_guest_fixed_ascii(mount_point_address, 16) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    };
+    let Some(mounted) = state.save_mounts.get(&mount_point) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
+    };
+    if mounted.read_only {
+        return sce_kernel_error(SAVE_DATA_ERROR_BAD_MOUNTED);
+    }
+    let buffer_address = read_guest_u64(icon_address);
+    let buffer_size = read_guest_u64(icon_address + 0x08);
+    let data_size = read_guest_u64(icon_address + 0x10);
+    let length = buffer_size.min(data_size);
+    if buffer_address == 0 || length > SAVE_DATA_MAX_ICON_SIZE {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    };
+    let mut icon = vec![0_u8; length];
+    read_guest_bytes(buffer_address, &mut icon);
+    let icon_path = mounted.path.join("sce_sys").join("icon0.png");
+    if let Err(error) = write_host_file_durable(&icon_path, &icon) {
+        eprintln!("[REMu][SAVEDATA] write icon failed: {error}");
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
+    eprintln!("[REMu][SAVEDATA] save_icon mount={mount_point:?} bytes={length:#x}");
+    0
+}
+
+fn save_data_commit(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
+    let commit_address = arguments[0];
+    if commit_address == 0 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let resource = read_guest_u32(commit_address);
+    if !state.save_transaction_resources.contains(&resource) {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let Some(transaction) = state.save_transactions.get(&resource).cloned() else {
+        return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+    };
+    if let Err(error) = commit_save_data_transaction(&transaction) {
+        eprintln!("[REMu][SAVEDATA] commit failed resource={resource}: {error}");
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
+    let Some(mounted) = state.save_mounts.get_mut(&transaction.mount_point) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
+    };
+    mounted.path.clone_from(&transaction.committed_path);
+    state.save_transactions.remove(&resource);
+    state.prepared_save_resources.remove(&resource);
+    eprintln!("[REMu][SAVEDATA] committed resource={resource}");
+    0
+}
+
+fn create_save_data_slot(slot: &Path, dir_name: &str, blocks: u64) -> std::io::Result<()> {
+    std::fs::create_dir_all(slot)?;
+    let param = default_save_data_param(dir_name, current_unix_seconds());
+    write_save_data_param(slot, &param)?;
+    write_host_file_durable(
+        &slot.join("sce_sys").join("blocks.bin"),
+        &blocks.to_le_bytes(),
+    )
+}
+
+fn enumerate_save_data_entries(
+    root: &Path,
+    pattern: &str,
+) -> std::io::Result<Vec<SaveDataSearchEntry>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for item in std::fs::read_dir(root)? {
+        let item = item?;
+        if !item.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = item.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if name.to_ascii_lowercase().starts_with("sce_")
+            || (!pattern.is_empty() && !save_data_pattern_matches(&name, pattern))
+        {
+            continue;
+        }
+        let path = item.path();
+        let (size, modified_seconds) = save_data_directory_stats(&path)?;
+        let used_blocks = size.div_ceil(SAVE_DATA_BLOCK_SIZE);
+        let stored_blocks = read_save_data_blocks(&path)?.unwrap_or(SAVE_DATA_MIN_BLOCKS);
+        let blocks = stored_blocks.max(used_blocks).max(1);
+        let mut param = read_save_data_param(&path, &name)?;
+        param[0x508..0x510].copy_from_slice(&modified_seconds.to_le_bytes());
+        let user_param = u32::from_le_bytes(
+            param[0x500..0x504]
+                .try_into()
+                .expect("fixed save user-param field"),
+        );
+        entries.push(SaveDataSearchEntry {
+            name,
+            param,
+            blocks,
+            free_blocks: blocks.saturating_sub(used_blocks),
+            modified_seconds,
+            user_param,
+        });
+    }
+    Ok(entries)
+}
+
+fn sort_save_data_entries(entries: &mut [SaveDataSearchEntry], sort_key: u32, sort_order: u32) {
+    entries.sort_by(|left, right| {
+        let order = match sort_key {
+            0 => left
+                .name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase()),
+            1 => left.user_param.cmp(&right.user_param),
+            2 => left.blocks.cmp(&right.blocks),
+            3 => left.modified_seconds.cmp(&right.modified_seconds),
+            5 => left.free_blocks.cmp(&right.free_blocks),
+            _ => unreachable!("validated save-data sort key"),
+        };
+        order.then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+    });
+    if sort_order == 1 {
+        entries.reverse();
+    }
+}
+
+fn save_data_pattern_matches(value: &str, pattern: &str) -> bool {
+    let value = value
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let pattern = pattern
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut current = vec![false; value.len() + 1];
+        if token == '%' {
+            current[0] = previous[0];
+            for index in 1..=value.len() {
+                current[index] = previous[index] || current[index - 1];
+            }
+        } else {
+            for index in 1..=value.len() {
+                current[index] = previous[index - 1] && (token == '_' || token == value[index - 1]);
+            }
+        }
+        previous = current;
+    }
+    previous[value.len()]
+}
+
+fn default_save_data_param(dir_name: &str, modified_seconds: i64) -> [u8; SAVE_DATA_PARAM_SIZE] {
+    let mut param = [0_u8; SAVE_DATA_PARAM_SIZE];
+    write_ascii_slice(&mut param[0x00..0x80], dir_name);
+    param[0x508..0x510].copy_from_slice(&modified_seconds.to_le_bytes());
+    param
+}
+
+fn read_save_data_param(
+    slot: &Path,
+    dir_name: &str,
+) -> std::io::Result<[u8; SAVE_DATA_PARAM_SIZE]> {
+    let path = slot.join("sce_sys").join("param.bin");
+    if !path.exists() {
+        let modified = std::fs::metadata(slot)
+            .and_then(|metadata| metadata.modified())
+            .map_or_else(|_| current_unix_seconds(), system_time_unix_seconds);
+        return Ok(default_save_data_param(dir_name, modified));
+    }
+    let bytes = std::fs::read(path)?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "save parameter has {} bytes, expected {SAVE_DATA_PARAM_SIZE}",
+                bytes.len()
+            ),
+        )
+    })
+}
+
+fn write_save_data_param(slot: &Path, param: &[u8; SAVE_DATA_PARAM_SIZE]) -> std::io::Result<()> {
+    write_host_file_durable(&slot.join("sce_sys").join("param.bin"), param)
+}
+
+fn read_save_data_blocks(slot: &Path) -> std::io::Result<Option<u64>> {
+    let path = slot.join("sce_sys").join("blocks.bin");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    let bytes: [u8; 8] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("save block metadata has {} bytes, expected 8", bytes.len()),
+        )
+    })?;
+    Ok(Some(u64::from_le_bytes(bytes)))
+}
+
+fn replace_save_data_string_field(field: &mut [u8], address: u64, size: u64) -> bool {
+    let Ok(size) = usize::try_from(size) else {
+        return false;
+    };
+    if size == 0 || size > field.len() {
+        return false;
+    }
+    let mut source = vec![0_u8; size];
+    read_guest_bytes(address, &mut source);
+    field.fill(0);
+    let source_length = source.iter().position(|byte| *byte == 0).unwrap_or(size);
+    let copy_length = source_length.min(field.len().saturating_sub(1));
+    field[..copy_length].copy_from_slice(&source[..copy_length]);
+    true
+}
+
+fn write_ascii_slice(destination: &mut [u8], value: &str) {
+    destination.fill(0);
+    let copy_length = value.len().min(destination.len().saturating_sub(1));
+    for (output, input) in destination[..copy_length].iter_mut().zip(value.as_bytes()) {
+        *output = if input.is_ascii() { *input } else { b'?' };
+    }
+}
+
+fn read_guest_fixed_ascii(address: u64, length: usize) -> Option<String> {
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: fixed-width SaveData ABI strings point to readable guest records of `length` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(length);
+    if !bytes[..end].iter().all(u8::is_ascii) {
+        return None;
+    }
+    String::from_utf8(bytes[..end].to_vec()).ok()
+}
+
+fn write_guest_fixed_ascii(address: u64, length: usize, value: &str) {
+    // SAFETY: the SaveData ABI supplies a writable fixed-width result record.
+    let destination = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length) };
+    write_ascii_slice(destination, value);
+}
+
+fn read_guest_bytes(address: u64, destination: &mut [u8]) {
+    // SAFETY: the guest ABI supplies a readable range matching the declared buffer size.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            address as *const u8,
+            destination.as_mut_ptr(),
+            destination.len(),
+        );
+    }
+}
+
+fn write_guest_bytes(address: u64, source: &[u8]) {
+    // SAFETY: the guest ABI supplies a writable range matching the declared result capacity.
+    unsafe {
+        std::ptr::copy_nonoverlapping(source.as_ptr(), address as *mut u8, source.len());
+    }
+}
+
+fn save_data_directory_stats(root: &Path) -> std::io::Result<(u64, i64)> {
+    let root_metadata = std::fs::metadata(root)?;
+    let mut total = 0_u64;
+    let mut latest = root_metadata
+        .modified()
+        .map_or_else(|_| current_unix_seconds(), system_time_unix_seconds);
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            latest = latest.max(
+                metadata
+                    .modified()
+                    .map_or_else(|_| latest, system_time_unix_seconds),
+            );
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok((total, latest))
+}
+
+fn current_unix_seconds() -> i64 {
+    system_time_unix_seconds(std::time::SystemTime::now())
+}
+
+fn system_time_unix_seconds(time: std::time::SystemTime) -> i64 {
+    time.duration_since(std::time::UNIX_EPOCH).map_or_else(
+        |error| -i64::try_from(error.duration().as_secs()).unwrap_or(i64::MAX),
+        |duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+    )
+}
+
+fn write_host_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn copy_save_data_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(destination)?;
+    let mut pending = vec![(source.to_owned(), destination.to_owned())];
+    while let Some((source_directory, destination_directory)) = pending.pop() {
+        for entry in std::fs::read_dir(source_directory)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination_directory.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                std::fs::create_dir(&destination_path)?;
+                pending.push((source_path, destination_path));
+            } else if file_type.is_file() {
+                std::fs::copy(source_path, destination_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sync_save_data_tree(root: &Path) -> std::io::Result<()> {
+    let mut directories = vec![root.to_owned()];
+    let mut index = 0;
+    while index < directories.len() {
+        for entry in std::fs::read_dir(&directories[index])? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file() {
+                std::fs::File::open(entry.path())?.sync_all()?;
+            }
+        }
+        index += 1;
+    }
+    for directory in directories.into_iter().rev() {
+        std::fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn commit_save_data_transaction(transaction: &SaveDataTransaction) -> std::io::Result<()> {
+    sync_save_data_tree(&transaction.staging_path)?;
+    let file_name = transaction
+        .committed_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("save");
+    let backup_path = transaction.committed_path.with_file_name(format!(
+        "sce_commit_backup_{}_{}_{}",
+        std::process::id(),
+        file_name,
+        transaction
+            .staging_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("transaction")
+    ));
+    std::fs::rename(&transaction.committed_path, &backup_path)?;
+    if let Err(error) = std::fs::rename(&transaction.staging_path, &transaction.committed_path) {
+        let _ = std::fs::rename(&backup_path, &transaction.committed_path);
+        return Err(error);
+    }
+    if let Some(parent) = transaction.committed_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    std::fs::remove_dir_all(backup_path)
 }
 
 fn guest_sincosf(value: f32, sin_address: u64, cos_address: u64) -> u64 {
@@ -6762,12 +7514,13 @@ fn resolve_probe_guest_path(
     guest_path: &str,
 ) -> Option<(PathBuf, bool)> {
     let normalized = guest_path.replace('\\', "/");
-    for (mount_point, host_root) in &state.save_mounts {
+    for (mount_point, mounted) in &state.save_mounts {
         if normalized == *mount_point {
-            return Some((host_root.clone(), true));
+            return Some((mounted.path.clone(), !mounted.read_only));
         }
         if let Some(relative) = normalized.strip_prefix(&format!("{mount_point}/")) {
-            return resolve_path_beneath(host_root, relative).map(|path| (path, true));
+            return resolve_path_beneath(&mounted.path, relative)
+                .map(|path| (path, !mounted.read_only));
         }
     }
     resolve_guest_path(&state.game_root, &normalized).map(|path| (path, false))
@@ -7238,10 +7991,8 @@ fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
     if output == 0 {
         return u64::MAX;
     }
-    // Console titles use clock ids whose numeric values do not match Darwin's constants. Passing
-    // those values through made clock id 4 return host monotonic uptime while the same title used
-    // Unix time elsewhere, producing multi-trillion-second deltas. SharpEmu's working ABI treats
-    // every accepted id as realtime, which is also what Dreaming Sarah expects here.
+    // Console clock ids do not share Darwin's numeric constants. This POSIX compatibility export
+    // returns wall-clock time, matching the console runtime's observable calendar-time contract.
     let mut timestamp = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -7293,6 +8044,9 @@ const fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
 }
 
 #[cfg(target_arch = "x86_64")]
+type GuestModuleInitializer = unsafe extern "C" fn(u64, u64, u64);
+
+#[cfg(target_arch = "x86_64")]
 fn probe_entry(
     image: &LinkedImage,
     process_image_name: &str,
@@ -7325,7 +8079,6 @@ fn probe_entry(
     }
     configure_probe_dispatch(image, game_root, maximum_import_hits);
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
-    type GuestModuleInitializer = unsafe extern "C" fn(u64, u64, u64);
     for initializer in &image.module_initializers {
         eprintln!("[REMu][MODULE] initializing runtime at {initializer}");
         // SAFETY: The module linker relocated this DT_INIT address in executable guest memory.
@@ -7401,16 +8154,20 @@ mod platform_independent_tests {
     use super::{
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
         AGC_R_DRAW_INDEX_AUTO, DEFAULT_THREAD_AFFINITY_MASK, DirectAllocation, GuestExitCallback,
-        MappedAllocation, ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
+        MappedAllocation, ProbeDispatchState, PthreadAttrState, SAVE_DATA_ERROR_EXISTS,
+        SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
-        destroy_pthread_attr, dispatch_probe_import, guest_clock_gettime, guest_free,
-        guest_global_locale, guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr,
-        guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory,
-        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity,
-        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
-        pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
-        sanitize_save_segment, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
+        destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
+        guest_clock_gettime, guest_free, guest_global_locale, guest_qsort, guest_tolower_table,
+        guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
+        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
+        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_detach_state,
+        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
+        read_guest_u64, resolve_guest_path, sanitize_save_segment, save_data_commit,
+        save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
+        save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
+        save_data_umount2, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
         write_guest_u32, write_guest_u64,
     };
 
@@ -7734,6 +8491,26 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn parses_dinkumware_unsigned_longs_with_end_pointer() {
+        let text = c"0x2a tail";
+        let mut end = std::ptr::null_mut::<libc::c_char>();
+        let result = dispatch_guest_numeric_parser(
+            "zlfEH8FmyUA",
+            [
+                text.as_ptr().addr() as u64,
+                (&raw mut end).addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+
+        assert_eq!(result.integer, 42);
+        assert_eq!(end.addr() - text.as_ptr().addr(), 4);
+    }
+
+    #[test]
     fn sorts_guest_elements_with_the_guest_comparator() {
         let mut values = [7_i32, -2, 11, 0, 4];
         guest_qsort([
@@ -7752,6 +8529,210 @@ mod platform_independent_tests {
         assert_eq!(sanitize_save_segment("SAVEDATA00"), "SAVEDATA00");
         assert_eq!(sanitize_save_segment("../outside"), "___outside");
         assert_eq!(sanitize_save_segment("///"), "default");
+    }
+
+    #[test]
+    fn matches_save_data_wildcards_case_insensitively() {
+        assert!(save_data_pattern_matches("SAVEDATA00", "save%"));
+        assert!(save_data_pattern_matches("slot-A", "SLOT__"));
+        assert!(save_data_pattern_matches("alpha-beta", "%ha_b%"));
+        assert!(!save_data_pattern_matches("slot", "slot_"));
+        assert!(!save_data_pattern_matches("other", "save%"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn persists_and_searches_transactional_save_data() {
+        let temporary = TemporaryTestDirectory::new("savedata-transaction");
+        let mut state = ProbeDispatchState {
+            save_root: temporary.path.clone(),
+            save_data_initialized: true,
+            next_save_transaction_resource: 1,
+            ..ProbeDispatchState::default()
+        };
+        std::fs::create_dir_all(&state.save_root).unwrap();
+
+        let resource = save_data_create_transaction_resource([0xc_0000, 0, 0, 0, 0, 0], &mut state);
+        assert_eq!(resource, 1);
+        let resource = u32::try_from(resource).unwrap();
+        let mut dir_name = [0_u8; 32];
+        dir_name[..10].copy_from_slice(b"SAVEDATA00");
+        let mut mount = [0_u8; 0x30];
+        let mut mount_result = [0_u8; 0x40];
+        let mount_address = mount.as_mut_ptr().addr() as u64;
+        write_guest_u32(mount_address, 0x1000_0000);
+        write_guest_u64(mount_address + 0x08, dir_name.as_ptr().addr() as u64);
+        write_guest_u64(mount_address + 0x10, 56);
+        write_guest_u32(mount_address + 0x20, 1 << 5);
+        write_guest_u32(mount_address + 0x28, resource);
+        let result_address = mount_result.as_mut_ptr().addr() as u64;
+        assert_eq!(
+            save_data_mount3([mount_address, result_address, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(&mount_result[..11], b"/savedata0\0");
+        assert_eq!(
+            u32::from_le_bytes(mount_result[0x1c..0x20].try_into().unwrap()),
+            1
+        );
+
+        let mut prepare = [0_u8; 0x28];
+        prepare[..4].copy_from_slice(&resource.to_le_bytes());
+        assert_eq!(
+            save_data_prepare(
+                [result_address, prepare.as_ptr().addr() as u64, 0, 0, 0, 0,],
+                &mut state,
+            ),
+            0
+        );
+
+        let mut param = [0_u8; SAVE_DATA_PARAM_SIZE];
+        param[..14].copy_from_slice(b"Save Metadata\0");
+        param[0x500..0x504].copy_from_slice(&42_u32.to_le_bytes());
+        assert_eq!(
+            save_data_set_param(
+                [
+                    result_address,
+                    0,
+                    param.as_ptr().addr() as u64,
+                    SAVE_DATA_PARAM_SIZE as u64,
+                    0,
+                    0,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        let icon_bytes = b"\x89PNG\r\n\x1a\ntransaction-icon";
+        let icon = [
+            icon_bytes.as_ptr().addr() as u64,
+            icon_bytes.len() as u64,
+            icon_bytes.len() as u64,
+        ];
+        assert_eq!(
+            save_data_save_icon(
+                [result_address, icon.as_ptr().addr() as u64, 0, 0, 0, 0],
+                &state,
+            ),
+            0
+        );
+
+        let committed_param = state.save_root.join("SAVEDATA00/sce_sys/param.bin");
+        assert_ne!(
+            &std::fs::read(&committed_param).unwrap()[..14],
+            b"Save Metadata\0"
+        );
+        let mut commit = [0_u8; 0x28];
+        commit[..4].copy_from_slice(&resource.to_le_bytes());
+        assert_eq!(
+            save_data_commit([commit.as_ptr().addr() as u64, 0, 0, 0, 0, 0], &mut state,),
+            0
+        );
+        assert_eq!(
+            &std::fs::read(&committed_param).unwrap()[..14],
+            b"Save Metadata\0"
+        );
+        assert_eq!(
+            std::fs::read(state.save_root.join("SAVEDATA00/sce_sys/icon0.png")).unwrap(),
+            icon_bytes
+        );
+
+        let mut search_condition = [0_u8; 0x40];
+        let mut search_result = [0_u8; 0x30];
+        let pattern = b"save%\0";
+        let mut found_names = [0_u8; 64];
+        let mut found_params = vec![0_u8; SAVE_DATA_PARAM_SIZE * 2];
+        let mut found_infos = [0_u8; 0x60];
+        let condition_address = search_condition.as_mut_ptr().addr() as u64;
+        let search_result_address = search_result.as_mut_ptr().addr() as u64;
+        write_guest_u32(condition_address, 0x1000_0000);
+        write_guest_u64(condition_address + 0x10, pattern.as_ptr().addr() as u64);
+        write_guest_u32(condition_address + 0x18, 1);
+        write_guest_u64(
+            search_result_address + 0x08,
+            found_names.as_mut_ptr().addr() as u64,
+        );
+        write_guest_u32(search_result_address + 0x10, 2);
+        write_guest_u64(
+            search_result_address + 0x18,
+            found_params.as_mut_ptr().addr() as u64,
+        );
+        write_guest_u64(
+            search_result_address + 0x20,
+            found_infos.as_mut_ptr().addr() as u64,
+        );
+        assert_eq!(
+            save_data_dir_name_search(
+                [condition_address, search_result_address, 0, 0, 0, 0],
+                &state,
+            ),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(search_result[..4].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(search_result[0x14..0x18].try_into().unwrap()),
+            1
+        );
+        assert_eq!(&found_names[..11], b"SAVEDATA00\0");
+        assert_eq!(&found_params[..14], b"Save Metadata\0");
+        assert_eq!(u64::from_le_bytes(found_infos[..8].try_into().unwrap()), 56);
+
+        assert_eq!(
+            save_data_umount2([0, result_address, 0, 0, 0, 0], &mut state),
+            0
+        );
+        mount_result.fill(0);
+        assert_eq!(
+            save_data_mount3([mount_address, result_address, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(mount_result[0x1c..0x20].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            save_data_umount2([0, result_address, 0, 0, 0, 0], &mut state),
+            0
+        );
+        write_guest_u32(mount_address + 0x20, 1 << 2);
+        assert_eq!(
+            save_data_mount3([mount_address, result_address, 0, 0, 0, 0], &mut state),
+            sce_kernel_error(SAVE_DATA_ERROR_EXISTS)
+        );
+        dir_name.fill(0);
+        dir_name[..7].copy_from_slice(b"MISSING");
+        write_guest_u32(mount_address + 0x20, 1 << 1);
+        assert_eq!(
+            save_data_mount3([mount_address, result_address, 0, 0, 0, 0], &mut state),
+            sce_kernel_error(SAVE_DATA_ERROR_NOT_FOUND)
+        );
+    }
+
+    struct TemporaryTestDirectory {
+        path: std::path::PathBuf,
+    }
+
+    impl TemporaryTestDirectory {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("remu-{label}-{}-{id}", std::process::id()));
+            if path.exists() {
+                std::fs::remove_dir_all(&path).unwrap();
+            }
+            std::fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TemporaryTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]
