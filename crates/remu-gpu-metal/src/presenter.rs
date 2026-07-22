@@ -325,18 +325,11 @@ impl MetalPresenter {
                 }
                 Ok(GpuEvent::IndexedDraw(draw)) => {
                     self.compile_draw_shaders(&draw);
-                    match self.execute_compiled_draw(&draw) {
-                        Ok(()) => continue,
-                        Err(error) => {
-                            let key = (draw.export_shader_address, draw.pixel_shader_address);
-                            if self.failed_draw_execution.insert(key) {
-                                eprintln!(
-                                    "[REMu][METAL] Gen5 draw es={:#x} ps={:#x} could not execute: {error}",
-                                    key.0, key.1
-                                );
-                            }
-                        }
-                    }
+                    // Dreaming Sarah's observed presentation, clear, and sprite pipelines have
+                    // direct guest-memory implementations. Prefer them even after their generic
+                    // Metal pipelines compile: the generic bridge currently snapshots, uploads,
+                    // and reads back an entire 4K render target per draw, which saturates the
+                    // bounded event queue and stalls every guest thread behind the import lock.
                     if is_dreaming_presenter_draw(&draw) {
                         self.pending_guest_draw = Some(*draw);
                     } else if let Some(fill) = execute_dreaming_fill_draw(&draw) {
@@ -370,27 +363,36 @@ impl MetalPresenter {
                                 executed.height,
                             );
                         }
-                    } else if self.logged_unsupported_guest_draws.len() < 16
-                        && self
-                            .logged_unsupported_guest_draws
-                            .insert((draw.export_shader_prefix, draw.pixel_shader_prefix))
-                    {
-                        let pixel_scalars = pixel_scalars(&draw);
-                        eprintln!(
-                            "[REMu][METAL] no translated Metal path for es={:#x}/{:x?} ps={:#x}/{:x?} indexed={} count={} instances={} target={:#x} cb_info={:#x} cb_attrib2={:#x} cb_attrib3={:#x} target_mask={:#x} ps_scalars={pixel_scalars:x?}",
-                            draw.export_shader_address,
-                            draw.export_shader_prefix,
-                            draw.pixel_shader_address,
-                            draw.pixel_shader_prefix,
-                            draw.indexed,
-                            draw.index_count,
-                            draw.instance_count,
-                            draw.color_target_address,
-                            register_value(&draw.context_registers, 0x31c).unwrap_or_default(),
-                            register_value(&draw.context_registers, 0x3b0).unwrap_or_default(),
-                            register_value(&draw.context_registers, 0x3b8).unwrap_or_default(),
-                            register_value(&draw.context_registers, 0x08e).unwrap_or_default(),
-                        );
+                    } else if let Err(error) = self.execute_compiled_draw(&draw) {
+                        let key = (draw.export_shader_address, draw.pixel_shader_address);
+                        if self.failed_draw_execution.insert(key) {
+                            eprintln!(
+                                "[REMu][METAL] Gen5 draw es={:#x} ps={:#x} could not execute: {error}",
+                                key.0, key.1
+                            );
+                        }
+                        if self.logged_unsupported_guest_draws.len() < 16
+                            && self
+                                .logged_unsupported_guest_draws
+                                .insert((draw.export_shader_prefix, draw.pixel_shader_prefix))
+                        {
+                            let pixel_scalars = pixel_scalars(&draw);
+                            eprintln!(
+                                "[REMu][METAL] no translated Metal path for es={:#x}/{:x?} ps={:#x}/{:x?} indexed={} count={} instances={} target={:#x} cb_info={:#x} cb_attrib2={:#x} cb_attrib3={:#x} target_mask={:#x} ps_scalars={pixel_scalars:x?}",
+                                draw.export_shader_address,
+                                draw.export_shader_prefix,
+                                draw.pixel_shader_address,
+                                draw.pixel_shader_prefix,
+                                draw.indexed,
+                                draw.index_count,
+                                draw.instance_count,
+                                draw.color_target_address,
+                                register_value(&draw.context_registers, 0x31c).unwrap_or_default(),
+                                register_value(&draw.context_registers, 0x3b0).unwrap_or_default(),
+                                register_value(&draw.context_registers, 0x3b8).unwrap_or_default(),
+                                register_value(&draw.context_registers, 0x08e).unwrap_or_default(),
+                            );
+                        }
                     }
                 }
                 Ok(GpuEvent::Shutdown) | Err(TryRecvError::Disconnected) => {
