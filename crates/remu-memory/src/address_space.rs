@@ -126,6 +126,8 @@ pub struct GuestVmaInfo {
     pub protection: GuestProtection,
     pub backing_id: Option<u64>,
     pub backing_offset: u64,
+    /// Opaque subsystem-owned metadata preserved across VMA splits.
+    pub metadata: u64,
 }
 
 #[derive(Debug, Error)]
@@ -344,6 +346,7 @@ struct Vma {
     protection: GuestProtection,
     kind: VmaKind,
     backing_offset: u64,
+    metadata: u64,
 }
 
 impl Vma {
@@ -359,11 +362,15 @@ impl Vma {
             protection: self.protection,
             backing_id,
             backing_offset,
+            metadata: self.metadata,
         }
     }
 
     fn can_merge(&self, next: &Self) -> bool {
-        if self.end != next.start || self.protection != next.protection {
+        if self.end != next.start
+            || self.protection != next.protection
+            || self.metadata != next.metadata
+        {
             return false;
         }
         match (&self.kind, &next.kind) {
@@ -395,6 +402,11 @@ struct HostReservation {
 // SAFETY: This is the unique owner of process VM pages. Moving it between threads does not create
 // an additional owner or invalidate the mapping.
 unsafe impl Send for HostReservation {}
+// SAFETY: HostReservation contains no Rust references and immutable access only observes its
+// address and size. VMA mutation still requires `&mut GuestAddressSpace`; callers that execute or
+// expose raw guest pointers must synchronize mapping changes with those users at the runtime
+// boundary, just as they must for mmap/munmap themselves.
+unsafe impl Sync for HostReservation {}
 
 impl HostReservation {
     fn anywhere(size: u64) -> Result<Self, AddressSpaceError> {
@@ -611,6 +623,7 @@ impl GuestAddressSpace {
                 protection: GuestProtection::NONE,
                 kind: VmaKind::Reserved,
                 backing_offset: 0,
+                metadata: 0,
             },
         );
         self.normalize();
@@ -639,6 +652,7 @@ impl GuestAddressSpace {
                 protection,
                 kind: VmaKind::Anonymous,
                 backing_offset: 0,
+                metadata: 0,
             },
         );
         self.normalize();
@@ -679,6 +693,7 @@ impl GuestAddressSpace {
                 protection,
                 kind: VmaKind::Shared(backing.clone()),
                 backing_offset,
+                metadata: 0,
             },
         );
         self.normalize();
@@ -721,6 +736,25 @@ impl GuestAddressSpace {
         Ok(())
     }
 
+    /// Associates opaque subsystem metadata with mapped pages. The value participates in VMA
+    /// merging and is retained by partial unmap and protection operations.
+    pub fn set_metadata(
+        &mut self,
+        address: GuestAddress,
+        size: u64,
+        metadata: u64,
+    ) -> Result<(), AddressSpaceError> {
+        let (start, end) = self.validate_page_range(address, size)?;
+        self.ensure_covered(start, end, true, None)?;
+        self.split_at(start);
+        self.split_at(end);
+        for (_, vma) in self.vmas.range_mut(start..end) {
+            vma.metadata = metadata;
+        }
+        self.normalize();
+        Ok(())
+    }
+
     /// Returns either the explicit VMA or the complete free gap containing `address`.
     pub fn query(&self, address: GuestAddress) -> Result<GuestVmaInfo, AddressSpaceError> {
         let value = address.get();
@@ -754,6 +788,7 @@ impl GuestAddressSpace {
             protection: GuestProtection::NONE,
             backing_id: None,
             backing_offset: 0,
+            metadata: 0,
         })
     }
 
@@ -1244,6 +1279,7 @@ mod tests {
                 protection: GuestProtection::NONE,
                 backing_id: None,
                 backing_offset: 0,
+                metadata: 0,
             }
         );
     }
@@ -1336,6 +1372,29 @@ mod tests {
             .protect(page(base, 1), GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
             .unwrap();
         assert_eq!(memory.vmas().len(), 1);
+    }
+
+    #[test]
+    fn opaque_metadata_follows_split_and_merge_range_surgery() {
+        let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+        let base = memory
+            .map_anonymous(
+                GuestMapPlacement::Anywhere,
+                3 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+            )
+            .unwrap();
+        memory
+            .set_metadata(page(base, 1), GUEST_PAGE_SIZE, 42)
+            .unwrap();
+        let split = memory.vmas();
+        assert_eq!(split.len(), 3);
+        assert_eq!(split[1].metadata, 42);
+        memory.set_metadata(base, 3 * GUEST_PAGE_SIZE, 7).unwrap();
+        let merged = memory.vmas();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].metadata, 7);
     }
 
     #[test]

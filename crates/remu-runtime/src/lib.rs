@@ -3,14 +3,14 @@
 
 mod agc_register_defaults;
 mod audio;
+#[cfg(target_os = "macos")]
+mod kernel_memory;
 mod np;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
@@ -22,6 +22,8 @@ use remu_loader::{
     DynamicInfo, Elf64Rela, Elf64Symbol, ImportedSymbol, InspectError, LoadedExecutable,
     ModuleDependencyGraphError, UnresolvedModuleDependency, resolve_module_dependency_graph,
 };
+#[cfg(target_os = "macos")]
+use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapPlacement};
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage, MappingError};
 use remu_shader::GuestMemoryReader;
 use thiserror::Error;
@@ -1956,6 +1958,11 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "pO96TwzOm5E" => "sceKernelGetDirectMemorySize",
         "rTXw65xmLIA" => "sceKernelAllocateDirectMemory",
         "L-Q3LEjIbgA" => "sceKernelMapDirectMemory",
+        "BQQniolj9tQ" => "sceKernelMapDirectMemory2",
+        "hwVSPCmp5tM" => "sceKernelCheckedReleaseDirectMemory",
+        "MBuItvba6z8" => "sceKernelReleaseDirectMemory",
+        "rVjRvHJ0X6c" => "sceKernelVirtualQuery",
+        "cQke9UuBQOk" => "sceKernelMunmap",
         "D0OdFMjp46I" => "sceKernelCreateEqueue",
         "fzyMKs9kim0" => "sceKernelWaitEqueue",
         "lLMT9vJAck0" => "clock_gettime",
@@ -2108,10 +2115,8 @@ fn write_import_stub(slot: &mut [u8], index: usize, dispatcher: u64) -> Result<(
 #[derive(Debug, Default)]
 struct ProbeDispatchState {
     unimplemented_nids: BTreeSet<String>,
-    direct_allocations: BTreeMap<u64, DirectAllocation>,
-    direct_memory_backing: Option<std::fs::File>,
-    next_virtual_hint: u64,
-    mapped_allocations: Vec<MappedAllocation>,
+    #[cfg(target_os = "macos")]
+    kernel_memory: Option<kernel_memory::KernelMemory>,
     next_thread_unique_id: u64,
     thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
     thread_attributes: BTreeMap<u64, PthreadAttrState>,
@@ -2258,21 +2263,6 @@ enum SplashState {
     #[default]
     Visible,
     Hidden,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MappedAllocation {
-    address: u64,
-    length: u64,
-    direct_start: u64,
-    protection: i32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DirectAllocation {
-    start: u64,
-    length: u64,
-    memory_type: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2504,10 +2494,10 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         Arc::new(ImportTelemetry::new(nids, maximum_hits));
     state.unimplemented_nids.clear();
-    state.direct_allocations.clear();
-    state.direct_memory_backing = None;
-    state.next_virtual_hint = 0x20_0000_0000;
-    state.mapped_allocations.clear();
+    #[cfg(target_os = "macos")]
+    {
+        state.kernel_memory = None;
+    }
     state.thread_handles.clear();
     state.thread_attributes.clear();
     state.detached_threads.clear();
@@ -3474,10 +3464,13 @@ fn dispatch_probe_import(
         "rTXw65xmLIA" => allocate_direct_memory(arguments, state),
         // sceKernelMapDirectMemory
         "L-Q3LEjIbgA" => map_direct_memory(arguments, state),
+        // sceKernelMapDirectMemory2 inserts memory type and passes alignment as argument seven.
+        "BQQniolj9tQ" => map_direct_memory_2(arguments, stack_arguments[0], state),
         // Kernel VM ownership calls must describe and retire the mappings created above. Returning
         // success without filling VirtualQuery makes libc feed uninitialized lengths into munmap.
         "rVjRvHJ0X6c" => kernel_virtual_query(arguments, state),
         "cQke9UuBQOk" => kernel_munmap(arguments, state),
+        "hwVSPCmp5tM" => kernel_checked_release_direct_memory(arguments, state),
         "MBuItvba6z8" => kernel_release_direct_memory(arguments, state),
         // libc memset
         "8zTFvBIAIN8" => guest_memset(arguments[0], arguments[1], arguments[2]),
@@ -6613,8 +6606,61 @@ fn write_output_i32(address: u64, value: i32) -> u64 {
     0
 }
 
+#[cfg(target_os = "macos")]
+fn kernel_memory_mut(
+    state: &mut ProbeDispatchState,
+) -> Result<&mut kernel_memory::KernelMemory, kernel_memory::KernelMemoryError> {
+    if state.kernel_memory.is_none() {
+        state.kernel_memory = Some(kernel_memory::KernelMemory::new()?);
+    }
+    Ok(state
+        .kernel_memory
+        .as_mut()
+        .expect("kernel memory was initialized immediately above"))
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_memory_error(error: &kernel_memory::KernelMemoryError) -> u64 {
+    use kernel_memory::KernelMemoryError;
+
+    let code = match error {
+        KernelMemoryError::DirectMemoryOverflow { .. }
+        | KernelMemoryError::AddressSpace(
+            AddressSpaceError::ZeroSize
+            | AddressSpaceError::Unaligned { .. }
+            | AddressSpaceError::InvalidAlignment { .. }
+            | AddressSpaceError::AddressOverflow { .. }
+            | AddressSpaceError::HostSizeOverflow { .. }
+            | AddressSpaceError::BackingOutOfBounds { .. }
+            | AddressSpaceError::ZeroBackingSize,
+        ) => SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+        KernelMemoryError::DirectMemoryNotAllocated { .. }
+        | KernelMemoryError::AddressSpace(
+            AddressSpaceError::NotMapped { .. }
+            | AddressSpaceError::Reserved { .. }
+            | AddressSpaceError::Overlap { .. }
+            | AddressSpaceError::OutOfBounds { .. },
+        ) => SCE_KERNEL_ERROR_NOT_FOUND,
+        KernelMemoryError::AddressSpace(AddressSpaceError::PermissionDenied { .. }) => {
+            SCE_KERNEL_ERROR_PERMISSION_DENIED
+        }
+        KernelMemoryError::DirectMemoryExhausted { .. }
+        | KernelMemoryError::AddressSpace(
+            AddressSpaceError::InvalidHostPageSize
+            | AddressSpaceError::IncompatibleHostPageSize { .. }
+            | AddressSpaceError::AddressSpaceExhausted { .. }
+            | AddressSpaceError::BackingOperationFailed { .. }
+            | AddressSpaceError::ReservationFailed { .. }
+            | AddressSpaceError::MachReservationFailed { .. }
+            | AddressSpaceError::HostOperationFailed { .. },
+        ) => SCE_KERNEL_ERROR_TRY_AGAIN,
+    };
+    sce_kernel_error(code)
+}
+
+#[cfg(target_os = "macos")]
 fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    const DIRECT_MEMORY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+    const DIRECT_MEMORY_SIZE: u64 = kernel_memory::DIRECT_MEMORY_SIZE;
     let search_start = i64::from_ne_bytes(arguments[0].to_ne_bytes())
         .max(0)
         .cast_unsigned();
@@ -6629,8 +6675,9 @@ fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -
     let output = arguments[5];
     if length == 0
         || output == 0
+        || !length.is_multiple_of(GUEST_PAGE_SIZE)
         || !alignment.is_power_of_two()
-        || alignment < MACOS_GUEST_PAGE_ALIGNMENT
+        || alignment < GUEST_PAGE_SIZE
     {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
@@ -6644,23 +6691,15 @@ fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -
     } else {
         search_start
     };
-    let Some(offset) = find_free_direct_range(
-        &state.direct_allocations,
-        search_start,
-        search_end,
-        length,
-        alignment,
-    ) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
+    let memory = match kernel_memory_mut(state) {
+        Ok(memory) => memory,
+        Err(error) => return kernel_memory_error(&error),
     };
-    state.direct_allocations.insert(
-        offset,
-        DirectAllocation {
-            start: offset,
-            length,
-            memory_type,
-        },
-    );
+    let offset =
+        match memory.allocate_direct(search_start, search_end, length, alignment, memory_type) {
+            Ok(offset) => offset,
+            Err(error) => return kernel_memory_error(&error),
+        };
     write_guest_u64(output, offset);
     if trace_guest_vm() {
         eprintln!(
@@ -6670,38 +6709,38 @@ fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -
     0
 }
 
-fn find_free_direct_range(
-    allocations: &BTreeMap<u64, DirectAllocation>,
-    search_start: u64,
-    search_end: u64,
-    length: u64,
-    alignment: u64,
-) -> Option<u64> {
-    let mut candidate = align_up_u64(search_start, alignment)?;
-    for allocation in allocations.values() {
-        let allocation_end = allocation.start.checked_add(allocation.length)?;
-        if allocation_end <= candidate {
-            continue;
-        }
-        let gap_end = allocation.start.min(search_end);
-        if candidate.checked_add(length)? <= gap_end {
-            return Some(candidate);
-        }
-        if allocation.start >= search_end {
-            return None;
-        }
-        candidate = align_up_u64(candidate.max(allocation_end), alignment)?;
-    }
-    if candidate.checked_add(length)? <= search_end {
-        Some(candidate)
-    } else {
-        None
-    }
+#[cfg(not(target_os = "macos"))]
+fn allocate_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(unix)]
-#[allow(clippy::too_many_lines)]
+#[cfg(target_os = "macos")]
 fn map_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    map_direct_memory_core(arguments, None, state)
+}
+
+#[cfg(target_os = "macos")]
+fn map_direct_memory_2(arguments: [u64; 6], alignment: u64, state: &mut ProbeDispatchState) -> u64 {
+    map_direct_memory_core(
+        [
+            arguments[0],
+            arguments[1],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+            alignment,
+        ],
+        Some(low_i32(arguments[2])),
+        state,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn map_direct_memory_core(
+    arguments: [u64; 6],
+    memory_type: Option<i32>,
+    state: &mut ProbeDispatchState,
+) -> u64 {
     let (output, length, protection, flags, direct_start) = (
         arguments[0],
         arguments[1],
@@ -6717,185 +6756,66 @@ fn map_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
     if output == 0
         || length == 0
         || !alignment.is_power_of_two()
-        || alignment < MACOS_GUEST_PAGE_ALIGNMENT
-        || !direct_start.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
-        || !length.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
+        || alignment < GUEST_PAGE_SIZE
+        || !direct_start.is_multiple_of(GUEST_PAGE_SIZE)
+        || !length.is_multiple_of(GUEST_PAGE_SIZE)
     {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(direct_end) = direct_start.checked_add(length) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    };
-    if !state.direct_allocations.values().any(|allocation| {
-        allocation.start <= direct_start
-            && allocation
-                .start
-                .checked_add(allocation.length)
-                .is_some_and(|end| direct_end <= end)
-    }) {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    }
-    let Ok(length_usize) = usize::try_from(length) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    };
-    let Ok(alignment_usize) = usize::try_from(alignment) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    };
-    let Some(reservation_size) = length_usize.checked_add(alignment_usize) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    };
-    if state.direct_memory_backing.is_none() {
-        state.direct_memory_backing = create_direct_memory_backing();
-    }
-    let Some(backing) = state.direct_memory_backing.as_ref() else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
-    };
     let requested = read_guest_u64(output);
     let fixed = flags & 0x10 != 0 && requested != 0;
-    let hint = if requested != 0 {
-        requested
+    let memory = match kernel_memory_mut(state) {
+        Ok(memory) => memory,
+        Err(error) => return kernel_memory_error(&error),
+    };
+    let placement = if fixed {
+        GuestMapPlacement::Fixed(GuestAddress::new(requested))
+    } else if requested != 0 && memory.contains_virtual_address(GuestAddress::new(requested)) {
+        GuestMapPlacement::Hint(GuestAddress::new(requested))
     } else {
-        align_up_u64(state.next_virtual_hint, alignment).unwrap_or(0)
+        GuestMapPlacement::Anywhere
     };
-    // Reserve an anonymous range first. MAP_FIXED below only replaces pages owned by this
-    // reservation, so a fixed guest request can never overwrite the Rosetta stack or host image.
-    let reservation = unsafe {
-        libc::mmap(
-            hint as *mut std::ffi::c_void,
-            reservation_size,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
+    let result = if let Some(memory_type) = memory_type {
+        memory.map_direct_with_memory_type(
+            placement,
+            length,
+            alignment,
+            protection,
+            direct_start,
+            Some(memory_type),
         )
+    } else {
+        memory.map_direct(placement, length, alignment, protection, direct_start)
     };
-    if reservation == libc::MAP_FAILED {
-        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
-    }
-    if fixed && reservation.addr() != usize::try_from(requested).unwrap_or(0) {
-        // SAFETY: reservation and size are the exact range returned by mmap above.
-        unsafe {
-            libc::munmap(reservation, reservation_size);
-        }
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    }
-    let reservation_address = reservation as usize;
-    let Some(aligned_address) = reservation_address
-        .checked_add(alignment_usize - 1)
-        .map(|value| value & !(alignment_usize - 1))
-    else {
-        // SAFETY: Releases the reservation returned by mmap above.
-        unsafe {
-            libc::munmap(reservation, reservation_size);
-        }
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    let mapped = match result {
+        Ok(mapped) => mapped,
+        Err(error) => return kernel_memory_error(&error),
     };
-    let prefix = aligned_address - reservation_address;
-    let suffix = reservation_size - prefix - length_usize;
-    let host_protection = host_memory_protection(protection);
-    let Ok(file_offset) = libc::off_t::try_from(direct_start) else {
-        // SAFETY: reservation and size are the exact range returned by mmap above.
-        unsafe {
-            libc::munmap(reservation, reservation_size);
-        }
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    };
-    // SAFETY: MAP_FIXED replaces only the aligned subrange of our private reservation with a
-    // shared view of the sparse direct-memory backing object.
-    let mapped = unsafe {
-        libc::mmap(
-            aligned_address as *mut std::ffi::c_void,
-            length_usize,
-            host_protection,
-            libc::MAP_SHARED | libc::MAP_FIXED,
-            backing.as_raw_fd(),
-            file_offset,
-        )
-    };
-    if mapped == libc::MAP_FAILED {
-        // SAFETY: reservation and size are the exact range returned by mmap above.
-        unsafe {
-            libc::munmap(reservation, reservation_size);
-        }
-        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
-    }
-    // SAFETY: Prefix/suffix are page-aligned subranges of the reservation around the file view.
-    unsafe {
-        if prefix != 0 {
-            libc::munmap(reservation, prefix);
-        }
-        if suffix != 0 {
-            libc::munmap(
-                (aligned_address + length_usize) as *mut std::ffi::c_void,
-                suffix,
-            );
-        }
-    }
-    write_guest_u64(output, aligned_address as u64);
-    state.next_virtual_hint = (aligned_address as u64).saturating_add(length);
-    state.mapped_allocations.push(MappedAllocation {
-        address: aligned_address as u64,
-        length,
-        direct_start,
-        protection,
-    });
+    write_guest_u64(output, mapped.get());
     if trace_guest_vm() {
         eprintln!(
-            "[REMu][VM] mapped direct={direct_start:#x} address={aligned_address:#x} length={length:#x} protection={protection:#x}"
+            "[REMu][VM] mapped direct={direct_start:#x} address={:#x} length={length:#x} protection={protection:#x}",
+            mapped.get()
         );
     }
     0
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "macos"))]
 fn map_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(unix)]
-fn create_direct_memory_backing() -> Option<std::fs::File> {
-    const DIRECT_MEMORY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
-    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
-    for _ in 0..32 {
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "remu-direct-memory-{}-{sequence}",
-            std::process::id()
-        ));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path);
-        let Ok(file) = file else {
-            continue;
-        };
-        if file.set_len(DIRECT_MEMORY_SIZE).is_err() {
-            let _ = std::fs::remove_file(&path);
-            return None;
-        }
-        let _ = std::fs::remove_file(&path);
-        return Some(file);
-    }
-    None
+#[cfg(not(target_os = "macos"))]
+fn map_direct_memory_2(
+    _arguments: [u64; 6],
+    _alignment: u64,
+    _state: &mut ProbeDispatchState,
+) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(unix)]
-fn host_memory_protection(protection: i32) -> i32 {
-    let mut result = libc::PROT_NONE;
-    if protection & (0x01 | 0x10) != 0 {
-        result |= libc::PROT_READ;
-    }
-    if protection & (0x02 | 0x20) != 0 {
-        result |= libc::PROT_WRITE;
-    }
-    if protection & 0x04 != 0 {
-        result |= libc::PROT_EXEC;
-    }
-    result
-}
-
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let address = arguments[0];
     let length = arguments[1];
@@ -6903,61 +6823,25 @@ fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     if address == 0 || length == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let aligned_address = address & !(MACOS_GUEST_PAGE_ALIGNMENT - 1);
+    let aligned_address = address & !(GUEST_PAGE_SIZE - 1);
     let Some(raw_end) = address.checked_add(length) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    let Some(aligned_end) = align_up_u64(raw_end, MACOS_GUEST_PAGE_ALIGNMENT) else {
+    let Some(aligned_end) = align_up_u64(raw_end, GUEST_PAGE_SIZE) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     let aligned_length = aligned_end - aligned_address;
-    let Ok(aligned_length_usize) = usize::try_from(aligned_length) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    let memory = match kernel_memory_mut(state) {
+        Ok(memory) => memory,
+        Err(error) => return kernel_memory_error(&error),
     };
-    // SAFETY: The guest asks the kernel to change protection on its own page-aligned mapped range.
-    // mprotect validates that the full host range is mapped before changing it.
-    if unsafe {
-        libc::mprotect(
-            aligned_address as *mut std::ffi::c_void,
-            aligned_length_usize,
-            host_memory_protection(protection),
-        )
-    } != 0
-    {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    if let Err(error) = memory.protect(
+        GuestAddress::new(aligned_address),
+        aligned_length,
+        protection,
+    ) {
+        return kernel_memory_error(&error);
     }
-
-    let mut updated = Vec::with_capacity(state.mapped_allocations.len() + 2);
-    for allocation in state.mapped_allocations.drain(..) {
-        let allocation_end = allocation.address.saturating_add(allocation.length);
-        let overlap_start = allocation.address.max(aligned_address);
-        let overlap_end = allocation_end.min(aligned_end);
-        if overlap_start >= overlap_end {
-            updated.push(allocation);
-            continue;
-        }
-        if allocation.address < overlap_start {
-            updated.push(MappedAllocation {
-                length: overlap_start - allocation.address,
-                ..allocation
-            });
-        }
-        updated.push(MappedAllocation {
-            address: overlap_start,
-            length: overlap_end - overlap_start,
-            direct_start: allocation.direct_start + (overlap_start - allocation.address),
-            protection,
-        });
-        if overlap_end < allocation_end {
-            updated.push(MappedAllocation {
-                address: overlap_end,
-                length: allocation_end - overlap_end,
-                direct_start: allocation.direct_start + (overlap_end - allocation.address),
-                protection: allocation.protection,
-            });
-        }
-    }
-    state.mapped_allocations = updated;
     if trace_guest_vm() {
         eprintln!(
             "[REMu][VM] protected address={aligned_address:#x} length={aligned_length:#x} protection={protection:#x}"
@@ -6966,11 +6850,12 @@ fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     0
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "macos"))]
 fn kernel_mprotect(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
+#[cfg(target_os = "macos")]
 fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     const VIRTUAL_QUERY_INFO_SIZE: u64 = 72;
     let (query, flags, output, output_size) = (
@@ -6982,28 +6867,19 @@ fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 
     if output == 0 || output_size < VIRTUAL_QUERY_INFO_SIZE {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let allocation = state
-        .mapped_allocations
-        .iter()
-        .filter(|allocation| {
-            let end = allocation.address.saturating_add(allocation.length);
-            (query >= allocation.address && query < end)
-                || (flags & 1 != 0 && allocation.address >= query)
-        })
-        .min_by_key(|allocation| {
-            let contains = query >= allocation.address
-                && query < allocation.address.saturating_add(allocation.length);
-            (!contains, allocation.address)
-        });
-    let Some(allocation) = allocation else {
+    let Some(memory) = state.kernel_memory.as_ref() else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
-    let end = allocation.address.saturating_add(allocation.length);
+    let Some(allocation) = memory.query(GuestAddress::new(query), flags & 1 != 0) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let end = allocation.address.get().saturating_add(allocation.size);
     guest_memset(output, 0, VIRTUAL_QUERY_INFO_SIZE);
-    write_guest_u64(output, allocation.address);
+    write_guest_u64(output, allocation.address.get());
     write_guest_u64(output + 0x08, end);
     write_guest_u64(output + 0x10, allocation.direct_start);
     write_guest_u32(output + 0x18, allocation.protection.cast_unsigned());
+    write_guest_u32(output + 0x1c, allocation.memory_type.cast_unsigned());
     // Direct and currently mapped, matching the Gen5 SceKernelVirtualQueryInfo flags.
     write_guest_u8(output + 0x20, 0x12);
     for (index, byte) in b"direct".iter().copied().enumerate() {
@@ -7012,125 +6888,105 @@ fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 
     if trace_guest_vm() {
         eprintln!(
             "[REMu][VM] query={query:#x} start={:#x} end={end:#x} direct={:#x}",
-            allocation.address, allocation.direct_start
+            allocation.address.get(),
+            allocation.direct_start
         );
     }
     0
 }
 
-#[cfg(unix)]
+#[cfg(not(target_os = "macos"))]
+fn kernel_virtual_query(_arguments: [u64; 6], _state: &ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+#[cfg(target_os = "macos")]
 fn kernel_munmap(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let (address, length) = (arguments[0], arguments[1]);
     if address == 0
         || length == 0
-        || !address.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
-        || !length.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
+        || !address.is_multiple_of(GUEST_PAGE_SIZE)
+        || !length.is_multiple_of(GUEST_PAGE_SIZE)
     {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(end) = address.checked_add(length) else {
+    if address.checked_add(length).is_none() {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    };
-    let overlaps = state.mapped_allocations.iter().any(|allocation| {
-        let allocation_end = allocation.address.saturating_add(allocation.length);
-        address < allocation_end && end > allocation.address
-    });
-    if !overlaps {
+    }
+    let Some(memory) = state.kernel_memory.as_mut() else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    }
-    let (Ok(host_address), Ok(host_length)) = (usize::try_from(address), usize::try_from(length))
-    else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    // SAFETY: every overlapping page belongs to a tracked mmap created above.
-    if unsafe { libc::munmap(host_address as *mut std::ffi::c_void, host_length) } != 0 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    if let Err(error) = memory.unmap(GuestAddress::new(address), length) {
+        return kernel_memory_error(&error);
     }
-    let mut replacement = Vec::new();
-    for allocation in state.mapped_allocations.drain(..) {
-        let allocation_end = allocation.address.saturating_add(allocation.length);
-        if address >= allocation_end || end <= allocation.address {
-            replacement.push(allocation);
-            continue;
-        }
-        if address > allocation.address {
-            replacement.push(MappedAllocation {
-                length: address - allocation.address,
-                ..allocation
-            });
-        }
-        if end < allocation_end {
-            replacement.push(MappedAllocation {
-                address: end,
-                length: allocation_end - end,
-                direct_start: allocation.direct_start + (end - allocation.address),
-                protection: allocation.protection,
-            });
-        }
-    }
-    state.mapped_allocations = replacement;
     if trace_guest_vm() {
         eprintln!("[REMu][VM] unmapped address={address:#x} length={length:#x}");
     }
     0
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "macos"))]
 fn kernel_munmap(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
+#[cfg(target_os = "macos")]
 fn kernel_release_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    kernel_release_direct_memory_core(arguments, false, state)
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_checked_release_direct_memory(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    kernel_release_direct_memory_core(arguments, true, state)
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_release_direct_memory_core(
+    arguments: [u64; 6],
+    checked: bool,
+    state: &mut ProbeDispatchState,
+) -> u64 {
     let (start, length) = (arguments[0], arguments[1]);
-    if !start.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
-        || !length.is_multiple_of(MACOS_GUEST_PAGE_ALIGNMENT)
-    {
+    if !start.is_multiple_of(GUEST_PAGE_SIZE) || !length.is_multiple_of(GUEST_PAGE_SIZE) {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     if length == 0 {
         return 0;
     }
-    let Some(end) = start.checked_add(length) else {
+    if start.checked_add(length).is_none() {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let released = if let Some(memory) = state.kernel_memory.as_mut() {
+        match memory.release_direct(start, length) {
+            Ok(released) => released,
+            Err(error) => return kernel_memory_error(&error),
+        }
+    } else {
+        false
     };
-    let owner = state
-        .direct_allocations
-        .values()
-        .copied()
-        .find(|allocation| {
-            allocation.start <= start
-                && allocation
-                    .start
-                    .checked_add(allocation.length)
-                    .is_some_and(|allocation_end| end <= allocation_end)
-        });
-    if let Some(owner) = owner {
-        let owner_end = owner.start + owner.length;
-        state.direct_allocations.remove(&owner.start);
-        if start > owner.start {
-            state.direct_allocations.insert(
-                owner.start,
-                DirectAllocation {
-                    length: start - owner.start,
-                    ..owner
-                },
-            );
-        }
-        if end < owner_end {
-            state.direct_allocations.insert(
-                end,
-                DirectAllocation {
-                    start: end,
-                    length: owner_end - end,
-                    memory_type: owner.memory_type,
-                },
-            );
-        }
+    if checked && !released {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     if trace_guest_vm() {
         eprintln!("[REMu][VM] released direct start={start:#x} length={length:#x}");
     }
     0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_release_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_checked_release_direct_memory(
+    _arguments: [u64; 6],
+    _state: &mut ProbeDispatchState,
+) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
 fn trace_guest_vm() -> bool {
@@ -8953,9 +8809,9 @@ mod platform_independent_tests {
 
     use super::{
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
-        AGC_R_DRAW_INDEX_AUTO, DEFAULT_THREAD_AFFINITY_MASK, DirectAllocation, GuestExitCallback,
-        MappedAllocation, ProbeDispatchState, PthreadAttrState, SAVE_DATA_ERROR_EXISTS,
-        SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
+        AGC_R_DRAW_INDEX_AUTO, DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState,
+        PthreadAttrState, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
+        SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
         decode_agc_memory_acquire, destroy_pthread_attr, dispatch_guest_numeric_parser,
@@ -9617,19 +9473,45 @@ mod platform_independent_tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn describes_a_tracked_direct_mapping_to_the_guest() {
         let mut state = ProbeDispatchState::default();
-        state.mapped_allocations.push(MappedAllocation {
-            address: 0x0070_0014_0000,
-            length: 0x1_0000,
-            direct_start: 0x20_0000,
-            protection: 0x33,
-        });
+        let mut direct = u64::MAX;
+        assert_eq!(
+            allocate_direct_memory(
+                [
+                    0x20_0000,
+                    0x21_0000,
+                    0x1_0000,
+                    0x4000,
+                    12,
+                    (&raw mut direct).addr() as u64,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(direct, 0x20_0000);
+        let mut mapped = 0_u64;
+        assert_eq!(
+            super::map_direct_memory(
+                [
+                    (&raw mut mapped).addr() as u64,
+                    0x1_0000,
+                    0x33,
+                    0,
+                    direct,
+                    0x4000,
+                ],
+                &mut state,
+            ),
+            0
+        );
         let mut output = [0xa5_u8; 72];
         let result = kernel_virtual_query(
             [
-                0x0070_0014_0000,
+                mapped,
                 0,
                 output.as_mut_ptr().addr() as u64,
                 output.len() as u64,
@@ -9639,34 +9521,41 @@ mod platform_independent_tests {
             &state,
         );
         assert_eq!(result, 0);
-        assert_eq!(
-            u64::from_le_bytes(output[0..8].try_into().unwrap()),
-            0x0070_0014_0000
-        );
+        assert_eq!(u64::from_le_bytes(output[0..8].try_into().unwrap()), mapped);
         assert_eq!(
             u64::from_le_bytes(output[8..16].try_into().unwrap()),
-            0x0070_0015_0000
+            mapped + 0x1_0000
         );
         assert_eq!(
             u64::from_le_bytes(output[16..24].try_into().unwrap()),
             0x20_0000
         );
         assert_eq!(u32::from_le_bytes(output[24..28].try_into().unwrap()), 0x33);
+        assert_eq!(u32::from_le_bytes(output[28..32].try_into().unwrap()), 12);
         assert_eq!(output[32], 0x12);
         assert_eq!(&output[33..39], b"direct");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn allocates_direct_memory_from_real_free_ranges() {
         let mut state = ProbeDispatchState::default();
-        state.direct_allocations.insert(
-            0x4000,
-            DirectAllocation {
-                start: 0x4000,
-                length: 0x4000,
-                memory_type: 3,
-            },
+        let mut occupied = u64::MAX;
+        assert_eq!(
+            allocate_direct_memory(
+                [
+                    0x4000,
+                    0x8000,
+                    0x4000,
+                    0x4000,
+                    3,
+                    (&raw mut occupied).addr() as u64,
+                ],
+                &mut state,
+            ),
+            0
         );
+        assert_eq!(occupied, 0x4000);
         let mut output = u64::MAX;
         let result = allocate_direct_memory(
             [
@@ -9681,43 +9570,72 @@ mod platform_independent_tests {
         );
         assert_eq!(result, 0);
         assert_eq!(output, 0);
-        assert_eq!(state.direct_allocations[&0].memory_type, 12);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn release_direct_memory_splits_the_owned_physical_range() {
         let mut state = ProbeDispatchState::default();
-        state.direct_allocations.insert(
-            0,
-            DirectAllocation {
-                start: 0,
-                length: 0xc000,
-                memory_type: 7,
-            },
+        let mut allocated = u64::MAX;
+        assert_eq!(
+            allocate_direct_memory(
+                [
+                    0,
+                    0xc000,
+                    0xc000,
+                    0x4000,
+                    7,
+                    (&raw mut allocated).addr() as u64,
+                ],
+                &mut state,
+            ),
+            0
         );
+        assert_eq!(allocated, 0);
         assert_eq!(
             kernel_release_direct_memory([0x4000, 0x4000, 0, 0, 0, 0], &mut state),
             0
         );
-        assert_eq!(state.direct_allocations[&0].length, 0x4000);
-        assert_eq!(state.direct_allocations[&0x8000].length, 0x4000);
-        assert_eq!(state.direct_allocations[&0x8000].memory_type, 7);
+        let mut replacement = u64::MAX;
+        assert_eq!(
+            allocate_direct_memory(
+                [
+                    0x4000,
+                    0x8000,
+                    0x4000,
+                    0x4000,
+                    9,
+                    (&raw mut replacement).addr() as u64,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(replacement, 0x4000);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn direct_memory_mappings_alias_the_same_physical_bytes() {
         use super::{kernel_munmap, map_direct_memory};
 
         let mut state = ProbeDispatchState::default();
-        state.direct_allocations.insert(
-            0,
-            DirectAllocation {
-                start: 0,
-                length: 0x4000,
-                memory_type: 12,
-            },
+        let mut direct = u64::MAX;
+        assert_eq!(
+            allocate_direct_memory(
+                [
+                    0,
+                    0x4000,
+                    0x4000,
+                    0x4000,
+                    12,
+                    (&raw mut direct).addr() as u64,
+                ],
+                &mut state,
+            ),
+            0
         );
+        assert_eq!(direct, 0);
         let mut first = 0_u64;
         let mut second = 0_u64;
         assert_eq!(
@@ -9741,6 +9659,140 @@ mod platform_independent_tests {
         }
         assert_eq!(kernel_munmap([first, 0x4000, 0, 0, 0, 0], &mut state), 0);
         assert_eq!(kernel_munmap([second, 0x4000, 0, 0, 0, 0], &mut state), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn direct_memory_abi_honors_fixed_and_hinted_placement_without_overwrite() {
+        let mut state = ProbeDispatchState::default();
+        let mut direct = u64::MAX;
+        assert_eq!(
+            allocate_direct_memory(
+                [
+                    0,
+                    0xc000,
+                    0xc000,
+                    0x4000,
+                    5,
+                    (&raw mut direct).addr() as u64,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        let base = state.kernel_memory.as_ref().unwrap().virtual_base();
+        let mut fixed = base.get() + 4 * 0x4000;
+        assert_eq!(
+            super::map_direct_memory(
+                [
+                    (&raw mut fixed).addr() as u64,
+                    0x4000,
+                    0x33,
+                    0x10,
+                    direct,
+                    0x4000,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        let mut collision = fixed;
+        assert_eq!(
+            super::map_direct_memory(
+                [
+                    (&raw mut collision).addr() as u64,
+                    0x4000,
+                    0x33,
+                    0x10,
+                    direct + 0x4000,
+                    0x4000,
+                ],
+                &mut state,
+            ),
+            sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+        );
+        let mut hinted = base.get() + 8 * 0x4000;
+        let requested_hint = hinted;
+        assert_eq!(
+            super::map_direct_memory(
+                [
+                    (&raw mut hinted).addr() as u64,
+                    0x4000,
+                    0x33,
+                    0,
+                    direct + 0x8000,
+                    0x4000,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(hinted, requested_hint);
+        assert_eq!(
+            super::kernel_munmap([fixed, 0x4000, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(
+            super::kernel_munmap([hinted, 0x4000, 0, 0, 0, 0], &mut state),
+            0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gen5_direct_memory_v2_and_checked_release_preserve_their_distinct_abi() {
+        let mut state = ProbeDispatchState::default();
+        assert_eq!(
+            super::kernel_checked_release_direct_memory([0, 0x4000, 0, 0, 0, 0], &mut state),
+            sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+        );
+        let mut direct = u64::MAX;
+        assert_eq!(
+            allocate_direct_memory(
+                [
+                    0,
+                    0x4000,
+                    0x4000,
+                    0x4000,
+                    3,
+                    (&raw mut direct).addr() as u64,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        let mut mapped = 0_u64;
+        assert_eq!(
+            super::map_direct_memory_2(
+                [(&raw mut mapped).addr() as u64, 0x4000, 13, 0x33, 0, direct,],
+                0x4000,
+                &mut state,
+            ),
+            0
+        );
+        let mapping = state
+            .kernel_memory
+            .as_ref()
+            .unwrap()
+            .query(remu_core::GuestAddress::new(mapped), false)
+            .unwrap();
+        assert_eq!(mapping.memory_type, 13);
+        assert_eq!(
+            super::kernel_checked_release_direct_memory([direct, 0x4000, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(
+            super::kernel_checked_release_direct_memory([direct, 0x4000, 0, 0, 0, 0], &mut state),
+            sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+        );
+        assert_eq!(
+            super::kernel_release_direct_memory([direct, 0x4000, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(
+            super::kernel_munmap([mapped, 0x4000, 0, 0, 0, 0], &mut state),
+            0
+        );
     }
 
     #[test]
