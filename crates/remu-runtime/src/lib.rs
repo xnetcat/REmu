@@ -4259,6 +4259,7 @@ const AGC_IT_SET_UCONFIG_REG_INDIRECT: u32 = 0x64;
 const AGC_IT_SET_CONTEXT_REG: u32 = 0x69;
 const AGC_IT_SET_SH_REG: u32 = 0x76;
 const AGC_IT_SET_UCONFIG_REG: u32 = 0x79;
+const AGC_IT_SET_UCONFIG_REG_INDEX: u32 = 0x7a;
 const AGC_IT_SET_CONTEXT_REG_INDIRECT: u32 = 0x9f;
 const AGC_R_ZERO: u32 = 0x00;
 const AGC_R_DRAW_INDEX_AUTO: u32 = 0x04;
@@ -4277,6 +4278,7 @@ const AGC_CB_SET_SH_REGISTER_RANGE_MARKER: u32 = 0x6875_000d;
 
 const AGC_SPI_PS_INPUT_CNTL_0: u32 = 0x191;
 const AGC_VGT_PRIMITIVE_TYPE: u32 = 0x242;
+const AGC_VGT_INDEX_TYPE: u32 = 0x243;
 const AGC_SPI_SHADER_PGM_LO_PS: u32 = 0x008;
 const AGC_SPI_SHADER_PGM_HI_PS: u32 = 0x009;
 const AGC_SPI_SHADER_PGM_LO_ES: u32 = 0x0c8;
@@ -5064,6 +5066,21 @@ fn agc_apply_submission_registers(
     register: u32,
     graphics: &mut AgcGraphicsState,
 ) -> Result<(), AgcSubmissionError> {
+    if opcode == AGC_IT_SET_UCONFIG_REG_INDEX {
+        if length != 3 {
+            return Err(AgcSubmissionError::IndexedUconfigRegisterPacketLength {
+                actual: length,
+            });
+        }
+        let register = read_guest_u32(packet_address + 4) & !0x7000_0000;
+        let value = read_guest_u32(packet_address + 8);
+        graphics.user_config_registers.insert(register, value);
+        if register == AGC_VGT_INDEX_TYPE {
+            graphics.index_size = value & 0x3;
+        }
+        return Ok(());
+    }
+
     if matches!(
         opcode,
         AGC_IT_SET_CONTEXT_REG | AGC_IT_SET_SH_REG | AGC_IT_SET_UCONFIG_REG
@@ -5351,6 +5368,8 @@ enum AgcSubmissionError {
     UnsupportedSetBaseShaderType(u32),
     #[error("native indirect-register opcode 0x{opcode:02X} has {actual} dwords, expected 5")]
     NativeIndirectRegisterPacketLength { opcode: u32, actual: u32 },
+    #[error("indexed SET_UCONFIG_REG packet has {actual} dwords, expected 3")]
+    IndexedUconfigRegisterPacketLength { actual: u32 },
     #[error(
         "indirect-register opcode 0x{opcode:02X} has null table address with {register_count} entries"
     )]
@@ -9634,21 +9653,21 @@ mod platform_independent_tests {
         AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_INDEX_BASE,
         AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
         AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT,
-        AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO,
-        AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry, DEFAULT_THREAD_AFFINITY_MASK,
-        GuestExitCallback, ProbeDispatchState, PthreadAttrState, SAVE_DATA_ERROR_EXISTS,
-        SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_FOUND,
-        SCE_KERNEL_ERROR_NOT_IMPLEMENTED, agc_apply_set_base, agc_apply_submission_registers,
-        agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
-        agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, allocate_direct_memory,
-        allocate_pthread_thread_object, create_pthread_attr, decode_agc_memory_acquire,
-        destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
-        guest_clock_gettime, guest_free, guest_global_locale, guest_kernel_fstat,
-        guest_kernel_ftruncate, guest_kernel_lseek, guest_kernel_read, guest_posix_file_result,
-        guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp,
-        guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory, kernel_stat_payload,
-        kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity, pthread_attr_get_stack,
-        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET,
+        AGC_R_DRAW_INDEX_AUTO, AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
+        DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState, PthreadAttrState,
+        SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
+        SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED, agc_apply_set_base,
+        agc_apply_submission_registers, agc_dcb_draw_index_auto, agc_dcb_set_index_buffer,
+        agc_dcb_set_num_instances, agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4,
+        allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
+        decode_agc_memory_acquire, destroy_pthread_attr, dispatch_guest_numeric_parser,
+        dispatch_probe_import, guest_clock_gettime, guest_free, guest_global_locale,
+        guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_lseek, guest_kernel_read,
+        guest_posix_file_result, guest_qsort, guest_tolower_table, guest_toupper_table,
+        guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory,
+        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity,
+        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
         pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
         resolve_guest_path, sanitize_save_segment, save_data_commit,
         save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
@@ -10847,6 +10866,28 @@ mod platform_independent_tests {
             Some(&0x44)
         );
         assert_eq!(graphics.user_config_registers.get(&0x242), Some(&4));
+    }
+
+    #[test]
+    fn applies_native_gen5_indexed_uconfig_packet() {
+        let packet = [
+            agc_pm4(3, AGC_IT_SET_UCONFIG_REG_INDEX, 0),
+            0x2000_0243,
+            0x400 | 1 | (2 << 6),
+        ];
+        let mut graphics = AgcGraphicsState::default();
+
+        agc_apply_submission_registers(
+            packet.as_ptr().addr() as u64,
+            3,
+            AGC_IT_SET_UCONFIG_REG_INDEX,
+            0,
+            &mut graphics,
+        )
+        .expect("native indexed user-config register packet");
+
+        assert_eq!(graphics.user_config_registers.get(&0x243), Some(&0x481));
+        assert_eq!(graphics.index_size, 1);
     }
 
     #[test]
