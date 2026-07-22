@@ -61,7 +61,54 @@ enum Command {
     },
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+extern "C" fn diagnostic_sigterm_handler(
+    _signal: i32,
+    information: *mut libc::siginfo_t,
+    _context: *mut libc::c_void,
+) {
+    const PREFIX: &[u8] = b"[REMu][DIAG] ignored external SIGTERM sender_pid=";
+    let sender_pid = if information.is_null() {
+        0
+    } else {
+        // SAFETY: macOS supplies a live `siginfo_t` for the duration of an SA_SIGINFO handler.
+        unsafe { (*information).si_pid }
+    };
+    let mut message = [0_u8; 96];
+    let mut length = 0_usize;
+    for byte in PREFIX {
+        message[length] = *byte;
+        length += 1;
+    }
+    let mut digits = [0_u8; 11];
+    let mut digit_count = 0_usize;
+    let mut remaining = sender_pid.unsigned_abs();
+    loop {
+        digits[digit_count] = b'0' + u8::try_from(remaining % 10).unwrap_or(0);
+        digit_count += 1;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    if sender_pid < 0 {
+        message[length] = b'-';
+        length += 1;
+    }
+    while digit_count != 0 {
+        digit_count -= 1;
+        message[length] = digits[digit_count];
+        length += 1;
+    }
+    message[length] = b'\n';
+    length += 1;
+    // SAFETY: `write` is async-signal-safe and `message[..length]` is live stack storage.
+    unsafe {
+        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), length);
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 extern "C" fn diagnostic_sigterm_handler(_signal: i32) {
     const MESSAGE: &[u8] = b"[REMu][DIAG] ignored external SIGTERM\n";
     // SAFETY: `write` is async-signal-safe and the message has static storage.
@@ -73,13 +120,28 @@ extern "C" fn diagnostic_sigterm_handler(_signal: i32) {
 fn install_diagnostic_signal_policy() {
     #[cfg(unix)]
     if matches!(std::env::var("REMU_IGNORE_SIGTERM").as_deref(), Ok("1")) {
-        // SAFETY: the handler performs only an async-signal-safe write and remains valid for the
-        // process lifetime. This opt-in exists solely for isolated compatibility runs.
-        unsafe {
-            libc::signal(
-                libc::SIGTERM,
-                diagnostic_sigterm_handler as *const () as libc::sighandler_t,
-            );
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: all fields are initialized before `sigaction`, and the handler performs only
+            // stack-local integer encoding plus an async-signal-safe write.
+            unsafe {
+                let mut action = std::mem::zeroed::<libc::sigaction>();
+                action.sa_sigaction = diagnostic_sigterm_handler as *const () as libc::sighandler_t;
+                libc::sigemptyset(&raw mut action.sa_mask);
+                action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+                libc::sigaction(libc::SIGTERM, &raw const action, std::ptr::null_mut());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // SAFETY: the handler performs only an async-signal-safe write and remains valid for
+            // the process lifetime.
+            unsafe {
+                libc::signal(
+                    libc::SIGTERM,
+                    diagnostic_sigterm_handler as *const () as libc::sighandler_t,
+                );
+            }
         }
         eprintln!("[REMu][DIAG] external SIGTERM will be ignored for this run");
     }
