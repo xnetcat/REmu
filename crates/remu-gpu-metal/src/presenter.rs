@@ -185,6 +185,7 @@ struct MetalPresenter {
     capture_started_at: Instant,
     capture_delay: Duration,
     capture_limit: usize,
+    capture_trigger_file: Option<PathBuf>,
     pressed_keys: HashSet<KeyCode>,
     shader_compile_sender: Sender<IndexedDraw>,
     shader_compile_receiver: Receiver<ShaderCompileResult>,
@@ -252,6 +253,7 @@ impl MetalPresenter {
             capture_started_at: Instant::now(),
             capture_delay: capture_delay_from_environment(),
             capture_limit: capture_limit_from_environment(),
+            capture_trigger_file: std::env::var_os("REMU_CAPTURE_TRIGGER_FILE").map(PathBuf::from),
             pressed_keys: HashSet::new(),
             shader_compile_sender,
             shader_compile_receiver,
@@ -1352,6 +1354,10 @@ impl MetalPresenter {
     fn capture_is_enabled(&self) -> bool {
         self.capture_directory.is_some()
             && self.capture_started_at.elapsed() >= self.capture_delay
+            && self
+                .capture_trigger_file
+                .as_ref()
+                .is_none_or(|path| path.is_file())
             && self.captured_guest_frames.len() < self.capture_limit
     }
 
