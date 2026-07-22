@@ -1743,6 +1743,68 @@ mod tests {
     }
 
     #[test]
+    fn decodes_every_vop3p_opcode_and_every_modifier_bit_pattern() {
+        const OPCODES: [(u32, &str); 8] = [
+            (0x0e, "VPkFmaF16"),
+            (0x0f, "VPkAddF16"),
+            (0x10, "VPkMulF16"),
+            (0x11, "VPkMinF16"),
+            (0x12, "VPkMaxF16"),
+            (0x20, "VFmaMixF32"),
+            (0x21, "VFmaMixloF16"),
+            (0x22, "VFmaMixhiF16"),
+        ];
+        let sources = 257u32 | (258u32 << 9) | (259u32 << 18);
+
+        for (opcode, name) in OPCODES {
+            let word = 0xcc00_0005 | (opcode << 16);
+            let frame = decode_frame(0, &[word, sources]).expect("VOP3P frame");
+            assert_eq!(frame.encoding, ShaderEncoding::Vop3p);
+            assert!(frame.opcode.is(name));
+            let instruction =
+                create_instruction(0, frame.encoding, frame.opcode, vec![word, sources]);
+            assert_eq!(
+                instruction.sources,
+                vec![Operand::vector(1), Operand::vector(2), Operand::vector(3)]
+            );
+            assert_eq!(instruction.destinations, vec![Operand::vector(5)]);
+        }
+
+        // Five independent fields occupy thirteen encoding bits. Check all 8192 combinations so
+        // a split OP_SEL_HI bit or swapped NEG lane cannot regress unnoticed.
+        for bits in 0u32..(1 << 13) {
+            let operand_select_mask = bits & 7;
+            let operand_select_high_mask = (bits >> 3) & 7;
+            let negate_low_mask = (bits >> 6) & 7;
+            let negate_high_mask = (bits >> 9) & 7;
+            let clamp = bits >> 12 != 0;
+            let word = 0xcc0e_0005
+                | (operand_select_mask << 11)
+                | ((operand_select_high_mask >> 2) << 14)
+                | (negate_high_mask << 8)
+                | (u32::from(clamp) << 15);
+            let extra = sources | ((operand_select_high_mask & 3) << 27) | (negate_low_mask << 29);
+            let instruction = create_instruction(
+                0,
+                ShaderEncoding::Vop3p,
+                Opcode::Known("VPkFmaF16"),
+                vec![word, extra],
+            );
+            assert_eq!(
+                instruction.control,
+                Some(InstructionControl::Vop3p(Vop3pControl {
+                    operand_select_mask,
+                    operand_select_high_mask,
+                    negate_low_mask,
+                    negate_high_mask,
+                    clamp,
+                })),
+                "incorrect VOP3P modifiers for packed bits 0x{bits:04X}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_reserved_scalar_opcode_instead_of_emitting_a_placeholder() {
         let error = decode_program(0x1000, &[0xbe80_0000]).expect_err("reserved SOP1 opcode");
         assert!(matches!(

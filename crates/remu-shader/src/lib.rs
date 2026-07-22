@@ -14,7 +14,7 @@ mod state;
 pub use decoder::{DecodeError, decode_program, read_program};
 pub use evaluator::{EvaluationError, EvaluationOptions, evaluate_shader};
 pub use format::decode_unified_format;
-pub use inline_constant::decode_inline_constant;
+pub use inline_constant::{decode_inline_constant, decode_v2f16_inline_constant};
 pub use ir::{
     BufferMemoryControl, ComputeSystemRegisters, ComputeSystemValue, DataShareControl, Dpp8Control,
     DppControl, ExportControl, GlobalMemoryBinding, GlobalMemoryControl, ImageBinding,

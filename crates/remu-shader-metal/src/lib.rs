@@ -13,8 +13,8 @@ use std::fmt::Write as _;
 use remu_shader::{
     Dpp8Control, DppControl, ExportControl, ImageBinding, ImageControl, Instruction,
     InstructionControl, Opcode, Operand, OperandKind, PixelOutputBinding, PixelOutputKind, Program,
-    SdwaControl, ShaderEncoding, ShaderEvaluation, VertexInputBinding, decode_inline_constant,
-    decode_unified_format,
+    SdwaControl, ShaderEncoding, ShaderEvaluation, VertexInputBinding, Vop3pControl,
+    decode_inline_constant, decode_unified_format, decode_v2f16_inline_constant,
 };
 
 const SCALAR_REGISTER_COUNT: u32 = 128;
@@ -341,6 +341,14 @@ impl<'a> Compiler<'a> {
         );
         if self.program.instructions.iter().any(is_format_buffer_load) {
             emit_format_prelude(&mut source);
+        }
+        if self
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction.control, Some(InstructionControl::Vop3p(_))))
+        {
+            emit_vop3p_prelude(&mut source);
         }
         if sampler_count != 0 {
             source.push_str("struct RemuSamplers {\n");
@@ -908,6 +916,215 @@ impl<'a> Compiler<'a> {
         ))
     }
 
+    fn emit_vop3p(&mut self, instruction: &Instruction, name: &str) -> Result<(), String> {
+        let Some(InstructionControl::Vop3p(control)) = instruction.control.as_ref() else {
+            return Err(format!("missing VOP3P control for {name}"));
+        };
+        let destination = destination_vector(instruction)?;
+        let result = match name {
+            "VPkFmaF16" | "VPkAddF16" | "VPkMulF16" | "VPkMinF16" | "VPkMaxF16" => {
+                self.emit_packed_f16(instruction, name, *control)?
+            }
+            "VFmaMixF32" | "VFmaMixloF16" | "VFmaMixhiF16" => {
+                self.emit_fma_mix(instruction, name, destination, *control)?
+            }
+            _ => return Err(format!("unsupported packed VOP3 opcode {name}")),
+        };
+        self.store_vector(destination, &result);
+        Ok(())
+    }
+
+    fn emit_packed_f16(
+        &mut self,
+        instruction: &Instruction,
+        name: &str,
+        control: Vop3pControl,
+    ) -> Result<String, String> {
+        let source_count = usize::from(name == "VPkFmaF16") + 2;
+        let mut raw_sources = Vec::with_capacity(source_count);
+        for index in 0..source_count {
+            let source = self.vop3p_packed_raw_source(instruction, index)?;
+            raw_sources.push(self.temp("uint", &source));
+        }
+        let low = self.emit_packed_f16_lane(name, &raw_sources, control, false);
+        let high = self.emit_packed_f16_lane(name, &raw_sources, control, true);
+        Ok(format!("({low} | ({high} << 16))"))
+    }
+
+    fn emit_packed_f16_lane(
+        &mut self,
+        name: &str,
+        raw_sources: &[String],
+        control: Vop3pControl,
+        high_lane: bool,
+    ) -> String {
+        let select_mask = if high_lane {
+            control.operand_select_high_mask
+        } else {
+            control.operand_select_mask
+        };
+        let negate_mask = if high_lane {
+            control.negate_high_mask
+        } else {
+            control.negate_low_mask
+        };
+        let mut operands = Vec::with_capacity(raw_sources.len());
+        for (index, raw) in raw_sources.iter().enumerate() {
+            let shift = if select_mask & (1 << index) != 0 {
+                16
+            } else {
+                0
+            };
+            let mut half_bits = format!("(({raw} >> {shift}) & 0xFFFFu)");
+            if negate_mask & (1 << index) != 0 {
+                half_bits = format!("({half_bits} ^ 0x8000u)");
+            }
+            operands.push(self.temp(
+                "float",
+                &format!("as_type<float>(remu_f16_to_f32_bits({half_bits}))"),
+            ));
+        }
+        let mut result_bits = match name {
+            "VPkFmaF16" => self.temp(
+                "uint",
+                &format!(
+                    "remu_f16_fma_rto_bits({}, {}, {})",
+                    operands[0], operands[1], operands[2]
+                ),
+            ),
+            "VPkAddF16" => self.temp(
+                "uint",
+                &format!("as_type<uint>({} + {})", operands[0], operands[1]),
+            ),
+            "VPkMulF16" => self.temp(
+                "uint",
+                &format!("as_type<uint>({} * {})", operands[0], operands[1]),
+            ),
+            "VPkMinF16" => self.temp(
+                "uint",
+                &format!(
+                    "remu_f16_minmax_bits({}, {}, false)",
+                    operands[0], operands[1]
+                ),
+            ),
+            "VPkMaxF16" => self.temp(
+                "uint",
+                &format!(
+                    "remu_f16_minmax_bits({}, {}, true)",
+                    operands[0], operands[1]
+                ),
+            ),
+            _ => unreachable!("packed opcode was classified before lane lowering"),
+        };
+        if control.clamp {
+            result_bits = self.temp("uint", &format!("remu_clamp_unit_f32_bits({result_bits})"));
+        }
+        self.temp("uint", &format!("remu_f32_to_f16_bits({result_bits})"))
+    }
+
+    fn emit_fma_mix(
+        &mut self,
+        instruction: &Instruction,
+        name: &str,
+        destination: u32,
+        control: Vop3pControl,
+    ) -> Result<String, String> {
+        let mut operands = Vec::with_capacity(3);
+        for index in 0..3 {
+            operands.push(self.fma_mix_operand(instruction, control, index)?);
+        }
+        let mut result_bits = self.temp(
+            "uint",
+            &format!(
+                "as_type<uint>(metal::precise::fma({}, {}, {}))",
+                operands[0], operands[1], operands[2]
+            ),
+        );
+        if control.clamp {
+            result_bits = self.temp("uint", &format!("remu_clamp_unit_f32_bits({result_bits})"));
+        }
+        Ok(match name {
+            "VFmaMixF32" => result_bits,
+            "VFmaMixloF16" => {
+                let half = self.temp("uint", &format!("remu_f32_to_f16_bits({result_bits})"));
+                format!("(v[{destination}] & 0xFFFF0000u) | {half}")
+            }
+            "VFmaMixhiF16" => {
+                let half = self.temp("uint", &format!("remu_f32_to_f16_bits({result_bits})"));
+                format!("(v[{destination}] & 0x0000FFFFu) | ({half} << 16)")
+            }
+            _ => unreachable!("mix opcode was classified before result lowering"),
+        })
+    }
+
+    fn fma_mix_operand(
+        &mut self,
+        instruction: &Instruction,
+        control: Vop3pControl,
+        index: usize,
+    ) -> Result<String, String> {
+        let operand = instruction
+            .sources
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("missing VOP3P source operand {index}"))?;
+        let read_as_half = control.operand_select_high_mask & (1 << index) != 0
+            && matches!(
+                operand.kind,
+                OperandKind::ScalarRegister | OperandKind::VectorRegister
+            );
+        let mut bits = if read_as_half {
+            let raw = self.raw_source(instruction, index)?;
+            let shift = if control.operand_select_mask & (1 << index) != 0 {
+                16
+            } else {
+                0
+            };
+            format!("remu_f16_to_f32_bits((({raw} >> {shift}) & 0xFFFFu))")
+        } else {
+            format!("as_type<uint>({})", self.float_source(instruction, index)?)
+        };
+        // FMA_MIX repurposes NEG_HI as absolute value and NEG as negate. Apply them
+        // in architectural abs-then-neg order using sign-bit operations.
+        if control.negate_high_mask & (1 << index) != 0 {
+            bits = format!("({bits} & 0x7FFFFFFFu)");
+        }
+        if control.negate_low_mask & (1 << index) != 0 {
+            bits = format!("({bits} ^ 0x80000000u)");
+        }
+        Ok(self.temp("float", &format!("as_type<float>({bits})")))
+    }
+
+    #[allow(clippy::unused_self)]
+    fn vop3p_packed_raw_source(
+        &self,
+        instruction: &Instruction,
+        index: usize,
+    ) -> Result<String, String> {
+        let operand = instruction
+            .sources
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("missing VOP3P source operand {index}"))?;
+        match operand.kind {
+            OperandKind::ScalarRegister if operand.value < SCALAR_REGISTER_COUNT => {
+                Ok(format!("s[{}]", operand.value))
+            }
+            OperandKind::VectorRegister if operand.value < VECTOR_REGISTER_COUNT => {
+                Ok(format!("v[{}]", operand.value))
+            }
+            OperandKind::LiteralConstant => Ok(format_u32(operand.value)),
+            OperandKind::EncodedConstant => decode_v2f16_inline_constant(operand.value)
+                .map(format_u32)
+                .ok_or_else(|| {
+                    format!("unsupported packed-f16 encoded constant {}", operand.value)
+                }),
+            _ => Err(format!(
+                "VOP3P register operand is outside the architectural file: {operand}"
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_vector_alu(&mut self, instruction: &Instruction) -> Result<(), String> {
         if let Some(InstructionControl::Sdwa(control)) = instruction.control.as_ref()
@@ -917,9 +1134,6 @@ impl<'a> Compiler<'a> {
                 || control.destination_unused == 3)
         {
             return Err("reserved SDWA selector or destination-unused mode".to_owned());
-        }
-        if matches!(instruction.control, Some(InstructionControl::Vop3p(_))) {
-            return Err("packed VOP3 controls require their dedicated lowering".to_owned());
         }
         if let Some(InstructionControl::Dpp(control)) = instruction.control
             && !is_supported_dpp_control(control.control)
@@ -933,6 +1147,9 @@ impl<'a> Compiler<'a> {
             .opcode
             .known_name()
             .ok_or_else(|| "raw vector opcode".to_owned())?;
+        if matches!(instruction.control, Some(InstructionControl::Vop3p(_))) {
+            return self.emit_vop3p(instruction, name);
+        }
         if name.starts_with("VCmp") {
             return self.emit_vector_compare(instruction, name);
         }
@@ -2027,6 +2244,95 @@ fn is_format_buffer_load(instruction: &Instruction) -> bool {
         || instruction.opcode.starts_with("TBufferLoadFormat")
 }
 
+fn emit_vop3p_prelude(source: &mut String) {
+    source.push_str(
+        r"inline bool remu_f32_bits_is_nan(uint bits) {
+    return (bits & 0x7FFFFFFFu) > 0x7F800000u;
+}
+
+inline uint remu_f16_to_f32_bits(uint half_bits) {
+    half_bits &= 0xFFFFu;
+    uint sign = (half_bits & 0x8000u) << 16;
+    uint exponent = (half_bits >> 10) & 0x1Fu;
+    uint mantissa = half_bits & 0x3FFu;
+    uint normal = ((exponent + 112u) << 23) | (mantissa << 13);
+    uint infinity_nan = 0x7F800000u | (mantissa << 13);
+    uint high_bit = 31u - clz(mantissa | 1u);
+    uint shift = 23u - high_bit;
+    uint sub_fraction = (mantissa << shift) & 0x7FFFFFu;
+    uint subnormal = mantissa != 0u ? ((high_bit + 103u) << 23) | sub_fraction : 0u;
+    uint magnitude = exponent == 0u ? subnormal : (exponent == 31u ? infinity_nan : normal);
+    return sign | magnitude;
+}
+
+inline uint remu_f32_to_f16_bits(uint bits) {
+    uint sign = (bits >> 16) & 0x8000u;
+    uint absolute = bits & 0x7FFFFFFFu;
+    bool infinity_nan_input = absolute >= 0x7F800000u;
+    bool nan_input = absolute > 0x7F800000u;
+    uint infinity_nan = sign | 0x7C00u | (nan_input ? 0x200u : 0u);
+
+    uint exponent = absolute >> 23;
+    uint mantissa = absolute & 0x7FFFFFu;
+    uint significand = mantissa | 0x800000u;
+
+    uint round_bit = (significand >> 13) & 1u;
+    uint rounded = (significand + 0xFFFu + round_bit) >> 13;
+    uint half_exponent = exponent - 112u;
+    uint normal_bits = (half_exponent << 10) + (rounded - 0x400u);
+    uint normal = exponent >= 113u ? (normal_bits >= 0x7C00u ? 0x7C00u : normal_bits) : 0u;
+
+    uint distance = 126u - exponent;
+    uint subnormal_shift = min(max(distance, 1u), 25u);
+    uint shift_mask = (1u << subnormal_shift) - 1u;
+    uint halfway = 1u << (subnormal_shift - 1u);
+    uint low_bits = significand & shift_mask;
+    uint quotient = significand >> subnormal_shift;
+    bool round_up = low_bits > halfway || (low_bits == halfway && (quotient & 1u) != 0u);
+    uint subnormal = quotient + (round_up ? 1u : 0u);
+
+    uint finite = exponent <= 112u ? subnormal : normal;
+    return infinity_nan_input ? infinity_nan : (sign | finite);
+}
+
+inline uint remu_clamp_unit_f32_bits(uint bits) {
+    uint magnitude = bits & 0x7FFFFFFFu;
+    if (remu_f32_bits_is_nan(bits) || (bits & 0x80000000u) != 0u || magnitude == 0u) return 0u;
+    return magnitude > 0x3F800000u ? 0x3F800000u : bits;
+}
+
+inline uint remu_f16_minmax_bits(float left, float right, bool maximum) {
+    uint left_bits = as_type<uint>(left);
+    uint right_bits = as_type<uint>(right);
+    if (remu_f32_bits_is_nan(left_bits)) return right_bits;
+    if (remu_f32_bits_is_nan(right_bits)) return left_bits;
+    return as_type<uint>(maximum ? (left > right ? left : right) : (left < right ? left : right));
+}
+
+inline uint remu_f16_fma_rto_bits(float left, float right, float addend) {
+#pragma clang fp reassociate(off) contract(off)
+    float product = left * right;
+    float sum = product + addend;
+    float product_part = sum - addend;
+    float addend_part = sum - product_part;
+    float product_error = product - product_part;
+    float addend_error = addend - addend_part;
+    float residual = product_error + addend_error;
+
+    uint sum_bits = as_type<uint>(sum);
+    uint residual_bits = as_type<uint>(residual);
+    uint residual_magnitude = residual_bits & 0x7FFFFFFFu;
+    bool inexact = residual_magnitude != 0u && residual_magnitude < 0x7F800000u;
+    bool adjust = inexact && (sum_bits & 1u) == 0u;
+    bool toward_zero = ((sum_bits ^ residual_bits) & 0x80000000u) != 0u;
+    uint stepped = toward_zero ? sum_bits - 1u : sum_bits + 1u;
+    return adjust ? stepped : sum_bits;
+}
+
+",
+    );
+}
+
 fn emit_format_prelude(source: &mut String) {
     source.push_str("static constant uint remu_gfx10_formats[128] = {\n    ");
     for unified in 0..128 {
@@ -2319,7 +2625,9 @@ fn image_component_type(binding: &ImageBinding) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use remu_shader::{Dpp8Control, DppControl, Instruction, Program, ShaderEvaluation};
+    use remu_shader::{
+        Dpp8Control, DppControl, Instruction, Program, ShaderEvaluation, Vop3pControl,
+    };
 
     use super::*;
 
@@ -2352,6 +2660,18 @@ mod tests {
                 .collect(),
             destinations: vec![Operand::vector(8)],
             control: Some(control),
+        }
+    }
+
+    fn vop3p_instruction(name: &'static str, control: Vop3pControl) -> Instruction {
+        Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vop3p,
+            opcode: Opcode::Known(name),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(1), Operand::vector(2), Operand::vector(3)],
+            destinations: vec![Operand::vector(8)],
+            control: Some(InstructionControl::Vop3p(control)),
         }
     }
 
@@ -2793,6 +3113,352 @@ mod tests {
                 compile_vector_instruction(instruction, MetalShaderStage::Compute);
             }
         }
+    }
+
+    #[test]
+    fn lowers_every_vop3p_opcode_for_every_modifier_bit_pattern() {
+        const OPCODES: [&str; 8] = [
+            "VPkFmaF16",
+            "VPkAddF16",
+            "VPkMulF16",
+            "VPkMinF16",
+            "VPkMaxF16",
+            "VFmaMixF32",
+            "VFmaMixloF16",
+            "VFmaMixhiF16",
+        ];
+        let seed = vop3p_instruction(
+            OPCODES[0],
+            Vop3pControl {
+                operand_select_mask: 0,
+                operand_select_high_mask: 0,
+                negate_low_mask: 0,
+                negate_high_mask: 0,
+                clamp: false,
+            },
+        );
+        let program = Program::new(0x1000, vec![seed]);
+        let evaluation = empty_evaluation();
+        let options = MetalCompileOptions::vertex(0);
+        let mut compiler = Compiler::new(&program, &evaluation, &options).expect("compiler");
+
+        for bits in 0u32..(1 << 13) {
+            let control = Vop3pControl {
+                operand_select_mask: bits & 7,
+                operand_select_high_mask: (bits >> 3) & 7,
+                negate_low_mask: (bits >> 6) & 7,
+                negate_high_mask: (bits >> 9) & 7,
+                clamp: bits >> 12 != 0,
+            };
+            for name in OPCODES {
+                compiler.body.clear();
+                compiler.next_temp = 0;
+                let instruction = vop3p_instruction(name, control);
+                compiler
+                    .emit_vector_alu(&instruction)
+                    .unwrap_or_else(|error| {
+                        panic!("{name} modifiers 0x{bits:04X} did not lower: {error}")
+                    });
+                assert!(compiler.body.contains("if (exec) v[8]"));
+            }
+        }
+    }
+
+    #[test]
+    fn vop3p_preserves_exact_packed_half_and_mix_destination_semantics() {
+        let packed = compile_vector_instruction(
+            vop3p_instruction(
+                "VPkFmaF16",
+                Vop3pControl {
+                    operand_select_mask: 0b001,
+                    operand_select_high_mask: 0b010,
+                    negate_low_mask: 0b100,
+                    negate_high_mask: 0b010,
+                    clamp: true,
+                },
+            ),
+            MetalShaderStage::Vertex,
+        );
+        assert!(packed.source.contains("remu_f16_to_f32_bits"));
+        assert!(packed.source.contains("remu_f32_to_f16_bits"));
+        assert!(packed.source.contains("remu_f16_fma_rto_bits"));
+        assert!(
+            packed
+                .source
+                .contains("#pragma clang fp reassociate(off) contract(off)")
+        );
+        assert!(packed.source.contains("remu_clamp_unit_f32_bits"));
+        assert!(packed.source.contains(">> 16) & 0xFFFFu"));
+        assert!(packed.source.contains("^ 0x8000u"));
+        assert!(packed.source.contains("| (t"));
+        assert!(packed.source.contains("<< 16)"));
+
+        let mut inline = vop3p_instruction(
+            "VPkAddF16",
+            Vop3pControl {
+                operand_select_mask: 0,
+                operand_select_high_mask: 0,
+                negate_low_mask: 0,
+                negate_high_mask: 0,
+                clamp: false,
+            },
+        );
+        inline.sources[0] = Operand {
+            kind: OperandKind::EncodedConstant,
+            value: 242,
+        };
+        let inline = compile_vector_instruction(inline, MetalShaderStage::Vertex);
+        assert!(inline.source.contains("uint t0 = 0x3C00u"));
+        assert!(!inline.source.contains("uint t0 = 0x3F800000u"));
+
+        let mix_control = Vop3pControl {
+            operand_select_mask: 0b001,
+            operand_select_high_mask: 0b101,
+            negate_low_mask: 0b010,
+            negate_high_mask: 0b001,
+            clamp: true,
+        };
+        let mut mix = vop3p_instruction("VFmaMixF32", mix_control);
+        mix.sources[2] = Operand {
+            kind: OperandKind::EncodedConstant,
+            value: 242,
+        };
+        let mix = compile_vector_instruction(mix, MetalShaderStage::Vertex);
+        assert!(
+            mix.source
+                .contains("remu_f16_to_f32_bits(((v[1] >> 16) & 0xFFFFu))")
+        );
+        assert!(mix.source.contains("as_type<float>(0x3F800000u)"));
+        assert!(mix.source.contains("& 0x7FFFFFFFu"));
+        assert!(mix.source.contains("^ 0x80000000u"));
+        assert!(mix.source.contains("metal::precise::fma"));
+
+        let low = compile_vector_instruction(
+            vop3p_instruction("VFmaMixloF16", mix_control),
+            MetalShaderStage::Vertex,
+        );
+        assert!(low.source.contains("(v[8] & 0xFFFF0000u) |"));
+        let high = compile_vector_instruction(
+            vop3p_instruction("VFmaMixhiF16", mix_control),
+            MetalShaderStage::Vertex,
+        );
+        assert!(high.source.contains("(v[8] & 0x0000FFFFu) |"));
+        assert!(high.source.contains("<< 16)"));
+    }
+
+    #[test]
+    fn packed_f16_fma_round_to_odd_avoids_the_pinned_double_rounding_case() {
+        fn f16_to_f32(bits: u16) -> f32 {
+            let bits = u32::from(bits);
+            let sign = (bits & 0x8000) << 16;
+            let exponent = (bits >> 10) & 0x1f;
+            let mantissa = bits & 0x3ff;
+            let normal = ((exponent + 112) << 23) | (mantissa << 13);
+            let infinity_nan = 0x7f80_0000 | (mantissa << 13);
+            let high_bit = 31 - (mantissa | 1).leading_zeros();
+            let shift = 23 - high_bit;
+            let subnormal = if mantissa == 0 {
+                0
+            } else {
+                ((high_bit + 103) << 23) | ((mantissa << shift) & 0x7f_ffff)
+            };
+            f32::from_bits(
+                sign | if exponent == 0 {
+                    subnormal
+                } else if exponent == 31 {
+                    infinity_nan
+                } else {
+                    normal
+                },
+            )
+        }
+
+        fn f32_to_f16(bits: u32) -> u16 {
+            let sign = (bits >> 16) & 0x8000;
+            let absolute = bits & 0x7fff_ffff;
+            if absolute >= 0x7f80_0000 {
+                return u16::try_from(sign | 0x7c00 | (u32::from(absolute > 0x7f80_0000) * 0x200))
+                    .expect("half bits");
+            }
+            let exponent = absolute >> 23;
+            let significand = (absolute & 0x7f_ffff) | 0x80_0000;
+            let round_bit = (significand >> 13) & 1;
+            let rounded = (significand + 0xfff + round_bit) >> 13;
+            let normal_bits = (exponent.wrapping_sub(112) << 10) + (rounded - 0x400);
+            let normal = if exponent >= 113 {
+                normal_bits.min(0x7c00)
+            } else {
+                0
+            };
+            let distance = 126u32.wrapping_sub(exponent);
+            let shift = distance.clamp(1, 25);
+            let low_bits = significand & ((1 << shift) - 1);
+            let halfway = 1 << (shift - 1);
+            let quotient = significand >> shift;
+            let round_up = low_bits > halfway || (low_bits == halfway && quotient & 1 != 0);
+            let subnormal = quotient + u32::from(round_up);
+            u16::try_from(sign | if exponent <= 112 { subnormal } else { normal })
+                .expect("half bits")
+        }
+
+        fn fma_round_to_odd(left: f32, right: f32, addend: f32) -> u32 {
+            let product = std::hint::black_box(left * right);
+            let sum = std::hint::black_box(product + addend);
+            let product_part = std::hint::black_box(sum - addend);
+            let addend_part = std::hint::black_box(sum - product_part);
+            let product_error = std::hint::black_box(product - product_part);
+            let addend_error = std::hint::black_box(addend - addend_part);
+            let residual = std::hint::black_box(product_error + addend_error);
+            let sum_bits = sum.to_bits();
+            let residual_bits = residual.to_bits();
+            let residual_magnitude = residual_bits & 0x7fff_ffff;
+            let adjust =
+                residual_magnitude != 0 && residual_magnitude < 0x7f80_0000 && sum_bits & 1 == 0;
+            if !adjust {
+                return sum_bits;
+            }
+            if (sum_bits ^ residual_bits) & 0x8000_0000 != 0 {
+                sum_bits - 1
+            } else {
+                sum_bits + 1
+            }
+        }
+
+        let left = f16_to_f32(0x4100); // 2.5
+        let right = f16_to_f32(0x7522); // 21024
+        let addend = f16_to_f32(0x04ea); // approximately 7.496e-5
+        let double_rounded = f32_to_f16(std::hint::black_box(left * right + addend).to_bits());
+        let single_rounded = f32_to_f16(fma_round_to_odd(left, right, addend));
+        assert_eq!(double_rounded, 0x7a6a);
+        assert_eq!(single_rounded, 0x7a6b);
+        assert_eq!(f32_to_f16(fma_round_to_odd(left, right, -addend)), 0x7a6a);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn generated_vop3p_msl_compiles_with_apple_metal() {
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+        fn find_metal_compiler() -> Option<PathBuf> {
+            if let Some(path) = std::env::var_os("REMU_METAL_COMPILER").map(PathBuf::from)
+                && path.is_file()
+            {
+                return Some(path);
+            }
+            let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.remu/toolchains/Metal.xctoolchain/usr/bin/metal");
+            if bundled.is_file() {
+                return Some(bundled);
+            }
+            let output = Command::new("xcrun")
+                .args(["--find", "metal"])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+        }
+
+        let Some(compiler) = find_metal_compiler() else {
+            eprintln!("skipping Apple Metal compile test: no metal compiler found");
+            return;
+        };
+        let control = Vop3pControl {
+            operand_select_mask: 0b101,
+            operand_select_high_mask: 0b011,
+            negate_low_mask: 0b110,
+            negate_high_mask: 0b101,
+            clamp: true,
+        };
+        let mut instructions = [
+            "VPkFmaF16",
+            "VPkAddF16",
+            "VPkMulF16",
+            "VPkMinF16",
+            "VPkMaxF16",
+            "VFmaMixF32",
+            "VFmaMixloF16",
+            "VFmaMixhiF16",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let mut instruction = vop3p_instruction(name, control);
+            instruction.pc = u32::try_from(index * 8).expect("small VOP3P test program");
+            instruction.destinations = vec![Operand::vector(
+                8 + u32::try_from(index).expect("small destination index"),
+            )];
+            instruction
+        })
+        .collect::<Vec<_>>();
+        instructions[1].sources[0] = Operand {
+            kind: OperandKind::EncodedConstant,
+            value: 242,
+        };
+        let program = Program::new(0x1000, instructions);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "remu-vop3p-metal-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create Metal test directory");
+
+        for stage in [
+            MetalShaderStage::Vertex,
+            MetalShaderStage::Pixel,
+            MetalShaderStage::Compute,
+        ] {
+            let options = match stage {
+                MetalShaderStage::Vertex => MetalCompileOptions::vertex(0),
+                MetalShaderStage::Pixel => MetalCompileOptions::pixel(
+                    vec![PixelOutputBinding {
+                        guest_slot: 0,
+                        host_location: 0,
+                        kind: PixelOutputKind::Float,
+                    }],
+                    0,
+                    0,
+                ),
+                MetalShaderStage::Compute => MetalCompileOptions {
+                    stage,
+                    required_vertex_output_count: 0,
+                    pixel_outputs: Vec::new(),
+                    pixel_input_enable: 0,
+                    pixel_input_address: 0,
+                },
+            };
+            let shader = compile_msl(&program, &empty_evaluation(), &options)
+                .expect("VOP3P program should lower");
+            let stem = match stage {
+                MetalShaderStage::Vertex => "vertex",
+                MetalShaderStage::Pixel => "pixel",
+                MetalShaderStage::Compute => "compute",
+            };
+            let source = directory.join(format!("{stem}.metal"));
+            let air = directory.join(format!("{stem}.air"));
+            std::fs::write(&source, shader.source).expect("write generated MSL");
+            let output = Command::new(&compiler)
+                .args(["-c", "-target", "air64-apple-macosx15.0"])
+                .arg("-fmetal-math-mode=safe")
+                .arg("-o")
+                .arg(&air)
+                .arg(&source)
+                .output()
+                .expect("run Apple Metal compiler");
+            assert!(
+                output.status.success(),
+                "{stage:?} VOP3P MSL failed to compile:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::remove_dir_all(directory).expect("remove Metal test directory");
     }
 
     #[test]
