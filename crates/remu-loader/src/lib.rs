@@ -9,6 +9,13 @@ use std::path::Path;
 use remu_core::GuestAddress;
 use thiserror::Error;
 
+mod dependency_graph;
+pub use dependency_graph::{
+    ModuleDependencyGraph, ModuleDependencyGraphBuilder, ModuleDependencyGraphError,
+    ModuleDependencyNode, UnresolvedModuleDependency, discover_app_root,
+    resolve_module_dependency_graph,
+};
+
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const PS5_CONTAINER_MAGIC: [u8; 4] = [0x4f, 0x15, 0x3d, 0x1d];
 const PS5_RETAIL_CONTAINER_MAGIC: [u8; 4] = [0x54, 0x14, 0xf5, 0xee];
@@ -39,6 +46,11 @@ const DT_INIT_ARRAY: i64 = 25;
 const DT_INIT_ARRAY_SIZE: i64 = 27;
 const DT_PREINIT_ARRAY: i64 = 32;
 const DT_PREINIT_ARRAY_SIZE: i64 = 33;
+const DT_SCE_ORIGINAL_FILENAME: i64 = 0x6100_0009;
+const DT_SCE_MODULE_INFO: i64 = 0x6100_000d;
+const DT_SCE_NEEDED_MODULE: i64 = 0x6100_000f;
+const DT_SCE_EXPORT_LIBRARY: i64 = 0x6100_0013;
+const DT_SCE_IMPORT_LIBRARY: i64 = 0x6100_0015;
 const DT_SCE_JUMP_RELOCATION: i64 = 0x6100_0029;
 const DT_SCE_PLTREL_SIZE: i64 = 0x6100_002d;
 const DT_SCE_RELA: i64 = 0x6100_002f;
@@ -47,6 +59,11 @@ const DT_SCE_STRING_TABLE: i64 = 0x6100_0035;
 const DT_SCE_STRING_TABLE_SIZE: i64 = 0x6100_0037;
 const DT_SCE_SYMBOL_TABLE: i64 = 0x6100_0039;
 const DT_SCE_SYMBOL_TABLE_SIZE: i64 = 0x6100_003f;
+const DT_SCE_ORIGINAL_FILENAME_1: i64 = 0x6100_0041;
+const DT_SCE_MODULE_INFO_1: i64 = 0x6100_0043;
+const DT_SCE_NEEDED_MODULE_1: i64 = 0x6100_0045;
+const DT_SCE_EXPORT_LIBRARY_1: i64 = 0x6100_0047;
+const DT_SCE_IMPORT_LIBRARY_1: i64 = 0x6100_0049;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutableKind {
@@ -222,10 +239,32 @@ pub struct ImportedSymbol {
     pub weak: bool,
 }
 
+/// A module namespace encoded in Sony dynamic-linker metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SceModuleReference {
+    pub name: String,
+    pub id: u16,
+    pub version_major: u8,
+    pub version_minor: u8,
+}
+
+/// A library namespace encoded in Sony dynamic-linker metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SceLibraryReference {
+    pub name: String,
+    pub id: u16,
+    pub version: u16,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DynamicInfo {
     pub entries: Vec<DynamicEntry>,
     pub needed_libraries: Vec<String>,
+    pub original_filename: Option<String>,
+    pub required_modules: Vec<SceModuleReference>,
+    pub exported_modules: Vec<SceModuleReference>,
+    pub imported_libraries: Vec<SceLibraryReference>,
+    pub exported_libraries: Vec<SceLibraryReference>,
     pub string_table_address: u64,
     pub string_table_size: u64,
     pub symbol_table_address: u64,
@@ -649,9 +688,26 @@ fn parse_dynamic(
             "dynamic string",
         )?;
         for entry in &info.entries {
-            if entry.tag == DT_NEEDED {
-                info.needed_libraries
-                    .push(read_dynamic_string(&string_table, entry.value)?);
+            match entry.tag {
+                DT_NEEDED => info
+                    .needed_libraries
+                    .push(read_dynamic_string(&string_table, entry.value)?),
+                DT_SCE_ORIGINAL_FILENAME | DT_SCE_ORIGINAL_FILENAME_1 => {
+                    info.original_filename = Some(read_dynamic_string(&string_table, entry.value)?);
+                }
+                DT_SCE_NEEDED_MODULE | DT_SCE_NEEDED_MODULE_1 => info
+                    .required_modules
+                    .push(read_sce_module_reference(&string_table, entry.value)?),
+                DT_SCE_MODULE_INFO | DT_SCE_MODULE_INFO_1 => info
+                    .exported_modules
+                    .push(read_sce_module_reference(&string_table, entry.value)?),
+                DT_SCE_IMPORT_LIBRARY | DT_SCE_IMPORT_LIBRARY_1 => info
+                    .imported_libraries
+                    .push(read_sce_library_reference(&string_table, entry.value)?),
+                DT_SCE_EXPORT_LIBRARY | DT_SCE_EXPORT_LIBRARY_1 => info
+                    .exported_libraries
+                    .push(read_sce_library_reference(&string_table, entry.value)?),
+                _ => {}
             }
         }
     }
@@ -665,6 +721,11 @@ fn summarize_dynamic_entries(entries: Vec<DynamicEntry>) -> DynamicInfo {
     let mut info = DynamicInfo {
         entries,
         needed_libraries: Vec::new(),
+        original_filename: None,
+        required_modules: Vec::new(),
+        exported_modules: Vec::new(),
+        imported_libraries: Vec::new(),
+        exported_libraries: Vec::new(),
         string_table_address: 0,
         string_table_size: 0,
         symbol_table_address: 0,
@@ -1051,6 +1112,37 @@ fn read_dynamic_string(bytes: &[u8], offset: u64) -> Result<String, InspectError
     let value = std::str::from_utf8(&suffix[..length])
         .map_err(|_| InspectError::InvalidDynamicString { offset })?;
     Ok(value.to_owned())
+}
+
+fn read_sce_module_reference(
+    string_table: &[u8],
+    value: u64,
+) -> Result<SceModuleReference, InspectError> {
+    let bytes = value.to_le_bytes();
+    Ok(SceModuleReference {
+        name: read_dynamic_string(
+            string_table,
+            u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        )?,
+        id: u16::from_le_bytes([bytes[6], bytes[7]]),
+        version_major: bytes[5],
+        version_minor: bytes[4],
+    })
+}
+
+fn read_sce_library_reference(
+    string_table: &[u8],
+    value: u64,
+) -> Result<SceLibraryReference, InspectError> {
+    let bytes = value.to_le_bytes();
+    Ok(SceLibraryReference {
+        name: read_dynamic_string(
+            string_table,
+            u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        )?,
+        id: u16::from_le_bytes([bytes[6], bytes[7]]),
+        version: u16::from_le_bytes([bytes[4], bytes[5]]),
+    })
 }
 
 fn read_vec_at(
