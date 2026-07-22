@@ -11,9 +11,10 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use remu_shader::{
-    ExportControl, ImageBinding, ImageControl, Instruction, InstructionControl, Opcode, Operand,
-    OperandKind, PixelOutputBinding, PixelOutputKind, Program, SdwaControl, ShaderEncoding,
-    ShaderEvaluation, VertexInputBinding, decode_inline_constant, decode_unified_format,
+    Dpp8Control, DppControl, ExportControl, ImageBinding, ImageControl, Instruction,
+    InstructionControl, Opcode, Operand, OperandKind, PixelOutputBinding, PixelOutputKind, Program,
+    SdwaControl, ShaderEncoding, ShaderEvaluation, VertexInputBinding, decode_inline_constant,
+    decode_unified_format,
 };
 
 const SCALAR_REGISTER_COUNT: u32 = 128;
@@ -674,7 +675,6 @@ impl<'a> Compiler<'a> {
         self.raw_source_with_sdwa_modifiers(instruction, index, true)
     }
 
-    #[allow(clippy::unused_self)]
     fn raw_source_with_sdwa_modifiers(
         &self,
         instruction: &Instruction,
@@ -706,6 +706,15 @@ impl<'a> Compiler<'a> {
                 "register operand is outside the architectural file: {operand}"
             )),
         }?;
+        if index == 0 {
+            value = match instruction.control.as_ref() {
+                Some(InstructionControl::Dpp(control)) => {
+                    self.apply_dpp_source(*control, &value)?
+                }
+                Some(InstructionControl::Dpp8(control)) => self.apply_dpp8_source(*control, &value),
+                _ => value,
+            };
+        }
         let Some(InstructionControl::Sdwa(control)) = instruction.control.as_ref() else {
             return Ok(value);
         };
@@ -806,6 +815,104 @@ impl<'a> Compiler<'a> {
         format!("as_type<uint>({value})")
     }
 
+    fn dpp_source_lane(control: DppControl) -> Result<(String, String), String> {
+        let dpp = control.control;
+        if dpp <= 0xff {
+            let selected = format!("(({dpp}u >> ((remu_lane & 3u) * 2u)) & 3u)");
+            let target = format!("((remu_lane & 0xFFFFFFFCu) + {selected})");
+            return Ok((target, "true".to_owned()));
+        }
+        if (0x101..=0x10f).contains(&dpp) {
+            let shift = dpp & 15;
+            let shifted = format!("((remu_lane & 15u) + {shift}u)");
+            let in_range = format!("({shifted} < 16u)");
+            let target = format!("((remu_lane & 0xFFFFFFF0u) + ({shifted} & 15u))");
+            return Ok((target, in_range));
+        }
+        if (0x111..=0x11f).contains(&dpp) {
+            let shift = dpp & 15;
+            let in_range = format!("((remu_lane & 15u) >= {shift}u)");
+            let target =
+                format!("((remu_lane & 0xFFFFFFF0u) + (((remu_lane & 15u) - {shift}u) & 15u))");
+            return Ok((target, in_range));
+        }
+        if (0x121..=0x12f).contains(&dpp) {
+            let shift = dpp & 15;
+            let target =
+                format!("((remu_lane & 0xFFFFFFF0u) + (((remu_lane & 15u) - {shift}u) & 15u))");
+            return Ok((target, "true".to_owned()));
+        }
+        let target = match dpp {
+            0x140 => "(remu_lane & 0xFFFFFFF0u) + (15u - (remu_lane & 15u))".to_owned(),
+            0x141 => "(remu_lane & 0xFFFFFFF8u) + (7u - (remu_lane & 7u))".to_owned(),
+            0x150..=0x15f => format!("(remu_lane & 0xFFFFFFF0u) + {}u", dpp & 15),
+            0x160..=0x16f => format!(
+                "(remu_lane & 0xFFFFFFF0u) + ((remu_lane & 15u) ^ {}u)",
+                dpp & 15
+            ),
+            _ => return Err(format!("unsupported DPP16 control 0x{dpp:03X}")),
+        };
+        Ok((format!("({target})"), "true".to_owned()))
+    }
+
+    fn shuffle_lane(&self, value: &str, target_lane: &str) -> String {
+        if self.options.stage == MetalShaderStage::Compute {
+            format!("simd_shuffle({value}, (ushort){target_lane})")
+        } else {
+            value.to_owned()
+        }
+    }
+
+    fn lane_active_expression(&self, target_lane: &str) -> String {
+        if self.options.stage == MetalShaderStage::Compute {
+            format!("simd_shuffle(exec ? 1u : 0u, (ushort){target_lane}) != 0u")
+        } else {
+            "exec".to_owned()
+        }
+    }
+
+    fn apply_dpp_source(&self, control: DppControl, value: &str) -> Result<String, String> {
+        let (target_lane, in_range) = Self::dpp_source_lane(control)?;
+        let safe_target = format!("((({in_range}) ? {target_lane} : remu_lane) & 31u)");
+        let shuffled = self.shuffle_lane(value, &safe_target);
+        if control.fetch_inactive {
+            return Ok(shuffled);
+        }
+        let source_active = self.lane_active_expression(&safe_target);
+        Ok(format!(
+            "((({in_range}) && ({source_active})) ? ({shuffled}) : 0u)"
+        ))
+    }
+
+    fn apply_dpp8_source(&self, control: Dpp8Control, value: &str) -> String {
+        let selector = format!(
+            "(({}u >> ((remu_lane & 7u) * 3u)) & 7u)",
+            control.lane_selectors
+        );
+        let target_lane = format!("(((remu_lane & 0xFFFFFFF8u) + {selector}) & 31u)");
+        let shuffled = self.shuffle_lane(value, &target_lane);
+        if control.fetch_inactive {
+            return shuffled;
+        }
+        let source_active = self.lane_active_expression(&target_lane);
+        format!("(({source_active}) ? ({shuffled}) : 0u)")
+    }
+
+    fn emit_dpp_write_enabled(&mut self, control: DppControl) -> Result<String, String> {
+        let (_, in_range) = Self::dpp_source_lane(control)?;
+        let row_enabled = format!("(({}u >> (remu_lane >> 4)) & 1u) != 0u", control.row_mask);
+        let bank_enabled = format!("(({}u >> (remu_lane & 3u)) & 1u) != 0u", control.bank_mask);
+        let source_allows = if control.bound_control {
+            "true"
+        } else {
+            &in_range
+        };
+        Ok(self.temp(
+            "bool",
+            &format!("({row_enabled}) && ({bank_enabled}) && ({source_allows})"),
+        ))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_vector_alu(&mut self, instruction: &Instruction) -> Result<(), String> {
         if let Some(InstructionControl::Sdwa(control)) = instruction.control.as_ref()
@@ -816,17 +923,16 @@ impl<'a> Compiler<'a> {
         {
             return Err("reserved SDWA selector or destination-unused mode".to_owned());
         }
-        if matches!(
-            instruction.control,
-            Some(
-                InstructionControl::Dpp(_)
-                    | InstructionControl::Dpp8(_)
-                    | InstructionControl::Vop3p(_)
-            )
-        ) {
-            return Err(
-                "DPP, DPP8, and packed VOP3 controls require their dedicated lowering".to_owned(),
-            );
+        if matches!(instruction.control, Some(InstructionControl::Vop3p(_))) {
+            return Err("packed VOP3 controls require their dedicated lowering".to_owned());
+        }
+        if let Some(InstructionControl::Dpp(control)) = instruction.control
+            && !is_supported_dpp_control(control.control)
+        {
+            return Err(format!(
+                "unsupported DPP16 control 0x{:03X}",
+                control.control
+            ));
         }
         let name = instruction
             .opcode
@@ -835,23 +941,18 @@ impl<'a> Compiler<'a> {
         if name.starts_with("VCmp") {
             return self.emit_vector_compare(instruction, name);
         }
-        if name == "VCndmaskB32" {
-            let destination = destination_vector(instruction)?;
-            let mask = if instruction.sources.len() > 2 {
-                self.mask_source(instruction.sources[2])?
-            } else {
-                "vcc".to_owned()
-            };
-            let false_value = self.raw_source(instruction, 0)?;
-            let true_value = self.raw_source(instruction, 1)?;
-            self.store_vector(
-                destination,
-                &format!("({mask}) ? ({true_value}) : ({false_value})"),
-            );
-            return Ok(());
-        }
         let destination = destination_vector(instruction)?;
         let expression = match name {
+            "VCndmaskB32" => {
+                let mask = if instruction.sources.len() > 2 {
+                    self.mask_source(instruction.sources[2])?
+                } else {
+                    "vcc".to_owned()
+                };
+                let false_value = self.raw_source(instruction, 0)?;
+                let true_value = self.raw_source(instruction, 1)?;
+                format!("({mask}) ? ({true_value}) : ({false_value})")
+            }
             "VMovB32" => self.raw_source(instruction, 0)?,
             "VAddF32" => self.float_result(
                 instruction,
@@ -1014,15 +1115,19 @@ impl<'a> Compiler<'a> {
                 ),
             _ => return Err(format!("unsupported vector opcode {name}")),
         };
-        let expression = if let Some(InstructionControl::Sdwa(control)) =
-            instruction.control.as_ref()
-            && control.scalar_destination.is_none()
-        {
-            let result = self.temp("uint", &expression);
-            self.apply_sdwa_destination(control, &result, &format!("v[{destination}]"))?
-        } else {
-            expression
-        };
+        let expression =
+            if let Some(InstructionControl::Dpp(control)) = instruction.control.as_ref() {
+                let result = self.temp("uint", &expression);
+                let write_enabled = self.emit_dpp_write_enabled(*control)?;
+                format!("({write_enabled}) ? {result} : v[{destination}]")
+            } else if let Some(InstructionControl::Sdwa(control)) = instruction.control.as_ref()
+                && control.scalar_destination.is_none()
+            {
+                let result = self.temp("uint", &expression);
+                self.apply_sdwa_destination(control, &result, &format!("v[{destination}]"))?
+            } else {
+                expression
+            };
         self.store_vector(destination, &expression);
         Ok(())
     }
@@ -1063,7 +1168,11 @@ impl<'a> Compiler<'a> {
             }
             VectorCompare::Class => self.emit_float_class_compare(instruction)?,
         };
-        let active = self.temp("bool", &format!("exec && ({condition})"));
+        let mut active = self.temp("bool", &format!("exec && ({condition})"));
+        if let Some(InstructionControl::Dpp(control)) = instruction.control.as_ref() {
+            let write_enabled = self.emit_dpp_write_enabled(*control)?;
+            active = self.temp("bool", &format!("({write_enabled}) ? {active} : vcc"));
+        }
         if name.starts_with("VCmpx") {
             self.store_exec_mask(&active);
         } else {
@@ -2038,6 +2147,20 @@ const fn align_full_image_address(image: &ImageControl, component: usize) -> usi
     }
 }
 
+const fn is_supported_dpp_control(control: u32) -> bool {
+    control <= 0xff
+        || matches!(
+            control,
+            0x101..=0x10f
+                | 0x111..=0x11f
+                | 0x121..=0x12f
+                | 0x140
+                | 0x141
+                | 0x150..=0x15f
+                | 0x160..=0x16f
+        )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VectorCompare {
     Always(bool),
@@ -2201,7 +2324,7 @@ fn image_component_type(binding: &ImageBinding) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use remu_shader::{Instruction, Program, ShaderEvaluation};
+    use remu_shader::{Dpp8Control, DppControl, Instruction, Program, ShaderEvaluation};
 
     use super::*;
 
@@ -2215,6 +2338,44 @@ mod tests {
             runtime_scalar_registers: BTreeSet::new(),
             vertex_inputs: Vec::new(),
         }
+    }
+
+    fn vector_instruction(
+        name: &'static str,
+        source_count: usize,
+        control: InstructionControl,
+    ) -> Instruction {
+        Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vop2,
+            opcode: Opcode::Known(name),
+            words: vec![0, 0],
+            sources: (1..=source_count)
+                .map(|register| {
+                    Operand::vector(u32::try_from(register).expect("test source index fits u32"))
+                })
+                .collect(),
+            destinations: vec![Operand::vector(8)],
+            control: Some(control),
+        }
+    }
+
+    fn compile_vector_instruction(
+        instruction: Instruction,
+        stage: MetalShaderStage,
+    ) -> MetalShader {
+        compile_msl(
+            &Program::new(0x1000, vec![instruction]),
+            &empty_evaluation(),
+            &MetalCompileOptions {
+                stage,
+                required_vertex_output_count: 0,
+                pixel_outputs: Vec::new(),
+                pixel_input_enable: 0,
+                pixel_input_address: 0,
+            },
+        )
+        .expect("vector instruction should lower")
     }
 
     #[test]
@@ -2482,5 +2643,250 @@ mod tests {
         );
         assert!(shader.source.contains("(uint)(uint64_t)simd_ballot("));
         assert!(!shader.source.contains("const uint remu_lane = 0u"));
+    }
+
+    #[test]
+    fn accepts_exactly_the_architectural_dpp16_control_space() {
+        for control in 0..=0x1ff {
+            let instruction = vector_instruction(
+                "VMovB32",
+                1,
+                InstructionControl::Dpp(DppControl {
+                    control,
+                    fetch_inactive: false,
+                    bound_control: false,
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    bank_mask: 0xf,
+                    row_mask: 0xf,
+                }),
+            );
+            let result = compile_msl(
+                &Program::new(0x1000, vec![instruction]),
+                &empty_evaluation(),
+                &MetalCompileOptions::vertex(0),
+            );
+            assert_eq!(
+                result.is_ok(),
+                is_supported_dpp_control(control),
+                "DPP control 0x{control:03X} acceptance differs from the ISA table: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lowers_dpp_and_dpp8_for_every_otherwise_supported_vector_alu() {
+        const ALU: [(&str, usize); 34] = [
+            ("VCndmaskB32", 2),
+            ("VMovB32", 1),
+            ("VAddF32", 2),
+            ("VSubF32", 2),
+            ("VSubrevF32", 2),
+            ("VMulF32", 2),
+            ("VMinF32", 2),
+            ("VMaxF32", 2),
+            ("VFmacF32", 2),
+            ("VMacF32", 2),
+            ("VFloorF32", 1),
+            ("VCeilF32", 1),
+            ("VTruncF32", 1),
+            ("VRndneF32", 1),
+            ("VFractF32", 1),
+            ("VSqrtF32", 1),
+            ("VRsqF32", 1),
+            ("VRcpF32", 1),
+            ("VRcpIflagF32", 1),
+            ("VLogF32", 1),
+            ("VExpF32", 1),
+            ("VSinF32", 1),
+            ("VCosF32", 1),
+            ("VAndB32", 2),
+            ("VLshrrevB32", 2),
+            ("VLshlAddU32", 3),
+            ("VCvtF32I32", 1),
+            ("VCvtPkrtzF16F32", 2),
+            ("VMadF32", 3),
+            ("VFmaF32", 3),
+            ("VMadAkF32", 3),
+            ("VMadMkF32", 3),
+            ("VFmaAkF32", 3),
+            ("VFmaMkF32", 3),
+        ];
+        const DPP_FAMILIES: [u32; 8] = [0xe4, 0x101, 0x111, 0x121, 0x140, 0x141, 0x150, 0x160];
+        for (name, source_count) in ALU {
+            for control in DPP_FAMILIES {
+                compile_vector_instruction(
+                    vector_instruction(
+                        name,
+                        source_count,
+                        InstructionControl::Dpp(DppControl {
+                            control,
+                            fetch_inactive: false,
+                            bound_control: false,
+                            absolute_mask: 0,
+                            negate_mask: 0,
+                            bank_mask: 0xf,
+                            row_mask: 0xf,
+                        }),
+                    ),
+                    MetalShaderStage::Compute,
+                );
+            }
+            for fetch_inactive in [false, true] {
+                compile_vector_instruction(
+                    vector_instruction(
+                        name,
+                        source_count,
+                        InstructionControl::Dpp8(Dpp8Control {
+                            lane_selectors: 0x00fa_c688,
+                            fetch_inactive,
+                        }),
+                    ),
+                    MetalShaderStage::Compute,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lowers_dpp_and_dpp8_for_all_decoded_vector_compares() {
+        const FLOAT_RELATIONS: [&str; 16] = [
+            "F", "Lt", "Eq", "Le", "Gt", "Lg", "Ge", "O", "U", "Nge", "Nlg", "Ngt", "Nle", "Neq",
+            "Nlt", "Tru",
+        ];
+        const INTEGER_RELATIONS: [&str; 8] = ["F", "Lt", "Eq", "Le", "Gt", "Ne", "Ge", "T"];
+        let mut names = Vec::new();
+        for prefix in ["VCmp", "VCmpx"] {
+            for relation in FLOAT_RELATIONS {
+                names.push(format!("{prefix}{relation}F32"));
+            }
+            for suffix in ["I32", "U32"] {
+                for relation in INTEGER_RELATIONS {
+                    names.push(format!("{prefix}{relation}{suffix}"));
+                }
+            }
+        }
+        names.push("VCmpClassF32".to_owned());
+        for name in names {
+            let name: &'static str = Box::leak(name.into_boxed_str());
+            for control in [
+                InstructionControl::Dpp(DppControl {
+                    control: 0x111,
+                    fetch_inactive: false,
+                    bound_control: false,
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    bank_mask: 0xf,
+                    row_mask: 0xf,
+                }),
+                InstructionControl::Dpp8(Dpp8Control {
+                    lane_selectors: 0x0005_3977,
+                    fetch_inactive: false,
+                }),
+            ] {
+                let mut instruction = vector_instruction(name, 2, control);
+                instruction.encoding = ShaderEncoding::Vopc;
+                instruction.destinations.clear();
+                compile_vector_instruction(instruction, MetalShaderStage::Compute);
+            }
+        }
+    }
+
+    #[test]
+    fn dpp_semantics_cover_lane_selection_activity_modifiers_and_write_masks() {
+        let shader = compile_vector_instruction(
+            vector_instruction(
+                "VAddF32",
+                2,
+                InstructionControl::Dpp(DppControl {
+                    control: 0x111,
+                    fetch_inactive: false,
+                    bound_control: false,
+                    absolute_mask: 1,
+                    negate_mask: 2,
+                    bank_mask: 0xa,
+                    row_mask: 5,
+                }),
+            ),
+            MetalShaderStage::Compute,
+        );
+        assert!(shader.source.contains("simd_shuffle(v[1], (ushort)"));
+        assert!(
+            shader
+                .source
+                .contains("simd_shuffle(exec ? 1u : 0u, (ushort)")
+        );
+        assert!(shader.source.contains("(remu_lane & 15u) >= 1u"));
+        assert!(shader.source.contains("fabs(as_type<float>"));
+        assert!(shader.source.contains("-(as_type<float>(v[2]))"));
+        assert!(shader.source.contains("5u >> (remu_lane >> 4)"));
+        assert!(shader.source.contains("10u >> (remu_lane & 3u)"));
+        assert!(shader.source.contains("? t"));
+        assert!(shader.source.contains(": v[8]"));
+
+        let fetch_inactive = compile_vector_instruction(
+            vector_instruction(
+                "VMovB32",
+                1,
+                InstructionControl::Dpp(DppControl {
+                    control: 0x101,
+                    fetch_inactive: true,
+                    bound_control: true,
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    bank_mask: 0xf,
+                    row_mask: 0xf,
+                }),
+            ),
+            MetalShaderStage::Compute,
+        );
+        assert!(
+            !fetch_inactive
+                .source
+                .contains("simd_shuffle(exec ? 1u : 0u")
+        );
+        assert!(fetch_inactive.source.contains("&& (true)"));
+    }
+
+    #[test]
+    fn dpp8_and_compare_masks_preserve_architectural_lane_state() {
+        let dpp8 = compile_vector_instruction(
+            vector_instruction(
+                "VMovB32",
+                1,
+                InstructionControl::Dpp8(Dpp8Control {
+                    lane_selectors: 0x0005_3977,
+                    fetch_inactive: false,
+                }),
+            ),
+            MetalShaderStage::Compute,
+        );
+        assert!(dpp8.source.contains("342391u >> ((remu_lane & 7u) * 3u)"));
+        assert!(dpp8.source.contains("remu_lane & 0xFFFFFFF8u"));
+        assert!(dpp8.source.contains("simd_shuffle(v[1], (ushort)"));
+        assert!(
+            dpp8.source
+                .contains("simd_shuffle(exec ? 1u : 0u, (ushort)")
+        );
+
+        let mut compare = vector_instruction(
+            "VCmpEqF32",
+            2,
+            InstructionControl::Dpp(DppControl {
+                control: 0xe4,
+                fetch_inactive: false,
+                bound_control: false,
+                absolute_mask: 0,
+                negate_mask: 0,
+                bank_mask: 0,
+                row_mask: 0,
+            }),
+        );
+        compare.encoding = ShaderEncoding::Vopc;
+        compare.destinations.clear();
+        let compare = compile_vector_instruction(compare, MetalShaderStage::Vertex);
+        assert!(compare.source.contains(": vcc"));
+        assert!(compare.source.contains("s[106] ="));
+        assert!(compare.source.contains("s[107] = 0u"));
     }
 }
