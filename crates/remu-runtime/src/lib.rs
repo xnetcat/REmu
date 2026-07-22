@@ -321,7 +321,7 @@ fn add_relocation_stats(total: &mut RelocationStats, addition: RelocationStats) 
     total.relative += addition.relative;
 }
 
-const LLE_LIBC_ALLOCATOR_NIDS: [&str; 8] = [
+const LLE_LIBC_RUNTIME_NIDS: [&str; 12] = [
     "bzQExy189ZI",
     "gQX+4GDQjpM",
     "tIhsqj0qsFE",
@@ -330,6 +330,13 @@ const LLE_LIBC_ALLOCATOR_NIDS: [&str; 8] = [
     "Ujf3KzMvRmI",
     "2Btkg8k24Zg",
     "cVSk9y8URbc",
+    // Dinkumware multibyte conversion shares hidden locale and per-thread mbstate with libc.
+    // Resolve the complete ABI family to the bundled runtime instead of splitting that state
+    // between guest code and host approximations.
+    "QxqK-IdpumU", // _Getpmbstate
+    "zS94yyJRSUs", // _Getpwcstate
+    "stv1S3BKfgw", // _Wctombx
+    "ATpTPg64JhM", // _Wctombx.initial
 ];
 
 fn selected_module_exports(
@@ -347,7 +354,7 @@ fn selected_module_exports(
             .filter(|symbol| !symbol.is_undefined())
         {
             let nid = extract_nid(&symbol.name);
-            if LLE_LIBC_ALLOCATOR_NIDS.contains(&nid) {
+            if LLE_LIBC_RUNTIME_NIDS.contains(&nid) {
                 let address = module
                     .base
                     .get()
@@ -1293,6 +1300,10 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "bnZxYgAFeA0" => "sceKernelGetSanitizerNewReplaceExternal",
         "NWtTN10cJzE" => "sceLibcHeapGetTraceInfo",
         "mkx2fVhNMsg" => "pthread_cond_broadcast",
+        "QxqK-IdpumU" => "_Getpmbstate",
+        "zS94yyJRSUs" => "_Getpwcstate",
+        "stv1S3BKfgw" => "_Wctombx",
+        "ATpTPg64JhM" => "_Wctombx.initial",
         "FxVZqBAA7ks" => "_write",
         "4wSze92BhLI" => "sceKernelWrite",
         "aI+OeCz8xrQ" => "scePthreadSelf",
