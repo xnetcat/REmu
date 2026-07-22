@@ -1315,12 +1315,15 @@ impl MetalPresenter {
             descriptor.tile_mode,
             fingerprint,
         );
-        if self.captured_guest_frames.len() >= self.capture_limit
-            || !self.captured_guest_frames.insert(captured_frame)
-        {
+        if self.captured_guest_frames.len() >= self.capture_limit {
             return;
         }
+        // A duplicate still consumed a readback and fingerprint pass. Advance the throttle so
+        // an unchanged 4K frame cannot force that work again on every translated draw.
         self.last_guest_capture = Some(Instant::now());
+        if !self.captured_guest_frames.insert(captured_frame) {
+            return;
+        }
         match capture_guest_frame(directory, &self.guest_bgra_bytes, descriptor, fingerprint) {
             Ok(path) => eprintln!("[REMu][METAL] captured frame {}", path.display()),
             Err(error) => eprintln!("[REMu][METAL] could not capture frame: {error}"),
