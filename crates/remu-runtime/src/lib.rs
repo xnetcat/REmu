@@ -2504,6 +2504,8 @@ struct GuestSyncState {
     condition_notify_count: u64,
     semaphores: HashMap<u32, GuestSemaphoreState>,
     next_semaphore_handle: u32,
+    semaphore_wait_count: u64,
+    semaphore_signal_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -3619,25 +3621,30 @@ fn guest_semaphore_wait(arguments: [u64; 6]) -> u64 {
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.semaphore_wait_count = state.semaphore_wait_count.saturating_add(1);
+    let wait_sequence = state.semaphore_wait_count;
+    let trace_call = trace_guest_sync() && trace_logarithmic_sequence(wait_sequence, 8);
+    let mut logged_block = false;
     loop {
         let Some(semaphore) = state.semaphores.get_mut(&handle) else {
             return u64::MAX;
         };
         if semaphore.count >= needed {
             semaphore.count -= needed;
-            if trace_guest_sync() {
+            if trace_call {
                 eprintln!(
-                    "[REMu][SEMA] acquire handle={handle} needed={needed} remaining={}",
+                    "[REMu][SEMA] acquire sequence={wait_sequence} handle={handle} needed={needed} remaining={}",
                     semaphore.count
                 );
             }
             return 0;
         }
-        if trace_guest_sync() {
+        if trace_call && !logged_block {
             eprintln!(
-                "[REMu][SEMA] wait handle={handle} needed={needed} available={}",
+                "[REMu][SEMA] wait sequence={wait_sequence} handle={handle} needed={needed} available={}",
                 semaphore.count
             );
+            logged_block = true;
         }
         state = sync
             .1
@@ -3654,6 +3661,8 @@ fn guest_semaphore_signal(arguments: [u64; 6]) -> u64 {
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.semaphore_signal_count = state.semaphore_signal_count.saturating_add(1);
+    let signal_sequence = state.semaphore_signal_count;
     let Some(semaphore) = state.semaphores.get_mut(&handle) else {
         return u64::MAX;
     };
@@ -3661,9 +3670,9 @@ fn guest_semaphore_signal(arguments: [u64; 6]) -> u64 {
         .count
         .saturating_add(amount)
         .min(semaphore.maximum);
-    if trace_guest_sync() {
+    if trace_guest_sync() && trace_logarithmic_sequence(signal_sequence, 8) {
         eprintln!(
-            "[REMu][SEMA] signal handle={handle} amount={amount} available={}",
+            "[REMu][SEMA] signal sequence={signal_sequence} handle={handle} amount={amount} available={}",
             semaphore.count
         );
     }

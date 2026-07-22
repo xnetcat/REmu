@@ -70,8 +70,10 @@ milestone completion claim.
   binding, busy destruction with pending waiters, destruction after selection, and a three-worker
   predicate-guarded pool in which one signal permits exactly one task consumption. Bounded
   power-of-two condition ticket/selection telemetry complements the existing opt-in all-call VM
-  map/protect/query/unmap trace. Native and Rosetta workspace tests and strict Clippy passed before
-  the process-checked run below.
+  map/protect/query/unmap trace. Semaphore waits and signals use the same guest-call sequence policy:
+  a blocked wait is logged once rather than after every unrelated wake of the shared host condition
+  variable. The retained run below contained 12,609 semaphore lines before this bound. Native and
+  Rosetta workspace tests and strict Clippy passed before the process-checked run below.
 - The single post-fix run at `c883eff` used direct shell, headless Metal, an exact 80-second bound,
   and opt-in VM/synchronization traces. It ended by deliberate timeout with four frames, zero
   unimplemented NIDs, and no remaining process; artifacts are retained under
