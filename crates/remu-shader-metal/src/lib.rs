@@ -2114,8 +2114,18 @@ impl<'a> Compiler<'a> {
         );
         let oob = self.temp(
             "bool",
-            &format!(
-                "{descriptor_null} || ({oob_select} == 0u ? ({index} >= {record_count} || {offset} >= {stride}) : {oob_select} == 1u ? ({index} >= {record_count}) : {oob_select} == 2u ? ({record_count} == 0u) : ({swizzled} && {stride} != 0u ? ({index} >= {record_count} || !remu_range_valid({offset}, {payload}, {stride})) : !remu_range_valid({buffer_offset}, {payload}, {reduced_records})))"
+            &buffer_oob_expression(
+                &descriptor_null,
+                &oob_select,
+                &index,
+                &record_count,
+                &offset,
+                &stride,
+                &swizzled,
+                &buffer_offset,
+                &reduced_records,
+                &payload,
+                0,
             ),
         );
         if is_format_buffer_memory(instruction) {
@@ -2128,6 +2138,29 @@ impl<'a> Compiler<'a> {
                 &oob,
             );
         }
+        let component_oobs = (control.dword_count > 1
+            && name.contains("Dword")
+            && !name.contains("Atomic"))
+        .then(|| {
+            (0..control.dword_count)
+                .map(|component| {
+                    let expression = buffer_oob_expression(
+                        &descriptor_null,
+                        &oob_select,
+                        &index,
+                        &record_count,
+                        &offset,
+                        &stride,
+                        &swizzled,
+                        &buffer_offset,
+                        &reduced_records,
+                        "4u",
+                        component * 4,
+                    );
+                    self.temp("bool", &expression)
+                })
+                .collect::<Vec<_>>()
+        });
         self.emit_raw_memory_operation(
             name,
             control.vector_data,
@@ -2137,6 +2170,7 @@ impl<'a> Compiler<'a> {
             binding_length,
             &address,
             &oob,
+            component_oobs.as_deref(),
             control.glc,
             control.lds,
             control.tfe,
@@ -2206,6 +2240,7 @@ impl<'a> Compiler<'a> {
             binding.data.len(),
             &local_address,
             &oob,
+            None,
             control.glc,
             control.lds,
             false,
@@ -2510,6 +2545,7 @@ impl<'a> Compiler<'a> {
         binding_length: usize,
         address: &str,
         descriptor_oob: &str,
+        component_descriptor_oobs: Option<&[String]>,
         glc: bool,
         lds: bool,
         tfe: bool,
@@ -2545,6 +2581,9 @@ impl<'a> Compiler<'a> {
                 }
             }
             for component in 0..dword_count {
+                let descriptor_oob = component_descriptor_oobs
+                    .and_then(|bounds| bounds.get(component as usize))
+                    .map_or(descriptor_oob, String::as_str);
                 let component_address = if component == 0 {
                     aligned_address.clone()
                 } else {
@@ -2604,6 +2643,9 @@ impl<'a> Compiler<'a> {
         if store {
             let (width, high) = raw_store_shape(name)?;
             for component in 0..dword_count {
+                let descriptor_oob = component_descriptor_oobs
+                    .and_then(|bounds| bounds.get(component as usize))
+                    .map_or(descriptor_oob, String::as_str);
                 let component_address = if component == 0 {
                     aligned_address.clone()
                 } else {
@@ -3230,6 +3272,35 @@ fn raw_store_shape(name: &str) -> Result<(u32, bool), String> {
     } else {
         Err(format!("unsupported raw store width for {name}"))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn buffer_oob_expression(
+    descriptor_null: &str,
+    oob_select: &str,
+    index: &str,
+    record_count: &str,
+    offset: &str,
+    stride: &str,
+    swizzled: &str,
+    buffer_offset: &str,
+    reduced_records: &str,
+    payload: &str,
+    component_offset: u32,
+) -> String {
+    let offset = if component_offset == 0 {
+        offset.to_owned()
+    } else {
+        format!("{offset} + {component_offset}u")
+    };
+    let buffer_offset = if component_offset == 0 {
+        buffer_offset.to_owned()
+    } else {
+        format!("{buffer_offset} + {component_offset}u")
+    };
+    format!(
+        "{descriptor_null} || ({oob_select} == 0u ? ({index} >= {record_count} || {offset} >= {stride}) : {oob_select} == 1u ? ({index} >= {record_count}) : {oob_select} == 2u ? ({record_count} == 0u) : ({swizzled} && {stride} != 0u ? ({index} >= {record_count} || !remu_range_valid({offset}, {payload}, {stride})) : !remu_range_valid({buffer_offset}, {payload}, {reduced_records})))"
+    )
 }
 
 fn memory_payload_bytes(name: &str, _dword_count: u32) -> Result<u32, String> {
@@ -4417,6 +4488,27 @@ mod tests {
         assert!(shader.source.contains("0xFFFF0000u"));
         assert!(shader.source.contains("0xFFFFFF00u"));
         assert!(shader.source.contains("remu_range_valid"));
+    }
+
+    #[test]
+    fn range_checks_raw_dword_vectors_per_component() {
+        let expression = buffer_oob_expression(
+            "null",
+            "mode",
+            "index",
+            "records",
+            "offset",
+            "stride",
+            "swizzled",
+            "buffer_offset",
+            "reduced_records",
+            "4u",
+            12,
+        );
+
+        assert!(expression.contains("offset + 12u >= stride"));
+        assert!(expression.contains("remu_range_valid(offset + 12u, 4u, stride)"));
+        assert!(expression.contains("remu_range_valid(buffer_offset + 12u, 4u, reduced_records)"));
     }
 
     #[test]
