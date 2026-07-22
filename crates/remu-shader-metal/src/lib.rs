@@ -398,6 +398,7 @@ impl<'a> Compiler<'a> {
                 parameters
                     .push("uint3 remu_local_id [[thread_position_in_threadgroup]]".to_owned());
                 parameters.push("uint3 remu_group_id [[threadgroup_position_in_grid]]".to_owned());
+                parameters.push("uint remu_lane [[thread_index_in_simdgroup]]".to_owned());
             }
         }
         let signature = match self.options.stage {
@@ -414,7 +415,12 @@ impl<'a> Compiler<'a> {
         source.push_str("    bool exec = true;\n    bool vcc = false;\n    bool scc = false;\n");
         source.push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
         source.push_str("    for (uint i = 0u; i < 128u; ++i) s[i] = remu_initial_s[i];\n");
-        source.push_str("    const uint remu_lane = 0u;\n");
+        if self.options.stage != MetalShaderStage::Compute {
+            // Metal simdgroup operations are not valid in the divergent graphics-stage
+            // interpreter loop, so graphics deliberately use the same single-lane wave model as
+            // the reference Metal backend. Compute invocations use their real simdgroup lane.
+            source.push_str("    const uint remu_lane = 0u;\n");
+        }
         match self.options.stage {
             MetalShaderStage::Vertex => {
                 source.push_str("    RemuVsOut remu_out = {};\n");
@@ -826,6 +832,9 @@ impl<'a> Compiler<'a> {
             .opcode
             .known_name()
             .ok_or_else(|| "raw vector opcode".to_owned())?;
+        if name.starts_with("VCmp") {
+            return self.emit_vector_compare(instruction, name);
+        }
         if name == "VCndmaskB32" {
             let destination = destination_vector(instruction)?;
             let mask = if instruction.sources.len() > 2 {
@@ -1016,6 +1025,120 @@ impl<'a> Compiler<'a> {
         };
         self.store_vector(destination, &expression);
         Ok(())
+    }
+
+    fn emit_vector_compare(&mut self, instruction: &Instruction, name: &str) -> Result<(), String> {
+        let condition = match classify_vector_compare(name)? {
+            VectorCompare::Always(value) => value.to_string(),
+            VectorCompare::Ordered => format!(
+                "(!isnan({}) && !isnan({}))",
+                self.float_source(instruction, 0)?,
+                self.float_source(instruction, 1)?
+            ),
+            VectorCompare::Unordered => format!(
+                "(isnan({}) || isnan({}))",
+                self.float_source(instruction, 0)?,
+                self.float_source(instruction, 1)?
+            ),
+            VectorCompare::Float { operator, negate } => {
+                let comparison = format!(
+                    "({} {operator} {})",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?
+                );
+                if negate {
+                    format!("!{comparison}")
+                } else {
+                    comparison
+                }
+            }
+            VectorCompare::Integer { operator, signed } => {
+                let left = self.raw_source(instruction, 0)?;
+                let right = self.raw_source(instruction, 1)?;
+                if signed {
+                    format!("(as_type<int>({left}) {operator} as_type<int>({right}))")
+                } else {
+                    format!("(({left}) {operator} ({right}))")
+                }
+            }
+            VectorCompare::Class => self.emit_float_class_compare(instruction)?,
+        };
+        let active = self.temp("bool", &format!("exec && ({condition})"));
+        if name.starts_with("VCmpx") {
+            self.store_exec_mask(&active);
+        } else {
+            let destination = match instruction.control.as_ref() {
+                Some(InstructionControl::Sdwa(control)) => {
+                    control.scalar_destination.unwrap_or(VCC_LO)
+                }
+                _ => VCC_LO,
+            };
+            self.store_lane_mask(destination, &active);
+        }
+        Ok(())
+    }
+
+    fn emit_float_class_compare(&mut self, instruction: &Instruction) -> Result<String, String> {
+        let value = self.temp("float", &self.float_source(instruction, 0)?);
+        let raw = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let mask = self.temp("uint", &self.raw_source(instruction, 1)?);
+        let negative = self.temp("bool", &format!("({raw} & 0x80000000u) != 0u"));
+        let nan = self.temp("bool", &format!("isnan({value})"));
+        let infinite = self.temp("bool", &format!("isinf({value})"));
+        let zero = self.temp("bool", &format!("{value} == 0.0f"));
+        let subnormal = self.temp(
+            "bool",
+            &format!("fabs({value}) > 0.0f && fabs({value}) < as_type<float>(0x00800000u)"),
+        );
+        let normal = self.temp(
+            "bool",
+            &format!("!({nan} || {infinite} || {zero} || {subnormal})"),
+        );
+        Ok(format!(
+            "((({mask} & 3u) != 0u) && {nan}) || \
+             ((({mask} >> 2) & 1u) != 0u && {infinite} && {negative}) || \
+             ((({mask} >> 3) & 1u) != 0u && {normal} && {negative}) || \
+             ((({mask} >> 4) & 1u) != 0u && {subnormal} && {negative}) || \
+             ((({mask} >> 5) & 1u) != 0u && {zero} && {negative}) || \
+             ((({mask} >> 6) & 1u) != 0u && {zero} && !{negative}) || \
+             ((({mask} >> 7) & 1u) != 0u && {subnormal} && !{negative}) || \
+             ((({mask} >> 8) & 1u) != 0u && {normal} && !{negative}) || \
+             ((({mask} >> 9) & 1u) != 0u && {infinite} && !{negative})"
+        ))
+    }
+
+    fn store_lane_mask(&mut self, register: u32, condition: &str) {
+        let ballot = self.ballot(condition);
+        match register {
+            VCC_LO => {
+                self.line(3, &format!("vcc = {condition};"));
+                self.line(3, &format!("s[{VCC_LO}] = {ballot};"));
+                self.line(3, &format!("s[{VCC_HI}] = 0u;"));
+            }
+            EXEC_LO => self.store_exec_mask(condition),
+            register if register < SCALAR_REGISTER_COUNT => {
+                self.line(3, &format!("s[{register}] = {ballot};"));
+                if register + 1 < SCALAR_REGISTER_COUNT {
+                    self.line(3, &format!("s[{}] = 0u;", register + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn store_exec_mask(&mut self, condition: &str) {
+        let ballot = self.ballot(condition);
+        self.line(3, &format!("exec = {condition};"));
+        self.line(3, &format!("s[{EXEC_LO}] = {ballot};"));
+        self.line(3, &format!("s[{EXEC_HI}] = 0u;"));
+    }
+
+    fn ballot(&self, condition: &str) -> String {
+        if self.options.stage == MetalShaderStage::Compute {
+            format!("(uint)(uint64_t)simd_ballot({condition})")
+        } else {
+            format!("({condition} ? 1u : 0u)")
+        }
     }
 
     fn apply_sdwa_destination(
@@ -1915,6 +2038,120 @@ const fn align_full_image_address(image: &ImageControl, component: usize) -> usi
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VectorCompare {
+    Always(bool),
+    Ordered,
+    Unordered,
+    Float {
+        operator: &'static str,
+        negate: bool,
+    },
+    Integer {
+        operator: &'static str,
+        signed: bool,
+    },
+    Class,
+}
+
+fn classify_vector_compare(name: &str) -> Result<VectorCompare, String> {
+    if name == "VCmpClassF32" {
+        return Ok(VectorCompare::Class);
+    }
+    let tail = name
+        .strip_prefix("VCmpx")
+        .or_else(|| name.strip_prefix("VCmp"))
+        .ok_or_else(|| format!("invalid vector compare opcode {name}"))?;
+    let (relation, kind) = tail
+        .strip_suffix("F32")
+        .map(|relation| (relation, "float"))
+        .or_else(|| {
+            tail.strip_suffix("I32")
+                .map(|relation| (relation, "signed"))
+        })
+        .or_else(|| {
+            tail.strip_suffix("U32")
+                .map(|relation| (relation, "unsigned"))
+        })
+        .ok_or_else(|| format!("invalid vector compare type in {name}"))?;
+    match kind {
+        "float" => match relation {
+            "F" => Ok(VectorCompare::Always(false)),
+            "Tru" => Ok(VectorCompare::Always(true)),
+            "O" => Ok(VectorCompare::Ordered),
+            "U" => Ok(VectorCompare::Unordered),
+            "Lt" => Ok(VectorCompare::Float {
+                operator: "<",
+                negate: false,
+            }),
+            "Eq" => Ok(VectorCompare::Float {
+                operator: "==",
+                negate: false,
+            }),
+            "Le" => Ok(VectorCompare::Float {
+                operator: "<=",
+                negate: false,
+            }),
+            "Gt" => Ok(VectorCompare::Float {
+                operator: ">",
+                negate: false,
+            }),
+            "Lg" => Ok(VectorCompare::Float {
+                operator: "!=",
+                negate: false,
+            }),
+            "Ge" => Ok(VectorCompare::Float {
+                operator: ">=",
+                negate: false,
+            }),
+            "Nge" => Ok(VectorCompare::Float {
+                operator: ">=",
+                negate: true,
+            }),
+            "Nlg" => Ok(VectorCompare::Float {
+                operator: "!=",
+                negate: true,
+            }),
+            "Ngt" => Ok(VectorCompare::Float {
+                operator: ">",
+                negate: true,
+            }),
+            "Nle" => Ok(VectorCompare::Float {
+                operator: "<=",
+                negate: true,
+            }),
+            "Neq" => Ok(VectorCompare::Float {
+                operator: "==",
+                negate: true,
+            }),
+            "Nlt" => Ok(VectorCompare::Float {
+                operator: "<",
+                negate: true,
+            }),
+            _ => Err(format!("unsupported float comparison {name}")),
+        },
+        "signed" | "unsigned" => {
+            let operator = match relation {
+                "F" | "T" => {
+                    return Ok(VectorCompare::Always(relation == "T"));
+                }
+                "Lt" => "<",
+                "Eq" => "==",
+                "Le" => "<=",
+                "Gt" => ">",
+                "Ne" => "!=",
+                "Ge" => ">=",
+                _ => return Err(format!("unsupported integer comparison {name}")),
+            };
+            Ok(VectorCompare::Integer {
+                operator,
+                signed: kind == "signed",
+            })
+        }
+        _ => unreachable!("comparison kind is selected above"),
+    }
+}
+
 fn destination_vector(instruction: &Instruction) -> Result<u32, String> {
     instruction
         .destinations
@@ -2100,5 +2337,150 @@ mod tests {
         assert!(shader.source.contains("clamp("));
         assert!(shader.source.contains("& 0xFFFF00FFu"));
         assert!(shader.source.contains("<< 8"));
+    }
+
+    #[test]
+    fn lowers_every_decoded_vector_compare_opcode() {
+        const FLOAT_RELATIONS: [&str; 16] = [
+            "F", "Lt", "Eq", "Le", "Gt", "Lg", "Ge", "O", "U", "Nge", "Nlg", "Ngt", "Nle", "Neq",
+            "Nlt", "Tru",
+        ];
+        const INTEGER_RELATIONS: [&str; 8] = ["F", "Lt", "Eq", "Le", "Gt", "Ne", "Ge", "T"];
+        let mut names = Vec::new();
+        for prefix in ["VCmp", "VCmpx"] {
+            for relation in FLOAT_RELATIONS {
+                names.push(format!("{prefix}{relation}F32"));
+            }
+            for suffix in ["I32", "U32"] {
+                for relation in INTEGER_RELATIONS {
+                    names.push(format!("{prefix}{relation}{suffix}"));
+                }
+            }
+        }
+        names.push("VCmpClassF32".to_owned());
+        assert_eq!(names.len(), 65);
+
+        for name in names {
+            let name: &'static str = Box::leak(name.into_boxed_str());
+            let program = Program::new(
+                0x1000,
+                vec![Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Vopc,
+                    opcode: Opcode::Known(name),
+                    words: vec![0],
+                    sources: vec![Operand::vector(1), Operand::vector(2)],
+                    destinations: Vec::new(),
+                    control: None,
+                }],
+            );
+            compile_msl(
+                &program,
+                &empty_evaluation(),
+                &MetalCompileOptions::vertex(0),
+            )
+            .unwrap_or_else(|error| panic!("{name} did not lower: {error}"));
+        }
+    }
+
+    #[test]
+    fn vector_compares_preserve_float_integer_and_mask_semantics() {
+        let compare = |pc, name, control| Instruction {
+            pc,
+            encoding: ShaderEncoding::Vopc,
+            opcode: Opcode::Known(name),
+            words: vec![0],
+            sources: vec![Operand::vector(1), Operand::vector(2)],
+            destinations: Vec::new(),
+            control,
+        };
+        let program = Program::new(
+            0x1000,
+            vec![
+                compare(0, "VCmpLtF32", None),
+                compare(4, "VCmpNgeF32", None),
+                compare(8, "VCmpLtI32", None),
+                compare(12, "VCmpLtU32", None),
+                compare(16, "VCmpxEqF32", None),
+                compare(
+                    20,
+                    "VCmpEqU32",
+                    Some(InstructionControl::Sdwa(SdwaControl {
+                        destination_select: 6,
+                        destination_unused: 0,
+                        source0_select: 6,
+                        source1_select: 6,
+                        source0_sign_extend: false,
+                        source1_sign_extend: false,
+                        absolute_mask: 0,
+                        negate_mask: 0,
+                        output_modifier: 0,
+                        clamp: false,
+                        scalar_destination: Some(12),
+                    })),
+                ),
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::vertex(0),
+        )
+        .expect("compare family should lower");
+        assert!(
+            shader
+                .source
+                .contains("as_type<float>(v[1]) < as_type<float>(v[2])")
+        );
+        assert!(
+            shader
+                .source
+                .contains("!(as_type<float>(v[1]) >= as_type<float>(v[2]))")
+        );
+        assert!(
+            shader
+                .source
+                .contains("as_type<int>(v[1]) < as_type<int>(v[2])")
+        );
+        assert!(shader.source.contains("((v[1]) < (v[2]))"));
+        assert!(shader.source.contains("exec = t"));
+        assert!(shader.source.contains("s[126] = (t"));
+        assert!(shader.source.contains("s[12] = (t"));
+        assert!(shader.source.contains("s[13] = 0u;"));
+    }
+
+    #[test]
+    fn compute_vector_compares_use_real_simd_lane_ballots() {
+        let program = Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vopc,
+                opcode: Opcode::Known("VCmpEqU32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1), Operand::vector(2)],
+                destinations: Vec::new(),
+                control: None,
+            }],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions {
+                stage: MetalShaderStage::Compute,
+                required_vertex_output_count: 0,
+                pixel_outputs: Vec::new(),
+                pixel_input_enable: 0,
+                pixel_input_address: 0,
+            },
+        )
+        .expect("compute compare should lower");
+        assert!(
+            shader
+                .source
+                .contains("uint remu_lane [[thread_index_in_simdgroup]]")
+        );
+        assert!(shader.source.contains("(uint)(uint64_t)simd_ballot("));
+        assert!(!shader.source.contains("const uint remu_lane = 0u"));
     }
 }
