@@ -59,6 +59,7 @@ if [ ! -x "$binary" ]; then
 fi
 
 auto_cross=${REMU_AUTO_CROSS:-8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,100,102,104,106,108,110,112,114,116,118}
+auto_pad_sequence=${REMU_AUTO_PAD_SEQUENCE:-}
 # Capturing a 4K PPM writes roughly 32 MiB per image and fingerprints the full frame on the
 # presenter thread. Keep it explicit so ordinary game runs measure the emulator rather than the
 # diagnostic I/O path.
@@ -101,11 +102,13 @@ if [ "${MTL_HUD_LOG_ENABLED:-0}" = 1 ]; then
 fi
 set +e
 if [ "$capture_frames" = 1 ]; then
-    env REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \
+    env REMU_AUTO_CROSS="$auto_cross" REMU_AUTO_PAD_SEQUENCE="$auto_pad_sequence" \
+        REMU_CAPTURE_DIR="$frame_dir" \
         arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path" \
         > "$run_dir/guest.log" 2>&1 &
 else
     env -u REMU_CAPTURE_DIR REMU_AUTO_CROSS="$auto_cross" \
+        REMU_AUTO_PAD_SEQUENCE="$auto_pad_sequence" \
         arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path" \
         > "$run_dir/guest.log" 2>&1 &
 fi

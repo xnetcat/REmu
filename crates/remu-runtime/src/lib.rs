@@ -2060,7 +2060,9 @@ unsafe extern "C" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
 
 #[cfg(not(target_arch = "x86_64"))]
 extern "C" fn import_dispatch_trampoline() {
-    let _dispatch: extern "C" fn(*const ImportCallFrame) -> ProbeImportReturn = import_dispatch;
+    std::hint::black_box(
+        import_dispatch as extern "C" fn(*const ImportCallFrame) -> ProbeImportReturn,
+    );
     unreachable!("x86-64 guest import stubs cannot execute on this host architecture");
 }
 
@@ -3391,11 +3393,7 @@ fn pad_read_state(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     }
     guest_memset(output, 0, 0x78);
     let host = remu_gpu::host_pad_state();
-    let buttons = if auto_cross_active() {
-        host.buttons | remu_gpu::PAD_BUTTON_CROSS
-    } else {
-        host.buttons
-    };
+    let buttons = host.buttons | auto_pad_buttons();
     let previous_buttons = LAST_LOGGED_BUTTONS.swap(buttons, Ordering::Relaxed);
     if previous_buttons != buttons {
         eprintln!("[REMu][PAD] buttons={buttons:#010x}");
@@ -3428,22 +3426,81 @@ fn pad_read_state(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     0
 }
 
-fn auto_cross_active() -> bool {
+fn parse_auto_pad_button(name: &str) -> Option<u32> {
+    let normalized = name.trim().to_ascii_lowercase();
+    let button = match normalized.as_str() {
+        "l3" => remu_gpu::PAD_BUTTON_L3,
+        "r3" => remu_gpu::PAD_BUTTON_R3,
+        "options" | "start" => remu_gpu::PAD_BUTTON_OPTIONS,
+        "up" => remu_gpu::PAD_BUTTON_UP,
+        "right" => remu_gpu::PAD_BUTTON_RIGHT,
+        "down" => remu_gpu::PAD_BUTTON_DOWN,
+        "left" => remu_gpu::PAD_BUTTON_LEFT,
+        "l2" => remu_gpu::PAD_BUTTON_L2,
+        "r2" => remu_gpu::PAD_BUTTON_R2,
+        "l1" => remu_gpu::PAD_BUTTON_L1,
+        "r1" => remu_gpu::PAD_BUTTON_R1,
+        "triangle" => remu_gpu::PAD_BUTTON_TRIANGLE,
+        "circle" => remu_gpu::PAD_BUTTON_CIRCLE,
+        "cross" | "x" => remu_gpu::PAD_BUTTON_CROSS,
+        "square" => remu_gpu::PAD_BUTTON_SQUARE,
+        _ => {
+            return normalized
+                .strip_prefix("0x")
+                .and_then(|value| u32::from_str_radix(value, 16).ok());
+        }
+    };
+    Some(button)
+}
+
+fn parse_auto_pad_sequence(value: &str) -> Vec<(Duration, u32)> {
+    let mut pulses = value
+        .split(',')
+        .filter_map(|entry| {
+            let (seconds, buttons) = entry.trim().split_once(':')?;
+            let seconds = seconds.trim().parse::<f64>().ok()?;
+            if !seconds.is_finite() || seconds < 0.0 {
+                return None;
+            }
+            let buttons = buttons
+                .split('+')
+                .map(parse_auto_pad_button)
+                .try_fold(0_u32, |mask, button| Some(mask | button?))?;
+            (buttons != 0).then(|| (Duration::from_secs_f64(seconds), buttons))
+        })
+        .collect::<Vec<_>>();
+    pulses.sort_by_key(|(time, _)| *time);
+    pulses
+}
+
+#[derive(Default)]
+struct AutoPadPulseState {
+    next: usize,
+    active: Option<(Instant, u32)>,
+}
+
+fn auto_pad_buttons() -> u32 {
     static START: OnceLock<Instant> = OnceLock::new();
-    static TIMES: OnceLock<Vec<Duration>> = OnceLock::new();
+    static PULSES: OnceLock<Vec<(Duration, u32)>> = OnceLock::new();
     static HOLD: OnceLock<Duration> = OnceLock::new();
-    static PULSE: OnceLock<Mutex<(usize, Option<Instant>)>> = OnceLock::new();
-    let times = TIMES.get_or_init(|| {
-        std::env::var("REMU_AUTO_CROSS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|value| value.trim().parse::<f64>().ok())
-            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-            .map(Duration::from_secs_f64)
-            .collect()
+    static STATE: OnceLock<Mutex<AutoPadPulseState>> = OnceLock::new();
+    let pulses = PULSES.get_or_init(|| {
+        let mut pulses = std::env::var("REMU_AUTO_PAD_SEQUENCE")
+            .ok()
+            .map_or_else(Vec::new, |value| parse_auto_pad_sequence(&value));
+        pulses.extend(
+            std::env::var("REMU_AUTO_CROSS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.trim().parse::<f64>().ok())
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| (Duration::from_secs_f64(seconds), remu_gpu::PAD_BUTTON_CROSS)),
+        );
+        pulses.sort_by_key(|(time, _)| *time);
+        pulses
     });
-    if times.is_empty() {
-        return false;
+    if pulses.is_empty() {
+        return 0;
     }
     let hold = *HOLD.get_or_init(|| {
         std::env::var("REMU_AUTO_CROSS_HOLD_MS")
@@ -3454,23 +3511,24 @@ fn auto_cross_active() -> bool {
     let start = *START.get_or_init(Instant::now);
     let now = Instant::now();
     let elapsed = now.saturating_duration_since(start);
-    let mut pulse = PULSE
-        .get_or_init(|| Mutex::new((0, None)))
+    let mut state = STATE
+        .get_or_init(|| Mutex::new(AutoPadPulseState::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if pulse.1.is_some_and(|active_until| now < active_until) {
-        return true;
-    }
-    pulse.1 = None;
-    if times
-        .get(pulse.0)
-        .is_some_and(|scheduled| elapsed >= *scheduled)
+    if let Some((active_until, buttons)) = state.active
+        && now < active_until
     {
-        pulse.0 += 1;
-        pulse.1 = Some(now + hold);
-        return true;
+        return buttons;
     }
-    false
+    state.active = None;
+    if let Some((scheduled, buttons)) = pulses.get(state.next).copied()
+        && elapsed >= scheduled
+    {
+        state.next += 1;
+        state.active = Some((now + hold, buttons));
+        return buttons;
+    }
+    0
 }
 
 fn system_service_get_status(arguments: [u64; 6]) -> u64 {
@@ -8414,14 +8472,36 @@ mod platform_independent_tests {
         guest_clock_gettime, guest_free, guest_global_locale, guest_qsort, guest_tolower_table,
         guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
         kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
-        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_detach_state,
-        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
-        read_guest_u64, resolve_guest_path, sanitize_save_segment, save_data_commit,
-        save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
-        save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
-        save_data_umount2, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
-        write_guest_u32, write_guest_u64, write_import_stub,
+        parse_auto_pad_sequence, pthread_attr_get_affinity, pthread_attr_get_stack,
+        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
+        sanitize_save_segment, save_data_commit, save_data_create_transaction_resource,
+        save_data_dir_name_search, save_data_mount3, save_data_pattern_matches, save_data_prepare,
+        save_data_save_icon, save_data_set_param, save_data_umount2, sce_kernel_error,
+        system_service_param_get_int, take_exit_callbacks, write_guest_u32, write_guest_u64,
+        write_import_stub,
     };
+
+    #[test]
+    fn parses_named_and_raw_auto_pad_pulses_in_time_order() {
+        assert_eq!(
+            parse_auto_pad_sequence("2.5:triangle,1:cross+down,3:0x8,bad:left,4:nope"),
+            vec![
+                (
+                    std::time::Duration::from_secs(1),
+                    remu_gpu::PAD_BUTTON_CROSS | remu_gpu::PAD_BUTTON_DOWN,
+                ),
+                (
+                    std::time::Duration::from_millis(2_500),
+                    remu_gpu::PAD_BUTTON_TRIANGLE,
+                ),
+                (
+                    std::time::Duration::from_secs(3),
+                    remu_gpu::PAD_BUTTON_OPTIONS,
+                ),
+            ]
+        );
+    }
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
         // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
