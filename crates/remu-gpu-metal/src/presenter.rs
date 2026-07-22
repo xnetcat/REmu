@@ -60,6 +60,28 @@ fn headless_metal_requested() -> bool {
     headless_metal_value_is_enabled(std::env::var_os("REMU_HEADLESS_METAL").as_deref())
 }
 
+fn process_resident_bytes() -> Option<u64> {
+    let mut task = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let byte_count = std::mem::size_of::<libc::proc_taskinfo>();
+    let byte_count = i32::try_from(byte_count).ok()?;
+    // SAFETY: `task` names writable storage of exactly the size passed to `proc_pidinfo` for the
+    // current process and is read only after libproc reports a complete `PROC_PIDTASKINFO` result.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(std::process::id()).ok()?,
+            libc::PROC_PIDTASKINFO,
+            0,
+            task.as_mut_ptr().cast::<c_void>(),
+            byte_count,
+        )
+    };
+    if written != byte_count {
+        return None;
+    }
+    // SAFETY: A complete result initialized every field of `proc_taskinfo` above.
+    Some(unsafe { task.assume_init() }.pti_resident_size)
+}
+
 // GFX10 context-register offsets are the MMIO dword address minus 0xA000. Color registers
 // 0..7 use a 15-dword primary stride; the high address and GFX10 extent/swizzle registers are
 // stored in separate dense eight-register arrays. These values match Mesa's generated gfx10
@@ -436,7 +458,10 @@ impl OrderedGpuEventReceiver {
             return OrderedEventPoll::Event(GpuEvent::IndexedDraw(blocked.draw));
         }
         match self.receiver.try_recv() {
-            Ok(event) => OrderedEventPoll::Event(event),
+            Ok(event) => {
+                remu_gpu::record_gpu_event_consumed();
+                OrderedEventPoll::Event(event)
+            }
             Err(TryRecvError::Empty) => OrderedEventPoll::Empty,
             Err(TryRecvError::Disconnected) => OrderedEventPoll::Disconnected,
         }
@@ -472,6 +497,37 @@ struct PendingGlobalWriteback {
     buffer: Buffer,
     guest_address: u64,
     byte_count: usize,
+}
+
+struct PendingPresentation {
+    command_buffer: CommandBuffer,
+    submitted_at: Instant,
+}
+
+struct PresenterStatistics {
+    interval_started: Instant,
+    guest_flips: u32,
+    completed_presents: u32,
+    encoded_draws: u32,
+    encoded_compute_dispatches: u32,
+    presentation_gpu_time: Duration,
+    last_audio_output_frames: u64,
+    last_audio_underrun_frames: u64,
+}
+
+impl PresenterStatistics {
+    fn new() -> Self {
+        Self {
+            interval_started: Instant::now(),
+            guest_flips: 0,
+            completed_presents: 0,
+            encoded_draws: 0,
+            encoded_compute_dispatches: 0,
+            presentation_gpu_time: Duration::ZERO,
+            last_audio_output_frames: remu_gpu::audio_output_frames(),
+            last_audio_underrun_frames: remu_gpu::audio_underrun_frames(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -599,6 +655,8 @@ struct MetalPresenter {
     resident_content_version: u64,
     open_guest_batch: Option<GuestCommandBatch>,
     committed_guest_batches: VecDeque<GuestCommandBatch>,
+    pending_presentations: VecDeque<PendingPresentation>,
+    statistics: PresenterStatistics,
     capture_directory: Option<PathBuf>,
     pressed_keys: HashSet<KeyCode>,
     shader_compile_sender: SyncSender<ShaderCompileRequest>,
@@ -668,6 +726,8 @@ impl MetalPresenter {
             resident_content_version: 0,
             open_guest_batch: None,
             committed_guest_batches: VecDeque::new(),
+            pending_presentations: VecDeque::new(),
+            statistics: PresenterStatistics::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
             pressed_keys: HashSet::new(),
             shader_compile_sender,
@@ -733,6 +793,7 @@ impl MetalPresenter {
     fn receive_events(&mut self) -> PresenterFlow {
         self.receive_shader_compilations();
         self.retire_completed_guest_batches();
+        self.retire_completed_presentations();
         // A bounded batch prevents a continuously producing guest from starving redraw and input
         // delivery. If the oldest event is waiting on shader compilation, the ordered receiver
         // stops here without touching any later event in the bounded upstream channel.
@@ -783,6 +844,7 @@ impl MetalPresenter {
                     tiling_mode,
                     ..
                 } => {
+                    self.statistics.guest_flips = self.statistics.guest_flips.saturating_add(1);
                     self.display = Some(DisplayConfiguration {
                         width,
                         height,
@@ -826,15 +888,22 @@ impl MetalPresenter {
                     }
                 }
                 GpuEvent::ComputeDispatch(dispatch) => {
-                    if let Err(error) = self.execute_compute_dispatch(&dispatch)
-                        && self
-                            .failed_compute_execution
-                            .insert(dispatch.shader_address)
-                    {
-                        eprintln!(
-                            "[REMu][METAL] Gen5 compute cs={:#x} could not execute: {error}",
-                            dispatch.shader_address
-                        );
+                    match self.execute_compute_dispatch(&dispatch) {
+                        Ok(()) => {
+                            self.statistics.encoded_compute_dispatches =
+                                self.statistics.encoded_compute_dispatches.saturating_add(1);
+                        }
+                        Err(error)
+                            if self
+                                .failed_compute_execution
+                                .insert(dispatch.shader_address) =>
+                        {
+                            eprintln!(
+                                "[REMu][METAL] Gen5 compute cs={:#x} could not execute: {error}",
+                                dispatch.shader_address
+                            );
+                        }
+                        Err(_) => {}
                     }
                 }
                 GpuEvent::IndexedDraw(draw) => {
@@ -880,6 +949,9 @@ impl MetalPresenter {
                                 register_value(&draw.context_registers, 0x08e).unwrap_or_default(),
                             );
                         }
+                    } else {
+                        self.statistics.encoded_draws =
+                            self.statistics.encoded_draws.saturating_add(1);
                     }
                 }
                 GpuEvent::Shutdown => {
@@ -1280,6 +1352,82 @@ impl MetalPresenter {
                 _ => return,
             }
         }
+    }
+
+    fn retire_completed_presentations(&mut self) {
+        loop {
+            let Some(presentation) = self.pending_presentations.front() else {
+                return;
+            };
+            match presentation.command_buffer.status() {
+                MTLCommandBufferStatus::Completed => {
+                    let presentation = self
+                        .pending_presentations
+                        .pop_front()
+                        .expect("front presentation exists");
+                    self.statistics.completed_presents =
+                        self.statistics.completed_presents.saturating_add(1);
+                    self.statistics.presentation_gpu_time += presentation.submitted_at.elapsed();
+                }
+                MTLCommandBufferStatus::Error => {
+                    self.pending_presentations.pop_front();
+                    eprintln!("[REMu][METAL] presentation command buffer failed");
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn update_window_title(&mut self) {
+        const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+        let elapsed = self.statistics.interval_started.elapsed();
+        if elapsed < UPDATE_INTERVAL || self.window.is_none() {
+            return;
+        }
+        let seconds = elapsed.as_secs_f64();
+        let completed = self.statistics.completed_presents;
+        let fps = f64::from(completed) / seconds;
+        let frame_milliseconds = if fps > 0.0 { 1_000.0 / fps } else { 0.0 };
+        let flip_rate = f64::from(self.statistics.guest_flips) / seconds;
+        let draw_rate = f64::from(self.statistics.encoded_draws) / seconds;
+        let compute_rate = f64::from(self.statistics.encoded_compute_dispatches) / seconds;
+        let gpu_milliseconds = if completed == 0 {
+            0.0
+        } else {
+            self.statistics.presentation_gpu_time.as_secs_f64() * 1_000.0 / f64::from(completed)
+        };
+        let resident_mib = process_resident_bytes().map(|bytes| bytes.div_ceil(1024 * 1024));
+        let audio_output = remu_gpu::audio_output_frames();
+        let interval_audio_output =
+            audio_output.saturating_sub(self.statistics.last_audio_output_frames);
+        let audio_underruns = remu_gpu::audio_underrun_frames();
+        let interval_underruns =
+            audio_underruns.saturating_sub(self.statistics.last_audio_underrun_frames);
+        let audio_underrun_percent = if interval_audio_output == 0 {
+            0.0
+        } else {
+            let output = u32::try_from(interval_audio_output).unwrap_or(u32::MAX);
+            let underruns = u32::try_from(interval_underruns).unwrap_or(u32::MAX);
+            f64::from(underruns) * 100.0 / f64::from(output)
+        };
+        let resident =
+            resident_mib.map_or_else(|| "RSS ?".to_owned(), |mib| format!("RSS {mib} MiB"));
+        let title = format!(
+            "REMu | FPS {fps:.1} ({frame_milliseconds:.1} ms) | Flip {flip_rate:.1}/s | GPU {gpu_milliseconds:.1} ms | {resident} | Draw {draw_rate:.0}/s CS {compute_rate:.0}/s | Q {}/{} | AudioU {audio_underrun_percent:.1}%",
+            remu_gpu::gpu_events_in_flight(),
+            self.pending_presentations.len(),
+        );
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(&title);
+        }
+        self.statistics.interval_started = Instant::now();
+        self.statistics.guest_flips = 0;
+        self.statistics.completed_presents = 0;
+        self.statistics.encoded_draws = 0;
+        self.statistics.encoded_compute_dispatches = 0;
+        self.statistics.presentation_gpu_time = Duration::ZERO;
+        self.statistics.last_audio_output_frames = audio_output;
+        self.statistics.last_audio_underrun_frames = audio_underruns;
     }
 
     fn flush_guest_command_batch(&mut self, wait: bool) -> Result<(), String> {
@@ -2144,7 +2292,7 @@ impl MetalPresenter {
         let Some(drawable) = layer.next_drawable() else {
             return;
         };
-        let command_buffer = queue.new_command_buffer();
+        let command_buffer = queue.new_command_buffer().to_owned();
         command_buffer.set_label("REMu guest presentation");
         if let (Some(display), Some(texture)) = (self.display, self.frame_texture.as_ref()) {
             let Ok(destination_width) = u32::try_from(drawable.texture().width()) else {
@@ -2180,6 +2328,10 @@ impl MetalPresenter {
         }
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        self.pending_presentations.push_back(PendingPresentation {
+            command_buffer,
+            submitted_at: Instant::now(),
+        });
         self.redraw_pending = false;
     }
 }
@@ -4274,6 +4426,8 @@ impl ApplicationHandler for MetalPresenter {
         if let Err(error) = self.flush_guest_command_batch(false) {
             eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
         }
+        self.retire_completed_presentations();
+        self.update_window_title();
         if self.redraw_pending
             && let Some(window) = self.window.as_ref()
         {
@@ -4370,9 +4524,9 @@ mod tests {
         headless_metal_value_is_enabled, metal_color_write_mask, metal_nonindexed_vertex_count,
         mode27_block_dimensions, mode27_source_byte_offset, mode27_within_block_byte_offset,
         parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
-        read_draw_indices, snapshot_guest_texture_linear, snapshot_guest_texture_raw,
-        srgb_unorm8_to_linear_unorm8, validate_compute_launch_for_metal,
-        write_guest_texture_linear,
+        process_resident_bytes, read_draw_indices, snapshot_guest_texture_linear,
+        snapshot_guest_texture_raw, srgb_unorm8_to_linear_unorm8,
+        validate_compute_launch_for_metal, write_guest_texture_linear,
     };
 
     #[test]
@@ -4387,6 +4541,11 @@ mod tests {
         assert!(headless_metal_value_is_enabled(Some(std::ffi::OsStr::new(
             "1"
         ))));
+    }
+
+    #[test]
+    fn reads_live_process_resident_memory_for_window_telemetry() {
+        assert!(process_resident_bytes().is_some_and(|bytes| bytes > 0));
     }
 
     #[allow(clippy::too_many_arguments)]

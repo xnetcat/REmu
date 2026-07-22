@@ -142,6 +142,10 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   preserves the existing contents. REmu therefore clears a newly allocated host-only scanout
   texture exactly once, then loads it for each later translated draw so separate Metal passes do
   not erase earlier guest draws. No upstream emulator implementation was copied for this policy.
+- Window telemetry uses public Metal command-buffer status/completion behavior and the installed
+  macOS SDK's `libproc.h`/`sys/proc_info.h` declarations for `proc_pidinfo(PROC_PIDTASKINFO)` live
+  resident memory. Audio-underrun percentage comes from REmu's own CoreAudio callback frame and
+  missing-sample counts; the title never relabels the Metal HUD's overlay cadence as guest FPS.
 - REmu independently implements a checked readback ticket: a backed single-sample texture is blitted
   into an aligned shared buffer on the producing command queue, the source and staging resources are
   retained through command-buffer completion, and padding is removed into the exact native pixel

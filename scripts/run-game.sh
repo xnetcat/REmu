@@ -75,11 +75,13 @@ auto_cross=${REMU_AUTO_CROSS:-}
 # diagnostic I/O path.
 capture_frames=${REMU_CAPTURE_FRAMES:-0}
 
-# Apple documents these variables as the command-line equivalent of Xcode's Metal Performance
-# HUD options. Preserve explicit MTL_* settings so callers can customize the HUD directly.
+# The emulator owns its live title-bar telemetry. Keep Apple's Metal HUD disabled by default so
+# it cannot obscure guest output or report presentation cadence as if it were guest frame rate.
 if [ "${REMU_METAL_HUD:-0}" = 1 ]; then
     MTL_HUD_ENABLED=${MTL_HUD_ENABLED:-1}
     export MTL_HUD_ENABLED
+else
+    unset MTL_HUD_ENABLED MTL_HUD_LOG_ENABLED
 fi
 if [ "${REMU_METAL_HUD_LOG:-0}" = 1 ]; then
     MTL_HUD_ENABLED=${MTL_HUD_ENABLED:-1}

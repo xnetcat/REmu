@@ -107,6 +107,20 @@ milestone completion claim.
   the current guest thread's DTV and corrects DTV slots from an erroneous 16-byte stride to the
   FreeBSD AMD64 one-pointer-per-module layout. Its module-2 regression clones two workers, proves
   their rebased TLS blocks do not alias, and covers invalid module IDs and address overflow.
+- The post-TLS run at `286e336` remained stable to its deliberate 150-second timeout, reached draw
+  checkpoint 4096, captured 16 frames, and reported zero unimplemented NIDs. Preserving a direct
+  scanout attachment across successive translated Metal passes produced changing post-boot pixels
+  instead of clearing every draw, but visual inspection shows only near-black fullscreen triangles
+  with channel values 0-2, not a menu or playable scene. The retained artifacts are
+  `.remu/runs/20260722T143508Z-dreaming-sarah`; this is renderer progress, not milestone progress.
+- A clean windowed follow-up without capture or VM/synchronization traces remained black. The Metal
+  HUD reported about 39 FPS, but that number described host presentation cadence over the black
+  texture and was not accepted as game performance. A live sample also found repeated per-draw
+  Metal argument reflection and resource allocation on the presentation thread. The current
+  observability increment disables the Metal HUD by default and reports REmu-owned title-bar
+  telemetry every 500 ms: completed presentation FPS/frame time, guest flip rate, average Metal
+  completion latency, live RSS, encoded draw/compute rates, guest GPU/presentation queue depths,
+  and the exact percentage of CoreAudio callback frames with a guest-port underrun.
 
 ## Subsystem ledger
 
@@ -118,13 +132,13 @@ milestone completion claim.
 | Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, and guest metadata are covered. `MAP_NO_COALESCE` mappings retain private identities for exact `VirtualQuery` boundaries; direct release invalidates all overlapping aliases and preserves unaffected tails. Containment-first/find-next query behavior and cross-VMA atomic unmap have synthetic coverage, and the `ad2b208` title run validated the corrected sequence. | Complete mapping lifecycle counters and exact query error/flag behavior for all exercised cases. |
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, and translated shader pipelines are present. | Complete reusable blend, depth/stencil, rasterization, culling, front-face, multisampling, resolve, and full structural cache identity; audit old blend commit `a0388df` without wholesale cherry-picking. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, and observed compute geometry are implemented with offline Metal compilation tests. | Complete the unimplemented RDNA2 instruction/resource/CFG surface and replace large per-draw shader snapshots with bounded content-addressed immutable spans. |
-| Presentation / frame capture | Guest display size is independent of host drawable size; headless Metal is opt-in; interactive runs use a regular app bundle; direct scanout avoids routine GPU-to-CPU presentation round trips. The bounded scanout/barrier run captured the correct splash and the expected later opaque-black transition from both alternating buffers. | Reach and capture the first post-transition scene after another concrete fix or diagnostic feature, then measure frame pacing. Do not infer playability from splash/transition frames. |
+| Presentation / frame capture | Guest display size is independent of host drawable size; headless Metal is opt-in; interactive runs use a regular app bundle; direct scanout avoids routine GPU-to-CPU presentation round trips and preserves composed draws across separate render passes. Completed-present, flip, queue, memory, draw/compute, and audio-underrun statistics update in the title bar without an overlay. | Resolve the post-boot near-black fullscreen triangles into the first real scene, then use completed-presentation and guest-flip rates to measure frame pacing. Do not infer playability from splash/transition frames. |
 | Runtime / ABI | Whole-process import auditing reports 379 HLE routes, 130 guest-libc routes, one host route, and one unresolved weak `__pthread_cxa_finalize`. Condition waits now use explicit FIFO tickets with distinct signal/broadcast cardinality, atomic mutex release/reacquisition, recursive-depth preservation, dynamic mutex binding, timeout arbitration, and SCE/POSIX error encodings. | Validate the BackgroundLoader crash correlation, then complete opaque guest condition-object lifecycle, guest-thread identity, cancellation, condition clock attributes, and POSIX absolute timed waits. Continue source-backed AGC fusion/event queues, save-dialog lifecycle, semaphore poll, unlink, pad/thread/save/sysmodule lifecycle, and researched anonymous NIDs. |
 | Audio | Host output, guest port/config validation, bounded queues, resampling, and stereo downmixing exist. | Audit timing/backpressure/device change/pause/teardown/A-V synchronization against actual title use and add deterministic offline mixer evidence. |
 | Video / Bink | No compatibility claim yet. | Identify each title's actual decoder/API path, then implement exact demux/decode/color/audio/timing semantics with legal generated fixtures. |
 | Storage / save data | Read-only app filesystem access and initial save transactions exist; dumps are not modified. | Complete namespace/path/case/permission/stat/iteration/atomicity/fsync/quota/slot/dialog/delete/concurrency semantics with crash-consistency tests. |
 | Input | Keyboard-backed pad state and opt-in deterministic Cross sequences exist. | Complete handle lifetime, disconnect/timestamps/dead zones/motion/touchpad/controller mapping/focus semantics as exercised. |
-| Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, HUD, and input diagnostics exist; run summaries retain revision/outcome/frame counts. AGC submissions, draws, compute dispatches, flips, Metal draw encodes, and condition wait/notify selections keep bounded logarithmic checkpoints; opt-in VM tracing records every low-volume map/protect/query/unmap transition. | Add a versioned documented config with strict precedence/validation and structured shader/pipeline/queue/copy/CPU/GPU/audio/frame-pacing counters. |
+| Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, opt-in HUD, and input diagnostics exist; the Metal HUD is off by default. Run summaries retain revision/outcome/frame counts. AGC submissions, draws, compute dispatches, flips, Metal draw encodes, and condition wait/notify selections keep bounded logarithmic checkpoints; opt-in VM tracing records every low-volume map/protect/query/unmap transition. The window title shows completed-presentation FPS/frame time, flip rate, Metal latency, live RSS, draw/compute rates, queue depths, and audio-underrun percentage. | Add a versioned documented config with strict precedence/validation and persist the live counters in structured run summaries. |
 
 ## Required validation for the current P0 increment
 
@@ -142,6 +156,13 @@ milestone completion claim.
 8. Complete at `ad2b208`: that controlled run proved the mapping fix and reached the next exact
    blocker, `__tls_get_addr`, at 84 seconds. The resulting TLS/DTV increment has passed checks 1-6;
    its next evidence step is one controlled direct-shell title run.
+9. Complete at `286e336`: the 150-second headless run validated TLS stability and direct-scanout
+   composition lifetime, but captured only near-black post-boot triangles. A clean windowed run and
+   user screenshot independently confirmed that the title remained black; the HUD's presentation
+   cadence was not treated as game FPS.
+10. Complete for the title-bar telemetry increment: checks 1-6 plus `sh -n scripts/run-game.sh`
+    pass natively and through Rosetta. Its next evidence step is a clean windowed launch with the
+    Metal HUD absent and live title statistics visible.
 
 Reference implementation provenance is recorded in [provenance](provenance.md); architectural and
 licensing constraints remain in [architecture](architecture.md) and [source policy](source-policy.md).

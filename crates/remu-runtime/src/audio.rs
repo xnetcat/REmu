@@ -117,13 +117,23 @@ impl AudioMixer {
             output.fill(0.0);
             return;
         }
+        let has_open_port = !self.queues.is_empty();
+        let mut output_frames = 0_u64;
+        let mut underrun_frames = 0_u64;
         for frame in output.chunks_mut(channels) {
+            output_frames = output_frames.saturating_add(1);
             let mut mixed = [0.0_f32; 2];
+            let mut missing_port_sample = false;
             for queue in self.queues.values_mut() {
                 if let Some(sample) = queue.pop_front() {
                     mixed[0] += sample[0];
                     mixed[1] += sample[1];
+                } else {
+                    missing_port_sample = true;
                 }
+            }
+            if has_open_port && missing_port_sample {
+                underrun_frames = underrun_frames.saturating_add(1);
             }
             frame.fill(0.0);
             if frame.len() == 1 {
@@ -132,6 +142,9 @@ impl AudioMixer {
                 frame[0] = mixed[0].clamp(-1.0, 1.0);
                 frame[1] = mixed[1].clamp(-1.0, 1.0);
             }
+        }
+        if has_open_port {
+            remu_gpu::report_audio_frames(output_frames, underrun_frames);
         }
     }
 }

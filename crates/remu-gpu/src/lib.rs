@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -57,6 +57,9 @@ impl Default for HostPadState {
 static HOST_PAD_BUTTONS: AtomicU32 = AtomicU32::new(0);
 static HOST_PAD_AXES: AtomicU32 = AtomicU32::new(0x8080_8080);
 static HOST_PAD_TRIGGERS: AtomicU32 = AtomicU32::new(0);
+static GPU_EVENTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static AUDIO_OUTPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
+static AUDIO_UNDERRUN_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_host_pad_state(state: HostPadState) {
     let axes = u32::from_le_bytes([state.left_x, state.left_y, state.right_x, state.right_y]);
@@ -80,6 +83,38 @@ pub fn host_pad_state() -> HostPadState {
         l2,
         r2,
     }
+}
+
+/// Returns the number of guest GPU events queued or blocked on the bounded presenter channel.
+#[must_use]
+pub fn gpu_events_in_flight() -> usize {
+    GPU_EVENTS_IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+/// Records that the presenter removed one event from the bounded guest GPU channel.
+pub fn record_gpu_event_consumed() {
+    let _ = GPU_EVENTS_IN_FLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
+
+/// Adds one host audio callback's output and underrun frame counts.
+pub fn report_audio_frames(output_frames: u64, underrun_frames: u64) {
+    AUDIO_OUTPUT_FRAMES.fetch_add(output_frames, Ordering::Relaxed);
+    AUDIO_UNDERRUN_FRAMES.fetch_add(underrun_frames, Ordering::Relaxed);
+}
+
+/// Returns the cumulative number of frames requested by the host audio device while a port was
+/// open.
+#[must_use]
+pub fn audio_output_frames() -> u64 {
+    AUDIO_OUTPUT_FRAMES.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of host audio frames affected by a guest-port underrun.
+#[must_use]
+pub fn audio_underrun_frames() -> u64 {
+    AUDIO_UNDERRUN_FRAMES.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -619,6 +654,9 @@ pub fn gpu_event_channel() -> (SyncSender<GpuEvent>, Receiver<GpuEvent>) {
 }
 
 pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
+    GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
+    AUDIO_OUTPUT_FRAMES.store(0, Ordering::Relaxed);
+    AUDIO_UNDERRUN_FRAMES.store(0, Ordering::Relaxed);
     let sink = GPU_EVENT_SINK.get_or_init(|| Mutex::new(None));
     *sink
         .lock()
@@ -626,6 +664,7 @@ pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
 }
 
 pub fn clear_event_sink() {
+    GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
     let Some(sink) = GPU_EVENT_SINK.get() else {
         return;
     };
@@ -643,7 +682,10 @@ pub fn emit_event(event: GpuEvent) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     if let Some(sender) = sender {
-        let _ = sender.send(event);
+        GPU_EVENTS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        if sender.send(event).is_err() {
+            record_gpu_event_consumed();
+        }
     }
 }
 
@@ -666,8 +708,10 @@ mod tests {
         COMPUTE_PGM_RSRC2_REGISTER, COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER,
         COMPUTE_START_Z_REGISTER, ComputeDispatchDecodeError, ComputeGrid,
         GPU_EVENT_QUEUE_CAPACITY, GpuEvent, GpuMemoryAcquire, GpuRegister, HostPadState,
-        compute_program_address, decode_compute_dispatch_direct, decode_compute_dispatch_indirect,
-        decode_compute_launch, decode_compute_system_registers, gpu_event_channel, host_pad_state,
+        audio_output_frames, audio_underrun_frames, clear_event_sink, compute_program_address,
+        decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
+        decode_compute_system_registers, emit_event, gpu_event_channel, gpu_events_in_flight,
+        host_pad_state, install_event_sink, record_gpu_event_consumed, report_audio_frames,
         set_host_pad_state,
     };
 
@@ -687,6 +731,22 @@ mod tests {
         sender
             .try_send(GpuEvent::Shutdown)
             .expect("receiver progress releases producer backpressure");
+    }
+
+    #[test]
+    fn runtime_telemetry_tracks_gpu_queue_and_audio_callback_progress() {
+        let (sender, receiver) = gpu_event_channel();
+        install_event_sink(sender);
+        emit_event(GpuEvent::Shutdown);
+        assert_eq!(gpu_events_in_flight(), 1);
+        assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
+        record_gpu_event_consumed();
+        assert_eq!(gpu_events_in_flight(), 0);
+
+        report_audio_frames(480, 12);
+        assert_eq!(audio_output_frames(), 480);
+        assert_eq!(audio_underrun_frames(), 12);
+        clear_event_sink();
     }
 
     #[test]
