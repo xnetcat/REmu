@@ -411,6 +411,15 @@ fn link(path: &Path) -> ExitCode {
         "imports.unresolved_weak={}",
         import_resolutions.unresolved_weak
     );
+    for resolution in linked.import_resolutions() {
+        println!(
+            "import_resolution={} nid={} weak={} symbol={}",
+            resolution.kind.as_str(),
+            resolution.nid,
+            resolution.weak,
+            resolution.symbol
+        );
+    }
     println!("unwind_records={}", linked.unwind_record_count());
     println!("bundled_modules={}", module_report.loaded_modules.len());
     println!(

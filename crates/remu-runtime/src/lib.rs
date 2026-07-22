@@ -10,7 +10,9 @@ mod np;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::CString;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
@@ -76,6 +78,34 @@ pub struct ImportResolutionStats {
     pub unresolved_weak: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ImportResolutionKind {
+    BundledGuest,
+    HostDirect,
+    HleDispatch,
+    UnresolvedWeak,
+}
+
+impl ImportResolutionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BundledGuest => "bundled-guest",
+            Self::HostDirect => "host-direct",
+            Self::HleDispatch => "hle-dispatch",
+            Self::UnresolvedWeak => "unresolved-weak",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportResolutionRecord {
+    pub symbol: String,
+    pub nid: String,
+    pub weak: bool,
+    pub kind: ImportResolutionKind,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RelocationStats {
     pub absolute: usize,
@@ -113,6 +143,7 @@ pub struct LinkedImage {
     pub tls: GuestTls,
     pub process_param: Option<GuestAddress>,
     import_resolution_stats: ImportResolutionStats,
+    import_resolutions: Vec<ImportResolutionRecord>,
     unwind_fdes: Vec<GuestAddress>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     module_initializers: Vec<GuestAddress>,
@@ -255,7 +286,7 @@ impl LinkedImage {
 
         let main_export = main_base_export_input(executable, dynamic, memory.image_base());
         let process_exports = collect_process_exports(&memory, &main_export, &linked_modules)?;
-        let import_resolution_stats = collect_import_resolution_stats(
+        let (import_resolution_stats, import_resolutions) = collect_import_resolutions(
             std::iter::once(dynamic).chain(linked_modules.iter().map(|module| module.dynamic)),
             &process_exports,
         )?;
@@ -341,6 +372,7 @@ impl LinkedImage {
             tls,
             process_param,
             import_resolution_stats,
+            import_resolutions,
             unwind_fdes,
             module_initializers,
         })
@@ -370,6 +402,11 @@ impl LinkedImage {
     #[must_use]
     pub fn import_resolution_stats(&self) -> ImportResolutionStats {
         self.import_resolution_stats
+    }
+
+    #[must_use]
+    pub fn import_resolutions(&self) -> &[ImportResolutionRecord] {
+        &self.import_resolutions
     }
 }
 
@@ -715,14 +752,6 @@ fn encode_sce_id(id: u16) -> String {
     encoded
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ImportResolution {
-    BundledGuest,
-    HostDirect,
-    HleDispatch,
-    UnresolvedWeak,
-}
-
 fn imported_symbol<'a>(
     dynamic: &'a DynamicInfo,
     import: &ImportedSymbol,
@@ -739,39 +768,52 @@ fn classify_import(
     dynamic: &DynamicInfo,
     import: &ImportedSymbol,
     process_exports: &BTreeMap<ProcessSymbolKey, u64>,
-) -> Result<ImportResolution, LinkError> {
+) -> Result<ImportResolutionKind, LinkError> {
     let symbol = imported_symbol(dynamic, import)?;
     let key = process_symbol_key(dynamic, symbol)?;
     if process_exports.contains_key(&key) {
-        return Ok(ImportResolution::BundledGuest);
+        return Ok(ImportResolutionKind::BundledGuest);
     }
     let nid = key.nid();
     if native_import_target(nid).is_some() || synthetic_data_import_target(nid).is_some() {
-        return Ok(ImportResolution::HostDirect);
+        return Ok(ImportResolutionKind::HostDirect);
     }
     if import.weak {
-        Ok(ImportResolution::UnresolvedWeak)
+        Ok(ImportResolutionKind::UnresolvedWeak)
     } else {
-        Ok(ImportResolution::HleDispatch)
+        Ok(ImportResolutionKind::HleDispatch)
     }
 }
 
-fn collect_import_resolution_stats<'a>(
+fn collect_import_resolutions<'a>(
     dynamics: impl IntoIterator<Item = &'a DynamicInfo>,
     process_exports: &BTreeMap<ProcessSymbolKey, u64>,
-) -> Result<ImportResolutionStats, LinkError> {
+) -> Result<(ImportResolutionStats, Vec<ImportResolutionRecord>), LinkError> {
     let mut stats = ImportResolutionStats::default();
+    let mut records = Vec::new();
     for dynamic in dynamics {
         for import in &dynamic.imports {
-            match classify_import(dynamic, import, process_exports)? {
-                ImportResolution::BundledGuest => stats.bundled_guest += 1,
-                ImportResolution::HostDirect => stats.host_direct += 1,
-                ImportResolution::HleDispatch => stats.hle_dispatch += 1,
-                ImportResolution::UnresolvedWeak => stats.unresolved_weak += 1,
+            let kind = classify_import(dynamic, import, process_exports)?;
+            match kind {
+                ImportResolutionKind::BundledGuest => stats.bundled_guest += 1,
+                ImportResolutionKind::HostDirect => stats.host_direct += 1,
+                ImportResolutionKind::HleDispatch => stats.hle_dispatch += 1,
+                ImportResolutionKind::UnresolvedWeak => stats.unresolved_weak += 1,
             }
+            let symbol = imported_symbol(dynamic, import)?;
+            let key = process_symbol_key(dynamic, symbol)?;
+            records.push(ImportResolutionRecord {
+                symbol: symbol.name.clone(),
+                nid: key.nid().to_owned(),
+                weak: import.weak,
+                kind,
+            });
         }
     }
-    Ok(stats)
+    records.sort_by(|left, right| {
+        (&left.symbol, left.kind, left.weak).cmp(&(&right.symbol, right.kind, right.weak))
+    });
+    Ok((stats, records))
 }
 
 #[cfg(test)]
@@ -1533,7 +1575,7 @@ fn create_import_stubs(
 ) -> Result<(Vec<ImportStub>, BTreeMap<u32, GuestAddress>), LinkError> {
     let mut dispatch_imports = BTreeMap::<ProcessSymbolKey, Vec<u32>>::new();
     for import in &dynamic.imports {
-        if classify_import(dynamic, import, process_exports)? != ImportResolution::HleDispatch {
+        if classify_import(dynamic, import, process_exports)? != ImportResolutionKind::HleDispatch {
             continue;
         }
         let symbol = imported_symbol(dynamic, import)?;
@@ -2081,6 +2123,20 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "eV9wAD2riIA" => "sceKernelStat",
         "Cg4srZ6TKbU" => "sceKernelRead",
         "UK2Tl2DWUns" => "sceKernelClose",
+        "6c3rCVE-fTU" => "_open",
+        "wuCroIGjt2g" => "open",
+        "DRuBt2pvICk" => "read",
+        "AqBioC2vF3I" => "posix_read",
+        "NNtFaKJbPt0" => "close",
+        "bY-PO6JhzhQ" => "posix_close",
+        "FN4gaPmuFV8" => "posix_write",
+        "Oy6IpwgtYOk" => "lseek",
+        "oib76F-12fk" => "sceKernelLseek",
+        "E6ao34wPw+U" => "stat",
+        "mqQMh1zPPT8" => "fstat",
+        "kBwCPsYX-m4" => "sceKernelFstat",
+        "ih4CD9-gghM" => "ftruncate",
+        "VW3TVZiM4-E" => "sceKernelFtruncate",
         "TywrFKCoLGY" => "sceSaveDataInitialize3",
         "dyIhnXq-0SM" => "sceSaveDataDirNameSearch",
         "ZP4e7rlzOUk" => "sceSaveDataMount3",
@@ -2284,6 +2340,10 @@ struct SaveDataTransaction {
 
 #[derive(Debug, Default)]
 struct VideoOutState {
+    is_open: bool,
+    user_id: i32,
+    bus_type: i32,
+    index: i32,
     pixel_format: u64,
     tiling_mode: u32,
     width: u32,
@@ -3413,6 +3473,9 @@ fn dispatch_kernel_file_import(
         "eV9wAD2riIA" => guest_kernel_stat(arguments, state),
         "Cg4srZ6TKbU" => guest_kernel_read(arguments, state),
         "UK2Tl2DWUns" => guest_kernel_close(arguments, state),
+        "oib76F-12fk" => guest_kernel_lseek(arguments, state),
+        "kBwCPsYX-m4" => guest_kernel_fstat(arguments, state),
+        "VW3TVZiM4-E" => guest_kernel_ftruncate(arguments, state),
         _ => return None,
     })
 }
@@ -3456,7 +3519,23 @@ fn dispatch_probe_import(
         }
         "bnZxYgAFeA0" => sanitizer_new_replace_external(),
         "NWtTN10cJzE" => libc_heap_get_trace_info(arguments[0], state),
-        "FxVZqBAA7ks" | "4wSze92BhLI" => guest_kernel_write(arguments, state),
+        "6c3rCVE-fTU" | "wuCroIGjt2g" => {
+            guest_posix_file_result(guest_kernel_open(arguments, state))
+        }
+        "DRuBt2pvICk" | "AqBioC2vF3I" => {
+            guest_posix_file_result(guest_kernel_read(arguments, state))
+        }
+        "NNtFaKJbPt0" | "bY-PO6JhzhQ" => {
+            guest_posix_file_result(guest_kernel_close(arguments, state))
+        }
+        "FxVZqBAA7ks" | "FN4gaPmuFV8" => {
+            guest_posix_file_result(guest_kernel_write(arguments, state))
+        }
+        "Oy6IpwgtYOk" => guest_posix_file_result(guest_kernel_lseek(arguments, state)),
+        "E6ao34wPw+U" => guest_posix_file_result(guest_kernel_stat(arguments, state)),
+        "mqQMh1zPPT8" => guest_posix_file_result(guest_kernel_fstat(arguments, state)),
+        "ih4CD9-gghM" => guest_posix_file_result(guest_kernel_ftruncate(arguments, state)),
+        "4wSze92BhLI" => guest_kernel_write(arguments, state),
         "aI+OeCz8xrQ" => current_guest_thread_handle(),
         // sceKernelGetDirectMemorySize
         "pO96TwzOm5E" => 16 * 1024 * 1024 * 1024,
@@ -3557,7 +3636,7 @@ fn dispatch_probe_import(
         "waPcxYiR3WA" => pthread_condition_attr_destroy(arguments[0], state),
         // Initial single-device handles for input, video, and audio.
         "xk0AcarP3V4" => pad_open(arguments, state),
-        "Up36PTk687E" => 1,
+        "Up36PTk687E" => video_out_open(arguments, state),
         // libSceAudioOut owns validated ports and consumes complete configured PCM buffers through
         // the host mixer. Output itself is handled above so pacing never holds the import lock.
         "JfEPXVxhFqA" => {
@@ -4726,7 +4805,7 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
 fn video_out_set_buffer_attribute2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let attribute = arguments[0];
     if attribute == 0 {
-        return u64::MAX;
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
     }
     guest_memset(attribute, 0, 0x50);
     write_guest_u32(attribute + 0x04, low_u32(arguments[2]));
@@ -4742,21 +4821,47 @@ fn video_out_set_buffer_attribute2(arguments: [u64; 6], state: &mut ProbeDispatc
     0
 }
 
+const VIDEO_OUT_ERROR_INVALID_VALUE: u32 = 0x8029_0001;
+const VIDEO_OUT_ERROR_INVALID_ADDRESS: u32 = 0x8029_0002;
+const VIDEO_OUT_ERROR_RESOURCE_BUSY: u32 = 0x8029_0009;
+const VIDEO_OUT_ERROR_INVALID_INDEX: u32 = 0x8029_000a;
+const VIDEO_OUT_ERROR_INVALID_HANDLE: u32 = 0x8029_000b;
+
+fn video_out_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let user_id = low_i32(arguments[0]);
+    let bus_type = low_i32(arguments[1]);
+    let index = low_i32(arguments[2]);
+    if bus_type != 0 || index != 0 {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_VALUE);
+    }
+    if state.video_out.is_open {
+        return sce_kernel_error(VIDEO_OUT_ERROR_RESOURCE_BUSY);
+    }
+    state.video_out.is_open = true;
+    state.video_out.user_id = user_id;
+    state.video_out.bus_type = bus_type;
+    state.video_out.index = index;
+    1
+}
+
 fn video_out_register_buffers2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let set_index = low_u32(arguments[1]);
     let buffer_index_start = usize::try_from(low_u32(arguments[2])).unwrap_or(usize::MAX);
     let entries = arguments[3];
     let buffer_count = usize::try_from(low_u32(arguments[4])).unwrap_or(usize::MAX);
     let attribute = arguments[5];
-    if arguments[0] == 0
-        || entries == 0
-        || attribute == 0
-        || buffer_index_start > 15
+    if low_i32(arguments[0]) != 1 || !state.video_out.is_open {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+    }
+    if entries == 0 || attribute == 0 {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
+    }
+    if buffer_index_start > 15
         || buffer_count == 0
         || buffer_count > 16
         || buffer_index_start.saturating_add(buffer_count) > 16
     {
-        return u64::MAX;
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_INDEX);
     }
 
     state.video_out.pixel_format = read_guest_u64(attribute + 0x20);
@@ -4794,8 +4899,11 @@ fn video_out_register_buffers2(arguments: [u64; 6], state: &mut ProbeDispatchSta
 fn video_out_add_flip_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let equeue = arguments[0];
     let handle = low_i32(arguments[1]);
-    if equeue == 0 || handle != 1 {
-        return u64::MAX;
+    if handle != 1 || !state.video_out.is_open {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+    }
+    if equeue == 0 {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
     }
     state.video_out.flip_events.insert(equeue, arguments[2]);
     0
@@ -8253,16 +8361,79 @@ fn guest_fread(destination: u64, size: u64, count: u64, handle: u64) -> u64 {
     }
 }
 
-const SCE_KERNEL_ERROR_PERMISSION_DENIED: u32 = 0x8002_0001;
+const SCE_KERNEL_ERROR_PERMISSION_DENIED: u32 = 0x8002_000d;
 const SCE_KERNEL_ERROR_NOT_FOUND: u32 = 0x8002_0002;
-const SCE_KERNEL_ERROR_INVALID_ARGUMENT: u32 = 0x8002_0003;
+const SCE_KERNEL_ERROR_INTERRUPTED: u32 = 0x8002_0004;
+const SCE_KERNEL_ERROR_IO: u32 = 0x8002_0005;
+const SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR: u32 = 0x8002_0009;
+const SCE_KERNEL_ERROR_OUT_OF_MEMORY: u32 = 0x8002_000c;
+const SCE_KERNEL_ERROR_MEMORY_FAULT: u32 = 0x8002_000e;
+const SCE_KERNEL_ERROR_BUSY: u32 = 0x8002_0010;
+const SCE_KERNEL_ERROR_ALREADY_EXISTS: u32 = 0x8002_0011;
+const SCE_KERNEL_ERROR_CROSS_DEVICE: u32 = 0x8002_0012;
+const SCE_KERNEL_ERROR_NOT_DIRECTORY: u32 = 0x8002_0014;
+const SCE_KERNEL_ERROR_IS_DIRECTORY: u32 = 0x8002_0015;
+const SCE_KERNEL_ERROR_INVALID_ARGUMENT: u32 = 0x8002_0016;
+const SCE_KERNEL_ERROR_FILE_TOO_LARGE: u32 = 0x8002_001b;
+const SCE_KERNEL_ERROR_NO_SPACE: u32 = 0x8002_001c;
+const SCE_KERNEL_ERROR_READ_ONLY: u32 = 0x8002_001e;
+const SCE_KERNEL_ERROR_BROKEN_PIPE: u32 = 0x8002_0020;
 const SCE_KERNEL_ERROR_TRY_AGAIN: u32 = 0x8002_0023;
-const SCE_KERNEL_ERROR_MEMORY_FAULT: u32 = 0x8002_0101;
-const SCE_KERNEL_ERROR_NOT_IMPLEMENTED: u32 = 0x8002_ffff;
+const SCE_KERNEL_ERROR_NOT_SUPPORTED: u32 = 0x8002_002d;
+const SCE_KERNEL_ERROR_NOT_IMPLEMENTED: u32 = 0x8002_004e;
 const SCE_KERNEL_STAT_SIZE: usize = 120;
 
 fn sce_kernel_error(code: u32) -> u64 {
     signed_i32_return(i32::from_ne_bytes(code.to_ne_bytes()))
+}
+
+fn guest_posix_file_result(result: u64) -> u64 {
+    let code = low_u32(result);
+    if code & 0x8000_0000 == 0 {
+        return result;
+    }
+    let errno = if code & 0xffff_ff00 == 0x8002_0000 {
+        i32::try_from(code & 0xff).expect("kernel errno fits i32")
+    } else {
+        libc::EIO
+    };
+    let errno_address = guest_errno_address();
+    if errno_address != 0 {
+        write_guest_u32(errno_address, errno.cast_unsigned());
+    }
+    u64::MAX
+}
+
+fn sce_kernel_io_error(error: &std::io::Error) -> u64 {
+    use std::io::ErrorKind;
+
+    let code = match error.kind() {
+        ErrorKind::NotFound => SCE_KERNEL_ERROR_NOT_FOUND,
+        ErrorKind::PermissionDenied => SCE_KERNEL_ERROR_PERMISSION_DENIED,
+        ErrorKind::BrokenPipe => SCE_KERNEL_ERROR_BROKEN_PIPE,
+        ErrorKind::AlreadyExists => SCE_KERNEL_ERROR_ALREADY_EXISTS,
+        ErrorKind::WouldBlock => SCE_KERNEL_ERROR_TRY_AGAIN,
+        ErrorKind::InvalidInput | ErrorKind::InvalidData => SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+        ErrorKind::TimedOut => 0x8002_003c,
+        ErrorKind::Interrupted => SCE_KERNEL_ERROR_INTERRUPTED,
+        ErrorKind::Unsupported => SCE_KERNEL_ERROR_NOT_SUPPORTED,
+        ErrorKind::OutOfMemory => SCE_KERNEL_ERROR_OUT_OF_MEMORY,
+        ErrorKind::NotADirectory => SCE_KERNEL_ERROR_NOT_DIRECTORY,
+        ErrorKind::IsADirectory => SCE_KERNEL_ERROR_IS_DIRECTORY,
+        ErrorKind::DirectoryNotEmpty => 0x8002_0042,
+        ErrorKind::ReadOnlyFilesystem => SCE_KERNEL_ERROR_READ_ONLY,
+        ErrorKind::StaleNetworkFileHandle => 0x8002_0046,
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => SCE_KERNEL_ERROR_NO_SPACE,
+        ErrorKind::FileTooLarge => SCE_KERNEL_ERROR_FILE_TOO_LARGE,
+        ErrorKind::ResourceBusy | ErrorKind::ExecutableFileBusy => SCE_KERNEL_ERROR_BUSY,
+        ErrorKind::Deadlock => 0x8002_000b,
+        ErrorKind::CrossesDevices => SCE_KERNEL_ERROR_CROSS_DEVICE,
+        ErrorKind::TooManyLinks => 0x8002_001f,
+        ErrorKind::InvalidFilename => 0x8002_003f,
+        ErrorKind::ArgumentListTooLong => 0x8002_0007,
+        _ => SCE_KERNEL_ERROR_IO,
+    };
+    sce_kernel_error(code)
 }
 
 fn audio_out_error(error: audio::AudioOutError) -> u64 {
@@ -8287,38 +8458,51 @@ fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
     let flags = low_i32(arguments[1]);
+    let access = flags & 0x3;
+    if access == 0x3 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
     let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
         eprintln!("[REMu][VFS] sceKernelOpen rejected guest={guest_path:?}");
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
-    if flags & 0x3 != 0 && !writable {
+    if access != 0 && !writable {
         eprintln!(
             "[REMu][VFS] sceKernelOpen rejected write access guest={guest_path:?} flags={flags:#x}"
         );
         return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
     }
-    let access = flags & 0x3;
+    let create = writable && flags & 0x200 != 0;
+    let exclusive = create && flags & 0x800 != 0;
     let mut options = std::fs::OpenOptions::new();
     options
         .read(access != 1)
         .write(access != 0)
-        .append(flags & 0x8 != 0)
-        .create(writable && flags & 0x200 != 0)
-        .truncate(writable && flags & 0x400 != 0);
-    if writable
-        && flags & 0x200 != 0
-        && let Some(parent) = host_path.parent()
-        && std::fs::create_dir_all(parent).is_err()
+        .append(access != 0 && flags & 0x8 != 0)
+        .create(create && !exclusive)
+        .create_new(exclusive)
+        .truncate(writable && access != 0 && flags & 0x400 != 0);
+    #[cfg(unix)]
     {
-        return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
+        options.mode(low_u32(arguments[2]));
     }
-    let Ok(file) = options.open(&host_path) else {
+    let file = match options.open(&host_path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "[REMu][VFS] sceKernelOpen failed guest={guest_path:?} host={:?}: {error}",
+                host_path.display()
+            );
+            return sce_kernel_io_error(&error);
+        }
+    };
+    if flags & 0x0002_0000 != 0 && file.metadata().is_ok_and(|metadata| !metadata.is_dir()) {
         eprintln!(
-            "[REMu][VFS] sceKernelOpen missing guest={guest_path:?} host={:?}",
+            "[REMu][VFS] sceKernelOpen expected directory guest={guest_path:?} host={:?}",
             host_path.display()
         );
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    };
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_DIRECTORY);
+    }
     let fd = state.next_kernel_fd.max(3);
     state.next_kernel_fd = fd.saturating_add(1);
     state.kernel_files.insert(fd, file);
@@ -8331,7 +8515,7 @@ fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
 
 fn guest_kernel_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     if arguments[1] == 0 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     }
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
@@ -8340,14 +8524,17 @@ fn guest_kernel_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
         eprintln!("[REMu][VFS] sceKernelStat rejected guest={guest_path:?}");
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
-    let Ok(metadata) = std::fs::metadata(&host_path) else {
-        eprintln!(
-            "[REMu][VFS] sceKernelStat missing guest={guest_path:?} host={:?}",
-            host_path.display()
-        );
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    let metadata = match std::fs::metadata(&host_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            eprintln!(
+                "[REMu][VFS] sceKernelStat failed guest={guest_path:?} host={:?}: {error}",
+                host_path.display()
+            );
+            return sce_kernel_io_error(&error);
+        }
     };
-    let payload = kernel_stat_payload(metadata.len(), metadata.is_dir(), guest_path.as_bytes());
+    let payload = kernel_stat_payload_from_metadata(&metadata, guest_path.as_bytes());
     // SAFETY: sceKernelStat supplies a writable 120-byte Gen5 stat object in live guest memory.
     unsafe {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), arguments[1] as *mut u8, payload.len());
@@ -8368,22 +8555,20 @@ fn guest_kernel_read(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         return 0;
     }
     if destination == 0 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     }
     let Ok(requested) = usize::try_from(requested) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    if requested > 128 * 1024 * 1024 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
     let Some(file) = state.kernel_files.get_mut(&fd) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+        return sce_kernel_error(SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR);
     };
     // SAFETY: sceKernelRead supplies a writable range of exactly `requested` bytes in live guest
     // memory, and the global import dispatcher serializes access to the associated File.
     let destination = unsafe { std::slice::from_raw_parts_mut(destination as *mut u8, requested) };
-    let Ok(read) = file.read(destination) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    let read = match file.read(destination) {
+        Ok(read) => read,
+        Err(error) => return sce_kernel_io_error(&error),
     };
     eprintln!("[REMu][VFS] sceKernelRead fd={fd} requested={requested} read={read}");
     u64::try_from(read).expect("read byte count fits u64")
@@ -8395,7 +8580,7 @@ fn guest_kernel_write(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u6
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     if length != 0 && arguments[1] == 0 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     }
     let payload = if length == 0 {
         &[]
@@ -8404,50 +8589,206 @@ fn guest_kernel_write(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u6
         unsafe { std::slice::from_raw_parts(arguments[1] as *const u8, length) }
     };
     let result = match fd {
-        1 => std::io::stdout().write_all(payload),
-        2 => std::io::stderr().write_all(payload),
+        1 => std::io::stdout().write(payload),
+        2 => std::io::stderr().write(payload),
         _ => state
             .kernel_files
             .get_mut(&fd)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
-            .and_then(|file| file.write_all(payload)),
+            .and_then(|file| file.write(payload)),
     };
-    if result.is_ok() {
-        length as u64
-    } else {
-        sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+    match result {
+        Ok(written) => u64::try_from(written).expect("written byte count fits u64"),
+        Err(error) if fd != 1 && fd != 2 && !state.kernel_files.contains_key(&fd) => {
+            sce_kernel_error(SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR)
+        }
+        Err(error) => sce_kernel_io_error(&error),
     }
 }
 
 fn guest_kernel_close(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let fd = low_i32(arguments[0]);
     if state.kernel_files.remove(&fd).is_none() {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+        return sce_kernel_error(SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR);
     }
     eprintln!("[REMu][VFS] sceKernelClose fd={fd}");
     0
 }
 
-fn kernel_stat_payload(size: u64, is_directory: bool, inode_seed: &[u8]) -> [u8; 120] {
-    let mut payload = [0_u8; SCE_KERNEL_STAT_SIZE];
-    let inode = inode_seed.iter().fold(0x811c_9dc5_u32, |hash, &byte| {
-        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
-    });
-    payload[4..8].copy_from_slice(&inode.to_le_bytes());
-    payload[8..10]
-        .copy_from_slice(&(if is_directory { 0x41ff_u16 } else { 0x81ff_u16 }).to_le_bytes());
-    payload[10..12].copy_from_slice(&1_u16.to_le_bytes());
-    let size = i64::try_from(size).unwrap_or(i64::MAX);
-    payload[72..80].copy_from_slice(&size.to_le_bytes());
-    let blocks = if is_directory {
-        128
-    } else {
-        (size + 511) / 512
+fn guest_kernel_lseek(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let fd = low_i32(arguments[0]);
+    let offset = i64::from_ne_bytes(arguments[1].to_ne_bytes());
+    let seek_from = match low_i32(arguments[2]) {
+        0 if offset >= 0 => std::io::SeekFrom::Start(offset.cast_unsigned()),
+        1 => std::io::SeekFrom::Current(offset),
+        2 => std::io::SeekFrom::End(offset),
+        _ => return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT),
     };
-    payload[80..88].copy_from_slice(&blocks.to_le_bytes());
-    payload[88..92]
-        .copy_from_slice(&(if is_directory { 65_536_u32 } else { 512_u32 }).to_le_bytes());
-    payload
+    let Some(file) = state.kernel_files.get_mut(&fd) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR);
+    };
+    match file.seek(seek_from) {
+        Ok(position) => position,
+        Err(error) => sce_kernel_io_error(&error),
+    }
+}
+
+fn guest_kernel_fstat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if arguments[1] == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    }
+    let fd = low_i32(arguments[0]);
+    let Some(file) = state.kernel_files.get(&fd) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR);
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return sce_kernel_io_error(&error),
+    };
+    let payload = kernel_stat_payload_from_metadata(&metadata, &fd.to_le_bytes());
+    // SAFETY: the guest ABI supplies writable storage for one complete 120-byte stat object.
+    unsafe {
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), arguments[1] as *mut u8, payload.len());
+    }
+    0
+}
+
+fn guest_kernel_ftruncate(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let fd = low_i32(arguments[0]);
+    let length = i64::from_ne_bytes(arguments[1].to_ne_bytes());
+    if length < 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(file) = state.kernel_files.get_mut(&fd) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR);
+    };
+    file.set_len(length.cast_unsigned())
+        .map_or_else(|error| sce_kernel_io_error(&error), |()| 0)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GuestKernelStat {
+    dev: u32,
+    ino: u32,
+    mode: u16,
+    nlink: u16,
+    uid: u32,
+    gid: u32,
+    rdev: u32,
+    atime_sec: i64,
+    atime_nsec: i64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+    size: i64,
+    blocks: i64,
+    block_size: u32,
+    flags: u32,
+    generation: u32,
+    spare: i32,
+    birthtime_sec: i64,
+    birthtime_nsec: i64,
+}
+
+impl GuestKernelStat {
+    fn encode(self) -> [u8; SCE_KERNEL_STAT_SIZE] {
+        let mut payload = [0_u8; SCE_KERNEL_STAT_SIZE];
+        payload[0..4].copy_from_slice(&self.dev.to_le_bytes());
+        payload[4..8].copy_from_slice(&self.ino.to_le_bytes());
+        payload[8..10].copy_from_slice(&self.mode.to_le_bytes());
+        payload[10..12].copy_from_slice(&self.nlink.to_le_bytes());
+        payload[12..16].copy_from_slice(&self.uid.to_le_bytes());
+        payload[16..20].copy_from_slice(&self.gid.to_le_bytes());
+        payload[20..24].copy_from_slice(&self.rdev.to_le_bytes());
+        payload[24..32].copy_from_slice(&self.atime_sec.to_le_bytes());
+        payload[32..40].copy_from_slice(&self.atime_nsec.to_le_bytes());
+        payload[40..48].copy_from_slice(&self.mtime_sec.to_le_bytes());
+        payload[48..56].copy_from_slice(&self.mtime_nsec.to_le_bytes());
+        payload[56..64].copy_from_slice(&self.ctime_sec.to_le_bytes());
+        payload[64..72].copy_from_slice(&self.ctime_nsec.to_le_bytes());
+        payload[72..80].copy_from_slice(&self.size.to_le_bytes());
+        payload[80..88].copy_from_slice(&self.blocks.to_le_bytes());
+        payload[88..92].copy_from_slice(&self.block_size.to_le_bytes());
+        payload[92..96].copy_from_slice(&self.flags.to_le_bytes());
+        payload[96..100].copy_from_slice(&self.generation.to_le_bytes());
+        payload[100..104].copy_from_slice(&self.spare.to_le_bytes());
+        payload[104..112].copy_from_slice(&self.birthtime_sec.to_le_bytes());
+        payload[112..120].copy_from_slice(&self.birthtime_nsec.to_le_bytes());
+        payload
+    }
+}
+
+fn fallback_inode(inode_seed: &[u8]) -> u32 {
+    inode_seed.iter().fold(0x811c_9dc5_u32, |hash, &byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+#[cfg(any(test, not(unix)))]
+fn kernel_stat_payload(size: u64, is_directory: bool, inode_seed: &[u8]) -> [u8; 120] {
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
+    GuestKernelStat {
+        ino: fallback_inode(inode_seed),
+        mode: if is_directory { 0x41ff } else { 0x81ff },
+        nlink: 1,
+        size,
+        blocks: if is_directory {
+            128
+        } else {
+            (size + 511) / 512
+        },
+        block_size: if is_directory { 65_536 } else { 512 },
+        ..GuestKernelStat::default()
+    }
+    .encode()
+}
+
+fn kernel_stat_payload_from_metadata(
+    metadata: &std::fs::Metadata,
+    inode_seed: &[u8],
+) -> [u8; SCE_KERNEL_STAT_SIZE] {
+    #[cfg(unix)]
+    {
+        let (birth_seconds, birth_nanoseconds) = metadata
+            .created()
+            .ok()
+            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or((metadata.ctime(), metadata.ctime_nsec()), |duration| {
+                (
+                    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+                    i64::from(duration.subsec_nanos()),
+                )
+            });
+        GuestKernelStat {
+            dev: u32::try_from(metadata.dev()).unwrap_or(u32::MAX),
+            ino: u32::try_from(metadata.ino()).unwrap_or_else(|_| fallback_inode(inode_seed)),
+            mode: u16::try_from(metadata.mode() & u32::from(u16::MAX)).expect("masked mode fits"),
+            nlink: u16::try_from(metadata.nlink()).unwrap_or(u16::MAX),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            rdev: u32::try_from(metadata.rdev()).unwrap_or(u32::MAX),
+            atime_sec: metadata.atime(),
+            atime_nsec: metadata.atime_nsec(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime_sec: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+            size: i64::try_from(metadata.size()).unwrap_or(i64::MAX),
+            blocks: i64::try_from(metadata.blocks()).unwrap_or(i64::MAX),
+            block_size: u32::try_from(metadata.blksize()).unwrap_or(u32::MAX),
+            flags: 0,
+            generation: 0,
+            spare: 0,
+            birthtime_sec: birth_seconds,
+            birthtime_nsec: birth_nanoseconds,
+        }
+        .encode()
+    }
+    #[cfg(not(unix))]
+    {
+        kernel_stat_payload(metadata.len(), metadata.is_dir(), inode_seed)
+    }
 }
 
 fn guest_memcmp(left: u64, right: u64, length: u64) -> u64 {
@@ -8811,21 +9152,23 @@ mod platform_independent_tests {
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
         AGC_R_DRAW_INDEX_AUTO, DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState,
         PthreadAttrState, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
-        SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
-        agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
-        allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
-        decode_agc_memory_acquire, destroy_pthread_attr, dispatch_guest_numeric_parser,
-        dispatch_probe_import, guest_clock_gettime, guest_free, guest_global_locale, guest_qsort,
-        guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy,
-        guest_wmemmove, kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query,
-        low_f32, low_u32, pthread_attr_get_affinity, pthread_attr_get_stack,
+        SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED, agc_dcb_draw_index_auto,
+        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4, allocate_direct_memory,
+        allocate_pthread_thread_object, create_pthread_attr, decode_agc_memory_acquire,
+        destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
+        guest_clock_gettime, guest_free, guest_global_locale, guest_kernel_fstat,
+        guest_kernel_ftruncate, guest_kernel_lseek, guest_kernel_read, guest_posix_file_result,
+        guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp,
+        guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory, kernel_stat_payload,
+        kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity, pthread_attr_get_stack,
         pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
-        pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
-        sanitize_save_segment, save_data_commit, save_data_create_transaction_resource,
-        save_data_dir_name_search, save_data_mount3, save_data_pattern_matches, save_data_prepare,
-        save_data_save_icon, save_data_set_param, save_data_umount2, sce_kernel_error,
-        system_service_param_get_int, take_exit_callbacks, write_guest_u32, write_guest_u64,
-        write_import_stub,
+        pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
+        resolve_guest_path, sanitize_save_segment, save_data_commit,
+        save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
+        save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
+        save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
+        system_service_param_get_int, take_exit_callbacks, video_out_open, write_guest_u32,
+        write_guest_u64, write_import_stub,
     };
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -8838,6 +9181,53 @@ mod platform_independent_tests {
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => 1,
         }
+    }
+
+    #[test]
+    fn posix_file_errors_return_minus_one_and_store_guest_errno() {
+        let mut tls = [0_u64; 16];
+        let thread_pointer = u64::try_from(tls.as_mut_ptr().addr()).unwrap();
+        set_current_guest_thread_pointer(thread_pointer);
+        assert_eq!(guest_posix_file_result(7), 7);
+        assert_eq!(read_guest_u32(thread_pointer + 0x40), 0);
+        assert_eq!(
+            guest_posix_file_result(super::sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)),
+            u64::MAX
+        );
+        assert_eq!(
+            read_guest_u32(thread_pointer + 0x40),
+            libc::ENOENT.cast_unsigned()
+        );
+        assert_eq!(
+            guest_posix_file_result(super::sce_kernel_error(
+                super::SCE_KERNEL_ERROR_INVALID_ARGUMENT
+            )),
+            u64::MAX
+        );
+        assert_eq!(
+            read_guest_u32(thread_pointer + 0x40),
+            libc::EINVAL.cast_unsigned()
+        );
+        set_current_guest_thread_pointer(0);
+    }
+
+    #[test]
+    fn video_out_open_owns_the_single_main_display_port() {
+        let mut state = ProbeDispatchState::default();
+        assert_eq!(video_out_open([0xff, 0, 0, 0, 0, 0], &mut state), 1);
+        assert_eq!(state.video_out.user_id, 0xff);
+        assert_eq!(state.video_out.bus_type, 0);
+        assert_eq!(state.video_out.index, 0);
+        assert_eq!(
+            video_out_open([0xff, 0, 0, 0, 0, 0], &mut state),
+            sce_kernel_error(super::VIDEO_OUT_ERROR_RESOURCE_BUSY)
+        );
+
+        let mut other = ProbeDispatchState::default();
+        assert_eq!(
+            video_out_open([0xff, 1, 0, 0, 0, 0], &mut other),
+            sce_kernel_error(super::VIDEO_OUT_ERROR_INVALID_VALUE)
+        );
     }
 
     #[test]
@@ -9471,6 +9861,53 @@ mod platform_independent_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn implements_seek_read_stat_and_truncate_on_one_guest_descriptor() {
+        let temporary = TemporaryTestDirectory::new("file-abi");
+        let path = temporary.path.join("payload.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut state = ProbeDispatchState::default();
+        state.kernel_files.insert(3, file);
+
+        assert_eq!(guest_kernel_lseek([3, 2, 0, 0, 0, 0], &mut state), 2);
+        let mut bytes = [0_u8; 2];
+        assert_eq!(
+            guest_kernel_read(
+                [3, bytes.as_mut_ptr().addr() as u64, 2, 0, 0, 0],
+                &mut state
+            ),
+            2
+        );
+        assert_eq!(&bytes, b"cd");
+
+        let mut stat = [0_u8; super::SCE_KERNEL_STAT_SIZE];
+        assert_eq!(
+            guest_kernel_fstat([3, stat.as_mut_ptr().addr() as u64, 0, 0, 0, 0], &state),
+            0
+        );
+        assert_eq!(i64::from_le_bytes(stat[72..80].try_into().unwrap()), 6);
+        assert_ne!(u32::from_le_bytes(stat[4..8].try_into().unwrap()), 0);
+        assert_ne!(u16::from_le_bytes(stat[8..10].try_into().unwrap()), 0);
+        assert_ne!(u32::from_le_bytes(stat[88..92].try_into().unwrap()), 0);
+
+        assert_eq!(guest_kernel_ftruncate([3, 4, 0, 0, 0, 0], &mut state), 0);
+        assert_eq!(
+            state
+                .kernel_files
+                .get(&3)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            4
+        );
     }
 
     #[cfg(target_os = "macos")]

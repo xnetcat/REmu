@@ -37,6 +37,17 @@ import=P330P3dFF68#A#B symbol=3 weak=false relocations=1 types=1
         self.assertTrue(imports["T72hz6ffq08"].callable)
         self.assertFalse(imports["P330P3dFF68"].callable)
 
+    def test_link_inventory_preserves_exact_scoped_symbol_resolution(self) -> None:
+        output = """\
+import_resolution=bundled-guest nid=T72hz6ffq08 weak=false symbol=T72hz6ffq08#A#B
+import_resolution=hle-dispatch nid=T72hz6ffq08 weak=false symbol=T72hz6ffq08#C#D
+import_resolution=host-direct nid=P330P3dFF68 weak=false symbol=P330P3dFF68#A#B
+"""
+        resolutions = AUDIT.parse_link_resolutions(output)
+        self.assertEqual(resolutions["T72hz6ffq08#A#B"], {"bundled-guest"})
+        self.assertEqual(resolutions["T72hz6ffq08#C#D"], {"hle-dispatch"})
+        self.assertEqual(resolutions["P330P3dFF68#A#B"], {"host-direct"})
+
     def test_runtime_source_distinguishes_handlers_from_names_and_stubs(self) -> None:
         runtime = AUDIT.inspect_runtime_source(
             Path(__file__).resolve().parents[2] / "crates/remu-runtime/src/lib.rs"

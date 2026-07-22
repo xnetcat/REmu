@@ -58,6 +58,10 @@ PLT_PATTERN = re.compile(
     r"^plt\[\d+\]=.* nid:(?P<nid>[A-Za-z0-9+-]{11}) "
     r"resolved:(?P<name>\S+) name:"
 )
+LINK_RESOLUTION_PATTERN = re.compile(
+    r"^import_resolution=(?P<kind>[a-z-]+) nid=(?P<nid>[A-Za-z0-9+-]{11}) "
+    r"weak=(?P<weak>true|false) symbol=(?P<symbol>\S+)$"
+)
 
 
 @dataclass
@@ -68,6 +72,7 @@ class ImportedNid:
     relocation_count: int = 0
     weak: bool = True
     remu_name: str | None = None
+    link_resolutions: set[str] = field(default_factory=set)
 
     @property
     def callable(self) -> bool:
@@ -167,10 +172,6 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
     names = parse_known_names(source)
     status_sets: list[tuple[str, set[str]]] = [
         (
-            "guest-module",
-            quoted_nids(constant_slice(source, "LLE_LIBC_RUNTIME_NIDS")),
-        ),
-        (
             "native-host",
             set().union(
                 *(quoted_nids(function_slice(source, function)) for function in (
@@ -211,7 +212,8 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
     )
 
     # The list above is ordered from strongest/specialized binding to broadest dispatch. Preserve
-    # the first classification so a native guest-module binding is not mislabeled as a fallback.
+    # the first classification. Bundled guest-module bindings are now resolved from each process's
+    # complete Sony symbol namespace at link time, so no obsolete source-level allowlist is used.
     statuses: dict[str, str] = {}
     for status, nids in status_sets:
         for nid in nids:
@@ -235,6 +237,31 @@ def run_import_inventory(command: Sequence[str], path: Path) -> str:
             f"import inventory failed for {path} (status {result.returncode}):\n{result.stderr}"
         )
     return result.stdout
+
+
+def run_link_inventory(command: Sequence[str], path: Path) -> str:
+    result = subprocess.run(
+        [*command, "link", str(path)],
+        cwd=REPO_ROOT,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"link inventory failed for {path} (status {result.returncode}):\n{result.stderr}"
+        )
+    return result.stdout
+
+
+def parse_link_resolutions(output: str) -> dict[str, set[str]]:
+    resolutions: dict[str, set[str]] = collections.defaultdict(set)
+    for line in output.splitlines():
+        match = LINK_RESOLUTION_PATTERN.match(line)
+        if match is not None:
+            resolutions[match.group("symbol")].add(match.group("kind"))
+    return dict(resolutions)
 
 
 def parse_import_inventory(output: str) -> tuple[list[str], dict[str, ImportedNid]]:
@@ -328,8 +355,9 @@ def resolve_command(explicit: Path | None) -> list[str]:
     if explicit is not None:
         return [str(explicit)]
     candidates = (
-        REPO_ROOT / "target/debug/remu",
+        REPO_ROOT / "target/x86_64-apple-darwin/debug/remu",
         REPO_ROOT / "target/x86_64-apple-darwin/release/remu",
+        REPO_ROOT / "target/debug/remu",
         REPO_ROOT / "target/release/remu",
     )
     for candidate in candidates:
@@ -345,11 +373,23 @@ def inventory_row(
     references: ReferenceCoverage,
 ) -> dict[str, object]:
     nid = imported.nid
+    link_kinds = imported.link_resolutions
+    if "hle-dispatch" in link_kinds or not link_kinds:
+        status = runtime.statuses.get(nid, "unknown")
+    elif link_kinds == {"bundled-guest"}:
+        status = "guest-module"
+    elif link_kinds == {"host-direct"}:
+        status = "native-host"
+    elif link_kinds == {"unresolved-weak"}:
+        status = "unresolved-weak"
+    else:
+        status = "linked-mixed"
     return {
         "title": title,
         "nid": nid,
         "name": runtime.names.get(nid) or imported.remu_name or references.names.get(nid),
-        "status": runtime.statuses.get(nid, "unknown"),
+        "status": status,
+        "link_resolutions": sorted(link_kinds),
         "callable": imported.callable,
         "weak": imported.weak,
         "symbols": sorted(imported.symbols),
@@ -380,6 +420,10 @@ def build_report(
         if not path.is_file():
             raise FileNotFoundError(f"game executable not found: {path}")
         dependencies, inventory = parse_import_inventory(run_import_inventory(command, path))
+        link_resolutions = parse_link_resolutions(run_link_inventory(command, path))
+        for imported in inventory.values():
+            for symbol in imported.symbols:
+                imported.link_resolutions.update(link_resolutions.get(symbol, ()))
         rows = [
             inventory_row(label, imported, runtime, references)
             for imported in sorted(inventory.values(), key=lambda value: value.nid)
