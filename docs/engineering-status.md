@@ -130,6 +130,15 @@ milestone completion claim.
   retains a bounded cache of immutable sampler argument buffers, keyed by compiled Metal function,
   buffer slot, and the complete ordered guest sampler descriptors. A device-backed regression
   compiles a real sampler argument-buffer function and proves identical bindings reuse one buffer.
+- The clean windowed `da09a79` comparison reached 54-58 completed presents/flips per second with
+  1.1-1.2 ms presentation latency, 386-406 encoded draws per second, and empty queues. This is a
+  material presenter-thread improvement over 36 FPS/254 draws per second, but the drawable remained
+  black and audio underruns remained 21.7-23.9%. A retained 105-second capture/IR run under
+  `.remu/runs/20260722T150443Z-dreaming-sarah` showed the first rejected post-boot draws have valid
+  ordinary color exports and no storage images. Their context retained a depth-enable/clear bit but
+  had no depth format, extent, or read/write base. The current increment requires that complete
+  non-null surface identity before treating depth as active, so stale control alone no longer
+  suppresses otherwise unambiguous targetless scanout association.
 
 ## Subsystem ledger
 
@@ -173,8 +182,13 @@ milestone completion claim.
     Rosetta. A clean windowed run had no Metal HUD and exposed live title statistics; its measured
     36.0 FPS/flip cadence, 1.4 ms Metal latency, empty queues, and 23.9% audio underruns identify a
     host CPU presentation bottleneck rather than saturated GPU execution.
-11. The sampler argument-buffer cache has a focused device-backed Metal regression. Complete checks
-    1-6, then compare one clean windowed Dreaming Sarah run against the `e071d2f` telemetry baseline.
+11. Complete at `da09a79`: the sampler argument-buffer cache passed checks 1-6 and its device-backed
+    Metal regression. The clean windowed comparison increased measured cadence from 36 FPS/254
+    draws per second to 54-58 FPS/386-406 draws per second, with the Metal HUD absent. Black output
+    and 21.7-23.9% audio underruns remain open.
+12. The stale-depth-state increment has focused coverage distinguishing a lone enable bit from a
+    complete depth surface. Complete checks 1-6, then retain one capture-backed windowed Dreaming
+    Sarah run to determine whether the newly admitted post-boot draws produce the first real scene.
 
 Reference implementation provenance is recorded in [provenance](provenance.md); architectural and
 licensing constraints remain in [architecture](architecture.md) and [source policy](source-policy.md).

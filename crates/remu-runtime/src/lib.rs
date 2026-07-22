@@ -4550,6 +4550,12 @@ const AGC_CB_COLOR0_ATTRIB2: u32 = 0x3b0;
 const AGC_CB_COLOR0_ATTRIB3: u32 = 0x3b8;
 const AGC_COLOR_TARGET_COUNT: u32 = 8;
 const AGC_DB_RENDER_CONTROL: u32 = 0x000;
+const AGC_DB_DEPTH_SIZE_XY: u32 = 0x007;
+const AGC_DB_Z_INFO: u32 = 0x010;
+const AGC_DB_Z_READ_BASE: u32 = 0x012;
+const AGC_DB_Z_WRITE_BASE: u32 = 0x014;
+const AGC_DB_Z_READ_BASE_HI: u32 = 0x01a;
+const AGC_DB_Z_WRITE_BASE_HI: u32 = 0x01c;
 const AGC_DB_DEPTH_CONTROL: u32 = 0x200;
 const AGC_COMPUTE_USER_DATA_0: u32 = 0x240;
 
@@ -5594,12 +5600,47 @@ fn agc_color_target_state(registers: &BTreeMap<u32, u32>) -> AgcColorTargetState
 }
 
 fn agc_has_active_depth_state(registers: &BTreeMap<u32, u32>) -> bool {
-    registers
+    let enabled = registers
         .get(&AGC_DB_DEPTH_CONTROL)
         .is_some_and(|control| control & 0x6 != 0)
         || registers
             .get(&AGC_DB_RENDER_CONTROL)
-            .is_some_and(|control| control & 1 != 0)
+            .is_some_and(|control| control & 1 != 0);
+    if !enabled
+        || registers
+            .get(&AGC_DB_Z_INFO)
+            .is_none_or(|info| info.trailing_zeros() >= 2)
+        || !registers.contains_key(&AGC_DB_DEPTH_SIZE_XY)
+    {
+        return false;
+    }
+    let read_address = (u64::from(
+        registers
+            .get(&AGC_DB_Z_READ_BASE_HI)
+            .copied()
+            .unwrap_or_default()
+            & 0xff,
+    ) << 40)
+        | (u64::from(
+            registers
+                .get(&AGC_DB_Z_READ_BASE)
+                .copied()
+                .unwrap_or_default(),
+        ) << 8);
+    let write_address = (u64::from(
+        registers
+            .get(&AGC_DB_Z_WRITE_BASE_HI)
+            .copied()
+            .unwrap_or_default()
+            & 0xff,
+    ) << 40)
+        | (u64::from(
+            registers
+                .get(&AGC_DB_Z_WRITE_BASE)
+                .copied()
+                .unwrap_or_default(),
+        ) << 8);
+    read_address != 0 || write_address != 0
 }
 
 fn agc_register_snapshot(registers: &BTreeMap<u32, u32>) -> Vec<remu_gpu::GpuRegister> {
@@ -12486,8 +12527,23 @@ mod platform_independent_tests {
             .insert(super::AGC_DB_DEPTH_CONTROL, 0x2);
         super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
         assert_eq!(
+            draw.scanout_target.map(|scanout| scanout.address),
+            Some(target.address),
+            "stale depth control without a bound depth surface does not suppress scanout"
+        );
+
+        draw.scanout_target = None;
+        graphics.context_registers.insert(super::AGC_DB_Z_INFO, 3);
+        graphics
+            .context_registers
+            .insert(super::AGC_DB_DEPTH_SIZE_XY, 1_279 | (719 << 16));
+        graphics
+            .context_registers
+            .insert(super::AGC_DB_Z_READ_BASE, 0x0012_3456);
+        super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
+        assert_eq!(
             draw.scanout_target, None,
-            "active depth state is not inferred as scanout"
+            "a complete active depth target is not inferred as scanout"
         );
 
         graphics.context_registers.clear();

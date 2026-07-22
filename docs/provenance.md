@@ -83,6 +83,11 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   GPL-2.0-only and was used only as behavioral research; no source was copied. REmu independently
   validates a complete submission, associates only unambiguous straight-line draws, preserves
   packet order, and transports partial flushes as GPU stage barriers rather than CPU notifications.
+- Depth-target validity was cross-checked against SharpEmu Metal snapshot
+  `2ee32b897504b06e13404749163908346045d60b` (`AgcExports.cs`, `DecodeDepthTarget`). REmu
+  independently requires enabled depth control plus a nonzero format, programmed extent, and at
+  least one non-null read/write base before depth suppresses targetless scanout association. Stale
+  control registers without an actual surface are not treated as a bound attachment.
 - Read-only app filesystem path resolution and libc stdio forwarding follow SharpEmu's
   GPL-2.0-or-later `LibcStdioExports.cs` design at local snapshot `ada67a19`; REmu uses native
   `FILE` objects directly because the Rosetta guest and host share the x86-64 libc ABI.
