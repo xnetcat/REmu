@@ -113,6 +113,21 @@ pub struct ShaderSnapshot {
     pub metadata: Option<ShaderMetadata>,
 }
 
+/// Exact GFX10 color-surface state retained for a display buffer that is named by a later
+/// `VideoOut` flip. Some games issue their final sampled blit without rebinding `CB_COLOR`; the
+/// command processor associates that draw with a previously programmed scanout surface instead
+/// of inventing context-register writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuColorTarget {
+    pub slot: u32,
+    pub address: u64,
+    pub view: u32,
+    pub info: u32,
+    pub attrib: u32,
+    pub attrib2: u32,
+    pub attrib3: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedDraw {
     pub sequence: u64,
@@ -135,6 +150,7 @@ pub struct IndexedDraw {
     pub export_shader_evaluation: Option<Arc<ShaderEvaluation>>,
     pub pixel_shader_evaluation: Option<Arc<ShaderEvaluation>>,
     pub color_target_address: u64,
+    pub scanout_target: Option<GpuColorTarget>,
     pub context_registers: Vec<GpuRegister>,
     pub shader_registers: Vec<GpuRegister>,
     pub user_config_registers: Vec<GpuRegister>,
@@ -478,6 +494,11 @@ pub enum GpuEvent {
         address: u64,
         buffer_index: u32,
         flip_argument: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        pixel_format: u64,
+        tiling_mode: u32,
     },
     MemoryAcquire(GpuMemoryAcquire),
     ComputeDispatch(Box<ComputeDispatch>),

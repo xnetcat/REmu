@@ -2354,7 +2354,17 @@ struct VideoOutState {
     width: u32,
     height: u32,
     display_buffers: Vec<u64>,
+    display_buffer_attributes: Vec<Option<VideoOutBufferAttributes>>,
     flip_events: BTreeMap<u64, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VideoOutBufferAttributes {
+    width: u32,
+    height: u32,
+    pitch: u32,
+    pixel_format: u64,
+    tiling_mode: u32,
 }
 
 #[derive(Debug, Default)]
@@ -2372,6 +2382,8 @@ struct AgcGraphicsState {
     emitted_draws: u64,
     emitted_compute_dispatches: u64,
     traced_shader_pairs: BTreeSet<(u64, u64)>,
+    known_color_targets: BTreeMap<u64, remu_gpu::GpuColorTarget>,
+    pending_targetless_draw: Option<Box<remu_gpu::IndexedDraw>>,
 }
 
 #[derive(Debug, Default)]
@@ -4285,6 +4297,17 @@ const AGC_SPI_SHADER_PGM_LO_ES: u32 = 0x0c8;
 const AGC_SPI_SHADER_PGM_HI_ES: u32 = 0x0c9;
 const AGC_CB_COLOR0_BASE: u32 = 0x318;
 const AGC_CB_COLOR0_BASE_EXT: u32 = 0x390;
+const AGC_CB_TARGET_MASK: u32 = 0x08e;
+const AGC_CB_SHADER_MASK: u32 = 0x08f;
+const AGC_CB_COLOR_REGISTER_STRIDE: u32 = 15;
+const AGC_CB_COLOR0_VIEW: u32 = 0x31b;
+const AGC_CB_COLOR0_INFO: u32 = 0x31c;
+const AGC_CB_COLOR0_ATTRIB: u32 = 0x31d;
+const AGC_CB_COLOR0_ATTRIB2: u32 = 0x3b0;
+const AGC_CB_COLOR0_ATTRIB3: u32 = 0x3b8;
+const AGC_COLOR_TARGET_COUNT: u32 = 8;
+const AGC_DB_RENDER_CONTROL: u32 = 0x000;
+const AGC_DB_DEPTH_CONTROL: u32 = 0x200;
 const AGC_COMPUTE_USER_DATA_0: u32 = 0x240;
 
 const AGC_SHADER_SPECIAL_GE_CNTL_OFFSET: u64 = 0x00;
@@ -4902,9 +4925,21 @@ fn video_out_register_buffers2(arguments: [u64; 6], state: &mut ProbeDispatchSta
         .video_out
         .display_buffers
         .resize(buffer_index_start + buffer_count, 0);
+    state
+        .video_out
+        .display_buffer_attributes
+        .resize(buffer_index_start + buffer_count, None);
+    let attributes = VideoOutBufferAttributes {
+        width: state.video_out.width,
+        height: state.video_out.height,
+        pitch: state.video_out.width,
+        pixel_format: state.video_out.pixel_format,
+        tiling_mode: state.video_out.tiling_mode,
+    };
     for index in 0..buffer_count {
         let entry = entries + u64::try_from(index).unwrap_or(u64::MAX) * 0x20;
         state.video_out.display_buffers[buffer_index_start + index] = read_guest_u64(entry);
+        state.video_out.display_buffer_attributes[buffer_index_start + index] = Some(attributes);
     }
     eprintln!(
         "[REMu][VIDEO] registered {} buffers at {}x{} format={:#x} tiling={} addresses={:x?}",
@@ -5036,11 +5071,6 @@ fn queue_video_out_flip(
         return;
     };
     let event_data = 6 | ((flip_argument & 0x0000_ffff_ffff_ffff) << 16);
-    remu_gpu::emit_event(remu_gpu::GpuEvent::Flip {
-        address: display_address,
-        buffer_index,
-        flip_argument,
-    });
     for (&equeue, &user_data) in &state.video_out.flip_events {
         state.pending_events.push_back(KernelQueuedEvent {
             equeue,
@@ -5057,6 +5087,82 @@ fn queue_video_out_flip(
             );
         }
     }
+}
+
+fn agc_submit_ordered_video_out_flip(
+    graphics: &mut AgcGraphicsState,
+    video_out: &VideoOutState,
+    handle: u32,
+    buffer_index: u32,
+    flip_argument: u64,
+) -> bool {
+    if handle != 1 || !video_out.is_open {
+        eprintln!("[REMu][VIDEO] ignored flip for invalid handle {handle}");
+        graphics.pending_targetless_draw = None;
+        return false;
+    }
+    let Some(&display_address) = video_out.display_buffers.get(buffer_index as usize) else {
+        eprintln!("[REMu][VIDEO] ignored flip for unregistered buffer index {buffer_index}");
+        return false;
+    };
+    let Some(attributes) = video_out
+        .display_buffer_attributes
+        .get(buffer_index as usize)
+        .copied()
+        .flatten()
+    else {
+        eprintln!("[REMu][VIDEO] ignored flip without attributes for buffer index {buffer_index}");
+        graphics.pending_targetless_draw = None;
+        return false;
+    };
+    if let Some(mut draw) = graphics.pending_targetless_draw.take() {
+        let target = graphics
+            .known_color_targets
+            .get(&display_address)
+            .copied()
+            .filter(|target| {
+                ((target.attrib2 >> 14) & 0x3fff) + 1 == attributes.width
+                    && (target.attrib2 & 0x3fff) + 1 == attributes.height
+            });
+        let export_masks = draw
+            .pixel_shader
+            .as_ref()
+            .map_or(0, |shader| shader.program.pixel_color_export_masks())
+            & draw
+                .context_registers
+                .iter()
+                .find(|register| register.offset == AGC_CB_SHADER_MASK)
+                .map_or(u32::MAX, |register| register.value);
+        let export_slots = (0..AGC_COLOR_TARGET_COUNT)
+            .filter(|slot| (export_masks >> (slot * 4)) & 0xf != 0)
+            .collect::<Vec<_>>();
+        if let Some(target) = target.filter(|target| export_slots.as_slice() == [target.slot]) {
+            draw.scanout_target = Some(target);
+            if draw.sequence <= 8 {
+                eprintln!(
+                    "[REMu][AGC] resolved targetless draw={} against scanout target={display_address:#x}",
+                    draw.sequence
+                );
+            }
+            remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(draw));
+        } else if draw.sequence <= 8 {
+            eprintln!(
+                "[REMu][AGC] discarded targetless draw={}: flip target {display_address:#x} has no matching programmed surface/export (exports={export_slots:?})",
+                draw.sequence,
+            );
+        }
+    }
+    remu_gpu::emit_event(remu_gpu::GpuEvent::Flip {
+        address: display_address,
+        buffer_index,
+        flip_argument,
+        width: attributes.width,
+        height: attributes.height,
+        pitch: attributes.pitch,
+        pixel_format: attributes.pixel_format,
+        tiling_mode: attributes.tiling_mode,
+    });
+    true
 }
 
 fn agc_apply_submission_registers(
@@ -5209,14 +5315,75 @@ fn agc_program_address(registers: &BTreeMap<u32, u32>, low: u32, high: u32) -> u
     (u64::from(high & 0xff) << 40) | (u64::from(low) << 8)
 }
 
-fn agc_color_target_address(registers: &BTreeMap<u32, u32>) -> u64 {
-    let Some((&low, &high)) = registers
-        .get(&AGC_CB_COLOR0_BASE)
-        .zip(registers.get(&AGC_CB_COLOR0_BASE_EXT))
-    else {
-        return 0;
-    };
-    (u64::from(high & 0xff) << 40) | (u64::from(low) << 8)
+#[derive(Debug)]
+enum AgcColorTargetState {
+    Absent,
+    Programmed(Vec<remu_gpu::GpuColorTarget>),
+    Malformed { slot: u32 },
+}
+
+fn agc_color_target_state(registers: &BTreeMap<u32, u32>) -> AgcColorTargetState {
+    let target_mask = registers.get(&AGC_CB_TARGET_MASK).copied();
+    let mut targets = Vec::new();
+    for slot in 0..AGC_COLOR_TARGET_COUNT {
+        if target_mask.is_some_and(|mask| (mask >> (slot * 4)).trailing_zeros() >= 4) {
+            continue;
+        }
+        let primary = slot * AGC_CB_COLOR_REGISTER_STRIDE;
+        let base = registers.get(&(AGC_CB_COLOR0_BASE + primary)).copied();
+        let base_ext = registers
+            .get(&(AGC_CB_COLOR0_BASE_EXT + slot))
+            .copied();
+        let address = base.zip(base_ext).map(|(low, high)| {
+            (u64::from(high & 0xff) << 40) | (u64::from(low) << 8)
+        });
+        let explicitly_enabled =
+            target_mask.is_some_and(|mask| (mask >> (slot * 4)).trailing_zeros() < 4);
+        if address.is_none_or(|address| address == 0) {
+            if explicitly_enabled {
+                return AgcColorTargetState::Malformed { slot };
+            }
+            continue;
+        }
+        let Some(view) = registers.get(&(AGC_CB_COLOR0_VIEW + primary)).copied() else {
+            return AgcColorTargetState::Malformed { slot };
+        };
+        let Some(info) = registers.get(&(AGC_CB_COLOR0_INFO + primary)).copied() else {
+            return AgcColorTargetState::Malformed { slot };
+        };
+        let Some(attrib) = registers.get(&(AGC_CB_COLOR0_ATTRIB + primary)).copied() else {
+            return AgcColorTargetState::Malformed { slot };
+        };
+        let Some(attrib2) = registers.get(&(AGC_CB_COLOR0_ATTRIB2 + slot)).copied() else {
+            return AgcColorTargetState::Malformed { slot };
+        };
+        let Some(attrib3) = registers.get(&(AGC_CB_COLOR0_ATTRIB3 + slot)).copied() else {
+            return AgcColorTargetState::Malformed { slot };
+        };
+        targets.push(remu_gpu::GpuColorTarget {
+            slot,
+            address: address.expect("nonzero color target address was checked"),
+            view,
+            info,
+            attrib,
+            attrib2,
+            attrib3,
+        });
+    }
+    if targets.is_empty() {
+        AgcColorTargetState::Absent
+    } else {
+        AgcColorTargetState::Programmed(targets)
+    }
+}
+
+fn agc_has_active_depth_state(registers: &BTreeMap<u32, u32>) -> bool {
+    registers
+        .get(&AGC_DB_DEPTH_CONTROL)
+        .is_some_and(|control| control & 0x6 != 0)
+        || registers
+            .get(&AGC_DB_RENDER_CONTROL)
+            .is_some_and(|control| control & 1 != 0)
 }
 
 fn agc_register_snapshot(registers: &BTreeMap<u32, u32>) -> Vec<remu_gpu::GpuRegister> {
@@ -5506,6 +5673,98 @@ fn agc_decode_compute_dispatch(
     })
 }
 
+fn agc_prepare_draw_color_targets(
+    graphics: &mut AgcGraphicsState,
+) -> (Vec<remu_gpu::GpuColorTarget>, bool) {
+    let (targets, absent) = match agc_color_target_state(&graphics.context_registers) {
+        AgcColorTargetState::Absent => (Vec::new(), true),
+        AgcColorTargetState::Programmed(targets) => (targets, false),
+        AgcColorTargetState::Malformed { slot } => {
+            if graphics.emitted_draws <= 8 {
+                eprintln!(
+                    "[REMu][AGC] draw={} has incomplete enabled CB_COLOR{slot} state",
+                    graphics.emitted_draws
+                );
+            }
+            (Vec::new(), false)
+        }
+    };
+    for target in &targets {
+        graphics.known_color_targets.insert(target.address, *target);
+    }
+    (targets, absent)
+}
+
+fn agc_draw_image_access(draw: &remu_gpu::IndexedDraw) -> (bool, bool) {
+    [
+        draw.export_shader_evaluation.as_deref(),
+        draw.pixel_shader_evaluation.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|evaluation| &evaluation.image_bindings)
+    .fold((false, false), |(reads, writes), binding| {
+        let writes_binding = binding.opcode.starts_with("ImageStore")
+            || binding.opcode.starts_with("ImageAtomic");
+        (reads || !writes_binding, writes || writes_binding)
+    })
+}
+
+fn agc_submit_or_defer_draw(
+    graphics: &mut AgcGraphicsState,
+    draw: remu_gpu::IndexedDraw,
+    color_target_absent: bool,
+) {
+    let (reads_image, writes_image) = agc_draw_image_access(&draw);
+    if color_target_absent
+        && !agc_has_active_depth_state(&graphics.context_registers)
+        && reads_image
+        && !writes_image
+    {
+        if draw.sequence <= 8 {
+            eprintln!(
+                "[REMu][AGC] deferred targetless sampled draw={} until the following VideoOut flip",
+                draw.sequence
+            );
+        }
+        graphics.pending_targetless_draw = Some(Box::new(draw));
+    } else {
+        remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
+    }
+}
+
+fn agc_discard_stale_targetless_draw(graphics: &mut AgcGraphicsState) {
+    if let Some(stale) = graphics.pending_targetless_draw.take()
+        && stale.sequence <= 8
+    {
+        eprintln!(
+            "[REMu][AGC] discarded unresolved targetless draw={} before the next draw",
+            stale.sequence
+        );
+    }
+}
+
+fn agc_trace_draw_summary(draw: &remu_gpu::IndexedDraw) {
+    if draw.sequence <= 8 {
+        eprintln!(
+            "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x}",
+            draw.sequence,
+            draw.indexed,
+            draw.index_count,
+            draw.instance_count,
+            draw.index_offset,
+            draw.index_buffer_address,
+            draw.index_buffer_count,
+            draw.index_resource_address,
+            draw.index_size,
+            draw.primitive_type,
+            draw.export_shader_address,
+            draw.pixel_shader_address,
+            draw.color_target_address,
+        );
+    }
+}
+
 fn agc_emit_draw(
     graphics: &mut AgcGraphicsState,
     shaders: &mut AgcShaderRegistry,
@@ -5517,6 +5776,7 @@ fn agc_emit_draw(
     if element_count == 0 {
         return;
     }
+    agc_discard_stale_targetless_draw(graphics);
     graphics.draw_index_offset = element_offset;
     graphics.emitted_draws = graphics.emitted_draws.saturating_add(1);
 
@@ -5530,7 +5790,10 @@ fn agc_emit_draw(
         AGC_SPI_SHADER_PGM_LO_PS,
         AGC_SPI_SHADER_PGM_HI_PS,
     );
-    let color_target_address = agc_color_target_address(&graphics.context_registers);
+    let (color_targets, color_target_absent) = agc_prepare_draw_color_targets(graphics);
+    let color_target_address = color_targets
+        .first()
+        .map_or(0, |target| target.address);
     let primitive_type = graphics
         .user_config_registers
         .get(&AGC_VGT_PRIMITIVE_TYPE)
@@ -5559,6 +5822,7 @@ fn agc_emit_draw(
         export_shader_evaluation: None,
         pixel_shader_evaluation: None,
         color_target_address,
+        scanout_target: None,
         context_registers: agc_register_snapshot(&graphics.context_registers),
         shader_registers: agc_register_snapshot(&graphics.shader_registers),
         user_config_registers: agc_register_snapshot(&graphics.user_config_registers),
@@ -5586,24 +5850,7 @@ fn agc_emit_draw(
             })
             .ok()
     });
-    if draw.sequence <= 8 {
-        eprintln!(
-            "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x}",
-            draw.sequence,
-            draw.indexed,
-            draw.index_count,
-            draw.instance_count,
-            draw.index_offset,
-            draw.index_buffer_address,
-            draw.index_buffer_count,
-            draw.index_resource_address,
-            draw.index_size,
-            draw.primitive_type,
-            draw.export_shader_address,
-            draw.pixel_shader_address,
-            draw.color_target_address,
-        );
-    }
+    agc_trace_draw_summary(&draw);
     if trace_agc_shaders()
         && graphics
             .traced_shader_pairs
@@ -5612,7 +5859,7 @@ fn agc_emit_draw(
     {
         trace_agc_shader_draw(&draw);
     }
-    remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
+    agc_submit_or_defer_draw(graphics, draw, color_target_absent);
 }
 
 fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
@@ -5897,6 +6144,7 @@ fn agc_handle_submission_packet(
     graphics: &mut AgcGraphicsState,
     shaders: &mut AgcShaderRegistry,
     index_resources: &BTreeMap<u64, u64>,
+    video_out: &VideoOutState,
     flips: &mut Vec<(u32, u32, u64)>,
 ) -> Result<(), AgcSubmissionError> {
     let AgcSubmissionPacket {
@@ -5982,7 +6230,15 @@ fn agc_handle_submission_packet(
         let buffer_index = read_guest_u32(packet_address + 8);
         let flip_argument = u64::from(read_guest_u32(packet_address + 16))
             | (u64::from(read_guest_u32(packet_address + 20)) << 32);
-        flips.push((handle, buffer_index, flip_argument));
+        if agc_submit_ordered_video_out_flip(
+            graphics,
+            video_out,
+            handle,
+            buffer_index,
+            flip_argument,
+        ) {
+            flips.push((handle, buffer_index, flip_argument));
+        }
     }
     Ok(())
 }
@@ -6003,17 +6259,22 @@ fn decode_agc_memory_acquire(packet_address: u64) -> remu_gpu::GpuMemoryAcquire 
     }
 }
 
+struct AgcSubmissionContext<'a> {
+    graphics: &'a mut AgcGraphicsState,
+    shaders: &'a mut AgcShaderRegistry,
+    index_resources: &'a BTreeMap<u64, u64>,
+    video_out: &'a VideoOutState,
+    submission_count: &'a mut u64,
+    flips: &'a mut Vec<(u32, u32, u64)>,
+}
+
 fn agc_parse_submission(
     command_address: u64,
     dword_count: u32,
-    graphics: &mut AgcGraphicsState,
-    shaders: &mut AgcShaderRegistry,
-    index_resources: &BTreeMap<u64, u64>,
-    submission_count: &mut u64,
-) -> Result<Vec<(u32, u32, u64)>, AgcSubmissionError> {
+    context: &mut AgcSubmissionContext<'_>,
+) -> Result<(), AgcSubmissionError> {
     let mut offset = 0_u32;
     let mut packets = BTreeMap::<(u32, u32), u32>::new();
-    let mut flips = Vec::new();
     while offset < dword_count {
         let packet_address = command_address + u64::from(offset) * 4;
         let header = read_guest_u32(packet_address);
@@ -6048,16 +6309,17 @@ fn agc_parse_submission(
                 opcode,
                 register,
             },
-            graphics,
-            shaders,
-            index_resources,
-            &mut flips,
+            context.graphics,
+            context.shaders,
+            context.index_resources,
+            context.video_out,
+            context.flips,
         )?;
         offset += length;
     }
 
-    *submission_count = submission_count.saturating_add(1);
-    if *submission_count <= 8 {
+    *context.submission_count = context.submission_count.saturating_add(1);
+    if *context.submission_count <= 8 {
         let packet_summary = packets
             .iter()
             .map(|(&(opcode, register), &count)| {
@@ -6067,11 +6329,11 @@ fn agc_parse_submission(
             .join(",");
         eprintln!(
             "[REMu][AGC] submit={} address={command_address:#x} dwords={dword_count} parsed={offset} packets=[{packet_summary}] flips={}",
-            submission_count,
-            flips.len()
+            context.submission_count,
+            context.flips.len()
         );
     }
-    Ok(flips)
+    Ok(())
 }
 
 fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -6084,20 +6346,20 @@ fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
     if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
         return u64::MAX;
     }
-    match agc_parse_submission(
-        command_address,
-        dword_count,
-        &mut state.agc_graphics,
-        &mut state.agc_shader_registry,
-        &state.agc_index_resources,
-        &mut state.agc_submission_count,
-    ) {
-        Ok(flips) => {
-            for (handle, buffer_index, flip_argument) in flips {
-                queue_video_out_flip(state, handle, buffer_index, flip_argument);
-            }
-            0
-        }
+    let mut flips = Vec::new();
+    let result = agc_parse_submission(command_address, dword_count, &mut AgcSubmissionContext {
+        graphics: &mut state.agc_graphics,
+        shaders: &mut state.agc_shader_registry,
+        index_resources: &state.agc_index_resources,
+        video_out: &state.video_out,
+        submission_count: &mut state.agc_submission_count,
+        flips: &mut flips,
+    });
+    for (handle, buffer_index, flip_argument) in flips {
+        queue_video_out_flip(state, handle, buffer_index, flip_argument);
+    }
+    match result {
+        Ok(()) => 0,
         Err(error) => {
             eprintln!("[REMu][AGC] rejected DCB submission: {error}");
             u64::MAX
@@ -6116,19 +6378,20 @@ fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
         let command_address = read_guest_u64(addresses + u64::from(index) * 8);
         let dword_count = read_guest_u32(sizes + u64::from(index) * 4);
         if command_address != 0 && dword_count != 0 && dword_count <= 1_000_000 {
-            match agc_parse_submission(
-                command_address,
-                dword_count,
-                &mut state.agc_graphics,
-                &mut state.agc_shader_registry,
-                &state.agc_index_resources,
-                &mut state.agc_submission_count,
-            ) {
-                Ok(flips) => {
-                    for (handle, buffer_index, flip_argument) in flips {
-                        queue_video_out_flip(state, handle, buffer_index, flip_argument);
-                    }
-                }
+            let mut flips = Vec::new();
+            let result = agc_parse_submission(command_address, dword_count, &mut AgcSubmissionContext {
+                graphics: &mut state.agc_graphics,
+                shaders: &mut state.agc_shader_registry,
+                index_resources: &state.agc_index_resources,
+                video_out: &state.video_out,
+                submission_count: &mut state.agc_submission_count,
+                flips: &mut flips,
+            });
+            for (handle, buffer_index, flip_argument) in flips {
+                queue_video_out_flip(state, handle, buffer_index, flip_argument);
+            }
+            match result {
+                Ok(()) => {}
                 Err(error) => {
                     eprintln!("[REMu][AGC] rejected DCB {index} in multi-submission: {error}");
                     return u64::MAX;
@@ -6167,17 +6430,18 @@ fn agc_submit_compute_commands(
     command_address: u64,
     dword_count: u32,
     state: &mut ProbeDispatchState,
-) -> Result<Vec<(u32, u32, u64)>, AgcSubmissionError> {
+    flips: &mut Vec<(u32, u32, u64)>,
+) -> Result<(), AgcSubmissionError> {
     let (command_address, dword_count) = agc_resolve_acb_descriptor(command_address, dword_count)?;
     let graphics = state.agc_compute_queues.entry(owner).or_default();
-    agc_parse_submission(
-        command_address,
-        dword_count,
+    agc_parse_submission(command_address, dword_count, &mut AgcSubmissionContext {
         graphics,
-        &mut state.agc_shader_registry,
-        &state.agc_index_resources,
-        &mut state.agc_submission_count,
-    )
+        shaders: &mut state.agc_shader_registry,
+        index_resources: &state.agc_index_resources,
+        video_out: &state.video_out,
+        submission_count: &mut state.agc_submission_count,
+        flips,
+    })
 }
 
 fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -6191,13 +6455,13 @@ fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
     if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
         return u64::MAX;
     }
-    match agc_submit_compute_commands(owner, command_address, dword_count, state) {
-        Ok(flips) => {
-            for (handle, buffer_index, flip_argument) in flips {
-                queue_video_out_flip(state, handle, buffer_index, flip_argument);
-            }
-            0
-        }
+    let mut flips = Vec::new();
+    let result = agc_submit_compute_commands(owner, command_address, dword_count, state, &mut flips);
+    for (handle, buffer_index, flip_argument) in flips {
+        queue_video_out_flip(state, handle, buffer_index, flip_argument);
+    }
+    match result {
+        Ok(()) => 0,
         Err(error) => {
             eprintln!("[REMu][AGC] rejected ACB submission for owner {owner}: {error}");
             u64::MAX
@@ -6219,12 +6483,14 @@ fn agc_driver_submit_multi_acbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
         if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
             return u64::MAX;
         }
-        match agc_submit_compute_commands(owner, command_address, dword_count, state) {
-            Ok(flips) => {
-                for (handle, buffer_index, flip_argument) in flips {
-                    queue_video_out_flip(state, handle, buffer_index, flip_argument);
-                }
-            }
+        let mut flips = Vec::new();
+        let result =
+            agc_submit_compute_commands(owner, command_address, dword_count, state, &mut flips);
+        for (handle, buffer_index, flip_argument) in flips {
+            queue_video_out_flip(state, handle, buffer_index, flip_argument);
+        }
+        match result {
+            Ok(()) => {}
             Err(error) => {
                 eprintln!(
                     "[REMu][AGC] rejected ACB {index} for owner {owner} in multi-submission: {error}"
@@ -9646,6 +9912,7 @@ fn terminate_probe(code: i32) -> ! {
 
 #[cfg(test)]
 mod platform_independent_tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -9654,12 +9921,14 @@ mod platform_independent_tests {
         AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
         AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT,
         AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET,
-        AGC_R_DRAW_INDEX_AUTO, AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
-        DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState, PthreadAttrState,
-        SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
-        SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED, agc_apply_set_base,
-        agc_apply_submission_registers, agc_dcb_draw_index_auto, agc_dcb_set_index_buffer,
-        agc_dcb_set_num_instances, agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4,
+        AGC_R_DRAW_INDEX_AUTO, AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState,
+        AgcShaderRegistry, DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState,
+        PthreadAttrState, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND,
+        SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
+        VideoOutBufferAttributes, VideoOutState, agc_apply_set_base,
+        agc_apply_submission_registers, agc_color_target_state, agc_dcb_draw_index_auto,
+        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_decode_compute_dispatch,
+        agc_driver_submit_acb, agc_pm4, agc_submit_ordered_video_out_flip,
         allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
         decode_agc_memory_acquire, destroy_pthread_attr, dispatch_guest_numeric_parser,
         dispatch_probe_import, guest_clock_gettime, guest_free, guest_global_locale,
@@ -9725,6 +9994,62 @@ mod platform_independent_tests {
             },
         );
         (graphics, shaders)
+    }
+
+    fn targetless_scanout_test_draw() -> remu_gpu::IndexedDraw {
+        let pixel_program = remu_shader::Program::new(
+            0x2000,
+            vec![remu_shader::Instruction {
+                pc: 0,
+                encoding: remu_shader::ShaderEncoding::Exp,
+                opcode: remu_shader::Opcode::EXPORT,
+                words: vec![0, 0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(remu_shader::InstructionControl::Export(
+                    remu_shader::ExportControl {
+                        target: 0,
+                        enable_mask: 0xf,
+                        compressed: false,
+                        done: true,
+                        valid_mask: false,
+                    },
+                )),
+            }],
+        );
+        remu_gpu::IndexedDraw {
+            sequence: 1,
+            indexed: false,
+            instance_count: 1,
+            index_buffer_address: 0,
+            index_resource_address: 0,
+            index_buffer_count: 0,
+            index_size: 0,
+            index_offset: 0,
+            index_count: 3,
+            draw_flags: 0,
+            primitive_type: 4,
+            export_shader_address: 0,
+            pixel_shader_address: 0x2000,
+            export_shader_prefix: [0; 4],
+            pixel_shader_prefix: [0; 4],
+            export_shader: None,
+            pixel_shader: Some(remu_gpu::ShaderSnapshot {
+                header_address: 0,
+                program: Arc::new(pixel_program),
+                metadata: None,
+            }),
+            export_shader_evaluation: None,
+            pixel_shader_evaluation: None,
+            color_target_address: 0,
+            scanout_target: None,
+            context_registers: vec![remu_gpu::GpuRegister {
+                offset: super::AGC_CB_SHADER_MASK,
+                value: 0xf,
+            }],
+            shader_registers: Vec::new(),
+            user_config_registers: Vec::new(),
+        }
     }
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -10888,6 +11213,101 @@ mod platform_independent_tests {
 
         assert_eq!(graphics.user_config_registers.get(&0x243), Some(&0x481));
         assert_eq!(graphics.index_size, 1);
+    }
+
+    #[test]
+    fn distinguishes_absent_programmed_and_malformed_color_target_state() {
+        let address = 0x0070_1234_5600_u64;
+        let mut registers = BTreeMap::from([
+            (super::AGC_CB_COLOR0_BASE, low_u32(address >> 8)),
+            (super::AGC_CB_COLOR0_BASE_EXT, low_u32(address >> 40)),
+            (super::AGC_CB_COLOR0_VIEW, 0),
+            (super::AGC_CB_COLOR0_INFO, 10 << 2),
+            (super::AGC_CB_COLOR0_ATTRIB, 0),
+            (super::AGC_CB_COLOR0_ATTRIB2, ((1_280 - 1) << 14) | (720 - 1)),
+            (super::AGC_CB_COLOR0_ATTRIB3, (27 << 14) | (1 << 24)),
+        ]);
+
+        let AgcColorTargetState::Programmed(targets) = agc_color_target_state(&registers) else {
+            panic!("a complete target remains enabled when CB_TARGET_MASK is absent");
+        };
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].address, address);
+
+        registers.remove(&super::AGC_CB_COLOR0_VIEW);
+        assert!(matches!(
+            agc_color_target_state(&registers),
+            AgcColorTargetState::Malformed { slot: 0 }
+        ));
+
+        registers.insert(super::AGC_CB_TARGET_MASK, 0);
+        assert!(matches!(
+            agc_color_target_state(&registers),
+            AgcColorTargetState::Absent
+        ));
+    }
+
+    #[test]
+    fn emits_deferred_scanout_draw_immediately_before_its_flip() {
+        let _event_guard = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let address = 0x0070_1234_5600_u64;
+        let target = remu_gpu::GpuColorTarget {
+            slot: 0,
+            address,
+            view: 0,
+            info: 10 << 2,
+            attrib: 0,
+            attrib2: ((1_280 - 1) << 14) | (720 - 1),
+            attrib3: (27 << 14) | (1 << 24),
+        };
+        let mut graphics = AgcGraphicsState::default();
+        graphics.known_color_targets.insert(address, target);
+        graphics.pending_targetless_draw = Some(Box::new(targetless_scanout_test_draw()));
+        let video_out = VideoOutState {
+            is_open: true,
+            width: 1_280,
+            height: 720,
+            display_buffers: vec![address],
+            display_buffer_attributes: vec![Some(VideoOutBufferAttributes {
+                width: 1_280,
+                height: 720,
+                pitch: 1_280,
+                pixel_format: 0x8000_0000_2200_0000,
+                tiling_mode: 0,
+            })],
+            ..VideoOutState::default()
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        remu_gpu::install_event_sink(sender);
+
+        assert!(agc_submit_ordered_video_out_flip(
+            &mut graphics,
+            &video_out,
+            1,
+            0,
+            0x1234,
+        ));
+        remu_gpu::clear_event_sink();
+
+        let remu_gpu::GpuEvent::IndexedDraw(draw) = receiver.recv().expect("deferred draw event")
+        else {
+            panic!("draw must precede flip");
+        };
+        assert_eq!(draw.scanout_target, Some(target));
+        let remu_gpu::GpuEvent::Flip {
+            address: flipped_address,
+            width,
+            height,
+            ..
+        } = receiver.recv().expect("ordered flip event")
+        else {
+            panic!("flip must follow draw");
+        };
+        assert_eq!(flipped_address, address);
+        assert_eq!((width, height), (1_280, 720));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

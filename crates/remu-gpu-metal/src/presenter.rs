@@ -25,8 +25,8 @@ use metal::{
 use objc::runtime::{Object, YES};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{
-    ComputeDispatch, ComputeGrid, GpuEvent, GpuMemoryAcquire, GpuRegister, HostPadState,
-    IndexedDraw, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
+    ComputeDispatch, ComputeGrid, GpuColorTarget, GpuEvent, GpuMemoryAcquire, GpuRegister,
+    HostPadState, IndexedDraw, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
     PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2,
     PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
 };
@@ -547,7 +547,22 @@ impl MetalPresenter {
                         "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode}"
                     );
                 }
-                Ok(GpuEvent::Flip { address, .. }) => {
+                Ok(GpuEvent::Flip {
+                    address,
+                    width,
+                    height,
+                    pitch,
+                    pixel_format,
+                    tiling_mode,
+                    ..
+                }) => {
+                    self.display = Some(DisplayConfiguration {
+                        width,
+                        height,
+                        pitch,
+                        pixel_format,
+                        tiling_mode,
+                    });
                     if let Err(error) = self.synchronize_flip_target(address) {
                         eprintln!("[REMu][METAL] flip synchronization failed: {error}");
                     }
@@ -612,7 +627,16 @@ impl MetalPresenter {
                         }
                     }
                 }
-                Ok(GpuEvent::Shutdown) | Err(TryRecvError::Disconnected) => {
+                Ok(GpuEvent::Shutdown) => {
+                    eprintln!("[REMu][METAL] guest runtime requested presenter shutdown");
+                    if let Err(error) = self.wait_for_guest_command_batches() {
+                        eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
+                    }
+                    event_loop.exit();
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    eprintln!("[REMu][METAL] GPU event channel disconnected; closing presenter");
                     if let Err(error) = self.wait_for_guest_command_batches() {
                         eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
                     }
@@ -2915,13 +2939,130 @@ fn decode_render_target_format(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn decode_render_target_state(
+    guest_slot: u32,
+    address: u64,
+    view: u32,
+    info: u32,
+    attrib: u32,
+    attrib2: u32,
+    attrib3: u32,
+    write_mask: u32,
+) -> Result<DecodedRenderTarget, String> {
+    let width = ((attrib2 >> 14) & 0x3fff)
+        .checked_add(1)
+        .ok_or("render-target width overflows")?;
+    let height = (attrib2 & 0x3fff)
+        .checked_add(1)
+        .ok_or("render-target height overflows")?;
+    if address < 0x10_000 || width > 16_384 || height > 16_384 {
+        return Err(format!(
+            "invalid color target {guest_slot} address={address:#x} extent={width}x{height}"
+        ));
+    }
+
+    let endian = info & 0x3;
+    let fast_clear = (info >> 13) & 1;
+    let fmask_compression = (info >> 14) & 1;
+    let dcc_enable = (info >> 28) & 1;
+    if endian != 0 || fast_clear != 0 || fmask_compression != 0 || dcc_enable != 0 {
+        return Err(format!(
+            "color target {guest_slot} requires unsupported metadata/endian state endian={endian} fast_clear={fast_clear} fmask={fmask_compression} dcc={dcc_enable}"
+        ));
+    }
+    let sample_log2 = (attrib >> 12) & 0x7;
+    let fragment_log2 = (attrib >> 15) & 0x3;
+    if sample_log2 != 0 || fragment_log2 != 0 {
+        return Err(format!(
+            "color target {guest_slot} is multisampled (samples_log2={sample_log2}, fragments_log2={fragment_log2})"
+        ));
+    }
+    let slice_start = view & 0x1fff;
+    let slice_max = (view >> 13) & 0x1fff;
+    let mip_level = (view >> 26) & 0xf;
+    let max_mip = (attrib2 >> 28) & 0xf;
+    let mip0_depth = attrib3 & 0x1fff;
+    if slice_start != 0 || slice_max != 0 || mip_level != 0 || max_mip != 0 || mip0_depth != 0 {
+        return Err(format!(
+            "color target {guest_slot} requires unsupported slice/mip view slices={slice_start}..={slice_max} mip={mip_level}/{max_mip} depth={mip0_depth}"
+        ));
+    }
+    let tile_mode = (attrib3 >> 14) & 0x1f;
+    if !matches!(tile_mode, 0 | 27) {
+        return Err(format!(
+            "color target {guest_slot} uses unsupported GFX10 swizzle mode {tile_mode}"
+        ));
+    }
+    let resource_type = (attrib3 >> 24) & 0x3;
+    let resource_level = (attrib3 >> 27) & 0x7;
+    let non_block_compressed_view = (attrib3 >> 31) & 1;
+    if !matches!(resource_type, 0 | 1)
+        || (resource_type == 0 && height != 1)
+        || resource_level != 0
+        || non_block_compressed_view != 0
+    {
+        return Err(format!(
+            "color target {guest_slot} requires unsupported resource state type={resource_type} level={resource_level} nbc={non_block_compressed_view} extent={width}x{height}"
+        ));
+    }
+    let format =
+        decode_render_target_format((info >> 2) & 0x1f, (info >> 8) & 0x7, (info >> 11) & 0x3)?;
+    let pitch = if tile_mode == 0 {
+        effective_linear_pitch(width, format.bytes_per_pixel)
+            .ok_or("linear render-target pitch overflows")?
+    } else {
+        width
+    };
+    Ok(DecodedRenderTarget {
+        guest_slot,
+        texture: GuestTextureDescriptor {
+            address,
+            width,
+            height,
+            pitch,
+            tile_mode,
+            pixel_format: format.pixel_format,
+            bytes_per_pixel: format.bytes_per_pixel,
+        },
+        output_kind: format.output_kind,
+        write_mask,
+    })
+}
+
 fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>, String> {
     let pixel = draw
         .pixel_shader
         .as_ref()
         .ok_or("draw has no decoded pixel shader")?;
     let export_masks = pixel.program.pixel_color_export_masks();
+    if let Some(target) = draw.scanout_target {
+        let shader_write_mask = (export_masks >> (target.slot * 4)) & 0xf;
+        if shader_write_mask == 0 {
+            return Err(format!(
+                "scanout target slot {} has no matching pixel export ({export_masks:#010x})",
+                target.slot
+            ));
+        }
+        return decode_scanout_target(target, shader_write_mask).map(|target| vec![target]);
+    }
     decode_render_targets_from_registers(&draw.context_registers, export_masks)
+}
+
+fn decode_scanout_target(
+    target: GpuColorTarget,
+    write_mask: u32,
+) -> Result<DecodedRenderTarget, String> {
+    decode_render_target_state(
+        target.slot,
+        target.address,
+        target.view,
+        target.info,
+        target.attrib,
+        target.attrib2,
+        target.attrib3,
+        write_mask,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2954,84 +3095,9 @@ fn decode_render_targets_from_registers(
         let attrib3 = required(CB_COLOR0_ATTRIB3 + guest_slot, "CB_COLOR_ATTRIB3")?;
 
         let address = (u64::from(base_ext & 0xff) << 40) | (u64::from(base) << 8);
-        let width = ((attrib2 >> 14) & 0x3fff)
-            .checked_add(1)
-            .ok_or("render-target width overflows")?;
-        let height = (attrib2 & 0x3fff)
-            .checked_add(1)
-            .ok_or("render-target height overflows")?;
-        if address < 0x10_000 || width > 16_384 || height > 16_384 {
-            return Err(format!(
-                "invalid color target {guest_slot} address={address:#x} extent={width}x{height}"
-            ));
-        }
-
-        let endian = info & 0x3;
-        let fast_clear = (info >> 13) & 1;
-        let fmask_compression = (info >> 14) & 1;
-        let dcc_enable = (info >> 28) & 1;
-        if endian != 0 || fast_clear != 0 || fmask_compression != 0 || dcc_enable != 0 {
-            return Err(format!(
-                "color target {guest_slot} requires unsupported metadata/endian state endian={endian} fast_clear={fast_clear} fmask={fmask_compression} dcc={dcc_enable}"
-            ));
-        }
-        let sample_log2 = (attrib >> 12) & 0x7;
-        let fragment_log2 = (attrib >> 15) & 0x3;
-        if sample_log2 != 0 || fragment_log2 != 0 {
-            return Err(format!(
-                "color target {guest_slot} is multisampled (samples_log2={sample_log2}, fragments_log2={fragment_log2})"
-            ));
-        }
-        let slice_start = view & 0x1fff;
-        let slice_max = (view >> 13) & 0x1fff;
-        let mip_level = (view >> 26) & 0xf;
-        let max_mip = (attrib2 >> 28) & 0xf;
-        let mip0_depth = attrib3 & 0x1fff;
-        if slice_start != 0 || slice_max != 0 || mip_level != 0 || max_mip != 0 || mip0_depth != 0 {
-            return Err(format!(
-                "color target {guest_slot} requires unsupported slice/mip view slices={slice_start}..={slice_max} mip={mip_level}/{max_mip} depth={mip0_depth}"
-            ));
-        }
-        let tile_mode = (attrib3 >> 14) & 0x1f;
-        if !matches!(tile_mode, 0 | 27) {
-            return Err(format!(
-                "color target {guest_slot} uses unsupported GFX10 swizzle mode {tile_mode}"
-            ));
-        }
-        let resource_type = (attrib3 >> 24) & 0x3;
-        let resource_level = (attrib3 >> 27) & 0x7;
-        let non_block_compressed_view = (attrib3 >> 31) & 1;
-        if !matches!(resource_type, 0 | 1)
-            || (resource_type == 0 && height != 1)
-            || resource_level != 0
-            || non_block_compressed_view != 0
-        {
-            return Err(format!(
-                "color target {guest_slot} requires unsupported resource state type={resource_type} level={resource_level} nbc={non_block_compressed_view} extent={width}x{height}"
-            ));
-        }
-        let format =
-            decode_render_target_format((info >> 2) & 0x1f, (info >> 8) & 0x7, (info >> 11) & 0x3)?;
-        let pitch = if tile_mode == 0 {
-            effective_linear_pitch(width, format.bytes_per_pixel)
-                .ok_or("linear render-target pitch overflows")?
-        } else {
-            width
-        };
-        targets.push(DecodedRenderTarget {
-            guest_slot,
-            texture: GuestTextureDescriptor {
-                address,
-                width,
-                height,
-                pitch,
-                tile_mode,
-                pixel_format: format.pixel_format,
-                bytes_per_pixel: format.bytes_per_pixel,
-            },
-            output_kind: format.output_kind,
-            write_mask,
-        });
+        targets.push(decode_render_target_state(
+            guest_slot, address, view, info, attrib, attrib2, attrib3, write_mask,
+        )?);
     }
     if targets.is_empty() {
         return Err(format!(
@@ -3539,7 +3605,10 @@ impl ApplicationHandler for MetalPresenter {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                eprintln!("[REMu][METAL] window close requested by AppKit");
+                event_loop.exit();
+            }
             WindowEvent::Focused(false) => {
                 self.pressed_keys.clear();
                 self.publish_pad_state();
@@ -3618,6 +3687,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     event_loop
         .run_app(&mut presenter)
         .map_err(|error| format!("event loop failed: {error}"))?;
+    eprintln!("[REMu][METAL] AppKit event loop stopped");
     if let Some(error) = presenter.startup_error {
         Err(error)
     } else {
@@ -3628,7 +3698,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use metal::{CompileOptions, Device, MTLPixelFormat, RenderPipelineDescriptor};
-    use remu_gpu::{ComputeGrid, ComputeLaunch, GpuRegister, IndexedDraw};
+    use remu_gpu::{ComputeGrid, ComputeLaunch, GpuColorTarget, GpuRegister, IndexedDraw};
     use remu_shader::PixelOutputKind;
 
     use super::{
@@ -3636,11 +3706,11 @@ mod tests {
         CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
         GuestTextureDescriptor, PresentationResolution, apply_image_destination_select,
         decode_image_descriptor, decode_render_target_format, decode_render_targets_from_registers,
-        decode_scissor, decode_viewport, effective_linear_pitch, effective_linear_rgba_pitch,
-        guest_texture_byte_count, guest_texture_descriptors_overlap, guest_texture_raw_matches,
-        metal_color_write_mask, metal_nonindexed_vertex_count, mode27_block_dimensions,
-        mode27_source_byte_offset, mode27_within_block_byte_offset, parse_presentation_resolution,
-        presentation_drawable_size, presentation_viewport, read_draw_indices,
+        decode_scanout_target, decode_scissor, decode_viewport, effective_linear_pitch,
+        effective_linear_rgba_pitch, guest_texture_byte_count, guest_texture_descriptors_overlap,
+        guest_texture_raw_matches, metal_color_write_mask, metal_nonindexed_vertex_count,
+        mode27_block_dimensions, mode27_source_byte_offset, mode27_within_block_byte_offset,
+        parse_presentation_resolution, presentation_drawable_size, presentation_viewport, read_draw_indices,
         snapshot_guest_texture_linear, snapshot_guest_texture_raw,
         validate_compute_launch_for_metal, write_guest_texture_linear,
     };
@@ -3760,6 +3830,7 @@ mod tests {
             export_shader_evaluation: None,
             pixel_shader_evaluation: None,
             color_target_address: 0,
+            scanout_target: None,
             context_registers: Vec::new(),
             shader_registers: Vec::new(),
             user_config_registers: Vec::new(),
@@ -3815,6 +3886,28 @@ mod tests {
         assert_eq!(targets[1].texture.bytes_per_pixel, 8);
         assert_eq!(targets[1].output_kind, PixelOutputKind::Uint);
         assert_eq!(targets[1].write_mask, 0x5);
+    }
+
+    #[test]
+    fn decodes_explicit_scanout_target_without_fabricating_context_registers() {
+        let target = GpuColorTarget {
+            slot: 0,
+            address: 0x0070_1234_5600,
+            view: 0,
+            info: 10 << 2,
+            attrib: 0,
+            attrib2: ((3_840 - 1) << 14) | (2_160 - 1),
+            attrib3: (27 << 14) | (1 << 24),
+        };
+
+        let decoded = decode_scanout_target(target, 0xf).expect("valid scanout target");
+
+        assert_eq!(decoded.guest_slot, 0);
+        assert_eq!(decoded.texture.address, target.address);
+        assert_eq!((decoded.texture.width, decoded.texture.height), (3_840, 2_160));
+        assert_eq!(decoded.texture.tile_mode, 27);
+        assert_eq!(decoded.texture.pixel_format, MTLPixelFormat::RGBA8Unorm);
+        assert_eq!(decoded.write_mask, 0xf);
     }
 
     #[test]
