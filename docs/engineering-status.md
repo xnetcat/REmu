@@ -49,6 +49,29 @@ milestone completion claim.
   1280x720 tile-27 phase after roughly 45-51 seconds. Runtime submission/draw/compute/flip logs and
   Metal encoded-draw logs now retain their small initial prefix plus power-of-two checkpoints, so a
   longer bounded run can prove progress or a stall with logarithmic rather than unbounded output.
+- A single direct-shell, process-checked, 70-second run at `f9e476b` reached AGC submission and draw
+  checkpoint 1024 and completed the retained data-payload parse, then exited from a guest `SIGBUS`
+  after about 67 seconds. The retained run is
+  `.remu/runs/20260722T124738Z-dreaming-sarah`; the matching macOS report is
+  `~/Library/Logs/DiagnosticReports/remu-2026-07-22-144902.ips`. It faulted BackgroundLoader worker
+  0 at guest RIP `0x800104f7d` while dereferencing an inaccessible allocator-list pointer. Other
+  loader workers were active or blocked on the same work-pool synchronization, and the last import
+  hit was `kDh-NfxgMtE` (`scePthreadCondSignal`) at the producer-side scheduling call. This is a
+  temporal correlation, not a causal conclusion: the exact consumer loops on a mutex-protected work
+  predicate, so an extra awakened worker rechecks false and waits again. The immediate failure is a
+  stale per-thread allocator freelist pointer into a range the guest had explicitly unmapped.
+- The runtime had routed signal and broadcast through one condition-wide generation plus
+  `notify_all`, incorrectly selecting every guest waiter. The current source-backed increment uses
+  FIFO per-wait tickets: signal selects exactly one current waiter, broadcast snapshots all current
+  waiters, empty signals are not retained, timeout and notification have one atomic winner, waits
+  release/reacquire the mutex atomically while preserving recursive depth, and selected completion
+  survives legal condition destruction. SCE calls return kernel errors and POSIX calls return errno.
+  Threaded tests cover exact one-waiter selection, mutex reacquisition, timeout, dynamic mutex
+  binding, busy destruction with pending waiters, destruction after selection, and a three-worker
+  predicate-guarded pool in which one signal permits exactly one task consumption. Bounded
+  power-of-two condition ticket/selection telemetry complements the existing opt-in all-call VM
+  map/protect/query/unmap trace. Native and Rosetta workspace tests and strict Clippy pass; a
+  process-checked post-fix game run is the next controlled evidence step.
 
 ## Subsystem ledger
 
@@ -60,12 +83,12 @@ milestone completion claim.
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, and translated shader pipelines are present. | Complete reusable blend, depth/stencil, rasterization, culling, front-face, multisampling, resolve, and full structural cache identity; audit old blend commit `a0388df` without wholesale cherry-picking. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, and observed compute geometry are implemented with offline Metal compilation tests. | Complete the unimplemented RDNA2 instruction/resource/CFG surface and replace large per-draw shader snapshots with bounded content-addressed immutable spans. |
 | Presentation / frame capture | Guest display size is independent of host drawable size; headless Metal is opt-in; interactive runs use a regular app bundle; direct scanout avoids routine GPU-to-CPU presentation round trips. The bounded scanout/barrier run captured the correct splash and the expected later opaque-black transition from both alternating buffers. | Reach and capture the first post-transition scene after another concrete fix or diagnostic feature, then measure frame pacing. Do not infer playability from splash/transition frames. |
-| Runtime / ABI | Whole-process import auditing reports 379 HLE routes, 130 guest-libc routes, one host route, and one unresolved weak `__pthread_cxa_finalize`; no sampled call reached a static dispatch gap. | Implement source-backed AGC fusion/event queues, save-dialog lifecycle, semaphore poll, unlink, stateful pad close, pthread exit, save deletion, sysmodule query/unload, and researched anonymous NIDs. |
+| Runtime / ABI | Whole-process import auditing reports 379 HLE routes, 130 guest-libc routes, one host route, and one unresolved weak `__pthread_cxa_finalize`. Condition waits now use explicit FIFO tickets with distinct signal/broadcast cardinality, atomic mutex release/reacquisition, recursive-depth preservation, dynamic mutex binding, timeout arbitration, and SCE/POSIX error encodings. | Validate the BackgroundLoader crash correlation, then complete opaque guest condition-object lifecycle, guest-thread identity, cancellation, condition clock attributes, and POSIX absolute timed waits. Continue source-backed AGC fusion/event queues, save-dialog lifecycle, semaphore poll, unlink, pad/thread/save/sysmodule lifecycle, and researched anonymous NIDs. |
 | Audio | Host output, guest port/config validation, bounded queues, resampling, and stereo downmixing exist. | Audit timing/backpressure/device change/pause/teardown/A-V synchronization against actual title use and add deterministic offline mixer evidence. |
 | Video / Bink | No compatibility claim yet. | Identify each title's actual decoder/API path, then implement exact demux/decode/color/audio/timing semantics with legal generated fixtures. |
 | Storage / save data | Read-only app filesystem access and initial save transactions exist; dumps are not modified. | Complete namespace/path/case/permission/stat/iteration/atomicity/fsync/quota/slot/dialog/delete/concurrency semantics with crash-consistency tests. |
 | Input | Keyboard-backed pad state and opt-in deterministic Cross sequences exist. | Complete handle lifetime, disconnect/timestamps/dead zones/motion/touchpad/controller mapping/focus semantics as exercised. |
-| Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, HUD, and input diagnostics exist; run summaries retain revision/outcome/frame counts. AGC submissions, draws, compute dispatches, flips, and Metal draw encodes keep bounded logarithmic progress checkpoints after their initial trace prefix. | Add a versioned documented config with strict precedence/validation and structured shader/pipeline/queue/copy/CPU/GPU/audio/frame-pacing counters. |
+| Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, HUD, and input diagnostics exist; run summaries retain revision/outcome/frame counts. AGC submissions, draws, compute dispatches, flips, Metal draw encodes, and condition wait/notify selections keep bounded logarithmic checkpoints; opt-in VM tracing records every low-volume map/protect/query/unmap transition. | Add a versioned documented config with strict precedence/validation and structured shader/pipeline/queue/copy/CPU/GPU/audio/frame-pacing counters. |
 
 ## Required validation for the current P0 increment
 
@@ -75,9 +98,10 @@ milestone completion claim.
 4. `cargo test --workspace --target x86_64-apple-darwin`
 5. `cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings`
 6. `python3 -m unittest scripts/tests/test_audit_import_coverage.py`
-7. Complete at `8ac72bd`: one direct-shell, process-checked, bounded headless Dreaming Sarah capture,
-   followed by frame hash/image and ordered-log comparison. The targetless draw compiled and produced
-   the expected opaque-black transition; no interactive launch was used and no process remained.
+7. Complete at `8ac72bd`: one direct-shell, process-checked, bounded headless Dreaming Sarah capture
+   produced the expected opaque-black transition. A later 70-second run at `f9e476b` exposed the
+   BackgroundLoader condition-variable/SIGBUS correlation. One longer post-condition-fix headless
+   validation is permitted only after checks 1-6 pass; no interactive launch is required.
 
 Reference implementation provenance is recorded in [provenance](provenance.md); architectural and
 licensing constraints remain in [architecture](architecture.md) and [source policy](source-policy.md).

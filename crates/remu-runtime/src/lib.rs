@@ -1990,6 +1990,14 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "bnZxYgAFeA0" => "sceKernelGetSanitizerNewReplaceExternal",
         "NWtTN10cJzE" => "sceLibcHeapGetTraceInfo",
         "mkx2fVhNMsg" => "pthread_cond_broadcast",
+        "kDh-NfxgMtE" => "scePthreadCondSignal",
+        "JGgj7Uvrl+A" => "scePthreadCondBroadcast",
+        "2MOy+rUfuhQ" => "pthread_cond_signal",
+        "WKAXJ4XBPQ4" => "scePthreadCondWait",
+        "Op8TBGY5KHg" => "pthread_cond_wait",
+        "0TyVk4MSLt0" => "pthread_cond_init",
+        "g+PZd2hiacg" => "scePthreadCondDestroy",
+        "RXXqi4CtF8w" => "pthread_cond_destroy",
         "QxqK-IdpumU" => "_Getpmbstate",
         "zS94yyJRSUs" => "_Getpwcstate",
         "-9SIhUr4Iuo" => "_Mbtowcx",
@@ -2490,9 +2498,115 @@ static IMPORT_TELEMETRY: OnceLock<RwLock<Arc<ImportTelemetry>>> = OnceLock::new(
 #[derive(Debug, Default)]
 struct GuestSyncState {
     mutexes: HashMap<u64, GuestMutexState>,
-    conditions: HashMap<u64, u64>,
+    conditions: HashMap<u64, GuestConditionState>,
+    condition_waiters: HashMap<u64, GuestConditionWaiterState>,
+    next_condition_waiter: u64,
+    condition_notify_count: u64,
     semaphores: HashMap<u32, GuestSemaphoreState>,
     next_semaphore_handle: u32,
+}
+
+#[derive(Debug, Default)]
+struct GuestConditionState {
+    waiters: VecDeque<u64>,
+    bound_mutex: Option<u64>,
+}
+
+impl GuestConditionState {
+    fn register_waiter(&mut self, waiter: u64, mutex: u64) -> bool {
+        if self.bound_mutex.is_some_and(|bound| bound != mutex) {
+            return false;
+        }
+        self.bound_mutex = Some(mutex);
+        self.waiters.push_back(waiter);
+        true
+    }
+
+    fn release_one(&mut self) -> Option<u64> {
+        let waiter = self.waiters.pop_front();
+        self.clear_binding_if_idle();
+        waiter
+    }
+
+    fn release_all(&mut self) -> VecDeque<u64> {
+        self.bound_mutex = None;
+        std::mem::take(&mut self.waiters)
+    }
+
+    fn cancel_wait(&mut self, waiter: u64) {
+        self.waiters.retain(|candidate| *candidate != waiter);
+        self.clear_binding_if_idle();
+    }
+
+    fn is_idle(&self) -> bool {
+        self.waiters.is_empty()
+    }
+
+    fn clear_binding_if_idle(&mut self) {
+        if self.waiters.is_empty() {
+            self.bound_mutex = None;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GuestConditionWaiterState {
+    released: bool,
+}
+
+impl GuestSyncState {
+    fn register_condition_waiter(&mut self, condition: u64, mutex: u64) -> Option<u64> {
+        if self
+            .conditions
+            .get(&condition)
+            .and_then(|condition| condition.bound_mutex)
+            .is_some_and(|bound| bound != mutex)
+        {
+            return None;
+        }
+        let waiter = loop {
+            self.next_condition_waiter = self.next_condition_waiter.wrapping_add(1).max(1);
+            if !self
+                .condition_waiters
+                .contains_key(&self.next_condition_waiter)
+            {
+                break self.next_condition_waiter;
+            }
+        };
+        assert!(
+            self.conditions
+                .entry(condition)
+                .or_default()
+                .register_waiter(waiter, mutex),
+            "condition mutex binding was validated under the synchronization lock"
+        );
+        self.condition_waiters
+            .insert(waiter, GuestConditionWaiterState { released: false });
+        Some(waiter)
+    }
+
+    fn condition_waiter_released(&self, waiter: u64) -> bool {
+        self.condition_waiters
+            .get(&waiter)
+            .is_some_and(|waiter| waiter.released)
+    }
+
+    fn finish_condition_wait(&mut self, condition: u64, waiter: u64, timed_out: bool) {
+        if timed_out {
+            self.conditions
+                .get_mut(&condition)
+                .expect("a pending condition waiter prevents destruction")
+                .cancel_wait(waiter);
+        }
+        let waiter_state = self
+            .condition_waiters
+            .remove(&waiter)
+            .expect("registered condition waiter survives condition destruction");
+        assert_eq!(
+            waiter_state.released, !timed_out,
+            "timeout and notification have exactly one winner"
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -3158,6 +3272,8 @@ fn is_guest_sync_import(nid: &str) -> bool {
             | "kDh-NfxgMtE"
             | "JGgj7Uvrl+A"
             | "mkx2fVhNMsg"
+            | "2MOy+rUfuhQ"
+            | "Op8TBGY5KHg"
             | "188x57JYp0g"
             | "Zxa0VhQVTsk"
             | "4czppHBiriw"
@@ -3177,19 +3293,36 @@ fn dispatch_guest_sync_import(
         "9UK1vLZQft4" | "7H0iTOciTLo" => guest_mutex_lock(arguments[0], false),
         "upoVrzMHFeE" | "K-jXhbt2gn4" => guest_mutex_lock(arguments[0], true),
         "tn3VlD0hG60" | "2Z+PpY6CaJg" => guest_mutex_unlock(arguments[0]),
-        "2Tb92quprl0" | "0TyVk4MSLt0" => guest_condition_init(arguments[0]),
-        "g+PZd2hiacg" | "RXXqi4CtF8w" => guest_condition_destroy(arguments[0]),
+        "2Tb92quprl0" => guest_condition_init(arguments[0]),
+        "0TyVk4MSLt0" => posix_pthread_result(guest_condition_init(arguments[0])),
+        "g+PZd2hiacg" => guest_condition_destroy(arguments[0]),
+        "RXXqi4CtF8w" => posix_pthread_result(guest_condition_destroy(arguments[0])),
         "WKAXJ4XBPQ4" => guest_condition_wait(arguments[0], arguments[1], None),
+        "Op8TBGY5KHg" => {
+            posix_pthread_result(guest_condition_wait(arguments[0], arguments[1], None))
+        }
         "BmMjYxmew1w" => guest_condition_wait(
             arguments[0],
             arguments[1],
             Some(u64::from(low_u32(arguments[2]))),
         ),
-        "kDh-NfxgMtE" | "JGgj7Uvrl+A" | "mkx2fVhNMsg" => guest_condition_signal(arguments[0]),
+        "kDh-NfxgMtE" => guest_condition_notify(arguments[0], false),
+        "2MOy+rUfuhQ" => posix_pthread_result(guest_condition_notify(arguments[0], false)),
+        "JGgj7Uvrl+A" => guest_condition_notify(arguments[0], true),
+        "mkx2fVhNMsg" => posix_pthread_result(guest_condition_notify(arguments[0], true)),
         "188x57JYp0g" => guest_semaphore_create(arguments),
         "Zxa0VhQVTsk" => guest_semaphore_wait(arguments),
         "4czppHBiriw" => guest_semaphore_signal(arguments),
         _ => 0,
+    }
+}
+
+fn posix_pthread_result(result: u64) -> u64 {
+    let result32 = low_u32(result);
+    if result32 & 0xffff_0000 == 0x8002_0000 {
+        u64::from(result32 & 0xffff)
+    } else {
+        result
     }
 }
 
@@ -3300,6 +3433,9 @@ fn guest_mutex_unlock(address: u64) -> u64 {
 }
 
 fn guest_condition_init(address: u64) -> u64 {
+    if address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
     let sync = guest_sync();
     sync.0
         .lock()
@@ -3311,55 +3447,86 @@ fn guest_condition_init(address: u64) -> u64 {
 }
 
 fn guest_condition_destroy(address: u64) -> u64 {
+    if address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
     let sync = guest_sync();
-    sync.0
+    let mut state = sync
+        .0
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .conditions
-        .remove(&address);
-    0
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match state.conditions.get(&address) {
+        Some(condition) if !condition.is_idle() => sce_kernel_error(SCE_KERNEL_ERROR_BUSY),
+        Some(_) => {
+            state.conditions.remove(&address);
+            0
+        }
+        None => sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT),
+    }
 }
 
 fn guest_condition_wait(condition: u64, mutex_address: u64, timeout_usec: Option<u64>) -> u64 {
+    if condition == 0 || mutex_address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
     let sync = guest_sync();
     let current = std::thread::current().id();
     let mut state = sync
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let generation = *state.conditions.entry(condition).or_default();
-    if let Some(mutex) = state.mutexes.get_mut(&mutex_address)
-        && mutex.owner.as_ref().is_some_and(|owner| *owner == current)
-    {
-        mutex.owner = None;
-        mutex.recursion = 0;
+    let released_recursion = match state.mutexes.get_mut(&mutex_address) {
+        Some(mutex) if mutex.owner.as_ref().is_some_and(|owner| *owner == current) => {
+            mutex.recursion.max(1)
+        }
+        _ => return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED),
+    };
+    let Some(waiter) = state.register_condition_waiter(condition, mutex_address) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if trace_guest_sync() && trace_logarithmic_sequence(waiter, 8) {
+        eprintln!(
+            "[REMu][COND] wait ticket={waiter} thread={} condition={condition:#x} mutex={mutex_address:#x} recursion={released_recursion}",
+            current_guest_thread_handle()
+        );
     }
+    let mutex = state
+        .mutexes
+        .get_mut(&mutex_address)
+        .expect("owned guest mutex exists");
+    mutex.owner = None;
+    mutex.recursion = 0;
     sync.1.notify_all();
 
-    if let Some(timeout) = timeout_usec {
+    let timed_out = if let Some(timeout) = timeout_usec {
         let duration = Duration::from_micros(timeout);
-        let (next_state, _) = sync
+        let (next_state, wait_result) = sync
             .1
             .wait_timeout_while(state, duration, |state| {
-                state.conditions.get(&condition).copied().unwrap_or(0) == generation
+                !state.condition_waiter_released(waiter)
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state = next_state;
+        wait_result.timed_out() && !state.condition_waiter_released(waiter)
     } else {
         state = sync
             .1
-            .wait_while(state, |state| {
-                state.conditions.get(&condition).copied().unwrap_or(0) == generation
-            })
+            .wait_while(state, |state| !state.condition_waiter_released(waiter))
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
+        false
+    };
+    state.finish_condition_wait(condition, waiter, timed_out);
 
     loop {
         let mutex = state.mutexes.entry(mutex_address).or_default();
         if mutex.owner.is_none() {
             mutex.owner = Some(current);
-            mutex.recursion = 1;
-            return 0;
+            mutex.recursion = released_recursion;
+            return if timed_out {
+                sce_kernel_error(SCE_KERNEL_ERROR_TIMED_OUT)
+            } else {
+                0
+            };
         }
         state = sync
             .1
@@ -3368,15 +3535,42 @@ fn guest_condition_wait(condition: u64, mutex_address: u64, timeout_usec: Option
     }
 }
 
-fn guest_condition_signal(condition: u64) -> u64 {
+fn guest_condition_notify(condition: u64, broadcast: bool) -> u64 {
+    if condition == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
     let sync = guest_sync();
     let mut state = sync
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let generation = state.conditions.entry(condition).or_default();
-    *generation = generation.wrapping_add(1);
-    sync.1.notify_all();
+    state.condition_notify_count = state.condition_notify_count.saturating_add(1);
+    let notify_sequence = state.condition_notify_count;
+    let guest_condition = state.conditions.entry(condition).or_default();
+    let pending_before = guest_condition.waiters.len();
+    let selected = if broadcast {
+        guest_condition.release_all()
+    } else {
+        guest_condition.release_one().into_iter().collect()
+    };
+    for waiter in &selected {
+        state
+            .condition_waiters
+            .get_mut(waiter)
+            .expect("pending condition waiter exists")
+            .released = true;
+    }
+    if trace_guest_sync() && trace_logarithmic_sequence(notify_sequence, 8) {
+        eprintln!(
+            "[REMu][COND] notify sequence={notify_sequence} condition={condition:#x} broadcast={broadcast} pending={pending_before} selected={selected:?}"
+        );
+    }
+    if !selected.is_empty() {
+        // One host Condvar coordinates all guest synchronization objects. Wake all host waiters so
+        // the selected condition ticket cannot be consumed by an unrelated host waiter; only the
+        // released guest ticket is allowed to proceed.
+        sync.1.notify_all();
+    }
     0
 }
 
@@ -9327,6 +9521,7 @@ fn guest_fread(destination: u64, size: u64, count: u64, handle: u64) -> u64 {
     }
 }
 
+const SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED: u32 = 0x8002_0001;
 const SCE_KERNEL_ERROR_PERMISSION_DENIED: u32 = 0x8002_000d;
 const SCE_KERNEL_ERROR_NOT_FOUND: u32 = 0x8002_0002;
 const SCE_KERNEL_ERROR_INTERRUPTED: u32 = 0x8002_0004;
@@ -9346,6 +9541,7 @@ const SCE_KERNEL_ERROR_READ_ONLY: u32 = 0x8002_001e;
 const SCE_KERNEL_ERROR_BROKEN_PIPE: u32 = 0x8002_0020;
 const SCE_KERNEL_ERROR_TRY_AGAIN: u32 = 0x8002_0023;
 const SCE_KERNEL_ERROR_NOT_SUPPORTED: u32 = 0x8002_002d;
+const SCE_KERNEL_ERROR_TIMED_OUT: u32 = 0x8002_003c;
 const SCE_KERNEL_ERROR_NOT_IMPLEMENTED: u32 = 0x8002_004e;
 const SCE_KERNEL_STAT_SIZE: usize = 120;
 
@@ -10159,6 +10355,7 @@ mod platform_independent_tests {
     }
 
     static GPU_EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
+    static GUEST_CONDITION_TEST: Mutex<()> = Mutex::new(());
 
     fn compute_graphics_state(program_address: u64) -> (AgcGraphicsState, AgcShaderRegistry) {
         let mut graphics = AgcGraphicsState::default();
@@ -10340,6 +10537,346 @@ mod platform_independent_tests {
         assert!(super::trace_logarithmic_sequence(16, 8));
         assert!(!super::trace_logarithmic_sequence(17, 8));
         assert!(super::trace_logarithmic_sequence(1_u64 << 63, 8));
+    }
+
+    #[test]
+    fn condition_signal_selects_one_waiter_and_broadcast_selects_the_rest() {
+        let mut condition = super::GuestConditionState::default();
+        let mutex = 0x1234;
+        let first = 1;
+        let second = 2;
+        let third = 3;
+        assert!(condition.register_waiter(first, mutex));
+        assert!(condition.register_waiter(second, mutex));
+        assert!(condition.register_waiter(third, mutex));
+        assert!(!condition.register_waiter(4, mutex + 1));
+
+        assert_eq!(condition.release_one(), Some(first));
+        assert_eq!(
+            condition.waiters.iter().copied().collect::<Vec<_>>(),
+            [second, third]
+        );
+        assert_eq!(condition.bound_mutex, Some(mutex));
+
+        assert_eq!(
+            condition.release_all().into_iter().collect::<Vec<_>>(),
+            [second, third]
+        );
+        assert!(condition.waiters.is_empty());
+        assert_eq!(condition.bound_mutex, None);
+        assert!(condition.is_idle());
+
+        assert_eq!(condition.release_one(), None, "signals are not retained");
+        let future = 5;
+        assert!(condition.register_waiter(future, mutex + 1));
+        condition.cancel_wait(future);
+        assert!(condition.is_idle());
+        assert_eq!(condition.bound_mutex, None);
+    }
+
+    #[test]
+    fn timed_condition_wait_reacquires_the_guest_mutex_before_returning() {
+        let _guard = GUEST_CONDITION_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let condition = 0x7fff_0000_0100;
+        let mutex = 0x7fff_0000_0200;
+        assert_eq!(super::guest_condition_init(condition), 0);
+        assert_eq!(
+            super::guest_mutex_init(
+                mutex,
+                super::PthreadMutexAttrState {
+                    mutex_type: 2,
+                    ..super::PthreadMutexAttrState::default()
+                }
+            ),
+            0
+        );
+        assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+        assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+
+        assert_eq!(
+            super::guest_condition_wait(condition, mutex, Some(0)),
+            sce_kernel_error(super::SCE_KERNEL_ERROR_TIMED_OUT)
+        );
+        {
+            let state = super::guest_sync()
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guest_mutex = state.mutexes.get(&mutex).expect("test mutex");
+            assert_eq!(guest_mutex.owner, Some(std::thread::current().id()));
+            assert_eq!(guest_mutex.recursion, 2);
+            assert!(
+                state
+                    .conditions
+                    .get(&condition)
+                    .is_some_and(super::GuestConditionState::is_idle)
+            );
+        }
+
+        assert_eq!(super::guest_mutex_unlock(mutex), 0);
+        assert_eq!(super::guest_mutex_unlock(mutex), 0);
+        assert_eq!(super::guest_mutex_destroy(mutex), 0);
+        assert_eq!(super::guest_condition_destroy(condition), 0);
+    }
+
+    #[test]
+    fn condition_wait_errors_use_the_selected_pthread_abi() {
+        let _guard = GUEST_CONDITION_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let condition = 0x7fff_0000_0900;
+        let mutex = 0x7fff_0000_0a00;
+        assert_eq!(super::guest_condition_init(condition), 0);
+        assert_eq!(
+            super::guest_mutex_init(mutex, super::PthreadMutexAttrState::default()),
+            0
+        );
+        assert_eq!(
+            super::dispatch_guest_sync_import("WKAXJ4XBPQ4", [condition, mutex, 0, 0, 0, 0], None),
+            sce_kernel_error(super::SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED)
+        );
+        assert_eq!(
+            super::dispatch_guest_sync_import("Op8TBGY5KHg", [condition, mutex, 0, 0, 0, 0], None),
+            u64::from(libc::EPERM.cast_unsigned())
+        );
+        assert_eq!(super::guest_mutex_destroy(mutex), 0);
+        assert_eq!(super::guest_condition_destroy(condition), 0);
+    }
+
+    #[test]
+    fn condition_signal_wakes_exactly_one_blocked_guest_thread() {
+        let _guard = GUEST_CONDITION_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let condition = 0x7fff_0000_1100;
+        let mutex = 0x7fff_0000_1200;
+        assert_eq!(super::guest_condition_init(condition), 0);
+        assert_eq!(
+            super::guest_mutex_init(mutex, super::PthreadMutexAttrState::default()),
+            0
+        );
+        let (finished, receiver) = std::sync::mpsc::channel();
+        let waiters = (0..2)
+            .map(|waiter| {
+                let finished = finished.clone();
+                std::thread::spawn(move || {
+                    assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+                    assert_eq!(super::guest_condition_wait(condition, mutex, None), 0);
+                    assert_eq!(super::guest_mutex_unlock(mutex), 0);
+                    finished.send(waiter).expect("test receiver remains live");
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(finished);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let waiting = super::guest_sync()
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .conditions
+                .get(&condition)
+                .map_or(0, |condition| condition.waiters.len());
+            if waiting == 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guest waiters did not block"
+            );
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            super::dispatch_guest_sync_import("kDh-NfxgMtE", [condition, 0, 0, 0, 0, 0], None),
+            0
+        );
+        let first = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("one signaled waiter");
+        let early_second = receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .ok();
+        assert_eq!(
+            super::dispatch_guest_sync_import("JGgj7Uvrl+A", [condition, 0, 0, 0, 0, 0], None),
+            0
+        );
+        let second = early_second.unwrap_or_else(|| {
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("broadcast waiter")
+        });
+        assert_ne!(first, second);
+        assert!(
+            early_second.is_none(),
+            "signal acquired broadcast semantics"
+        );
+        for waiter in waiters {
+            waiter.join().expect("guest waiter thread");
+        }
+        assert_eq!(super::guest_mutex_destroy(mutex), 0);
+        assert_eq!(super::guest_condition_destroy(condition), 0);
+    }
+
+    #[test]
+    fn condition_signal_allows_exactly_one_predicate_guarded_task_consumption() {
+        let _guard = GUEST_CONDITION_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let condition = 0x7fff_0000_1900;
+        let mutex = 0x7fff_0000_1a00;
+        assert_eq!(super::guest_condition_init(condition), 0);
+        assert_eq!(
+            super::guest_mutex_init(mutex, super::PthreadMutexAttrState::default()),
+            0
+        );
+        let jobs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (consumed, receiver) = std::sync::mpsc::channel();
+        let workers = (0..3)
+            .map(|worker| {
+                let jobs = std::sync::Arc::clone(&jobs);
+                let stopping = std::sync::Arc::clone(&stopping);
+                let consumed = consumed.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+                        while jobs.load(std::sync::atomic::Ordering::SeqCst) == 0
+                            && !stopping.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            assert_eq!(super::guest_condition_wait(condition, mutex, None), 0);
+                        }
+                        if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                            assert_eq!(super::guest_mutex_unlock(mutex), 0);
+                            break;
+                        }
+                        assert_eq!(jobs.fetch_sub(1, std::sync::atomic::Ordering::SeqCst), 1);
+                        assert_eq!(super::guest_mutex_unlock(mutex), 0);
+                        consumed.send(worker).expect("test receiver remains live");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(consumed);
+        wait_for_guest_condition_waiters(condition, 3);
+
+        assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+        jobs.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(super::guest_condition_notify(condition, false), 0);
+        assert_eq!(super::guest_mutex_unlock(mutex), 0);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("one worker consumed the queued task");
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "one signal cannot produce a second task consumption"
+        );
+        wait_for_guest_condition_waiters(condition, 3);
+
+        assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(super::guest_condition_notify(condition, true), 0);
+        assert_eq!(super::guest_mutex_unlock(mutex), 0);
+        for worker in workers {
+            worker.join().expect("guest worker thread");
+        }
+        assert_eq!(jobs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(super::guest_mutex_destroy(mutex), 0);
+        assert_eq!(super::guest_condition_destroy(condition), 0);
+    }
+
+    fn wait_for_guest_condition_waiters(condition: u64, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let waiting = super::guest_sync()
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .conditions
+                .get(&condition)
+                .map_or(0, |condition| condition.waiters.len());
+            if waiting == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guest condition waiter count did not reach {expected}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn selected_condition_waiter_survives_legal_condition_destruction() {
+        let _guard = GUEST_CONDITION_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let condition = 0x7fff_0000_2100;
+        let mutex = 0x7fff_0000_2200;
+        assert_eq!(super::guest_condition_init(condition), 0);
+        assert_eq!(
+            super::guest_mutex_init(mutex, super::PthreadMutexAttrState::default()),
+            0
+        );
+        let (events, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+            events.send("locked").expect("test receiver remains live");
+            assert_eq!(super::guest_condition_wait(condition, mutex, None), 0);
+            events.send("returned").expect("test receiver remains live");
+            assert_eq!(super::guest_mutex_unlock(mutex), 0);
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("waiter acquired guest mutex"),
+            "locked"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let waiting = super::guest_sync()
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .conditions
+                .get(&condition)
+                .map_or(0, |condition| condition.waiters.len());
+            if waiting == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guest waiter did not block"
+            );
+            std::thread::yield_now();
+        }
+
+        assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+        assert_eq!(
+            super::guest_condition_destroy(condition),
+            sce_kernel_error(super::SCE_KERNEL_ERROR_BUSY)
+        );
+        assert_eq!(super::guest_condition_notify(condition, false), 0);
+        assert_eq!(super::guest_condition_destroy(condition), 0);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "selected waiter must reacquire its mutex before returning"
+        );
+        assert_eq!(super::guest_mutex_unlock(mutex), 0);
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("selected waiter reacquired its mutex"),
+            "returned"
+        );
+        waiter.join().expect("guest waiter thread");
+        assert_eq!(super::guest_mutex_destroy(mutex), 0);
     }
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {

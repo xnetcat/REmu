@@ -36,6 +36,18 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   startup behavior, and the first mutex/condition/semaphore services follow the corresponding
   SharpEmu CPU and HLE implementations at snapshot `ada67a19`. The Rust implementation uses host
   threads and condition variables while retaining guest-visible handles and ownership state.
+- Pthread condition-variable wake cardinality, atomic mutex release/reacquisition, recursive-depth
+  restoration, dynamic mutex binding, timeout arbitration, and destroy-after-selection behavior
+  were cross-checked against POSIX Issue 8 and three compatible emulator implementations: SharpEmu
+  snapshot `ada67a192495829b5d5408c08453cdfdc8553bb0`
+  (`KernelPthreadCompatExports.cs` and `PthreadCondSemanticsTests.cs`), KytyPS5 snapshot
+  `8a4600c5e99ab3b3873b9ea57b70044f0fa34807` (`src/kernel/pthread.h`,
+  `src/kernel/pthread.cpp`, and `src/libs/libKernel.cpp`), and shadPS4 snapshot
+  `4c72de0732ce7443a1631bf190e2606294f58f65`
+  (`src/core/libraries/kernel/threads/pthread.h` and `condvar.cpp`). KytyPS5 was used only as
+  behavioral research. REmu independently uses guest tickets outside condition-owned pending state,
+  so one signal cannot become a broadcast and a selected waiter can reacquire its mutex after legal
+  condition destruction. No upstream source was copied.
 - AGC shader-header pointer relocation, program-register patching, and the VideoOut buffer-attribute
   and registration layouts were adapted from SharpEmu's GPL-2.0-or-later `AgcExports.cs` and
   `VideoOutExports.cs` at local snapshot `ada67a19`.
