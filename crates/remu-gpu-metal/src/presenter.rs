@@ -21,7 +21,7 @@ use metal::{
     MTLTextureUsage, MTLViewport, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
     RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
-use objc::runtime::{Class, Object, YES};
+use objc::runtime::{Object, YES};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{
     ComputeDispatch, ComputeGrid, GpuEvent, GpuMemoryAcquire, GpuRegister, HostPadState,
@@ -2896,48 +2896,11 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     let event_loop = builder
         .build()
         .map_err(|error| format!("event loop failed: {error}"))?;
-    // A Rosetta-hosted command-line binary is not launched through an application bundle, and
-    // LaunchServices does not reliably deliver NSApplicationDidFinishLaunching. Complete the
-    // AppKit launch explicitly, as SharpEmu's bare Metal presenter does. Winit sees the launched
-    // application when `run_app` installs its handler and then emits the normal init/resume events.
-    unsafe {
-        let application_class =
-            Class::get("NSApplication").ok_or("could not find the NSApplication class")?;
-        let application: *mut Object = msg_send![application_class, sharedApplication];
-        if application.is_null() {
-            return Err("could not create the shared NSApplication".to_owned());
-        }
-        let _: () = msg_send![application, finishLaunching];
-        // LaunchServices can still omit the delegate notification for an unbundled translated
-        // executable. Deliver the standard callback to Winit's installed application delegate so
-        // its `run_app` path knows AppKit is launched and dispatches `Resumed`.
-        let delegate: *mut Object = msg_send![application, delegate];
-        if delegate.is_null() {
-            return Err("AppKit did not install an application delegate".to_owned());
-        }
-        let string_class = Class::get("NSString").ok_or("could not find the NSString class")?;
-        let notification_class =
-            Class::get("NSNotification").ok_or("could not find the NSNotification class")?;
-        let notification_name: *mut Object =
-            msg_send![string_class, stringWithUTF8String: c"REMuDidFinishLaunching".as_ptr()];
-        let notification: *mut Object = msg_send![notification_class,
-            notificationWithName: notification_name
-            object: application
-        ];
-        if notification.is_null() {
-            return Err("could not create the AppKit launch notification".to_owned());
-        }
-        let _: () = msg_send![delegate, applicationDidFinishLaunching: notification];
-    }
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
-    // Build the window outside Winit's launch/resume callback. This keeps AppKit lifecycle work
-    // out of the callback and lets the compiler-free blit presenter start immediately.
-    #[allow(deprecated)]
-    let window = event_loop
-        .create_window(presenter_window_attributes())
-        .map_err(|error| format!("could not create the macOS window: {error}"))?;
-    presenter.initialize_window(window)?;
-    eprintln!("[REMu][METAL] AppKit event loop ready");
+    // Winit owns NSApplication's delegate and launch state. Calling `finishLaunching` or its
+    // delegate callback ourselves marks the delegate as running before `run_app`, causing a
+    // re-entrant AppKit loop assertion. Window and Metal-layer creation happen from `resumed`,
+    // after Winit has delivered the canonical launch sequence on the main thread.
     event_loop
         .run_app(&mut presenter)
         .map_err(|error| format!("event loop failed: {error}"))?;
