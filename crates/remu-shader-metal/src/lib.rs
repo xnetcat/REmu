@@ -417,10 +417,10 @@ impl<'a> Compiler<'a> {
         source.push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
         source.push_str("    for (uint i = 0u; i < 128u; ++i) s[i] = remu_initial_s[i];\n");
         if self.options.stage != MetalShaderStage::Compute {
-            // Metal simdgroup operations are not valid in the divergent graphics-stage
-            // interpreter loop, so graphics deliberately use the same single-lane wave model as
-            // the reference Metal backend. Compute invocations use their real simdgroup lane.
-            source.push_str("    const uint remu_lane = 0u;\n");
+            // Graphics stages cannot declare thread_index_in_simdgroup, but the exclusive prefix
+            // of one is the architectural lane index. Wave operations are emitted before the
+            // EXEC-guarded write, keeping every host lane converged at simdgroup intrinsics.
+            source.push_str("    uint remu_lane = simd_prefix_exclusive_sum(1u);\n");
         }
         match self.options.stage {
             MetalShaderStage::Vertex => {
@@ -437,7 +437,9 @@ impl<'a> Compiler<'a> {
                 );
             }
         }
-        source.push_str("    s[106] = 0u; s[107] = 0u; s[126] = 1u; s[127] = 0u;\n");
+        source.push_str(
+            "    s[106] = 0u; s[107] = 0u; s[126] = (uint)(uint64_t)simd_ballot(true); s[127] = 0u;\n",
+        );
         source.push_str("    while (active) {\n        switch (pc) {\n");
         source.push_str(&self.body);
         source.push_str(
@@ -675,6 +677,7 @@ impl<'a> Compiler<'a> {
         self.raw_source_with_sdwa_modifiers(instruction, index, true)
     }
 
+    #[allow(clippy::unused_self)]
     fn raw_source_with_sdwa_modifiers(
         &self,
         instruction: &Instruction,
@@ -708,10 +711,10 @@ impl<'a> Compiler<'a> {
         }?;
         if index == 0 {
             value = match instruction.control.as_ref() {
-                Some(InstructionControl::Dpp(control)) => {
-                    self.apply_dpp_source(*control, &value)?
+                Some(InstructionControl::Dpp(control)) => Self::apply_dpp_source(*control, &value)?,
+                Some(InstructionControl::Dpp8(control)) => {
+                    Self::apply_dpp8_source(*control, &value)
                 }
-                Some(InstructionControl::Dpp8(control)) => self.apply_dpp8_source(*control, &value),
                 _ => value,
             };
         }
@@ -855,46 +858,38 @@ impl<'a> Compiler<'a> {
         Ok((format!("({target})"), "true".to_owned()))
     }
 
-    fn shuffle_lane(&self, value: &str, target_lane: &str) -> String {
-        if self.options.stage == MetalShaderStage::Compute {
-            format!("simd_shuffle({value}, (ushort){target_lane})")
-        } else {
-            value.to_owned()
-        }
+    fn shuffle_lane(value: &str, target_lane: &str) -> String {
+        format!("simd_shuffle({value}, (ushort){target_lane})")
     }
 
-    fn lane_active_expression(&self, target_lane: &str) -> String {
-        if self.options.stage == MetalShaderStage::Compute {
-            format!("simd_shuffle(exec ? 1u : 0u, (ushort){target_lane}) != 0u")
-        } else {
-            "exec".to_owned()
-        }
+    fn lane_active_expression(target_lane: &str) -> String {
+        format!("simd_shuffle(exec ? 1u : 0u, (ushort){target_lane}) != 0u")
     }
 
-    fn apply_dpp_source(&self, control: DppControl, value: &str) -> Result<String, String> {
+    fn apply_dpp_source(control: DppControl, value: &str) -> Result<String, String> {
         let (target_lane, in_range) = Self::dpp_source_lane(control)?;
         let safe_target = format!("((({in_range}) ? {target_lane} : remu_lane) & 31u)");
-        let shuffled = self.shuffle_lane(value, &safe_target);
+        let shuffled = Self::shuffle_lane(value, &safe_target);
         if control.fetch_inactive {
             return Ok(shuffled);
         }
-        let source_active = self.lane_active_expression(&safe_target);
+        let source_active = Self::lane_active_expression(&safe_target);
         Ok(format!(
             "((({in_range}) && ({source_active})) ? ({shuffled}) : 0u)"
         ))
     }
 
-    fn apply_dpp8_source(&self, control: Dpp8Control, value: &str) -> String {
+    fn apply_dpp8_source(control: Dpp8Control, value: &str) -> String {
         let selector = format!(
             "(({}u >> ((remu_lane & 7u) * 3u)) & 7u)",
             control.lane_selectors
         );
         let target_lane = format!("(((remu_lane & 0xFFFFFFF8u) + {selector}) & 31u)");
-        let shuffled = self.shuffle_lane(value, &target_lane);
+        let shuffled = Self::shuffle_lane(value, &target_lane);
         if control.fetch_inactive {
             return shuffled;
         }
-        let source_active = self.lane_active_expression(&target_lane);
+        let source_active = Self::lane_active_expression(&target_lane);
         format!("(({source_active}) ? ({shuffled}) : 0u)")
     }
 
@@ -1120,6 +1115,10 @@ impl<'a> Compiler<'a> {
                 let result = self.temp("uint", &expression);
                 let write_enabled = self.emit_dpp_write_enabled(*control)?;
                 format!("({write_enabled}) ? {result} : v[{destination}]")
+            } else if matches!(instruction.control, Some(InstructionControl::Dpp8(_))) {
+                // Keep the shuffle converged across inactive guest lanes; only the architectural
+                // destination write is EXEC-masked below.
+                self.temp("uint", &expression)
             } else if let Some(InstructionControl::Sdwa(control)) = instruction.control.as_ref()
                 && control.scalar_destination.is_none()
             {
@@ -1217,7 +1216,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn store_lane_mask(&mut self, register: u32, condition: &str) {
-        let ballot = self.ballot(condition);
+        let ballot = Self::ballot(condition);
         match register {
             VCC_LO => {
                 self.line(3, &format!("vcc = {condition};"));
@@ -1236,18 +1235,14 @@ impl<'a> Compiler<'a> {
     }
 
     fn store_exec_mask(&mut self, condition: &str) {
-        let ballot = self.ballot(condition);
+        let ballot = Self::ballot(condition);
         self.line(3, &format!("exec = {condition};"));
         self.line(3, &format!("s[{EXEC_LO}] = {ballot};"));
         self.line(3, &format!("s[{EXEC_HI}] = 0u;"));
     }
 
-    fn ballot(&self, condition: &str) -> String {
-        if self.options.stage == MetalShaderStage::Compute {
-            format!("(uint)(uint64_t)simd_ballot({condition})")
-        } else {
-            format!("({condition} ? 1u : 0u)")
-        }
+    fn ballot(condition: &str) -> String {
+        format!("(uint)(uint64_t)simd_ballot({condition})")
     }
 
     fn apply_sdwa_destination(
@@ -2605,8 +2600,16 @@ mod tests {
         );
         assert!(shader.source.contains("((v[1]) < (v[2]))"));
         assert!(shader.source.contains("exec = t"));
-        assert!(shader.source.contains("s[126] = (t"));
-        assert!(shader.source.contains("s[12] = (t"));
+        assert!(
+            shader
+                .source
+                .contains("s[126] = (uint)(uint64_t)simd_ballot(t")
+        );
+        assert!(
+            shader
+                .source
+                .contains("s[12] = (uint)(uint64_t)simd_ballot(t")
+        );
         assert!(shader.source.contains("s[13] = 0u;"));
     }
 
@@ -2888,5 +2891,43 @@ mod tests {
         assert!(compare.source.contains(": vcc"));
         assert!(compare.source.contains("s[106] ="));
         assert!(compare.source.contains("s[107] = 0u"));
+    }
+
+    #[test]
+    fn graphics_dpp_uses_converged_real_wave_operations() {
+        let shader = compile_vector_instruction(
+            vector_instruction(
+                "VMovB32",
+                1,
+                InstructionControl::Dpp8(Dpp8Control {
+                    lane_selectors: 0x00fa_c688,
+                    fetch_inactive: false,
+                }),
+            ),
+            MetalShaderStage::Vertex,
+        );
+        assert!(
+            shader
+                .source
+                .contains("uint remu_lane = simd_prefix_exclusive_sum(1u)")
+        );
+        assert!(shader.source.contains("simd_shuffle(v[1], (ushort)"));
+        assert!(
+            shader
+                .source
+                .contains("s[126] = (uint)(uint64_t)simd_ballot(true)")
+        );
+        let shuffle = shader
+            .source
+            .find("simd_shuffle(v[1], (ushort)")
+            .expect("DPP8 shuffle");
+        let write = shader
+            .source
+            .find("if (exec) v[8]")
+            .expect("EXEC-guarded destination write");
+        assert!(
+            shuffle < write,
+            "wave shuffle must be converged before EXEC guard"
+        );
     }
 }
