@@ -43,7 +43,8 @@ scripts/run-game.sh SUPERLIMINAL 120
 
 Set `REMU_CAPTURE_FRAMES=0` for faster control-flow probes that do not need screenshots. Override
 the comma-separated input schedule with `REMU_AUTO_CROSS`; detailed first-seen shader register
-dumps are opt-in through `REMU_TRACE_AGC_SHADERS=1`.
+dumps are opt-in through `REMU_TRACE_AGC_SHADERS=1`. Use
+`REMU_TRACE_AGC_SUBMISSIONS=1` to log every decoded DCB and draw without the extra shader work.
 
 On Apple Silicon, use the crash-capturing probe wrapper during game bring-up. It builds the
 x86-64 release binary, launches it under Rosetta and LLDB, and keeps the guest logs, backtraces,

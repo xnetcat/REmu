@@ -4563,7 +4563,7 @@ fn agc_emit_draw(
             })
             .ok()
     });
-    if draw.sequence <= 8 {
+    if draw.sequence <= 8 || trace_agc_submissions() {
         eprintln!(
             "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x}",
             draw.sequence,
@@ -4963,7 +4963,7 @@ fn agc_parse_submission(command_address: u64, dword_count: u32, state: &mut Prob
     }
 
     state.agc_submission_count = state.agc_submission_count.saturating_add(1);
-    if state.agc_submission_count <= 8 {
+    if state.agc_submission_count <= 8 || trace_agc_submissions() {
         let packet_summary = packets
             .iter()
             .map(|(&(opcode, register), &count)| {
@@ -6520,6 +6520,13 @@ fn trace_agc_shaders() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("REMU_TRACE_AGC_SHADERS").is_some_and(|value| value == "1")
+    })
+}
+
+fn trace_agc_submissions() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_AGC_SUBMISSIONS").is_some_and(|value| value == "1")
     })
 }
 
