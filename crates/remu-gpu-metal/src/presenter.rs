@@ -302,9 +302,6 @@ impl MetalPresenter {
                     );
                 }
                 Ok(GpuEvent::Flip { address, .. }) => {
-                    if let Err(error) = self.synchronize_flip_target(address) {
-                        eprintln!("[REMu][METAL] flip synchronization failed: {error}");
-                    }
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
                     self.pending_flip = Some(PendingFlip {
                         address,
@@ -399,10 +396,6 @@ impl MetalPresenter {
     fn refresh_deferred_flip(&mut self, draw: &IndexedDraw) {
         let address = draw.color_target_address;
         if self.pending_flip.is_none_or(|flip| flip.address != address) {
-            return;
-        }
-        if let Err(error) = self.synchronize_flip_target(address) {
-            eprintln!("[REMu][METAL] deferred flip synchronization failed: {error}");
             return;
         }
         self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
@@ -743,35 +736,6 @@ impl MetalPresenter {
             }
             write_back_pending_globals(&batch.global_writebacks)?;
         }
-        Ok(())
-    }
-
-    fn synchronize_flip_target(&mut self, address: u64) -> Result<(), String> {
-        let display = self.display;
-        let descriptor = self
-            .resident_guest_textures
-            .values()
-            .filter(|resident| resident.descriptor.address == address && resident.gpu_written)
-            .filter(|resident| {
-                display.is_none_or(|display| {
-                    resident.descriptor.width == display.width
-                        && resident.descriptor.height == display.height
-                })
-            })
-            .max_by_key(|resident| resident.content_version)
-            .map(|resident| resident.descriptor);
-        let Some(descriptor) = descriptor else {
-            return Ok(());
-        };
-        self.wait_for_guest_command_batches()?;
-        let resident = self
-            .resident_guest_textures
-            .get_mut(&descriptor)
-            .expect("selected resident texture exists");
-        let rgba = read_texture_rgba(&resident.texture, descriptor)?;
-        write_guest_texture_rgba(descriptor, &rgba)?;
-        rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
-        resident.gpu_written = false;
         Ok(())
     }
 
@@ -1204,7 +1168,12 @@ impl MetalPresenter {
         if !self.redraw_pending {
             return;
         }
-        self.upload_pending_frame();
+        // A translated target already lives in a private Metal texture. Present it directly so a
+        // flip does not force a 4K GPU wait, readback, guest-memory writeback, then upload. The CPU
+        // frame texture remains the fallback for pre-translation and unsupported draws.
+        if self.pending_resident_frame().is_none() {
+            self.upload_pending_frame();
+        }
         let (Some(layer), Some(queue)) = (self.layer.as_ref(), self.command_queue.as_ref()) else {
             return;
         };
@@ -1213,7 +1182,11 @@ impl MetalPresenter {
         };
         let command_buffer = queue.new_command_buffer();
         command_buffer.set_label("REMu guest presentation");
-        if let (Some(display), Some(texture)) = (self.display, self.frame_texture.as_ref()) {
+        if let (Some(display), Some(texture)) = (
+            self.display,
+            self.pending_resident_frame()
+                .or(self.frame_texture.as_ref()),
+        ) {
             let encoder = command_buffer.new_blit_command_encoder();
             encoder.set_label("REMu display-buffer presentation blit");
             encoder.copy_from_texture(
@@ -1234,6 +1207,21 @@ impl MetalPresenter {
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
         self.redraw_pending = false;
+    }
+
+    fn pending_resident_frame(&self) -> Option<&Texture> {
+        let display = self.display?;
+        let flip = self.pending_flip?;
+        self.resident_guest_textures
+            .values()
+            .filter(|resident| {
+                resident.gpu_written
+                    && resident.descriptor.address == flip.address
+                    && resident.descriptor.width == display.width
+                    && resident.descriptor.height == display.height
+            })
+            .max_by_key(|resident| resident.content_version)
+            .map(|resident| &resident.texture)
     }
 }
 
