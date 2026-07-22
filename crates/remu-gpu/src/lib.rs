@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use remu_shader::{ComputeSystemRegisters, Program, ShaderEvaluation, ShaderMetadata};
@@ -23,6 +23,11 @@ pub const PAD_BUTTON_TRIANGLE: u32 = 0x1000;
 pub const PAD_BUTTON_CIRCLE: u32 = 0x2000;
 pub const PAD_BUTTON_CROSS: u32 = 0x4000;
 pub const PAD_BUTTON_SQUARE: u32 = 0x8000;
+
+/// Maximum number of decoded GPU events retained between the guest command processor and the
+/// host presenter. A bounded queue prevents shader compilation stalls from growing memory without
+/// limit while preserving producer order through backpressure.
+pub const GPU_EVENT_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostPadState {
@@ -588,9 +593,15 @@ impl GpuMemoryAcquire {
     }
 }
 
-static GPU_EVENT_SINK: OnceLock<Mutex<Option<Sender<GpuEvent>>>> = OnceLock::new();
+static GPU_EVENT_SINK: OnceLock<Mutex<Option<SyncSender<GpuEvent>>>> = OnceLock::new();
 
-pub fn install_event_sink(sender: Sender<GpuEvent>) {
+/// Creates the bounded, ordered event channel used by the guest GPU command processor.
+#[must_use]
+pub fn gpu_event_channel() -> (SyncSender<GpuEvent>, Receiver<GpuEvent>) {
+    std::sync::mpsc::sync_channel(GPU_EVENT_QUEUE_CAPACITY)
+}
+
+pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
     let sink = GPU_EVENT_SINK.get_or_init(|| Mutex::new(None));
     *sink
         .lock()
@@ -631,11 +642,30 @@ mod tests {
         COMPUTE_NUM_THREAD_X_REGISTER, COMPUTE_NUM_THREAD_Y_REGISTER,
         COMPUTE_NUM_THREAD_Z_REGISTER, COMPUTE_PGM_HI_REGISTER, COMPUTE_PGM_LO_REGISTER,
         COMPUTE_PGM_RSRC2_REGISTER, COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER,
-        COMPUTE_START_Z_REGISTER, ComputeDispatchDecodeError, ComputeGrid, GpuMemoryAcquire,
-        GpuRegister, HostPadState, compute_program_address, decode_compute_dispatch_direct,
-        decode_compute_dispatch_indirect, decode_compute_launch, decode_compute_system_registers,
-        host_pad_state, set_host_pad_state,
+        COMPUTE_START_Z_REGISTER, ComputeDispatchDecodeError, ComputeGrid,
+        GPU_EVENT_QUEUE_CAPACITY, GpuEvent, GpuMemoryAcquire, GpuRegister, HostPadState,
+        compute_program_address, decode_compute_dispatch_direct, decode_compute_dispatch_indirect,
+        decode_compute_launch, decode_compute_system_registers, gpu_event_channel, host_pad_state,
+        set_host_pad_state,
     };
+
+    #[test]
+    fn gpu_event_channel_applies_bounded_backpressure() {
+        let (sender, receiver) = gpu_event_channel();
+        for _ in 0..GPU_EVENT_QUEUE_CAPACITY {
+            sender
+                .try_send(GpuEvent::Shutdown)
+                .expect("event fits bounded queue");
+        }
+        assert!(matches!(
+            sender.try_send(GpuEvent::Shutdown),
+            Err(std::sync::mpsc::TrySendError::Full(GpuEvent::Shutdown))
+        ));
+        assert_eq!(receiver.try_recv(), Ok(GpuEvent::Shutdown));
+        sender
+            .try_send(GpuEvent::Shutdown)
+            .expect("receiver progress releases producer backpressure");
+    }
 
     #[test]
     fn shares_a_host_pad_snapshot_across_the_gpu_runtime_seam() {

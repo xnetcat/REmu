@@ -8,7 +8,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,8 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const GPU_EVENTS_PER_TICK: usize = 16;
+const SHADER_COMPILE_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PresenterFlow {
@@ -255,6 +257,62 @@ struct ShaderCompileRequest {
     draw: IndexedDraw,
 }
 
+struct BlockedGraphicsDraw {
+    key: GraphicsPipelineKey,
+    draw: Box<IndexedDraw>,
+}
+
+struct OrderedGpuEventReceiver {
+    receiver: Receiver<GpuEvent>,
+    blocked_draw: Option<BlockedGraphicsDraw>,
+}
+
+#[derive(Debug)]
+enum OrderedEventPoll {
+    Event(GpuEvent),
+    Blocked,
+    Empty,
+    Disconnected,
+}
+
+impl OrderedGpuEventReceiver {
+    fn new(receiver: Receiver<GpuEvent>) -> Self {
+        Self {
+            receiver,
+            blocked_draw: None,
+        }
+    }
+
+    fn block_draw(&mut self, key: GraphicsPipelineKey, draw: Box<IndexedDraw>) {
+        assert!(
+            self.blocked_draw.is_none(),
+            "ordered Metal event gate already contains a blocked draw"
+        );
+        self.blocked_draw = Some(BlockedGraphicsDraw { key, draw });
+    }
+
+    fn try_recv(
+        &mut self,
+        pipeline_resolved: impl FnOnce(&GraphicsPipelineKey) -> bool,
+    ) -> OrderedEventPoll {
+        if let Some(blocked) = self.blocked_draw.as_ref() {
+            if !pipeline_resolved(&blocked.key) {
+                return OrderedEventPoll::Blocked;
+            }
+            let blocked = self
+                .blocked_draw
+                .take()
+                .expect("blocked draw exists after readiness check");
+            return OrderedEventPoll::Event(GpuEvent::IndexedDraw(blocked.draw));
+        }
+        match self.receiver.try_recv() {
+            Ok(event) => OrderedEventPoll::Event(event),
+            Err(TryRecvError::Empty) => OrderedEventPoll::Empty,
+            Err(TryRecvError::Disconnected) => OrderedEventPoll::Disconnected,
+        }
+    }
+}
+
 struct UploadedImageTexture {
     texture: Texture,
     descriptor: DecodedImageDescriptor,
@@ -379,7 +437,7 @@ enum GuestScissor {
 }
 
 struct MetalPresenter {
-    receiver: Receiver<GpuEvent>,
+    receiver: OrderedGpuEventReceiver,
     window: Option<Window>,
     device: Option<Device>,
     layer: Option<MetalLayer>,
@@ -413,7 +471,7 @@ struct MetalPresenter {
     committed_guest_batches: VecDeque<GuestCommandBatch>,
     capture_directory: Option<PathBuf>,
     pressed_keys: HashSet<KeyCode>,
-    shader_compile_sender: Sender<ShaderCompileRequest>,
+    shader_compile_sender: SyncSender<ShaderCompileRequest>,
     shader_compile_receiver: Receiver<ShaderCompileResult>,
     redraw_pending: bool,
 }
@@ -426,7 +484,7 @@ impl MetalPresenter {
         let presentation_resolution = PresentationResolution::from_environment()?;
         let presentation = create_presentation_resources(&device)?;
         let (shader_compile_sender, shader_compile_requests) =
-            mpsc::channel::<ShaderCompileRequest>();
+            mpsc::sync_channel::<ShaderCompileRequest>(SHADER_COMPILE_QUEUE_CAPACITY);
         let (shader_compile_results, shader_compile_receiver) =
             mpsc::channel::<ShaderCompileResult>();
         let compiler_device = device.clone();
@@ -448,7 +506,7 @@ impl MetalPresenter {
             })
             .map_err(|error| format!("could not start Metal compiler worker: {error}"))?;
         Ok(Self {
-            receiver,
+            receiver: OrderedGpuEventReceiver::new(receiver),
             window: None,
             device: Some(device),
             layer: None,
@@ -546,17 +604,34 @@ impl MetalPresenter {
         self.receive_shader_compilations();
         self.retire_completed_guest_batches();
         // A bounded batch prevents a continuously producing guest from starving redraw and input
-        // delivery. The bounded sender applies backpressure until the next AppKit iteration.
-        for _ in 0..16 {
-            match self.receiver.try_recv() {
-                Ok(GpuEvent::DisplayRegistered {
+        // delivery. If the oldest event is waiting on shader compilation, the ordered receiver
+        // stops here without touching any later event in the bounded upstream channel.
+        for _ in 0..GPU_EVENTS_PER_TICK {
+            let event = match self.receiver.try_recv(|key| {
+                self.compiled_shader_pairs.contains_key(key)
+                    || self.failed_shader_pairs.contains(key)
+            }) {
+                OrderedEventPoll::Event(event) => event,
+                OrderedEventPoll::Blocked | OrderedEventPoll::Empty => {
+                    return PresenterFlow::Continue;
+                }
+                OrderedEventPoll::Disconnected => {
+                    eprintln!("[REMu][METAL] GPU event channel disconnected; closing presenter");
+                    if let Err(error) = self.wait_for_guest_command_batches() {
+                        eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
+                    }
+                    return PresenterFlow::Shutdown;
+                }
+            };
+            match event {
+                GpuEvent::DisplayRegistered {
                     width,
                     height,
                     pitch,
                     pixel_format,
                     tiling_mode,
                     ..
-                }) => {
+                } => {
                     self.display = Some(DisplayConfiguration {
                         width,
                         height,
@@ -569,7 +644,7 @@ impl MetalPresenter {
                         "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode}"
                     );
                 }
-                Ok(GpuEvent::Flip {
+                GpuEvent::Flip {
                     address,
                     width,
                     height,
@@ -577,7 +652,7 @@ impl MetalPresenter {
                     pixel_format,
                     tiling_mode,
                     ..
-                }) => {
+                } => {
                     self.display = Some(DisplayConfiguration {
                         width,
                         height,
@@ -607,12 +682,12 @@ impl MetalPresenter {
                     });
                     self.redraw_pending = true;
                 }
-                Ok(GpuEvent::MemoryAcquire(acquire)) => {
+                GpuEvent::MemoryAcquire(acquire) => {
                     if let Err(error) = self.synchronize_cpu_written_guest_resources(acquire) {
                         eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
                     }
                 }
-                Ok(GpuEvent::ComputeDispatch(dispatch)) => {
+                GpuEvent::ComputeDispatch(dispatch) => {
                     if let Err(error) = self.execute_compute_dispatch(&dispatch)
                         && self
                             .failed_compute_execution
@@ -624,10 +699,18 @@ impl MetalPresenter {
                         );
                     }
                 }
-                Ok(GpuEvent::IndexedDraw(draw)) => {
+                GpuEvent::IndexedDraw(draw) => {
+                    let key = graphics_pipeline_key(&draw);
                     self.compile_draw_shaders(&draw);
+                    if let Ok(key) = key.as_ref()
+                        && !self.compiled_shader_pairs.contains_key(key)
+                        && !self.failed_shader_pairs.contains(key)
+                    {
+                        debug_assert!(self.compiling_shader_pairs.contains(key));
+                        self.receiver.block_draw(key.clone(), draw);
+                        return PresenterFlow::Continue;
+                    }
                     if let Err(error) = self.execute_compiled_draw(&draw) {
-                        let key = graphics_pipeline_key(&draw);
                         if key
                             .as_ref()
                             .is_ok_and(|key| self.failed_draw_execution.insert(key.clone()))
@@ -661,21 +744,13 @@ impl MetalPresenter {
                         }
                     }
                 }
-                Ok(GpuEvent::Shutdown) => {
+                GpuEvent::Shutdown => {
                     eprintln!("[REMu][METAL] guest runtime requested presenter shutdown");
                     if let Err(error) = self.wait_for_guest_command_batches() {
                         eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
                     }
                     return PresenterFlow::Shutdown;
                 }
-                Err(TryRecvError::Disconnected) => {
-                    eprintln!("[REMu][METAL] GPU event channel disconnected; closing presenter");
-                    if let Err(error) = self.wait_for_guest_command_batches() {
-                        eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
-                    }
-                    return PresenterFlow::Shutdown;
-                }
-                Err(TryRecvError::Empty) => return PresenterFlow::Continue,
             }
         }
         PresenterFlow::Continue
@@ -710,7 +785,21 @@ impl MetalPresenter {
     }
 
     fn receive_shader_compilations(&mut self) {
-        while let Ok(result) = self.shader_compile_receiver.try_recv() {
+        loop {
+            let result = match self.shader_compile_receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    for key in self.compiling_shader_pairs.drain() {
+                        eprintln!(
+                            "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: compiler worker stopped",
+                            key.export_shader_address, key.pixel_shader_address
+                        );
+                        self.failed_shader_pairs.insert(key);
+                    }
+                    break;
+                }
+            };
             self.compiling_shader_pairs.remove(&result.key);
             match result.compiled {
                 Ok(compiled) => {
@@ -3923,22 +4012,24 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 mod tests {
     use metal::{CompileOptions, Device, MTLPixelFormat, RenderPipelineDescriptor};
     use remu_gpu::{
-        ComputeGrid, ComputeLaunch, GpuColorTarget, GpuRegister, GpuScanoutTarget, IndexedDraw,
+        ComputeGrid, ComputeLaunch, GpuColorTarget, GpuEvent, GpuRegister, GpuScanoutTarget,
+        IndexedDraw, gpu_event_channel,
     };
     use remu_shader::PixelOutputKind;
 
     use super::{
         CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
         CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
-        GuestTextureDescriptor, PresentationResolution, apply_image_destination_select,
-        decode_image_descriptor, decode_render_target_format, decode_render_targets_from_registers,
-        decode_scanout_target, decode_scissor, decode_viewport, effective_linear_pitch,
-        effective_linear_rgba_pitch, guest_texture_byte_count, guest_texture_descriptors_overlap,
-        guest_texture_raw_matches, headless_metal_value_is_enabled, metal_color_write_mask,
-        metal_nonindexed_vertex_count, mode27_block_dimensions, mode27_source_byte_offset,
-        mode27_within_block_byte_offset, parse_presentation_resolution, presentation_drawable_size,
-        presentation_viewport, read_draw_indices, snapshot_guest_texture_linear,
-        snapshot_guest_texture_raw, validate_compute_launch_for_metal, write_guest_texture_linear,
+        GraphicsPipelineKey, GuestTextureDescriptor, OrderedEventPoll, OrderedGpuEventReceiver,
+        PresentationResolution, apply_image_destination_select, decode_image_descriptor,
+        decode_render_target_format, decode_render_targets_from_registers, decode_scanout_target,
+        decode_scissor, decode_viewport, effective_linear_pitch, effective_linear_rgba_pitch,
+        guest_texture_byte_count, guest_texture_descriptors_overlap, guest_texture_raw_matches,
+        headless_metal_value_is_enabled, metal_color_write_mask, metal_nonindexed_vertex_count,
+        mode27_block_dimensions, mode27_source_byte_offset, mode27_within_block_byte_offset,
+        parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
+        read_draw_indices, snapshot_guest_texture_linear, snapshot_guest_texture_raw,
+        validate_compute_launch_for_metal, write_guest_texture_linear,
     };
 
     #[test]
@@ -4075,6 +4166,58 @@ mod tests {
             shader_registers: Vec::new(),
             user_config_registers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ordered_compile_gate_replays_one_shot_draw_before_flip() {
+        let (sender, receiver) = gpu_event_channel();
+        let mut ordered = OrderedGpuEventReceiver::new(receiver);
+        let key = GraphicsPipelineKey {
+            export_shader_address: 0x1000,
+            pixel_shader_address: 0x2000,
+            targets: Vec::new(),
+        };
+        let mut draw = indexed_draw(0, 0, 0);
+        draw.sequence = 17;
+        ordered.block_draw(key, Box::new(draw));
+        sender
+            .send(GpuEvent::Flip {
+                address: 0x7000_0000,
+                buffer_index: 1,
+                flip_argument: 9,
+                width: 1_280,
+                height: 720,
+                pitch: 1_280,
+                pixel_format: 0x8000_0000_2200_0000,
+                tiling_mode: 0,
+            })
+            .expect("queue later flip");
+
+        assert!(matches!(
+            ordered.try_recv(|_| false),
+            OrderedEventPoll::Blocked
+        ));
+        assert!(matches!(
+            ordered.try_recv(|_| false),
+            OrderedEventPoll::Blocked
+        ));
+        match ordered.try_recv(|_| true) {
+            OrderedEventPoll::Event(GpuEvent::IndexedDraw(draw)) => {
+                assert_eq!(draw.sequence, 17);
+            }
+            other => panic!("expected the blocked draw exactly once, got {other:?}"),
+        }
+        assert!(matches!(
+            ordered.try_recv(|_| true),
+            OrderedEventPoll::Event(GpuEvent::Flip {
+                address: 0x7000_0000,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ordered.try_recv(|_| true),
+            OrderedEventPoll::Empty
+        ));
     }
 
     #[test]
