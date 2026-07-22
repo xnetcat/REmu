@@ -45,6 +45,10 @@ milestone completion claim.
   SHA-256 `2d02539a60a0d952d92b30e455ac5aeb2ab13510993224e7c94cdd4e29fbb581`. Visual inspection shows
   the correct Ratalaika splash followed by opaque black, matching the later pixel shader's constant
   `[0, 0, 0, 1]` export. This closes the retained blocker, not the Dreaming Sarah milestone.
+- The 30-second run ends before a new failure: historical retained runs first reached the dynamic
+  1280x720 tile-27 phase after roughly 45-51 seconds. Runtime submission/draw/compute/flip logs and
+  Metal encoded-draw logs now retain their small initial prefix plus power-of-two checkpoints, so a
+  longer bounded run can prove progress or a stall with logarithmic rather than unbounded output.
 
 ## Subsystem ledger
 
@@ -61,7 +65,7 @@ milestone completion claim.
 | Video / Bink | No compatibility claim yet. | Identify each title's actual decoder/API path, then implement exact demux/decode/color/audio/timing semantics with legal generated fixtures. |
 | Storage / save data | Read-only app filesystem access and initial save transactions exist; dumps are not modified. | Complete namespace/path/case/permission/stat/iteration/atomicity/fsync/quota/slot/dialog/delete/concurrency semantics with crash-consistency tests. |
 | Input | Keyboard-backed pad state and opt-in deterministic Cross sequences exist. | Complete handle lifetime, disconnect/timestamps/dead zones/motion/touchpad/controller mapping/focus semantics as exercised. |
-| Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, HUD, and input diagnostics exist; run summaries retain revision/outcome/frame counts. | Add a versioned documented config with strict precedence/validation and structured shader/pipeline/queue/copy/CPU/GPU/audio/frame-pacing counters. |
+| Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, HUD, and input diagnostics exist; run summaries retain revision/outcome/frame counts. AGC submissions, draws, compute dispatches, flips, and Metal draw encodes keep bounded logarithmic progress checkpoints after their initial trace prefix. | Add a versioned documented config with strict precedence/validation and structured shader/pipeline/queue/copy/CPU/GPU/audio/frame-pacing counters. |
 
 ## Required validation for the current P0 increment
 

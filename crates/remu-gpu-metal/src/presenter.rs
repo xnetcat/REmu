@@ -1577,7 +1577,7 @@ impl MetalPresenter {
     fn execute_compiled_draw(&mut self, draw: &IndexedDraw) -> Result<(), String> {
         self.retire_completed_guest_batches();
         let started = Instant::now();
-        let trace = draw.sequence <= 4;
+        let trace = draw.sequence <= 4 || draw.sequence.is_power_of_two();
         let targets = decode_render_targets(draw)?;
         let key = graphics_pipeline_key_from_targets(draw, &targets);
         if !self.compiled_shader_pairs.contains_key(&key) {

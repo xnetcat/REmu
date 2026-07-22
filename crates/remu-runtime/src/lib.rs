@@ -3482,6 +3482,10 @@ fn low_u32(value: u64) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+const fn trace_logarithmic_sequence(sequence: u64, initial: u64) -> bool {
+    sequence <= initial || sequence.is_power_of_two()
+}
+
 fn low_i32(value: u64) -> i32 {
     let bytes = value.to_le_bytes();
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
@@ -5100,7 +5104,7 @@ fn queue_video_out_flip(
             data: event_data,
             user_data,
         });
-        if state.agc_submission_count <= 8 {
+        if trace_logarithmic_sequence(state.agc_submission_count, 8) {
             eprintln!(
                 "[REMu][VIDEO] queued flip handle={handle} index={buffer_index} address={display_address:#x} equeue={equeue:#x}"
             );
@@ -5700,7 +5704,7 @@ fn agc_prepare_draw_color_targets(
         AgcColorTargetState::Absent => (Vec::new(), true),
         AgcColorTargetState::Programmed(targets) => (targets, false),
         AgcColorTargetState::Malformed { slot } => {
-            if graphics.emitted_draws <= 8 {
+            if trace_logarithmic_sequence(graphics.emitted_draws, 8) {
                 eprintln!(
                     "[REMu][AGC] draw={} has incomplete enabled CB_COLOR{slot} state",
                     graphics.emitted_draws
@@ -5762,7 +5766,7 @@ fn agc_resolve_targetless_scanout(
         .filter(|slot| (export_masks >> (slot * 4)) & 0xf != 0)
         .collect::<Vec<_>>();
     let [export_slot] = export_slots.as_slice() else {
-        if draw.sequence <= 8 {
+        if trace_logarithmic_sequence(draw.sequence, 8) {
             eprintln!(
                 "[REMu][AGC] did not associate targetless draw={}: future flip target {:#x} has ambiguous pixel exports {export_slots:?}",
                 draw.sequence, target.address,
@@ -5789,7 +5793,7 @@ fn agc_resolve_targetless_scanout(
         write_mask: (export_masks >> (*export_slot * 4)) & 0xf,
         color_surface,
     });
-    if draw.sequence <= 8 {
+    if trace_logarithmic_sequence(draw.sequence, 8) {
         eprintln!(
             "[REMu][AGC] resolved targetless draw={} against future scanout target={:#x} programmed_surface={}",
             draw.sequence,
@@ -5800,7 +5804,7 @@ fn agc_resolve_targetless_scanout(
 }
 
 fn agc_trace_draw_summary(draw: &remu_gpu::IndexedDraw) {
-    if draw.sequence <= 8 {
+    if trace_logarithmic_sequence(draw.sequence, 8) {
         eprintln!(
             "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x}",
             draw.sequence,
@@ -6337,7 +6341,7 @@ fn agc_handle_submission_packet(
                     packet_address,
                     source,
                 })?;
-        if dispatch.sequence <= 8 {
+        if trace_logarithmic_sequence(dispatch.sequence, 8) {
             eprintln!(
                 "[REMu][AGC] compute={} source={:?} grid={:?} base={:?} local={:?} wave={} cs={:#x}",
                 dispatch.sequence,
@@ -6502,7 +6506,7 @@ fn agc_parse_submission(
     }
 
     *context.submission_count = context.submission_count.saturating_add(1);
-    if *context.submission_count <= 8 {
+    if trace_logarithmic_sequence(*context.submission_count, 8) {
         let packet_summary = packet_counts
             .iter()
             .map(|(&(opcode, register), &count)| {
@@ -10325,6 +10329,17 @@ mod platform_independent_tests {
             0,
         ]);
         (commands, expected_acquire)
+    }
+
+    #[test]
+    fn gpu_progress_telemetry_keeps_a_prefix_and_logarithmic_checkpoints() {
+        for sequence in 0..=8 {
+            assert!(super::trace_logarithmic_sequence(sequence, 8));
+        }
+        assert!(!super::trace_logarithmic_sequence(9, 8));
+        assert!(super::trace_logarithmic_sequence(16, 8));
+        assert!(!super::trace_logarithmic_sequence(17, 8));
+        assert!(super::trace_logarithmic_sequence(1_u64 << 63, 8));
     }
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
