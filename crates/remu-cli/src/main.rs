@@ -523,9 +523,9 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
         .unwrap_or("eboot.bin")
         .to_owned();
     let game_root = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-    // Bound translated GPU work so the guest cannot run hundreds of frames ahead of Metal. This
-    // also keeps the AppKit loop responsive enough to publish keyboard/controller state.
-    let (sender, receiver) = std::sync::mpsc::sync_channel(64);
+    // Do not block the guest while it holds the import-dispatch lock. Explicit GPU ordering events
+    // still serialize cache invalidation with preceding and following translated work.
+    let (sender, receiver) = std::sync::mpsc::channel();
     remu_gpu::install_event_sink(sender.clone());
     let guest = std::thread::spawn(move || {
         let started = Instant::now();

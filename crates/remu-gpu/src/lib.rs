@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use remu_shader::{Program, ShaderEvaluation, ShaderMetadata};
@@ -171,9 +171,9 @@ pub enum GpuEvent {
     Shutdown,
 }
 
-static GPU_EVENT_SINK: OnceLock<Mutex<Option<SyncSender<GpuEvent>>>> = OnceLock::new();
+static GPU_EVENT_SINK: OnceLock<Mutex<Option<Sender<GpuEvent>>>> = OnceLock::new();
 
-pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
+pub fn install_event_sink(sender: Sender<GpuEvent>) {
     let sink = GPU_EVENT_SINK.get_or_init(|| Mutex::new(None));
     *sink
         .lock()
