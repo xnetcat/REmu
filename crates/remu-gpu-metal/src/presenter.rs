@@ -111,6 +111,40 @@ struct SpriteVertex {
     opacity: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SoftwareSamplerAddressMode {
+    Repeat,
+    MirrorRepeat,
+    ClampToEdge,
+    MirrorClampToEdge,
+    ClampToBorder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SoftwareSamplerFilter {
+    Nearest,
+    Linear,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SoftwareSampler {
+    address_s: SoftwareSamplerAddressMode,
+    address_t: SoftwareSamplerAddressMode,
+    min_filter: SoftwareSamplerFilter,
+    mag_filter: SoftwareSamplerFilter,
+}
+
+impl Default for SoftwareSampler {
+    fn default() -> Self {
+        Self {
+            address_s: SoftwareSamplerAddressMode::ClampToEdge,
+            address_t: SoftwareSamplerAddressMode::ClampToEdge,
+            min_filter: SoftwareSamplerFilter::Nearest,
+            mag_filter: SoftwareSamplerFilter::Nearest,
+        }
+    }
+}
+
 struct CompiledShaderPair {
     pipeline: RenderPipelineState,
     vertex_function: Function,
@@ -1755,6 +1789,51 @@ fn sampler_mip_filter(value: u32) -> MTLSamplerMipFilter {
     }
 }
 
+fn software_sampler_address_mode(value: u32) -> SoftwareSamplerAddressMode {
+    match value {
+        0 => SoftwareSamplerAddressMode::Repeat,
+        1 => SoftwareSamplerAddressMode::MirrorRepeat,
+        2 => SoftwareSamplerAddressMode::ClampToEdge,
+        3 | 5 | 7 => SoftwareSamplerAddressMode::MirrorClampToEdge,
+        4 | 6 => SoftwareSamplerAddressMode::ClampToBorder,
+        _ => unreachable!("three-bit sampler address mode"),
+    }
+}
+
+fn software_sampler_filter(value: u32) -> SoftwareSamplerFilter {
+    if matches!(value, 1 | 3) {
+        SoftwareSamplerFilter::Linear
+    } else {
+        SoftwareSamplerFilter::Nearest
+    }
+}
+
+fn software_sampler_for_source(
+    draw: &IndexedDraw,
+    source: GuestTextureDescriptor,
+) -> SoftwareSampler {
+    let Some(evaluation) = draw.pixel_shader_evaluation.as_deref() else {
+        return SoftwareSampler::default();
+    };
+    let Some(binding) = sampled_image_bindings(evaluation).find(|binding| {
+        let words = &binding.resource_descriptor;
+        words.len() >= 2
+            && (((u64::from(words[1] & 0xff) << 32) | u64::from(words[0])) << 8) == source.address
+    }) else {
+        return SoftwareSampler::default();
+    };
+    let words = &binding.sampler_descriptor;
+    if words.len() < 3 {
+        return SoftwareSampler::default();
+    }
+    SoftwareSampler {
+        address_s: software_sampler_address_mode(words[0] & 0x7),
+        address_t: software_sampler_address_mode((words[0] >> 3) & 0x7),
+        mag_filter: software_sampler_filter((words[2] >> 20) & 0x3),
+        min_filter: software_sampler_filter((words[2] >> 22) & 0x3),
+    }
+}
+
 fn sampled_image_bindings(evaluation: &ShaderEvaluation) -> impl Iterator<Item = &ImageBinding> {
     evaluation.image_bindings.iter().filter(|binding| {
         binding.opcode.starts_with("ImageSample") || binding.opcode.starts_with("ImageGather")
@@ -2079,7 +2158,15 @@ fn software_rasterize_sprite(
     let target_bytes =
         unsafe { std::slice::from_raw_parts_mut(target_address as *mut u8, target_length) };
     capture_sampled_texture_if_requested(source_bytes, source);
-    rasterize_sprite_triangles(source_bytes, source, target_bytes, target, &vertices);
+    let sampler = software_sampler_for_source(draw, source);
+    rasterize_sprite_triangles(
+        source_bytes,
+        source,
+        target_bytes,
+        target,
+        &vertices,
+        sampler,
+    );
     Some(())
 }
 
@@ -2310,9 +2397,17 @@ fn rasterize_sprite_triangles(
     target_bytes: &mut [u8],
     target: GuestTextureDescriptor,
     vertices: &[SpriteVertex],
+    sampler: SoftwareSampler,
 ) {
     for triangle in vertices.chunks_exact(3) {
-        rasterize_sprite_triangle(source_bytes, source, target_bytes, target, triangle);
+        rasterize_sprite_triangle(
+            source_bytes,
+            source,
+            target_bytes,
+            target,
+            triangle,
+            sampler,
+        );
     }
 }
 
@@ -2327,6 +2422,7 @@ fn rasterize_sprite_triangle(
     target_bytes: &mut [u8],
     target: GuestTextureDescriptor,
     vertices: &[SpriteVertex],
+    sampler: SoftwareSampler,
 ) {
     let edge = |a: [f32; 2], b: [f32; 2], point: [f32; 2]| {
         (point[0] - a[0]) * (b[1] - a[1]) - (point[1] - a[1]) * (b[0] - a[0])
@@ -2339,6 +2435,7 @@ fn rasterize_sprite_triangle(
     if area.abs() < f32::EPSILON {
         return;
     }
+    let filter = sprite_sampler_filter(vertices, source, sampler);
     let (Ok(target_width), Ok(target_height)) =
         (i32::try_from(target.width), i32::try_from(target.height))
     else {
@@ -2391,13 +2488,8 @@ fn rasterize_sprite_triangle(
                 + weights[1] * vertices[1].opacity
                 + weights[2] * vertices[2].opacity)
                 .clamp(0.0, 1.0);
-            let source_x =
-                (uv[0].clamp(0.0, 1.0) * (source.width.saturating_sub(1)) as f32).round() as usize;
-            let source_y =
-                (uv[1].clamp(0.0, 1.0) * (source.height.saturating_sub(1)) as f32).round() as usize;
-            let source_offset = guest_pixel_byte_offset(source, source_x, source_y);
             let target_offset = guest_pixel_byte_offset(target, x as usize, y as usize);
-            let source_pixel = &source_bytes[source_offset..source_offset + 4];
+            let source_pixel = sample_software_texture(source_bytes, source, sampler, filter, uv);
             let mut modulated = [0_u8; 4];
             for channel in 0..4 {
                 modulated[channel] = transform_color_channel(source_pixel[channel], opacity, 0.0);
@@ -2408,6 +2500,178 @@ fn rasterize_sprite_triangle(
             );
         }
     }
+}
+
+#[allow(clippy::cast_precision_loss, clippy::similar_names)]
+fn sprite_sampler_filter(
+    vertices: &[SpriteVertex],
+    source: GuestTextureDescriptor,
+    sampler: SoftwareSampler,
+) -> SoftwareSamplerFilter {
+    let delta_x_1 = vertices[1].position[0] - vertices[0].position[0];
+    let delta_y_1 = vertices[1].position[1] - vertices[0].position[1];
+    let delta_x_2 = vertices[2].position[0] - vertices[0].position[0];
+    let delta_y_2 = vertices[2].position[1] - vertices[0].position[1];
+    let determinant = delta_x_1 * delta_y_2 - delta_x_2 * delta_y_1;
+    if determinant.abs() < f32::EPSILON {
+        return sampler.mag_filter;
+    }
+    let delta_u_1 = vertices[1].uv[0] - vertices[0].uv[0];
+    let delta_v_1 = vertices[1].uv[1] - vertices[0].uv[1];
+    let delta_u_2 = vertices[2].uv[0] - vertices[0].uv[0];
+    let delta_v_2 = vertices[2].uv[1] - vertices[0].uv[1];
+    let reciprocal = determinant.recip();
+    let du_dx = (delta_u_1 * delta_y_2 - delta_u_2 * delta_y_1) * reciprocal;
+    let du_dy = (delta_x_1 * delta_u_2 - delta_x_2 * delta_u_1) * reciprocal;
+    let dv_dx = (delta_v_1 * delta_y_2 - delta_v_2 * delta_y_1) * reciprocal;
+    let dv_dy = (delta_x_1 * delta_v_2 - delta_x_2 * delta_v_1) * reciprocal;
+    let width = source.width as f32;
+    let height = source.height as f32;
+    let footprint_x = (du_dx * width).hypot(dv_dx * height);
+    let footprint_y = (du_dy * width).hypot(dv_dy * height);
+    if footprint_x.max(footprint_y) > 1.0 {
+        sampler.min_filter
+    } else {
+        sampler.mag_filter
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::similar_names
+)]
+fn sample_software_texture(
+    source_bytes: &[u8],
+    source: GuestTextureDescriptor,
+    sampler: SoftwareSampler,
+    filter: SoftwareSamplerFilter,
+    uv: [f32; 2],
+) -> [u8; 4] {
+    match filter {
+        SoftwareSamplerFilter::Nearest => {
+            let x = (uv[0] * source.width as f32).floor() as i64;
+            let y = (uv[1] * source.height as f32).floor() as i64;
+            software_texel(
+                source_bytes,
+                source,
+                sampler.address_s,
+                sampler.address_t,
+                x,
+                y,
+            )
+        }
+        SoftwareSamplerFilter::Linear => {
+            let x = uv[0] * source.width as f32 - 0.5;
+            let y = uv[1] * source.height as f32 - 0.5;
+            let x0 = x.floor() as i64;
+            let y0 = y.floor() as i64;
+            let fraction_x = x - x.floor();
+            let fraction_y = y - y.floor();
+            let samples = [
+                software_texel(
+                    source_bytes,
+                    source,
+                    sampler.address_s,
+                    sampler.address_t,
+                    x0,
+                    y0,
+                ),
+                software_texel(
+                    source_bytes,
+                    source,
+                    sampler.address_s,
+                    sampler.address_t,
+                    x0 + 1,
+                    y0,
+                ),
+                software_texel(
+                    source_bytes,
+                    source,
+                    sampler.address_s,
+                    sampler.address_t,
+                    x0,
+                    y0 + 1,
+                ),
+                software_texel(
+                    source_bytes,
+                    source,
+                    sampler.address_s,
+                    sampler.address_t,
+                    x0 + 1,
+                    y0 + 1,
+                ),
+            ];
+            std::array::from_fn(|channel| {
+                let top = f32::from(samples[0][channel]) * (1.0 - fraction_x)
+                    + f32::from(samples[1][channel]) * fraction_x;
+                let bottom = f32::from(samples[2][channel]) * (1.0 - fraction_x)
+                    + f32::from(samples[3][channel]) * fraction_x;
+                (top * (1.0 - fraction_y) + bottom * fraction_y)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            })
+        }
+    }
+}
+
+fn software_texel(
+    source_bytes: &[u8],
+    source: GuestTextureDescriptor,
+    address_s: SoftwareSamplerAddressMode,
+    address_t: SoftwareSamplerAddressMode,
+    x: i64,
+    y: i64,
+) -> [u8; 4] {
+    let Some(x) = software_texel_index(x, source.width, address_s) else {
+        return [0; 4];
+    };
+    let Some(y) = software_texel_index(y, source.height, address_t) else {
+        return [0; 4];
+    };
+    let offset = guest_pixel_byte_offset(source, x, y);
+    source_bytes[offset..offset + 4]
+        .try_into()
+        .expect("guest texture pixel has four channels")
+}
+
+fn software_texel_index(
+    index: i64,
+    extent: u32,
+    mode: SoftwareSamplerAddressMode,
+) -> Option<usize> {
+    let extent = i64::from(extent);
+    if extent == 0 {
+        return None;
+    }
+    let index = match mode {
+        SoftwareSamplerAddressMode::Repeat => index.rem_euclid(extent),
+        SoftwareSamplerAddressMode::MirrorRepeat => {
+            let period = extent * 2;
+            let repeated = index.rem_euclid(period);
+            if repeated < extent {
+                repeated
+            } else {
+                period - 1 - repeated
+            }
+        }
+        SoftwareSamplerAddressMode::ClampToEdge => index.clamp(0, extent - 1),
+        SoftwareSamplerAddressMode::MirrorClampToEdge => {
+            if index < 0 {
+                (-index - 1).min(extent - 1)
+            } else {
+                index.min(extent - 1)
+            }
+        }
+        SoftwareSamplerAddressMode::ClampToBorder => {
+            if !(0..extent).contains(&index) {
+                return None;
+            }
+            index
+        }
+    };
+    usize::try_from(index).ok()
 }
 
 fn blend_premultiplied_rgba(source: &[u8], target: &mut [u8]) {
@@ -3064,12 +3328,13 @@ mod tests {
 
     use super::{
         DREAMING_FILL_ES_PREFIX, DREAMING_FILL_PS_PREFIX, GuestPresentConstants,
-        GuestTextureDescriptor, apply_image_destination_select, blend_premultiplied_rgba,
-        blit_guest_texture_bytes, convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra,
-        decode_image_descriptor, decode_scissor, decode_viewport, effective_linear_rgba_pitch,
-        execute_dreaming_fill_draw, metal_nonindexed_vertex_count, mode27_source_byte_offset,
-        mode27_within_block_byte_offset, read_draw_indices, snapshot_guest_texture_rgba,
-        transform_sprite_position, write_guest_texture_rgba,
+        GuestTextureDescriptor, SoftwareSampler, SoftwareSamplerAddressMode, SoftwareSamplerFilter,
+        apply_image_destination_select, blend_premultiplied_rgba, blit_guest_texture_bytes,
+        convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra, decode_image_descriptor,
+        decode_scissor, decode_viewport, effective_linear_rgba_pitch, execute_dreaming_fill_draw,
+        metal_nonindexed_vertex_count, mode27_source_byte_offset, mode27_within_block_byte_offset,
+        read_draw_indices, sample_software_texture, snapshot_guest_texture_rgba,
+        software_texel_index, transform_sprite_position, write_guest_texture_rgba,
     };
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
@@ -3116,6 +3381,54 @@ mod tests {
         assert_eq!(effective_linear_rgba_pitch(320), Some(320));
         assert_eq!(effective_linear_rgba_pitch(980), Some(1024));
         assert_eq!(effective_linear_rgba_pitch(250), Some(256));
+    }
+
+    #[test]
+    fn applies_guest_sampler_address_modes_to_texel_coordinates() {
+        use SoftwareSamplerAddressMode::{
+            ClampToBorder, ClampToEdge, MirrorClampToEdge, MirrorRepeat, Repeat,
+        };
+
+        assert_eq!(software_texel_index(-1, 4, Repeat), Some(3));
+        assert_eq!(software_texel_index(4, 4, Repeat), Some(0));
+        assert_eq!(software_texel_index(-1, 4, MirrorRepeat), Some(0));
+        assert_eq!(software_texel_index(4, 4, MirrorRepeat), Some(3));
+        assert_eq!(software_texel_index(5, 4, MirrorRepeat), Some(2));
+        assert_eq!(software_texel_index(-1, 4, ClampToEdge), Some(0));
+        assert_eq!(software_texel_index(4, 4, ClampToEdge), Some(3));
+        assert_eq!(software_texel_index(-2, 4, MirrorClampToEdge), Some(1));
+        assert_eq!(software_texel_index(5, 4, MirrorClampToEdge), Some(3));
+        assert_eq!(software_texel_index(-1, 4, ClampToBorder), None);
+        assert_eq!(software_texel_index(4, 4, ClampToBorder), None);
+    }
+
+    #[test]
+    fn linearly_filters_software_sampled_guest_textures() {
+        let source = [0_u8, 0, 0, 255, 100, 200, 50, 255];
+        let descriptor = GuestTextureDescriptor {
+            address: 0,
+            width: 2,
+            height: 1,
+            pitch: 2,
+            tile_mode: 0,
+        };
+        let sampler = SoftwareSampler {
+            address_s: SoftwareSamplerAddressMode::ClampToEdge,
+            address_t: SoftwareSamplerAddressMode::ClampToEdge,
+            min_filter: SoftwareSamplerFilter::Linear,
+            mag_filter: SoftwareSamplerFilter::Linear,
+        };
+
+        assert_eq!(
+            sample_software_texture(
+                &source,
+                descriptor,
+                sampler,
+                SoftwareSamplerFilter::Linear,
+                [0.5, 0.5],
+            ),
+            [50, 100, 25, 255]
+        );
     }
 
     #[test]
