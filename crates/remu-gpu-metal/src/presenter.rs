@@ -13,12 +13,13 @@ use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
-    Buffer, CommandBuffer, CompileOptions, Device, Function, Library, MTLCommandBufferStatus,
-    MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion,
-    MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
-    MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
-    MTLViewport, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState,
-    SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
+    Buffer, CommandBuffer, CompileOptions, Device, Function, Library, MTLBlendFactor,
+    MTLBlendOperation, MTLColorWriteMask, MTLCommandBufferStatus, MTLIndexType, MTLLoadAction,
+    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLScissorRect, MTLSize,
+    MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer,
+    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
+    SamplerState, Texture, TextureDescriptor,
 };
 use objc::runtime::{Class, Object, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -78,12 +79,22 @@ struct GuestTextureDescriptor {
 }
 
 struct CompiledShaderPair {
-    pipeline: RenderPipelineState,
+    pipelines: HashMap<GuestBlendPipelineState, RenderPipelineState>,
+    color_guest_slots: Vec<u32>,
     vertex_function: Function,
     pixel_function: Function,
     vertex: remu_shader_metal::MetalShader,
     pixel: remu_shader_metal::MetalShader,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GuestBlendAttachmentState {
+    control: u32,
+    write_mask: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GuestBlendPipelineState(Vec<GuestBlendAttachmentState>);
 
 struct ShaderCompileResult {
     key: (u64, u64),
@@ -545,25 +556,25 @@ impl MetalPresenter {
         let pixel_function = pixel_library
             .get_function(&pixel_msl.entry_point, None)
             .map_err(|error| format!("Metal pixel function: {error}"))?;
-        let descriptor = RenderPipelineDescriptor::new();
-        descriptor.set_label(&format!(
-            "REMu Gen5 ES {:#x} PS {:#x}",
-            draw.export_shader_address, draw.pixel_shader_address
-        ));
-        descriptor.set_vertex_function(Some(&vertex_function));
-        descriptor.set_fragment_function(Some(&pixel_function));
-        for location in 0..pixel_options.pixel_outputs.len() {
-            descriptor
-                .color_attachments()
-                .object_at(u64::try_from(location).expect("color location fits u64"))
-                .ok_or_else(|| format!("Metal has no color attachment {location}"))?
-                .set_pixel_format(MTLPixelFormat::RGBA8Unorm);
-        }
-        let pipeline = device
-            .new_render_pipeline_state(&descriptor)
-            .map_err(|error| format!("Metal render pipeline: {error}"))?;
+        let color_guest_slots = pixel_options
+            .pixel_outputs
+            .iter()
+            .map(|output| output.guest_slot)
+            .collect::<Vec<_>>();
+        let blend_state = decode_blend_pipeline_state(draw, &color_guest_slots);
+        let pipeline = create_render_pipeline(
+            device,
+            draw.export_shader_address,
+            draw.pixel_shader_address,
+            &vertex_function,
+            &pixel_function,
+            &blend_state,
+        )?;
+        let mut pipelines = HashMap::new();
+        pipelines.insert(blend_state, pipeline);
         Ok(CompiledShaderPair {
-            pipeline,
+            pipelines,
+            color_guest_slots,
             vertex_function,
             pixel_function,
             vertex: vertex_msl,
@@ -822,6 +833,16 @@ impl MetalPresenter {
         if let Some(indices) = draw.indexed.then(|| read_draw_indices(draw)).flatten() {
             eprintln!("[REMu][METAL][BIND] indices={indices:?}");
         }
+        eprintln!(
+            "[REMu][METAL][BIND] blend0={:#010x} target_mask={:#010x} constant={:08x?}",
+            register_value(&draw.context_registers, 0x1e0).unwrap_or_default(),
+            register_value(&draw.context_registers, 0x08e).unwrap_or(0xf),
+            [0x105, 0x106, 0x107, 0x108].map(|register| register_value(
+                &draw.context_registers,
+                register
+            )
+            .unwrap_or_default()),
+        );
         if let Ok(viewport) = viewport {
             eprintln!(
                 "[REMu][METAL][BIND] viewport=({}, {}) {}x{} depth={}..{}",
@@ -974,6 +995,34 @@ impl MetalPresenter {
             &mut self.resident_guest_textures,
             &mut self.sampled_texture_cache,
         )?;
+        let blend_state = self
+            .compiled_shader_pairs
+            .get(&key)
+            .map(|compiled| decode_blend_pipeline_state(draw, &compiled.color_guest_slots))
+            .ok_or("shader pair has no compiled Metal pipeline")?;
+        if !self
+            .compiled_shader_pairs
+            .get(&key)
+            .is_some_and(|compiled| compiled.pipelines.contains_key(&blend_state))
+        {
+            let compiled = self
+                .compiled_shader_pairs
+                .get(&key)
+                .ok_or("shader pair has no compiled Metal pipeline")?;
+            let pipeline = create_render_pipeline(
+                &device,
+                key.0,
+                key.1,
+                &compiled.vertex_function,
+                &compiled.pixel_function,
+                &blend_state,
+            )?;
+            self.compiled_shader_pairs
+                .get_mut(&key)
+                .expect("compiled shader pair still exists")
+                .pipelines
+                .insert(blend_state.clone(), pipeline);
+        }
         let compiled = self
             .compiled_shader_pairs
             .get(&key)
@@ -990,7 +1039,11 @@ impl MetalPresenter {
             compiled.pixel.bindings.sampler_argument_buffer_index,
             pixel_evaluation,
         )?;
-        let pipeline = compiled.pipeline.clone();
+        let pipeline = compiled
+            .pipelines
+            .get(&blend_state)
+            .expect("draw blend pipeline was created above")
+            .clone();
         let vertex_scalar_buffer_index = compiled.vertex.bindings.initial_scalar_buffer_index;
         let pixel_scalar_buffer_index = compiled.pixel.bindings.initial_scalar_buffer_index;
         let vertex_sampler_buffer_index = compiled.vertex.bindings.sampler_argument_buffer_index;
@@ -1032,6 +1085,12 @@ impl MetalPresenter {
             let encoder = batch.command_buffer.new_render_command_encoder(pass);
             encoder.set_label("REMu translated guest render pass");
             encoder.set_render_pipeline_state(&pipeline);
+            encoder.set_blend_color(
+                f32::from_bits(register_value(&draw.context_registers, 0x105).unwrap_or_default()),
+                f32::from_bits(register_value(&draw.context_registers, 0x106).unwrap_or_default()),
+                f32::from_bits(register_value(&draw.context_registers, 0x107).unwrap_or_default()),
+                f32::from_bits(register_value(&draw.context_registers, 0x108).unwrap_or_default()),
+            );
             let scissor = decode_scissor(draw, target.width, target.height)?;
             let viewport = decode_viewport(draw, target.width, target.height, scissor);
             encoder.set_viewport(viewport);
@@ -1399,6 +1458,130 @@ impl MetalPresenter {
             .max_by_key(|resident| resident.content_version)
             .map(|resident| &resident.texture)
     }
+}
+
+fn decode_blend_pipeline_state(
+    draw: &IndexedDraw,
+    color_guest_slots: &[u32],
+) -> GuestBlendPipelineState {
+    let target_mask = register_value(&draw.context_registers, 0x08e);
+    GuestBlendPipelineState(
+        color_guest_slots
+            .iter()
+            .map(|&guest_slot| GuestBlendAttachmentState {
+                control: register_value(&draw.context_registers, 0x1e0 + guest_slot)
+                    .unwrap_or_default(),
+                write_mask: target_mask
+                    .map_or(0xf, |mask| (mask >> guest_slot.saturating_mul(4)) & 0xf),
+            })
+            .collect(),
+    )
+}
+
+const fn metal_blend_factor(factor: u32) -> MTLBlendFactor {
+    match factor {
+        0 => MTLBlendFactor::Zero,
+        2 => MTLBlendFactor::SourceColor,
+        3 => MTLBlendFactor::OneMinusSourceColor,
+        4 => MTLBlendFactor::SourceAlpha,
+        5 => MTLBlendFactor::OneMinusSourceAlpha,
+        6 => MTLBlendFactor::DestinationAlpha,
+        7 => MTLBlendFactor::OneMinusDestinationAlpha,
+        8 => MTLBlendFactor::DestinationColor,
+        9 => MTLBlendFactor::OneMinusDestinationColor,
+        10 => MTLBlendFactor::SourceAlphaSaturated,
+        13 => MTLBlendFactor::BlendColor,
+        14 => MTLBlendFactor::OneMinusBlendColor,
+        15 => MTLBlendFactor::Source1Color,
+        16 => MTLBlendFactor::OneMinusSource1Color,
+        17 => MTLBlendFactor::Source1Alpha,
+        18 => MTLBlendFactor::OneMinusSource1Alpha,
+        19 => MTLBlendFactor::BlendAlpha,
+        20 => MTLBlendFactor::OneMinusBlendAlpha,
+        _ => MTLBlendFactor::One,
+    }
+}
+
+const fn metal_blend_operation(function: u32) -> MTLBlendOperation {
+    match function {
+        1 => MTLBlendOperation::Subtract,
+        2 => MTLBlendOperation::Min,
+        3 => MTLBlendOperation::Max,
+        4 => MTLBlendOperation::ReverseSubtract,
+        _ => MTLBlendOperation::Add,
+    }
+}
+
+fn metal_color_write_mask(guest: u32) -> MTLColorWriteMask {
+    MTLColorWriteMask::from_bits_retain(
+        (u64::from(guest & 1 != 0) << 3)
+            | (u64::from(guest & 2 != 0) << 2)
+            | (u64::from(guest & 4 != 0) << 1)
+            | u64::from(guest & 8 != 0),
+    )
+}
+
+fn configure_blend_attachment(
+    attachment: &metal::RenderPipelineColorAttachmentDescriptorRef,
+    state: GuestBlendAttachmentState,
+) {
+    attachment.set_write_mask(metal_color_write_mask(state.write_mask));
+    if state.control >> 30 & 1 == 0 {
+        return;
+    }
+    attachment.set_blending_enabled(true);
+    let color_source = state.control & 0x1f;
+    let color_function = state.control >> 5 & 0x7;
+    let color_destination = state.control >> 8 & 0x1f;
+    let separate_alpha = state.control >> 29 & 1 != 0;
+    let alpha_source = if separate_alpha {
+        state.control >> 16 & 0x1f
+    } else {
+        color_source
+    };
+    let alpha_function = if separate_alpha {
+        state.control >> 21 & 0x7
+    } else {
+        color_function
+    };
+    let alpha_destination = if separate_alpha {
+        state.control >> 24 & 0x1f
+    } else {
+        color_destination
+    };
+    attachment.set_source_rgb_blend_factor(metal_blend_factor(color_source));
+    attachment.set_destination_rgb_blend_factor(metal_blend_factor(color_destination));
+    attachment.set_rgb_blend_operation(metal_blend_operation(color_function));
+    attachment.set_source_alpha_blend_factor(metal_blend_factor(alpha_source));
+    attachment.set_destination_alpha_blend_factor(metal_blend_factor(alpha_destination));
+    attachment.set_alpha_blend_operation(metal_blend_operation(alpha_function));
+}
+
+fn create_render_pipeline(
+    device: &Device,
+    export_shader_address: u64,
+    pixel_shader_address: u64,
+    vertex_function: &Function,
+    pixel_function: &Function,
+    blend_state: &GuestBlendPipelineState,
+) -> Result<RenderPipelineState, String> {
+    let descriptor = RenderPipelineDescriptor::new();
+    descriptor.set_label(&format!(
+        "REMu Gen5 ES {export_shader_address:#x} PS {pixel_shader_address:#x}"
+    ));
+    descriptor.set_vertex_function(Some(vertex_function));
+    descriptor.set_fragment_function(Some(pixel_function));
+    for (location, state) in blend_state.0.iter().copied().enumerate() {
+        let attachment = descriptor
+            .color_attachments()
+            .object_at(u64::try_from(location).expect("color location fits u64"))
+            .ok_or_else(|| format!("Metal has no color attachment {location}"))?;
+        attachment.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        configure_blend_attachment(attachment, state);
+    }
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| format!("Metal render pipeline: {error}"))
 }
 
 fn compile_metal_libraries(
@@ -2772,12 +2955,15 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use metal::{MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask};
     use remu_gpu::{GpuEvent, GpuMemoryAcquire, GpuRegister, IndexedDraw};
 
     use super::{
-        GuestTextureDescriptor, apply_image_destination_select, decode_image_descriptor,
+        GuestBlendAttachmentState, GuestBlendPipelineState, GuestTextureDescriptor,
+        apply_image_destination_select, decode_blend_pipeline_state, decode_image_descriptor,
         decode_scissor, decode_viewport, effective_linear_rgba_pitch,
         guest_texture_descriptors_overlap, guest_texture_raw_matches, latest_complete_frame_start,
+        metal_blend_factor, metal_blend_operation, metal_color_write_mask,
         metal_nonindexed_vertex_count, mode27_source_byte_offset, mode27_within_block_byte_offset,
         read_draw_indices, snapshot_guest_texture_raw, snapshot_guest_texture_rgba,
         write_guest_texture_rgba,
@@ -2857,6 +3043,35 @@ mod tests {
     fn expands_nonindexed_rect_lists_to_a_four_vertex_triangle_strip() {
         assert_eq!(metal_nonindexed_vertex_count(0x11, 3), 4);
         assert_eq!(metal_nonindexed_vertex_count(4, 3), 3);
+    }
+
+    #[test]
+    fn decodes_guest_blend_pipeline_state_and_metal_mappings() {
+        let mut draw = indexed_draw(0x10_000, 0, 3);
+        draw.context_registers = vec![
+            GpuRegister {
+                offset: 0x08e,
+                value: 0x5,
+            },
+            GpuRegister {
+                offset: 0x1e0,
+                value: 0x4000_0504,
+            },
+        ];
+        assert_eq!(
+            decode_blend_pipeline_state(&draw, &[0]),
+            GuestBlendPipelineState(vec![GuestBlendAttachmentState {
+                control: 0x4000_0504,
+                write_mask: 0x5,
+            }])
+        );
+        assert_eq!(metal_blend_factor(4), MTLBlendFactor::SourceAlpha);
+        assert_eq!(metal_blend_factor(5), MTLBlendFactor::OneMinusSourceAlpha);
+        assert_eq!(metal_blend_operation(4), MTLBlendOperation::ReverseSubtract);
+        assert_eq!(
+            metal_color_write_mask(0x5),
+            MTLColorWriteMask::Red | MTLColorWriteMask::Blue
+        );
     }
 
     #[test]
