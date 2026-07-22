@@ -281,14 +281,12 @@ impl KernelMemory {
     ) -> Result<(), KernelMemoryError> {
         self.virtual_memory
             .protect(address, size, translate_protection(raw_protection))?;
-        let end =
-            address
-                .get()
-                .checked_add(size)
-                .ok_or_else(|| KernelMemoryError::DirectMemoryOverflow {
-                    start: address.get(),
-                    size,
-                })?;
+        let end = address.get().checked_add(size).ok_or_else(|| {
+            KernelMemoryError::DirectMemoryOverflow {
+                start: address.get(),
+                size,
+            }
+        })?;
         let affected: Vec<_> = self
             .virtual_memory
             .vmas()

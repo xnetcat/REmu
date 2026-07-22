@@ -132,6 +132,7 @@ fn dispatch_common_command(
     stack_arguments: [u64; 6],
 ) -> Option<u64> {
     Some(match nid {
+        "qj7QZpgr9Uw" => type_two_packet(arguments),
         "LtTouSCZjHM" => cb_nop(arguments),
         "t7PlZ9nt5Lc" => low_u32(arguments[0]).wrapping_mul(4).into(),
         "k3GhuSNmBLU" => cb_dispatch(arguments),
@@ -144,6 +145,14 @@ fn dispatch_common_command(
         "hL7C0IRpWZI" => 32,
         _ => return None,
     })
+}
+
+fn type_two_packet(arguments: [u64; 6]) -> u64 {
+    let Some(command) = allocate_dwords(arguments[0], 1) else {
+        return 0;
+    };
+    write_u32(command, 0x8000_0000);
+    command
 }
 
 fn dispatch_async_command(
@@ -1835,6 +1844,19 @@ mod tests {
     }
 
     #[test]
+    fn builds_native_type_two_packet() {
+        let mut fixture = CommandFixture::new(0);
+        let buffer = fixture.address();
+
+        assert_eq!(
+            call("qj7QZpgr9Uw", args(&[buffer]), [0; 6]),
+            fixture.start()
+        );
+        assert_eq!(fixture.words[0], 0x8000_0000);
+        assert_eq!(fixture.cursor(), fixture.start() + 4);
+    }
+
+    #[test]
     fn reserves_a_register_range_payload_when_values_are_null() {
         let mut fixture = CommandFixture::new(0);
         fixture.words[2..6].copy_from_slice(&[0x1111, 0x2222, 0x3333, 0x4444]);
@@ -1846,10 +1868,7 @@ mod tests {
         );
         assert_eq!(fixture.words[0], pm4(6, IT_SET_SH_REG, 0));
         assert_eq!(fixture.words[1], 0x8c);
-        assert_eq!(
-            &fixture.words[2..6],
-            &[0x1111, 0x2222, 0x3333, 0x4444]
-        );
+        assert_eq!(&fixture.words[2..6], &[0x1111, 0x2222, 0x3333, 0x4444]);
         assert_eq!(fixture.cursor(), fixture.start() + 24);
     }
 

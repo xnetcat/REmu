@@ -2104,6 +2104,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "Yw0jKSqop+E" => "sceAgcDcbDrawIndexAuto",
         "n2fD4A+pb+g" => "sceAgcCbSetShRegisterRangeDirect",
         "V++UgBtQhn0" => "sceAgcGetDataPacketPayloadAddress",
+        "qj7QZpgr9Uw" => "sceAgcUnknownQj7QZpgr9Uw",
         "aJf+j5yntiU" => "sceAgcDcbEventWrite",
         "LtTouSCZjHM" => "sceAgcCbNop",
         "WmAc2MEj6Io" => "sceAgcDcbDmaData",
@@ -3704,7 +3705,6 @@ fn dispatch_probe_import(
         "HV4j+E0MBHE" => agc_create_interpolant_mapping(arguments),
         "n2fD4A+pb+g" => agc_cb_set_sh_register_range_direct(arguments),
         "V++UgBtQhn0" => agc_get_data_packet_payload_address(arguments),
-        "qj7QZpgr9Uw" => agc_type_two_packet(arguments),
         "aJf+j5yntiU" => agc_dcb_event_write(arguments),
         "LtTouSCZjHM" => agc_cb_nop(arguments),
         "WmAc2MEj6Io" => agc_dcb_dma_data(arguments, stack_arguments),
@@ -4571,14 +4571,6 @@ fn agc_get_data_packet_payload_address(arguments: [u64; 6]) -> u64 {
     0
 }
 
-fn agc_type_two_packet(arguments: [u64; 6]) -> u64 {
-    let Some(command) = agc_allocate_command_dwords(arguments[0], 1) else {
-        return 0;
-    };
-    write_guest_u32(command, 0x8000_0000);
-    command
-}
-
 fn agc_dcb_event_write(arguments: [u64; 6]) -> u64 {
     let event_type = low_u32(arguments[1]) & 0xff;
     if event_type > 0x3f || arguments[2] != 0 {
@@ -5185,9 +5177,7 @@ fn agc_apply_submission_registers(
 ) -> Result<(), AgcSubmissionError> {
     if opcode == AGC_IT_SET_UCONFIG_REG_INDEX {
         if length != 3 {
-            return Err(AgcSubmissionError::IndexedUconfigRegisterPacketLength {
-                actual: length,
-            });
+            return Err(AgcSubmissionError::IndexedUconfigRegisterPacketLength { actual: length });
         }
         let register = read_guest_u32(packet_address + 4) & !0x7000_0000;
         let value = read_guest_u32(packet_address + 8);
@@ -5342,12 +5332,10 @@ fn agc_color_target_state(registers: &BTreeMap<u32, u32>) -> AgcColorTargetState
         }
         let primary = slot * AGC_CB_COLOR_REGISTER_STRIDE;
         let base = registers.get(&(AGC_CB_COLOR0_BASE + primary)).copied();
-        let base_ext = registers
-            .get(&(AGC_CB_COLOR0_BASE_EXT + slot))
-            .copied();
-        let address = base.zip(base_ext).map(|(low, high)| {
-            (u64::from(high & 0xff) << 40) | (u64::from(low) << 8)
-        });
+        let base_ext = registers.get(&(AGC_CB_COLOR0_BASE_EXT + slot)).copied();
+        let address = base
+            .zip(base_ext)
+            .map(|(low, high)| (u64::from(high & 0xff) << 40) | (u64::from(low) << 8));
         let explicitly_enabled =
             target_mask.is_some_and(|mask| (mask >> (slot * 4)).trailing_zeros() < 4);
         if address.is_none_or(|address| address == 0) {
@@ -5715,8 +5703,8 @@ fn agc_draw_image_access(draw: &remu_gpu::IndexedDraw) -> (bool, bool) {
     .flatten()
     .flat_map(|evaluation| &evaluation.image_bindings)
     .fold((false, false), |(reads, writes), binding| {
-        let writes_binding = binding.opcode.starts_with("ImageStore")
-            || binding.opcode.starts_with("ImageAtomic");
+        let writes_binding =
+            binding.opcode.starts_with("ImageStore") || binding.opcode.starts_with("ImageAtomic");
         (reads || !writes_binding, writes || writes_binding)
     })
 }
@@ -5802,9 +5790,7 @@ fn agc_emit_draw(
         AGC_SPI_SHADER_PGM_HI_PS,
     );
     let (color_targets, color_target_absent) = agc_prepare_draw_color_targets(graphics);
-    let color_target_address = color_targets
-        .first()
-        .map_or(0, |target| target.address);
+    let color_target_address = color_targets.first().map_or(0, |target| target.address);
     let primitive_type = graphics
         .user_config_registers
         .get(&AGC_VGT_PRIMITIVE_TYPE)
@@ -6358,14 +6344,18 @@ fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
         return u64::MAX;
     }
     let mut flips = Vec::new();
-    let result = agc_parse_submission(command_address, dword_count, &mut AgcSubmissionContext {
-        graphics: &mut state.agc_graphics,
-        shaders: &mut state.agc_shader_registry,
-        index_resources: &state.agc_index_resources,
-        video_out: &state.video_out,
-        submission_count: &mut state.agc_submission_count,
-        flips: &mut flips,
-    });
+    let result = agc_parse_submission(
+        command_address,
+        dword_count,
+        &mut AgcSubmissionContext {
+            graphics: &mut state.agc_graphics,
+            shaders: &mut state.agc_shader_registry,
+            index_resources: &state.agc_index_resources,
+            video_out: &state.video_out,
+            submission_count: &mut state.agc_submission_count,
+            flips: &mut flips,
+        },
+    );
     for (handle, buffer_index, flip_argument) in flips {
         queue_video_out_flip(state, handle, buffer_index, flip_argument);
     }
@@ -6390,14 +6380,18 @@ fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
         let dword_count = read_guest_u32(sizes + u64::from(index) * 4);
         if command_address != 0 && dword_count != 0 && dword_count <= 1_000_000 {
             let mut flips = Vec::new();
-            let result = agc_parse_submission(command_address, dword_count, &mut AgcSubmissionContext {
-                graphics: &mut state.agc_graphics,
-                shaders: &mut state.agc_shader_registry,
-                index_resources: &state.agc_index_resources,
-                video_out: &state.video_out,
-                submission_count: &mut state.agc_submission_count,
-                flips: &mut flips,
-            });
+            let result = agc_parse_submission(
+                command_address,
+                dword_count,
+                &mut AgcSubmissionContext {
+                    graphics: &mut state.agc_graphics,
+                    shaders: &mut state.agc_shader_registry,
+                    index_resources: &state.agc_index_resources,
+                    video_out: &state.video_out,
+                    submission_count: &mut state.agc_submission_count,
+                    flips: &mut flips,
+                },
+            );
             for (handle, buffer_index, flip_argument) in flips {
                 queue_video_out_flip(state, handle, buffer_index, flip_argument);
             }
@@ -6445,14 +6439,18 @@ fn agc_submit_compute_commands(
 ) -> Result<(), AgcSubmissionError> {
     let (command_address, dword_count) = agc_resolve_acb_descriptor(command_address, dword_count)?;
     let graphics = state.agc_compute_queues.entry(owner).or_default();
-    agc_parse_submission(command_address, dword_count, &mut AgcSubmissionContext {
-        graphics,
-        shaders: &mut state.agc_shader_registry,
-        index_resources: &state.agc_index_resources,
-        video_out: &state.video_out,
-        submission_count: &mut state.agc_submission_count,
-        flips,
-    })
+    agc_parse_submission(
+        command_address,
+        dword_count,
+        &mut AgcSubmissionContext {
+            graphics,
+            shaders: &mut state.agc_shader_registry,
+            index_resources: &state.agc_index_resources,
+            video_out: &state.video_out,
+            submission_count: &mut state.agc_submission_count,
+            flips,
+        },
+    )
 }
 
 fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -6467,7 +6465,8 @@ fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
         return u64::MAX;
     }
     let mut flips = Vec::new();
-    let result = agc_submit_compute_commands(owner, command_address, dword_count, state, &mut flips);
+    let result =
+        agc_submit_compute_commands(owner, command_address, dword_count, state, &mut flips);
     for (handle, buffer_index, flip_argument) in flips {
         queue_video_out_flip(state, handle, buffer_index, flip_argument);
     }
@@ -9930,29 +9929,28 @@ mod platform_independent_tests {
     use super::{
         AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_INDEX_BASE,
         AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
-        AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT,
-        AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET,
-        AGC_R_DRAW_INDEX_AUTO, AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState,
-        AgcShaderRegistry, DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState,
-        PthreadAttrState, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND,
-        SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
-        VideoOutBufferAttributes, VideoOutState, agc_apply_set_base,
-        agc_apply_submission_registers, agc_color_target_state, agc_dcb_draw_index_auto,
-        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_decode_compute_dispatch,
-        agc_driver_submit_acb, agc_pm4, agc_submit_ordered_video_out_flip,
-        allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
-        decode_agc_memory_acquire, destroy_pthread_attr, dispatch_guest_numeric_parser,
-        dispatch_probe_import, guest_clock_gettime, guest_free, guest_global_locale,
-        guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_lseek, guest_kernel_read,
-        guest_posix_file_result, guest_qsort, guest_tolower_table, guest_toupper_table,
-        guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory,
-        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity,
-        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
-        pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
-        resolve_guest_path, sanitize_save_segment, save_data_commit,
-        save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
-        save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
-        save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
+        AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG_INDEX,
+        AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO,
+        AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
+        DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState, PthreadAttrState,
+        SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
+        SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED, VideoOutBufferAttributes,
+        VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_color_target_state,
+        agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
+        agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4,
+        agc_submit_ordered_video_out_flip, allocate_direct_memory, allocate_pthread_thread_object,
+        create_pthread_attr, decode_agc_memory_acquire, destroy_pthread_attr,
+        dispatch_guest_numeric_parser, dispatch_probe_import, guest_clock_gettime, guest_free,
+        guest_global_locale, guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_lseek,
+        guest_kernel_read, guest_posix_file_result, guest_qsort, guest_tolower_table,
+        guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
+        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
+        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_detach_state,
+        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
+        read_guest_u32, read_guest_u64, resolve_guest_path, sanitize_save_segment,
+        save_data_commit, save_data_create_transaction_resource, save_data_dir_name_search,
+        save_data_mount3, save_data_pattern_matches, save_data_prepare, save_data_save_icon,
+        save_data_set_param, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
         system_service_param_get_int, take_exit_callbacks, video_out_open, write_guest_u32,
         write_guest_u64, write_import_stub,
     };
@@ -11235,7 +11233,10 @@ mod platform_independent_tests {
             (super::AGC_CB_COLOR0_VIEW, 0),
             (super::AGC_CB_COLOR0_INFO, 10 << 2),
             (super::AGC_CB_COLOR0_ATTRIB, 0),
-            (super::AGC_CB_COLOR0_ATTRIB2, ((1_280 - 1) << 14) | (720 - 1)),
+            (
+                super::AGC_CB_COLOR0_ATTRIB2,
+                ((1_280 - 1) << 14) | (720 - 1),
+            ),
             (super::AGC_CB_COLOR0_ATTRIB3, (27 << 14) | (1 << 24)),
         ]);
 

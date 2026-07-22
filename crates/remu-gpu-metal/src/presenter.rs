@@ -582,7 +582,9 @@ impl MetalPresenter {
                             }
                         }
                         Err(error) => {
-                            eprintln!("[REMu][METAL] direct scanout synchronization failed: {error}");
+                            eprintln!(
+                                "[REMu][METAL] direct scanout synchronization failed: {error}"
+                            );
                         }
                     }
                     self.pending_flip = Some(PendingFlip {
@@ -3134,9 +3136,7 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
     decode_render_targets_from_registers(&draw.context_registers, export_masks)
 }
 
-fn decode_scanout_target(
-    target: GpuScanoutTarget,
-) -> Result<DecodedRenderTarget, String> {
+fn decode_scanout_target(target: GpuScanoutTarget) -> Result<DecodedRenderTarget, String> {
     if let Some(surface) = target.color_surface {
         let mut decoded = decode_render_target_state(
             target.export_slot,
@@ -3152,7 +3152,9 @@ fn decode_scanout_target(
             || decoded.texture.width != target.width
             || decoded.texture.height != target.height
         {
-            return Err("programmed scanout surface disagrees with VideoOut registration".to_owned());
+            return Err(
+                "programmed scanout surface disagrees with VideoOut registration".to_owned(),
+            );
         }
         decoded.guest_slot = target.export_slot;
         return Ok(decoded);
@@ -3202,11 +3204,19 @@ fn decode_video_out_pixel_format(pixel_format: u64) -> Result<(MTLPixelFormat, u
     const F2_R10_G10_B10_A2_BT2100_PQ: u64 = 0x8100_0704_2200_0000;
     const F2_B10_G10_R10_A2_BT2100_PQ: u64 = 0x8100_0704_0000_0000;
     let pixel_format = match pixel_format {
-        A8_R8_G8_B8_SRGB | A8_B8_G8_R8_SRGB | A2_R10_G10_B10
-        | A2_R10_G10_B10_SRGB | A2_R10_G10_B10_BT2020_PQ
-        | F2_R8_G8_B8_A8_SRGB | F2_B8_G8_R8_A8_SRGB | F2_R10_G10_B10_A2
-        | F2_B10_G10_R10_A2 | F2_R10_G10_B10_A2_SRGB | F2_B10_G10_R10_A2_SRGB
-        | F2_R10_G10_B10_A2_BT2100_PQ | F2_B10_G10_R10_A2_BT2100_PQ => pixel_format,
+        A8_R8_G8_B8_SRGB
+        | A8_B8_G8_R8_SRGB
+        | A2_R10_G10_B10
+        | A2_R10_G10_B10_SRGB
+        | A2_R10_G10_B10_BT2020_PQ
+        | F2_R8_G8_B8_A8_SRGB
+        | F2_B8_G8_R8_A8_SRGB
+        | F2_R10_G10_B10_A2
+        | F2_B10_G10_R10_A2
+        | F2_R10_G10_B10_A2_SRGB
+        | F2_B10_G10_R10_A2_SRGB
+        | F2_R10_G10_B10_A2_BT2100_PQ
+        | F2_B10_G10_R10_A2_BT2100_PQ => pixel_format,
         _ => {
             return Err(format!(
                 "unsupported VideoOut pixel format {pixel_format:#018x}"
@@ -3216,10 +3226,14 @@ fn decode_video_out_pixel_format(pixel_format: u64) -> Result<(MTLPixelFormat, u
     let metal = match pixel_format {
         A8_B8_G8_R8_SRGB | F2_R8_G8_B8_A8_SRGB => MTLPixelFormat::RGBA8Unorm_sRGB,
         A8_R8_G8_B8_SRGB | F2_B8_G8_R8_A8_SRGB => MTLPixelFormat::BGRA8Unorm_sRGB,
-        F2_R10_G10_B10_A2 | F2_R10_G10_B10_A2_SRGB
-        | F2_R10_G10_B10_A2_BT2100_PQ => MTLPixelFormat::RGB10A2Unorm,
-        A2_R10_G10_B10 | A2_R10_G10_B10_SRGB | A2_R10_G10_B10_BT2020_PQ
-        | F2_B10_G10_R10_A2 | F2_B10_G10_R10_A2_SRGB
+        F2_R10_G10_B10_A2 | F2_R10_G10_B10_A2_SRGB | F2_R10_G10_B10_A2_BT2100_PQ => {
+            MTLPixelFormat::RGB10A2Unorm
+        }
+        A2_R10_G10_B10
+        | A2_R10_G10_B10_SRGB
+        | A2_R10_G10_B10_BT2020_PQ
+        | F2_B10_G10_R10_A2
+        | F2_B10_G10_R10_A2_SRGB
         | F2_B10_G10_R10_A2_BT2100_PQ => MTLPixelFormat::BGR10A2Unorm,
         _ => unreachable!("VideoOut format cohort was exhaustively matched"),
     };
@@ -3873,8 +3887,8 @@ mod tests {
         effective_linear_rgba_pitch, guest_texture_byte_count, guest_texture_descriptors_overlap,
         guest_texture_raw_matches, metal_color_write_mask, metal_nonindexed_vertex_count,
         mode27_block_dimensions, mode27_source_byte_offset, mode27_within_block_byte_offset,
-        parse_presentation_resolution, presentation_drawable_size, presentation_viewport, read_draw_indices,
-        snapshot_guest_texture_linear, snapshot_guest_texture_raw,
+        parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
+        read_draw_indices, snapshot_guest_texture_linear, snapshot_guest_texture_raw,
         validate_compute_launch_for_metal, write_guest_texture_linear,
     };
 
@@ -4078,7 +4092,10 @@ mod tests {
 
         assert_eq!(decoded.guest_slot, 0);
         assert_eq!(decoded.texture.address, target.address);
-        assert_eq!((decoded.texture.width, decoded.texture.height), (3_840, 2_160));
+        assert_eq!(
+            (decoded.texture.width, decoded.texture.height),
+            (3_840, 2_160)
+        );
         assert_eq!(decoded.texture.tile_mode, 27);
         assert_eq!(decoded.texture.pixel_format, MTLPixelFormat::RGBA8Unorm);
         assert_eq!(decoded.write_mask, 0xf);
@@ -4102,8 +4119,14 @@ mod tests {
         let decoded = decode_scanout_target(target).expect("valid direct scanout target");
 
         assert!(decoded.direct_scanout);
-        assert_eq!(decoded.texture.pixel_format, MTLPixelFormat::RGBA8Unorm_sRGB);
-        assert_eq!((decoded.texture.width, decoded.texture.height), (3_840, 2_160));
+        assert_eq!(
+            decoded.texture.pixel_format,
+            MTLPixelFormat::RGBA8Unorm_sRGB
+        );
+        assert_eq!(
+            (decoded.texture.width, decoded.texture.height),
+            (3_840, 2_160)
+        );
     }
 
     #[test]
@@ -4124,9 +4147,11 @@ mod tests {
         let texture = presenter.ensure_direct_scanout_texture(&device, descriptor);
         presenter.next_flip_sequence = 1;
 
-        assert!(presenter
-            .activate_direct_scanout(descriptor.address, descriptor.width, descriptor.height)
-            .expect("activate direct scanout"));
+        assert!(
+            presenter
+                .activate_direct_scanout(descriptor.address, descriptor.width, descriptor.height)
+                .expect("activate direct scanout")
+        );
         assert_eq!(presenter.frame_texture_size, (640, 360));
         let output_texture = presenter.frame_texture.as_ref().expect("presented texture");
         assert_eq!(output_texture.width(), texture.width());
