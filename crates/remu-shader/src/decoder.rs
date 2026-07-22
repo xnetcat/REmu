@@ -1805,6 +1805,85 @@ mod tests {
     }
 
     #[test]
+    fn decodes_every_supported_ds_opcode_and_every_control_bit_pattern() {
+        const OPCODES: [(u32, &str, usize, usize); 37] = [
+            (0x00, "DsAddU32", 2, 0),
+            (0x01, "DsSubU32", 2, 0),
+            (0x03, "DsIncU32", 2, 0),
+            (0x04, "DsDecU32", 2, 0),
+            (0x05, "DsMinI32", 2, 0),
+            (0x06, "DsMaxI32", 2, 0),
+            (0x07, "DsMinU32", 2, 0),
+            (0x08, "DsMaxU32", 2, 0),
+            (0x09, "DsAndB32", 2, 0),
+            (0x0a, "DsOrB32", 2, 0),
+            (0x0b, "DsXorB32", 2, 0),
+            (0x0d, "DsWriteB32", 2, 0),
+            (0x0e, "DsWrite2B32", 3, 0),
+            (0x0f, "DsWrite2St64B32", 3, 0),
+            (0x10, "DsCmpstB32", 3, 0),
+            (0x20, "DsAddRtnU32", 2, 1),
+            (0x21, "DsSubRtnU32", 2, 1),
+            (0x23, "DsIncRtnU32", 2, 1),
+            (0x24, "DsDecRtnU32", 2, 1),
+            (0x25, "DsMinRtnI32", 2, 1),
+            (0x26, "DsMaxRtnI32", 2, 1),
+            (0x27, "DsMinRtnU32", 2, 1),
+            (0x28, "DsMaxRtnU32", 2, 1),
+            (0x29, "DsAndRtnB32", 2, 1),
+            (0x2a, "DsOrRtnB32", 2, 1),
+            (0x2b, "DsXorRtnB32", 2, 1),
+            (0x2d, "DsWrxchgRtnB32", 2, 1),
+            (0x30, "DsCmpstRtnB32", 3, 1),
+            (0x35, "DsSwizzleB32", 1, 1),
+            (0x36, "DsReadB32", 1, 1),
+            (0x37, "DsRead2B32", 1, 2),
+            (0x38, "DsRead2St64B32", 1, 2),
+            (0x4d, "DsWriteB64", 3, 0),
+            (0xde, "DsWriteB96", 4, 0),
+            (0xdf, "DsWriteB128", 5, 0),
+            (0xfe, "DsReadB96", 1, 3),
+            (0xff, "DsReadB128", 1, 4),
+        ];
+        let extra = 1u32 | (2u32 << 8) | (3u32 << 16) | (4u32 << 24);
+        for (opcode, name, source_count, destination_count) in OPCODES {
+            let word = 0xd800_0000 | (opcode << 18);
+            let frame = decode_frame(0, &[word, extra]).expect("DS frame");
+            assert_eq!(frame.encoding, ShaderEncoding::Ds);
+            assert!(frame.opcode.is(name));
+            let instruction =
+                create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+            assert_eq!(instruction.sources.len(), source_count, "{name} sources");
+            assert_eq!(
+                instruction.destinations.len(),
+                destination_count,
+                "{name} destinations"
+            );
+        }
+
+        // OFFSET0, OFFSET1, and GDS are independent fields. Cover all 131072 combinations to
+        // prevent a one-bit opcode shift or a truncated concatenated byte offset from regressing.
+        for bits in 0u32..(1 << 17) {
+            let word = 0xd800_0000 | (bits & 0xffff) | ((bits >> 16) << 17);
+            let instruction = create_instruction(
+                0,
+                ShaderEncoding::Ds,
+                Opcode::Known("DsReadB32"),
+                vec![word, extra],
+            );
+            assert_eq!(
+                instruction.control,
+                Some(InstructionControl::DataShare(DataShareControl {
+                    offset0: bits & 0xff,
+                    offset1: (bits >> 8) & 0xff,
+                    gds: bits >> 16 != 0,
+                })),
+                "incorrect DS control for packed bits 0x{bits:05X}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_reserved_scalar_opcode_instead_of_emitting_a_placeholder() {
         let error = decode_program(0x1000, &[0xbe80_0000]).expect_err("reserved SOP1 opcode");
         assert!(matches!(

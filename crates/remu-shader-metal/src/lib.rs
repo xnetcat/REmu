@@ -11,10 +11,10 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use remu_shader::{
-    Dpp8Control, DppControl, ExportControl, ImageBinding, ImageControl, Instruction,
-    InstructionControl, Opcode, Operand, OperandKind, PixelOutputBinding, PixelOutputKind, Program,
-    SdwaControl, ShaderEncoding, ShaderEvaluation, VertexInputBinding, Vop3pControl,
-    decode_inline_constant, decode_unified_format, decode_v2f16_inline_constant,
+    DataShareControl, Dpp8Control, DppControl, ExportControl, ImageBinding, ImageControl,
+    Instruction, InstructionControl, Opcode, Operand, OperandKind, PixelOutputBinding,
+    PixelOutputKind, Program, SdwaControl, ShaderEncoding, ShaderEvaluation, VertexInputBinding,
+    Vop3pControl, decode_inline_constant, decode_unified_format, decode_v2f16_inline_constant,
 };
 
 const SCALAR_REGISTER_COUNT: u32 = 128;
@@ -38,6 +38,14 @@ pub struct MetalCompileOptions {
     pub pixel_outputs: Vec<PixelOutputBinding>,
     pub pixel_input_enable: u32,
     pub pixel_input_address: u32,
+    /// Bytes of guest LDS allocated to each compute workgroup.
+    ///
+    /// A non-zero, dword-aligned value is required only when the program contains an LDS memory
+    /// operation. `DS_SWIZZLE_B32` does not allocate or access LDS and therefore does not require
+    /// this field. Apple GPUs expose at most 32 KiB of threadgroup memory to this backend; larger
+    /// guest allocations are rejected instead of being silently wrapped or spilled with different
+    /// synchronization semantics.
+    pub lds_size_bytes: u32,
 }
 
 impl MetalCompileOptions {
@@ -49,6 +57,7 @@ impl MetalCompileOptions {
             pixel_outputs: Vec::new(),
             pixel_input_enable: 0,
             pixel_input_address: 0,
+            lds_size_bytes: 0,
         }
     }
 
@@ -64,6 +73,19 @@ impl MetalCompileOptions {
             pixel_outputs,
             pixel_input_enable,
             pixel_input_address,
+            lds_size_bytes: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn compute(lds_size_bytes: u32) -> Self {
+        Self {
+            stage: MetalShaderStage::Compute,
+            required_vertex_output_count: 0,
+            pixel_outputs: Vec::new(),
+            pixel_input_enable: 0,
+            pixel_input_address: 0,
+            lds_size_bytes,
         }
     }
 }
@@ -75,6 +97,8 @@ pub struct MetalBindingLayout {
     pub sampler_argument_buffer_index: Option<u32>,
     pub texture_count: u32,
     pub sampler_count: u32,
+    /// Dynamic threadgroup-memory length that the compute encoder must bind at index zero.
+    pub threadgroup_memory_bytes: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,6 +245,16 @@ impl<'a> Compiler<'a> {
         let sampler_count = u32::try_from(sampler_count)
             .map_err(|_| MetalCompileError::InvalidInterface("too many samplers".into()))?;
         let initial_scalar_buffer_index = global_buffer_count;
+        let threadgroup_memory_bytes = if self
+            .program
+            .instructions
+            .iter()
+            .any(is_lds_memory_instruction)
+        {
+            self.options.lds_size_bytes
+        } else {
+            0
+        };
         Ok(MetalShader {
             source,
             entry_point: "remu_main".into(),
@@ -233,6 +267,7 @@ impl<'a> Compiler<'a> {
                 texture_count: u32::try_from(self.image_kinds.len())
                     .map_err(|_| MetalCompileError::InvalidInterface("too many textures".into()))?,
                 sampler_count,
+                threadgroup_memory_bytes,
             },
             vertex_inputs: self.evaluation.vertex_inputs.clone(),
             interpolated_attribute_count: self
@@ -284,6 +319,15 @@ impl<'a> Compiler<'a> {
             // no host instruction and retain their full architectural effect.
             "SNop" | "SWaitcnt" | "SWaitcntDepctr" | "SInstPrefetch" | "STtraceData"
             | "SClause" | "SSendmsg" | "VNop" => {}
+            "SBarrier" => {
+                if self.options.stage != MetalShaderStage::Compute {
+                    return Err(
+                        "workgroup barriers cannot be represented by a Metal graphics stage"
+                            .to_owned(),
+                    );
+                }
+                self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
+            }
             "Exp" => self.emit_export(instruction)?,
             _ if matches!(
                 instruction.control,
@@ -308,6 +352,9 @@ impl<'a> Compiler<'a> {
             ) =>
             {
                 self.emit_buffer_memory(instruction)?;
+            }
+            _ if matches!(instruction.control, Some(InstructionControl::DataShare(_))) => {
+                self.emit_data_share(instruction)?;
             }
             _ if instruction.opcode.starts_with("V") => self.emit_vector_alu(instruction)?,
             _ if instruction.opcode.starts_with("S") => self.emit_scalar_alu(instruction)?,
@@ -349,6 +396,14 @@ impl<'a> Compiler<'a> {
             .any(|instruction| matches!(instruction.control, Some(InstructionControl::Vop3p(_))))
         {
             emit_vop3p_prelude(&mut source);
+        }
+        let uses_lds_memory = self
+            .program
+            .instructions
+            .iter()
+            .any(is_lds_memory_instruction);
+        if uses_lds_memory {
+            emit_data_share_prelude(&mut source);
         }
         if sampler_count != 0 {
             source.push_str("struct RemuSamplers {\n");
@@ -404,6 +459,10 @@ impl<'a> Compiler<'a> {
             }
             MetalShaderStage::Pixel => {}
             MetalShaderStage::Compute => {
+                if uses_lds_memory {
+                    parameters
+                        .push("threadgroup atomic_uint* remu_lds [[threadgroup(0)]]".to_owned());
+                }
                 parameters
                     .push("uint3 remu_local_id [[thread_position_in_threadgroup]]".to_owned());
                 parameters.push("uint3 remu_group_id [[threadgroup_position_in_grid]]".to_owned());
@@ -1912,6 +1971,293 @@ impl<'a> Compiler<'a> {
         Err(format!("unsupported generic buffer opcode {name}"))
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn emit_data_share(&mut self, instruction: &Instruction) -> Result<(), String> {
+        let Some(InstructionControl::DataShare(control)) = instruction.control.as_ref() else {
+            return Err("missing data-share control".to_owned());
+        };
+        if control.gds {
+            return Err("GDS operations require a system-wide data-share resource".to_owned());
+        }
+        let name = instruction
+            .opcode
+            .known_name()
+            .ok_or_else(|| "raw data-share opcode".to_owned())?;
+        if name == "DsSwizzleB32" {
+            return self.emit_ds_swizzle(instruction, control);
+        }
+        if self.options.stage != MetalShaderStage::Compute {
+            return Err(
+                "LDS memory is workgroup-shared and cannot be represented by a Metal graphics stage"
+                    .to_owned(),
+            );
+        }
+        if self.options.lds_size_bytes == 0 || self.options.lds_size_bytes & 3 != 0 {
+            return Err(
+                "LDS memory operations require a non-zero dword-aligned allocation size".to_owned(),
+            );
+        }
+        if self.options.lds_size_bytes > 32 * 1024 {
+            return Err(format!(
+                "{} bytes of guest LDS exceed Apple Metal's 32768-byte threadgroup-memory limit",
+                self.options.lds_size_bytes
+            ));
+        }
+
+        match name {
+            "DsWriteB32" => self.emit_ds_write(instruction, control, 1),
+            "DsWriteB64" => self.emit_ds_write(instruction, control, 2),
+            "DsWriteB96" => self.emit_ds_write(instruction, control, 3),
+            "DsWriteB128" => self.emit_ds_write(instruction, control, 4),
+            "DsWrite2B32" => self.emit_ds_write_pair(instruction, control, false),
+            "DsWrite2St64B32" => self.emit_ds_write_pair(instruction, control, true),
+            "DsReadB32" => self.emit_ds_read(instruction, control, 1),
+            "DsReadB96" => self.emit_ds_read(instruction, control, 3),
+            "DsReadB128" => self.emit_ds_read(instruction, control, 4),
+            "DsRead2B32" => self.emit_ds_read_pair(instruction, control, false),
+            "DsRead2St64B32" => self.emit_ds_read_pair(instruction, control, true),
+            _ if is_lds_atomic_name(name) => self.emit_ds_atomic(instruction, control, name),
+            _ => Err(format!("unsupported LDS opcode {name}")),
+        }
+    }
+
+    fn emit_ds_write(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+        dword_count: usize,
+    ) -> Result<(), String> {
+        if instruction.sources.len() < dword_count + 1 {
+            return Err(format!("LDS write requires {dword_count} data dwords"));
+        }
+        let base = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let first_offset = ds_combined_offset(control);
+        let mut values = Vec::with_capacity(dword_count);
+        for component in 0..dword_count {
+            values.push(self.temp("uint", &self.raw_source(instruction, component + 1)?));
+        }
+        for (component, value) in values.iter().enumerate() {
+            let component_offset = u32::try_from(component)
+                .map_err(|_| "LDS component index overflow".to_owned())?
+                * 4;
+            let address = self.ds_address(&base, first_offset + component_offset);
+            let index = self.temp("uint", &format!("{address} >> 2"));
+            self.emit_ds_store_index(&index, value);
+        }
+        Ok(())
+    }
+
+    fn emit_ds_write_pair(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+        stride64: bool,
+    ) -> Result<(), String> {
+        if instruction.sources.len() < 3 {
+            return Err("LDS write2 requires two data dwords".to_owned());
+        }
+        let base = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let first = self.temp("uint", &self.raw_source(instruction, 1)?);
+        let second = self.temp("uint", &self.raw_source(instruction, 2)?);
+        let scale = if stride64 { 4 * 64 } else { 4 };
+        for (offset, value) in [
+            (control.offset0 * scale, first),
+            (control.offset1 * scale, second),
+        ] {
+            let address = self.ds_address(&base, offset);
+            let index = self.temp("uint", &format!("{address} >> 2"));
+            self.emit_ds_store_index(&index, &value);
+        }
+        Ok(())
+    }
+
+    fn emit_ds_read(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+        dword_count: usize,
+    ) -> Result<(), String> {
+        if instruction.destinations.len() < dword_count {
+            return Err(format!(
+                "LDS read requires {dword_count} destination dwords"
+            ));
+        }
+        let base = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let first_offset = ds_combined_offset(control);
+        let mut values = Vec::with_capacity(dword_count);
+        for component in 0..dword_count {
+            let component_offset = u32::try_from(component)
+                .map_err(|_| "LDS component index overflow".to_owned())?
+                * 4;
+            let address = self.ds_address(&base, first_offset + component_offset);
+            let index = self.temp("uint", &format!("{address} >> 2"));
+            values.push(self.emit_ds_load_index(&index));
+        }
+        for (destination, value) in instruction.destinations.iter().zip(values) {
+            self.store_vector(vector_operand(*destination)?, &value);
+        }
+        Ok(())
+    }
+
+    fn emit_ds_read_pair(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+        stride64: bool,
+    ) -> Result<(), String> {
+        if instruction.destinations.len() < 2 {
+            return Err("LDS read2 requires two destination dwords".to_owned());
+        }
+        let base = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let scale = if stride64 { 4 * 64 } else { 4 };
+        let mut values = Vec::with_capacity(2);
+        for offset in [control.offset0 * scale, control.offset1 * scale] {
+            let address = self.ds_address(&base, offset);
+            let index = self.temp("uint", &format!("{address} >> 2"));
+            values.push(self.emit_ds_load_index(&index));
+        }
+        for (destination, value) in instruction.destinations.iter().zip(values) {
+            self.store_vector(vector_operand(*destination)?, &value);
+        }
+        Ok(())
+    }
+
+    fn emit_ds_atomic(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+        name: &str,
+    ) -> Result<(), String> {
+        let required_sources = if matches!(name, "DsCmpstB32" | "DsCmpstRtnB32") {
+            3
+        } else {
+            2
+        };
+        if instruction.sources.len() < required_sources {
+            return Err(format!("{name} has missing atomic operands"));
+        }
+        let base = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let address = self.ds_address(&base, ds_combined_offset(control));
+        let index = self.temp("uint", &format!("{address} >> 2"));
+        let data0 = self.temp("uint", &self.raw_source(instruction, 1)?);
+        let data1 = if required_sources == 3 {
+            Some(self.temp("uint", &self.raw_source(instruction, 2)?))
+        } else {
+            None
+        };
+        let original = self.temp("uint", "0u");
+        let pointer = format!("remu_lds + {index}");
+        let operation = match name {
+            "DsAddU32" | "DsAddRtnU32" => {
+                format!("atomic_fetch_add_explicit({pointer}, {data0}, memory_order_relaxed)")
+            }
+            "DsSubU32" | "DsSubRtnU32" => {
+                format!("atomic_fetch_sub_explicit({pointer}, {data0}, memory_order_relaxed)")
+            }
+            "DsIncU32" | "DsIncRtnU32" => format!("remu_ds_inc({pointer}, {data0})"),
+            "DsDecU32" | "DsDecRtnU32" => format!("remu_ds_dec({pointer}, {data0})"),
+            "DsMinI32" | "DsMinRtnI32" => format!("remu_ds_smin({pointer}, {data0})"),
+            "DsMaxI32" | "DsMaxRtnI32" => format!("remu_ds_smax({pointer}, {data0})"),
+            "DsMinU32" | "DsMinRtnU32" => {
+                format!("atomic_fetch_min_explicit({pointer}, {data0}, memory_order_relaxed)")
+            }
+            "DsMaxU32" | "DsMaxRtnU32" => {
+                format!("atomic_fetch_max_explicit({pointer}, {data0}, memory_order_relaxed)")
+            }
+            "DsAndB32" | "DsAndRtnB32" => {
+                format!("atomic_fetch_and_explicit({pointer}, {data0}, memory_order_relaxed)")
+            }
+            "DsOrB32" | "DsOrRtnB32" => {
+                format!("atomic_fetch_or_explicit({pointer}, {data0}, memory_order_relaxed)")
+            }
+            "DsXorB32" | "DsXorRtnB32" => {
+                format!("atomic_fetch_xor_explicit({pointer}, {data0}, memory_order_relaxed)")
+            }
+            "DsWrxchgRtnB32" => {
+                format!("atomic_exchange_explicit({pointer}, {data0}, memory_order_relaxed)")
+            }
+            "DsCmpstB32" | "DsCmpstRtnB32" => format!(
+                "remu_ds_cmpst({pointer}, {data0}, {})",
+                data1.expect("compare/store requires DATA1")
+            ),
+            _ => return Err(format!("unsupported LDS atomic opcode {name}")),
+        };
+        self.line(
+            3,
+            &format!(
+                "if (exec && {index} < {}u && {index} <= (s[124] >> 2)) {original} = {operation};",
+                self.options.lds_size_bytes / 4
+            ),
+        );
+        if name.contains("Rtn") {
+            let destination = instruction
+                .destinations
+                .first()
+                .copied()
+                .ok_or_else(|| format!("{name} has no return destination"))?;
+            self.store_vector(vector_operand(destination)?, &original);
+        }
+        Ok(())
+    }
+
+    fn emit_ds_swizzle(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+    ) -> Result<(), String> {
+        if instruction.sources.len() != 1 || instruction.destinations.len() != 1 {
+            return Err("DS_SWIZZLE_B32 requires one source and one destination".to_owned());
+        }
+        let source = vector_operand(instruction.sources[0])?;
+        let destination = vector_operand(instruction.destinations[0])?;
+        let offset = u16::try_from(ds_combined_offset(control))
+            .expect("two 8-bit data-share offsets fit u16");
+        let source_lane = self.temp("uint", &ds_swizzle_lane_expression(offset));
+        let shuffled = self.temp(
+            "uint",
+            &format!("simd_shuffle(v[{source}], (ushort)({source_lane} & 31u))"),
+        );
+        let source_active = self.temp(
+            "uint",
+            &format!("simd_shuffle(exec ? 1u : 0u, (ushort)({source_lane} & 31u))"),
+        );
+        self.store_vector(
+            destination,
+            &format!("{source_active} != 0u ? {shuffled} : 0u"),
+        );
+        Ok(())
+    }
+
+    fn ds_address(&mut self, base: &str, offset_bytes: u32) -> String {
+        if offset_bytes == 0 {
+            base.to_owned()
+        } else {
+            self.temp("uint", &format!("{base} + {}", format_u32(offset_bytes)))
+        }
+    }
+
+    fn emit_ds_load_index(&mut self, index: &str) -> String {
+        let value = self.temp("uint", "0u");
+        self.line(
+            3,
+            &format!(
+                "if (exec && {index} < {}u && {index} <= (s[124] >> 2)) {value} = atomic_load_explicit(remu_lds + {index}, memory_order_relaxed);",
+                self.options.lds_size_bytes / 4
+            ),
+        );
+        value
+    }
+
+    fn emit_ds_store_index(&mut self, index: &str, value: &str) {
+        self.line(
+            3,
+            &format!(
+                "if (exec && {index} < {}u && {index} <= (s[124] >> 2)) atomic_store_explicit(remu_lds + {index}, {value}, memory_order_relaxed);",
+                self.options.lds_size_bytes / 4
+            ),
+        );
+    }
+
     fn emit_format_buffer_load(
         &mut self,
         control: &remu_shader::BufferMemoryControl,
@@ -2237,6 +2583,149 @@ fn format_u32(value: u32) -> String {
     } else {
         format!("0x{value:X}u")
     }
+}
+
+fn is_lds_memory_instruction(instruction: &Instruction) -> bool {
+    matches!(instruction.control, Some(InstructionControl::DataShare(_)))
+        && !instruction.opcode.is("DsSwizzleB32")
+}
+
+fn is_lds_atomic_name(name: &str) -> bool {
+    matches!(
+        name,
+        "DsAddU32"
+            | "DsSubU32"
+            | "DsIncU32"
+            | "DsDecU32"
+            | "DsMinI32"
+            | "DsMaxI32"
+            | "DsMinU32"
+            | "DsMaxU32"
+            | "DsAndB32"
+            | "DsOrB32"
+            | "DsXorB32"
+            | "DsCmpstB32"
+            | "DsAddRtnU32"
+            | "DsSubRtnU32"
+            | "DsIncRtnU32"
+            | "DsDecRtnU32"
+            | "DsMinRtnI32"
+            | "DsMaxRtnI32"
+            | "DsMinRtnU32"
+            | "DsMaxRtnU32"
+            | "DsAndRtnB32"
+            | "DsOrRtnB32"
+            | "DsXorRtnB32"
+            | "DsWrxchgRtnB32"
+            | "DsCmpstRtnB32"
+    )
+}
+
+const fn ds_combined_offset(control: &DataShareControl) -> u32 {
+    control.offset0 | (control.offset1 << 8)
+}
+
+fn ds_swizzle_lane_expression(offset: u16) -> String {
+    if offset >= 0xe000 {
+        let mask = u32::from(offset & 0x1f);
+        let reverse = if mask.count_ones() == 5 {
+            "0u".to_owned()
+        } else {
+            format!(
+                "(reverse_bits(remu_lane & 31u) >> {}u)",
+                27 + mask.count_ones()
+            )
+        };
+        format!("({reverse} | (remu_lane & {mask}u))")
+    } else if offset >= 0xc000 {
+        let rotate = u32::from((offset >> 5) & 0x1f);
+        let mask = u32::from(offset & 0x1f);
+        let delta = if offset & (1 << 10) == 0 {
+            rotate
+        } else {
+            32 - rotate
+        };
+        format!(
+            "((remu_lane & {mask}u) | (((remu_lane + {delta}u) & 31u) & {}u))",
+            31 ^ mask
+        )
+    } else if offset & 0x8000 != 0 {
+        format!("((remu_lane & 0xFFFFFFFCu) | ((0x{offset:04X}u >> ((remu_lane & 3u) * 2u)) & 3u))")
+    } else {
+        let and_mask = u32::from(offset & 0x1f);
+        let or_mask = u32::from((offset >> 5) & 0x1f);
+        let xor_mask = u32::from((offset >> 10) & 0x1f);
+        format!(
+            "((remu_lane & 0xFFFFFFE0u) | ((((remu_lane & 31u) & {and_mask}u) | {or_mask}u) ^ {xor_mask}u))"
+        )
+    }
+}
+
+fn emit_data_share_prelude(source: &mut String) {
+    source.push_str(
+        r"inline uint remu_ds_inc(threadgroup atomic_uint* location, uint ceiling) {
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint desired = observed >= ceiling ? 0u : observed + 1u;
+        uint expected = observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_ds_dec(threadgroup atomic_uint* location, uint ceiling) {
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint desired = (observed == 0u || observed > ceiling) ? ceiling : observed - 1u;
+        uint expected = observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_ds_smin(threadgroup atomic_uint* location, uint value) {
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint desired = as_type<int>(value) < as_type<int>(observed) ? value : observed;
+        uint expected = observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_ds_smax(threadgroup atomic_uint* location, uint value) {
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint desired = as_type<int>(value) > as_type<int>(observed) ? value : observed;
+        uint expected = observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+}
+
+inline uint remu_ds_cmpst(threadgroup atomic_uint* location, uint comparator,
+                         uint replacement) {
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (observed == comparator) {
+        uint expected = observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, replacement,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return observed;
+        observed = expected;
+    }
+    return observed;
+}
+
+",
+    );
 }
 
 fn is_format_buffer_load(instruction: &Instruction) -> bool {
@@ -2626,7 +3115,8 @@ fn image_component_type(binding: &ImageBinding) -> &'static str {
 #[cfg(test)]
 mod tests {
     use remu_shader::{
-        Dpp8Control, DppControl, Instruction, Program, ShaderEvaluation, Vop3pControl,
+        DataShareControl, Dpp8Control, DppControl, Instruction, Program, ShaderEvaluation,
+        Vop3pControl, decode_program,
     };
 
     use super::*;
@@ -2675,6 +3165,72 @@ mod tests {
         }
     }
 
+    const DS_OPCODES: [(u32, &str); 37] = [
+        (0x00, "DsAddU32"),
+        (0x01, "DsSubU32"),
+        (0x03, "DsIncU32"),
+        (0x04, "DsDecU32"),
+        (0x05, "DsMinI32"),
+        (0x06, "DsMaxI32"),
+        (0x07, "DsMinU32"),
+        (0x08, "DsMaxU32"),
+        (0x09, "DsAndB32"),
+        (0x0a, "DsOrB32"),
+        (0x0b, "DsXorB32"),
+        (0x0d, "DsWriteB32"),
+        (0x0e, "DsWrite2B32"),
+        (0x0f, "DsWrite2St64B32"),
+        (0x10, "DsCmpstB32"),
+        (0x20, "DsAddRtnU32"),
+        (0x21, "DsSubRtnU32"),
+        (0x23, "DsIncRtnU32"),
+        (0x24, "DsDecRtnU32"),
+        (0x25, "DsMinRtnI32"),
+        (0x26, "DsMaxRtnI32"),
+        (0x27, "DsMinRtnU32"),
+        (0x28, "DsMaxRtnU32"),
+        (0x29, "DsAndRtnB32"),
+        (0x2a, "DsOrRtnB32"),
+        (0x2b, "DsXorRtnB32"),
+        (0x2d, "DsWrxchgRtnB32"),
+        (0x30, "DsCmpstRtnB32"),
+        (0x35, "DsSwizzleB32"),
+        (0x36, "DsReadB32"),
+        (0x37, "DsRead2B32"),
+        (0x38, "DsRead2St64B32"),
+        (0x4d, "DsWriteB64"),
+        (0xde, "DsWriteB96"),
+        (0xdf, "DsWriteB128"),
+        (0xfe, "DsReadB96"),
+        (0xff, "DsReadB128"),
+    ];
+
+    fn decoded_ds_program(offset: u16, gds: bool) -> Program {
+        let mut words = Vec::with_capacity(DS_OPCODES.len() * 2 + 1);
+        for (opcode, _) in DS_OPCODES {
+            words.push(0xd800_0000 | (opcode << 18) | (u32::from(gds) << 17) | u32::from(offset));
+            words.push(1u32 | (2u32 << 8) | (3u32 << 16) | (8u32 << 24));
+        }
+        words.extend([0xbf8a_0000, 0xbf81_0000]);
+        decode_program(0x1000, &words).expect("complete DS test program")
+    }
+
+    fn ds_swizzle_instruction(offset: u16) -> Instruction {
+        Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Ds,
+            opcode: Opcode::Known("DsSwizzleB32"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(2)],
+            destinations: vec![Operand::vector(8)],
+            control: Some(InstructionControl::DataShare(DataShareControl {
+                offset0: u32::from(offset & 0xff),
+                offset1: u32::from(offset >> 8),
+                gds: false,
+            })),
+        }
+    }
+
     fn compile_vector_instruction(
         instruction: Instruction,
         stage: MetalShaderStage,
@@ -2688,6 +3244,7 @@ mod tests {
                 pixel_outputs: Vec::new(),
                 pixel_input_enable: 0,
                 pixel_input_address: 0,
+                lds_size_bytes: 0,
             },
         )
         .expect("vector instruction should lower")
@@ -2717,6 +3274,132 @@ mod tests {
         )
         .expect_err("raw opcode must fail");
         assert!(error.to_string().contains("raw opcode"));
+    }
+
+    #[test]
+    fn lowers_every_decoded_ds_operation_with_architectural_offsets_and_atomics() {
+        let program = decoded_ds_program(0x1234, false);
+        for (instruction, (_, name)) in program.instructions.iter().zip(DS_OPCODES) {
+            assert!(instruction.opcode.is(name));
+        }
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(32 * 1024),
+        )
+        .expect("every decoded DS operation should lower");
+        assert_eq!(shader.bindings.threadgroup_memory_bytes, 32 * 1024);
+        assert!(
+            shader
+                .source
+                .contains("threadgroup atomic_uint* remu_lds [[threadgroup(0)]]")
+        );
+        assert!(shader.source.contains("+ 0x1234u"));
+        assert!(shader.source.contains("+ 0xD0u"));
+        assert!(shader.source.contains("+ 0x48u"));
+        assert!(shader.source.contains("+ 0x3400u"));
+        assert!(shader.source.contains("+ 0x1200u"));
+        assert!(shader.source.contains("atomic_fetch_add_explicit"));
+        assert!(shader.source.contains("atomic_fetch_sub_explicit"));
+        assert!(shader.source.contains("atomic_fetch_min_explicit"));
+        assert!(shader.source.contains("atomic_fetch_max_explicit"));
+        assert!(shader.source.contains("atomic_fetch_and_explicit"));
+        assert!(shader.source.contains("atomic_fetch_or_explicit"));
+        assert!(shader.source.contains("atomic_fetch_xor_explicit"));
+        assert!(shader.source.contains("atomic_exchange_explicit"));
+        assert!(shader.source.contains("remu_ds_inc"));
+        assert!(
+            shader
+                .source
+                .contains("observed >= ceiling ? 0u : observed + 1u")
+        );
+        assert!(
+            shader
+                .source
+                .contains("(observed == 0u || observed > ceiling) ? ceiling : observed - 1u")
+        );
+        assert!(shader.source.contains("remu_ds_cmpst"));
+        assert!(shader.source.contains("if (exec &&"));
+        assert!(shader.source.contains("< 8192u"));
+        assert!(shader.source.contains("<= (s[124] >> 2)"));
+        assert!(
+            shader
+                .source
+                .contains("threadgroup_barrier(mem_flags::mem_threadgroup)")
+        );
+    }
+
+    #[test]
+    fn ds_rejects_unrepresentable_resources_instead_of_wrapping_or_privatizing_memory() {
+        let memory_program = Program::new(
+            0x1000,
+            vec![decoded_ds_program(0, false).instructions[0].clone()],
+        );
+        let graphics_error = compile_msl(
+            &memory_program,
+            &empty_evaluation(),
+            &MetalCompileOptions::vertex(0),
+        )
+        .expect_err("graphics LDS must not become lane-private scratch");
+        assert!(graphics_error.to_string().contains("workgroup-shared"));
+
+        let missing_size = compile_msl(
+            &memory_program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(0),
+        )
+        .expect_err("compute LDS requires its architectural allocation size");
+        assert!(missing_size.to_string().contains("non-zero dword-aligned"));
+
+        let oversized = compile_msl(
+            &memory_program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(64 * 1024),
+        )
+        .expect_err("64 KiB guest LDS cannot silently alias 32 KiB Metal memory");
+        assert!(oversized.to_string().contains("32768-byte"));
+
+        let gds_program = decoded_ds_program(0, true);
+        let gds_error = compile_msl(
+            &gds_program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(32 * 1024),
+        )
+        .expect_err("GDS needs a system-wide resource");
+        assert!(gds_error.to_string().contains("system-wide"));
+    }
+
+    #[test]
+    fn lowers_all_65536_ds_swizzle_controls_and_all_four_isa_modes() {
+        let seed = ds_swizzle_instruction(0);
+        let program = Program::new(0x1000, vec![seed]);
+        let evaluation = empty_evaluation();
+        let options = MetalCompileOptions::vertex(0);
+        let mut compiler = Compiler::new(&program, &evaluation, &options).expect("compiler");
+        for offset in 0u16..=u16::MAX {
+            compiler.body.clear();
+            compiler.next_temp = 0;
+            compiler
+                .emit_data_share(&ds_swizzle_instruction(offset))
+                .unwrap_or_else(|error| panic!("swizzle 0x{offset:04X} did not lower: {error}"));
+            assert!(compiler.body.contains("simd_shuffle(v[2]"));
+            assert!(compiler.body.contains("simd_shuffle(exec ? 1u : 0u"));
+            assert!(compiler.body.contains("if (exec) v[8]"));
+        }
+
+        let basic =
+            compile_vector_instruction(ds_swizzle_instruction(0x041f), MetalShaderStage::Vertex);
+        assert!(basic.source.contains("remu_lane & 31u"));
+        let quad =
+            compile_vector_instruction(ds_swizzle_instruction(0x80f6), MetalShaderStage::Vertex);
+        assert!(quad.source.contains("0x80F6u >> ((remu_lane & 3u) * 2u)"));
+        let rotate =
+            compile_vector_instruction(ds_swizzle_instruction(0xc020), MetalShaderStage::Vertex);
+        assert!(rotate.source.contains("remu_lane + 1u"));
+        let fft =
+            compile_vector_instruction(ds_swizzle_instruction(0xe000), MetalShaderStage::Vertex);
+        assert!(fft.source.contains("reverse_bits(remu_lane & 31u)"));
+        assert!(!fft.source.contains("threadgroup atomic_uint* remu_lds"));
     }
 
     #[test]
@@ -2956,6 +3639,7 @@ mod tests {
                 pixel_outputs: Vec::new(),
                 pixel_input_enable: 0,
                 pixel_input_address: 0,
+                lds_size_bytes: 0,
             },
         )
         .expect("compute compare should lower");
@@ -3431,6 +4115,7 @@ mod tests {
                     pixel_outputs: Vec::new(),
                     pixel_input_enable: 0,
                     pixel_input_address: 0,
+                    lds_size_bytes: 0,
                 },
             };
             let shader = compile_msl(&program, &empty_evaluation(), &options)
@@ -3459,6 +4144,113 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(directory).expect("remove Metal test directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_ds_msl_compiles_with_apple_metal_in_every_valid_stage() {
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+        fn find_metal_compiler() -> Option<PathBuf> {
+            if let Some(path) = std::env::var_os("REMU_METAL_COMPILER").map(PathBuf::from)
+                && path.is_file()
+            {
+                return Some(path);
+            }
+            let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.remu/toolchains/Metal.xctoolchain/usr/bin/metal");
+            if bundled.is_file() {
+                return Some(bundled);
+            }
+            let output = Command::new("xcrun")
+                .args(["--find", "metal"])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+        }
+
+        let Some(compiler) = find_metal_compiler() else {
+            eprintln!("skipping Apple Metal DS compile test: no metal compiler found");
+            return;
+        };
+        let mut swizzles = [0x041f, 0x80f6, 0xc020, 0xe000]
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                let mut instruction = ds_swizzle_instruction(offset);
+                instruction.pc = u32::try_from(index * 8).expect("small swizzle program");
+                instruction
+            })
+            .collect::<Vec<_>>();
+        swizzles.push(Instruction {
+            pc: 32,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0xbf81_0000],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        });
+        let swizzle_program = Program::new(0x1000, swizzles);
+        let programs = [
+            (
+                "compute",
+                decoded_ds_program(0x1234, false),
+                MetalCompileOptions::compute(32 * 1024),
+            ),
+            (
+                "vertex",
+                swizzle_program.clone(),
+                MetalCompileOptions::vertex(0),
+            ),
+            (
+                "pixel",
+                swizzle_program,
+                MetalCompileOptions::pixel(
+                    vec![PixelOutputBinding {
+                        guest_slot: 0,
+                        host_location: 0,
+                        kind: PixelOutputKind::Float,
+                    }],
+                    0,
+                    0,
+                ),
+            ),
+        ];
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("remu-ds-metal-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create Metal DS test directory");
+
+        for (stem, program, options) in programs {
+            let shader = compile_msl(&program, &empty_evaluation(), &options)
+                .expect("valid DS program should lower");
+            let source = directory.join(format!("{stem}.metal"));
+            let air = directory.join(format!("{stem}.air"));
+            std::fs::write(&source, shader.source).expect("write generated DS MSL");
+            let output = Command::new(&compiler)
+                .args(["-c", "-target", "air64-apple-macosx15.0"])
+                .arg("-fmetal-math-mode=safe")
+                .arg("-o")
+                .arg(&air)
+                .arg(&source)
+                .output()
+                .expect("run Apple Metal compiler");
+            assert!(
+                output.status.success(),
+                "{stem} DS MSL failed to compile:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::remove_dir_all(directory).expect("remove Metal DS test directory");
     }
 
     #[test]
