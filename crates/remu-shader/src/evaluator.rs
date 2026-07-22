@@ -565,7 +565,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             binding.writable |= request.writable;
             return Ok(());
         }
-        let data = if request.base_address == 0 && request.supplemental {
+        let data = if request.supplemental {
             vec![0; usize::try_from(request.requested_bytes.clamp(4, 4096)).unwrap_or(4)]
         } else if request.allow_shorter {
             self.read_adaptive_binding(
@@ -1784,6 +1784,52 @@ mod tests {
         assert_eq!(evaluation.scalar_registers[5], 0xaabb_ccdd);
         assert_eq!(evaluation.global_memory_bindings.len(), 1);
         assert_eq!(evaluation.global_memory_bindings[0].data.len(), 8);
+    }
+
+    #[test]
+    fn represents_untaken_global_memory_paths_without_copying_guest_buffers() {
+        let mut branch = instruction(
+            0,
+            ShaderEncoding::Sopp,
+            "SBranch",
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        branch.words[0] = 1;
+        let shader = state(
+            vec![
+                branch,
+                instruction(
+                    4,
+                    ShaderEncoding::Flat,
+                    "GlobalLoadDword",
+                    Vec::new(),
+                    Vec::new(),
+                    Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        scalar_address: 0,
+                        offset_bytes: 0,
+                        glc: false,
+                        slc: false,
+                    })),
+                ),
+                end(8),
+            ],
+            vec![0x2000, 0],
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("supplemental resource discovery");
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].base_address, 0x2000);
+        assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4096]);
     }
 
     #[test]
