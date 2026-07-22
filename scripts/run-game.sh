@@ -102,6 +102,9 @@ fi
 if [ "${MTL_HUD_LOG_ENABLED:-0}" = 1 ]; then
     echo "[REMu] Metal Performance HUD logging enabled"
 fi
+if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
+    echo "[REMu] headless Metal presenter enabled"
+fi
 set +e
 if [ "$capture_frames" = 1 ]; then
     env REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \

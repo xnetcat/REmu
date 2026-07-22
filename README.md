@@ -55,6 +55,10 @@ Enable Apple's in-window Metal Performance HUD with `REMU_METAL_HUD=1`; add
 comma-separated Cross-button schedule with `REMU_AUTO_CROSS`. Detailed first-seen shader register dumps are opt-in through
 `REMU_TRACE_AGC_SHADERS=1`.
 
+For unattended Metal translation and frame capture without creating an AppKit window, set both
+`REMU_HEADLESS_METAL=1` and `REMU_CAPTURE_FRAMES=1`. The normal interactive presenter remains the
+default.
+
 On Apple Silicon, use the crash-capturing probe wrapper during game bring-up. It builds the
 x86-64 release binary, launches it under Rosetta and LLDB, and keeps the guest logs, backtraces,
 registers, revision, and launch settings together under `.remu/runs/`:
