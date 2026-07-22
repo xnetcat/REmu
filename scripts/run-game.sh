@@ -382,7 +382,11 @@ cleanup() {
         kill "$child_pid" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT HUP INT TERM
+# Native AppKit activation and terminal workspace changes can transiently detach the controlling
+# PTY. Keep bounded game runs alive across SIGHUP; Ctrl+C and explicit termination still clean up
+# the child normally.
+trap '' HUP
+trap cleanup EXIT INT TERM
 
 echo "[REMu] launching $game_name; artifacts: $run_dir"
 echo "[REMu] render resolution: $render_size ($render_policy)"
