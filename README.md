@@ -4,8 +4,9 @@ REmu is an experimental PlayStation 5 compatibility layer written in Rust. Its g
 legally dumped games directly on desktop operating systems without emulating the PlayStation shell.
 
 The project maps and runs authorized x86-64 game dumps under Rosetta. Dreaming Sarah currently
-boots through resource loading and renders its title through the Metal presentation path; title-to-
-menu transition work is in progress.
+boots through resource loading, submits AGC draw streams, compiles observed RDNA2 shaders to Metal,
+and flips its display buffers. Complete render-target state propagation is still in progress; the
+latest captured guest buffers are black, so visual game output is not claimed yet.
 
 See the [architecture](docs/architecture.md), [implementation roadmap](docs/roadmap.md), and
 [reference audit](docs/reference-audit.md). Adapted implementation sources are tracked in
@@ -32,18 +33,27 @@ cargo run -p remu-cli -- run /path/to/eboot.bin
 cargo run -p remu-cli -- gpu-info
 ```
 
-For repeatable Apple Silicon game runs, use the bounded runner. It builds the x86-64 release,
-injects periodic Cross presses, captures changed frames, records unresolved NIDs, and always cleans
-up its exact child process:
+For repeatable Apple Silicon game runs, use the runner. It builds the x86-64 release, injects
+periodic Cross presses, records unresolved NIDs, and keeps logs and optional captures under
+`.remu/runs/`. With no second argument it is interactive and has no timer; pass a positive number of
+seconds only for a bounded diagnostic run:
 
 ```sh
+scripts/run-game.sh DREAMING
+scripts/run-game.sh SUPERLIMINAL
 scripts/run-game.sh DREAMING 120
-scripts/run-game.sh SUPERLIMINAL 120
 ```
 
-Set `REMU_CAPTURE_FRAMES=0` for faster control-flow probes that do not need screenshots. Override
-the comma-separated input schedule with `REMU_AUTO_CROSS`; detailed first-seen shader register
-dumps are opt-in through `REMU_TRACE_AGC_SHADERS=1`.
+Frame capture is disabled by default because reading and writing a 4K guest buffer is expensive;
+enable it with `REMU_CAPTURE_FRAMES=1`. `REMU_PRESENTATION_SIZE=window` (the default) renders the
+host drawable at logical window resolution, `native` uses Retina backing resolution, and a value
+such as `1920x1080` selects a fixed drawable size. These options scale only presentation: the guest
+keeps the display-buffer dimensions it requested.
+
+Enable Apple's in-window Metal Performance HUD with `REMU_METAL_HUD=1`; add
+`REMU_METAL_HUD_LOG=1` to record its metrics. Override the comma-separated input schedule with
+`REMU_AUTO_CROSS`; detailed first-seen shader register dumps are opt-in through
+`REMU_TRACE_AGC_SHADERS=1`.
 
 On Apple Silicon, use the crash-capturing probe wrapper during game bring-up. It builds the
 x86-64 release binary, launches it under Rosetta and LLDB, and keeps the guest logs, backtraces,
