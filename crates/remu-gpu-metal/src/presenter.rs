@@ -15,11 +15,12 @@ use std::time::{Duration, Instant};
 use core_graphics_types::geometry::CGSize;
 use metal::{
     Buffer, CommandBuffer, CompileOptions, ComputePipelineState, Device, Function, Library,
-    MTLClearColor, MTLCommandBufferStatus, MTLIndexType, MTLLoadAction, MTLPixelFormat,
-    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter,
-    MTLSamplerMipFilter, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
-    MTLTextureUsage, MTLViewport, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
-    RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
+    MTLClearColor, MTLColorWriteMask, MTLCommandBufferStatus, MTLIndexType, MTLLoadAction,
+    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode,
+    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLScissorRect, MTLSize, MTLStorageMode,
+    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer, RenderPassDescriptor,
+    RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor, SamplerState, Texture,
+    TextureDescriptor,
 };
 use objc::runtime::{Object, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -30,7 +31,7 @@ use remu_gpu::{
     PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
 };
 use remu_memory::CpuWriteWatch;
-use remu_shader::{ImageBinding, ShaderEvaluation};
+use remu_shader::{ImageBinding, PixelOutputKind, ShaderEvaluation};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -41,6 +42,21 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+// GFX10 context-register offsets are the MMIO dword address minus 0xA000. Color registers
+// 0..7 use a 15-dword primary stride; the high address and GFX10 extent/swizzle registers are
+// stored in separate dense eight-register arrays. These values match Mesa's generated gfx10
+// register database and SharpEmu's AGC command-stream decoder.
+const CB_TARGET_MASK: u32 = 0x08e;
+const CB_COLOR0_BASE: u32 = 0x318;
+const CB_COLOR_REGISTER_STRIDE: u32 = 15;
+const CB_COLOR0_VIEW: u32 = 0x31b;
+const CB_COLOR0_INFO: u32 = 0x31c;
+const CB_COLOR0_ATTRIB: u32 = 0x31d;
+const CB_COLOR0_BASE_EXT: u32 = 0x390;
+const CB_COLOR0_ATTRIB2: u32 = 0x3b0;
+const CB_COLOR0_ATTRIB3: u32 = 0x3b8;
+const COLOR_TARGET_COUNT: u32 = 8;
 
 const PRESENTATION_SHADER_SOURCE: &str = r"
 #include <metal_stdlib>
@@ -124,6 +140,38 @@ struct GuestTextureDescriptor {
     height: u32,
     pitch: u32,
     tile_mode: u32,
+    pixel_format: MTLPixelFormat,
+    bytes_per_pixel: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RenderTargetFormat {
+    pixel_format: MTLPixelFormat,
+    output_kind: PixelOutputKind,
+    bytes_per_pixel: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RenderTargetPipelineState {
+    guest_slot: u32,
+    pixel_format: MTLPixelFormat,
+    output_kind: PixelOutputKind,
+    write_mask: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GraphicsPipelineKey {
+    export_shader_address: u64,
+    pixel_shader_address: u64,
+    targets: Vec<RenderTargetPipelineState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedRenderTarget {
+    guest_slot: u32,
+    texture: GuestTextureDescriptor,
+    output_kind: PixelOutputKind,
+    write_mask: u32,
 }
 
 struct CompiledShaderPair {
@@ -178,8 +226,13 @@ struct ComputePipelineKey {
 }
 
 struct ShaderCompileResult {
-    key: (u64, u64),
+    key: GraphicsPipelineKey,
     compiled: Result<CompiledShaderPair, String>,
+}
+
+struct ShaderCompileRequest {
+    key: GraphicsPipelineKey,
+    draw: IndexedDraw,
 }
 
 struct UploadedImageTexture {
@@ -325,10 +378,10 @@ struct MetalPresenter {
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
     captured_guest_frames: HashSet<(u64, u32, u32, u32, u64)>,
     last_guest_capture: Option<Instant>,
-    compiled_shader_pairs: HashMap<(u64, u64), CompiledShaderPair>,
-    compiling_shader_pairs: HashSet<(u64, u64)>,
-    failed_shader_pairs: HashSet<(u64, u64)>,
-    failed_draw_execution: HashSet<(u64, u64)>,
+    compiled_shader_pairs: HashMap<GraphicsPipelineKey, CompiledShaderPair>,
+    compiling_shader_pairs: HashSet<GraphicsPipelineKey>,
+    failed_shader_pairs: HashSet<GraphicsPipelineKey>,
+    failed_draw_execution: HashSet<GraphicsPipelineKey>,
     compiled_compute_pipelines: HashMap<ComputePipelineKey, CompiledComputePipeline>,
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
@@ -339,7 +392,7 @@ struct MetalPresenter {
     committed_guest_batches: VecDeque<GuestCommandBatch>,
     capture_directory: Option<PathBuf>,
     pressed_keys: HashSet<KeyCode>,
-    shader_compile_sender: Sender<IndexedDraw>,
+    shader_compile_sender: Sender<ShaderCompileRequest>,
     shader_compile_receiver: Receiver<ShaderCompileResult>,
     redraw_pending: bool,
 }
@@ -351,17 +404,18 @@ impl MetalPresenter {
         command_queue.set_label("REmu guest command queue");
         let presentation_resolution = PresentationResolution::from_environment()?;
         let presentation = create_presentation_resources(&device)?;
-        let (shader_compile_sender, shader_compile_requests) = mpsc::channel::<IndexedDraw>();
+        let (shader_compile_sender, shader_compile_requests) =
+            mpsc::channel::<ShaderCompileRequest>();
         let (shader_compile_results, shader_compile_receiver) =
             mpsc::channel::<ShaderCompileResult>();
         let compiler_device = device.clone();
         std::thread::Builder::new()
             .name("remu-metal-compiler".to_owned())
             .spawn(move || {
-                while let Ok(draw) = shader_compile_requests.recv() {
-                    let key = (draw.export_shader_address, draw.pixel_shader_address);
+                while let Ok(request) = shader_compile_requests.recv() {
+                    let ShaderCompileRequest { key, draw } = request;
                     let compiled = objc::rc::autoreleasepool(|| {
-                        Self::compile_draw_shader_pair(&compiler_device, &draw)
+                        Self::compile_draw_shader_pair(&compiler_device, &draw, &key)
                     });
                     if shader_compile_results
                         .send(ShaderCompileResult { key, compiled })
@@ -524,11 +578,14 @@ impl MetalPresenter {
                 Ok(GpuEvent::IndexedDraw(draw)) => {
                     self.compile_draw_shaders(&draw);
                     if let Err(error) = self.execute_compiled_draw(&draw) {
-                        let key = (draw.export_shader_address, draw.pixel_shader_address);
-                        if self.failed_draw_execution.insert(key) {
+                        let key = graphics_pipeline_key(&draw);
+                        if key
+                            .as_ref()
+                            .is_ok_and(|key| self.failed_draw_execution.insert(key.clone()))
+                        {
                             eprintln!(
                                 "[REMu][METAL] Gen5 draw es={:#x} ps={:#x} could not execute: {error}",
-                                key.0, key.1
+                                draw.export_shader_address, draw.pixel_shader_address
                             );
                         }
                         if self.logged_unsupported_guest_draws.len() < 16
@@ -568,20 +625,29 @@ impl MetalPresenter {
     }
 
     fn compile_draw_shaders(&mut self, draw: &IndexedDraw) {
-        let key = (draw.export_shader_address, draw.pixel_shader_address);
+        let Ok(key) = graphics_pipeline_key(draw) else {
+            return;
+        };
         if self.compiled_shader_pairs.contains_key(&key)
             || self.compiling_shader_pairs.contains(&key)
             || self.failed_shader_pairs.contains(&key)
         {
             return;
         }
-        self.compiling_shader_pairs.insert(key);
-        if self.shader_compile_sender.send(draw.clone()).is_err() {
+        self.compiling_shader_pairs.insert(key.clone());
+        if self
+            .shader_compile_sender
+            .send(ShaderCompileRequest {
+                key: key.clone(),
+                draw: draw.clone(),
+            })
+            .is_err()
+        {
             self.compiling_shader_pairs.remove(&key);
-            self.failed_shader_pairs.insert(key);
+            self.failed_shader_pairs.insert(key.clone());
             eprintln!(
                 "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: compiler worker stopped",
-                key.0, key.1
+                key.export_shader_address, key.pixel_shader_address
             );
         }
     }
@@ -593,18 +659,18 @@ impl MetalPresenter {
                 Ok(compiled) => {
                     eprintln!(
                         "[REMu][METAL] compiled Gen5 shader pair es={:#x} ps={:#x} MSL={vertex_bytes}/{pixel_bytes} bytes",
-                        result.key.0,
-                        result.key.1,
+                        result.key.export_shader_address,
+                        result.key.pixel_shader_address,
                         vertex_bytes = compiled.vertex.source.len(),
                         pixel_bytes = compiled.pixel.source.len(),
                     );
                     self.compiled_shader_pairs.insert(result.key, compiled);
                 }
                 Err(error) => {
-                    self.failed_shader_pairs.insert(result.key);
+                    self.failed_shader_pairs.insert(result.key.clone());
                     eprintln!(
                         "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
-                        result.key.0, result.key.1
+                        result.key.export_shader_address, result.key.pixel_shader_address
                     );
                 }
             }
@@ -614,6 +680,7 @@ impl MetalPresenter {
     fn compile_draw_shader_pair(
         device: &Device,
         draw: &IndexedDraw,
+        key: &GraphicsPipelineKey,
     ) -> Result<CompiledShaderPair, String> {
         let export = draw
             .export_shader
@@ -631,19 +698,15 @@ impl MetalPresenter {
             .pixel_shader_evaluation
             .as_ref()
             .ok_or("draw has no evaluated pixel shader resources")?;
-        let mut host_location = 0_u32;
-        let pixel_outputs = (0..8)
-            .filter_map(|guest_slot| {
-                let mask = (pixel.program.pixel_color_export_masks() >> (guest_slot * 4)) & 0xf;
-                (mask != 0).then(|| {
-                    let binding = remu_shader::PixelOutputBinding {
-                        guest_slot,
-                        host_location,
-                        kind: remu_shader::PixelOutputKind::Float,
-                    };
-                    host_location += 1;
-                    binding
-                })
+        let pixel_outputs = key
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(host_location, target)| remu_shader::PixelOutputBinding {
+                guest_slot: target.guest_slot,
+                host_location: u32::try_from(host_location)
+                    .expect("at most eight color targets fit u32"),
+                kind: target.output_kind,
             })
             .collect();
         let pixel_options = remu_shader_metal::MetalCompileOptions::pixel(
@@ -674,12 +737,13 @@ impl MetalPresenter {
         ));
         descriptor.set_vertex_function(Some(&vertex_function));
         descriptor.set_fragment_function(Some(&pixel_function));
-        for location in 0..pixel_options.pixel_outputs.len() {
-            descriptor
+        for (location, target) in key.targets.iter().enumerate() {
+            let attachment = descriptor
                 .color_attachments()
                 .object_at(u64::try_from(location).expect("color location fits u64"))
-                .ok_or_else(|| format!("Metal has no color attachment {location}"))?
-                .set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+                .ok_or_else(|| format!("Metal has no color attachment {location}"))?;
+            attachment.set_pixel_format(target.pixel_format);
+            attachment.set_write_mask(metal_color_write_mask(target.write_mask));
         }
         let pipeline = device
             .new_render_pipeline_state(&descriptor)
@@ -716,8 +780,8 @@ impl MetalPresenter {
                     .remove(&alias)
                     .expect("collected resident alias exists");
                 if resident.gpu_written {
-                    let rgba = read_texture_rgba(&resident.texture, resident.descriptor)?;
-                    write_guest_texture_rgba(resident.descriptor, &rgba)?;
+                    let linear = read_texture_linear(&resident.texture, resident.descriptor)?;
+                    write_guest_texture_linear(resident.descriptor, &linear)?;
                 }
             }
             self.sampled_texture_cache
@@ -748,15 +812,14 @@ impl MetalPresenter {
             }
             let raw =
                 snapshot_watched_guest_texture_raw(resident.descriptor, &resident.write_watch)?;
-            let rgba = decode_guest_texture_rgba_from_raw(resident.descriptor, &raw)?;
-            let texture = create_rgba_texture(
+            let linear = decode_guest_texture_linear_from_raw(resident.descriptor, &raw)?;
+            let texture = create_guest_texture(
                 &device,
-                resident.descriptor.width,
-                resident.descriptor.height,
+                resident.descriptor,
                 MTLTextureUsage::RenderTarget
                     | MTLTextureUsage::ShaderRead
                     | MTLTextureUsage::ShaderWrite,
-                &rgba,
+                &linear,
             )?;
             texture.set_label(&format!(
                 "REMu guest image {:#x}",
@@ -776,15 +839,10 @@ impl MetalPresenter {
                 continue;
             }
             let raw = snapshot_watched_guest_texture_raw(key.descriptor, &cached.write_watch)?;
-            let mut rgba = decode_guest_texture_rgba_from_raw(key.descriptor, &raw)?;
+            let mut rgba = decode_guest_texture_linear_from_raw(key.descriptor, &raw)?;
             apply_image_destination_select(&mut rgba, key.destination_select)?;
-            let texture = create_rgba_texture(
-                &device,
-                key.descriptor.width,
-                key.descriptor.height,
-                MTLTextureUsage::ShaderRead,
-                &rgba,
-            )?;
+            let texture =
+                create_guest_texture(&device, key.descriptor, MTLTextureUsage::ShaderRead, &rgba)?;
             texture.set_label(&format!(
                 "REMu sampled guest image {:#x}",
                 key.descriptor.address
@@ -841,8 +899,8 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .get_mut(&descriptor)
                 .expect("collected sampled alias exists");
-            let rgba = read_texture_rgba(&resident.texture, descriptor)?;
-            write_guest_texture_rgba(descriptor, &rgba)?;
+            let linear = read_texture_linear(&resident.texture, descriptor)?;
+            write_guest_texture_linear(descriptor, &linear)?;
             rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
             resident.gpu_written = false;
         }
@@ -938,8 +996,8 @@ impl MetalPresenter {
             .resident_guest_textures
             .get_mut(&descriptor)
             .expect("selected resident texture exists");
-        let rgba = read_texture_rgba(&resident.texture, descriptor)?;
-        write_guest_texture_rgba(descriptor, &rgba)?;
+        let linear = read_texture_linear(&resident.texture, descriptor)?;
+        write_guest_texture_linear(descriptor, &linear)?;
         rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
         resident.gpu_written = false;
         Ok(())
@@ -1151,7 +1209,8 @@ impl MetalPresenter {
         self.retire_completed_guest_batches();
         let started = Instant::now();
         let trace = draw.sequence <= 4;
-        let key = (draw.export_shader_address, draw.pixel_shader_address);
+        let targets = decode_render_targets(draw)?;
+        let key = graphics_pipeline_key_from_targets(draw, &targets);
         if !self.compiled_shader_pairs.contains_key(&key) {
             return Err("shader pair has no compiled Metal pipeline".to_owned());
         }
@@ -1173,10 +1232,18 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal command queue is unavailable")?
             .clone();
-        let target = decode_render_target(draw).ok_or("unsupported render-target descriptor")?;
-        let target_texture = self
-            .ensure_resident_texture(&device, target)
-            .map_err(|error| format!("render target guest memory is unreadable: {error}"))?;
+        let mut target_textures = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let texture = self
+                .ensure_resident_texture(&device, target.texture)
+                .map_err(|error| {
+                    format!(
+                        "render target {} guest memory is unreadable: {error}",
+                        target.guest_slot
+                    )
+                })?;
+            target_textures.push(texture);
+        }
 
         for evaluation in [export_evaluation, pixel_evaluation] {
             for binding in evaluation
@@ -1186,13 +1253,15 @@ impl MetalPresenter {
             {
                 let descriptor = decode_image_descriptor(&binding.resource_descriptor)
                     .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                if descriptor.guest != target
-                    && guest_texture_descriptors_overlap(descriptor.guest, target)
-                {
-                    return Err(format!(
-                        "writable image at PC {:#x} aliases the render target through an incompatible view",
-                        binding.pc
-                    ));
+                for target in &targets {
+                    if descriptor.guest != target.texture
+                        && guest_texture_descriptors_overlap(descriptor.guest, target.texture)
+                    {
+                        return Err(format!(
+                            "writable image at PC {:#x} aliases render target {} through an incompatible view",
+                            binding.pc, target.guest_slot
+                        ));
+                    }
                 }
                 self.ensure_resident_texture(&device, descriptor.guest)?;
             }
@@ -1236,13 +1305,15 @@ impl MetalPresenter {
         let pixel_sampler_buffer_index = compiled.pixel.bindings.sampler_argument_buffer_index;
 
         let pass = RenderPassDescriptor::new();
-        let attachment = pass
-            .color_attachments()
-            .object_at(0)
-            .ok_or("Metal render pass has no color attachment zero")?;
-        attachment.set_texture(Some(&target_texture));
-        attachment.set_load_action(MTLLoadAction::Load);
-        attachment.set_store_action(MTLStoreAction::Store);
+        for (location, texture) in target_textures.iter().enumerate() {
+            let attachment = pass
+                .color_attachments()
+                .object_at(u64::try_from(location).map_err(|_| "color location overflow")?)
+                .ok_or_else(|| format!("Metal render pass has no color attachment {location}"))?;
+            attachment.set_texture(Some(texture));
+            attachment.set_load_action(MTLLoadAction::Load);
+            attachment.set_store_action(MTLStoreAction::Store);
+        }
         if self.open_guest_batch.is_none() {
             let command_buffer = queue.new_command_buffer().to_owned();
             command_buffer.set_label("REMu translated guest batch");
@@ -1258,8 +1329,8 @@ impl MetalPresenter {
                 .as_mut()
                 .expect("guest command batch was opened above");
             batch.work.push(GuestBatchWork::Draw {
-                export: key.0,
-                pixel: key.1,
+                export: key.export_shader_address,
+                pixel: key.pixel_shader_address,
             });
             collect_pending_global_writebacks(
                 &export_buffers,
@@ -1274,8 +1345,13 @@ impl MetalPresenter {
             let encoder = batch.command_buffer.new_render_command_encoder(pass);
             encoder.set_label("REMu translated guest render pass");
             encoder.set_render_pipeline_state(&pipeline);
-            let scissor = decode_scissor(draw, target.width, target.height)?;
-            let viewport = decode_viewport(draw, target.width, target.height, scissor);
+            let primary_target = targets
+                .first()
+                .expect("render-target decoder requires at least one target")
+                .texture;
+            let scissor = decode_scissor(draw, primary_target.width, primary_target.height)?;
+            let viewport =
+                decode_viewport(draw, primary_target.width, primary_target.height, scissor);
             encoder.set_viewport(viewport);
             if let GuestScissor::Rect(rect) = scissor {
                 encoder.set_scissor_rect(rect);
@@ -1368,7 +1444,9 @@ impl MetalPresenter {
             encoder.end_encoding();
         }
 
-        self.mark_resident_texture_written(target);
+        for target in &targets {
+            self.mark_resident_texture_written(target.texture);
+        }
         for texture in export_textures.iter().chain(&pixel_textures) {
             if texture.writable {
                 self.mark_resident_texture_written(texture.descriptor.guest);
@@ -1384,8 +1462,20 @@ impl MetalPresenter {
             .is_some_and(|batch| batch.work.len() >= 32);
         if capture_due {
             self.wait_for_guest_command_batches()?;
-            let rendered = read_texture_rgba(&target_texture, target)?;
-            self.capture_translated_frame_if_changed(target, &rendered);
+            let primary_target = targets
+                .first()
+                .expect("render-target decoder requires at least one target")
+                .texture;
+            if matches!(
+                primary_target.pixel_format,
+                MTLPixelFormat::RGBA8Unorm
+                    | MTLPixelFormat::RGBA8Unorm_sRGB
+                    | MTLPixelFormat::BGRA8Unorm
+                    | MTLPixelFormat::BGRA8Unorm_sRGB
+            ) {
+                let rendered = read_texture_linear(&target_textures[0], primary_target)?;
+                self.capture_translated_frame_if_changed(primary_target, &rendered);
+            }
         } else if batch_full {
             self.flush_guest_command_batch(false)?;
         }
@@ -1393,8 +1483,8 @@ impl MetalPresenter {
             eprintln!(
                 "[REMu][METAL] encoded Gen5 draw={} es={:#x} ps={:#x} in {:?}",
                 draw.sequence,
-                key.0,
-                key.1,
+                key.export_shader_address,
+                key.pixel_shader_address,
                 started.elapsed()
             );
         }
@@ -1466,8 +1556,10 @@ impl MetalPresenter {
                 height: display.height,
                 pitch: display.width,
                 tile_mode: 0,
+                pixel_format: MTLPixelFormat::BGRA8Unorm,
+                bytes_per_pixel: 4,
             };
-            read_texture_rgba(texture, descriptor).map(|bytes| (descriptor, bytes))
+            read_texture_linear(texture, descriptor).map(|bytes| (descriptor, bytes))
         });
         self.uploaded_flip_sequence = flip.sequence;
         if flip.sequence == 1 {
@@ -1520,7 +1612,7 @@ impl MetalPresenter {
     fn capture_translated_frame_if_changed(
         &mut self,
         descriptor: GuestTextureDescriptor,
-        rgba: &[u8],
+        native_bytes: &[u8],
     ) {
         if self.capture_directory.is_none()
             || self
@@ -1529,12 +1621,20 @@ impl MetalPresenter {
         {
             return;
         }
-        self.guest_bgra_bytes.resize(rgba.len(), 0);
-        for (source, destination) in rgba
-            .chunks_exact(4)
-            .zip(self.guest_bgra_bytes.chunks_exact_mut(4))
-        {
-            destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
+        self.guest_bgra_bytes.resize(native_bytes.len(), 0);
+        match descriptor.pixel_format {
+            MTLPixelFormat::RGBA8Unorm | MTLPixelFormat::RGBA8Unorm_sRGB => {
+                for (source, destination) in native_bytes
+                    .chunks_exact(4)
+                    .zip(self.guest_bgra_bytes.chunks_exact_mut(4))
+                {
+                    destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
+                }
+            }
+            MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB => {
+                self.guest_bgra_bytes.copy_from_slice(native_bytes);
+            }
+            _ => return,
         }
         self.capture_guest_frame_if_changed(descriptor);
     }
@@ -2088,13 +2188,13 @@ fn guest_texture_raw_matches(
     Ok(source == shadow)
 }
 
-fn decode_guest_texture_rgba_from_raw(
+fn decode_guest_texture_linear_from_raw(
     descriptor: GuestTextureDescriptor,
     source: &[u8],
 ) -> Result<Vec<u8>, String> {
     let output_length = u64::from(descriptor.width)
         .checked_mul(u64::from(descriptor.height))
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(u64::from(descriptor.bytes_per_pixel)))
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or("guest texture dimensions overflow")?;
     let expected_source = usize::try_from(
@@ -2115,10 +2215,16 @@ fn decode_guest_texture_rgba_from_raw(
     if descriptor.tile_mode == 0 {
         let source_row_bytes = usize::try_from(descriptor.pitch)
             .map_err(|_| "texture pitch does not fit usize")?
-            .checked_mul(4)
+            .checked_mul(
+                usize::try_from(descriptor.bytes_per_pixel)
+                    .map_err(|_| "texture bytes per pixel does not fit usize")?,
+            )
             .ok_or("source row byte count overflows")?;
         let output_row_bytes = width
-            .checked_mul(4)
+            .checked_mul(
+                usize::try_from(descriptor.bytes_per_pixel)
+                    .map_err(|_| "texture bytes per pixel does not fit usize")?,
+            )
             .ok_or("output row byte count overflows")?;
         for y in 0..height {
             let source_offset = y
@@ -2140,14 +2246,17 @@ fn decode_guest_texture_rgba_from_raw(
 }
 
 #[cfg(test)]
-fn snapshot_guest_texture_rgba(descriptor: GuestTextureDescriptor) -> Result<Vec<u8>, String> {
+fn snapshot_guest_texture_linear(descriptor: GuestTextureDescriptor) -> Result<Vec<u8>, String> {
     let (source_address, source_length) = guest_texture_raw_range(descriptor)?;
     // SAFETY: See snapshot_guest_texture_raw; decoding completes before this function returns.
     let source = unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) };
-    decode_guest_texture_rgba_from_raw(descriptor, source)
+    decode_guest_texture_linear_from_raw(descriptor, source)
 }
 
-fn write_guest_texture_rgba(descriptor: GuestTextureDescriptor, rgba: &[u8]) -> Result<(), String> {
+fn write_guest_texture_linear(
+    descriptor: GuestTextureDescriptor,
+    linear: &[u8],
+) -> Result<(), String> {
     let byte_count = guest_texture_byte_count(descriptor)
         .ok_or("guest texture byte count overflows the host address space")?;
     if descriptor.address < 0x10_000 || byte_count > 128 * 1024 * 1024 {
@@ -2162,12 +2271,12 @@ fn write_guest_texture_rgba(descriptor: GuestTextureDescriptor, rgba: &[u8]) -> 
         usize::try_from(descriptor.height).map_err(|_| "texture height does not fit usize")?;
     let required = width
         .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(usize::try_from(descriptor.bytes_per_pixel).ok()?))
         .ok_or("guest texture dimensions overflow")?;
-    if rgba.len() != required {
+    if linear.len() != required {
         return Err(format!(
-            "tight RGBA image has {} bytes, expected {required}",
-            rgba.len()
+            "tight guest image has {} bytes, expected {required}",
+            linear.len()
         ));
     }
     let destination_address = usize::try_from(descriptor.address)
@@ -2182,10 +2291,16 @@ fn write_guest_texture_rgba(descriptor: GuestTextureDescriptor, rgba: &[u8]) -> 
     if descriptor.tile_mode == 0 {
         let destination_row_bytes = usize::try_from(descriptor.pitch)
             .map_err(|_| "texture pitch does not fit usize")?
-            .checked_mul(4)
+            .checked_mul(
+                usize::try_from(descriptor.bytes_per_pixel)
+                    .map_err(|_| "texture bytes per pixel does not fit usize")?,
+            )
             .ok_or("destination row byte count overflows")?;
         let source_row_bytes = width
-            .checked_mul(4)
+            .checked_mul(
+                usize::try_from(descriptor.bytes_per_pixel)
+                    .map_err(|_| "texture bytes per pixel does not fit usize")?,
+            )
             .ok_or("source row byte count overflows")?;
         for y in 0..height {
             let source_offset = y
@@ -2197,64 +2312,64 @@ fn write_guest_texture_rgba(descriptor: GuestTextureDescriptor, rgba: &[u8]) -> 
             destination
                 .get_mut(destination_offset..destination_offset + source_row_bytes)
                 .ok_or("guest texture row exceeds its decoded allocation")?
-                .copy_from_slice(&rgba[source_offset..source_offset + source_row_bytes]);
+                .copy_from_slice(&linear[source_offset..source_offset + source_row_bytes]);
         }
     } else {
-        copy_linear_to_mode27(rgba, descriptor, destination)?;
+        copy_linear_to_mode27(linear, descriptor, destination)?;
     }
     Ok(())
 }
 
-fn create_rgba_texture(
+fn create_guest_texture(
     device: &Device,
-    width: u32,
-    height: u32,
+    guest: GuestTextureDescriptor,
     usage: MTLTextureUsage,
-    rgba: &[u8],
+    linear: &[u8],
 ) -> Result<Texture, String> {
-    let required = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(4))
+    let required = u64::from(guest.width)
+        .checked_mul(u64::from(guest.height))
+        .and_then(|pixels| pixels.checked_mul(u64::from(guest.bytes_per_pixel)))
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or("Metal texture dimensions overflow")?;
-    if width == 0 || height == 0 || rgba.len() != required {
+    if guest.width == 0 || guest.height == 0 || linear.len() != required {
         return Err(format!(
-            "invalid RGBA upload {}x{} with {} bytes (expected {required})",
-            width,
-            height,
-            rgba.len()
+            "invalid guest texture upload {}x{} format {:?} with {} bytes (expected {required})",
+            guest.width,
+            guest.height,
+            guest.pixel_format,
+            linear.len()
         ));
     }
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2);
-    descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
-    descriptor.set_width(u64::from(width));
-    descriptor.set_height(u64::from(height));
+    descriptor.set_pixel_format(guest.pixel_format);
+    descriptor.set_width(u64::from(guest.width));
+    descriptor.set_height(u64::from(guest.height));
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(usage);
     let texture = device.new_texture(&descriptor);
     texture.replace_region(
-        MTLRegion::new_2d(0, 0, u64::from(width), u64::from(height)),
+        MTLRegion::new_2d(0, 0, u64::from(guest.width), u64::from(guest.height)),
         0,
-        rgba.as_ptr().cast::<c_void>(),
-        u64::from(width) * 4,
+        linear.as_ptr().cast::<c_void>(),
+        u64::from(guest.width) * u64::from(guest.bytes_per_pixel),
     );
     Ok(texture)
 }
 
-fn read_texture_rgba(
+fn read_texture_linear(
     texture: &Texture,
     descriptor: GuestTextureDescriptor,
 ) -> Result<Vec<u8>, String> {
     let length = u64::from(descriptor.width)
         .checked_mul(u64::from(descriptor.height))
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(u64::from(descriptor.bytes_per_pixel)))
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or("Metal texture readback dimensions overflow")?;
-    let mut rgba = vec![0_u8; length];
+    let mut linear = vec![0_u8; length];
     texture.get_bytes(
-        rgba.as_mut_ptr().cast::<c_void>(),
-        u64::from(descriptor.width) * 4,
+        linear.as_mut_ptr().cast::<c_void>(),
+        u64::from(descriptor.width) * u64::from(descriptor.bytes_per_pixel),
         MTLRegion::new_2d(
             0,
             0,
@@ -2263,7 +2378,7 @@ fn read_texture_rgba(
         ),
         0,
     );
-    Ok(rgba)
+    Ok(linear)
 }
 
 fn ensure_resident_texture_in_map(
@@ -2276,13 +2391,12 @@ fn ensure_resident_texture_in_map(
     }
     let write_watch = watch_guest_texture(descriptor)?;
     let raw = snapshot_watched_guest_texture_raw(descriptor, &write_watch)?;
-    let rgba = decode_guest_texture_rgba_from_raw(descriptor, &raw)?;
-    let texture = create_rgba_texture(
+    let linear = decode_guest_texture_linear_from_raw(descriptor, &raw)?;
+    let texture = create_guest_texture(
         device,
-        descriptor.width,
-        descriptor.height,
+        descriptor,
         MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite,
-        &rgba,
+        &linear,
     )?;
     texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));
     resident_guest_textures.insert(
@@ -2437,6 +2551,8 @@ fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescriptor, Stri
             height,
             pitch,
             tile_mode,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
         },
         destination_select,
     })
@@ -2509,14 +2625,13 @@ fn upload_image_textures(
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
                     let raw = snapshot_watched_guest_texture_raw(descriptor.guest, &write_watch)
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                    let mut rgba = decode_guest_texture_rgba_from_raw(descriptor.guest, &raw)
+                    let mut rgba = decode_guest_texture_linear_from_raw(descriptor.guest, &raw)
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
                     apply_image_destination_select(&mut rgba, descriptor.destination_select)
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                    let texture = create_rgba_texture(
+                    let texture = create_guest_texture(
                         device,
-                        descriptor.guest.width,
-                        descriptor.guest.height,
+                        descriptor.guest,
                         MTLTextureUsage::ShaderRead,
                         &rgba,
                     )?;
@@ -2728,33 +2843,235 @@ fn pixel_scalars(draw: &IndexedDraw) -> [u32; 4] {
     })
 }
 
-fn decode_render_target(draw: &IndexedDraw) -> Option<GuestTextureDescriptor> {
-    let info = register_value(&draw.context_registers, 0x31c)?;
-    let attrib2 = register_value(&draw.context_registers, 0x3b0)?;
-    let attrib3 = register_value(&draw.context_registers, 0x3b8)?;
-    let target_mask = register_value(&draw.context_registers, 0x08e).unwrap_or(0xf);
-    let width = ((attrib2 >> 14) & 0x3fff).checked_add(1)?;
-    let height = (attrib2 & 0x3fff).checked_add(1)?;
-    let format = (info >> 2) & 0x1f;
-    let number_type = (info >> 8) & 0x7;
-    let tile_mode = (attrib3 >> 14) & 0x1f;
-    if draw.color_target_address < 0x10_000
-        || width > 8_192
-        || height > 8_192
-        || format != 10
-        || number_type != 0
-        || !matches!(tile_mode, 0 | 27)
-        || target_mask.trailing_zeros() >= 4
-    {
-        return None;
-    }
-    Some(GuestTextureDescriptor {
-        address: draw.color_target_address,
-        width,
-        height,
-        pitch: width,
-        tile_mode,
+fn decode_render_target_format(
+    data_format: u32,
+    number_type: u32,
+    component_swap: u32,
+) -> Result<RenderTargetFormat, String> {
+    // Mesa's ac_get_cb_format/ac_get_cb_number_type tables establish the valid GFX10
+    // combinations. Metal has direct, bit-compatible render-target formats for this cohort.
+    // Scaled number types have no Metal color-attachment equivalent and are rejected.
+    let (pixel_format, bytes_per_pixel) = match (data_format, number_type, component_swap) {
+        (1, 0, 0) => (MTLPixelFormat::R8Unorm, 1),
+        (1, 1, 0) => (MTLPixelFormat::R8Snorm, 1),
+        (1, 4, 0) => (MTLPixelFormat::R8Uint, 1),
+        (1, 5, 0) => (MTLPixelFormat::R8Sint, 1),
+        (1, 6, 0) => (MTLPixelFormat::R8Unorm_sRGB, 1),
+        (2, 0, 0) => (MTLPixelFormat::R16Unorm, 2),
+        (2, 1, 0) => (MTLPixelFormat::R16Snorm, 2),
+        (2, 4, 0) => (MTLPixelFormat::R16Uint, 2),
+        (2, 5, 0) => (MTLPixelFormat::R16Sint, 2),
+        (2, 7, 0) => (MTLPixelFormat::R16Float, 2),
+        (3, 0, 0) => (MTLPixelFormat::RG8Unorm, 2),
+        (3, 1, 0) => (MTLPixelFormat::RG8Snorm, 2),
+        (3, 4, 0) => (MTLPixelFormat::RG8Uint, 2),
+        (3, 5, 0) => (MTLPixelFormat::RG8Sint, 2),
+        (3, 6, 0) => (MTLPixelFormat::RG8Unorm_sRGB, 2),
+        (4, 4, 0) => (MTLPixelFormat::R32Uint, 4),
+        (4, 5, 0) => (MTLPixelFormat::R32Sint, 4),
+        (4, 7, 0) => (MTLPixelFormat::R32Float, 4),
+        (5, 0, 0) => (MTLPixelFormat::RG16Unorm, 4),
+        (5, 1, 0) => (MTLPixelFormat::RG16Snorm, 4),
+        (5, 4, 0) => (MTLPixelFormat::RG16Uint, 4),
+        (5, 5, 0) => (MTLPixelFormat::RG16Sint, 4),
+        (5, 7, 0) => (MTLPixelFormat::RG16Float, 4),
+        (6 | 7, 7, 0) => (MTLPixelFormat::RG11B10Float, 4),
+        (8, 0, 0) => (MTLPixelFormat::RGB10A2Unorm, 4),
+        (9, 0, 0) => (MTLPixelFormat::BGR10A2Unorm, 4),
+        (10, 0, 0) => (MTLPixelFormat::RGBA8Unorm, 4),
+        (10, 0, 1) => (MTLPixelFormat::BGRA8Unorm, 4),
+        (10, 1, 0) => (MTLPixelFormat::RGBA8Snorm, 4),
+        (10, 4, 0) => (MTLPixelFormat::RGBA8Uint, 4),
+        (10, 5, 0) => (MTLPixelFormat::RGBA8Sint, 4),
+        (10, 6, 0) => (MTLPixelFormat::RGBA8Unorm_sRGB, 4),
+        (10, 6, 1) => (MTLPixelFormat::BGRA8Unorm_sRGB, 4),
+        (11, 4, 0) => (MTLPixelFormat::RG32Uint, 8),
+        (11, 5, 0) => (MTLPixelFormat::RG32Sint, 8),
+        (11, 7, 0) => (MTLPixelFormat::RG32Float, 8),
+        (12, 0, 0) => (MTLPixelFormat::RGBA16Unorm, 8),
+        (12, 1, 0) => (MTLPixelFormat::RGBA16Snorm, 8),
+        (12, 4, 0) => (MTLPixelFormat::RGBA16Uint, 8),
+        (12, 5, 0) => (MTLPixelFormat::RGBA16Sint, 8),
+        (12, 7, 0) => (MTLPixelFormat::RGBA16Float, 8),
+        (14, 4, 0) => (MTLPixelFormat::RGBA32Uint, 16),
+        (14, 5, 0) => (MTLPixelFormat::RGBA32Sint, 16),
+        (14, 7, 0) => (MTLPixelFormat::RGBA32Float, 16),
+        (24, 7, 0) => (MTLPixelFormat::RGB9E5Float, 4),
+        _ => {
+            return Err(format!(
+                "unsupported GFX10 color format={data_format} number_type={number_type} component_swap={component_swap}"
+            ));
+        }
+    };
+    let output_kind = match number_type {
+        4 => PixelOutputKind::Uint,
+        5 => PixelOutputKind::Sint,
+        _ => PixelOutputKind::Float,
+    };
+    Ok(RenderTargetFormat {
+        pixel_format,
+        output_kind,
+        bytes_per_pixel,
     })
+}
+
+fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>, String> {
+    let pixel = draw
+        .pixel_shader
+        .as_ref()
+        .ok_or("draw has no decoded pixel shader")?;
+    let export_masks = pixel.program.pixel_color_export_masks();
+    decode_render_targets_from_registers(&draw.context_registers, export_masks)
+}
+
+#[allow(clippy::too_many_lines)]
+fn decode_render_targets_from_registers(
+    context_registers: &[GpuRegister],
+    export_masks: u32,
+) -> Result<Vec<DecodedRenderTarget>, String> {
+    let target_mask = register_value(context_registers, CB_TARGET_MASK)
+        .ok_or("draw has no CB_TARGET_MASK register")?;
+    let mut targets = Vec::new();
+    for guest_slot in 0..COLOR_TARGET_COUNT {
+        let target_write_mask = (target_mask >> (guest_slot * 4)) & 0xf;
+        let shader_write_mask = (export_masks >> (guest_slot * 4)) & 0xf;
+        let write_mask = target_write_mask & shader_write_mask;
+        if write_mask == 0 {
+            continue;
+        }
+        let primary = guest_slot * CB_COLOR_REGISTER_STRIDE;
+        let required = |offset, name| {
+            register_value(context_registers, offset).ok_or_else(|| {
+                format!("color target {guest_slot} has no {name} register ({offset:#x})")
+            })
+        };
+        let base = required(CB_COLOR0_BASE + primary, "CB_COLOR_BASE")?;
+        let base_ext = required(CB_COLOR0_BASE_EXT + guest_slot, "CB_COLOR_BASE_EXT")?;
+        let view = required(CB_COLOR0_VIEW + primary, "CB_COLOR_VIEW")?;
+        let info = required(CB_COLOR0_INFO + primary, "CB_COLOR_INFO")?;
+        let attrib = required(CB_COLOR0_ATTRIB + primary, "CB_COLOR_ATTRIB")?;
+        let attrib2 = required(CB_COLOR0_ATTRIB2 + guest_slot, "CB_COLOR_ATTRIB2")?;
+        let attrib3 = required(CB_COLOR0_ATTRIB3 + guest_slot, "CB_COLOR_ATTRIB3")?;
+
+        let address = (u64::from(base_ext & 0xff) << 40) | (u64::from(base) << 8);
+        let width = ((attrib2 >> 14) & 0x3fff)
+            .checked_add(1)
+            .ok_or("render-target width overflows")?;
+        let height = (attrib2 & 0x3fff)
+            .checked_add(1)
+            .ok_or("render-target height overflows")?;
+        if address < 0x10_000 || width > 16_384 || height > 16_384 {
+            return Err(format!(
+                "invalid color target {guest_slot} address={address:#x} extent={width}x{height}"
+            ));
+        }
+
+        let endian = info & 0x3;
+        let fast_clear = (info >> 13) & 1;
+        let fmask_compression = (info >> 14) & 1;
+        let dcc_enable = (info >> 28) & 1;
+        if endian != 0 || fast_clear != 0 || fmask_compression != 0 || dcc_enable != 0 {
+            return Err(format!(
+                "color target {guest_slot} requires unsupported metadata/endian state endian={endian} fast_clear={fast_clear} fmask={fmask_compression} dcc={dcc_enable}"
+            ));
+        }
+        let sample_log2 = (attrib >> 12) & 0x7;
+        let fragment_log2 = (attrib >> 15) & 0x3;
+        if sample_log2 != 0 || fragment_log2 != 0 {
+            return Err(format!(
+                "color target {guest_slot} is multisampled (samples_log2={sample_log2}, fragments_log2={fragment_log2})"
+            ));
+        }
+        let slice_start = view & 0x1fff;
+        let slice_max = (view >> 13) & 0x1fff;
+        let mip_level = (view >> 26) & 0xf;
+        let max_mip = (attrib2 >> 28) & 0xf;
+        let mip0_depth = attrib3 & 0x1fff;
+        if slice_start != 0 || slice_max != 0 || mip_level != 0 || max_mip != 0 || mip0_depth != 0 {
+            return Err(format!(
+                "color target {guest_slot} requires unsupported slice/mip view slices={slice_start}..={slice_max} mip={mip_level}/{max_mip} depth={mip0_depth}"
+            ));
+        }
+        let tile_mode = (attrib3 >> 14) & 0x1f;
+        if !matches!(tile_mode, 0 | 27) {
+            return Err(format!(
+                "color target {guest_slot} uses unsupported GFX10 swizzle mode {tile_mode}"
+            ));
+        }
+        let resource_type = (attrib3 >> 24) & 0x3;
+        let resource_level = (attrib3 >> 27) & 0x7;
+        let non_block_compressed_view = (attrib3 >> 31) & 1;
+        if !matches!(resource_type, 0 | 1)
+            || (resource_type == 0 && height != 1)
+            || resource_level != 0
+            || non_block_compressed_view != 0
+        {
+            return Err(format!(
+                "color target {guest_slot} requires unsupported resource state type={resource_type} level={resource_level} nbc={non_block_compressed_view} extent={width}x{height}"
+            ));
+        }
+        let format =
+            decode_render_target_format((info >> 2) & 0x1f, (info >> 8) & 0x7, (info >> 11) & 0x3)?;
+        let pitch = if tile_mode == 0 {
+            effective_linear_pitch(width, format.bytes_per_pixel)
+                .ok_or("linear render-target pitch overflows")?
+        } else {
+            width
+        };
+        targets.push(DecodedRenderTarget {
+            guest_slot,
+            texture: GuestTextureDescriptor {
+                address,
+                width,
+                height,
+                pitch,
+                tile_mode,
+                pixel_format: format.pixel_format,
+                bytes_per_pixel: format.bytes_per_pixel,
+            },
+            output_kind: format.output_kind,
+            write_mask,
+        });
+    }
+    if targets.is_empty() {
+        return Err(format!(
+            "draw has no color target enabled by both CB_TARGET_MASK={target_mask:#010x} and pixel exports={export_masks:#010x}"
+        ));
+    }
+    Ok(targets)
+}
+
+fn graphics_pipeline_key(draw: &IndexedDraw) -> Result<GraphicsPipelineKey, String> {
+    let targets = decode_render_targets(draw)?;
+    Ok(graphics_pipeline_key_from_targets(draw, &targets))
+}
+
+fn graphics_pipeline_key_from_targets(
+    draw: &IndexedDraw,
+    targets: &[DecodedRenderTarget],
+) -> GraphicsPipelineKey {
+    GraphicsPipelineKey {
+        export_shader_address: draw.export_shader_address,
+        pixel_shader_address: draw.pixel_shader_address,
+        targets: targets
+            .iter()
+            .map(|target| RenderTargetPipelineState {
+                guest_slot: target.guest_slot,
+                pixel_format: target.texture.pixel_format,
+                output_kind: target.output_kind,
+                write_mask: target.write_mask,
+            })
+            .collect(),
+    }
+}
+
+fn metal_color_write_mask(guest_mask: u32) -> MTLColorWriteMask {
+    // GFX10 CB_TARGET_MASK is R=1,G=2,B=4,A=8; MTLColorWriteMask uses the reverse bits.
+    let metal_mask = u64::from(guest_mask & 1 != 0) << 3
+        | u64::from(guest_mask & 2 != 0) << 2
+        | u64::from(guest_mask & 4 != 0) << 1
+        | u64::from(guest_mask & 8 != 0);
+    MTLColorWriteMask::from_bits_retain(metal_mask)
 }
 
 fn read_draw_indices(draw: &IndexedDraw) -> Option<Vec<u32>> {
@@ -2794,13 +3111,17 @@ fn copy_mode27_to_linear(
         usize::try_from(descriptor.width).map_err(|_| "texture width does not fit usize")?;
     let height =
         usize::try_from(descriptor.height).map_err(|_| "texture height does not fit usize")?;
+    let bytes_per_pixel = usize::try_from(descriptor.bytes_per_pixel)
+        .map_err(|_| "texture bytes per pixel does not fit usize")?;
+    let (block_width, block_height) = mode27_block_dimensions(bytes_per_pixel)
+        .ok_or("mode 27 requires a 1, 2, 4, 8, or 16-byte pixel format")?;
     let expected_source = usize::try_from(
         guest_texture_byte_count(descriptor).ok_or("mode 27 texture byte count overflows")?,
     )
     .map_err(|_| "mode 27 texture byte count does not fit usize")?;
     let expected_destination = width
         .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
         .ok_or("mode 27 linear byte count overflows")?;
     if source.len() != expected_source || destination.len() != expected_destination {
         return Err(format!(
@@ -2809,21 +3130,29 @@ fn copy_mode27_to_linear(
             destination.len(),
         ));
     }
-    let blocks_per_row = width.div_ceil(128);
-    for block_y in 0..height.div_ceil(128) {
-        let block_height = (height - block_y * 128).min(128);
+    let blocks_per_row = width.div_ceil(block_width);
+    for block_y in 0..height.div_ceil(block_height) {
+        let rows = (height - block_y * block_height).min(block_height);
         for block_x in 0..blocks_per_row {
-            let block_width = (width - block_x * 128).min(128);
+            let columns = (width - block_x * block_width).min(block_width);
             let block_base = (block_y * blocks_per_row + block_x) * 65_536;
-            let offsets = mode27_block_byte_offsets(block_x, block_y);
-            for local_y in 0..block_height {
-                let destination_row = ((block_y * 128 + local_y) * width + block_x * 128) * 4;
-                let offset_row = local_y * 128;
-                for local_x in 0..block_width {
+            let offsets = mode27_block_byte_offsets(
+                block_x,
+                block_y,
+                bytes_per_pixel,
+                block_width,
+                block_height,
+            );
+            for local_y in 0..rows {
+                let destination_row = ((block_y * block_height + local_y) * width
+                    + block_x * block_width)
+                    * bytes_per_pixel;
+                let offset_row = local_y * block_width;
+                for local_x in 0..columns {
                     let source_offset = block_base + usize::from(offsets[offset_row + local_x]);
-                    let destination_offset = destination_row + local_x * 4;
-                    destination[destination_offset..destination_offset + 4]
-                        .copy_from_slice(&source[source_offset..source_offset + 4]);
+                    let destination_offset = destination_row + local_x * bytes_per_pixel;
+                    destination[destination_offset..destination_offset + bytes_per_pixel]
+                        .copy_from_slice(&source[source_offset..source_offset + bytes_per_pixel]);
                 }
             }
         }
@@ -2840,9 +3169,13 @@ fn copy_linear_to_mode27(
         usize::try_from(descriptor.width).map_err(|_| "texture width does not fit usize")?;
     let height =
         usize::try_from(descriptor.height).map_err(|_| "texture height does not fit usize")?;
+    let bytes_per_pixel = usize::try_from(descriptor.bytes_per_pixel)
+        .map_err(|_| "texture bytes per pixel does not fit usize")?;
+    let (block_width, block_height) = mode27_block_dimensions(bytes_per_pixel)
+        .ok_or("mode 27 requires a 1, 2, 4, 8, or 16-byte pixel format")?;
     let expected_source = width
         .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
         .ok_or("mode 27 linear byte count overflows")?;
     let expected_destination = usize::try_from(
         guest_texture_byte_count(descriptor).ok_or("mode 27 texture byte count overflows")?,
@@ -2855,22 +3188,30 @@ fn copy_linear_to_mode27(
             destination.len(),
         ));
     }
-    let blocks_per_row = width.div_ceil(128);
-    for block_y in 0..height.div_ceil(128) {
-        let block_height = (height - block_y * 128).min(128);
+    let blocks_per_row = width.div_ceil(block_width);
+    for block_y in 0..height.div_ceil(block_height) {
+        let rows = (height - block_y * block_height).min(block_height);
         for block_x in 0..blocks_per_row {
-            let block_width = (width - block_x * 128).min(128);
+            let columns = (width - block_x * block_width).min(block_width);
             let block_base = (block_y * blocks_per_row + block_x) * 65_536;
-            let offsets = mode27_block_byte_offsets(block_x, block_y);
-            for local_y in 0..block_height {
-                let source_row = ((block_y * 128 + local_y) * width + block_x * 128) * 4;
-                let offset_row = local_y * 128;
-                for local_x in 0..block_width {
-                    let source_offset = source_row + local_x * 4;
+            let offsets = mode27_block_byte_offsets(
+                block_x,
+                block_y,
+                bytes_per_pixel,
+                block_width,
+                block_height,
+            );
+            for local_y in 0..rows {
+                let source_row = ((block_y * block_height + local_y) * width
+                    + block_x * block_width)
+                    * bytes_per_pixel;
+                let offset_row = local_y * block_width;
+                for local_x in 0..columns {
+                    let source_offset = source_row + local_x * bytes_per_pixel;
                     let destination_offset =
                         block_base + usize::from(offsets[offset_row + local_x]);
-                    destination[destination_offset..destination_offset + 4]
-                        .copy_from_slice(&source[source_offset..source_offset + 4]);
+                    destination[destination_offset..destination_offset + bytes_per_pixel]
+                        .copy_from_slice(&source[source_offset..source_offset + bytes_per_pixel]);
                 }
             }
         }
@@ -2882,18 +3223,30 @@ fn effective_linear_rgba_pitch(pitch: u32) -> Option<u32> {
     // GNM linear surfaces align RGBA8 rows to 256 bytes. This is implicit for common 128-bit
     // texture descriptors, so widths such as 980 and 250 must be read with 1024- and 256-pixel
     // strides even when the descriptor's extended pitch word is zero.
-    pitch.checked_add(63).map(|value| value & !63)
+    effective_linear_pitch(pitch, 4)
+}
+
+fn effective_linear_pitch(width: u32, bytes_per_pixel: u32) -> Option<u32> {
+    if !matches!(bytes_per_pixel, 1 | 2 | 4 | 8 | 16) {
+        return None;
+    }
+    let alignment = 256 / bytes_per_pixel;
+    width
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
 }
 
 fn guest_texture_byte_count(descriptor: GuestTextureDescriptor) -> Option<u64> {
     if descriptor.tile_mode == 27 {
-        let blocks_wide = u64::from(descriptor.width).div_ceil(128);
-        let blocks_high = u64::from(descriptor.height).div_ceil(128);
+        let (block_width, block_height) =
+            mode27_block_dimensions(usize::try_from(descriptor.bytes_per_pixel).ok()?)?;
+        let blocks_wide = u64::from(descriptor.width).div_ceil(u64::try_from(block_width).ok()?);
+        let blocks_high = u64::from(descriptor.height).div_ceil(u64::try_from(block_height).ok()?);
         blocks_wide.checked_mul(blocks_high)?.checked_mul(65_536)
     } else {
         u64::from(descriptor.pitch)
             .checked_mul(u64::from(descriptor.height))?
-            .checked_mul(4)
+            .checked_mul(u64::from(descriptor.bytes_per_pixel))
     }
 }
 
@@ -2918,53 +3271,169 @@ fn mode27_source_byte_offset(x: usize, y: usize, width: usize) -> usize {
     let block_x = x / 128;
     let block_y = y / 128;
     let block_index = block_y * blocks_per_row + block_x;
-    let offsets = mode27_block_byte_offsets(block_x, block_y);
+    let offsets = mode27_block_byte_offsets(block_x, block_y, 4, 128, 128);
     block_index * 65_536 + usize::from(offsets[(y & 127) * 128 + (x & 127)])
 }
 
-fn mode27_block_byte_offsets(block_x: usize, block_y: usize) -> &'static [u16] {
-    const PIXELS_PER_BLOCK: usize = 128 * 128;
-    static OFFSETS: OnceLock<Box<[u16]>> = OnceLock::new();
+fn mode27_block_byte_offsets(
+    block_x: usize,
+    block_y: usize,
+    bytes_per_pixel: usize,
+    block_width: usize,
+    block_height: usize,
+) -> &'static [u16] {
+    static OFFSETS: OnceLock<[Box<[u16]>; 5]> = OnceLock::new();
     let offsets = OFFSETS.get_or_init(|| {
-        let mut offsets = vec![0_u16; 4 * PIXELS_PER_BLOCK];
-        for block_y_parity in 0..2 {
-            for block_x_parity in 0..2 {
-                let table = (block_y_parity * 2 + block_x_parity) * PIXELS_PER_BLOCK;
-                for local_y in 0..128 {
-                    for local_x in 0..128 {
-                        let global_x = local_x | (block_x_parity << 7);
-                        let global_y = local_y | (block_y_parity << 7);
-                        offsets[table + local_y * 128 + local_x] =
-                            u16::try_from(mode27_within_block_byte_offset(global_x, global_y))
+        std::array::from_fn(|log2_bytes| {
+            let bytes_per_pixel = 1 << log2_bytes;
+            let (block_width, block_height) = mode27_block_dimensions(bytes_per_pixel)
+                .expect("mode 27 table bytes per pixel is supported");
+            let elements_per_block = block_width * block_height;
+            let mut offsets = vec![0_u16; 4 * elements_per_block];
+            for block_y_parity in 0..2 {
+                for block_x_parity in 0..2 {
+                    let table = (block_y_parity * 2 + block_x_parity) * elements_per_block;
+                    for local_y in 0..block_height {
+                        for local_x in 0..block_width {
+                            let global_x = local_x | (block_x_parity * block_width);
+                            let global_y = local_y | (block_y_parity * block_height);
+                            offsets[table + local_y * block_width + local_x] =
+                                u16::try_from(mode27_within_block_byte_offset_for_format(
+                                    global_x,
+                                    global_y,
+                                    bytes_per_pixel,
+                                ))
                                 .expect("mode 27 byte offset fits u16");
+                        }
                     }
                 }
             }
-        }
-        offsets.into_boxed_slice()
+            offsets.into_boxed_slice()
+        })
     });
-    let table = ((block_y & 1) * 2 + (block_x & 1)) * PIXELS_PER_BLOCK;
-    &offsets[table..table + PIXELS_PER_BLOCK]
+    let log2_bytes =
+        usize::try_from(bytes_per_pixel.trailing_zeros()).expect("mode 27 log2 bytes fits usize");
+    let elements_per_block = block_width * block_height;
+    let table = ((block_y & 1) * 2 + (block_x & 1)) * elements_per_block;
+    &offsets[log2_bytes][table..table + elements_per_block]
 }
 
+#[cfg(test)]
 fn mode27_within_block_byte_offset(x: usize, y: usize) -> usize {
+    mode27_within_block_byte_offset_for_format(x, y, 4)
+}
+
+fn mode27_block_dimensions(bytes_per_pixel: usize) -> Option<(usize, usize)> {
+    if !bytes_per_pixel.is_power_of_two() || !(1..=16).contains(&bytes_per_pixel) {
+        return None;
+    }
+    let element_bits = usize::try_from((65_536 / bytes_per_pixel).trailing_zeros())
+        .expect("mode 27 element bit count fits usize");
+    let width_bits = element_bits.div_ceil(2);
+    Some((1 << width_bits, 1 << (element_bits - width_bits)))
+}
+
+fn mode27_within_block_byte_offset_for_format(x: usize, y: usize, bytes_per_pixel: usize) -> usize {
     let bit = |value: usize, index: usize| (value >> index) & 1;
-    let mut within = 0;
-    within |= bit(x, 0) << 2;
-    within |= bit(x, 1) << 3;
-    within |= bit(y, 0) << 4;
-    within |= bit(y, 1) << 5;
-    within |= bit(x, 2) << 6;
-    within |= bit(y, 2) << 7;
-    within |= (bit(x, 7) ^ bit(y, 4) ^ bit(y, 7)) << 8;
-    within |= (bit(x, 4) ^ bit(y, 4)) << 9;
-    within |= (bit(x, 6) ^ bit(y, 5)) << 10;
-    within |= (bit(x, 5) ^ bit(y, 6)) << 11;
-    within |= bit(x, 3) << 12;
-    within |= bit(y, 3) << 13;
-    within |= (bit(x, 6) ^ bit(y, 7)) << 14;
-    within |= (bit(x, 7) ^ bit(y, 6)) << 15;
-    within
+    let log2_bytes =
+        usize::try_from(bytes_per_pixel.trailing_zeros()).expect("mode 27 log2 bytes fits usize");
+    let address_bits: [(usize, usize); 16] = match log2_bytes {
+        0 => [
+            (bit(x, 0), 0),
+            (bit(x, 1), 0),
+            (bit(x, 2), 0),
+            (bit(x, 3), 0),
+            (bit(y, 0), 0),
+            (bit(y, 1), 0),
+            (bit(y, 2), 0),
+            (bit(y, 3), 0),
+            (bit(x, 7) ^ bit(y, 4) ^ bit(y, 7), 0),
+            (bit(x, 4) ^ bit(y, 4), 0),
+            (bit(x, 6) ^ bit(y, 5), 0),
+            (bit(x, 5) ^ bit(y, 6), 0),
+            (bit(x, 6), 0),
+            (bit(y, 6), 0),
+            (bit(x, 7) ^ bit(y, 8), 0),
+            (bit(x, 8) ^ bit(y, 7), 0),
+        ],
+        1 => [
+            (0, 0),
+            (bit(x, 0), 0),
+            (bit(x, 1), 0),
+            (bit(x, 2), 0),
+            (bit(y, 0), 0),
+            (bit(y, 1), 0),
+            (bit(y, 2), 0),
+            (bit(x, 3), 0),
+            (bit(x, 7) ^ bit(y, 4) ^ bit(y, 7), 0),
+            (bit(x, 4) ^ bit(y, 4), 0),
+            (bit(x, 6) ^ bit(y, 5), 0),
+            (bit(x, 5) ^ bit(y, 6), 0),
+            (bit(y, 3), 0),
+            (bit(x, 6), 0),
+            (bit(x, 7) ^ bit(y, 7), 0),
+            (bit(x, 8) ^ bit(y, 6), 0),
+        ],
+        2 => [
+            (0, 0),
+            (0, 0),
+            (bit(x, 0), 0),
+            (bit(x, 1), 0),
+            (bit(y, 0), 0),
+            (bit(y, 1), 0),
+            (bit(x, 2), 0),
+            (bit(y, 2), 0),
+            (bit(x, 7) ^ bit(y, 4) ^ bit(y, 7), 0),
+            (bit(x, 4) ^ bit(y, 4), 0),
+            (bit(x, 6) ^ bit(y, 5), 0),
+            (bit(x, 5) ^ bit(y, 6), 0),
+            (bit(x, 3), 0),
+            (bit(y, 3), 0),
+            (bit(x, 6) ^ bit(y, 7), 0),
+            (bit(x, 7) ^ bit(y, 6), 0),
+        ],
+        3 => [
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (bit(x, 0), 0),
+            (bit(y, 0), 0),
+            (bit(x, 1), 0),
+            (bit(x, 2), 0),
+            (bit(y, 1), 0),
+            (bit(x, 7) ^ bit(y, 4) ^ bit(y, 7), 0),
+            (bit(x, 4) ^ bit(y, 4), 0),
+            (bit(x, 6) ^ bit(y, 5), 0),
+            (bit(x, 5) ^ bit(y, 6), 0),
+            (bit(y, 2), 0),
+            (bit(x, 3), 0),
+            (bit(x, 7) ^ bit(y, 3), 0),
+            (bit(x, 6) ^ bit(y, 6), 0),
+        ],
+        4 => [
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (bit(x, 0), 0),
+            (bit(y, 0), 0),
+            (bit(x, 1), 0),
+            (bit(y, 1), 0),
+            (bit(x, 7) ^ bit(y, 4) ^ bit(y, 7), 0),
+            (bit(x, 4) ^ bit(y, 4), 0),
+            (bit(x, 6) ^ bit(y, 5), 0),
+            (bit(x, 5) ^ bit(y, 6), 0),
+            (bit(x, 2), 0),
+            (bit(y, 2), 0),
+            (bit(x, 6) ^ bit(y, 3), 0),
+            (bit(x, 3) ^ bit(y, 6), 0),
+        ],
+        _ => unreachable!("mode 27 bytes per pixel was validated"),
+    };
+    address_bits
+        .iter()
+        .enumerate()
+        .fold(0, |offset, (index, &(value, _))| offset | (value << index))
 }
 
 fn presenter_window_attributes() -> winit::window::WindowAttributes {
@@ -3158,17 +3627,67 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use metal::{CompileOptions, Device, MTLPixelFormat, RenderPipelineDescriptor};
     use remu_gpu::{ComputeGrid, ComputeLaunch, GpuRegister, IndexedDraw};
+    use remu_shader::PixelOutputKind;
 
     use super::{
+        CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
+        CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
         GuestTextureDescriptor, PresentationResolution, apply_image_destination_select,
-        decode_image_descriptor, decode_scissor, decode_viewport, effective_linear_rgba_pitch,
-        guest_texture_descriptors_overlap, guest_texture_raw_matches,
-        metal_nonindexed_vertex_count, mode27_source_byte_offset, mode27_within_block_byte_offset,
-        parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
-        read_draw_indices, snapshot_guest_texture_raw, snapshot_guest_texture_rgba,
-        validate_compute_launch_for_metal, write_guest_texture_rgba,
+        decode_image_descriptor, decode_render_target_format, decode_render_targets_from_registers,
+        decode_scissor, decode_viewport, effective_linear_pitch, effective_linear_rgba_pitch,
+        guest_texture_byte_count, guest_texture_descriptors_overlap, guest_texture_raw_matches,
+        metal_color_write_mask, metal_nonindexed_vertex_count, mode27_block_dimensions,
+        mode27_source_byte_offset, mode27_within_block_byte_offset, parse_presentation_resolution,
+        presentation_drawable_size, presentation_viewport, read_draw_indices,
+        snapshot_guest_texture_linear, snapshot_guest_texture_raw,
+        validate_compute_launch_for_metal, write_guest_texture_linear,
     };
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_color_target_registers(
+        registers: &mut Vec<GpuRegister>,
+        slot: u32,
+        address: u64,
+        width: u32,
+        height: u32,
+        data_format: u32,
+        number_type: u32,
+        tile_mode: u32,
+    ) {
+        let primary = slot * CB_COLOR_REGISTER_STRIDE;
+        registers.extend([
+            GpuRegister {
+                offset: CB_COLOR0_BASE + primary,
+                value: u32::try_from((address >> 8) & 0xffff_ffff).expect("base fits u32"),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_VIEW + primary,
+                value: 0,
+            },
+            GpuRegister {
+                offset: CB_COLOR0_INFO + primary,
+                value: (data_format << 2) | (number_type << 8),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_ATTRIB + primary,
+                value: 0,
+            },
+            GpuRegister {
+                offset: CB_COLOR0_BASE_EXT + slot,
+                value: u32::try_from((address >> 40) & 0xff).expect("base extension fits u32"),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_ATTRIB2 + slot,
+                value: ((width - 1) << 14) | (height - 1),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_ATTRIB3 + slot,
+                value: (tile_mode << 14) | (u32::from(height > 1) << 24),
+            },
+        ]);
+    }
 
     #[test]
     fn parses_configurable_presentation_resolution() {
@@ -3263,6 +3782,272 @@ mod tests {
         assert_eq!(effective_linear_rgba_pitch(320), Some(320));
         assert_eq!(effective_linear_rgba_pitch(980), Some(1024));
         assert_eq!(effective_linear_rgba_pitch(250), Some(256));
+        assert_eq!(effective_linear_pitch(250, 1), Some(256));
+        assert_eq!(effective_linear_pitch(250, 2), Some(256));
+        assert_eq!(effective_linear_pitch(250, 8), Some(256));
+        assert_eq!(effective_linear_pitch(250, 16), Some(256));
+    }
+
+    #[test]
+    fn decodes_all_gfx10_color_slots_and_dense_metal_output_layout() {
+        let address0 = 0x0070_1234_5600_u64;
+        let address3 = 0x0071_89ab_cd00_u64;
+        let mut registers = vec![GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0x0000_f00b,
+        }];
+        append_color_target_registers(&mut registers, 0, address0, 1_280, 720, 10, 0, 27);
+        append_color_target_registers(&mut registers, 3, address3, 1_280, 720, 12, 4, 27);
+        registers.sort_by_key(|register| register.offset);
+
+        let targets = decode_render_targets_from_registers(&registers, 0x0000_5007)
+            .expect("two valid MRT targets");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].guest_slot, 0);
+        assert_eq!(targets[0].texture.address, address0);
+        assert_eq!(targets[0].texture.pixel_format, MTLPixelFormat::RGBA8Unorm);
+        assert_eq!(targets[0].texture.bytes_per_pixel, 4);
+        assert_eq!(targets[0].output_kind, PixelOutputKind::Float);
+        assert_eq!(targets[0].write_mask, 0x3);
+        assert_eq!(targets[1].guest_slot, 3);
+        assert_eq!(targets[1].texture.address, address3);
+        assert_eq!(targets[1].texture.pixel_format, MTLPixelFormat::RGBA16Uint);
+        assert_eq!(targets[1].texture.bytes_per_pixel, 8);
+        assert_eq!(targets[1].output_kind, PixelOutputKind::Uint);
+        assert_eq!(targets[1].write_mask, 0x5);
+    }
+
+    #[test]
+    fn render_target_decode_rejects_incomplete_or_lossy_state() {
+        let address = 0x0070_1234_5600_u64;
+        let mut registers = vec![GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0xf,
+        }];
+        append_color_target_registers(&mut registers, 0, address, 640, 360, 10, 0, 27);
+        registers.sort_by_key(|register| register.offset);
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_INFO)
+            .expect("color info exists")
+            .value |= 1 << 28;
+        assert!(
+            decode_render_targets_from_registers(&registers, 0xf)
+                .expect_err("DCC cannot be silently treated as raw color")
+                .contains("dcc=1")
+        );
+
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_INFO)
+            .expect("color info exists")
+            .value &= !(1 << 28);
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_VIEW)
+            .expect("color view exists")
+            .value = 1 << 26;
+        assert!(
+            decode_render_targets_from_registers(&registers, 0xf)
+                .expect_err("nonzero mip view cannot be silently flattened")
+                .contains("mip=1/0")
+        );
+
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_VIEW)
+            .expect("color view exists")
+            .value = 0;
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_ATTRIB3)
+            .expect("color attrib3 exists")
+            .value = (27 << 14) | (3 << 24);
+        assert!(
+            decode_render_targets_from_registers(&registers, 0xf)
+                .expect_err("reserved resource type cannot be treated as a 2D texture")
+                .contains("type=3")
+        );
+
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_ATTRIB3)
+            .expect("color attrib3 exists")
+            .value = (27 << 14) | (1 << 24);
+
+        registers.retain(|register| register.offset != CB_COLOR0_ATTRIB2);
+        assert!(
+            decode_render_targets_from_registers(&registers, 0xf)
+                .expect_err("missing extent register must fail")
+                .contains("CB_COLOR_ATTRIB2")
+        );
+    }
+
+    #[test]
+    fn maps_guest_number_types_to_matching_metal_export_types() {
+        let float = decode_render_target_format(10, 0, 0).expect("RGBA8 unorm");
+        let uint = decode_render_target_format(10, 4, 0).expect("RGBA8 uint");
+        let sint = decode_render_target_format(12, 5, 0).expect("RGBA16 sint");
+        let bgra = decode_render_target_format(10, 0, 1).expect("BGRA component swap");
+        assert_eq!(float.output_kind, PixelOutputKind::Float);
+        assert_eq!(uint.output_kind, PixelOutputKind::Uint);
+        assert_eq!(sint.output_kind, PixelOutputKind::Sint);
+        assert_eq!(bgra.pixel_format, MTLPixelFormat::BGRA8Unorm);
+        assert!(decode_render_target_format(10, 2, 0).is_err());
+        assert!(decode_render_target_format(10, 0, 2).is_err());
+    }
+
+    #[test]
+    fn translates_gfx10_write_mask_bit_order_to_metal() {
+        assert_eq!(metal_color_write_mask(0x1).bits(), 0x8);
+        assert_eq!(metal_color_write_mask(0x2).bits(), 0x4);
+        assert_eq!(metal_color_write_mask(0x4).bits(), 0x2);
+        assert_eq!(metal_color_write_mask(0x8).bits(), 0x1);
+        assert_eq!(metal_color_write_mask(0xf).bits(), 0xf);
+    }
+
+    #[test]
+    fn apple_metal_compiles_mixed_float_uint_sint_mrt_pipeline() {
+        let device = Device::system_default().expect("Apple test host has a Metal device");
+        let source = r"
+#include <metal_stdlib>
+using namespace metal;
+struct MixedMrtOutput {
+    float4 floating [[color(0)]];
+    uint4 unsigned_integer [[color(1)]];
+    int4 signed_integer [[color(2)]];
+};
+vertex float4 remu_mrt_vertex(uint vertex_id [[vertex_id]]) {
+    return float4(float(vertex_id & 1u), float((vertex_id >> 1u) & 1u), 0.0, 1.0);
+}
+fragment MixedMrtOutput remu_mrt_fragment() {
+    return { float4(0.25), uint4(7u), int4(-3) };
+}
+";
+        let options = CompileOptions::new();
+        options.set_fast_math_enabled(false);
+        let library = device
+            .new_library_with_source(source, &options)
+            .expect("mixed MRT MSL compiles");
+        let vertex = library
+            .get_function("remu_mrt_vertex", None)
+            .expect("MRT vertex function exists");
+        let fragment = library
+            .get_function("remu_mrt_fragment", None)
+            .expect("MRT fragment function exists");
+        let descriptor = RenderPipelineDescriptor::new();
+        descriptor.set_vertex_function(Some(&vertex));
+        descriptor.set_fragment_function(Some(&fragment));
+        for (location, format, mask) in [
+            (0, MTLPixelFormat::RGBA8Unorm, 0xf),
+            (1, MTLPixelFormat::RGBA8Uint, 0x5),
+            (2, MTLPixelFormat::RGBA16Sint, 0xa),
+        ] {
+            let attachment = descriptor
+                .color_attachments()
+                .object_at(location)
+                .expect("Metal exposes eight color attachments");
+            attachment.set_pixel_format(format);
+            attachment.set_write_mask(metal_color_write_mask(mask));
+        }
+        device
+            .new_render_pipeline_state(&descriptor)
+            .expect("mixed typed MRT render pipeline compiles");
+    }
+
+    #[test]
+    fn every_decoded_render_target_format_is_apple_metal_renderable() {
+        let device = Device::system_default().expect("Apple test host has a Metal device");
+        let source = r"
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 remu_format_vertex(uint vertex_id [[vertex_id]]) {
+    return float4(float(vertex_id & 1u), float((vertex_id >> 1u) & 1u), 0.0, 1.0);
+}
+fragment float4 remu_format_float() { return float4(0.25); }
+fragment uint4 remu_format_uint() { return uint4(7u); }
+fragment int4 remu_format_sint() { return int4(-3); }
+";
+        let library = device
+            .new_library_with_source(source, &CompileOptions::new())
+            .expect("format-cohort MSL compiles");
+        let vertex = library
+            .get_function("remu_format_vertex", None)
+            .expect("format vertex exists");
+        let cases = [
+            (1, 0, 0),
+            (1, 1, 0),
+            (1, 4, 0),
+            (1, 5, 0),
+            (1, 6, 0),
+            (2, 0, 0),
+            (2, 1, 0),
+            (2, 4, 0),
+            (2, 5, 0),
+            (2, 7, 0),
+            (3, 0, 0),
+            (3, 1, 0),
+            (3, 4, 0),
+            (3, 5, 0),
+            (3, 6, 0),
+            (4, 4, 0),
+            (4, 5, 0),
+            (4, 7, 0),
+            (5, 0, 0),
+            (5, 1, 0),
+            (5, 4, 0),
+            (5, 5, 0),
+            (5, 7, 0),
+            (6, 7, 0),
+            (7, 7, 0),
+            (8, 0, 0),
+            (9, 0, 0),
+            (10, 0, 0),
+            (10, 0, 1),
+            (10, 1, 0),
+            (10, 4, 0),
+            (10, 5, 0),
+            (10, 6, 0),
+            (10, 6, 1),
+            (11, 4, 0),
+            (11, 5, 0),
+            (11, 7, 0),
+            (12, 0, 0),
+            (12, 1, 0),
+            (12, 4, 0),
+            (12, 5, 0),
+            (12, 7, 0),
+            (14, 4, 0),
+            (14, 5, 0),
+            (14, 7, 0),
+            (24, 7, 0),
+        ];
+        for (data_format, number_type, component_swap) in cases {
+            let decoded = decode_render_target_format(data_format, number_type, component_swap)
+                .expect("listed format decodes");
+            let fragment_name = match decoded.output_kind {
+                PixelOutputKind::Float => "remu_format_float",
+                PixelOutputKind::Uint => "remu_format_uint",
+                PixelOutputKind::Sint => "remu_format_sint",
+            };
+            let fragment = library
+                .get_function(fragment_name, None)
+                .expect("typed fragment exists");
+            let descriptor = RenderPipelineDescriptor::new();
+            descriptor.set_vertex_function(Some(&vertex));
+            descriptor.set_fragment_function(Some(&fragment));
+            descriptor
+                .color_attachments()
+                .object_at(0)
+                .expect("color attachment zero exists")
+                .set_pixel_format(decoded.pixel_format);
+            device.new_render_pipeline_state(&descriptor).unwrap_or_else(|error| {
+                panic!(
+                    "Metal rejected GFX10 format {data_format}/{number_type}/swap{component_swap} as {:?}: {error}",
+                    decoded.pixel_format
+                )
+            });
+        }
     }
 
     #[test]
@@ -3391,6 +4176,8 @@ mod tests {
             height: u32::try_from(height).expect("height fits u32"),
             pitch: u32::try_from(width).expect("pitch fits u32"),
             tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
         };
         let mut linear = vec![0_u8; width * height * 4];
         for y in 0..height {
@@ -3405,11 +4192,54 @@ mod tests {
             }
         }
 
-        write_guest_texture_rgba(descriptor, &linear).expect("mode 27 write succeeds");
+        write_guest_texture_linear(descriptor, &linear).expect("mode 27 write succeeds");
         assert_eq!(
-            snapshot_guest_texture_rgba(descriptor).expect("mode 27 snapshot succeeds"),
+            snapshot_guest_texture_linear(descriptor).expect("mode 27 snapshot succeeds"),
             linear
         );
+    }
+
+    #[test]
+    fn mode27_round_trips_every_supported_render_target_element_size() {
+        for (bytes_per_pixel, pixel_format) in [
+            (1, MTLPixelFormat::R8Unorm),
+            (2, MTLPixelFormat::RG8Unorm),
+            (4, MTLPixelFormat::RGBA8Unorm),
+            (8, MTLPixelFormat::RGBA16Float),
+            (16, MTLPixelFormat::RGBA32Float),
+        ] {
+            let (block_width, block_height) = mode27_block_dimensions(bytes_per_pixel)
+                .expect("render-target element size has a mode 27 equation");
+            let width = block_width + 1;
+            let height = block_height + 1;
+            let mut descriptor = GuestTextureDescriptor {
+                address: 0x1_0000,
+                width: u32::try_from(width).expect("test width fits u32"),
+                height: u32::try_from(height).expect("test height fits u32"),
+                pitch: u32::try_from(width).expect("test pitch fits u32"),
+                tile_mode: 27,
+                pixel_format,
+                bytes_per_pixel: u32::try_from(bytes_per_pixel)
+                    .expect("test bytes per pixel fits u32"),
+            };
+            let tiled_length = usize::try_from(
+                guest_texture_byte_count(descriptor).expect("tiled byte count fits u64"),
+            )
+            .expect("tiled byte count fits usize");
+            let mut tiled = vec![0_u8; tiled_length];
+            descriptor.address = u64::try_from(tiled.as_mut_ptr() as usize)
+                .expect("test allocation address fits u64");
+            let linear_length = width * height * bytes_per_pixel;
+            let linear = (0..linear_length)
+                .map(|index| u8::try_from(index & 0xff).expect("masked byte fits u8"))
+                .collect::<Vec<_>>();
+            write_guest_texture_linear(descriptor, &linear).expect("mode 27 write succeeds");
+            assert_eq!(
+                snapshot_guest_texture_linear(descriptor).expect("mode 27 snapshot succeeds"),
+                linear,
+                "bytes per pixel {bytes_per_pixel}",
+            );
+        }
     }
 
     #[test]
@@ -3421,6 +4251,8 @@ mod tests {
             height: 8,
             pitch: 16,
             tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
         };
         let shadow = snapshot_guest_texture_raw(descriptor).expect("raw snapshot succeeds");
         assert!(guest_texture_raw_matches(descriptor, &shadow).expect("raw comparison succeeds"));
@@ -3436,6 +4268,8 @@ mod tests {
             height: 64,
             pitch: 64,
             tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
         };
         let overlapping_view = GuestTextureDescriptor {
             address: base.address + 8_192,
@@ -3443,6 +4277,8 @@ mod tests {
             height: 32,
             pitch: 32,
             tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
         };
         let adjacent = GuestTextureDescriptor {
             address: base.address + 16_384,
