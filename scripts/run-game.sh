@@ -36,7 +36,8 @@ fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
 bundled_metal_compiler="$repo_dir/.remu/toolchains/Metal.xctoolchain/usr/bin/metal"
-if [ -z "${REMU_METAL_COMPILER:-}" ] && [ -x "$bundled_metal_compiler" ]; then
+if [ "${REMU_USE_BUNDLED_METAL_COMPILER:-0}" = 1 ] && \
+    [ -z "${REMU_METAL_COMPILER:-}" ] && [ -x "$bundled_metal_compiler" ]; then
     REMU_METAL_COMPILER=$bundled_metal_compiler
     export REMU_METAL_COMPILER
 fi

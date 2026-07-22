@@ -321,7 +321,7 @@ fn add_relocation_stats(total: &mut RelocationStats, addition: RelocationStats) 
     total.relative += addition.relative;
 }
 
-const LLE_LIBC_RUNTIME_NIDS: [&str; 12] = [
+const LLE_LIBC_RUNTIME_NIDS: [&str; 13] = [
     "bzQExy189ZI",
     "gQX+4GDQjpM",
     "tIhsqj0qsFE",
@@ -335,6 +335,7 @@ const LLE_LIBC_RUNTIME_NIDS: [&str; 12] = [
     // between guest code and host approximations.
     "QxqK-IdpumU", // _Getpmbstate
     "zS94yyJRSUs", // _Getpwcstate
+    "-9SIhUr4Iuo", // _Mbtowcx
     "stv1S3BKfgw", // _Wctombx
     "ATpTPg64JhM", // _Wctombx.initial
 ];
@@ -1302,6 +1303,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "mkx2fVhNMsg" => "pthread_cond_broadcast",
         "QxqK-IdpumU" => "_Getpmbstate",
         "zS94yyJRSUs" => "_Getpwcstate",
+        "-9SIhUr4Iuo" => "_Mbtowcx",
         "stv1S3BKfgw" => "_Wctombx",
         "ATpTPg64JhM" => "_Wctombx.initial",
         "FxVZqBAA7ks" => "_write",
@@ -1344,6 +1346,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "m5-2bsNfv7s" => "scePthreadCondattrInit",
         "waPcxYiR3WA" => "scePthreadCondattrDestroy",
         "4qGrR6eoP9Y" => "scePthreadDetach",
+        "T72hz6ffq08" => "scePthreadYield",
         "g8cM39EUZ6o" => "sceSysmoduleLoadModule",
         "hZIg1EWGsHM" => "sceUltInitialize",
         "CdWp0oHWGr0" => "sceUserServiceGetInitialUser",
@@ -1998,6 +2001,13 @@ extern "C" fn import_dispatch(
             attributes.detach_state = 1;
         }
         drop(thread);
+        return ProbeImportReturn::integer(0);
+    }
+    if nid == "T72hz6ffq08" {
+        // Yield outside the global import-dispatch lock so another guest worker can enter an HLE
+        // service while this host thread gives up its remaining scheduler quantum.
+        drop(state);
+        std::thread::yield_now();
         return ProbeImportReturn::integer(0);
     }
     if is_guest_sync_import(&nid) {
