@@ -4667,6 +4667,12 @@ fn evaluate_shader_snapshot(
     user_data_register: u32,
     scalar_register_base: u32,
 ) -> Result<remu_shader::ShaderEvaluation, String> {
+    // Global/buffer descriptors can advertise hundreds of MiB even when a draw touches only a
+    // small working set. Copying the shader evaluator's 16 MiB diagnostic ceiling through Mach
+    // VM for every statically discovered branch made a single sprite draw take minutes under
+    // Rosetta. Images are captured separately from their exact descriptors, and generated Metal
+    // buffer loads already return zero outside this bounded snapshot.
+    const MAX_DRAW_BINDING_SNAPSHOT_BYTES: usize = 1024 * 1024;
     let state = remu_shader::build_shader_state(
         Arc::clone(&snapshot.program),
         snapshot.metadata.clone(),
@@ -4684,7 +4690,10 @@ fn evaluate_shader_snapshot(
     remu_shader::evaluate_shader(
         &ProcessGuestMemory,
         &state,
-        remu_shader::EvaluationOptions::default(),
+        remu_shader::EvaluationOptions {
+            maximum_binding_bytes: MAX_DRAW_BINDING_SNAPSHOT_BYTES,
+            ..remu_shader::EvaluationOptions::default()
+        },
     )
     .map_err(|error| format!("evaluation-error({error})"))
 }
