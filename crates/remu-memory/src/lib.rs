@@ -19,8 +19,9 @@ pub use write_watch::CpuWriteWatch;
 mod address_space;
 #[cfg(target_os = "macos")]
 pub use address_space::{
-    AddressSpaceError, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
-    GuestProtection, GuestVmaInfo, GuestVmaState, RequestedAddress,
+    AddressSpaceError, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
+    GuestPhysicalBacking, GuestProtection, GuestSharedMapOptions, GuestVmaInfo, GuestVmaState,
+    RequestedAddress,
 };
 
 pub const PS5_MAIN_IMAGE_BASE: GuestAddress = GuestAddress::new(0x0000_0008_0000_0000);

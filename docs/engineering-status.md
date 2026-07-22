@@ -70,8 +70,29 @@ milestone completion claim.
   binding, busy destruction with pending waiters, destruction after selection, and a three-worker
   predicate-guarded pool in which one signal permits exactly one task consumption. Bounded
   power-of-two condition ticket/selection telemetry complements the existing opt-in all-call VM
-  map/protect/query/unmap trace. Native and Rosetta workspace tests and strict Clippy pass; a
-  process-checked post-fix game run is the next controlled evidence step.
+  map/protect/query/unmap trace. Native and Rosetta workspace tests and strict Clippy passed before
+  the process-checked run below.
+- The single post-fix run at `c883eff` used direct shell, headless Metal, an exact 80-second bound,
+  and opt-in VM/synchronization traces. It ended by deliberate timeout with four frames, zero
+  unimplemented NIDs, and no remaining process; artifacts are retained under
+  `.remu/runs/20260722T131219Z-dreaming-sarah`. It crossed the former 67-second SIGBUS, completed
+  the data-payload parse, retained AGC/Metal draw checkpoint 1024, and continued loading launcher,
+  menu, image, FLAC, and OGG resources through the timeout. Splash and opaque-black transition
+  hashes remain `e40b7edcc73511a9b535953e3430fd37d5bfd87b4b276cf11205f15ef9ffe7a7` and
+  `2d02539a60a0d952d92b30e455ac5aeb2ab13510993224e7c94cdd4e29fbb581`. This closes that crash
+  checkpoint, not the title milestone or post-transition rendering.
+- The VM trace exposed a more direct allocator-corruption mechanism. Independent adjacent direct
+  mappings were normalized into one VMA, so a query at `0x7005530000` reported the merged range
+  `0x7000230000..0x7005560000`. The guest consequently requested a `0x5330000`-byte unmap from the
+  interior address; strict coverage rejected it, but the following physical release succeeded and
+  allowed live aliases to be reused. The old fault page `0x70093c39a0` lay in the same incorrectly
+  coalesced/released span. The guest explicitly supplied `MAP_NO_COALESCE` (`0x400000`). The current
+  increment propagates that public flag into backend-neutral VMA policy: fragments from one mapping
+  may recombine, compatible default mappings may coalesce, and independent no-coalesce mappings
+  retain exact `VirtualQuery` boundaries. Releasing a direct-memory subrange now invalidates every
+  overlapping virtual alias while preserving adjusted tails before physical ownership becomes
+  reusable. Synthetic address-space and kernel-memory tests reproduce these invariants without
+  title data.
 
 ## Subsystem ledger
 
@@ -80,6 +101,7 @@ milestone completion claim.
 | CPU, loader, linker | x86-64 guest execution remains behind the native CPU backend and runs under Rosetta; ELF/SELF mapping, observed relocations, TLS, and import trampolines have synthetic coverage. | Continue source-backed HLE import closure; do not begin the AArch64 translator before a milestone requires it. |
 | AGC / PM4 ordering | Native Gen5 command routing, type-2 packets, clear state, ABI-side packet-predication patching, submission-bounded targetless scanout association, compute submission, a backpressured 64-event transport channel, and a one-entry shader compile gate are implemented. Partial-flush `EVENT_WRITE` types 7/15/16 become ordered compute/vertex/pixel GPU barriers; a blocked draw replays once before barrier/acquire/flip successors. | Implement execution-side `SET_PREDICATION`/header-bit semantics, then source-backed release/wait, cache visibility, fence writes, and graphics-equeue completion. Keep those operations distinct; a partial flush alone is not a CPU notification. |
 | Metal resources / readback | Persistent guest textures, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, MSAA resolve targets, and supported depth readback are covered by GPU tests. Internal Metal compression is handled by the blit and remains separate from guest tiling. | Move diagnostic capture to bounded asynchronous tickets and a reusable staging pool after correctness evidence; add explicit block-compressed and combined depth/stencil aspect layouts when guest formats exercise them. |
+| Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, and guest metadata are covered. `MAP_NO_COALESCE` mappings retain private identities for exact `VirtualQuery` boundaries; direct release invalidates all overlapping aliases and preserves unaffected tails. Containment-first/find-next query behavior and cross-VMA atomic unmap have synthetic coverage. | The full native/Rosetta gate is green. Validate the corrected query/unmap/release sequence in the next single controlled title run, then complete mapping lifecycle counters and exact query error/flag behavior for all exercised cases. |
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, and translated shader pipelines are present. | Complete reusable blend, depth/stencil, rasterization, culling, front-face, multisampling, resolve, and full structural cache identity; audit old blend commit `a0388df` without wholesale cherry-picking. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, and observed compute geometry are implemented with offline Metal compilation tests. | Complete the unimplemented RDNA2 instruction/resource/CFG surface and replace large per-draw shader snapshots with bounded content-addressed immutable spans. |
 | Presentation / frame capture | Guest display size is independent of host drawable size; headless Metal is opt-in; interactive runs use a regular app bundle; direct scanout avoids routine GPU-to-CPU presentation round trips. The bounded scanout/barrier run captured the correct splash and the expected later opaque-black transition from both alternating buffers. | Reach and capture the first post-transition scene after another concrete fix or diagnostic feature, then measure frame pacing. Do not infer playability from splash/transition frames. |
@@ -98,10 +120,11 @@ milestone completion claim.
 4. `cargo test --workspace --target x86_64-apple-darwin`
 5. `cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings`
 6. `python3 -m unittest scripts/tests/test_audit_import_coverage.py`
-7. Complete at `8ac72bd`: one direct-shell, process-checked, bounded headless Dreaming Sarah capture
-   produced the expected opaque-black transition. A later 70-second run at `f9e476b` exposed the
-   BackgroundLoader condition-variable/SIGBUS correlation. One longer post-condition-fix headless
-   validation is permitted only after checks 1-6 pass; no interactive launch is required.
+7. Complete at `c883eff`: one direct-shell, process-checked, 80-second headless Dreaming Sarah run
+   crossed the old SIGBUS and reached sustained background asset loading. Its VM trace exposed the
+   adjacent-map query-boundary defect now covered synthetically. The mapping-identity increment has
+   passed checks 1-6; its next evidence step is one controlled direct-shell run, not an interactive
+   or routine launch loop.
 
 Reference implementation provenance is recorded in [provenance](provenance.md); architectural and
 licensing constraints remain in [architecture](architecture.md) and [source policy](source-policy.md).

@@ -7,8 +7,8 @@ use remu_core::GuestAddress;
 #[cfg(test)]
 use remu_memory::GUEST_PAGE_SIZE;
 use remu_memory::{
-    AddressSpaceError, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking, GuestProtection,
-    GuestVmaInfo, GuestVmaState,
+    AddressSpaceError, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
+    GuestPhysicalBacking, GuestProtection, GuestSharedMapOptions, GuestVmaInfo, GuestVmaState,
 };
 use thiserror::Error;
 
@@ -34,6 +34,14 @@ pub(super) struct KernelVirtualMapping {
     pub direct_start: u64,
     pub protection: i32,
     pub memory_type: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct KernelDirectMapOptions {
+    pub raw_protection: i32,
+    pub direct_start: u64,
+    pub memory_type: Option<i32>,
+    pub coalescing: GuestMapCoalescing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,18 +134,10 @@ impl DirectMemory {
     }
 
     fn release(&mut self, start: u64, size: u64) -> Result<bool, KernelMemoryError> {
-        let end = start
-            .checked_add(size)
-            .ok_or(KernelMemoryError::DirectMemoryOverflow { start, size })?;
-        let owner = self
-            .allocations
-            .range(..=start)
-            .next_back()
-            .map(|(_, allocation)| *allocation)
-            .filter(|allocation| start >= allocation.start && end <= allocation.end);
-        let Some(owner) = owner else {
+        let Some(owner) = self.containing_allocation(start, size)? else {
             return Ok(false);
         };
+        let end = start + size;
         self.allocations.remove(&owner.start);
         if owner.start < start {
             self.insert(owner.start, start, owner.memory_type);
@@ -146,6 +146,22 @@ impl DirectMemory {
             self.insert(end, owner.end, owner.memory_type);
         }
         Ok(true)
+    }
+
+    fn containing_allocation(
+        &self,
+        start: u64,
+        size: u64,
+    ) -> Result<Option<DirectAllocation>, KernelMemoryError> {
+        let end = start
+            .checked_add(size)
+            .ok_or(KernelMemoryError::DirectMemoryOverflow { start, size })?;
+        Ok(self
+            .allocations
+            .range(..=start)
+            .next_back()
+            .map(|(_, allocation)| *allocation)
+            .filter(|allocation| start >= allocation.start && end <= allocation.end))
     }
 
     fn segments(&self, start: u64, size: u64) -> Result<Vec<DirectSegment>, KernelMemoryError> {
@@ -213,10 +229,48 @@ impl KernelMemory {
     }
 
     pub fn release_direct(&mut self, start: u64, size: u64) -> Result<bool, KernelMemoryError> {
-        self.direct_memory.release(start, size)
+        if self
+            .direct_memory
+            .containing_allocation(start, size)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let end = start
+            .checked_add(size)
+            .ok_or(KernelMemoryError::DirectMemoryOverflow { start, size })?;
+        let aliases = self
+            .virtual_memory
+            .vmas()
+            .into_iter()
+            .filter_map(|vma| {
+                if vma.state != GuestVmaState::Shared
+                    || vma.backing_id != Some(self.direct_memory.backing.id())
+                {
+                    return None;
+                }
+                let backing_end = vma.backing_offset.checked_add(vma.size)?;
+                let overlap_start = start.max(vma.backing_offset);
+                let overlap_end = end.min(backing_end);
+                (overlap_start < overlap_end).then_some((
+                    GuestAddress::new(vma.start.get() + overlap_start - vma.backing_offset),
+                    overlap_end - overlap_start,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (address, alias_size) in aliases {
+            self.virtual_memory.unmap(address, alias_size)?;
+        }
+        let released = self.direct_memory.release(start, size)?;
+        assert!(
+            released,
+            "validated direct allocation remains owned until release"
+        );
+        Ok(true)
     }
 
-    pub fn map_direct(
+    #[cfg(test)]
+    fn map_direct(
         &mut self,
         placement: GuestMapPlacement,
         size: u64,
@@ -224,34 +278,44 @@ impl KernelMemory {
         raw_protection: i32,
         direct_start: u64,
     ) -> Result<GuestAddress, KernelMemoryError> {
-        self.map_direct_with_memory_type(
+        self.map_direct_with_options(
             placement,
             size,
             alignment,
-            raw_protection,
-            direct_start,
-            None,
+            KernelDirectMapOptions {
+                raw_protection,
+                direct_start,
+                memory_type: None,
+                coalescing: GuestMapCoalescing::Allowed,
+            },
         )
     }
 
-    pub fn map_direct_with_memory_type(
+    pub fn map_direct_with_options(
         &mut self,
         placement: GuestMapPlacement,
         size: u64,
         alignment: u64,
-        raw_protection: i32,
-        direct_start: u64,
-        memory_type: Option<i32>,
+        options: KernelDirectMapOptions,
     ) -> Result<GuestAddress, KernelMemoryError> {
+        let KernelDirectMapOptions {
+            raw_protection,
+            direct_start,
+            memory_type,
+            coalescing,
+        } = options;
         let segments = self.direct_memory.segments(direct_start, size)?;
         let protection = translate_protection(raw_protection);
-        let mapped = self.virtual_memory.map_shared(
+        let mapped = self.virtual_memory.map_shared_with_coalescing(
             placement,
             size,
             alignment,
             protection,
             &self.direct_memory.backing,
-            direct_start,
+            GuestSharedMapOptions {
+                backing_offset: direct_start,
+                coalescing,
+            },
         )?;
         for segment in segments {
             let virtual_start = mapped
@@ -454,6 +518,67 @@ mod tests {
     }
 
     #[test]
+    fn direct_release_invalidates_every_alias_and_preserves_unaffected_tails() {
+        let mut memory = KernelMemory::new().unwrap();
+        memory
+            .allocate_direct(
+                0,
+                DIRECT_MEMORY_SIZE,
+                3 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                12,
+            )
+            .unwrap();
+        let first = memory
+            .map_direct(
+                GuestMapPlacement::Anywhere,
+                3 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x33,
+                0,
+            )
+            .unwrap();
+        let second = memory
+            .map_direct(
+                GuestMapPlacement::Anywhere,
+                3 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x33,
+                0,
+            )
+            .unwrap();
+
+        assert!(
+            memory
+                .release_direct(GUEST_PAGE_SIZE, GUEST_PAGE_SIZE)
+                .unwrap()
+        );
+        for alias in [first, second] {
+            assert!(memory.query(alias, false).is_some());
+            assert!(memory.query(page(alias, 1), false).is_none());
+            let right = memory.query(page(alias, 2), false).unwrap();
+            assert_eq!(right.address, page(alias, 2));
+            assert_eq!(right.size, GUEST_PAGE_SIZE);
+            assert_eq!(right.direct_start, 2 * GUEST_PAGE_SIZE);
+        }
+        assert!(
+            !memory
+                .release_direct(GUEST_PAGE_SIZE, GUEST_PAGE_SIZE)
+                .unwrap()
+        );
+        assert!(matches!(
+            memory.map_direct(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x33,
+                GUEST_PAGE_SIZE,
+            ),
+            Err(KernelMemoryError::DirectMemoryNotAllocated { .. })
+        ));
+    }
+
+    #[test]
     fn mapping_across_physical_allocations_retains_each_memory_type() {
         let mut memory = KernelMemory::new().unwrap();
         memory
@@ -479,6 +604,88 @@ mod tests {
             .unwrap();
         assert_eq!(memory.query(mapped, false).unwrap().memory_type, 4);
         assert_eq!(memory.query(page(mapped, 1), false).unwrap().memory_type, 9);
+    }
+
+    #[test]
+    fn independent_adjacent_direct_maps_retain_virtual_query_boundaries() {
+        let mut memory = KernelMemory::new().unwrap();
+        memory
+            .allocate_direct(0, DIRECT_MEMORY_SIZE, GUEST_PAGE_SIZE, GUEST_PAGE_SIZE, 12)
+            .unwrap();
+        memory
+            .allocate_direct(
+                GUEST_PAGE_SIZE,
+                DIRECT_MEMORY_SIZE,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                12,
+            )
+            .unwrap();
+        let first = memory
+            .map_direct_with_options(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                KernelDirectMapOptions {
+                    raw_protection: 0x33,
+                    direct_start: 0,
+                    memory_type: None,
+                    coalescing: GuestMapCoalescing::Disallowed,
+                },
+            )
+            .unwrap();
+        let second = memory
+            .map_direct_with_options(
+                GuestMapPlacement::Fixed(page(first, 1)),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                KernelDirectMapOptions {
+                    raw_protection: 0x33,
+                    direct_start: GUEST_PAGE_SIZE,
+                    memory_type: None,
+                    coalescing: GuestMapCoalescing::Disallowed,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(second, page(first, 1));
+        assert_eq!(memory.query(first, false).unwrap().size, GUEST_PAGE_SIZE);
+        let second_query = memory.query(second, false).unwrap();
+        assert_eq!(second_query.address, second);
+        assert_eq!(second_query.size, GUEST_PAGE_SIZE);
+        assert_eq!(second_query.direct_start, GUEST_PAGE_SIZE);
+    }
+
+    #[test]
+    fn virtual_query_prefers_containment_then_the_smallest_later_mapping() {
+        let mut memory = KernelMemory::new().unwrap();
+        memory
+            .allocate_direct(
+                0,
+                DIRECT_MEMORY_SIZE,
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                12,
+            )
+            .unwrap();
+        let base = memory.virtual_base();
+        let first = page(base, 2);
+        let second = page(base, 5);
+        for (address, direct_start) in [(first, 0), (second, GUEST_PAGE_SIZE)] {
+            memory
+                .map_direct(
+                    GuestMapPlacement::Fixed(address),
+                    GUEST_PAGE_SIZE,
+                    GUEST_PAGE_SIZE,
+                    0x33,
+                    direct_start,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(memory.query(first, true).unwrap().address, first);
+        assert!(memory.query(page(base, 3), false).is_none());
+        assert_eq!(memory.query(page(base, 3), true).unwrap().address, second);
     }
 
     #[test]

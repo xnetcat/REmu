@@ -23,6 +23,7 @@ use thiserror::Error;
 pub const GUEST_PAGE_SIZE: u64 = 16 * 1024;
 
 static NEXT_BACKING_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GuestProtection(u8);
@@ -108,6 +109,18 @@ pub enum GuestMapPlacement {
     Anywhere,
     Hint(GuestAddress),
     Fixed(GuestAddress),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestMapCoalescing {
+    Allowed,
+    Disallowed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestSharedMapOptions {
+    pub backing_offset: u64,
+    pub coalescing: GuestMapCoalescing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +360,7 @@ struct Vma {
     kind: VmaKind,
     backing_offset: u64,
     metadata: u64,
+    mapping_id: u64,
 }
 
 impl Vma {
@@ -370,6 +384,7 @@ impl Vma {
         if self.end != next.start
             || self.protection != next.protection
             || self.metadata != next.metadata
+            || self.mapping_id != next.mapping_id
         {
             return false;
         }
@@ -624,6 +639,7 @@ impl GuestAddressSpace {
                 kind: VmaKind::Reserved,
                 backing_offset: 0,
                 metadata: 0,
+                mapping_id: 0,
             },
         );
         self.normalize();
@@ -653,6 +669,7 @@ impl GuestAddressSpace {
                 kind: VmaKind::Anonymous,
                 backing_offset: 0,
                 metadata: 0,
+                mapping_id: 0,
             },
         );
         self.normalize();
@@ -670,6 +687,34 @@ impl GuestAddressSpace {
         backing: &GuestPhysicalBacking,
         backing_offset: u64,
     ) -> Result<GuestAddress, AddressSpaceError> {
+        self.map_shared_with_coalescing(
+            placement,
+            size,
+            alignment,
+            protection,
+            backing,
+            GuestSharedMapOptions {
+                backing_offset,
+                coalescing: GuestMapCoalescing::Allowed,
+            },
+        )
+    }
+
+    /// Maps a shared backing slice while preserving independent mapping-call boundaries when
+    /// coalescing is disabled by the guest ABI.
+    pub fn map_shared_with_coalescing(
+        &mut self,
+        placement: GuestMapPlacement,
+        size: u64,
+        alignment: u64,
+        protection: GuestProtection,
+        backing: &GuestPhysicalBacking,
+        options: GuestSharedMapOptions,
+    ) -> Result<GuestAddress, AddressSpaceError> {
+        let GuestSharedMapOptions {
+            backing_offset,
+            coalescing,
+        } = options;
         Self::validate_allocation(size, alignment)?;
         require_aligned("physical backing offset", backing_offset, GUEST_PAGE_SIZE)?;
         let backing_end = checked_end(backing_offset, size)?;
@@ -694,6 +739,10 @@ impl GuestAddressSpace {
                 kind: VmaKind::Shared(backing.clone()),
                 backing_offset,
                 metadata: 0,
+                mapping_id: match coalescing {
+                    GuestMapCoalescing::Allowed => 0,
+                    GuestMapCoalescing::Disallowed => next_mapping_id(),
+                },
             },
         );
         self.normalize();
@@ -755,7 +804,9 @@ impl GuestAddressSpace {
         Ok(())
     }
 
-    /// Returns either the explicit VMA or the complete free gap containing `address`.
+    /// Returns either the tracked VMA or the complete free gap containing `address`. Protection and
+    /// metadata surgery may split one mapping internally; guest mappings created with coalescing
+    /// disabled retain their original query boundaries.
     pub fn query(&self, address: GuestAddress) -> Result<GuestVmaInfo, AddressSpaceError> {
         let value = address.get();
         if value < self.base().get() || value >= self.end {
@@ -1186,6 +1237,15 @@ fn host_page_size() -> Result<u64, AddressSpaceError> {
     Ok(size)
 }
 
+fn next_mapping_id() -> u64 {
+    loop {
+        let id = NEXT_MAPPING_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 fn require_aligned(
     field: &'static str,
     value: u64,
@@ -1480,6 +1540,35 @@ mod tests {
         assert_eq!(vmas.len(), 2);
         assert_eq!(vmas[0].size, 2 * GUEST_PAGE_SIZE);
         assert_eq!(vmas[1].backing_offset, 3 * GUEST_PAGE_SIZE);
+    }
+
+    #[test]
+    fn no_coalesce_shared_maps_retain_independent_query_boundaries() {
+        let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+        let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+        let base = memory.base();
+        for page_index in 0..2 {
+            memory
+                .map_shared_with_coalescing(
+                    GuestMapPlacement::Fixed(page(base, page_index)),
+                    GUEST_PAGE_SIZE,
+                    GUEST_PAGE_SIZE,
+                    GuestProtection::READ_WRITE,
+                    &backing,
+                    GuestSharedMapOptions {
+                        backing_offset: page_index * GUEST_PAGE_SIZE,
+                        coalescing: GuestMapCoalescing::Disallowed,
+                    },
+                )
+                .unwrap();
+        }
+        let vmas = memory.vmas();
+        assert_eq!(vmas.len(), 2);
+        assert!(vmas.iter().all(|vma| vma.size == GUEST_PAGE_SIZE));
+        assert_eq!(memory.query(base).unwrap().start, base);
+        assert_eq!(memory.query(page(base, 1)).unwrap().start, page(base, 1));
+        memory.unmap(base, 2 * GUEST_PAGE_SIZE).unwrap();
+        assert!(memory.vmas().is_empty());
     }
 
     #[test]

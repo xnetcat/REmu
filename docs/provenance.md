@@ -48,6 +48,16 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   behavioral research. REmu independently uses guest tickets outside condition-owned pending state,
   so one signal cannot become a broadcast and a selected waiter can reacquire its mutex after legal
   condition destruction. No upstream source was copied.
+- Direct-memory `MAP_NO_COALESCE` (`0x400000`), containment-first/find-next `VirtualQuery`, cross-VMA
+  unmap, and release-time alias invalidation were cross-checked against KytyPS5 snapshot
+  `8a4600c5e99ab3b3873b9ea57b70044f0fa34807` (`src/kernel/memory.cpp`) and shadPS4 snapshot
+  `4c72de0732ce7443a1631bf190e2606294f58f65` (`src/core/memory.h` and
+  `src/core/memory.cpp`). SharpEmu snapshot `d765552e69c49abb79b6d9a24d29fe4ae0c63688`
+  (`KernelMemoryCompatExports.cs`) independently preserves one query region per map call but has
+  incomplete partial-unmap/release alias lifetime, so it was used only as corroborating research.
+  REmu independently assigns private identities only to guest no-coalesce mappings, preserves those
+  identities through VMA surgery, and removes every overlapping virtual alias before released
+  physical pages can be reused. No upstream source was copied.
 - AGC shader-header pointer relocation, program-register patching, and the VideoOut buffer-attribute
   and registration layouts were adapted from SharpEmu's GPL-2.0-or-later `AgcExports.cs` and
   `VideoOutExports.cs` at local snapshot `ada67a19`.

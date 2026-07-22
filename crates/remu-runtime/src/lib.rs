@@ -26,7 +26,7 @@ use remu_loader::{
     ModuleDependencyGraphError, UnresolvedModuleDependency, resolve_module_dependency_graph,
 };
 #[cfg(target_os = "macos")]
-use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapPlacement};
+use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapCoalescing, GuestMapPlacement};
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage, MappingError};
 use remu_shader::GuestMemoryReader;
 use thiserror::Error;
@@ -8043,18 +8043,22 @@ fn map_direct_memory_core(
     } else {
         GuestMapPlacement::Anywhere
     };
-    let result = if let Some(memory_type) = memory_type {
-        memory.map_direct_with_memory_type(
-            placement,
-            length,
-            alignment,
-            protection,
-            direct_start,
-            Some(memory_type),
-        )
+    let coalescing = if flags & 0x40_0000 == 0 {
+        GuestMapCoalescing::Allowed
     } else {
-        memory.map_direct(placement, length, alignment, protection, direct_start)
+        GuestMapCoalescing::Disallowed
     };
+    let result = memory.map_direct_with_options(
+        placement,
+        length,
+        alignment,
+        kernel_memory::KernelDirectMapOptions {
+            raw_protection: protection,
+            direct_start,
+            memory_type,
+            coalescing,
+        },
+    );
     let mapped = match result {
         Ok(mapped) => mapped,
         Err(error) => return kernel_memory_error(&error),
@@ -11926,6 +11930,15 @@ mod platform_independent_tests {
             super::kernel_checked_release_direct_memory([direct, 0x4000, 0, 0, 0, 0], &mut state),
             0
         );
+        assert!(
+            state
+                .kernel_memory
+                .as_ref()
+                .unwrap()
+                .query(remu_core::GuestAddress::new(mapped), false)
+                .is_none(),
+            "direct-memory release invalidates every virtual alias"
+        );
         assert_eq!(
             super::kernel_checked_release_direct_memory([direct, 0x4000, 0, 0, 0, 0], &mut state),
             sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
@@ -11936,7 +11949,7 @@ mod platform_independent_tests {
         );
         assert_eq!(
             super::kernel_munmap([mapped, 0x4000, 0, 0, 0, 0], &mut state),
-            0
+            sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
         );
     }
 
