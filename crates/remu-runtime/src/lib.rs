@@ -1483,10 +1483,11 @@ struct ProbeDispatchState {
     direct_memory_backing: Option<std::fs::File>,
     next_virtual_hint: u64,
     mapped_allocations: Vec<MappedAllocation>,
-    next_thread_handle: u64,
+    next_thread_unique_id: u64,
     thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
     thread_attributes: BTreeMap<u64, PthreadAttrState>,
     detached_threads: BTreeSet<u64>,
+    pthread_threads: BTreeMap<u64, PthreadThreadObject>,
     pthread_attributes: BTreeMap<u64, PthreadAttrObject>,
     pthread_mutex_attributes: BTreeMap<u64, PthreadMutexAttrObject>,
     pthread_condition_attributes: BTreeSet<u64>,
@@ -1581,6 +1582,15 @@ impl Default for PthreadMutexAttrState {
 struct PthreadMutexAttrObject {
     handle: u64,
     attributes: PthreadMutexAttrState,
+}
+
+const PTHREAD_THREAD_OBJECT_SIZE: u64 = 0x1000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PthreadThreadObject {
+    handle: u64,
+    unique_id: u64,
+    name: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1742,6 +1752,48 @@ fn set_current_guest_thread_handle(thread_handle: u64) {
     CURRENT_GUEST_THREAD_HANDLE.set(thread_handle);
 }
 
+fn allocate_pthread_thread_object(state: &mut ProbeDispatchState, name: &str) -> Option<u64> {
+    let unique_id = state.next_thread_unique_id.max(1);
+    state.next_thread_unique_id = unique_id.checked_add(1)?;
+    let handle = guest_calloc(1, PTHREAD_THREAD_OBJECT_SIZE);
+    if handle == 0 {
+        return None;
+    }
+    state.pthread_threads.insert(
+        handle,
+        PthreadThreadObject {
+            handle,
+            unique_id,
+            name: if name.is_empty() {
+                format!("Thread-{unique_id:X}")
+            } else {
+                name.to_owned()
+            },
+        },
+    );
+    Some(handle)
+}
+
+fn retire_detached_guest_thread(handle: u64) {
+    let Some(dispatch) = PROBE_DISPATCH.get() else {
+        return;
+    };
+    let object = {
+        let mut state = dispatch
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.detached_threads.remove(&handle) {
+            return;
+        }
+        state.thread_handles.remove(&handle);
+        state.thread_attributes.remove(&handle);
+        state.pthread_threads.remove(&handle)
+    };
+    if let Some(object) = object {
+        guest_free(object.handle);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits: usize) {
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
@@ -1762,13 +1814,18 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.direct_memory_backing = None;
     state.next_virtual_hint = 0x20_0000_0000;
     state.mapped_allocations.clear();
-    state.next_thread_handle = 2;
     state.thread_handles.clear();
     state.thread_attributes.clear();
+    state.detached_threads.clear();
+    for object in std::mem::take(&mut state.pthread_threads).into_values() {
+        guest_free(object.handle);
+    }
+    state.next_thread_unique_id = 1;
+    let main_thread = allocate_pthread_thread_object(&mut state, "main")
+        .expect("the process main-thread object allocation must succeed");
     state
         .thread_attributes
-        .insert(1, PthreadAttrState::default());
-    state.detached_threads.clear();
+        .insert(main_thread, PthreadAttrState::default());
     for object in std::mem::take(&mut state.pthread_attributes).into_values() {
         guest_free(object.handle);
     }
@@ -1825,7 +1882,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = GuestSyncState::default();
-    set_current_guest_thread_handle(1);
+    set_current_guest_thread_handle(main_thread);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1911,8 +1968,6 @@ extern "C" fn import_dispatch(
         terminate_probe(status);
     }
     if nid == "6UgtwV+0zb4" {
-        let handle = state.next_thread_handle;
-        state.next_thread_handle = state.next_thread_handle.saturating_add(1);
         if call_args[0] == 0 || call_args[2] == 0 {
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
         }
@@ -1920,13 +1975,18 @@ extern "C" fn import_dispatch(
         let entry = call_args[2];
         let thread_argument = call_args[3];
         let guest_tls = clone_guest_tls(&state.tls_template);
+        let thread_name = read_guest_cstring(call_args[4]).filter(|name| !name.is_empty());
+        let Some(handle) =
+            allocate_pthread_thread_object(&mut state, thread_name.as_deref().unwrap_or_default())
+        else {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN));
+        };
         let mut builder = std::thread::Builder::new();
         if let Ok(stack_size) = usize::try_from(attributes.stack_size)
             && stack_size >= usize::try_from(MACOS_GUEST_PAGE_ALIGNMENT).unwrap_or(0x4000)
         {
             builder = builder.stack_size(stack_size);
         }
-        let thread_name = read_guest_cstring(call_args[4]).filter(|name| !name.is_empty());
         if let Some(name) = thread_name.as_ref() {
             builder = builder.name(name.clone());
         }
@@ -1958,8 +2018,12 @@ extern "C" fn import_dispatch(
                     trace_name.as_deref().unwrap_or("")
                 );
             }
+            retire_detached_guest_thread(handle);
             result
         }) else {
+            if let Some(object) = state.pthread_threads.remove(&handle) {
+                guest_free(object.handle);
+            }
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN));
         };
         write_guest_u64(call_args[0], handle);
@@ -1976,13 +2040,18 @@ extern "C" fn import_dispatch(
         if call_args[0] == 0 || state.detached_threads.contains(&call_args[0]) {
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
         }
-        let handle = state.thread_handles.remove(&call_args[0]);
-        state.thread_attributes.remove(&call_args[0]);
-        drop(state);
+        let thread_id = call_args[0];
+        let handle = state.thread_handles.remove(&thread_id);
         let Some(handle) = handle else {
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
         };
+        let object = state.pthread_threads.remove(&thread_id);
+        state.thread_attributes.remove(&call_args[0]);
+        drop(state);
         let return_value = handle.join().unwrap_or(u64::MAX);
+        if let Some(object) = object {
+            guest_free(object.handle);
+        }
         if call_args[1] != 0 {
             write_guest_u64(call_args[1], return_value);
         }
@@ -1996,11 +2065,19 @@ extern "C" fn import_dispatch(
         let Some(thread) = state.thread_handles.remove(&handle) else {
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
         };
+        let finished = thread.is_finished();
         state.detached_threads.insert(handle);
         if let Some(attributes) = state.thread_attributes.get_mut(&handle) {
             attributes.detach_state = 1;
         }
         drop(thread);
+        if finished {
+            state.detached_threads.remove(&handle);
+            state.thread_attributes.remove(&handle);
+            if let Some(object) = state.pthread_threads.remove(&handle) {
+                guest_free(object.handle);
+            }
+        }
         return ProbeImportReturn::integer(0);
     }
     if nid == "T72hz6ffq08" {
@@ -7326,14 +7403,15 @@ mod platform_independent_tests {
         AGC_R_DRAW_INDEX_AUTO, DEFAULT_THREAD_AFFINITY_MASK, DirectAllocation, GuestExitCallback,
         MappedAllocation, ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
-        allocate_direct_memory, create_pthread_attr, destroy_pthread_attr, dispatch_probe_import,
-        guest_clock_gettime, guest_free, guest_global_locale, guest_qsort, guest_tolower_table,
-        guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
-        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
-        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_detach_state,
-        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
-        read_guest_u64, resolve_guest_path, sanitize_save_segment, sce_kernel_error,
-        system_service_param_get_int, take_exit_callbacks, write_guest_u32, write_guest_u64,
+        allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
+        destroy_pthread_attr, dispatch_probe_import, guest_clock_gettime, guest_free,
+        guest_global_locale, guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr,
+        guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory,
+        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity,
+        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
+        sanitize_save_segment, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
+        write_guest_u32, write_guest_u64,
     };
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -7576,6 +7654,29 @@ mod platform_independent_tests {
         assert_eq!(affinity_mask, DEFAULT_THREAD_AFFINITY_MASK);
         assert_eq!(destroy_pthread_attr(attribute_address, &mut state), 0);
         assert_eq!(opaque_attribute, 0);
+    }
+
+    #[test]
+    fn pthread_threads_are_distinct_guest_pointer_objects() {
+        let mut state = ProbeDispatchState {
+            next_thread_unique_id: 1,
+            ..ProbeDispatchState::default()
+        };
+        let first = allocate_pthread_thread_object(&mut state, "worker").unwrap();
+        let second = allocate_pthread_thread_object(&mut state, "").unwrap();
+
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
+        assert_eq!(read_guest_u64(first), 0);
+        assert_eq!(read_guest_u64(second + 0xff8), 0);
+        assert_eq!(state.pthread_threads[&first].unique_id, 1);
+        assert_eq!(state.pthread_threads[&first].name, "worker");
+        assert_eq!(state.pthread_threads[&second].unique_id, 2);
+        assert_eq!(state.pthread_threads[&second].name, "Thread-2");
+
+        for object in state.pthread_threads.into_values() {
+            guest_free(object.handle);
+        }
     }
 
     #[test]
