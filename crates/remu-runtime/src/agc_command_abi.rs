@@ -462,8 +462,7 @@ fn cb_set_register_range(arguments: [u64; 6], opcode: u32) -> u64 {
     if value_count == 0
         || value_count > 0x3fff
         || first_register > 0xffff
-        || values == 0
-        || values & 3 != 0
+        || (values != 0 && values & 3 != 0)
     {
         return 0;
     }
@@ -472,11 +471,15 @@ fn cb_set_register_range(arguments: [u64; 6], opcode: u32) -> u64 {
     };
     write_u32(command, pm4(packet_count, opcode, 0));
     write_u32(command + 4, first_register);
-    for index in 0..value_count {
-        write_u32(
-            command + 8 + u64::from(index) * 4,
-            read_u32(values + u64::from(index) * 4),
-        );
+    // A null values pointer reserves an inline data packet whose payload the caller fills after
+    // `sceAgcGetDataPacketPayloadAddress`. This is a first-class ABI form, not an error.
+    if values != 0 {
+        for index in 0..value_count {
+            write_u32(
+                command + 8 + u64::from(index) * 4,
+                read_u32(values + u64::from(index) * 4),
+            );
+        }
     }
     command
 }
@@ -1829,6 +1832,25 @@ mod tests {
             &[pm4(3, IT_DRAW_INDEX_AUTO, 0), 6, 2]
         );
         assert_eq!(fixture.cursor(), fixture.start() + 44);
+    }
+
+    #[test]
+    fn reserves_a_register_range_payload_when_values_are_null() {
+        let mut fixture = CommandFixture::new(0);
+        fixture.words[2..6].copy_from_slice(&[0x1111, 0x2222, 0x3333, 0x4444]);
+        let buffer = fixture.address();
+
+        assert_eq!(
+            call("n2fD4A+pb+g", args(&[buffer, 0x8c, 0, 4]), [0; 6]),
+            fixture.start()
+        );
+        assert_eq!(fixture.words[0], pm4(6, IT_SET_SH_REG, 0));
+        assert_eq!(fixture.words[1], 0x8c);
+        assert_eq!(
+            &fixture.words[2..6],
+            &[0x1111, 0x2222, 0x3333, 0x4444]
+        );
+        assert_eq!(fixture.cursor(), fixture.start() + 24);
     }
 
     #[test]
