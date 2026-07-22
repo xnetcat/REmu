@@ -7,7 +7,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
@@ -118,6 +118,11 @@ struct CompiledShaderPair {
     pixel: remu_shader_metal::MetalShader,
 }
 
+struct ShaderCompileResult {
+    key: (u64, u64),
+    compiled: Result<CompiledShaderPair, String>,
+}
+
 struct UploadedImageTexture {
     texture: Texture,
     descriptor: DecodedImageDescriptor,
@@ -163,16 +168,40 @@ struct MetalPresenter {
     logged_fill_draw: bool,
     logged_software_draws: HashSet<(SoftwareDrawKind, u64, u64)>,
     compiled_shader_pairs: HashMap<(u64, u64), CompiledShaderPair>,
+    compiling_shader_pairs: HashSet<(u64, u64)>,
     failed_shader_pairs: HashSet<(u64, u64)>,
     failed_draw_execution: HashSet<(u64, u64)>,
     capture_directory: Option<PathBuf>,
     pressed_keys: HashSet<KeyCode>,
+    shader_compile_sender: Sender<IndexedDraw>,
+    shader_compile_receiver: Receiver<ShaderCompileResult>,
 }
 
 impl MetalPresenter {
     fn new(receiver: Receiver<GpuEvent>) -> Result<Self, String> {
         let device = Device::system_default().ok_or("no Metal device is available")?;
         let command_queue = device.new_command_queue();
+        let (shader_compile_sender, shader_compile_requests) = mpsc::channel::<IndexedDraw>();
+        let (shader_compile_results, shader_compile_receiver) =
+            mpsc::channel::<ShaderCompileResult>();
+        let compiler_device = device.clone();
+        std::thread::Builder::new()
+            .name("remu-metal-compiler".to_owned())
+            .spawn(move || {
+                while let Ok(draw) = shader_compile_requests.recv() {
+                    let key = (draw.export_shader_address, draw.pixel_shader_address);
+                    let compiled = objc::rc::autoreleasepool(|| {
+                        Self::compile_draw_shader_pair(&compiler_device, &draw)
+                    });
+                    if shader_compile_results
+                        .send(ShaderCompileResult { key, compiled })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| format!("could not start Metal compiler worker: {error}"))?;
         Ok(Self {
             receiver,
             window: None,
@@ -199,10 +228,13 @@ impl MetalPresenter {
             logged_fill_draw: false,
             logged_software_draws: HashSet::new(),
             compiled_shader_pairs: HashMap::new(),
+            compiling_shader_pairs: HashSet::new(),
             failed_shader_pairs: HashSet::new(),
             failed_draw_execution: HashSet::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
             pressed_keys: HashSet::new(),
+            shader_compile_sender,
+            shader_compile_receiver,
         })
     }
 
@@ -251,6 +283,7 @@ impl MetalPresenter {
 
     #[allow(clippy::too_many_lines)]
     fn receive_events(&mut self, event_loop: &ActiveEventLoop) {
+        self.receive_shader_compilations();
         // A bounded batch prevents a continuously producing guest from starving redraw and input
         // delivery. The bounded sender applies backpressure until the next AppKit iteration.
         for _ in 0..16 {
@@ -370,32 +403,52 @@ impl MetalPresenter {
 
     fn compile_draw_shaders(&mut self, draw: &IndexedDraw) {
         let key = (draw.export_shader_address, draw.pixel_shader_address);
-        if self.compiled_shader_pairs.contains_key(&key) || self.failed_shader_pairs.contains(&key)
+        if self.compiled_shader_pairs.contains_key(&key)
+            || self.compiling_shader_pairs.contains(&key)
+            || self.failed_shader_pairs.contains(&key)
         {
             return;
         }
-        match self.compile_draw_shader_pair(draw) {
-            Ok(compiled) => {
-                eprintln!(
-                    "[REMu][METAL] compiled Gen5 shader pair es={:#x} ps={:#x} MSL={vertex_bytes}/{pixel_bytes} bytes",
-                    key.0,
-                    key.1,
-                    vertex_bytes = compiled.vertex.source.len(),
-                    pixel_bytes = compiled.pixel.source.len(),
-                );
-                self.compiled_shader_pairs.insert(key, compiled);
-            }
-            Err(error) => {
-                self.failed_shader_pairs.insert(key);
-                eprintln!(
-                    "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
-                    key.0, key.1
-                );
+        self.compiling_shader_pairs.insert(key);
+        if self.shader_compile_sender.send(draw.clone()).is_err() {
+            self.compiling_shader_pairs.remove(&key);
+            self.failed_shader_pairs.insert(key);
+            eprintln!(
+                "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: compiler worker stopped",
+                key.0, key.1
+            );
+        }
+    }
+
+    fn receive_shader_compilations(&mut self) {
+        while let Ok(result) = self.shader_compile_receiver.try_recv() {
+            self.compiling_shader_pairs.remove(&result.key);
+            match result.compiled {
+                Ok(compiled) => {
+                    eprintln!(
+                        "[REMu][METAL] compiled Gen5 shader pair es={:#x} ps={:#x} MSL={vertex_bytes}/{pixel_bytes} bytes",
+                        result.key.0,
+                        result.key.1,
+                        vertex_bytes = compiled.vertex.source.len(),
+                        pixel_bytes = compiled.pixel.source.len(),
+                    );
+                    self.compiled_shader_pairs.insert(result.key, compiled);
+                }
+                Err(error) => {
+                    self.failed_shader_pairs.insert(result.key);
+                    eprintln!(
+                        "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
+                        result.key.0, result.key.1
+                    );
+                }
             }
         }
     }
 
-    fn compile_draw_shader_pair(&self, draw: &IndexedDraw) -> Result<CompiledShaderPair, String> {
+    fn compile_draw_shader_pair(
+        device: &Device,
+        draw: &IndexedDraw,
+    ) -> Result<CompiledShaderPair, String> {
         let export = draw
             .export_shader
             .as_ref()
@@ -412,7 +465,6 @@ impl MetalPresenter {
             .pixel_shader_evaluation
             .as_ref()
             .ok_or("draw has no evaluated pixel shader resources")?;
-        let device = self.device.as_ref().ok_or("Metal device is unavailable")?;
         let mut host_location = 0_u32;
         let pixel_outputs = (0..8)
             .filter_map(|guest_slot| {

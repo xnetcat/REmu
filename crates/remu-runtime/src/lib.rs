@@ -1294,6 +1294,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "NWtTN10cJzE" => "sceLibcHeapGetTraceInfo",
         "mkx2fVhNMsg" => "pthread_cond_broadcast",
         "FxVZqBAA7ks" => "_write",
+        "4wSze92BhLI" => "sceKernelWrite",
+        "aI+OeCz8xrQ" => "scePthreadSelf",
         "pO96TwzOm5E" => "sceKernelGetDirectMemorySize",
         "rTXw65xmLIA" => "sceKernelAllocateDirectMemory",
         "L-Q3LEjIbgA" => "sceKernelMapDirectMemory",
@@ -1327,6 +1329,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "DzES9hQF4f4" => "scePthreadAttrSetschedparam",
         "x1X76arYMxU" => "scePthreadAttrGet",
         "-quPa4SEJUw" => "scePthreadAttrGetstack",
+        "8+s5BzZjxSg" => "scePthreadAttrGetaffinity",
         "m5-2bsNfv7s" => "scePthreadCondattrInit",
         "waPcxYiR3WA" => "scePthreadCondattrDestroy",
         "4qGrR6eoP9Y" => "scePthreadDetach",
@@ -2546,7 +2549,8 @@ fn dispatch_probe_import(
         }
         "bnZxYgAFeA0" => sanitizer_new_replace_external(),
         "NWtTN10cJzE" => libc_heap_get_trace_info(arguments[0], state),
-        "FxVZqBAA7ks" => guest_kernel_write(arguments, state),
+        "FxVZqBAA7ks" | "4wSze92BhLI" => guest_kernel_write(arguments, state),
+        "aI+OeCz8xrQ" => current_guest_thread_handle(),
         // sceKernelGetDirectMemorySize
         "pO96TwzOm5E" => 16 * 1024 * 1024 * 1024,
         // sceKernelAllocateDirectMemory
@@ -2639,6 +2643,7 @@ fn dispatch_probe_import(
         "DzES9hQF4f4" => pthread_attr_set_schedule_param(arguments, state),
         "x1X76arYMxU" => pthread_attr_get(arguments, state),
         "-quPa4SEJUw" => pthread_attr_get_stack(arguments, state),
+        "8+s5BzZjxSg" => pthread_attr_get_affinity(arguments, state),
         "m5-2bsNfv7s" => pthread_condition_attr_init(arguments[0], state),
         "waPcxYiR3WA" => pthread_condition_attr_destroy(arguments[0], state),
         // Initial single-device handles for input, video, and audio.
@@ -4997,6 +5002,18 @@ fn pthread_attr_get_stack(arguments: [u64; 6], state: &ProbeDispatchState) -> u6
     0
 }
 
+fn pthread_attr_get_affinity(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if arguments[1] == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(attributes) = pthread_attr_state(arguments[0], state) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    write_guest_u64(arguments[1], attributes.affinity_mask);
+    // The Gen5 kernel ABI returns the observable mask in RAX as well as through the output pointer.
+    attributes.affinity_mask
+}
+
 fn pthread_attr_set_detach_state(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let detach_state = low_i32(arguments[1]);
     if !matches!(detach_state, 0 | 1) {
@@ -7285,17 +7302,17 @@ mod platform_independent_tests {
 
     use super::{
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
-        AGC_R_DRAW_INDEX_AUTO, DirectAllocation, GuestExitCallback, MappedAllocation,
-        ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
+        AGC_R_DRAW_INDEX_AUTO, DEFAULT_THREAD_AFFINITY_MASK, DirectAllocation, GuestExitCallback,
+        MappedAllocation, ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, create_pthread_attr, destroy_pthread_attr, dispatch_probe_import,
         guest_clock_gettime, guest_free, guest_global_locale, guest_qsort, guest_tolower_table,
         guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
         kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
-        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
-        pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
-        sanitize_save_segment, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
-        write_guest_u32, write_guest_u64,
+        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_detach_state,
+        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
+        read_guest_u64, resolve_guest_path, sanitize_save_segment, sce_kernel_error,
+        system_service_param_get_int, take_exit_callbacks, write_guest_u32, write_guest_u64,
     };
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -7500,6 +7517,7 @@ mod platform_independent_tests {
         );
         let mut stack_address = u64::MAX;
         let mut stack_size = 0_u64;
+        let mut affinity_mask = 0_u64;
         assert_eq!(
             pthread_attr_get_stack(
                 [
@@ -7520,6 +7538,21 @@ mod platform_independent_tests {
         assert_eq!(attributes.schedule_priority, priority);
         assert_eq!(stack_address, 0);
         assert_eq!(stack_size, 0x20_0000);
+        assert_eq!(
+            pthread_attr_get_affinity(
+                [
+                    attribute_address,
+                    (&raw mut affinity_mask).addr() as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                &state,
+            ),
+            DEFAULT_THREAD_AFFINITY_MASK
+        );
+        assert_eq!(affinity_mask, DEFAULT_THREAD_AFFINITY_MASK);
         assert_eq!(destroy_pthread_attr(attribute_address, &mut state), 0);
         assert_eq!(opaque_attribute, 0);
     }
