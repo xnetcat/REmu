@@ -8300,20 +8300,36 @@ fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
     if output == 0 {
         return u64::MAX;
     }
-    // Orbis inherits FreeBSD clock IDs while Darwin assigns different numeric values. In
-    // particular, FreeBSD 4 is CLOCK_MONOTONIC; passing it through or treating it as realtime
-    // puts Construct's animation clock trillions of milliseconds away from its process epoch.
-    let host_clock = match clock_id {
-        0 | 9 | 10 => libc::CLOCK_REALTIME,
-        4 | 5 | 7 | 8 | 11 | 12 | 13 => libc::CLOCK_MONOTONIC,
+    // Orbis inherits FreeBSD clock IDs while Darwin assigns different numeric values. Keep
+    // monotonic-family clocks monotonic, but anchor them to the Unix epoch: title middleware
+    // encountered in practice compares these clocks with epoch-scale values.
+    let epoch_anchored = match clock_id {
+        0 | 9 | 10 => false,
+        4 | 5 | 7 | 8 | 11 | 12 | 13 => true,
         _ => return signed_i32_return(-1),
     };
     let mut timestamp = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: timestamp is a valid writable host timespec.
-    let status = unsafe { libc::clock_gettime(host_clock, &raw mut timestamp) };
+    let status = if epoch_anchored {
+        static EPOCH_CLOCK: OnceLock<(Instant, Duration)> = OnceLock::new();
+        let (started_at, epoch_at_start) = EPOCH_CLOCK.get_or_init(|| {
+            (
+                Instant::now(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default(),
+            )
+        });
+        let now = epoch_at_start.saturating_add(started_at.elapsed());
+        timestamp.tv_sec = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+        timestamp.tv_nsec = i64::from(now.subsec_nanos());
+        0
+    } else {
+        // SAFETY: timestamp is a valid writable host timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut timestamp) }
+    };
     if status == 0 {
         write_guest_u64(output, u64::try_from(timestamp.tv_sec).unwrap_or(0));
         write_guest_u64(output + 8, u64::try_from(timestamp.tv_nsec).unwrap_or(0));
@@ -8615,23 +8631,23 @@ mod platform_independent_tests {
     }
 
     #[test]
-    fn translates_freebsd_clock_ids_to_darwin_clocks() {
+    fn provides_epoch_anchored_monotonic_title_clock() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let mut output = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let mut host_monotonic = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: host_monotonic is a valid writable timespec.
-        assert_eq!(
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut host_monotonic) },
-            0
-        );
         assert_eq!(guest_clock_gettime(4, (&raw mut output).addr() as u64), 0);
-        assert!((output.tv_sec - host_monotonic.tv_sec).abs() <= 1);
+        assert!(output.tv_sec >= i64::try_from(before).unwrap());
+        assert!(output.tv_sec <= i64::try_from(before + 2).unwrap());
         assert!((0..1_000_000_000).contains(&output.tv_nsec));
+        let first = (output.tv_sec, output.tv_nsec);
+
+        assert_eq!(guest_clock_gettime(4, (&raw mut output).addr() as u64), 0);
+        assert!((output.tv_sec, output.tv_nsec) >= first);
 
         assert_eq!(
             guest_clock_gettime(3, (&raw mut output).addr() as u64),
