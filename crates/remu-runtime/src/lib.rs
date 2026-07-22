@@ -2428,6 +2428,7 @@ impl AgcGraphicsState {
         self.instance_count = 1;
         self.draw_index_offset = 0;
         self.compute_indirect_args_address = 0;
+        self.pending_targetless_draw = None;
     }
 }
 
@@ -4278,6 +4279,7 @@ const AGC_COMMAND_BUFFER_RESERVED_DWORDS_OFFSET: u64 = 0x30;
 
 const AGC_IT_NOP: u32 = 0x10;
 const AGC_IT_SET_BASE: u32 = 0x11;
+const AGC_IT_CLEAR_STATE: u32 = 0x12;
 const AGC_IT_INDEX_BUFFER_SIZE: u32 = 0x13;
 const AGC_IT_DISPATCH_DIRECT: u32 = 0x15;
 const AGC_IT_DISPATCH_INDIRECT: u32 = 0x16;
@@ -5554,6 +5556,10 @@ enum AgcSubmissionError {
     UnsupportedBaseIndex(u32),
     #[error("SET_BASE selects unsupported shader type {0}")]
     UnsupportedSetBaseShaderType(u32),
+    #[error("CLEAR_STATE packet has {actual} dwords, expected 2")]
+    ClearStatePacketLength { actual: u32 },
+    #[error("CLEAR_STATE control has unsupported bits 0x{0:08X}")]
+    UnsupportedClearStateControl(u32),
     #[error("native indirect-register opcode 0x{opcode:02X} has {actual} dwords, expected 5")]
     NativeIndirectRegisterPacketLength { opcode: u32, actual: u32 },
     #[error("indexed SET_UCONFIG_REG packet has {actual} dwords, expected 3")]
@@ -6158,6 +6164,26 @@ struct AgcSubmissionPacket {
     register: u32,
 }
 
+fn agc_apply_clear_state(
+    packet_address: u64,
+    length: u32,
+    graphics: &mut AgcGraphicsState,
+) -> Result<(), AgcSubmissionError> {
+    if length != 2 {
+        return Err(AgcSubmissionError::ClearStatePacketLength { actual: length });
+    }
+    let control = read_guest_u32(packet_address + 4);
+    if control & !0x0f != 0 {
+        return Err(AgcSubmissionError::UnsupportedClearStateControl(control));
+    }
+    // Gen5's DcbResetQueue emits CLEAR_STATE with a four-bit state selector. KytyPS5's command
+    // processor validates that selector and resets the complete context, shader, user-config,
+    // index, instance and indirect-argument state regardless of its admitted value. Resource
+    // residency and telemetry are host bookkeeping, not register state.
+    graphics.reset_pipeline();
+    Ok(())
+}
+
 fn agc_handle_submission_packet(
     packet: AgcSubmissionPacket,
     graphics: &mut AgcGraphicsState,
@@ -6172,6 +6198,9 @@ fn agc_handle_submission_packet(
         opcode,
         register,
     } = packet;
+    if opcode == AGC_IT_CLEAR_STATE {
+        agc_apply_clear_state(packet_address, length, graphics)?;
+    }
     if opcode == AGC_IT_NOP && matches!(register, AGC_R_DRAW_RESET | AGC_R_ACB_RESET) && length >= 2
     {
         graphics.reset_pipeline();
@@ -11244,6 +11273,100 @@ mod platform_independent_tests {
 
         assert_eq!(graphics.user_config_registers.get(&0x243), Some(&0x481));
         assert_eq!(graphics.index_size, 1);
+    }
+
+    #[test]
+    fn clear_state_resets_complete_queue_state_without_discarding_residency() {
+        let address = 0x0070_1234_5600_u64;
+        let target = remu_gpu::GpuColorTarget {
+            slot: 0,
+            address,
+            view: 0,
+            info: 10 << 2,
+            attrib: 0,
+            attrib2: ((1_280 - 1) << 14) | (720 - 1),
+            attrib3: (27 << 14) | (1 << 24),
+        };
+        let packet = [agc_pm4(2, super::AGC_IT_CLEAR_STATE, 0), 0x0f];
+        let mut graphics = AgcGraphicsState::default();
+        graphics.context_registers.insert(0x318, 1);
+        graphics.shader_registers.insert(0x20c, 2);
+        graphics.user_config_registers.insert(0x242, 3);
+        graphics.index_buffer_address = 0x1000;
+        graphics.index_resource_address = 0x2000;
+        graphics.index_buffer_count = 9;
+        graphics.index_size = 1;
+        graphics.instance_count = 7;
+        graphics.draw_index_offset = 5;
+        graphics.compute_indirect_args_address = 0x3000;
+        graphics.emitted_draws = 11;
+        graphics.known_color_targets.insert(address, target);
+        graphics.pending_targetless_draw = Some(Box::new(targetless_scanout_test_draw()));
+
+        super::agc_handle_submission_packet(
+            super::AgcSubmissionPacket {
+                address: packet.as_ptr().addr() as u64,
+                length: 2,
+                opcode: super::AGC_IT_CLEAR_STATE,
+                register: 0,
+            },
+            &mut graphics,
+            &mut AgcShaderRegistry::default(),
+            &BTreeMap::new(),
+            &VideoOutState::default(),
+            &mut Vec::new(),
+        )
+        .expect("valid CLEAR_STATE packet");
+
+        assert!(graphics.context_registers.is_empty());
+        assert!(graphics.shader_registers.is_empty());
+        assert!(graphics.user_config_registers.is_empty());
+        assert_eq!(graphics.index_buffer_address, 0);
+        assert_eq!(graphics.index_resource_address, 0);
+        assert_eq!(graphics.index_buffer_count, 0);
+        assert_eq!(graphics.index_size, 0);
+        assert_eq!(graphics.instance_count, 1);
+        assert_eq!(graphics.draw_index_offset, 0);
+        assert_eq!(graphics.compute_indirect_args_address, 0);
+        assert!(graphics.pending_targetless_draw.is_none());
+        assert_eq!(graphics.emitted_draws, 11);
+        assert_eq!(graphics.known_color_targets.get(&address), Some(&target));
+    }
+
+    #[test]
+    fn clear_state_rejects_non_native_layouts() {
+        let invalid_control = [agc_pm4(2, super::AGC_IT_CLEAR_STATE, 0), 0x10];
+        let mut graphics = AgcGraphicsState::default();
+        let mut shaders = AgcShaderRegistry::default();
+        let index_resources = BTreeMap::new();
+        let video_out = VideoOutState::default();
+        let mut flips = Vec::new();
+
+        let mut invoke = |address, length, graphics: &mut AgcGraphicsState| {
+            super::agc_handle_submission_packet(
+                super::AgcSubmissionPacket {
+                    address,
+                    length,
+                    opcode: super::AGC_IT_CLEAR_STATE,
+                    register: 0,
+                },
+                graphics,
+                &mut shaders,
+                &index_resources,
+                &video_out,
+                &mut flips,
+            )
+        };
+        assert!(matches!(
+            invoke(invalid_control.as_ptr().addr() as u64, 2, &mut graphics),
+            Err(super::AgcSubmissionError::UnsupportedClearStateControl(
+                0x10
+            ))
+        ));
+        assert!(matches!(
+            invoke(invalid_control.as_ptr().addr() as u64, 3, &mut graphics),
+            Err(super::AgcSubmissionError::ClearStatePacketLength { actual: 3 })
+        ));
     }
 
     #[test]
