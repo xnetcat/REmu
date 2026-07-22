@@ -10,6 +10,11 @@ use remu_core::GuestAddress;
 use remu_loader::LoadedExecutable;
 use thiserror::Error;
 
+#[cfg(target_os = "macos")]
+mod write_watch;
+#[cfg(target_os = "macos")]
+pub use write_watch::CpuWriteWatch;
+
 pub const PS5_MAIN_IMAGE_BASE: GuestAddress = GuestAddress::new(0x0000_0008_0000_0000);
 
 pub const GUEST_EXECUTE: u32 = 0x1;
