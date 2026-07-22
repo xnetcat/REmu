@@ -8811,7 +8811,7 @@ mod platform_independent_tests {
         AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
         AGC_R_DRAW_INDEX_AUTO, DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState,
         PthreadAttrState, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
-        SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
+        SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
         decode_agc_memory_acquire, destroy_pthread_attr, dispatch_guest_numeric_parser,
