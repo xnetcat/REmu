@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+mod agc_command_abi;
 mod agc_register_defaults;
 mod audio;
 #[cfg(target_os = "macos")]
@@ -3501,6 +3502,10 @@ fn dispatch_probe_import(
     state: &mut ProbeDispatchState,
 ) -> u64 {
     if let Some(result) = dispatch_kernel_file_import(nid, arguments, state) {
+        return result;
+    }
+    if let Some(result) = agc_command_abi::dispatch_agc_command_abi(nid, arguments, stack_arguments)
+    {
         return result;
     }
     match nid {
