@@ -2120,6 +2120,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "n2fD4A+pb+g" => "sceAgcCbSetShRegisterRangeDirect",
         "V++UgBtQhn0" => "sceAgcGetDataPacketPayloadAddress",
         "qj7QZpgr9Uw" => "sceAgcUnknownQj7QZpgr9Uw",
+        "w6Dj1VJt5qY" => "sceAgcSetPacketPredication",
+        "n8vgpaQg6dA" => "sceAgcSetRangePredication",
         "vcmNN+AAXnY" => "sceAgcSetCxRegIndirectPatchSetAddress",
         "d-6uF9sZDIU" => "sceAgcSetCxRegIndirectPatchAddRegisters",
         "Qrj4c+61z4A" => "sceAgcSetShRegIndirectPatchSetAddress",

@@ -252,6 +252,8 @@ fn dispatch_draw_sync_command(
 
 fn dispatch_packet_patch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
+        "w6Dj1VJt5qY" => set_packet_predication(arguments),
+        "n8vgpaQg6dA" => set_range_predication(arguments),
         "IxYiarKlXxM" => patch_dma_address(arguments, false),
         "cdDRpqcFGbU" => patch_dma_address(arguments, true),
         "2BS4EtAaF28" => patch_jump_target(arguments),
@@ -268,6 +270,46 @@ fn dispatch_packet_patch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         "fPSCdQxgpSw" => patch_write_data_address(arguments),
         _ => return None,
     })
+}
+
+fn predication_bit(value: u64) -> u32 {
+    u32::from(low_u8(value) == 1)
+}
+
+fn set_packet_predication(arguments: [u64; 6]) -> u64 {
+    let packet = arguments[0];
+    if packet == 0 || !packet.is_multiple_of(4) {
+        return GRAPHICS5_ERROR_INVALID_PACKET;
+    }
+    let header = read_u32(packet);
+    write_u32(packet, (header & !1) | predication_bit(arguments[1]));
+    0
+}
+
+fn set_range_predication(arguments: [u64; 6]) -> u64 {
+    let mut packet = arguments[0];
+    let end = arguments[1];
+    if packet >= end {
+        return 0;
+    }
+    if packet == 0 || end == 0 || !packet.is_multiple_of(4) || !end.is_multiple_of(4) {
+        return GRAPHICS5_ERROR_INVALID_PACKET;
+    }
+    let predication = predication_bit(arguments[2]);
+    while packet < end {
+        let header = read_u32(packet);
+        write_u32(packet, (header & !1) | predication);
+        let dword_count = if header & 0x3fff_ff00 == 0x3fff_1000 {
+            1
+        } else {
+            ((header >> 16) & 0x3fff) + 2
+        };
+        let Some(next) = packet.checked_add(u64::from(dword_count) * 4) else {
+            return GRAPHICS5_ERROR_INVALID_PACKET;
+        };
+        packet = next;
+    }
+    0
 }
 
 fn low_u32(value: u64) -> u32 {
@@ -1854,6 +1896,36 @@ mod tests {
         );
         assert_eq!(fixture.words[0], 0x8000_0000);
         assert_eq!(fixture.cursor(), fixture.start() + 4);
+    }
+
+    #[test]
+    fn patches_single_and_range_packet_predication_bits() {
+        let mut packet = [pm4(3, IT_SET_SH_REG, 0), 0x123, 0x456];
+        let address = packet.as_mut_ptr().addr() as u64;
+
+        assert_eq!(call("w6Dj1VJt5qY", args(&[address, 0x101]), [0; 6]), 0);
+        assert_eq!(packet[0], pm4(3, IT_SET_SH_REG, 0) | 1);
+        assert_eq!(call("w6Dj1VJt5qY", args(&[address, 2]), [0; 6]), 0);
+        assert_eq!(packet[0], pm4(3, IT_SET_SH_REG, 0));
+        assert_eq!(
+            call("w6Dj1VJt5qY", args(&[0, 1]), [0; 6]),
+            GRAPHICS5_ERROR_INVALID_PACKET
+        );
+
+        let mut range = [
+            pm4(2, IT_CLEAR_STATE, 0),
+            0x0f,
+            pm4(3, IT_SET_SH_REG, 0),
+            0x123,
+            0x456,
+        ];
+        let start = range.as_mut_ptr().addr() as u64;
+        let end = start + u64::try_from(range.len() * 4).expect("range byte count fits u64");
+        assert_eq!(call("n8vgpaQg6dA", args(&[start, end, 1]), [0; 6]), 0);
+        assert_eq!(range[0], pm4(2, IT_CLEAR_STATE, 0) | 1);
+        assert_eq!(range[2], pm4(3, IT_SET_SH_REG, 0) | 1);
+        assert_eq!(&range[1..2], &[0x0f]);
+        assert_eq!(&range[3..], &[0x123, 0x456]);
     }
 
     #[test]
