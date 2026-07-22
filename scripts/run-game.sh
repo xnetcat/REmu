@@ -27,7 +27,9 @@ case "$game_name" in
         game_name=$(basename -- "$(dirname -- "$game_path")")
         ;;
 esac
-timeout_seconds=${2:-120}
+# Interactive launches stay open until the guest exits or the user closes the window. Pass a
+# positive second argument only for a deliberately bounded diagnostic run.
+timeout_seconds=${2:-0}
 if [ ! -f "$game_path" ]; then
     echo "error: game executable not found: $game_path" >&2
     exit 66

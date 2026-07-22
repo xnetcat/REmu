@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use core_graphics_types::geometry::CGSize;
 use metal::{
     Buffer, CommandBuffer, CompileOptions, ComputePipelineState, Device, Function, Library,
-    MTLCommandBufferStatus, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLClearColor, MTLCommandBufferStatus, MTLIndexType, MTLLoadAction, MTLPixelFormat,
     MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter,
     MTLSamplerMipFilter, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
     MTLTextureUsage, MTLViewport, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
@@ -41,6 +41,66 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+const PRESENTATION_SHADER_SOURCE: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+
+struct REmuPresentationVertex {
+    float4 position [[position]];
+    float2 texture_coordinate;
+};
+
+vertex REmuPresentationVertex remu_presentation_vertex(uint vertex_id [[vertex_id]]) {
+    constexpr float2 positions[] = {
+        float2(-1.0, -1.0),
+        float2( 3.0, -1.0),
+        float2(-1.0,  3.0),
+    };
+    constexpr float2 texture_coordinates[] = {
+        float2(0.0,  1.0),
+        float2(2.0,  1.0),
+        float2(0.0, -1.0),
+    };
+    return {
+        float4(positions[vertex_id], 0.0, 1.0),
+        texture_coordinates[vertex_id],
+    };
+}
+
+fragment float4 remu_presentation_fragment(
+    REmuPresentationVertex input [[stage_in]],
+    texture2d<float> source [[texture(0)]],
+    sampler source_sampler [[sampler(0)]]) {
+    return source.sample(source_sampler, input.texture_coordinate);
+}
+";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PresentationResolution {
+    LogicalWindow,
+    NativeWindow,
+    Fixed(u32, u32),
+}
+
+impl PresentationResolution {
+    fn from_environment() -> Result<Self, String> {
+        let Some(value) = std::env::var_os("REMU_PRESENTATION_SIZE") else {
+            return Ok(Self::LogicalWindow);
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| "REMU_PRESENTATION_SIZE is not valid UTF-8".to_owned())?;
+        parse_presentation_resolution(&value)
+    }
+}
+
+struct PresentationResources {
+    pipeline: RenderPipelineState,
+    _vertex_function: Function,
+    _fragment_function: Function,
+    sampler: SamplerState,
+}
 
 #[derive(Clone, Copy)]
 struct DisplayConfiguration {
@@ -251,6 +311,8 @@ struct MetalPresenter {
     device: Option<Device>,
     layer: Option<MetalLayer>,
     command_queue: Option<metal::CommandQueue>,
+    presentation: PresentationResources,
+    presentation_resolution: PresentationResolution,
     guest_bgra_bytes: Vec<u8>,
     frame_texture: Option<Texture>,
     frame_texture_size: (u32, u32),
@@ -287,6 +349,8 @@ impl MetalPresenter {
         let device = Device::system_default().ok_or("no Metal device is available")?;
         let command_queue = device.new_command_queue();
         command_queue.set_label("REmu guest command queue");
+        let presentation_resolution = PresentationResolution::from_environment()?;
+        let presentation = create_presentation_resources(&device)?;
         let (shader_compile_sender, shader_compile_requests) = mpsc::channel::<IndexedDraw>();
         let (shader_compile_results, shader_compile_receiver) =
             mpsc::channel::<ShaderCompileResult>();
@@ -314,6 +378,8 @@ impl MetalPresenter {
             device: Some(device),
             layer: None,
             command_queue: Some(command_queue),
+            presentation,
+            presentation_resolution,
             guest_bgra_bytes: Vec::new(),
             frame_texture: None,
             frame_texture_size: (0, 0),
@@ -361,9 +427,9 @@ impl MetalPresenter {
         let mut layer = MetalLayer::new();
         layer.set_device(device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        // The compiler-free presenter blits into each drawable instead of running a fullscreen
-        // shader, so the drawable must permit blit writes.
-        layer.set_framebuffer_only(false);
+        // Presentation uses a fullscreen sampling pass so a high-resolution guest display buffer
+        // does not force an equally large host drawable. The layer remains framebuffer-only.
+        layer.set_framebuffer_only(true);
         layer.set_presents_with_transaction(false);
 
         // SAFETY: Winit owns a live NSView on the main thread. NSView retains the CAMetalLayer;
@@ -381,8 +447,18 @@ impl MetalPresenter {
         }
 
         let size = window.inner_size();
-        layer.set_drawable_size(CGSize::new(f64::from(size.width), f64::from(size.height)));
-        eprintln!("[REMu][METAL] presenter started on {}", device.name());
+        let (width, height) = presentation_drawable_size(
+            self.presentation_resolution,
+            size.width,
+            size.height,
+            window.scale_factor(),
+        );
+        layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
+        eprintln!(
+            "[REMu][METAL] presenter started on {} at {width}x{height} ({:?})",
+            device.name(),
+            self.presentation_resolution
+        );
 
         self.window = Some(window);
         self.layer = Some(layer);
@@ -413,11 +489,6 @@ impl MetalPresenter {
                         tiling_mode,
                     });
                     self.frame_texture = None;
-                    if let Some(layer) = self.layer.as_ref() {
-                        // Keep the drawable at guest resolution. Core Animation scales it into the
-                        // window while Metal performs a simple one-to-one copy.
-                        layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
-                    }
                     eprintln!(
                         "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode}"
                     );
@@ -1384,12 +1455,35 @@ impl MetalPresenter {
             source as *const c_void,
             bytes_per_row as u64,
         );
+        let capture = (self.capture_directory.is_some()
+            && self
+                .last_guest_capture
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)))
+        .then(|| {
+            let descriptor = GuestTextureDescriptor {
+                address: flip.address,
+                width: display.width,
+                height: display.height,
+                pitch: display.width,
+                tile_mode: 0,
+            };
+            read_texture_rgba(texture, descriptor).map(|bytes| (descriptor, bytes))
+        });
         self.uploaded_flip_sequence = flip.sequence;
         if flip.sequence == 1 {
             eprintln!(
                 "[REMu][METAL] uploaded first guest display buffer format={:#x}",
                 display.pixel_format
             );
+        }
+        if let Some(capture) = capture {
+            match capture {
+                Ok((descriptor, bgra)) => {
+                    self.guest_bgra_bytes = bgra;
+                    self.capture_guest_frame_if_changed(descriptor);
+                }
+                Err(error) => eprintln!("[REMu][METAL] could not read back flipped frame: {error}"),
+            }
         }
     }
 
@@ -1518,19 +1612,33 @@ impl MetalPresenter {
         let command_buffer = queue.new_command_buffer();
         command_buffer.set_label("REMu guest presentation");
         if let (Some(display), Some(texture)) = (self.display, self.frame_texture.as_ref()) {
-            let encoder = command_buffer.new_blit_command_encoder();
-            encoder.set_label("REMu display-buffer presentation blit");
-            encoder.copy_from_texture(
-                texture,
-                0,
-                0,
-                MTLOrigin::default(),
-                MTLSize::new(u64::from(display.width), u64::from(display.height), 1),
-                drawable.texture(),
-                0,
-                0,
-                MTLOrigin::default(),
-            );
+            let Ok(destination_width) = u32::try_from(drawable.texture().width()) else {
+                return;
+            };
+            let Ok(destination_height) = u32::try_from(drawable.texture().height()) else {
+                return;
+            };
+            let pass = RenderPassDescriptor::new();
+            let attachment = pass
+                .color_attachments()
+                .object_at(0)
+                .expect("Metal presentation pass has color attachment zero");
+            attachment.set_texture(Some(drawable.texture()));
+            attachment.set_load_action(MTLLoadAction::Clear);
+            attachment.set_store_action(MTLStoreAction::Store);
+            attachment.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+            let encoder = command_buffer.new_render_command_encoder(pass);
+            encoder.set_label("REMu scaled display-buffer presentation");
+            encoder.set_render_pipeline_state(&self.presentation.pipeline);
+            encoder.set_viewport(presentation_viewport(
+                display.width,
+                display.height,
+                destination_width,
+                destination_height,
+            ));
+            encoder.set_fragment_texture(0, Some(texture));
+            encoder.set_fragment_sampler_state(0, Some(&self.presentation.sampler));
+            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
             encoder.end_encoding();
         } else {
             return;
@@ -1585,6 +1693,49 @@ fn validate_compute_launch_for_metal(
         ));
     }
     Ok(())
+}
+
+fn create_presentation_resources(device: &Device) -> Result<PresentationResources, String> {
+    let library = if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+        compile_metal_library_with_tools(device, "presentation", PRESENTATION_SHADER_SOURCE)?
+    } else {
+        let options = CompileOptions::new();
+        options.set_fast_math_enabled(false);
+        device
+            .new_library_with_source(PRESENTATION_SHADER_SOURCE, &options)
+            .map_err(|error| format!("Metal presentation shader compilation: {error}"))?
+    };
+    let vertex_function = library
+        .get_function("remu_presentation_vertex", None)
+        .map_err(|error| format!("Metal presentation vertex function: {error}"))?;
+    let fragment_function = library
+        .get_function("remu_presentation_fragment", None)
+        .map_err(|error| format!("Metal presentation fragment function: {error}"))?;
+    let descriptor = RenderPipelineDescriptor::new();
+    descriptor.set_label("REMu scaled display presentation");
+    descriptor.set_vertex_function(Some(&vertex_function));
+    descriptor.set_fragment_function(Some(&fragment_function));
+    descriptor
+        .color_attachments()
+        .object_at(0)
+        .ok_or("Metal has no presentation color attachment")?
+        .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    let pipeline = device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| format!("Metal presentation pipeline: {error}"))?;
+    let sampler_descriptor = SamplerDescriptor::new();
+    sampler_descriptor.set_address_mode_s(MTLSamplerAddressMode::ClampToEdge);
+    sampler_descriptor.set_address_mode_t(MTLSamplerAddressMode::ClampToEdge);
+    sampler_descriptor.set_min_filter(MTLSamplerMinMagFilter::Linear);
+    sampler_descriptor.set_mag_filter(MTLSamplerMinMagFilter::Linear);
+    sampler_descriptor.set_mip_filter(MTLSamplerMipFilter::NotMipmapped);
+    let sampler = device.new_sampler(&sampler_descriptor);
+    Ok(PresentationResources {
+        pipeline,
+        _vertex_function: vertex_function,
+        _fragment_function: fragment_function,
+        sampler,
+    })
 }
 
 fn compile_metal_libraries(
@@ -2822,6 +2973,84 @@ fn presenter_window_attributes() -> winit::window::WindowAttributes {
         .with_inner_size(LogicalSize::new(1280, 720))
 }
 
+fn parse_presentation_resolution(value: &str) -> Result<PresentationResolution, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "window" | "logical" => Ok(PresentationResolution::LogicalWindow),
+        "native" => Ok(PresentationResolution::NativeWindow),
+        _ => {
+            let (width, height) = normalized.split_once('x').ok_or_else(|| {
+                format!(
+                    "invalid REMU_PRESENTATION_SIZE {value:?}; expected window, native, or WIDTHxHEIGHT"
+                )
+            })?;
+            let width = width
+                .parse::<u32>()
+                .map_err(|_| format!("invalid width in REMU_PRESENTATION_SIZE {value:?}"))?;
+            let height = height
+                .parse::<u32>()
+                .map_err(|_| format!("invalid height in REMU_PRESENTATION_SIZE {value:?}"))?;
+            if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+                return Err(format!(
+                    "REMU_PRESENTATION_SIZE dimensions must each be in 1..=16384, got {width}x{height}"
+                ));
+            }
+            Ok(PresentationResolution::Fixed(width, height))
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn presentation_drawable_size(
+    resolution: PresentationResolution,
+    physical_width: u32,
+    physical_height: u32,
+    scale_factor: f64,
+) -> (u32, u32) {
+    match resolution {
+        PresentationResolution::Fixed(width, height) => (width, height),
+        PresentationResolution::NativeWindow => (physical_width.max(1), physical_height.max(1)),
+        PresentationResolution::LogicalWindow => {
+            let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+                scale_factor
+            } else {
+                1.0
+            };
+            let logical = |physical: u32| {
+                // The result is rounded and clamped to the complete accepted u32 subrange before
+                // conversion, so neither truncation nor a negative result is possible.
+                (f64::from(physical) / scale_factor)
+                    .round()
+                    .clamp(1.0, 16_384.0) as u32
+            };
+            (logical(physical_width), logical(physical_height))
+        }
+    }
+}
+
+fn presentation_viewport(
+    source_width: u32,
+    source_height: u32,
+    destination_width: u32,
+    destination_height: u32,
+) -> MTLViewport {
+    let source_width = f64::from(source_width.max(1));
+    let source_height = f64::from(source_height.max(1));
+    let destination_width = f64::from(destination_width.max(1));
+    let destination_height = f64::from(destination_height.max(1));
+    let scale = (destination_width / source_width).min(destination_height / source_height);
+    let width = source_width * scale;
+    let height = source_height * scale;
+    MTLViewport {
+        originX: (destination_width - width) * 0.5,
+        originY: (destination_height - height) * 0.5,
+        width,
+        height,
+        znear: 0.0,
+        zfar: 1.0,
+    }
+}
+
 impl ApplicationHandler for MetalPresenter {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() || self.startup_error.is_some() {
@@ -2856,10 +3085,26 @@ impl ApplicationHandler for MetalPresenter {
                     && size.height != 0
                     && let Some(layer) = self.layer.as_ref()
                 {
-                    let (width, height) =
-                        self.display.map_or((size.width, size.height), |display| {
-                            (display.width, display.height)
-                        });
+                    let scale_factor = self.window.as_ref().map_or(1.0, Window::scale_factor);
+                    let (width, height) = presentation_drawable_size(
+                        self.presentation_resolution,
+                        size.width,
+                        size.height,
+                        scale_factor,
+                    );
+                    layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
+                    self.redraw_pending = true;
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let (Some(window), Some(layer)) = (self.window.as_ref(), self.layer.as_ref()) {
+                    let size = window.inner_size();
+                    let (width, height) = presentation_drawable_size(
+                        self.presentation_resolution,
+                        size.width,
+                        size.height,
+                        scale_factor,
+                    );
                     layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
                     self.redraw_pending = true;
                 }
@@ -2916,13 +3161,63 @@ mod tests {
     use remu_gpu::{ComputeGrid, ComputeLaunch, GpuRegister, IndexedDraw};
 
     use super::{
-        GuestTextureDescriptor, apply_image_destination_select, decode_image_descriptor,
-        decode_scissor, decode_viewport, effective_linear_rgba_pitch,
+        GuestTextureDescriptor, PresentationResolution, apply_image_destination_select,
+        decode_image_descriptor, decode_scissor, decode_viewport, effective_linear_rgba_pitch,
         guest_texture_descriptors_overlap, guest_texture_raw_matches,
         metal_nonindexed_vertex_count, mode27_source_byte_offset, mode27_within_block_byte_offset,
+        parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
         read_draw_indices, snapshot_guest_texture_raw, snapshot_guest_texture_rgba,
         validate_compute_launch_for_metal, write_guest_texture_rgba,
     };
+
+    #[test]
+    fn parses_configurable_presentation_resolution() {
+        assert_eq!(
+            parse_presentation_resolution("window").expect("logical window mode"),
+            PresentationResolution::LogicalWindow
+        );
+        assert_eq!(
+            parse_presentation_resolution("native").expect("native window mode"),
+            PresentationResolution::NativeWindow
+        );
+        assert_eq!(
+            parse_presentation_resolution("1920x1080").expect("fixed presentation size"),
+            PresentationResolution::Fixed(1_920, 1_080)
+        );
+        assert!(parse_presentation_resolution("0x720").is_err());
+        assert!(parse_presentation_resolution("garbage").is_err());
+    }
+
+    #[test]
+    fn logical_presentation_avoids_retina_and_guest_4k_drawables() {
+        assert_eq!(
+            presentation_drawable_size(PresentationResolution::LogicalWindow, 2_560, 1_440, 2.0),
+            (1_280, 720)
+        );
+        assert_eq!(
+            presentation_drawable_size(
+                PresentationResolution::Fixed(1_920, 1_080),
+                2_560,
+                1_440,
+                2.0
+            ),
+            (1_920, 1_080)
+        );
+    }
+
+    #[test]
+    fn presentation_viewport_preserves_guest_aspect_ratio() {
+        let viewport = presentation_viewport(3_840, 2_160, 1_024, 768);
+        assert_eq!(
+            (
+                viewport.originX,
+                viewport.originY,
+                viewport.width,
+                viewport.height
+            ),
+            (0.0, 96.0, 1_024.0, 576.0)
+        );
+    }
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
         IndexedDraw {
