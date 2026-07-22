@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -1483,12 +1483,7 @@ fn write_native_import_stub(slot: &mut [u8], target: u64) {
 
 #[derive(Debug, Default)]
 struct ProbeDispatchState {
-    nids: Vec<String>,
-    seen_nids: BTreeSet<String>,
     unimplemented_nids: BTreeSet<String>,
-    import_counts: BTreeMap<String, usize>,
-    hits: usize,
-    maximum_hits: usize,
     direct_allocations: BTreeMap<u64, DirectAllocation>,
     direct_memory_backing: Option<std::fs::File>,
     next_virtual_hint: u64,
@@ -1728,6 +1723,48 @@ struct KernelQueuedEvent {
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
 
+#[derive(Debug)]
+struct ImportTelemetry {
+    nids: Box<[String]>,
+    seen: Box<[AtomicBool]>,
+    counts: Box<[AtomicUsize]>,
+    hits: AtomicUsize,
+    maximum_hits: usize,
+}
+
+impl ImportTelemetry {
+    fn new(nids: Vec<String>, maximum_hits: usize) -> Self {
+        let count = nids.len();
+        Self {
+            nids: nids.into_boxed_slice(),
+            seen: (0..count)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            counts: (0..count)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            hits: AtomicUsize::new(0),
+            maximum_hits,
+        }
+    }
+
+    fn hot_imports(&self, limit: usize) -> Vec<(&str, usize)> {
+        let mut counts = self
+            .nids
+            .iter()
+            .zip(&self.counts)
+            .map(|(nid, count)| (nid.as_str(), count.load(Ordering::Relaxed)))
+            .collect::<Vec<_>>();
+        counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+        counts.truncate(limit);
+        counts
+    }
+}
+
+static IMPORT_TELEMETRY: OnceLock<RwLock<Arc<ImportTelemetry>>> = OnceLock::new();
+
 #[derive(Debug, Default)]
 struct GuestSyncState {
     mutexes: HashMap<u64, GuestMutexState>,
@@ -1831,16 +1868,18 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     let mut state = state
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.nids = image
+    let nids = image
         .import_stubs
         .iter()
         .map(|stub| stub.nid.clone())
         .collect();
-    state.seen_nids.clear();
+    let telemetry =
+        IMPORT_TELEMETRY.get_or_init(|| RwLock::new(Arc::new(ImportTelemetry::new(Vec::new(), 0))));
+    *telemetry
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Arc::new(ImportTelemetry::new(nids, maximum_hits));
     state.unimplemented_nids.clear();
-    state.import_counts.clear();
-    state.hits = 0;
-    state.maximum_hits = maximum_hits;
     state.direct_allocations.clear();
     state.direct_memory_backing = None;
     state.next_virtual_hint = 0x20_0000_0000;
@@ -2060,25 +2099,26 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     let float_argument0 = low_xmm_f64(frame.xmm_arguments[0]);
     let index = frame.dispatch_index;
     let guest_return_address = frame.guest_return_address;
-    let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-    let mut state = state
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(nid) = usize::try_from(index)
-        .ok()
-        .and_then(|index| state.nids.get(index))
-        .cloned()
-    else {
+    let telemetry = IMPORT_TELEMETRY
+        .get_or_init(|| RwLock::new(Arc::new(ImportTelemetry::new(Vec::new(), 0))))
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(index) = usize::try_from(index).ok() else {
         eprintln!("[REMu][IMPORT] invalid stub index {index}");
         terminate_probe(87);
     };
-    state.hits += 1;
-    *state.import_counts.entry(nid.clone()).or_default() += 1;
-    if state.seen_nids.insert(nid.clone()) {
-        let name = known_nid_name(&nid).unwrap_or("unknown");
+    let Some(nid) = telemetry.nids.get(index).map(String::as_str) else {
+        eprintln!("[REMu][IMPORT] invalid stub index {index}");
+        terminate_probe(87);
+    };
+    let hit = telemetry.hits.fetch_add(1, Ordering::Relaxed) + 1;
+    telemetry.counts[index].fetch_add(1, Ordering::Relaxed);
+    if !telemetry.seen[index].swap(true, Ordering::Relaxed) {
+        let name = known_nid_name(nid).unwrap_or("unknown");
         eprintln!(
             "[REMu][IMPORT] first_hit={} nid={} name={} return={guest_return_address:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
-            state.hits,
+            hit,
             nid,
             name,
             call_args[0],
@@ -2089,29 +2129,16 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             call_args[5],
         );
     }
-    if state.maximum_hits != 0 && state.hits >= state.maximum_hits {
+    if telemetry.maximum_hits != 0 && hit >= telemetry.maximum_hits {
         eprintln!("[REMu][PROBE] import hit limit reached at nid={nid}");
-        let mut counts = state
-            .import_counts
-            .iter()
-            .map(|(nid, count)| (nid, *count))
-            .collect::<Vec<_>>();
-        counts.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
-        for (nid, count) in counts.into_iter().take(8) {
+        for (nid, count) in telemetry.hot_imports(8) {
             eprintln!("[REMu][PROBE] hot_import nid={nid} hits={count}");
         }
         terminate_probe(86);
     }
-    if nid == "H2e8t5ScQGc" {
-        let callbacks = take_exit_callbacks(&mut state, Some(call_args[0]));
-        drop(state);
-        invoke_guest_exit_callbacks(callbacks);
-        return ProbeImportReturn::integer(0);
-    }
-    if matches!(nid.as_str(), "uMei1W9uyNo" | "6Z83sYWFlA8") {
+    if matches!(nid, "uMei1W9uyNo" | "6Z83sYWFlA8") {
         let status = low_i32(call_args[0]);
         let run_callbacks = nid == "uMei1W9uyNo";
-        drop(state);
         if run_callbacks {
             run_all_guest_exit_callbacks();
         }
@@ -2120,6 +2147,59 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             if run_callbacks { "exit" } else { "_exit" }
         );
         terminate_probe(status);
+    }
+    if nid == "T72hz6ffq08" {
+        std::thread::yield_now();
+        return ProbeImportReturn::integer(0);
+    }
+    if is_guest_sync_import(nid) {
+        let is_mutex_init = matches!(nid, "cmo1RIYva9o" | "ttHNfU+qDBU");
+        let mutex_attributes = if is_mutex_init {
+            let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
+            let state = state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pthread_mutex_attr_state(call_args[1], &state)
+        } else {
+            None
+        };
+        if is_mutex_init && call_args[1] != 0 && mutex_attributes.is_none() {
+            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        }
+        return ProbeImportReturn::integer(dispatch_guest_sync_import(
+            nid,
+            call_args,
+            mutex_attributes,
+        ));
+    }
+    if matches!(
+        nid,
+        "5OqszGpy7Mg" | "zlfEH8FmyUA" | "VOBg+iNwB-4" | "2vDqwBlpF-o"
+    ) {
+        return dispatch_guest_numeric_parser(nid, call_args);
+    }
+    if nid == "pztV4AF18iI" {
+        return ProbeImportReturn::integer(guest_sincosf(
+            low_f32(float_argument0),
+            call_args[0],
+            call_args[1],
+        ));
+    }
+    if nid == "AEJdIVZTEmo" {
+        return ProbeImportReturn::integer(guest_qsort(call_args));
+    }
+    if nid == "dhK16CKwhQg" {
+        return ProbeImportReturn::integer(u64::from(float_argument0.is_finite()));
+    }
+    let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
+    let mut state = state
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if nid == "H2e8t5ScQGc" {
+        let callbacks = take_exit_callbacks(&mut state, Some(call_args[0]));
+        drop(state);
+        invoke_guest_exit_callbacks(callbacks);
+        return ProbeImportReturn::integer(0);
     }
     if nid == "6UgtwV+0zb4" {
         if call_args[0] == 0 || call_args[2] == 0 {
@@ -2234,28 +2314,6 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         }
         return ProbeImportReturn::integer(0);
     }
-    if nid == "T72hz6ffq08" {
-        // Yield outside the global import-dispatch lock so another guest worker can enter an HLE
-        // service while this host thread gives up its remaining scheduler quantum.
-        drop(state);
-        std::thread::yield_now();
-        return ProbeImportReturn::integer(0);
-    }
-    if is_guest_sync_import(&nid) {
-        let is_mutex_init = matches!(nid.as_str(), "cmo1RIYva9o" | "ttHNfU+qDBU");
-        let mutex_attributes = is_mutex_init
-            .then(|| pthread_mutex_attr_state(call_args[1], &state))
-            .flatten();
-        if is_mutex_init && call_args[1] != 0 && mutex_attributes.is_none() {
-            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
-        }
-        drop(state);
-        return ProbeImportReturn::integer(dispatch_guest_sync_import(
-            &nid,
-            call_args,
-            mutex_attributes,
-        ));
-    }
     if nid == "QOQtbeDqsT4" {
         let output = state.audio_out.output(call_args);
         drop(state);
@@ -2269,30 +2327,8 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             Err(error) => ProbeImportReturn::integer(audio_out_error(error)),
         };
     }
-    if matches!(
-        nid.as_str(),
-        "5OqszGpy7Mg" | "zlfEH8FmyUA" | "VOBg+iNwB-4" | "2vDqwBlpF-o"
-    ) {
-        drop(state);
-        return dispatch_guest_numeric_parser(&nid, call_args);
-    }
-    if nid == "pztV4AF18iI" {
-        drop(state);
-        return ProbeImportReturn::integer(guest_sincosf(
-            low_f32(float_argument0),
-            call_args[0],
-            call_args[1],
-        ));
-    }
-    if nid == "AEJdIVZTEmo" {
-        drop(state);
-        return ProbeImportReturn::integer(guest_qsort(call_args));
-    }
-    if nid == "dhK16CKwhQg" {
-        return ProbeImportReturn::integer(u64::from(float_argument0.is_finite()));
-    }
     ProbeImportReturn::integer(dispatch_probe_import(
-        &nid, call_args, stack_args, &mut state,
+        nid, call_args, stack_args, &mut state,
     ))
 }
 
@@ -8224,11 +8260,12 @@ fn probe_entry(
     unsafe {
         libc::alarm(0);
     }
-    let import_hits = PROBE_DISPATCH.get().map_or(0, |state| {
-        state
+    let import_hits = IMPORT_TELEMETRY.get().map_or(0, |telemetry| {
+        telemetry
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .hits
+            .load(Ordering::Relaxed)
     });
     Ok(ProbeOutcome {
         return_value,
