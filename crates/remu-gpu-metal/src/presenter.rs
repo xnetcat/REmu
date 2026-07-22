@@ -1132,11 +1132,15 @@ impl MetalPresenter {
                 self.mark_resident_texture_written(texture.descriptor.guest);
             }
         }
+        let is_display_target = self.display.is_some_and(|display| {
+            target.width == display.width && target.height == display.height
+        });
         let capture_due = self.capture_directory.is_some()
             && (binding_trace
-                || self
-                    .last_guest_capture
-                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)));
+                || (is_display_target
+                    && self
+                        .last_guest_capture
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))));
         let batch_full = self
             .open_guest_batch
             .as_ref()
@@ -1144,7 +1148,7 @@ impl MetalPresenter {
         if capture_due {
             self.wait_for_guest_command_batches()?;
             let rendered = read_texture_rgba(&target_texture, target)?;
-            self.capture_translated_frame_if_changed(target, &rendered);
+            self.capture_translated_frame_if_changed(target, &rendered, binding_trace);
         } else if batch_full {
             self.flush_guest_command_batch(false)?;
         }
@@ -1257,11 +1261,13 @@ impl MetalPresenter {
         &mut self,
         descriptor: GuestTextureDescriptor,
         rgba: &[u8],
+        force: bool,
     ) {
         if self.capture_directory.is_none()
-            || self
-                .last_guest_capture
-                .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+            || (!force
+                && self
+                    .last_guest_capture
+                    .is_some_and(|last| last.elapsed() < Duration::from_secs(1)))
         {
             return;
         }
