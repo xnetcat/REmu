@@ -1,7 +1,7 @@
 //! Guest-facing Gen5 AGC command-buffer construction ABI.
 //!
 //! The packet layouts in this module are the native Gen5 encodings used by the
-//! open-source KytyPS5 implementation.  Keeping construction and patching in one
+//! open-source `KytyPS5` implementation.  Keeping construction and patching in one
 //! place is important: patch functions validate the packet opcode they mutate,
 //! and every `GetSize` result is tied to the corresponding encoder.
 
@@ -61,6 +61,8 @@ const R_RELEASE_MEM: u32 = 0x18;
 const VGT_INDEX_TYPE: u32 = 0x243;
 const MAX_PACKET_DWORDS: u32 = 0x4001;
 
+type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
+
 #[derive(Clone, Copy)]
 enum IndirectRegisterKind {
     Context,
@@ -68,6 +70,7 @@ enum IndirectRegisterKind {
     UserConfig,
 }
 
+#[derive(Clone, Copy)]
 struct WaitRegMemArguments {
     command_buffer: u64,
     size: u32,
@@ -92,7 +95,7 @@ impl IndirectRegisterKind {
 
 /// Dispatch one stateless Gen5 AGC command-construction import.
 ///
-/// `arguments` contains the six SysV integer-register arguments and
+/// `arguments` contains the six `SysV` integer-register arguments and
 /// `stack_arguments` starts with the seventh argument. The return is `None`
 /// only when `nid` is outside this coherent ABI cohort.
 pub(crate) fn dispatch_agc_command_abi(
@@ -100,8 +103,16 @@ pub(crate) fn dispatch_agc_command_abi(
     arguments: [u64; 6],
     stack_arguments: [u64; 6],
 ) -> Option<u64> {
-    let result = match nid {
-        // Indirect register packet patching.
+    dispatch_indirect_register_patch(nid, arguments)
+        .or_else(|| dispatch_common_command(nid, arguments, stack_arguments))
+        .or_else(|| dispatch_async_command(nid, arguments, stack_arguments))
+        .or_else(|| dispatch_draw_command(nid, arguments, stack_arguments))
+        .or_else(|| dispatch_draw_sync_command(nid, arguments, stack_arguments))
+        .or_else(|| dispatch_packet_patch(nid, arguments))
+}
+
+fn dispatch_indirect_register_patch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
+    Some(match nid {
         "vcmNN+AAXnY" => patch_indirect_address(arguments, IndirectRegisterKind::Context),
         "Qrj4c+61z4A" => patch_indirect_address(arguments, IndirectRegisterKind::Shader),
         "6lNcCp+fxi4" => patch_indirect_address(arguments, IndirectRegisterKind::UserConfig),
@@ -111,8 +122,16 @@ pub(crate) fn dispatch_agc_command_abi(
         "d-6uF9sZDIU" => patch_indirect_count(arguments, IndirectRegisterKind::Context, true),
         "z2duB-hHQSM" => patch_indirect_count(arguments, IndirectRegisterKind::Shader, true),
         "vRoArM9zaIk" => patch_indirect_count(arguments, IndirectRegisterKind::UserConfig, true),
+        _ => return None,
+    })
+}
 
-        // Common/compute command buffers.
+fn dispatch_common_command(
+    nid: &str,
+    arguments: [u64; 6],
+    stack_arguments: [u64; 6],
+) -> Option<u64> {
+    Some(match nid {
         "LtTouSCZjHM" => cb_nop(arguments),
         "t7PlZ9nt5Lc" => low_u32(arguments[0]).wrapping_mul(4).into(),
         "k3GhuSNmBLU" => cb_dispatch(arguments),
@@ -123,81 +142,90 @@ pub(crate) fn dispatch_agc_command_abi(
         "UZbQjYAwwXM" => cb_set_sh_registers(arguments),
         "wr23dPKyWc0" => cb_release_mem(arguments, stack_arguments),
         "hL7C0IRpWZI" => 32,
+        _ => return None,
+    })
+}
 
-        // Asynchronous command buffers.
+fn dispatch_async_command(
+    nid: &str,
+    arguments: [u64; 6],
+    stack_arguments: [u64; 6],
+) -> Option<u64> {
+    Some(match nid {
         "JrtiDtKeS38" => acb_reset_queue(arguments),
         "cFazmnXpJOE" => event_write(arguments),
         "KT-hTp-Ch14" => acb_acquire_mem(arguments),
-        "ewobAQeMo5k" => 32,
+        "ewobAQeMo5k" | "M0ttm8h7SKA" => 32,
         "qyM2bxYFPAk" => cond_exec(arguments),
         "ozKzBP4aki4" => 20,
         "htn36gPnBk4" => acb_wait_reg_mem(arguments, stack_arguments),
         "-RnpfpxIhec" => dma_data(arguments, stack_arguments),
-        "M0ttm8h7SKA" => 32,
         "qzMN2XKGA4k" => copy_data(arguments, stack_arguments, true),
         "j3EtxFkSIhQ" => acb_dispatch_indirect(arguments),
         "eZ4+17OQz4Q" => write_data(arguments, stack_arguments),
         "xAeBOa0A3kk" | "cpCILPya5Zk" => push_marker(arguments),
         "6mFxkVqdmbQ" => pop_marker(arguments),
+        _ => return None,
+    })
+}
 
-        // Draw command buffers.
+fn dispatch_draw_command(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]) -> Option<u64> {
+    Some(match nid {
         "TRO721eVt4g" => dcb_reset_queue(arguments),
         "MWiElSNE8j8" => dcb_wait_until_safe(arguments),
         "pFLArOT53+w" => set_register_direct(arguments, IT_SET_SH_REG),
         "LHFXRrlTPD8" => set_register_direct(arguments, IT_SET_CONTEXT_REG),
-        "1DeUNpRIDDA" => 12,
         "w4-d0n60hdo" => set_register_direct(arguments, IT_SET_UCONFIG_REG),
         "ZvwO9euwYzc" => set_registers_indirect(arguments, IndirectRegisterKind::Context),
         "-HOOCn0JY48" => set_registers_indirect(arguments, IndirectRegisterKind::Shader),
         "hvUfkUIQcOE" => set_registers_indirect(arguments, IndirectRegisterKind::UserConfig),
         "GIIW2J37e70" => set_index_size(arguments),
-        // sceAgcDcbSetIndexBuffer is deliberately left to the parent runtime: the shipped
-        // four-argument ABI associates a CPU index pointer with a GPU resource address.
+        // DcbSetIndexBuffer stays in the parent runtime because its four-argument ABI associates
+        // a CPU index pointer with a GPU resource address.
         "8N2tmT3jmC8" => set_index_count(arguments),
         "mljzuGDZRQ4" => 28,
         "tSBxhAPyytQ" => set_num_instances(arguments),
-        "6DFuRKT4C9w" => 8,
         "q88lQ+GP5Yk" => draw_index(arguments),
         "6ee9Hd3EWXQ" => 24,
         "Rlx+bykm0r0" => draw_index_multi_instanced(arguments),
         "mR9j7+SfM34" => 36,
         "Yw0jKSqop+E" => draw_index_auto(arguments),
-        "WrdP9Zxx3lQ" => 12,
         "B+aG9DUnTKA" => draw_index_offset(arguments),
-        "qMlfB1ZhMDc" => 20,
         "RmaJwLtc8rY" => set_base_indirect_args(arguments),
         "1q1titRBL6o" => draw_indirect(arguments, false),
-        "cxPZ4Wgvdj8" => 20,
         "t1vNu082-jM" => draw_indirect(arguments, true),
-        "mStuvI0zOtc" => 20,
         "ypVBz4uPKcQ" => draw_index_indirect_multi(arguments, stack_arguments),
         "CtB+A9-VxO0" => dcb_dispatch_indirect(arguments),
-        "w8HVkEeXPv8" => 12,
+        "1DeUNpRIDDA" | "WrdP9Zxx3lQ" | "w8HVkEeXPv8" => 12,
+        "qMlfB1ZhMDc" | "cxPZ4Wgvdj8" | "mStuvI0zOtc" => 20,
+        "6DFuRKT4C9w" => 8,
+        _ => return None,
+    })
+}
+
+fn dispatch_draw_sync_command(
+    nid: &str,
+    arguments: [u64; 6],
+    stack_arguments: [u64; 6],
+) -> Option<u64> {
+    Some(match nid {
         "aJf+j5yntiU" => event_write(arguments),
         "57labkp+rSQ" => dcb_acquire_mem(arguments, stack_arguments),
-        "-vnlTPPXPrw" => 32,
+        "-vnlTPPXPrw" | "2ccJz9LQI+w" => 32,
         "1rZSWUv1IRc" => copy_data(arguments, stack_arguments, false),
         "WmAc2MEj6Io" => dma_data(arguments, stack_arguments),
-        "2ccJz9LQI+w" => 32,
         "xSAR0LTcRKM" => dcb_jump(arguments),
         "VEGu4dixjUg" => 16,
         "zfcxg-ewMK8" => dcb_rewind(arguments),
-        "QIXCsbipds0" => 8,
         "BIPexNBSGog" => cond_exec(arguments),
-        "ou16V5hh5sg" => 20,
         "bbFueFP+J4k" => set_predication(arguments),
         "u2T2DiA5hRI" => stall_command_buffer_parser(arguments),
-        "+u6dKSLWM2o" => 8,
         "i1jyy49AjXU" => write_data(arguments, stack_arguments),
-        "p9tI+yTvx68" => low_u32(arguments[0])
+        "p9tI+yTvx68" | "rUuVjyR+Rd4" => low_u32(arguments[0])
             .wrapping_mul(4)
             .wrapping_add(16)
             .into(),
         "vuSXe69VILM" => dcb_get_lod_stats(arguments, stack_arguments),
-        "rUuVjyR+Rd4" => low_u32(arguments[0])
-            .wrapping_mul(4)
-            .wrapping_add(16)
-            .into(),
         "VmW0Tdpy420" => dcb_wait_reg_mem(arguments, stack_arguments),
         "43WJ08sSugE" => match low_u32(arguments[0]) {
             0 => 56,
@@ -206,9 +234,15 @@ pub(crate) fn dispatch_agc_command_abi(
         },
         "+kSrjIVxKFE" | "QhCbS4X9Rl8" => push_marker(arguments),
         "H7uZqCoNuWk" => pop_marker(arguments),
+        "QIXCsbipds0" | "+u6dKSLWM2o" => 8,
+        "ou16V5hh5sg" => 20,
         "YUeqkyT7mEQ" => set_flip(arguments),
+        _ => return None,
+    })
+}
 
-        // Packet patching.
+fn dispatch_packet_patch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
+    Some(match nid {
         "IxYiarKlXxM" => patch_dma_address(arguments, false),
         "cdDRpqcFGbU" => patch_dma_address(arguments, true),
         "2BS4EtAaF28" => patch_jump_target(arguments),
@@ -224,12 +258,11 @@ pub(crate) fn dispatch_agc_command_abi(
         "T9fjQIINoeE" => patch_release_type(arguments),
         "fPSCdQxgpSw" => patch_write_data_address(arguments),
         _ => return None,
-    };
-    Some(result)
+    })
 }
 
 fn low_u32(value: u64) -> u32 {
-    value as u32
+    u32::try_from(value & u64::from(u32::MAX)).expect("value is masked to 32 bits")
 }
 
 fn low_u16(value: u64) -> u32 {
@@ -248,7 +281,7 @@ fn pm4(length_dwords: u32, opcode: u32, register: u32) -> u32 {
 }
 
 fn packet_opcode(command: u64) -> Option<u32> {
-    (command != 0 && command & 3 == 0).then(|| (read_u32(command) >> 8) & 0xff)
+    (command != 0 && command.is_multiple_of(4)).then(|| (read_u32(command) >> 8) & 0xff)
 }
 
 fn packet_register(command: u64) -> u32 {
@@ -308,9 +341,10 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
         }
         let requested = dword_count.checked_add(reserved)?;
         let user_data = read_u64(command_buffer + COMMAND_BUFFER_USER_DATA_OFFSET);
-        type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
         // SAFETY: this field is the guest-provided SysV command-buffer growth callback.
-        let callback: GrowCallback = unsafe { std::mem::transmute(callback as usize) };
+        let callback_address = usize::try_from(callback).ok()?;
+        // SAFETY: the validated address is the callback pointer stored in the guest descriptor.
+        let callback: GrowCallback = unsafe { std::mem::transmute(callback_address) };
         // SAFETY: the callback ABI and arguments are defined by the Gen5 CommandBuffer layout.
         if !unsafe { callback(command_buffer, requested, user_data) } {
             return None;
@@ -329,8 +363,8 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
 
 fn has_capacity(cursor_up: u64, cursor_down: u64, reserved: u32, needed: u32) -> bool {
     cursor_up != 0
-        && cursor_up & 3 == 0
-        && cursor_down & 3 == 0
+        && cursor_up.is_multiple_of(4)
+        && cursor_down.is_multiple_of(4)
         && cursor_down > cursor_up
         && cursor_down
             .checked_sub(cursor_up)
@@ -1563,7 +1597,8 @@ fn patch_wait_address(arguments: [u64; 6]) -> u64 {
     if address == 0 || address & (alignment - 1) != 0 || address >> 50 != 0 {
         return GRAPHICS5_ERROR_INVALID_PACKET;
     }
-    write_u32(command + 4, low_u32(address) & !(alignment as u32 - 1));
+    let alignment = u32::try_from(alignment).expect("wait alignment fits in u32");
+    write_u32(command + 4, low_u32(address) & !(alignment - 1));
     write_u32(command + 8, low_u32(address >> 32) & 0x3_ffff);
     0
 }
@@ -1913,7 +1948,7 @@ mod tests {
         assert_eq!(call("T9fjQIINoeE", args(&[command, 3]), [0; 6]), 0);
         assert_eq!(call("0fWWK5uG9rQ", args(&[command, 0x2000]), [0; 6]), 0);
         assert_eq!(
-            call("MlEw1feXcjg", args(&[command, 2, 1, 0xabcdef]), [0; 6]),
+            call("MlEw1feXcjg", args(&[command, 2, 1, 0x00ab_cdef]), [0; 6]),
             0
         );
         assert_eq!(fixture.words[1] & 0x00ff_f000, 0x0045_6000);
