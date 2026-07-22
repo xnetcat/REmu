@@ -55,6 +55,8 @@ import_resolution=host-direct nid=P330P3dFF68 weak=false symbol=P330P3dFF68#A#B
         self.assertEqual(runtime.statuses["T72hz6ffq08"], "hle-lock-aware")
         self.assertEqual(runtime.statuses["kALvdgEv5ME"], "stub-success")
         self.assertEqual(runtime.statuses["hqi8yMOCmG0"], "stub-passthrough")
+        self.assertEqual(runtime.statuses["qj7QZpgr9Uw"], "hle-native-agc")
+        self.assertEqual(runtime.statuses["vcmNN+AAXnY"], "hle-native-agc")
         self.assertNotEqual(runtime.statuses["8zTFvBIAIN8"], "named-only")
 
 

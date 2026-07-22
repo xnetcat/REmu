@@ -170,6 +170,23 @@ def parse_flat_stub_arms(dispatch_source: str, return_expression: str) -> set[st
 def inspect_runtime_source(path: Path) -> RuntimeCoverage:
     source = path.read_text(encoding="utf-8")
     names = parse_known_names(source)
+    agc_command_source_path = path.with_name("agc_command_abi.rs")
+    native_agc_nids: set[str] = set()
+    if agc_command_source_path.is_file():
+        agc_command_source = agc_command_source_path.read_text(encoding="utf-8")
+        native_agc_nids = set().union(
+            *(
+                quoted_nids(function_slice(agc_command_source, function))
+                for function in (
+                    "dispatch_indirect_register_patch",
+                    "dispatch_common_command",
+                    "dispatch_async_command",
+                    "dispatch_draw_command",
+                    "dispatch_draw_sync_command",
+                    "dispatch_packet_patch",
+                )
+            )
+        )
     status_sets: list[tuple[str, set[str]]] = [
         (
             "native-host",
@@ -186,6 +203,7 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
             quoted_nids(function_slice(source, "synthetic_data_imports"))
             | quoted_nids(function_slice(source, "synthetic_data_import_target")),
         ),
+        ("hle-native-agc", native_agc_nids),
     ]
 
     probe_dispatch = function_slice(source, "dispatch_probe_import")
