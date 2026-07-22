@@ -1122,6 +1122,7 @@ fn compile_metal_libraries_with_tools(
         .map_err(|error| format!("could not write {}: {error}", pixel_path.display()))?;
     run_metal_tool(
         Command::new(&compiler)
+            .current_dir(&directory.0)
             .arg("-c")
             .arg(&vertex_path)
             .arg("-o")
@@ -1130,6 +1131,7 @@ fn compile_metal_libraries_with_tools(
     )?;
     run_metal_tool(
         Command::new(&compiler)
+            .current_dir(&directory.0)
             .arg("-c")
             .arg(&pixel_path)
             .arg("-o")
@@ -1138,6 +1140,7 @@ fn compile_metal_libraries_with_tools(
     )?;
     run_metal_tool(
         Command::new(&linker)
+            .current_dir(&directory.0)
             .arg(&vertex_air)
             .arg("-o")
             .arg(&vertex_library_path),
@@ -1145,6 +1148,7 @@ fn compile_metal_libraries_with_tools(
     )?;
     run_metal_tool(
         Command::new(&linker)
+            .current_dir(&directory.0)
             .arg(&pixel_air)
             .arg("-o")
             .arg(&pixel_library_path),
