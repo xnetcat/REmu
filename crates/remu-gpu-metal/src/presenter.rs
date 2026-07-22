@@ -3,30 +3,31 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
-    Buffer, CommandBuffer, CompileOptions, Device, Function, Library, MTLCommandBufferStatus,
-    MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion,
-    MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
-    MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
-    MTLViewport, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState,
-    SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
+    Buffer, CommandBuffer, CompileOptions, ComputePipelineState, Device, Function, Library,
+    MTLCommandBufferStatus, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter,
+    MTLSamplerMipFilter, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
+    MTLTextureUsage, MTLViewport, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
+    RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use objc::runtime::{Class, Object, YES};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{
-    GpuEvent, GpuMemoryAcquire, GpuRegister, HostPadState, IndexedDraw, PAD_BUTTON_CIRCLE,
-    PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1, PAD_BUTTON_L2, PAD_BUTTON_LEFT,
-    PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE,
-    PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
+    ComputeDispatch, ComputeGrid, GpuEvent, GpuMemoryAcquire, GpuRegister, HostPadState,
+    IndexedDraw, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
+    PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2,
+    PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
 };
 use remu_memory::CpuWriteWatch;
 use remu_shader::{ImageBinding, ShaderEvaluation};
@@ -73,6 +74,49 @@ struct CompiledShaderPair {
     pixel: remu_shader_metal::MetalShader,
 }
 
+struct CompiledComputePipeline {
+    pipeline: ComputePipelineState,
+    function: Function,
+    shader: remu_shader_metal::MetalShader,
+}
+
+#[derive(Clone)]
+struct ProgramIdentity(Arc<remu_shader::Program>);
+
+impl std::fmt::Debug for ProgramIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProgramIdentity")
+            .field("address", &self.0.address)
+            .field("pointer", &Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for ProgramIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ProgramIdentity {}
+
+impl Hash for ProgramIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ComputePipelineKey {
+    program_identity: ProgramIdentity,
+    lds_size_bytes: u32,
+    wave_lane_count: u32,
+    compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
+    global_bindings: Vec<(Vec<u32>, u64, usize, bool)>,
+    image_bindings: Vec<(u32, bool)>,
+}
+
 struct ShaderCompileResult {
     key: (u64, u64),
     compiled: Result<CompiledShaderPair, String>,
@@ -109,9 +153,82 @@ struct PendingGlobalWriteback {
     byte_count: usize,
 }
 
+#[derive(Debug)]
+enum GuestBatchWork {
+    Draw { export: u64, pixel: u64 },
+    Compute { shader: u64 },
+}
+
+fn describe_guest_batch(work: &[GuestBatchWork]) -> String {
+    work.iter()
+        .map(|item| match item {
+            GuestBatchWork::Draw { export, pixel } => format!("draw({export:#x},{pixel:#x})"),
+            GuestBatchWork::Compute { shader } => format!("compute({shader:#x})"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn compute_pipeline_key(
+    dispatch: &ComputeDispatch,
+    evaluation: &ShaderEvaluation,
+    program: &std::sync::Arc<remu_shader::Program>,
+) -> ComputePipelineKey {
+    let embeds_global_base = program.instructions.iter().any(|instruction| {
+        matches!(
+            instruction.control.as_ref(),
+            Some(remu_shader::InstructionControl::GlobalMemory(_))
+        )
+    });
+    ComputePipelineKey {
+        // Retaining the Arc makes pointer identity stable for the lifetime of both successful and
+        // negative cache entries; an allocator cannot recycle a dropped Program into this key.
+        program_identity: ProgramIdentity(Arc::clone(program)),
+        lds_size_bytes: dispatch.launch.lds_size_bytes,
+        wave_lane_count: dispatch.launch.wave_lane_count,
+        compute_system_registers: evaluation.compute_system_registers,
+        global_bindings: evaluation
+            .global_memory_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.instruction_pcs.clone(),
+                    if embeds_global_base {
+                        binding.base_address
+                    } else {
+                        0
+                    },
+                    binding.data.len(),
+                    binding.writable,
+                )
+            })
+            .collect(),
+        image_bindings: evaluation
+            .image_bindings
+            .iter()
+            .map(|binding| {
+                let unified_format = binding
+                    .resource_descriptor
+                    .get(1)
+                    .map_or(0, |word| (word >> 20) & 0x1ff);
+                let storage = is_storage_image_opcode(binding.opcode);
+                (unified_format, storage)
+            })
+            .collect(),
+    }
+}
+
+fn is_writable_image_opcode(opcode: remu_shader::Opcode) -> bool {
+    opcode.starts_with("ImageStore") || opcode.starts_with("ImageAtomic")
+}
+
+fn is_storage_image_opcode(opcode: remu_shader::Opcode) -> bool {
+    is_writable_image_opcode(opcode) || opcode.starts_with("ImageLoad")
+}
+
 struct GuestCommandBatch {
     command_buffer: CommandBuffer,
-    draws: Vec<(u64, u64)>,
+    work: Vec<GuestBatchWork>,
     global_writebacks: Vec<PendingGlobalWriteback>,
 }
 
@@ -150,6 +267,9 @@ struct MetalPresenter {
     compiling_shader_pairs: HashSet<(u64, u64)>,
     failed_shader_pairs: HashSet<(u64, u64)>,
     failed_draw_execution: HashSet<(u64, u64)>,
+    compiled_compute_pipelines: HashMap<ComputePipelineKey, CompiledComputePipeline>,
+    failed_compute_pipelines: HashSet<ComputePipelineKey>,
+    failed_compute_execution: HashSet<u64>,
     resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     resident_content_version: u64,
@@ -210,6 +330,9 @@ impl MetalPresenter {
             compiling_shader_pairs: HashSet::new(),
             failed_shader_pairs: HashSet::new(),
             failed_draw_execution: HashSet::new(),
+            compiled_compute_pipelines: HashMap::new(),
+            failed_compute_pipelines: HashSet::new(),
+            failed_compute_execution: HashSet::new(),
             resident_guest_textures: HashMap::new(),
             sampled_texture_cache: HashMap::new(),
             resident_content_version: 0,
@@ -313,6 +436,18 @@ impl MetalPresenter {
                 Ok(GpuEvent::MemoryAcquire(acquire)) => {
                     if let Err(error) = self.synchronize_cpu_written_guest_resources(acquire) {
                         eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
+                    }
+                }
+                Ok(GpuEvent::ComputeDispatch(dispatch)) => {
+                    if let Err(error) = self.execute_compute_dispatch(&dispatch)
+                        && self
+                            .failed_compute_execution
+                            .insert(dispatch.shader_address)
+                    {
+                        eprintln!(
+                            "[REMu][METAL] Gen5 compute cs={:#x} could not execute: {error}",
+                            dispatch.shader_address
+                        );
                     }
                 }
                 Ok(GpuEvent::IndexedDraw(draw)) => {
@@ -600,14 +735,15 @@ impl MetalPresenter {
 
     fn synchronize_sampled_aliases(
         &mut self,
-        evaluations: [&ShaderEvaluation; 2],
+        evaluations: &[&ShaderEvaluation],
     ) -> Result<(), String> {
         let mut aliases = Vec::new();
-        for evaluation in evaluations {
-            for binding in evaluation.image_bindings.iter().filter(|binding| {
-                !binding.opcode.starts_with("ImageStore")
-                    && !binding.opcode.starts_with("ImageAtomic")
-            }) {
+        for &evaluation in evaluations {
+            for binding in evaluation
+                .image_bindings
+                .iter()
+                .filter(|binding| !is_storage_image_opcode(binding.opcode))
+            {
                 let sampled = decode_image_descriptor(&binding.resource_descriptor)
                     .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
                 let identity_select = matches!(sampled.destination_select, 0 | 0xfac);
@@ -662,7 +798,10 @@ impl MetalPresenter {
                         .committed_guest_batches
                         .pop_front()
                         .expect("front batch exists");
-                    eprintln!("[REMu][METAL] guest command batch {:?} failed", batch.draws);
+                    eprintln!(
+                        "[REMu][METAL] guest command batch [{}] failed",
+                        describe_guest_batch(&batch.work)
+                    );
                 }
                 _ => return,
             }
@@ -678,8 +817,8 @@ impl MetalPresenter {
             batch.command_buffer.wait_until_completed();
             if batch.command_buffer.status() != MTLCommandBufferStatus::Completed {
                 return Err(format!(
-                    "Metal guest command batch {:?} ended in {:?}",
-                    batch.draws,
+                    "Metal guest command batch [{}] ended in {:?}",
+                    describe_guest_batch(&batch.work),
                     batch.command_buffer.status()
                 ));
             }
@@ -696,8 +835,8 @@ impl MetalPresenter {
             batch.command_buffer.wait_until_completed();
             if batch.command_buffer.status() != MTLCommandBufferStatus::Completed {
                 return Err(format!(
-                    "Metal guest command batch {:?} ended in {:?}",
-                    batch.draws,
+                    "Metal guest command batch [{}] ended in {:?}",
+                    describe_guest_batch(&batch.work),
                     batch.command_buffer.status()
                 ));
             }
@@ -736,6 +875,207 @@ impl MetalPresenter {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn execute_compute_dispatch(&mut self, dispatch: &ComputeDispatch) -> Result<(), String> {
+        self.retire_completed_guest_batches();
+        if dispatch.launch.base_group != [0; 3] {
+            return Err(format!(
+                "Metal compute does not yet support nonzero base groups {:?}",
+                dispatch.launch.base_group
+            ));
+        }
+        let snapshot = dispatch
+            .shader
+            .as_ref()
+            .ok_or("dispatch has no decoded compute shader")?;
+        let evaluation = dispatch
+            .shader_evaluation
+            .as_ref()
+            .ok_or("dispatch has no evaluated compute resources")?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
+
+        let pipeline_key = compute_pipeline_key(dispatch, evaluation, &snapshot.program);
+        if self.failed_compute_pipelines.contains(&pipeline_key) {
+            return Err("compute pipeline previously failed to compile".to_owned());
+        }
+        if !self.compiled_compute_pipelines.contains_key(&pipeline_key) {
+            let compiled = (|| {
+                let options =
+                    remu_shader_metal::MetalCompileOptions::compute(dispatch.launch.lds_size_bytes);
+                let lowered =
+                    remu_shader_metal::compile_msl(&snapshot.program, evaluation, &options)
+                        .map_err(|error| format!("compute lowering: {error}"))?;
+                if lowered.stage != remu_shader_metal::MetalShaderStage::Compute {
+                    return Err("compute lowering returned a non-compute Metal stage".to_owned());
+                }
+                let library = compile_metal_compute_library(&device, &lowered.source)?;
+                let function = library
+                    .get_function(&lowered.entry_point, None)
+                    .map_err(|error| format!("Metal compute function: {error}"))?;
+                let pipeline = device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(|error| format!("Metal compute pipeline: {error}"))?;
+                Ok::<_, String>(CompiledComputePipeline {
+                    pipeline,
+                    function,
+                    shader: lowered,
+                })
+            })();
+            let compiled = match compiled {
+                Ok(compiled) => compiled,
+                Err(error) => {
+                    self.failed_compute_pipelines.insert(pipeline_key.clone());
+                    return Err(error);
+                }
+            };
+            eprintln!(
+                "[REMu][METAL] compiled Gen5 compute cs={:#x} MSL={} bytes local={:?} LDS={} bytes",
+                dispatch.shader_address,
+                compiled.shader.source.len(),
+                dispatch.launch.threads_per_group,
+                compiled.shader.bindings.threadgroup_memory_bytes,
+            );
+            self.compiled_compute_pipelines
+                .insert(pipeline_key.clone(), compiled);
+        }
+        let compiled = self
+            .compiled_compute_pipelines
+            .get(&pipeline_key)
+            .expect("compute pipeline was cached above");
+        let pipeline = compiled.pipeline.clone();
+        let function = compiled.function.clone();
+        let bindings = compiled.shader.bindings.clone();
+        let execution_width = u32::try_from(pipeline.thread_execution_width())
+            .map_err(|_| "Metal compute execution width does not fit u32")?;
+        let dynamic_lds = bindings.threadgroup_memory_bytes;
+        validate_compute_launch_for_metal(
+            dispatch.launch,
+            execution_width,
+            pipeline.max_total_threads_per_threadgroup(),
+            device.max_threadgroup_memory_length(),
+            pipeline.static_threadgroup_memory_length(),
+            dynamic_lds,
+        )?;
+
+        for binding in evaluation
+            .image_bindings
+            .iter()
+            .filter(|binding| is_storage_image_opcode(binding.opcode))
+        {
+            let descriptor = decode_image_descriptor(&binding.resource_descriptor)
+                .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+            self.ensure_resident_texture(&device, descriptor.guest)?;
+        }
+        self.synchronize_sampled_aliases(&[evaluation])?;
+
+        let buffers = upload_global_buffers(&device, evaluation)?;
+        let textures = upload_image_textures(
+            &device,
+            evaluation,
+            &mut self.resident_guest_textures,
+            &mut self.sampled_texture_cache,
+        )?;
+        let (sampler_buffer, _samplers) = create_sampler_argument_buffer(
+            &device,
+            &function,
+            bindings.sampler_argument_buffer_index,
+            evaluation,
+        )?;
+        if self.open_guest_batch.is_none() {
+            let command_buffer = queue.new_command_buffer().to_owned();
+            command_buffer.set_label("REMu translated guest batch");
+            self.open_guest_batch = Some(GuestCommandBatch {
+                command_buffer,
+                work: Vec::new(),
+                global_writebacks: Vec::new(),
+            });
+        }
+        {
+            let batch = self
+                .open_guest_batch
+                .as_mut()
+                .expect("guest command batch was opened above");
+            batch.work.push(GuestBatchWork::Compute {
+                shader: dispatch.shader_address,
+            });
+            collect_pending_global_writebacks(&buffers, evaluation, &mut batch.global_writebacks)?;
+            let encoder = batch.command_buffer.new_compute_command_encoder();
+            encoder.set_label(&format!("REMu Gen5 compute {:#x}", dispatch.shader_address));
+            encoder.set_compute_pipeline_state(&pipeline);
+            for (index, buffer) in buffers.iter().enumerate() {
+                encoder.set_buffer(
+                    u64::try_from(index).map_err(|_| "compute buffer index overflow")?,
+                    Some(buffer),
+                    0,
+                );
+            }
+            encoder.set_bytes(
+                u64::from(bindings.initial_scalar_buffer_index),
+                u64::try_from(evaluation.initial_scalar_registers.len() * 4)
+                    .map_err(|_| "compute scalar byte count overflow")?,
+                evaluation
+                    .initial_scalar_registers
+                    .as_ptr()
+                    .cast::<c_void>(),
+            );
+            for (index, texture) in textures.iter().enumerate() {
+                encoder.set_texture(
+                    u64::try_from(index).map_err(|_| "compute texture index overflow")?,
+                    Some(&texture.texture),
+                );
+            }
+            if let (Some(index), Some(buffer)) = (
+                bindings.sampler_argument_buffer_index,
+                sampler_buffer.as_ref(),
+            ) {
+                encoder.set_buffer(u64::from(index), Some(buffer), 0);
+            }
+            if dynamic_lds != 0 {
+                encoder.set_threadgroup_memory_length(0, u64::from(dynamic_lds));
+            }
+            let local = MTLSize::new(
+                u64::from(dispatch.launch.threads_per_group[0]),
+                u64::from(dispatch.launch.threads_per_group[1]),
+                u64::from(dispatch.launch.threads_per_group[2]),
+            );
+            match dispatch.launch.grid {
+                ComputeGrid::Threadgroups(groups) => encoder.dispatch_thread_groups(
+                    MTLSize::new(
+                        u64::from(groups[0]),
+                        u64::from(groups[1]),
+                        u64::from(groups[2]),
+                    ),
+                    local,
+                ),
+                ComputeGrid::Threads(threads) => encoder
+                    .dispatch_threads(MTLSize::new(threads[0], threads[1], threads[2]), local),
+            }
+            encoder.end_encoding();
+        }
+        for texture in &textures {
+            if texture.writable {
+                self.mark_resident_texture_written(texture.descriptor.guest);
+            }
+        }
+        if self
+            .open_guest_batch
+            .as_ref()
+            .is_some_and(|batch| batch.work.len() >= 32)
+        {
+            self.flush_guest_command_batch(false)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn execute_compiled_draw(&mut self, draw: &IndexedDraw) -> Result<(), String> {
         self.retire_completed_guest_batches();
         let started = Instant::now();
@@ -768,10 +1108,11 @@ impl MetalPresenter {
             .map_err(|error| format!("render target guest memory is unreadable: {error}"))?;
 
         for evaluation in [export_evaluation, pixel_evaluation] {
-            for binding in evaluation.image_bindings.iter().filter(|binding| {
-                binding.opcode.starts_with("ImageStore")
-                    || binding.opcode.starts_with("ImageAtomic")
-            }) {
+            for binding in evaluation
+                .image_bindings
+                .iter()
+                .filter(|binding| is_storage_image_opcode(binding.opcode))
+            {
                 let descriptor = decode_image_descriptor(&binding.resource_descriptor)
                     .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
                 if descriptor.guest != target
@@ -785,7 +1126,7 @@ impl MetalPresenter {
                 self.ensure_resident_texture(&device, descriptor.guest)?;
             }
         }
-        self.synchronize_sampled_aliases([export_evaluation, pixel_evaluation])?;
+        self.synchronize_sampled_aliases(&[export_evaluation, pixel_evaluation])?;
 
         let export_buffers = upload_global_buffers(&device, export_evaluation)?;
         let pixel_buffers = upload_global_buffers(&device, pixel_evaluation)?;
@@ -836,7 +1177,7 @@ impl MetalPresenter {
             command_buffer.set_label("REMu translated guest batch");
             self.open_guest_batch = Some(GuestCommandBatch {
                 command_buffer,
-                draws: Vec::new(),
+                work: Vec::new(),
                 global_writebacks: Vec::new(),
             });
         }
@@ -845,7 +1186,10 @@ impl MetalPresenter {
                 .open_guest_batch
                 .as_mut()
                 .expect("guest command batch was opened above");
-            batch.draws.push(key);
+            batch.work.push(GuestBatchWork::Draw {
+                export: key.0,
+                pixel: key.1,
+            });
             collect_pending_global_writebacks(
                 &export_buffers,
                 export_evaluation,
@@ -966,7 +1310,7 @@ impl MetalPresenter {
         let batch_full = self
             .open_guest_batch
             .as_ref()
-            .is_some_and(|batch| batch.draws.len() >= 32);
+            .is_some_and(|batch| batch.work.len() >= 32);
         if capture_due {
             self.wait_for_guest_command_batches()?;
             let rendered = read_texture_rgba(&target_texture, target)?;
@@ -1197,6 +1541,52 @@ impl MetalPresenter {
     }
 }
 
+fn validate_compute_launch_for_metal(
+    launch: remu_gpu::ComputeLaunch,
+    execution_width: u32,
+    maximum_threads_per_group: u64,
+    maximum_threadgroup_memory_bytes: u64,
+    static_threadgroup_memory_bytes: u64,
+    dynamic_threadgroup_memory_bytes: u32,
+) -> Result<(), String> {
+    if launch.base_group != [0; 3] {
+        return Err(format!(
+            "Metal compute does not yet support nonzero base groups {:?}",
+            launch.base_group
+        ));
+    }
+    if execution_width != launch.wave_lane_count {
+        return Err(format!(
+            "guest wave{} cannot execute on Metal SIMD{} without changing wave semantics",
+            launch.wave_lane_count, execution_width
+        ));
+    }
+    let threadgroup_threads = launch.threads_per_group_total();
+    if threadgroup_threads == 0 || threadgroup_threads > maximum_threads_per_group {
+        return Err(format!(
+            "guest compute threadgroup {:?} has {threadgroup_threads} threads, Metal permits {maximum_threads_per_group}",
+            launch.threads_per_group
+        ));
+    }
+    if dynamic_threadgroup_memory_bytes != 0
+        && dynamic_threadgroup_memory_bytes != launch.lds_size_bytes
+    {
+        return Err(format!(
+            "Metal shader requests {dynamic_threadgroup_memory_bytes} bytes of LDS, dispatch declares {}",
+            launch.lds_size_bytes
+        ));
+    }
+    let total_threadgroup_memory = static_threadgroup_memory_bytes
+        .checked_add(u64::from(dynamic_threadgroup_memory_bytes))
+        .ok_or("Metal threadgroup memory size overflows")?;
+    if total_threadgroup_memory > maximum_threadgroup_memory_bytes {
+        return Err(format!(
+            "compute pipeline needs {total_threadgroup_memory} bytes of threadgroup memory, this Metal device permits {maximum_threadgroup_memory_bytes}"
+        ));
+    }
+    Ok(())
+}
+
 fn compile_metal_libraries(
     device: &Device,
     vertex_source: &str,
@@ -1217,11 +1607,33 @@ fn compile_metal_libraries(
     Ok((vertex, pixel))
 }
 
+fn compile_metal_compute_library(device: &Device, source: &str) -> Result<Library, String> {
+    if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+        return compile_metal_library_with_tools(device, "compute", source);
+    }
+    let compile_options = CompileOptions::new();
+    compile_options.set_fast_math_enabled(false);
+    device
+        .new_library_with_source(source, &compile_options)
+        .map_err(|error| format!("Metal compute compilation: {error}"))
+}
+
 fn compile_metal_libraries_with_tools(
     device: &Device,
     vertex_source: &str,
     pixel_source: &str,
 ) -> Result<(Library, Library), String> {
+    Ok((
+        compile_metal_library_with_tools(device, "vertex", vertex_source)?,
+        compile_metal_library_with_tools(device, "pixel", pixel_source)?,
+    ))
+}
+
+fn compile_metal_library_with_tools(
+    device: &Device,
+    stage: &str,
+    source: &str,
+) -> Result<Library, String> {
     static NEXT_COMPILE_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
     let compiler = std::env::var_os("REMU_METAL_COMPILER")
         .map(PathBuf::from)
@@ -1239,59 +1651,32 @@ fn compile_metal_libraries_with_tools(
     std::fs::create_dir(&directory)
         .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
     let directory = MetalCompileDirectory(directory);
-    let vertex_path = directory.0.join("vertex.metal");
-    let pixel_path = directory.0.join("pixel.metal");
-    let vertex_air = directory.0.join("vertex.air");
-    let pixel_air = directory.0.join("pixel.air");
-    let vertex_library_path = directory.0.join("vertex.metallib");
-    let pixel_library_path = directory.0.join("pixel.metallib");
-    std::fs::write(&vertex_path, vertex_source)
-        .map_err(|error| format!("could not write {}: {error}", vertex_path.display()))?;
-    std::fs::write(&pixel_path, pixel_source)
-        .map_err(|error| format!("could not write {}: {error}", pixel_path.display()))?;
+    let source_path = directory.0.join(format!("{stage}.metal"));
+    let air_path = directory.0.join(format!("{stage}.air"));
+    let library_path = directory.0.join(format!("{stage}.metallib"));
+    std::fs::write(&source_path, source)
+        .map_err(|error| format!("could not write {}: {error}", source_path.display()))?;
     run_metal_tool(
         Command::new(&compiler)
             .current_dir(&directory.0)
             .arg("-fmetal-math-mode=safe")
             .arg("-c")
-            .arg(&vertex_path)
+            .arg(&source_path)
             .arg("-o")
-            .arg(&vertex_air),
-        "vertex compilation",
-    )?;
-    run_metal_tool(
-        Command::new(&compiler)
-            .current_dir(&directory.0)
-            .arg("-fmetal-math-mode=safe")
-            .arg("-c")
-            .arg(&pixel_path)
-            .arg("-o")
-            .arg(&pixel_air),
-        "pixel compilation",
+            .arg(&air_path),
+        &format!("{stage} compilation"),
     )?;
     run_metal_tool(
         Command::new(&linker)
             .current_dir(&directory.0)
-            .arg(&vertex_air)
+            .arg(&air_path)
             .arg("-o")
-            .arg(&vertex_library_path),
-        "vertex library link",
+            .arg(&library_path),
+        &format!("{stage} library link"),
     )?;
-    run_metal_tool(
-        Command::new(&linker)
-            .current_dir(&directory.0)
-            .arg(&pixel_air)
-            .arg("-o")
-            .arg(&pixel_library_path),
-        "pixel library link",
-    )?;
-    let vertex_library = device
-        .new_library_with_file(&vertex_library_path)
-        .map_err(|error| format!("could not load {}: {error}", vertex_library_path.display()))?;
-    let pixel_library = device
-        .new_library_with_file(&pixel_library_path)
-        .map_err(|error| format!("could not load {}: {error}", pixel_library_path.display()))?;
-    Ok((vertex_library, pixel_library))
+    device
+        .new_library_with_file(&library_path)
+        .map_err(|error| format!("could not load {}: {error}", library_path.display()))
 }
 
 fn run_metal_tool(command: &mut Command, operation: &str) -> Result<(), String> {
@@ -1946,16 +2331,16 @@ fn upload_image_textures(
         .map(|binding| {
             let descriptor = decode_image_descriptor(&binding.resource_descriptor)
                 .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-            let writable = binding.opcode.starts_with("ImageStore")
-                || binding.opcode.starts_with("ImageAtomic");
-            if writable && !matches!(descriptor.destination_select, 0 | 0xfac) {
+            let writable = is_writable_image_opcode(binding.opcode);
+            let storage = is_storage_image_opcode(binding.opcode);
+            if storage && !matches!(descriptor.destination_select, 0 | 0xfac) {
                 return Err(format!(
-                    "writable image at PC {:#x} has non-identity destination select {:#x}",
+                    "storage image at PC {:#x} has non-identity destination select {:#x}",
                     binding.pc, descriptor.destination_select
                 ));
             }
             let identity_select = matches!(descriptor.destination_select, 0 | 0xfac);
-            let texture = if writable {
+            let texture = if storage {
                 ensure_resident_texture_in_map(device, descriptor.guest, resident_guest_textures)?
             } else if identity_select
                 && let Some(resident) = resident_guest_textures.get(&descriptor.guest)
@@ -2565,7 +2950,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use remu_gpu::{GpuRegister, IndexedDraw};
+    use remu_gpu::{ComputeGrid, ComputeLaunch, GpuRegister, IndexedDraw};
 
     use super::{
         GuestTextureDescriptor, apply_image_destination_select, decode_image_descriptor,
@@ -2573,7 +2958,7 @@ mod tests {
         guest_texture_descriptors_overlap, guest_texture_raw_matches,
         metal_nonindexed_vertex_count, mode27_source_byte_offset, mode27_within_block_byte_offset,
         read_draw_indices, snapshot_guest_texture_raw, snapshot_guest_texture_rgba,
-        write_guest_texture_rgba,
+        validate_compute_launch_for_metal, write_guest_texture_rgba,
     };
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
@@ -2820,5 +3205,73 @@ mod tests {
         assert_eq!(previous_target_traffic, 13_271_040_000);
         assert_eq!(persistent_target_traffic, 66_355_200);
         assert_eq!(previous_target_traffic / persistent_target_traffic, 200);
+    }
+
+    fn compute_launch() -> ComputeLaunch {
+        ComputeLaunch {
+            grid: ComputeGrid::Threadgroups([8, 4, 1]),
+            group_count: [8, 4, 1],
+            base_group: [0; 3],
+            threads_per_group: [32, 2, 1],
+            wave_lane_count: 32,
+            lds_size_bytes: 16 * 1024,
+            initiator: 0x8045,
+        }
+    }
+
+    #[test]
+    fn validates_exact_metal_compute_execution_geometry() {
+        validate_compute_launch_for_metal(compute_launch(), 32, 1_024, 32 * 1024, 0, 16 * 1024)
+            .expect("representable compute launch");
+    }
+
+    #[test]
+    fn rejects_compute_geometry_metal_cannot_represent_exactly() {
+        let mut based = compute_launch();
+        based.base_group = [4, 0, 0];
+        assert!(
+            validate_compute_launch_for_metal(based, 32, 1_024, 32 * 1024, 0, 16 * 1024)
+                .expect_err("dispatch base is not silently dropped")
+                .contains("nonzero base")
+        );
+
+        assert!(
+            validate_compute_launch_for_metal(
+                compute_launch(),
+                16,
+                1_024,
+                32 * 1024,
+                0,
+                16 * 1024,
+            )
+                .expect_err("wave width must match")
+                .contains("wave32")
+        );
+
+        let mut oversized = compute_launch();
+        oversized.threads_per_group = [1_025, 1, 1];
+        assert!(
+            validate_compute_launch_for_metal(oversized, 32, 1_024, 32 * 1024, 0, 16 * 1024)
+                .expect_err("oversized workgroup must fail")
+                .contains("1025 threads")
+        );
+
+        assert!(
+            validate_compute_launch_for_metal(compute_launch(), 32, 1_024, 32 * 1024, 0, 8 * 1024)
+                .expect_err("LDS binding must equal lowering layout")
+                .contains("8192 bytes of LDS")
+        );
+        assert!(
+            validate_compute_launch_for_metal(
+                compute_launch(),
+                32,
+                1_024,
+                32 * 1024,
+                20 * 1024,
+                16 * 1024,
+            )
+            .expect_err("Metal LDS limit must be enforced")
+            .contains("36864 bytes")
+        );
     }
 }

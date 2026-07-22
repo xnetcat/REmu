@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use remu_shader::{Program, ShaderEvaluation, ShaderMetadata};
+use remu_shader::{ComputeSystemRegisters, Program, ShaderEvaluation, ShaderMetadata};
 use thiserror::Error;
 
 pub const PAD_BUTTON_L3: u32 = 0x0002;
@@ -140,6 +140,316 @@ pub struct IndexedDraw {
     pub user_config_registers: Vec<GpuRegister>,
 }
 
+pub const COMPUTE_START_X_REGISTER: u32 = 0x204;
+pub const COMPUTE_START_Y_REGISTER: u32 = 0x205;
+pub const COMPUTE_START_Z_REGISTER: u32 = 0x206;
+pub const COMPUTE_NUM_THREAD_X_REGISTER: u32 = 0x207;
+pub const COMPUTE_NUM_THREAD_Y_REGISTER: u32 = 0x208;
+pub const COMPUTE_NUM_THREAD_Z_REGISTER: u32 = 0x209;
+pub const COMPUTE_PGM_LO_REGISTER: u32 = 0x20c;
+pub const COMPUTE_PGM_HI_REGISTER: u32 = 0x20d;
+pub const COMPUTE_PGM_RSRC2_REGISTER: u32 = 0x213;
+
+const PM4_TYPE3: u32 = 3;
+const PM4_DISPATCH_DIRECT: u32 = 0x15;
+const PM4_DISPATCH_INDIRECT: u32 = 0x16;
+const DISPATCH_ENABLE: u32 = 1;
+const DISPATCH_PARTIAL_THREADGROUP: u32 = 1 << 1;
+const DISPATCH_FORCE_START_AT_ZERO: u32 = 1 << 2;
+const DISPATCH_USE_THREAD_DIMENSIONS: u32 = 1 << 5;
+const DISPATCH_WAVE32: u32 = 1 << 15;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ComputeGrid {
+    /// A regular grid whose dimensions are workgroup counts.
+    Threadgroups([u32; 3]),
+    /// An exact thread grid. Metal must use `dispatchThreads` so the final workgroup is not padded.
+    Threads([u64; 3]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ComputeLaunch {
+    pub grid: ComputeGrid,
+    pub group_count: [u32; 3],
+    pub base_group: [u32; 3],
+    pub threads_per_group: [u32; 3],
+    pub wave_lane_count: u32,
+    pub lds_size_bytes: u32,
+    pub initiator: u32,
+}
+
+impl ComputeLaunch {
+    #[must_use]
+    pub const fn threads_per_group_total(self) -> u64 {
+        self.threads_per_group[0] as u64
+            * self.threads_per_group[1] as u64
+            * self.threads_per_group[2] as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ComputeDispatchSource {
+    Direct,
+    Indirect { dimensions_address: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ComputeIndirectDimensions {
+    BaseOffset(u32),
+    Absolute(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ComputeIndirectPacket {
+    pub dimensions: ComputeIndirectDimensions,
+    pub initiator: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeDispatch {
+    pub sequence: u64,
+    pub source: ComputeDispatchSource,
+    pub launch: ComputeLaunch,
+    pub shader_address: u64,
+    pub shader_prefix: [u32; 4],
+    pub shader: Option<ShaderSnapshot>,
+    pub shader_evaluation: Option<Arc<ShaderEvaluation>>,
+    pub shader_registers: Vec<GpuRegister>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum ComputeDispatchDecodeError {
+    #[error("compute packet has {actual} dwords, expected {expected}")]
+    PacketLength { expected: u32, actual: usize },
+    #[error("compute packet declares unsupported length of {0} dwords")]
+    DeclaredPacketLength(u32),
+    #[error("PM4 header 0x{0:08X} is not DISPATCH_DIRECT")]
+    NotDispatchDirect(u32),
+    #[error("PM4 header 0x{0:08X} is not DISPATCH_INDIRECT")]
+    NotDispatchIndirect(u32),
+    #[error("dispatch initiator 0x{0:08X} does not enable compute")]
+    Disabled(u32),
+    #[error("compute {axis}-dimension end {end} is not after base {base}")]
+    EndNotAfterBase { axis: char, end: u64, base: u64 },
+    #[error("compute {axis}-dimension partial size {partial} exceeds full size {full}")]
+    InvalidPartialSize { axis: char, partial: u32, full: u32 },
+    #[error("compute {axis}-dimension thread count overflows")]
+    ThreadCountOverflow { axis: char },
+}
+
+/// Decodes the complete geometry of a Gen5 direct or resolved-indirect compute dispatch.
+///
+/// Packet dimensions are end coordinates unless `USE_THREAD_DIMENSIONS` is set. When
+/// `FORCE_START_AT_000` is clear, `COMPUTE_START_{X,Y,Z}` supplies the base coordinates. Partial
+/// workgroups become an exact thread grid instead of being rounded up with extra invocations.
+pub fn decode_compute_launch(
+    dimensions: [u32; 3],
+    initiator: u32,
+    shader_registers: &[GpuRegister],
+) -> Result<ComputeLaunch, ComputeDispatchDecodeError> {
+    if initiator & DISPATCH_ENABLE == 0 {
+        return Err(ComputeDispatchDecodeError::Disabled(initiator));
+    }
+    let register = |offset| {
+        shader_registers
+            .iter()
+            .find(|register| register.offset == offset)
+            .map_or(0, |register| register.value)
+    };
+    let thread_registers = [
+        register(COMPUTE_NUM_THREAD_X_REGISTER),
+        register(COMPUTE_NUM_THREAD_Y_REGISTER),
+        register(COMPUTE_NUM_THREAD_Z_REGISTER),
+    ];
+    let threads_per_group = thread_registers.map(|value| (value & 0xffff).max(1));
+    let base_group = if initiator & DISPATCH_FORCE_START_AT_ZERO != 0 {
+        [0; 3]
+    } else {
+        [
+            register(COMPUTE_START_X_REGISTER),
+            register(COMPUTE_START_Y_REGISTER),
+            register(COMPUTE_START_Z_REGISTER),
+        ]
+    };
+    let axes = ['x', 'y', 'z'];
+    let mut group_count = [0_u32; 3];
+    let grid = if initiator & DISPATCH_USE_THREAD_DIMENSIONS != 0 {
+        let mut threads = [0_u64; 3];
+        for axis in 0..3 {
+            let start_thread = u64::from(base_group[axis])
+                .checked_mul(u64::from(threads_per_group[axis]))
+                .ok_or(ComputeDispatchDecodeError::ThreadCountOverflow { axis: axes[axis] })?;
+            let end_thread = u64::from(dimensions[axis]);
+            if end_thread <= start_thread {
+                return Err(ComputeDispatchDecodeError::EndNotAfterBase {
+                    axis: axes[axis],
+                    end: end_thread,
+                    base: start_thread,
+                });
+            }
+            threads[axis] = end_thread - start_thread;
+            let groups = threads[axis].div_ceil(u64::from(threads_per_group[axis]));
+            group_count[axis] = u32::try_from(groups).map_err(|_| {
+                ComputeDispatchDecodeError::ThreadCountOverflow { axis: axes[axis] }
+            })?;
+        }
+        ComputeGrid::Threads(threads)
+    } else {
+        for axis in 0..3 {
+            if dimensions[axis] <= base_group[axis] {
+                return Err(ComputeDispatchDecodeError::EndNotAfterBase {
+                    axis: axes[axis],
+                    end: u64::from(dimensions[axis]),
+                    base: u64::from(base_group[axis]),
+                });
+            }
+            group_count[axis] = dimensions[axis] - base_group[axis];
+        }
+        if initiator & DISPATCH_PARTIAL_THREADGROUP == 0 {
+            ComputeGrid::Threadgroups(group_count)
+        } else {
+            let mut threads = [0_u64; 3];
+            for axis in 0..3 {
+                let partial = thread_registers[axis] >> 16;
+                let full = threads_per_group[axis];
+                if partial == 0 || partial > full {
+                    return Err(ComputeDispatchDecodeError::InvalidPartialSize {
+                        axis: axes[axis],
+                        partial,
+                        full,
+                    });
+                }
+                threads[axis] = u64::from(group_count[axis] - 1)
+                    .checked_mul(u64::from(full))
+                    .and_then(|prefix| prefix.checked_add(u64::from(partial)))
+                    .ok_or(ComputeDispatchDecodeError::ThreadCountOverflow { axis: axes[axis] })?;
+            }
+            ComputeGrid::Threads(threads)
+        }
+    };
+    let resource2 = register(COMPUTE_PGM_RSRC2_REGISTER);
+    Ok(ComputeLaunch {
+        grid,
+        group_count,
+        base_group,
+        threads_per_group,
+        wave_lane_count: if initiator & DISPATCH_WAVE32 != 0 {
+            32
+        } else {
+            64
+        },
+        lds_size_bytes: ((resource2 >> 15) & 0x1ff) * 512,
+        initiator,
+    })
+}
+
+/// Decodes one complete type-3 `DISPATCH_DIRECT` packet and its active compute registers.
+pub fn decode_compute_dispatch_direct(
+    packet: &[u32],
+    shader_registers: &[GpuRegister],
+) -> Result<ComputeLaunch, ComputeDispatchDecodeError> {
+    let Some(&header) = packet.first() else {
+        return Err(ComputeDispatchDecodeError::PacketLength {
+            expected: 5,
+            actual: 0,
+        });
+    };
+    let declared = ((header >> 16) & 0x3fff) + 2;
+    if declared != 5 {
+        return Err(ComputeDispatchDecodeError::DeclaredPacketLength(declared));
+    }
+    if packet.len() != 5 {
+        return Err(ComputeDispatchDecodeError::PacketLength {
+            expected: 5,
+            actual: packet.len(),
+        });
+    }
+    if header >> 30 != PM4_TYPE3 || (header >> 8) & 0xff != PM4_DISPATCH_DIRECT {
+        return Err(ComputeDispatchDecodeError::NotDispatchDirect(header));
+    }
+    decode_compute_launch(
+        [packet[1], packet[2], packet[3]],
+        packet[4],
+        shader_registers,
+    )
+}
+
+/// Decodes either observed Gen5 `DISPATCH_INDIRECT` packet layout without dereferencing guest
+/// memory. Three-dword packets carry an offset from the active indirect-argument base; four-dword
+/// packets carry an absolute 64-bit dimensions address.
+pub fn decode_compute_dispatch_indirect(
+    packet: &[u32],
+) -> Result<ComputeIndirectPacket, ComputeDispatchDecodeError> {
+    let Some(&header) = packet.first() else {
+        return Err(ComputeDispatchDecodeError::PacketLength {
+            expected: 3,
+            actual: 0,
+        });
+    };
+    if header >> 30 != PM4_TYPE3 || (header >> 8) & 0xff != PM4_DISPATCH_INDIRECT {
+        return Err(ComputeDispatchDecodeError::NotDispatchIndirect(header));
+    }
+    let declared = ((header >> 16) & 0x3fff) + 2;
+    if !matches!(declared, 3 | 4) {
+        return Err(ComputeDispatchDecodeError::DeclaredPacketLength(declared));
+    }
+    if packet.len() != usize::try_from(declared).unwrap_or(usize::MAX) {
+        return Err(ComputeDispatchDecodeError::PacketLength {
+            expected: declared,
+            actual: packet.len(),
+        });
+    }
+    if declared == 3 {
+        Ok(ComputeIndirectPacket {
+            dimensions: ComputeIndirectDimensions::BaseOffset(packet[1]),
+            initiator: packet[2],
+        })
+    } else {
+        Ok(ComputeIndirectPacket {
+            dimensions: ComputeIndirectDimensions::Absolute(
+                u64::from(packet[1]) | (u64::from(packet[2]) << 32),
+            ),
+            initiator: packet[3],
+        })
+    }
+}
+
+#[must_use]
+pub fn compute_program_address(shader_registers: &[GpuRegister]) -> Option<u64> {
+    let low = shader_registers
+        .iter()
+        .find(|register| register.offset == COMPUTE_PGM_LO_REGISTER)?
+        .value;
+    let high = shader_registers
+        .iter()
+        .find(|register| register.offset == COMPUTE_PGM_HI_REGISTER)?
+        .value;
+    Some((u64::from(high) << 40) | (u64::from(low) << 8))
+}
+
+#[must_use]
+pub fn decode_compute_system_registers(shader_registers: &[GpuRegister]) -> ComputeSystemRegisters {
+    let resource2 = shader_registers
+        .iter()
+        .find(|register| register.offset == COMPUTE_PGM_RSRC2_REGISTER)
+        .map_or(0, |register| register.value);
+    let mut next_register = (resource2 >> 1) & 0x1f;
+    let mut consume_enabled = |mask| {
+        if resource2 & mask == 0 {
+            return None;
+        }
+        let register = next_register;
+        next_register += 1;
+        Some(register)
+    };
+    ComputeSystemRegisters {
+        work_group_x: consume_enabled(1 << 7),
+        work_group_y: consume_enabled(1 << 8),
+        work_group_z: consume_enabled(1 << 9),
+        thread_group_size: consume_enabled(1 << 10),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GpuProbeError {
     #[error("{0} is unavailable on this host")]
@@ -168,6 +478,7 @@ pub enum GpuEvent {
         flip_argument: u64,
     },
     MemoryAcquire(GpuMemoryAcquire),
+    ComputeDispatch(Box<ComputeDispatch>),
     IndexedDraw(Box<IndexedDraw>),
     Shutdown,
 }
@@ -277,7 +588,15 @@ pub fn acquire_memory(acquire: GpuMemoryAcquire) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuMemoryAcquire, HostPadState, host_pad_state, set_host_pad_state};
+    use super::{
+        COMPUTE_NUM_THREAD_X_REGISTER, COMPUTE_NUM_THREAD_Y_REGISTER,
+        COMPUTE_NUM_THREAD_Z_REGISTER, COMPUTE_PGM_HI_REGISTER, COMPUTE_PGM_LO_REGISTER,
+        COMPUTE_PGM_RSRC2_REGISTER, COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER,
+        COMPUTE_START_Z_REGISTER, ComputeDispatchDecodeError, ComputeGrid, GpuMemoryAcquire,
+        GpuRegister, HostPadState, compute_program_address, decode_compute_dispatch_direct,
+        decode_compute_dispatch_indirect, decode_compute_launch, decode_compute_system_registers,
+        host_pad_state, set_host_pad_state,
+    };
 
     #[test]
     fn shares_a_host_pad_snapshot_across_the_gpu_runtime_seam() {
@@ -318,5 +637,123 @@ mod tests {
         assert!(all.invalidates_guest_resources());
         assert!(all.covers_all_guest_memory());
         assert!(all.overlaps(0x7000_0000_0000, 0x1000));
+    }
+
+    fn compute_registers(thread_words: [u32; 3], starts: [u32; 3]) -> Vec<GpuRegister> {
+        [
+            (COMPUTE_NUM_THREAD_X_REGISTER, thread_words[0]),
+            (COMPUTE_NUM_THREAD_Y_REGISTER, thread_words[1]),
+            (COMPUTE_NUM_THREAD_Z_REGISTER, thread_words[2]),
+            (COMPUTE_START_X_REGISTER, starts[0]),
+            (COMPUTE_START_Y_REGISTER, starts[1]),
+            (COMPUTE_START_Z_REGISTER, starts[2]),
+            (COMPUTE_PGM_RSRC2_REGISTER, 64 << 15),
+        ]
+        .map(|(offset, value)| GpuRegister { offset, value })
+        .to_vec()
+    }
+
+    #[test]
+    fn decodes_direct_group_dimensions_wave_size_and_lds() {
+        let registers = compute_registers([64, 2, 1], [99, 99, 99]);
+        let packet = [0xc003_1500, 10, 4, 2, 0x8045];
+        let launch =
+            decode_compute_dispatch_direct(&packet, &registers).expect("valid direct dispatch");
+        assert_eq!(launch.grid, ComputeGrid::Threadgroups([10, 4, 2]));
+        assert_eq!(launch.group_count, [10, 4, 2]);
+        assert_eq!(launch.base_group, [0; 3]);
+        assert_eq!(launch.threads_per_group, [64, 2, 1]);
+        assert_eq!(launch.threads_per_group_total(), 128);
+        assert_eq!(launch.wave_lane_count, 32);
+        assert_eq!(launch.lds_size_bytes, 32 * 1024);
+    }
+
+    #[test]
+    fn decodes_thread_dimensions_as_an_exact_unpadded_grid() {
+        let registers = compute_registers([64, 1, 1], [0; 3]);
+        let launch = decode_compute_launch([130, 3, 1], 0x8025, &registers)
+            .expect("valid thread-dimension dispatch");
+        assert_eq!(launch.grid, ComputeGrid::Threads([130, 3, 1]));
+        assert_eq!(launch.group_count, [3, 3, 1]);
+    }
+
+    #[test]
+    fn decodes_partial_final_workgroups_without_padded_invocations() {
+        let registers = compute_registers([(32 << 16) | 64, (1 << 16) | 4, (1 << 16) | 1], [0; 3]);
+        let launch = decode_compute_launch([3, 2, 1], 0x8007, &registers)
+            .expect("valid partial-threadgroup dispatch");
+        assert_eq!(launch.grid, ComputeGrid::Threads([160, 5, 1]));
+        assert_eq!(launch.group_count, [3, 2, 1]);
+    }
+
+    #[test]
+    fn preserves_nonzero_compute_start_for_backend_validation() {
+        let registers = compute_registers([8, 4, 2], [4, 3, 2]);
+        let launch = decode_compute_launch([10, 8, 5], 0x8001, &registers)
+            .expect("valid based dispatch geometry");
+        assert_eq!(launch.base_group, [4, 3, 2]);
+        assert_eq!(launch.group_count, [6, 5, 3]);
+        assert_eq!(launch.grid, ComputeGrid::Threadgroups([6, 5, 3]));
+    }
+
+    #[test]
+    fn rejects_disabled_and_malformed_compute_dispatches() {
+        let registers = compute_registers([64, 1, 1], [0; 3]);
+        assert_eq!(
+            decode_compute_launch([1; 3], 0x8004, &registers),
+            Err(ComputeDispatchDecodeError::Disabled(0x8004))
+        );
+        assert!(matches!(
+            decode_compute_dispatch_direct(&[0xc002_1500, 1, 1, 1], &registers),
+            Err(ComputeDispatchDecodeError::DeclaredPacketLength(4))
+        ));
+        assert!(matches!(
+            decode_compute_launch([1; 3], 0x8003, &compute_registers([64, 1, 1], [0; 3])),
+            Err(ComputeDispatchDecodeError::InvalidPartialSize { axis: 'x', .. })
+        ));
+    }
+
+    #[test]
+    fn decodes_compute_program_and_system_sgpr_state() {
+        let registers = [
+            GpuRegister {
+                offset: COMPUTE_PGM_LO_REGISTER,
+                value: 0x1234_5678,
+            },
+            GpuRegister {
+                offset: COMPUTE_PGM_HI_REGISTER,
+                value: 0x5a,
+            },
+            GpuRegister {
+                offset: COMPUTE_PGM_RSRC2_REGISTER,
+                value: (4 << 1) | (1 << 7) | (1 << 9) | (1 << 10),
+            },
+        ];
+        assert_eq!(compute_program_address(&registers), Some(0x5a12_3456_7800));
+        let system = decode_compute_system_registers(&registers);
+        assert_eq!(system.work_group_x, Some(4));
+        assert_eq!(system.work_group_y, None);
+        assert_eq!(system.work_group_z, Some(5));
+        assert_eq!(system.thread_group_size, Some(6));
+    }
+
+    #[test]
+    fn decodes_base_relative_and_absolute_indirect_dispatch_packets() {
+        let relative = decode_compute_dispatch_indirect(&[0xc001_1600, 0x280, 0x8041])
+            .expect("relative indirect packet");
+        assert_eq!(
+            relative.dimensions,
+            super::ComputeIndirectDimensions::BaseOffset(0x280)
+        );
+        assert_eq!(relative.initiator, 0x8041);
+
+        let absolute =
+            decode_compute_dispatch_indirect(&[0xc002_1600, 0x7654_3200, 0x1234, 0x8001])
+                .expect("absolute indirect packet");
+        assert_eq!(
+            absolute.dimensions,
+            super::ComputeIndirectDimensions::Absolute(0x1234_7654_3200)
+        );
+        assert_eq!(absolute.initiator, 0x8001);
     }
 }
