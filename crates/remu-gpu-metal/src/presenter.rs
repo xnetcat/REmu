@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -1229,16 +1230,7 @@ fn snapshot_guest_texture_rgba(descriptor: GuestTextureDescriptor) -> Result<Vec
             );
         }
     } else {
-        for y in 0..height {
-            for x in 0..width {
-                let source_offset = guest_pixel_byte_offset(descriptor, x, y);
-                let destination_offset = (y * width + x) * 4;
-                let source_pixel = source
-                    .get(source_offset..source_offset + 4)
-                    .ok_or("guest texture layout points beyond its decoded allocation")?;
-                output[destination_offset..destination_offset + 4].copy_from_slice(source_pixel);
-            }
-        }
+        copy_mode27_to_linear(source, descriptor, &mut output)?;
     }
     Ok(output)
 }
@@ -1296,16 +1288,7 @@ fn write_guest_texture_rgba(descriptor: GuestTextureDescriptor, rgba: &[u8]) -> 
                 .copy_from_slice(&rgba[source_offset..source_offset + source_row_bytes]);
         }
     } else {
-        for y in 0..height {
-            for x in 0..width {
-                let source_offset = (y * width + x) * 4;
-                let destination_offset = guest_pixel_byte_offset(descriptor, x, y);
-                let destination_pixel = destination
-                    .get_mut(destination_offset..destination_offset + 4)
-                    .ok_or("guest texture layout points beyond its decoded allocation")?;
-                destination_pixel.copy_from_slice(&rgba[source_offset..source_offset + 4]);
-            }
-        }
+        copy_linear_to_mode27(rgba, descriptor, destination)?;
     }
     Ok(())
 }
@@ -2355,6 +2338,99 @@ fn guest_pixel_byte_offset(descriptor: GuestTextureDescriptor, x: usize, y: usiz
     }
 }
 
+fn copy_mode27_to_linear(
+    source: &[u8],
+    descriptor: GuestTextureDescriptor,
+    destination: &mut [u8],
+) -> Result<(), String> {
+    let width =
+        usize::try_from(descriptor.width).map_err(|_| "texture width does not fit usize")?;
+    let height =
+        usize::try_from(descriptor.height).map_err(|_| "texture height does not fit usize")?;
+    let expected_source = usize::try_from(
+        guest_texture_byte_count(descriptor).ok_or("mode 27 texture byte count overflows")?,
+    )
+    .map_err(|_| "mode 27 texture byte count does not fit usize")?;
+    let expected_destination = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("mode 27 linear byte count overflows")?;
+    if source.len() != expected_source || destination.len() != expected_destination {
+        return Err(format!(
+            "mode 27 copy has source/destination lengths {}/{}, expected {expected_source}/{expected_destination}",
+            source.len(),
+            destination.len(),
+        ));
+    }
+    let blocks_per_row = width.div_ceil(128);
+    for block_y in 0..height.div_ceil(128) {
+        let block_height = (height - block_y * 128).min(128);
+        for block_x in 0..blocks_per_row {
+            let block_width = (width - block_x * 128).min(128);
+            let block_base = (block_y * blocks_per_row + block_x) * 65_536;
+            let offsets = mode27_block_byte_offsets(block_x, block_y);
+            for local_y in 0..block_height {
+                let destination_row = ((block_y * 128 + local_y) * width + block_x * 128) * 4;
+                let offset_row = local_y * 128;
+                for local_x in 0..block_width {
+                    let source_offset = block_base + usize::from(offsets[offset_row + local_x]);
+                    let destination_offset = destination_row + local_x * 4;
+                    destination[destination_offset..destination_offset + 4]
+                        .copy_from_slice(&source[source_offset..source_offset + 4]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_linear_to_mode27(
+    source: &[u8],
+    descriptor: GuestTextureDescriptor,
+    destination: &mut [u8],
+) -> Result<(), String> {
+    let width =
+        usize::try_from(descriptor.width).map_err(|_| "texture width does not fit usize")?;
+    let height =
+        usize::try_from(descriptor.height).map_err(|_| "texture height does not fit usize")?;
+    let expected_source = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("mode 27 linear byte count overflows")?;
+    let expected_destination = usize::try_from(
+        guest_texture_byte_count(descriptor).ok_or("mode 27 texture byte count overflows")?,
+    )
+    .map_err(|_| "mode 27 texture byte count does not fit usize")?;
+    if source.len() != expected_source || destination.len() != expected_destination {
+        return Err(format!(
+            "mode 27 copy has source/destination lengths {}/{}, expected {expected_source}/{expected_destination}",
+            source.len(),
+            destination.len(),
+        ));
+    }
+    let blocks_per_row = width.div_ceil(128);
+    for block_y in 0..height.div_ceil(128) {
+        let block_height = (height - block_y * 128).min(128);
+        for block_x in 0..blocks_per_row {
+            let block_width = (width - block_x * 128).min(128);
+            let block_base = (block_y * blocks_per_row + block_x) * 65_536;
+            let offsets = mode27_block_byte_offsets(block_x, block_y);
+            for local_y in 0..block_height {
+                let source_row = ((block_y * 128 + local_y) * width + block_x * 128) * 4;
+                let offset_row = local_y * 128;
+                for local_x in 0..block_width {
+                    let source_offset = source_row + local_x * 4;
+                    let destination_offset =
+                        block_base + usize::from(offsets[offset_row + local_x]);
+                    destination[destination_offset..destination_offset + 4]
+                        .copy_from_slice(&source[source_offset..source_offset + 4]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn alpha_blend_rgba(source: &[u8], target: &mut [u8]) {
     let alpha = u32::from(source[3]);
     let inverse = 255 - alpha;
@@ -2536,9 +2612,41 @@ fn guest_texture_byte_count(descriptor: GuestTextureDescriptor) -> Option<u64> {
 }
 
 fn mode27_source_byte_offset(x: usize, y: usize, width: usize) -> usize {
-    let bit = |value: usize, index: usize| (value >> index) & 1;
     let blocks_per_row = width.div_ceil(128);
-    let block_index = y / 128 * blocks_per_row + x / 128;
+    let block_x = x / 128;
+    let block_y = y / 128;
+    let block_index = block_y * blocks_per_row + block_x;
+    let offsets = mode27_block_byte_offsets(block_x, block_y);
+    block_index * 65_536 + usize::from(offsets[(y & 127) * 128 + (x & 127)])
+}
+
+fn mode27_block_byte_offsets(block_x: usize, block_y: usize) -> &'static [u16] {
+    const PIXELS_PER_BLOCK: usize = 128 * 128;
+    static OFFSETS: OnceLock<Box<[u16]>> = OnceLock::new();
+    let offsets = OFFSETS.get_or_init(|| {
+        let mut offsets = vec![0_u16; 4 * PIXELS_PER_BLOCK];
+        for block_y_parity in 0..2 {
+            for block_x_parity in 0..2 {
+                let table = (block_y_parity * 2 + block_x_parity) * PIXELS_PER_BLOCK;
+                for local_y in 0..128 {
+                    for local_x in 0..128 {
+                        let global_x = local_x | (block_x_parity << 7);
+                        let global_y = local_y | (block_y_parity << 7);
+                        offsets[table + local_y * 128 + local_x] =
+                            u16::try_from(mode27_within_block_byte_offset(global_x, global_y))
+                                .expect("mode 27 byte offset fits u16");
+                    }
+                }
+            }
+        }
+        offsets.into_boxed_slice()
+    });
+    let table = ((block_y & 1) * 2 + (block_x & 1)) * PIXELS_PER_BLOCK;
+    &offsets[table..table + PIXELS_PER_BLOCK]
+}
+
+fn mode27_within_block_byte_offset(x: usize, y: usize) -> usize {
+    let bit = |value: usize, index: usize| (value >> index) & 1;
     let mut within = 0;
     within |= bit(x, 0) << 2;
     within |= bit(x, 1) << 3;
@@ -2554,7 +2662,7 @@ fn mode27_source_byte_offset(x: usize, y: usize, width: usize) -> usize {
     within |= bit(y, 3) << 13;
     within |= (bit(x, 6) ^ bit(y, 7)) << 14;
     within |= (bit(x, 7) ^ bit(y, 6)) << 15;
-    block_index * 65_536 + within
+    within
 }
 
 fn convert_mode27_rgba_to_bgra(
@@ -2566,16 +2674,31 @@ fn convert_mode27_rgba_to_bgra(
 ) {
     let width = usize::try_from(width).expect("validated width fits");
     let height = usize::try_from(height).expect("validated height fits");
-    for y in 0..height {
-        for x in 0..width {
-            let source_offset = mode27_source_byte_offset(x, y, width);
-            let destination_offset = (y * width + x) * 4;
-            let rgba = &source[source_offset..source_offset + 4];
-            let bgra = &mut destination[destination_offset..destination_offset + 4];
-            bgra[0] = transform_color_channel(rgba[2], constants.multiply[2], constants.add[2]);
-            bgra[1] = transform_color_channel(rgba[1], constants.multiply[1], constants.add[1]);
-            bgra[2] = transform_color_channel(rgba[0], constants.multiply[0], constants.add[0]);
-            bgra[3] = transform_color_channel(rgba[3], constants.multiply[3], constants.add[3]);
+    let blocks_per_row = width.div_ceil(128);
+    for block_y in 0..height.div_ceil(128) {
+        let block_height = (height - block_y * 128).min(128);
+        for block_x in 0..blocks_per_row {
+            let block_width = (width - block_x * 128).min(128);
+            let block_base = (block_y * blocks_per_row + block_x) * 65_536;
+            let offsets = mode27_block_byte_offsets(block_x, block_y);
+            for local_y in 0..block_height {
+                let destination_row = ((block_y * 128 + local_y) * width + block_x * 128) * 4;
+                let offset_row = local_y * 128;
+                for local_x in 0..block_width {
+                    let source_offset = block_base + usize::from(offsets[offset_row + local_x]);
+                    let destination_offset = destination_row + local_x * 4;
+                    let rgba = &source[source_offset..source_offset + 4];
+                    let bgra = &mut destination[destination_offset..destination_offset + 4];
+                    bgra[0] =
+                        transform_color_channel(rgba[2], constants.multiply[2], constants.add[2]);
+                    bgra[1] =
+                        transform_color_channel(rgba[1], constants.multiply[1], constants.add[1]);
+                    bgra[2] =
+                        transform_color_channel(rgba[0], constants.multiply[0], constants.add[0]);
+                    bgra[3] =
+                        transform_color_channel(rgba[3], constants.multiply[3], constants.add[3]);
+                }
+            }
         }
     }
 }
@@ -2778,7 +2901,8 @@ mod tests {
         blit_guest_texture_bytes, convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra,
         decode_image_descriptor, decode_scissor, decode_viewport, effective_linear_rgba_pitch,
         execute_dreaming_fill_draw, metal_nonindexed_vertex_count, mode27_source_byte_offset,
-        read_draw_indices, transform_sprite_position,
+        mode27_within_block_byte_offset, read_draw_indices, snapshot_guest_texture_rgba,
+        transform_sprite_position, write_guest_texture_rgba,
     };
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
@@ -3054,6 +3178,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mode27_lookup_matches_the_scalar_address_equation_across_blocks() {
+        let width = 385_usize;
+        for y in 0..257 {
+            for x in 0..width {
+                let expected = (y / 128 * width.div_ceil(128) + x / 128) * 65_536
+                    + mode27_within_block_byte_offset(x, y);
+                assert_eq!(mode27_source_byte_offset(x, y, width), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_mode27_guest_copy_round_trips_partial_and_parity_blocks() {
+        let width = 385_usize;
+        let height = 257_usize;
+        let mut tiled = vec![0_u8; width.div_ceil(128) * height.div_ceil(128) * 65_536];
+        let descriptor = GuestTextureDescriptor {
+            address: u64::try_from(tiled.as_mut_ptr() as usize).expect("test address fits u64"),
+            width: u32::try_from(width).expect("width fits u32"),
+            height: u32::try_from(height).expect("height fits u32"),
+            pitch: u32::try_from(width).expect("pitch fits u32"),
+            tile_mode: 27,
+        };
+        let mut linear = vec![0_u8; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * width + x) * 4;
+                linear[offset..offset + 4].copy_from_slice(&[
+                    u8::try_from(x & 0xff).expect("masked X fits u8"),
+                    u8::try_from(y & 0xff).expect("masked Y fits u8"),
+                    u8::try_from((x ^ y) & 0xff).expect("masked xor fits u8"),
+                    0xff,
+                ]);
+            }
+        }
+
+        write_guest_texture_rgba(descriptor, &linear).expect("mode 27 write succeeds");
+        assert_eq!(
+            snapshot_guest_texture_rgba(descriptor).expect("mode 27 snapshot succeeds"),
+            linear
+        );
     }
 
     #[test]
