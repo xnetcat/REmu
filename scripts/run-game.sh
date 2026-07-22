@@ -62,7 +62,8 @@ auto_cross=${REMU_AUTO_CROSS:-8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,
 auto_pad_sequence=${REMU_AUTO_PAD_SEQUENCE:-}
 # Capturing a 4K PPM writes roughly 32 MiB per image and fingerprints the full frame on the
 # presenter thread. Keep it explicit so ordinary game runs measure the emulator rather than the
-# diagnostic I/O path.
+# diagnostic I/O path. REMU_CAPTURE_DELAY_SECONDS and REMU_CAPTURE_MAX_FRAMES can bound a late
+# visual proof without slowing the entire boot.
 capture_frames=${REMU_CAPTURE_FRAMES:-0}
 
 # Apple documents these variables as the command-line equivalent of Xcode's Metal Performance

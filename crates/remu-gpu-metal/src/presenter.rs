@@ -182,6 +182,9 @@ struct MetalPresenter {
     open_guest_batch: Option<GuestCommandBatch>,
     committed_guest_batches: VecDeque<GuestCommandBatch>,
     capture_directory: Option<PathBuf>,
+    capture_started_at: Instant,
+    capture_delay: Duration,
+    capture_limit: usize,
     pressed_keys: HashSet<KeyCode>,
     shader_compile_sender: Sender<IndexedDraw>,
     shader_compile_receiver: Receiver<ShaderCompileResult>,
@@ -246,6 +249,9 @@ impl MetalPresenter {
             open_guest_batch: None,
             committed_guest_batches: VecDeque::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
+            capture_started_at: Instant::now(),
+            capture_delay: capture_delay_from_environment(),
+            capture_limit: capture_limit_from_environment(),
             pressed_keys: HashSet::new(),
             shader_compile_sender,
             shader_compile_receiver,
@@ -1194,7 +1200,7 @@ impl MetalPresenter {
         let is_display_target = self.display.is_some_and(|display| {
             target.width == display.width && target.height == display.height
         });
-        let capture_due = self.capture_directory.is_some()
+        let capture_due = self.capture_is_enabled()
             && (binding_trace
                 || (is_display_target
                     && self
@@ -1290,6 +1296,9 @@ impl MetalPresenter {
         let Some(directory) = self.capture_directory.as_deref() else {
             return;
         };
+        if !self.capture_is_enabled() {
+            return;
+        }
         if self
             .last_guest_capture
             .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
@@ -1304,7 +1313,7 @@ impl MetalPresenter {
             descriptor.tile_mode,
             fingerprint,
         );
-        if self.captured_guest_frames.len() >= 128
+        if self.captured_guest_frames.len() >= self.capture_limit
             || !self.captured_guest_frames.insert(captured_frame)
         {
             return;
@@ -1322,7 +1331,7 @@ impl MetalPresenter {
         rgba: &[u8],
         force: bool,
     ) {
-        if self.capture_directory.is_none()
+        if !self.capture_is_enabled()
             || (!force
                 && self
                     .last_guest_capture
@@ -1338,6 +1347,12 @@ impl MetalPresenter {
             destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
         }
         self.capture_guest_frame_if_changed(descriptor);
+    }
+
+    fn capture_is_enabled(&self) -> bool {
+        self.capture_directory.is_some()
+            && self.capture_started_at.elapsed() >= self.capture_delay
+            && self.captured_guest_frames.len() < self.capture_limit
     }
 
     fn update_keyboard_input(&mut self, code: KeyCode, state: ElementState) {
@@ -2519,6 +2534,21 @@ fn guest_frame_fingerprint(bytes: &[u8]) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &value| {
             (hash ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01b3)
         })
+}
+
+fn capture_delay_from_environment() -> Duration {
+    std::env::var("REMU_CAPTURE_DELAY_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(Duration::ZERO, Duration::from_secs)
+}
+
+fn capture_limit_from_environment() -> usize {
+    std::env::var("REMU_CAPTURE_MAX_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(128)
 }
 
 fn capture_guest_frame(
