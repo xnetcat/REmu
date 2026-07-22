@@ -40,6 +40,18 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_GPU_EVENTS_PER_TICK: usize = 8_192;
+const GPU_EVENT_COALESCE_THRESHOLD: usize = 128;
+
+fn latest_complete_frame_start(events: &[GpuEvent]) -> usize {
+    let mut flips = events
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, event)| matches!(event, GpuEvent::Flip { .. }).then_some(index));
+    let _latest_flip = flips.next();
+    flips.next().map_or(0, |previous_flip| previous_flip + 1)
+}
 
 #[derive(Clone, Copy)]
 struct DisplayConfiguration {
@@ -143,6 +155,7 @@ struct MetalPresenter {
     uploaded_flip_sequence: u64,
     startup_error: Option<String>,
     logged_unsupported_layout: bool,
+    logged_event_coalescing: bool,
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
     captured_guest_frames: HashSet<(u64, u32, u32, u32, u64)>,
     last_guest_capture: Option<Instant>,
@@ -204,6 +217,7 @@ impl MetalPresenter {
             uploaded_flip_sequence: 0,
             startup_error: None,
             logged_unsupported_layout: false,
+            logged_event_coalescing: false,
             logged_unsupported_guest_draws: HashSet::new(),
             captured_guest_frames: HashSet::new(),
             last_guest_capture: None,
@@ -268,78 +282,112 @@ impl MetalPresenter {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn receive_events(&mut self, event_loop: &ActiveEventLoop) {
         self.receive_shader_compilations();
         self.retire_completed_guest_batches();
-        // A bounded batch prevents a continuously producing guest from starving redraw and input
-        // delivery. The bounded sender applies backpressure until the next AppKit iteration.
-        for _ in 0..16 {
+        let mut events = Vec::with_capacity(GPU_EVENT_COALESCE_THRESHOLD);
+        for _ in 0..MAX_GPU_EVENTS_PER_TICK {
             match self.receiver.try_recv() {
-                Ok(GpuEvent::DisplayRegistered {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    events.push(GpuEvent::Shutdown);
+                    break;
+                }
+            }
+        }
+        let frame_start = if events.len() >= GPU_EVENT_COALESCE_THRESHOLD {
+            latest_complete_frame_start(&events)
+        } else {
+            0
+        };
+        if frame_start != 0 && !self.logged_event_coalescing {
+            self.logged_event_coalescing = true;
+            eprintln!(
+                "[REMu][METAL] skipped {frame_start} stale queued GPU events to catch the latest complete frame"
+            );
+        }
+        for (index, event) in events.into_iter().enumerate() {
+            if index < frame_start
+                && !matches!(
+                    &event,
+                    GpuEvent::DisplayRegistered { .. } | GpuEvent::Shutdown
+                )
+            {
+                continue;
+            }
+            if self.process_gpu_event(event, event_loop) {
+                return;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn process_gpu_event(&mut self, event: GpuEvent, event_loop: &ActiveEventLoop) -> bool {
+        match event {
+            GpuEvent::DisplayRegistered {
+                width,
+                height,
+                pitch,
+                pixel_format,
+                tiling_mode,
+                ..
+            } => {
+                self.display = Some(DisplayConfiguration {
                     width,
                     height,
                     pitch,
                     pixel_format,
                     tiling_mode,
-                    ..
-                }) => {
-                    self.display = Some(DisplayConfiguration {
-                        width,
-                        height,
-                        pitch,
-                        pixel_format,
-                        tiling_mode,
-                    });
-                    self.frame_texture = None;
-                    if let Some(layer) = self.layer.as_ref() {
-                        // Keep the drawable at guest resolution. Core Animation scales it into the
-                        // window while Metal performs a simple one-to-one copy.
-                        layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
-                    }
-                    eprintln!(
-                        "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode}"
-                    );
+                });
+                self.frame_texture = None;
+                if let Some(layer) = self.layer.as_ref() {
+                    // Keep the drawable at guest resolution. Core Animation scales it into the
+                    // window while Metal performs a simple one-to-one copy.
+                    layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
                 }
-                Ok(GpuEvent::Flip { address, .. }) => {
-                    self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
-                    self.pending_flip = Some(PendingFlip {
-                        address,
-                        sequence: self.next_flip_sequence,
-                    });
-                    self.redraw_pending = true;
+                eprintln!(
+                    "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode}"
+                );
+            }
+            GpuEvent::Flip { address, .. } => {
+                self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
+                self.pending_flip = Some(PendingFlip {
+                    address,
+                    sequence: self.next_flip_sequence,
+                });
+                self.redraw_pending = true;
+            }
+            GpuEvent::MemoryAcquire(acquire) => {
+                if let Err(error) = self.synchronize_cpu_written_guest_resources(acquire) {
+                    eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
                 }
-                Ok(GpuEvent::MemoryAcquire(acquire)) => {
-                    if let Err(error) = self.synchronize_cpu_written_guest_resources(acquire) {
-                        eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
-                    }
+            }
+            GpuEvent::IndexedDraw(draw) => {
+                let key = (draw.export_shader_address, draw.pixel_shader_address);
+                self.compile_draw_shaders(&draw);
+                if !self.compiled_shader_pairs.contains_key(&key)
+                    && self.compiling_shader_pairs.contains(&key)
+                {
+                    // Compilation is asynchronous so the AppKit event loop remains responsive.
+                    // Retain the latest draw for a new pair: static screens may submit only once,
+                    // and dropping that draw leaves the already-flipped buffer black.
+                    self.pending_shader_draws.insert(key, draw);
+                    return false;
                 }
-                Ok(GpuEvent::IndexedDraw(draw)) => {
-                    let key = (draw.export_shader_address, draw.pixel_shader_address);
-                    self.compile_draw_shaders(&draw);
-                    if !self.compiled_shader_pairs.contains_key(&key)
-                        && self.compiling_shader_pairs.contains(&key)
-                    {
-                        // Compilation is asynchronous so the AppKit event loop remains responsive.
-                        // Retain the latest draw for a new pair: static screens may submit only
-                        // once, and dropping that draw leaves the already-flipped buffer black.
-                        self.pending_shader_draws.insert(key, draw);
-                        continue;
-                    }
-                    if let Err(error) = self.execute_compiled_draw(&draw) {
-                        self.log_draw_execution_failure(&draw, &error);
-                    }
+                if let Err(error) = self.execute_compiled_draw(&draw) {
+                    self.log_draw_execution_failure(&draw, &error);
                 }
-                Ok(GpuEvent::Shutdown) | Err(TryRecvError::Disconnected) => {
-                    if let Err(error) = self.wait_for_guest_command_batches() {
-                        eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
-                    }
-                    event_loop.exit();
-                    return;
+            }
+            GpuEvent::Shutdown => {
+                if let Err(error) = self.wait_for_guest_command_batches() {
+                    eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
                 }
-                Err(TryRecvError::Empty) => return,
+                event_loop.exit();
+                return true;
             }
         }
+        false
     }
 
     fn compile_draw_shaders(&mut self, draw: &IndexedDraw) {
@@ -2596,16 +2644,40 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use remu_gpu::{GpuRegister, IndexedDraw};
+    use remu_gpu::{GpuEvent, GpuMemoryAcquire, GpuRegister, IndexedDraw};
 
     use super::{
         GuestTextureDescriptor, apply_image_destination_select, decode_image_descriptor,
         decode_scissor, decode_viewport, effective_linear_rgba_pitch,
-        guest_texture_descriptors_overlap, guest_texture_raw_matches,
+        guest_texture_descriptors_overlap, guest_texture_raw_matches, latest_complete_frame_start,
         metal_nonindexed_vertex_count, mode27_source_byte_offset, mode27_within_block_byte_offset,
         read_draw_indices, snapshot_guest_texture_raw, snapshot_guest_texture_rgba,
         write_guest_texture_rgba,
     };
+
+    fn flip(address: u64) -> GpuEvent {
+        GpuEvent::Flip {
+            address,
+            buffer_index: 0,
+            flip_argument: 0,
+        }
+    }
+
+    #[test]
+    fn queued_event_coalescing_retains_the_latest_complete_frame_and_open_tail() {
+        let acquire = GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+            engine: 0,
+            cb_db_control: 0,
+            base_address: 0,
+            size_bytes: 0,
+            poll_interval: 0,
+            gcr_control: 0,
+        });
+        let events = vec![acquire.clone(), flip(1), acquire.clone(), flip(2), acquire];
+
+        assert_eq!(latest_complete_frame_start(&events), 2);
+        assert_eq!(latest_complete_frame_start(&events[..2]), 0);
+    }
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
         IndexedDraw {
