@@ -4858,6 +4858,9 @@ fn agc_handle_submission_packet(
         register,
         &mut state.agc_graphics,
     );
+    if opcode == AGC_IT_NOP && register == AGC_R_ACQUIRE_MEM && length >= 8 {
+        remu_gpu::acquire_memory(decode_agc_memory_acquire(packet_address));
+    }
     if opcode == AGC_IT_INDEX_BASE && length >= 3 {
         state.agc_graphics.index_buffer_address = u64::from(read_guest_u32(packet_address + 4))
             | (u64::from(read_guest_u32(packet_address + 8)) << 32);
@@ -4903,6 +4906,22 @@ fn agc_handle_submission_packet(
         let flip_argument = u64::from(read_guest_u32(packet_address + 16))
             | (u64::from(read_guest_u32(packet_address + 20)) << 32);
         flips.push((handle, buffer_index, flip_argument));
+    }
+}
+
+fn decode_agc_memory_acquire(packet_address: u64) -> remu_gpu::GpuMemoryAcquire {
+    let coher_control = read_guest_u32(packet_address + 4);
+    let size_units = u64::from(read_guest_u32(packet_address + 8))
+        | (u64::from(read_guest_u32(packet_address + 12) & 0xff) << 32);
+    let base_units = u64::from(read_guest_u32(packet_address + 16))
+        | (u64::from(read_guest_u32(packet_address + 20) & 0x00ff_ffff) << 32);
+    remu_gpu::GpuMemoryAcquire {
+        engine: coher_control >> 31,
+        cb_db_control: coher_control & 0x7fff_ffff,
+        base_address: base_units << 8,
+        size_bytes: size_units << 8,
+        poll_interval: read_guest_u32(packet_address + 24) & 0xffff,
+        gcr_control: read_guest_u32(packet_address + 28) & 0x7_ffff,
     }
 }
 
@@ -8313,17 +8332,18 @@ mod platform_independent_tests {
         SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4,
         allocate_direct_memory, allocate_pthread_thread_object, create_pthread_attr,
-        destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
-        guest_clock_gettime, guest_free, guest_global_locale, guest_qsort, guest_tolower_table,
-        guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
-        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
-        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_detach_state,
-        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
-        read_guest_u64, resolve_guest_path, sanitize_save_segment, save_data_commit,
-        save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
-        save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
-        save_data_umount2, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
-        write_guest_u32, write_guest_u64, write_import_stub,
+        decode_agc_memory_acquire, destroy_pthread_attr, dispatch_guest_numeric_parser,
+        dispatch_probe_import, guest_clock_gettime, guest_free, guest_global_locale, guest_qsort,
+        guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy,
+        guest_wmemmove, kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query,
+        low_f32, low_u32, pthread_attr_get_affinity, pthread_attr_get_stack,
+        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        pthread_attr_set_stack_size, read_guest_u16, read_guest_u64, resolve_guest_path,
+        sanitize_save_segment, save_data_commit, save_data_create_transaction_resource,
+        save_data_dir_name_search, save_data_mount3, save_data_pattern_matches, save_data_prepare,
+        save_data_save_icon, save_data_set_param, save_data_umount2, sce_kernel_error,
+        system_service_param_get_int, take_exit_callbacks, write_guest_u32, write_guest_u64,
+        write_import_stub,
     };
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -9095,6 +9115,28 @@ mod platform_independent_tests {
         }
         assert_eq!(kernel_munmap([first, 0x4000, 0, 0, 0, 0], &mut state), 0);
         assert_eq!(kernel_munmap([second, 0x4000, 0, 0, 0, 0], &mut state), 0);
+    }
+
+    #[test]
+    fn decodes_gen5_memory_acquire_ranges_and_controls() {
+        let packet = [
+            agc_pm4(8, AGC_IT_NOP, super::AGC_R_ACQUIRE_MEM),
+            0x8000_1234,
+            0x3456_789a,
+            0x0000_00ab,
+            0x7654_3210,
+            0x0000_cdef,
+            0xabcd_2468,
+            0xfff5_4321,
+        ];
+        let decoded = decode_agc_memory_acquire(packet.as_ptr().addr() as u64);
+
+        assert_eq!(decoded.engine, 1);
+        assert_eq!(decoded.cb_db_control, 0x1234);
+        assert_eq!(decoded.base_address, 0x00cd_ef76_5432_1000);
+        assert_eq!(decoded.size_bytes, 0xab34_5678_9a00);
+        assert_eq!(decoded.poll_interval, 0x2468);
+        assert_eq!(decoded.gcr_control, 0x5_4321);
     }
 
     #[test]
