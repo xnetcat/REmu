@@ -11313,7 +11313,7 @@ mod platform_independent_tests {
             })],
             ..VideoOutState::default()
         };
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = remu_gpu::gpu_event_channel();
         remu_gpu::install_event_sink(sender);
 
         assert!(agc_submit_ordered_video_out_flip(
@@ -11407,7 +11407,7 @@ mod platform_independent_tests {
             dword_count: 5,
             flags: [0; 4],
         };
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = remu_gpu::gpu_event_channel();
         remu_gpu::install_event_sink(sender);
         let mut state = ProbeDispatchState {
             agc_shader_registry: shaders,

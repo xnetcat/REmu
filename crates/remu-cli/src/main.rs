@@ -498,9 +498,10 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
         .unwrap_or("eboot.bin")
         .to_owned();
     let game_root = module_report.app_root;
-    // Do not block the guest while it holds the import-dispatch lock. Explicit GPU ordering events
-    // still serialize cache invalidation with preceding and following translated work.
-    let (sender, receiver) = std::sync::mpsc::channel();
+    // Preserve command-stream order with bounded memory. If Metal is compiling a pipeline, the
+    // queue eventually applies backpressure to the guest instead of dropping work or growing
+    // without limit.
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_event_sink(sender.clone());
     let guest = std::thread::spawn(move || {
         let started = Instant::now();
