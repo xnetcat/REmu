@@ -1,7 +1,7 @@
 //! Guest-facing Gen5 AGC command-buffer construction ABI.
 //!
 //! The packet layouts in this module are the native Gen5 encodings used by the
-//! open-source KytyPS5 implementation.  Keeping construction and patching in one
+//! open-source `KytyPS5` implementation. Keeping construction and patching in one
 //! place is important: patch functions validate the packet opcode they mutate,
 //! and every `GetSize` result is tied to the corresponding encoder.
 
@@ -68,6 +68,7 @@ enum IndirectRegisterKind {
     UserConfig,
 }
 
+#[derive(Clone, Copy)]
 struct WaitRegMemArguments {
     command_buffer: u64,
     size: u32,
@@ -92,9 +93,10 @@ impl IndirectRegisterKind {
 
 /// Dispatch one stateless Gen5 AGC command-construction import.
 ///
-/// `arguments` contains the six SysV integer-register arguments and
+/// `arguments` contains the six `SysV` integer-register arguments and
 /// `stack_arguments` starts with the seventh argument. The return is `None`
 /// only when `nid` is outside this coherent ABI cohort.
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 pub(crate) fn dispatch_agc_command_abi(
     nid: &str,
     arguments: [u64; 6],
@@ -229,7 +231,8 @@ pub(crate) fn dispatch_agc_command_abi(
 }
 
 fn low_u32(value: u64) -> u32 {
-    value as u32
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn low_u16(value: u64) -> u32 {
@@ -248,7 +251,7 @@ fn pm4(length_dwords: u32, opcode: u32, register: u32) -> u32 {
 }
 
 fn packet_opcode(command: u64) -> Option<u32> {
-    (command != 0 && command & 3 == 0).then(|| (read_u32(command) >> 8) & 0xff)
+    (command != 0 && command.is_multiple_of(4)).then(|| (read_u32(command) >> 8) & 0xff)
 }
 
 fn packet_register(command: u64) -> u32 {
@@ -294,6 +297,8 @@ fn write_words(address: u64, words: &[u32]) {
     }
 }
 
+type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
+
 fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
     if command_buffer == 0 || command_buffer & 7 != 0 || dword_count == 0 {
         return None;
@@ -308,9 +313,9 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
         }
         let requested = dword_count.checked_add(reserved)?;
         let user_data = read_u64(command_buffer + COMMAND_BUFFER_USER_DATA_OFFSET);
-        type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
+        let callback = usize::try_from(callback).ok()?;
         // SAFETY: this field is the guest-provided SysV command-buffer growth callback.
-        let callback: GrowCallback = unsafe { std::mem::transmute(callback as usize) };
+        let callback: GrowCallback = unsafe { std::mem::transmute(callback) };
         // SAFETY: the callback ABI and arguments are defined by the Gen5 CommandBuffer layout.
         if !unsafe { callback(command_buffer, requested, user_data) } {
             return None;
@@ -329,8 +334,8 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
 
 fn has_capacity(cursor_up: u64, cursor_down: u64, reserved: u32, needed: u32) -> bool {
     cursor_up != 0
-        && cursor_up & 3 == 0
-        && cursor_down & 3 == 0
+        && cursor_up.is_multiple_of(4)
+        && cursor_down.is_multiple_of(4)
         && cursor_down > cursor_up
         && cursor_down
             .checked_sub(cursor_up)
@@ -1553,17 +1558,17 @@ fn wait_kind(command: u64) -> Option<(u64, u64, u64)> {
 fn patch_wait_address(arguments: [u64; 6]) -> u64 {
     let command = arguments[0];
     let address = arguments[1];
-    let alignment = if is_packet(command, IT_NOP, Some(R_WAIT_MEM_32)) {
+    let alignment: u32 = if is_packet(command, IT_NOP, Some(R_WAIT_MEM_32)) {
         4
     } else if is_packet(command, IT_NOP, Some(R_WAIT_MEM_64)) {
         8
     } else {
         return GRAPHICS5_ERROR_INVALID_PACKET;
     };
-    if address == 0 || address & (alignment - 1) != 0 || address >> 50 != 0 {
+    if address == 0 || address & u64::from(alignment - 1) != 0 || address >> 50 != 0 {
         return GRAPHICS5_ERROR_INVALID_PACKET;
     }
-    write_u32(command + 4, low_u32(address) & !(alignment as u32 - 1));
+    write_u32(command + 4, low_u32(address) & !(alignment - 1));
     write_u32(command + 8, low_u32(address >> 32) & 0x3_ffff);
     0
 }
@@ -1913,7 +1918,7 @@ mod tests {
         assert_eq!(call("T9fjQIINoeE", args(&[command, 3]), [0; 6]), 0);
         assert_eq!(call("0fWWK5uG9rQ", args(&[command, 0x2000]), [0; 6]), 0);
         assert_eq!(
-            call("MlEw1feXcjg", args(&[command, 2, 1, 0xabcdef]), [0; 6]),
+            call("MlEw1feXcjg", args(&[command, 2, 1, 0x00ab_cdef]), [0; 6]),
             0
         );
         assert_eq!(fixture.words[1] & 0x00ff_f000, 0x0045_6000);
