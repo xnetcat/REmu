@@ -4672,7 +4672,6 @@ fn evaluate_shader_snapshot(
     // VM for every statically discovered branch made a single sprite draw take minutes under
     // Rosetta. Images are captured separately from their exact descriptors, and generated Metal
     // buffer loads already return zero outside this bounded snapshot.
-    const MAX_DRAW_BINDING_SNAPSHOT_BYTES: usize = 1024 * 1024;
     let state = remu_shader::build_shader_state(
         Arc::clone(&snapshot.program),
         snapshot.metadata.clone(),
@@ -4691,11 +4690,26 @@ fn evaluate_shader_snapshot(
         &ProcessGuestMemory,
         &state,
         remu_shader::EvaluationOptions {
-            maximum_binding_bytes: MAX_DRAW_BINDING_SNAPSHOT_BYTES,
+            maximum_binding_bytes: max_draw_binding_snapshot_bytes(),
             ..remu_shader::EvaluationOptions::default()
         },
     )
     .map_err(|error| format!("evaluation-error({error})"))
+}
+
+fn max_draw_binding_snapshot_bytes() -> usize {
+    const DEFAULT_BYTES: usize = 1024 * 1024;
+    const MINIMUM_BYTES: usize = 4 * 1024;
+    const MAXIMUM_BYTES: usize = 16 * 1024 * 1024;
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("REMU_MAX_DRAW_BINDING_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(DEFAULT_BYTES, |value| {
+                value.clamp(MINIMUM_BYTES, MAXIMUM_BYTES)
+            })
+    })
 }
 
 fn trace_msl_pair(draw: &remu_gpu::IndexedDraw, export_user_data_base: u32) -> String {
