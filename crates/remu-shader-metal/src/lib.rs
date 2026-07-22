@@ -789,6 +789,116 @@ impl<'a> Compiler<'a> {
         let destination = destination_vector(instruction)?;
         let expression = match name {
             "VMovB32" => self.raw_source(instruction, 0)?,
+            "VAddF32" => self.float_result(
+                instruction,
+                &format!(
+                    "{} + {}",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?
+                ),
+            ),
+            "VSubF32" => self.float_result(
+                instruction,
+                &format!(
+                    "{} - {}",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?
+                ),
+            ),
+            "VSubrevF32" => self.float_result(
+                instruction,
+                &format!(
+                    "{} - {}",
+                    self.float_source(instruction, 1)?,
+                    self.float_source(instruction, 0)?
+                ),
+            ),
+            "VMulF32" => self.float_result(
+                instruction,
+                &format!(
+                    "{} * {}",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?
+                ),
+            ),
+            "VMinF32" => self.float_result(
+                instruction,
+                &format!(
+                    "fmin({}, {})",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?
+                ),
+            ),
+            "VMaxF32" => self.float_result(
+                instruction,
+                &format!(
+                    "fmax({}, {})",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?
+                ),
+            ),
+            "VFmacF32" | "VMacF32" => self.float_result(
+                instruction,
+                &format!(
+                    "fma({}, {}, as_type<float>(v[{destination}]))",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?
+                ),
+            ),
+            "VFloorF32" => self.float_result(
+                instruction,
+                &format!("floor({})", self.float_source(instruction, 0)?),
+            ),
+            "VCeilF32" => self.float_result(
+                instruction,
+                &format!("ceil({})", self.float_source(instruction, 0)?),
+            ),
+            "VTruncF32" => self.float_result(
+                instruction,
+                &format!("trunc({})", self.float_source(instruction, 0)?),
+            ),
+            "VRndneF32" => self.float_result(
+                instruction,
+                &format!("rint({})", self.float_source(instruction, 0)?),
+            ),
+            "VFractF32" => self.float_result(
+                instruction,
+                &format!("fract({})", self.float_source(instruction, 0)?),
+            ),
+            "VSqrtF32" => self.float_result(
+                instruction,
+                &format!("sqrt({})", self.float_source(instruction, 0)?),
+            ),
+            "VRsqF32" => self.float_result(
+                instruction,
+                &format!("rsqrt({})", self.float_source(instruction, 0)?),
+            ),
+            "VRcpF32" | "VRcpIflagF32" => self.float_result(
+                instruction,
+                &format!("1.0f / {}", self.float_source(instruction, 0)?),
+            ),
+            "VLogF32" => self.float_result(
+                instruction,
+                &format!("log2({})", self.float_source(instruction, 0)?),
+            ),
+            "VExpF32" => self.float_result(
+                instruction,
+                &format!("exp2({})", self.float_source(instruction, 0)?),
+            ),
+            "VSinF32" => self.float_result(
+                instruction,
+                &format!(
+                    "sin({} * 6.28318530717958647692f)",
+                    self.float_source(instruction, 0)?
+                ),
+            ),
+            "VCosF32" => self.float_result(
+                instruction,
+                &format!(
+                    "cos({} * 6.28318530717958647692f)",
+                    self.float_source(instruction, 0)?
+                ),
+            ),
             "VAndB32" => format!(
                 "({} & {})",
                 self.raw_source(instruction, 0)?,
@@ -1788,5 +1898,61 @@ mod tests {
         )
         .expect_err("raw opcode must fail");
         assert!(error.to_string().contains("raw opcode"));
+    }
+
+    #[test]
+    fn lowers_common_gen5_float_arithmetic_with_destination_accumulation() {
+        let instruction = |pc, encoding, name, sources: Vec<Operand>, destination| Instruction {
+            pc,
+            encoding,
+            opcode: Opcode::Known(name),
+            words: vec![0],
+            sources,
+            destinations: vec![Operand::vector(destination)],
+            control: None,
+        };
+        let program = Program::new(
+            0x1000,
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Vop2,
+                    "VMulF32",
+                    vec![Operand::vector(1), Operand::vector(2)],
+                    0,
+                ),
+                instruction(
+                    4,
+                    ShaderEncoding::Vop2,
+                    "VMacF32",
+                    vec![Operand::vector(3), Operand::vector(4)],
+                    0,
+                ),
+                instruction(
+                    8,
+                    ShaderEncoding::Vop1,
+                    "VRcpF32",
+                    vec![Operand::vector(0)],
+                    5,
+                ),
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::vertex(0),
+        )
+        .expect("common float ALU should lower");
+        assert!(
+            shader
+                .source
+                .contains("as_type<float>(v[1]) * as_type<float>(v[2])")
+        );
+        assert!(
+            shader
+                .source
+                .contains("fma(as_type<float>(v[3]), as_type<float>(v[4]), as_type<float>(v[0]))")
+        );
+        assert!(shader.source.contains("1.0f / as_type<float>(v[0])"));
     }
 }
