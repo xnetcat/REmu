@@ -323,6 +323,7 @@ struct DecodedRenderTarget {
 struct DirectScanoutTexture {
     descriptor: GuestTextureDescriptor,
     texture: Texture,
+    initialized: bool,
 }
 
 struct CompiledShaderPair {
@@ -1106,9 +1107,22 @@ impl MetalPresenter {
             DirectScanoutTexture {
                 descriptor,
                 texture: texture.clone(),
+                initialized: false,
             },
         );
         texture
+    }
+
+    fn direct_scanout_needs_initial_clear(&self, address: u64) -> bool {
+        self.direct_scanout_textures
+            .get(&address)
+            .is_none_or(|scanout| !scanout.initialized)
+    }
+
+    fn mark_direct_scanout_initialized(&mut self, address: u64) {
+        if let Some(scanout) = self.direct_scanout_textures.get_mut(&address) {
+            scanout.initialized = true;
+        }
     }
 
     fn synchronize_cpu_written_guest_resources(
@@ -1602,10 +1616,15 @@ impl MetalPresenter {
             .ok_or("Metal command queue is unavailable")?
             .clone();
         let mut target_textures = Vec::with_capacity(targets.len());
+        let mut clear_uninitialized_targets = Vec::with_capacity(targets.len());
         for target in &targets {
             let texture = if target.direct_scanout {
-                self.ensure_direct_scanout_texture(&device, target.texture)
+                let texture = self.ensure_direct_scanout_texture(&device, target.texture);
+                clear_uninitialized_targets
+                    .push(self.direct_scanout_needs_initial_clear(target.texture.address));
+                texture
             } else {
+                clear_uninitialized_targets.push(false);
                 self.ensure_resident_texture(&device, target.texture)
                     .map_err(|error| {
                         format!(
@@ -1677,13 +1696,17 @@ impl MetalPresenter {
         let pixel_sampler_buffer_index = compiled.pixel.bindings.sampler_argument_buffer_index;
 
         let pass = RenderPassDescriptor::new();
-        for (location, (texture, target)) in target_textures.iter().zip(&targets).enumerate() {
+        for (location, (texture, clear_uninitialized)) in target_textures
+            .iter()
+            .zip(&clear_uninitialized_targets)
+            .enumerate()
+        {
             let attachment = pass
                 .color_attachments()
                 .object_at(u64::try_from(location).map_err(|_| "color location overflow")?)
                 .ok_or_else(|| format!("Metal render pass has no color attachment {location}"))?;
             attachment.set_texture(Some(texture));
-            if target.direct_scanout {
+            if *clear_uninitialized {
                 attachment.set_load_action(MTLLoadAction::Clear);
                 attachment.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
             } else {
@@ -1822,7 +1845,9 @@ impl MetalPresenter {
         }
 
         for target in &targets {
-            if !target.direct_scanout {
+            if target.direct_scanout {
+                self.mark_direct_scanout_initialized(target.texture.address);
+            } else {
                 self.mark_resident_texture_written(target.texture);
             }
         }
@@ -4868,6 +4893,15 @@ mod tests {
         };
 
         let texture = presenter.ensure_direct_scanout_texture(&device, descriptor);
+        assert!(presenter.direct_scanout_needs_initial_clear(descriptor.address));
+        presenter.mark_direct_scanout_initialized(descriptor.address);
+        assert!(!presenter.direct_scanout_needs_initial_clear(descriptor.address));
+        let reused = presenter.ensure_direct_scanout_texture(&device, descriptor);
+        assert_eq!(
+            (reused.width(), reused.height()),
+            (texture.width(), texture.height())
+        );
+        assert!(!presenter.direct_scanout_needs_initial_clear(descriptor.address));
         presenter.next_flip_sequence = 1;
 
         assert!(

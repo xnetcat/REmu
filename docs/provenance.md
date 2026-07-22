@@ -137,6 +137,11 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   Metal documentation for `MTLStorageMode`, `MTLBlitCommandEncoder`, `MTLCommandBuffer`,
   `MTLTexture.getBytes`, load/store actions, and the published Metal feature limits. They were also
   checked against the corresponding public framework headers in the installed macOS SDK.
+- Direct-scanout attachment lifetime follows Apple's public `MTLLoadAction` and render-pass
+  attachment documentation: `Clear` writes every attachment pixel at pass start, while `Load`
+  preserves the existing contents. REmu therefore clears a newly allocated host-only scanout
+  texture exactly once, then loads it for each later translated draw so separate Metal passes do
+  not erase earlier guest draws. No upstream emulator implementation was copied for this policy.
 - REmu independently implements a checked readback ticket: a backed single-sample texture is blitted
   into an aligned shared buffer on the producing command queue, the source and staging resources are
   retained through command-buffer completion, and padding is removed into the exact native pixel
