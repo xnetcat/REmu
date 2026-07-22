@@ -1207,6 +1207,7 @@ fn compile_metal_libraries(
     }
 
     let compile_options = CompileOptions::new();
+    compile_options.set_fast_math_enabled(false);
     let vertex = device
         .new_library_with_source(vertex_source, &compile_options)
         .map_err(|error| format!("Metal vertex compilation: {error}"))?;
@@ -1251,6 +1252,7 @@ fn compile_metal_libraries_with_tools(
     run_metal_tool(
         Command::new(&compiler)
             .current_dir(&directory.0)
+            .arg("-fmetal-math-mode=safe")
             .arg("-c")
             .arg(&vertex_path)
             .arg("-o")
@@ -1260,6 +1262,7 @@ fn compile_metal_libraries_with_tools(
     run_metal_tool(
         Command::new(&compiler)
             .current_dir(&directory.0)
+            .arg("-fmetal-math-mode=safe")
             .arg("-c")
             .arg(&pixel_path)
             .arg("-o")
