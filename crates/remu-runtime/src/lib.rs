@@ -5136,18 +5136,29 @@ fn agc_submit_ordered_video_out_flip(
         let export_slots = (0..AGC_COLOR_TARGET_COUNT)
             .filter(|slot| (export_masks >> (slot * 4)) & 0xf != 0)
             .collect::<Vec<_>>();
-        if let Some(target) = target.filter(|target| export_slots.as_slice() == [target.slot]) {
-            draw.scanout_target = Some(target);
+        if let [export_slot] = export_slots.as_slice() {
+            draw.scanout_target = Some(remu_gpu::GpuScanoutTarget {
+                address: display_address,
+                width: attributes.width,
+                height: attributes.height,
+                pitch: attributes.pitch,
+                pixel_format: attributes.pixel_format,
+                tiling_mode: attributes.tiling_mode,
+                export_slot: *export_slot,
+                write_mask: (export_masks >> (*export_slot * 4)) & 0xf,
+                color_surface: target,
+            });
             if draw.sequence <= 8 {
                 eprintln!(
-                    "[REMu][AGC] resolved targetless draw={} against scanout target={display_address:#x}",
-                    draw.sequence
+                    "[REMu][AGC] resolved targetless draw={} against scanout target={display_address:#x} programmed_surface={}",
+                    draw.sequence,
+                    target.is_some(),
                 );
             }
             remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(draw));
         } else if draw.sequence <= 8 {
             eprintln!(
-                "[REMu][AGC] discarded targetless draw={}: flip target {display_address:#x} has no matching programmed surface/export (exports={export_slots:?})",
+                "[REMu][AGC] discarded targetless draw={}: flip target {display_address:#x} has ambiguous pixel exports {export_slots:?}",
                 draw.sequence,
             );
         }
@@ -11295,7 +11306,20 @@ mod platform_independent_tests {
         else {
             panic!("draw must precede flip");
         };
-        assert_eq!(draw.scanout_target, Some(target));
+        assert_eq!(
+            draw.scanout_target,
+            Some(remu_gpu::GpuScanoutTarget {
+                address,
+                width: 1_280,
+                height: 720,
+                pitch: 1_280,
+                pixel_format: 0x8000_0000_2200_0000,
+                tiling_mode: 0,
+                export_slot: 0,
+                write_mask: 0xf,
+                color_surface: Some(target),
+            })
+        );
         let remu_gpu::GpuEvent::Flip {
             address: flipped_address,
             width,

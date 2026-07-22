@@ -128,6 +128,22 @@ pub struct GpuColorTarget {
     pub attrib3: u32,
 }
 
+/// A display attachment named explicitly by a following `VideoOut` flip. `color_surface` retains
+/// exact prior GFX10 surface state when one exists; otherwise the backend renders directly to a
+/// host scanout image using the registered display format without fabricating guest registers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuScanoutTarget {
+    pub address: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub pixel_format: u64,
+    pub tiling_mode: u32,
+    pub export_slot: u32,
+    pub write_mask: u32,
+    pub color_surface: Option<GpuColorTarget>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedDraw {
     pub sequence: u64,
@@ -150,7 +166,7 @@ pub struct IndexedDraw {
     pub export_shader_evaluation: Option<Arc<ShaderEvaluation>>,
     pub pixel_shader_evaluation: Option<Arc<ShaderEvaluation>>,
     pub color_target_address: u64,
-    pub scanout_target: Option<GpuColorTarget>,
+    pub scanout_target: Option<GpuScanoutTarget>,
     pub context_registers: Vec<GpuRegister>,
     pub shader_registers: Vec<GpuRegister>,
     pub user_config_registers: Vec<GpuRegister>,

@@ -25,7 +25,7 @@ use metal::{
 use objc::runtime::{Object, YES};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{
-    ComputeDispatch, ComputeGrid, GpuColorTarget, GpuEvent, GpuMemoryAcquire, GpuRegister,
+    ComputeDispatch, ComputeGrid, GpuEvent, GpuMemoryAcquire, GpuRegister, GpuScanoutTarget,
     HostPadState, IndexedDraw, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
     PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2,
     PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
@@ -172,6 +172,12 @@ struct DecodedRenderTarget {
     texture: GuestTextureDescriptor,
     output_kind: PixelOutputKind,
     write_mask: u32,
+    direct_scanout: bool,
+}
+
+struct DirectScanoutTexture {
+    descriptor: GuestTextureDescriptor,
+    texture: Texture,
 }
 
 struct CompiledShaderPair {
@@ -386,6 +392,7 @@ struct MetalPresenter {
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
     resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    direct_scanout_textures: HashMap<u64, DirectScanoutTexture>,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     resident_content_version: u64,
     open_guest_batch: Option<GuestCommandBatch>,
@@ -454,6 +461,7 @@ impl MetalPresenter {
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),
             resident_guest_textures: HashMap::new(),
+            direct_scanout_textures: HashMap::new(),
             sampled_texture_cache: HashMap::new(),
             resident_content_version: 0,
             open_guest_batch: None,
@@ -563,10 +571,20 @@ impl MetalPresenter {
                         pixel_format,
                         tiling_mode,
                     });
-                    if let Err(error) = self.synchronize_flip_target(address) {
-                        eprintln!("[REMu][METAL] flip synchronization failed: {error}");
-                    }
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
+                    match self.activate_direct_scanout(address, width, height) {
+                        Ok(true) => {
+                            self.uploaded_flip_sequence = self.next_flip_sequence;
+                        }
+                        Ok(false) => {
+                            if let Err(error) = self.synchronize_flip_target(address) {
+                                eprintln!("[REMu][METAL] flip synchronization failed: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("[REMu][METAL] direct scanout synchronization failed: {error}");
+                        }
+                    }
                     self.pending_flip = Some(PendingFlip {
                         address,
                         sequence: self.next_flip_sequence,
@@ -814,6 +832,34 @@ impl MetalPresenter {
         ensure_resident_texture_in_map(device, descriptor, &mut self.resident_guest_textures)
     }
 
+    fn ensure_direct_scanout_texture(
+        &mut self,
+        device: &Device,
+        descriptor: GuestTextureDescriptor,
+    ) -> Texture {
+        if let Some(scanout) = self.direct_scanout_textures.get(&descriptor.address)
+            && scanout.descriptor == descriptor
+        {
+            return scanout.texture.clone();
+        }
+        let metal_descriptor = TextureDescriptor::new();
+        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_pixel_format(descriptor.pixel_format);
+        metal_descriptor.set_width(u64::from(descriptor.width));
+        metal_descriptor.set_height(u64::from(descriptor.height));
+        metal_descriptor.set_storage_mode(MTLStorageMode::Private);
+        metal_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&metal_descriptor);
+        self.direct_scanout_textures.insert(
+            descriptor.address,
+            DirectScanoutTexture {
+                descriptor,
+                texture: texture.clone(),
+            },
+        );
+        texture
+    }
+
     fn synchronize_cpu_written_guest_resources(
         &mut self,
         acquire: GpuMemoryAcquire,
@@ -1025,6 +1071,34 @@ impl MetalPresenter {
         rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
         resident.gpu_written = false;
         Ok(())
+    }
+
+    fn activate_direct_scanout(
+        &mut self,
+        address: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<bool, String> {
+        let Some((descriptor, texture)) = self
+            .direct_scanout_textures
+            .get(&address)
+            .filter(|scanout| {
+                scanout.descriptor.width == width && scanout.descriptor.height == height
+            })
+            .map(|scanout| (scanout.descriptor, scanout.texture.clone()))
+        else {
+            return Ok(false);
+        };
+        self.wait_for_guest_command_batches()?;
+        self.frame_texture = Some(texture);
+        self.frame_texture_size = (descriptor.width, descriptor.height);
+        if self.next_flip_sequence == 1 {
+            eprintln!(
+                "[REMu][METAL] presenting translated direct scanout at {address:#x} {}x{}",
+                descriptor.width, descriptor.height
+            );
+        }
+        Ok(true)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1258,14 +1332,17 @@ impl MetalPresenter {
             .clone();
         let mut target_textures = Vec::with_capacity(targets.len());
         for target in &targets {
-            let texture = self
-                .ensure_resident_texture(&device, target.texture)
-                .map_err(|error| {
-                    format!(
-                        "render target {} guest memory is unreadable: {error}",
-                        target.guest_slot
-                    )
-                })?;
+            let texture = if target.direct_scanout {
+                self.ensure_direct_scanout_texture(&device, target.texture)
+            } else {
+                self.ensure_resident_texture(&device, target.texture)
+                    .map_err(|error| {
+                        format!(
+                            "render target {} guest memory is unreadable: {error}",
+                            target.guest_slot
+                        )
+                    })?
+            };
             target_textures.push(texture);
         }
 
@@ -1329,13 +1406,18 @@ impl MetalPresenter {
         let pixel_sampler_buffer_index = compiled.pixel.bindings.sampler_argument_buffer_index;
 
         let pass = RenderPassDescriptor::new();
-        for (location, texture) in target_textures.iter().enumerate() {
+        for (location, (texture, target)) in target_textures.iter().zip(&targets).enumerate() {
             let attachment = pass
                 .color_attachments()
                 .object_at(u64::try_from(location).map_err(|_| "color location overflow")?)
                 .ok_or_else(|| format!("Metal render pass has no color attachment {location}"))?;
             attachment.set_texture(Some(texture));
-            attachment.set_load_action(MTLLoadAction::Load);
+            if target.direct_scanout {
+                attachment.set_load_action(MTLLoadAction::Clear);
+                attachment.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+            } else {
+                attachment.set_load_action(MTLLoadAction::Load);
+            }
             attachment.set_store_action(MTLStoreAction::Store);
         }
         if self.open_guest_batch.is_none() {
@@ -1469,7 +1551,9 @@ impl MetalPresenter {
         }
 
         for target in &targets {
-            self.mark_resident_texture_written(target.texture);
+            if !target.direct_scanout {
+                self.mark_resident_texture_written(target.texture);
+            }
         }
         for texture in export_textures.iter().chain(&pixel_textures) {
             if texture.writable {
@@ -3027,6 +3111,7 @@ fn decode_render_target_state(
         },
         output_kind: format.output_kind,
         write_mask,
+        direct_scanout: false,
     })
 }
 
@@ -3037,32 +3122,108 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
         .ok_or("draw has no decoded pixel shader")?;
     let export_masks = pixel.program.pixel_color_export_masks();
     if let Some(target) = draw.scanout_target {
-        let shader_write_mask = (export_masks >> (target.slot * 4)) & 0xf;
-        if shader_write_mask == 0 {
+        let shader_write_mask = (export_masks >> (target.export_slot * 4)) & 0xf;
+        if shader_write_mask == 0 || shader_write_mask & target.write_mask == 0 {
             return Err(format!(
                 "scanout target slot {} has no matching pixel export ({export_masks:#010x})",
-                target.slot
+                target.export_slot
             ));
         }
-        return decode_scanout_target(target, shader_write_mask).map(|target| vec![target]);
+        return decode_scanout_target(target).map(|target| vec![target]);
     }
     decode_render_targets_from_registers(&draw.context_registers, export_masks)
 }
 
 fn decode_scanout_target(
-    target: GpuColorTarget,
-    write_mask: u32,
+    target: GpuScanoutTarget,
 ) -> Result<DecodedRenderTarget, String> {
-    decode_render_target_state(
-        target.slot,
-        target.address,
-        target.view,
-        target.info,
-        target.attrib,
-        target.attrib2,
-        target.attrib3,
-        write_mask,
-    )
+    if let Some(surface) = target.color_surface {
+        let mut decoded = decode_render_target_state(
+            target.export_slot,
+            surface.address,
+            surface.view,
+            surface.info,
+            surface.attrib,
+            surface.attrib2,
+            surface.attrib3,
+            target.write_mask,
+        )?;
+        if decoded.texture.address != target.address
+            || decoded.texture.width != target.width
+            || decoded.texture.height != target.height
+        {
+            return Err("programmed scanout surface disagrees with VideoOut registration".to_owned());
+        }
+        decoded.guest_slot = target.export_slot;
+        return Ok(decoded);
+    }
+    let (pixel_format, bytes_per_pixel) = decode_video_out_pixel_format(target.pixel_format)?;
+    if target.address < 0x10_000
+        || target.width == 0
+        || target.height == 0
+        || target.width > 16_384
+        || target.height > 16_384
+        || target.pitch < target.width
+    {
+        return Err(format!(
+            "invalid direct scanout address={:#x} extent={}x{} pitch={}",
+            target.address, target.width, target.height, target.pitch
+        ));
+    }
+    Ok(DecodedRenderTarget {
+        guest_slot: target.export_slot,
+        texture: GuestTextureDescriptor {
+            address: target.address,
+            width: target.width,
+            height: target.height,
+            pitch: target.pitch,
+            tile_mode: 0,
+            pixel_format,
+            bytes_per_pixel,
+        },
+        output_kind: PixelOutputKind::Float,
+        write_mask: target.write_mask,
+        direct_scanout: true,
+    })
+}
+
+fn decode_video_out_pixel_format(pixel_format: u64) -> Result<(MTLPixelFormat, u32), String> {
+    const A8_R8_G8_B8_SRGB: u64 = 0x8000_0000;
+    const A8_B8_G8_R8_SRGB: u64 = 0x8000_2200;
+    const A2_R10_G10_B10: u64 = 0x8806_0000;
+    const A2_R10_G10_B10_SRGB: u64 = 0x8800_0000;
+    const A2_R10_G10_B10_BT2020_PQ: u64 = 0x8874_0000;
+    const F2_R8_G8_B8_A8_SRGB: u64 = 0x8000_0000_2200_0000;
+    const F2_B8_G8_R8_A8_SRGB: u64 = 0x8000_0000_0000_0000;
+    const F2_R10_G10_B10_A2: u64 = 0x8100_0006_2200_0000;
+    const F2_B10_G10_R10_A2: u64 = 0x8100_0006_0000_0000;
+    const F2_R10_G10_B10_A2_SRGB: u64 = 0x8100_0000_2200_0000;
+    const F2_B10_G10_R10_A2_SRGB: u64 = 0x8100_0000_0000_0000;
+    const F2_R10_G10_B10_A2_BT2100_PQ: u64 = 0x8100_0704_2200_0000;
+    const F2_B10_G10_R10_A2_BT2100_PQ: u64 = 0x8100_0704_0000_0000;
+    let pixel_format = match pixel_format {
+        A8_R8_G8_B8_SRGB | A8_B8_G8_R8_SRGB | A2_R10_G10_B10
+        | A2_R10_G10_B10_SRGB | A2_R10_G10_B10_BT2020_PQ
+        | F2_R8_G8_B8_A8_SRGB | F2_B8_G8_R8_A8_SRGB | F2_R10_G10_B10_A2
+        | F2_B10_G10_R10_A2 | F2_R10_G10_B10_A2_SRGB | F2_B10_G10_R10_A2_SRGB
+        | F2_R10_G10_B10_A2_BT2100_PQ | F2_B10_G10_R10_A2_BT2100_PQ => pixel_format,
+        _ => {
+            return Err(format!(
+                "unsupported VideoOut pixel format {pixel_format:#018x}"
+            ));
+        }
+    };
+    let metal = match pixel_format {
+        A8_B8_G8_R8_SRGB | F2_R8_G8_B8_A8_SRGB => MTLPixelFormat::RGBA8Unorm_sRGB,
+        A8_R8_G8_B8_SRGB | F2_B8_G8_R8_A8_SRGB => MTLPixelFormat::BGRA8Unorm_sRGB,
+        F2_R10_G10_B10_A2 | F2_R10_G10_B10_A2_SRGB
+        | F2_R10_G10_B10_A2_BT2100_PQ => MTLPixelFormat::RGB10A2Unorm,
+        A2_R10_G10_B10 | A2_R10_G10_B10_SRGB | A2_R10_G10_B10_BT2020_PQ
+        | F2_B10_G10_R10_A2 | F2_B10_G10_R10_A2_SRGB
+        | F2_B10_G10_R10_A2_BT2100_PQ => MTLPixelFormat::BGR10A2Unorm,
+        _ => unreachable!("VideoOut format cohort was exhaustively matched"),
+    };
+    Ok((metal, 4))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3698,7 +3859,9 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use metal::{CompileOptions, Device, MTLPixelFormat, RenderPipelineDescriptor};
-    use remu_gpu::{ComputeGrid, ComputeLaunch, GpuColorTarget, GpuRegister, IndexedDraw};
+    use remu_gpu::{
+        ComputeGrid, ComputeLaunch, GpuColorTarget, GpuRegister, GpuScanoutTarget, IndexedDraw,
+    };
     use remu_shader::PixelOutputKind;
 
     use super::{
@@ -3890,7 +4053,7 @@ mod tests {
 
     #[test]
     fn decodes_explicit_scanout_target_without_fabricating_context_registers() {
-        let target = GpuColorTarget {
+        let surface = GpuColorTarget {
             slot: 0,
             address: 0x0070_1234_5600,
             view: 0,
@@ -3899,8 +4062,19 @@ mod tests {
             attrib2: ((3_840 - 1) << 14) | (2_160 - 1),
             attrib3: (27 << 14) | (1 << 24),
         };
+        let target = GpuScanoutTarget {
+            address: surface.address,
+            width: 3_840,
+            height: 2_160,
+            pitch: 3_840,
+            pixel_format: 0x8000_0000_2200_0000,
+            tiling_mode: 0,
+            export_slot: 0,
+            write_mask: 0xf,
+            color_surface: Some(surface),
+        };
 
-        let decoded = decode_scanout_target(target, 0xf).expect("valid scanout target");
+        let decoded = decode_scanout_target(target).expect("valid scanout target");
 
         assert_eq!(decoded.guest_slot, 0);
         assert_eq!(decoded.texture.address, target.address);
@@ -3908,6 +4082,55 @@ mod tests {
         assert_eq!(decoded.texture.tile_mode, 27);
         assert_eq!(decoded.texture.pixel_format, MTLPixelFormat::RGBA8Unorm);
         assert_eq!(decoded.write_mask, 0xf);
+        assert!(!decoded.direct_scanout);
+    }
+
+    #[test]
+    fn decodes_video_out_only_scanout_as_a_host_target() {
+        let target = GpuScanoutTarget {
+            address: 0x0070_1234_5600,
+            width: 3_840,
+            height: 2_160,
+            pitch: 3_840,
+            pixel_format: 0x8000_0000_2200_0000,
+            tiling_mode: 0,
+            export_slot: 0,
+            write_mask: 0xf,
+            color_surface: None,
+        };
+
+        let decoded = decode_scanout_target(target).expect("valid direct scanout target");
+
+        assert!(decoded.direct_scanout);
+        assert_eq!(decoded.texture.pixel_format, MTLPixelFormat::RGBA8Unorm_sRGB);
+        assert_eq!((decoded.texture.width, decoded.texture.height), (3_840, 2_160));
+    }
+
+    #[test]
+    fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = super::MetalPresenter::new(receiver).expect("Metal presenter state");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let descriptor = GuestTextureDescriptor {
+            address: 0x0070_1234_5600,
+            width: 640,
+            height: 360,
+            pitch: 640,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm_sRGB,
+            bytes_per_pixel: 4,
+        };
+
+        let texture = presenter.ensure_direct_scanout_texture(&device, descriptor);
+        presenter.next_flip_sequence = 1;
+
+        assert!(presenter
+            .activate_direct_scanout(descriptor.address, descriptor.width, descriptor.height)
+            .expect("activate direct scanout"));
+        assert_eq!(presenter.frame_texture_size, (640, 360));
+        let output_texture = presenter.frame_texture.as_ref().expect("presented texture");
+        assert_eq!(output_texture.width(), texture.width());
+        assert_eq!(output_texture.height(), texture.height());
     }
 
     #[test]
