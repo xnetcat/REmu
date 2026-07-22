@@ -797,13 +797,13 @@ impl MetalPresenter {
         target: GuestTextureDescriptor,
         export_evaluation: &ShaderEvaluation,
         pixel_evaluation: &ShaderEvaluation,
-    ) {
+    ) -> bool {
         let key = (draw.export_shader_address, draw.pixel_shader_address);
         let Some(traced_binding_pairs) = self.traced_binding_pairs.as_mut() else {
-            return;
+            return false;
         };
         if !traced_binding_pairs.insert(key) {
-            return;
+            return false;
         }
         let scissor = decode_scissor(draw, target.width, target.height);
         let viewport = scissor
@@ -819,6 +819,9 @@ impl MetalPresenter {
             draw.instance_count,
             draw.primitive_type,
         );
+        if let Some(indices) = draw.indexed.then(|| read_draw_indices(draw)).flatten() {
+            eprintln!("[REMu][METAL][BIND] indices={indices:?}");
+        }
         if let Ok(viewport) = viewport {
             eprintln!(
                 "[REMu][METAL][BIND] viewport=({}, {}) {}x{} depth={}..{}",
@@ -900,6 +903,7 @@ impl MetalPresenter {
                 }
             }
         }
+        true
     }
 
     #[allow(clippy::too_many_lines)]
@@ -933,7 +937,8 @@ impl MetalPresenter {
         let target_texture = self
             .ensure_resident_texture(&device, target)
             .map_err(|error| format!("render target guest memory is unreadable: {error}"))?;
-        self.trace_draw_bindings(draw, target, export_evaluation, pixel_evaluation);
+        let binding_trace =
+            self.trace_draw_bindings(draw, target, export_evaluation, pixel_evaluation);
 
         for evaluation in [export_evaluation, pixel_evaluation] {
             for binding in evaluation.image_bindings.iter().filter(|binding| {
@@ -1128,9 +1133,10 @@ impl MetalPresenter {
             }
         }
         let capture_due = self.capture_directory.is_some()
-            && self
-                .last_guest_capture
-                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
+            && (binding_trace
+                || self
+                    .last_guest_capture
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)));
         let batch_full = self
             .open_guest_batch
             .as_ref()
