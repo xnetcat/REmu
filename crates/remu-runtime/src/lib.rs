@@ -2408,7 +2408,6 @@ struct AgcGraphicsState {
     emitted_compute_dispatches: u64,
     traced_shader_pairs: BTreeSet<(u64, u64)>,
     known_color_targets: BTreeMap<u64, remu_gpu::GpuColorTarget>,
-    pending_targetless_draw: Option<Box<remu_gpu::IndexedDraw>>,
 }
 
 #[derive(Debug, Default)]
@@ -2430,7 +2429,6 @@ impl AgcGraphicsState {
         self.instance_count = 1;
         self.draw_index_offset = 0;
         self.compute_indirect_args_address = 0;
-        self.pending_targetless_draw = None;
     }
 }
 
@@ -4285,12 +4283,15 @@ const AGC_IT_CLEAR_STATE: u32 = 0x12;
 const AGC_IT_INDEX_BUFFER_SIZE: u32 = 0x13;
 const AGC_IT_DISPATCH_DIRECT: u32 = 0x15;
 const AGC_IT_DISPATCH_INDIRECT: u32 = 0x16;
+const AGC_IT_SET_PREDICATION: u32 = 0x20;
+const AGC_IT_COND_EXEC: u32 = 0x22;
 const AGC_IT_INDEX_BASE: u32 = 0x26;
 const AGC_IT_INDEX_TYPE: u32 = 0x2a;
 const AGC_IT_DRAW_INDEX_AUTO: u32 = 0x2d;
 const AGC_IT_NUM_INSTANCES: u32 = 0x2f;
 const AGC_IT_DRAW_INDEX_OFFSET: u32 = 0x35;
 const AGC_IT_WAIT_REG_MEM: u32 = 0x3c;
+const AGC_IT_INDIRECT_BUFFER: u32 = 0x3f;
 const AGC_IT_EVENT_WRITE: u32 = 0x46;
 const AGC_IT_SET_SH_REG_INDIRECT: u32 = 0x63;
 const AGC_IT_SET_UCONFIG_REG_INDIRECT: u32 = 0x64;
@@ -5107,8 +5108,33 @@ fn queue_video_out_flip(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AgcVideoOutTarget {
+    address: u64,
+    attributes: VideoOutBufferAttributes,
+}
+
+fn agc_video_out_target(
+    video_out: &VideoOutState,
+    handle: u32,
+    buffer_index: u32,
+) -> Option<AgcVideoOutTarget> {
+    if handle != 1 || !video_out.is_open {
+        return None;
+    }
+    let address = *video_out.display_buffers.get(buffer_index as usize)?;
+    let attributes = video_out
+        .display_buffer_attributes
+        .get(buffer_index as usize)
+        .copied()
+        .flatten()?;
+    Some(AgcVideoOutTarget {
+        address,
+        attributes,
+    })
+}
+
 fn agc_submit_ordered_video_out_flip(
-    graphics: &mut AgcGraphicsState,
     video_out: &VideoOutState,
     handle: u32,
     buffer_index: u32,
@@ -5116,80 +5142,29 @@ fn agc_submit_ordered_video_out_flip(
 ) -> bool {
     if handle != 1 || !video_out.is_open {
         eprintln!("[REMu][VIDEO] ignored flip for invalid handle {handle}");
-        graphics.pending_targetless_draw = None;
         return false;
     }
-    let Some(&display_address) = video_out.display_buffers.get(buffer_index as usize) else {
+    if video_out
+        .display_buffers
+        .get(buffer_index as usize)
+        .is_none()
+    {
         eprintln!("[REMu][VIDEO] ignored flip for unregistered buffer index {buffer_index}");
         return false;
-    };
-    let Some(attributes) = video_out
-        .display_buffer_attributes
-        .get(buffer_index as usize)
-        .copied()
-        .flatten()
-    else {
+    }
+    let Some(target) = agc_video_out_target(video_out, handle, buffer_index) else {
         eprintln!("[REMu][VIDEO] ignored flip without attributes for buffer index {buffer_index}");
-        graphics.pending_targetless_draw = None;
         return false;
     };
-    if let Some(mut draw) = graphics.pending_targetless_draw.take() {
-        let target = graphics
-            .known_color_targets
-            .get(&display_address)
-            .copied()
-            .filter(|target| {
-                ((target.attrib2 >> 14) & 0x3fff) + 1 == attributes.width
-                    && (target.attrib2 & 0x3fff) + 1 == attributes.height
-            });
-        let export_masks = draw
-            .pixel_shader
-            .as_ref()
-            .map_or(0, |shader| shader.program.pixel_color_export_masks())
-            & draw
-                .context_registers
-                .iter()
-                .find(|register| register.offset == AGC_CB_SHADER_MASK)
-                .map_or(u32::MAX, |register| register.value);
-        let export_slots = (0..AGC_COLOR_TARGET_COUNT)
-            .filter(|slot| (export_masks >> (slot * 4)) & 0xf != 0)
-            .collect::<Vec<_>>();
-        if let [export_slot] = export_slots.as_slice() {
-            draw.scanout_target = Some(remu_gpu::GpuScanoutTarget {
-                address: display_address,
-                width: attributes.width,
-                height: attributes.height,
-                pitch: attributes.pitch,
-                pixel_format: attributes.pixel_format,
-                tiling_mode: attributes.tiling_mode,
-                export_slot: *export_slot,
-                write_mask: (export_masks >> (*export_slot * 4)) & 0xf,
-                color_surface: target,
-            });
-            if draw.sequence <= 8 {
-                eprintln!(
-                    "[REMu][AGC] resolved targetless draw={} against scanout target={display_address:#x} programmed_surface={}",
-                    draw.sequence,
-                    target.is_some(),
-                );
-            }
-            remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(draw));
-        } else if draw.sequence <= 8 {
-            eprintln!(
-                "[REMu][AGC] discarded targetless draw={}: flip target {display_address:#x} has ambiguous pixel exports {export_slots:?}",
-                draw.sequence,
-            );
-        }
-    }
     remu_gpu::emit_event(remu_gpu::GpuEvent::Flip {
-        address: display_address,
+        address: target.address,
         buffer_index,
         flip_argument,
-        width: attributes.width,
-        height: attributes.height,
-        pitch: attributes.pitch,
-        pixel_format: attributes.pixel_format,
-        tiling_mode: attributes.tiling_mode,
+        width: target.attributes.width,
+        height: target.attributes.height,
+        pitch: target.attributes.pitch,
+        pixel_format: target.attributes.pixel_format,
+        tiling_mode: target.attributes.tiling_mode,
     });
     true
 }
@@ -5562,6 +5537,22 @@ enum AgcSubmissionError {
     ClearStatePacketLength { actual: u32 },
     #[error("CLEAR_STATE control has unsupported bits 0x{0:08X}")]
     UnsupportedClearStateControl(u32),
+    #[error("partial-flush EVENT_WRITE packet has {actual} dwords, expected 2")]
+    EventWritePacketLength { actual: u32 },
+    #[error("partial-flush EVENT_WRITE control has unsupported bits 0x{0:08X}")]
+    UnsupportedEventWriteControl(u32),
+    #[error(
+        "partial-flush EVENT_WRITE type 0x{event_type:02X} uses event index {actual}, expected 4"
+    )]
+    PartialFlushEventIndex { event_type: u32, actual: u32 },
+    #[error(
+        "EVENT_WRITE type 0x{event_type:02X} index {event_index} with {length} dwords is not implemented"
+    )]
+    UnsupportedEventWrite {
+        event_type: u32,
+        event_index: u32,
+        length: u32,
+    },
     #[error("native indirect-register opcode 0x{opcode:02X} has {actual} dwords, expected 5")]
     NativeIndirectRegisterPacketLength { opcode: u32, actual: u32 },
     #[error("indexed SET_UCONFIG_REG packet has {actual} dwords, expected 3")]
@@ -5724,7 +5715,7 @@ fn agc_prepare_draw_color_targets(
     (targets, absent)
 }
 
-fn agc_draw_image_access(draw: &remu_gpu::IndexedDraw) -> (bool, bool) {
+fn agc_draw_writes_image(draw: &remu_gpu::IndexedDraw) -> bool {
     [
         draw.export_shader_evaluation.as_deref(),
         draw.pixel_shader_evaluation.as_deref(),
@@ -5732,43 +5723,78 @@ fn agc_draw_image_access(draw: &remu_gpu::IndexedDraw) -> (bool, bool) {
     .into_iter()
     .flatten()
     .flat_map(|evaluation| &evaluation.image_bindings)
-    .fold((false, false), |(reads, writes), binding| {
-        let writes_binding =
-            binding.opcode.starts_with("ImageStore") || binding.opcode.starts_with("ImageAtomic");
-        (reads || !writes_binding, writes || writes_binding)
+    .any(|binding| {
+        binding.opcode.starts_with("ImageStore") || binding.opcode.starts_with("ImageAtomic")
     })
 }
 
-fn agc_submit_or_defer_draw(
-    graphics: &mut AgcGraphicsState,
-    draw: remu_gpu::IndexedDraw,
-    color_target_absent: bool,
-) {
-    let (reads_image, writes_image) = agc_draw_image_access(&draw);
-    if color_target_absent
-        && !agc_has_active_depth_state(&graphics.context_registers)
-        && reads_image
-        && !writes_image
-    {
-        if draw.sequence <= 8 {
-            eprintln!(
-                "[REMu][AGC] deferred targetless sampled draw={} until the following VideoOut flip",
-                draw.sequence
-            );
-        }
-        graphics.pending_targetless_draw = Some(Box::new(draw));
-    } else {
-        remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
-    }
+fn agc_draw_resources_evaluated(draw: &remu_gpu::IndexedDraw) -> bool {
+    (draw.export_shader.is_none() || draw.export_shader_evaluation.is_some())
+        && (draw.pixel_shader.is_none() || draw.pixel_shader_evaluation.is_some())
 }
 
-fn agc_discard_stale_targetless_draw(graphics: &mut AgcGraphicsState) {
-    if let Some(stale) = graphics.pending_targetless_draw.take()
-        && stale.sequence <= 8
+fn agc_resolve_targetless_scanout(
+    graphics: &mut AgcGraphicsState,
+    draw: &mut remu_gpu::IndexedDraw,
+    color_target_absent: bool,
+    future_target: Option<AgcVideoOutTarget>,
+) {
+    if !color_target_absent
+        || agc_has_active_depth_state(&graphics.context_registers)
+        || !agc_draw_resources_evaluated(draw)
+        || agc_draw_writes_image(draw)
     {
+        return;
+    }
+    let Some(target) = future_target else {
+        return;
+    };
+    let export_masks = draw
+        .pixel_shader
+        .as_ref()
+        .map_or(0, |shader| shader.program.pixel_color_export_masks())
+        & draw
+            .context_registers
+            .iter()
+            .find(|register| register.offset == AGC_CB_SHADER_MASK)
+            .map_or(u32::MAX, |register| register.value);
+    let export_slots = (0..AGC_COLOR_TARGET_COUNT)
+        .filter(|slot| (export_masks >> (slot * 4)) & 0xf != 0)
+        .collect::<Vec<_>>();
+    let [export_slot] = export_slots.as_slice() else {
+        if draw.sequence <= 8 {
+            eprintln!(
+                "[REMu][AGC] did not associate targetless draw={}: future flip target {:#x} has ambiguous pixel exports {export_slots:?}",
+                draw.sequence, target.address,
+            );
+        }
+        return;
+    };
+    let color_surface = graphics
+        .known_color_targets
+        .get(&target.address)
+        .copied()
+        .filter(|surface| {
+            ((surface.attrib2 >> 14) & 0x3fff) + 1 == target.attributes.width
+                && (surface.attrib2 & 0x3fff) + 1 == target.attributes.height
+        });
+    draw.scanout_target = Some(remu_gpu::GpuScanoutTarget {
+        address: target.address,
+        width: target.attributes.width,
+        height: target.attributes.height,
+        pitch: target.attributes.pitch,
+        pixel_format: target.attributes.pixel_format,
+        tiling_mode: target.attributes.tiling_mode,
+        export_slot: *export_slot,
+        write_mask: (export_masks >> (*export_slot * 4)) & 0xf,
+        color_surface,
+    });
+    if draw.sequence <= 8 {
         eprintln!(
-            "[REMu][AGC] discarded unresolved targetless draw={} before the next draw",
-            stale.sequence
+            "[REMu][AGC] resolved targetless draw={} against future scanout target={:#x} programmed_surface={}",
+            draw.sequence,
+            target.address,
+            color_surface.is_some(),
         );
     }
 }
@@ -5801,11 +5827,11 @@ fn agc_emit_draw(
     element_offset: u32,
     element_count: u32,
     draw_flags: u32,
+    future_scanout_target: Option<AgcVideoOutTarget>,
 ) {
     if element_count == 0 {
         return;
     }
-    agc_discard_stale_targetless_draw(graphics);
     graphics.draw_index_offset = element_offset;
     graphics.emitted_draws = graphics.emitted_draws.saturating_add(1);
 
@@ -5886,7 +5912,13 @@ fn agc_emit_draw(
     {
         trace_agc_shader_draw(&draw);
     }
-    agc_submit_or_defer_draw(graphics, draw, color_target_absent);
+    agc_resolve_targetless_scanout(
+        graphics,
+        &mut draw,
+        color_target_absent,
+        future_scanout_target,
+    );
+    remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
 }
 
 fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
@@ -6147,6 +6179,7 @@ fn agc_emit_indexed_draw(
     packet_address: u64,
     graphics: &mut AgcGraphicsState,
     shaders: &mut AgcShaderRegistry,
+    future_scanout_target: Option<AgcVideoOutTarget>,
 ) {
     agc_emit_draw(
         graphics,
@@ -6155,6 +6188,7 @@ fn agc_emit_indexed_draw(
         read_guest_u32(packet_address + 8),
         read_guest_u32(packet_address + 12),
         read_guest_u32(packet_address + 16),
+        future_scanout_target,
     );
 }
 
@@ -6164,6 +6198,7 @@ struct AgcSubmissionPacket {
     length: u32,
     opcode: u32,
     register: u32,
+    predicated: bool,
 }
 
 fn agc_apply_clear_state(
@@ -6186,6 +6221,40 @@ fn agc_apply_clear_state(
     Ok(())
 }
 
+fn decode_agc_pipeline_barrier(
+    packet_address: u64,
+    length: u32,
+) -> Result<remu_gpu::GpuPipelineBarrier, AgcSubmissionError> {
+    let control = read_guest_u32(packet_address + 4);
+    let event_type = control & 0x3f;
+    let event_index = (control >> 8) & 0x7;
+    let wait_for = match event_type {
+        0x07 => remu_gpu::GpuPipelineStage::ComputeShader,
+        0x0f => remu_gpu::GpuPipelineStage::VertexShader,
+        0x10 => remu_gpu::GpuPipelineStage::PixelShader,
+        _ => {
+            return Err(AgcSubmissionError::UnsupportedEventWrite {
+                event_type,
+                event_index,
+                length,
+            });
+        }
+    };
+    if length != 2 {
+        return Err(AgcSubmissionError::EventWritePacketLength { actual: length });
+    }
+    if control & !0x0000_073f != 0 {
+        return Err(AgcSubmissionError::UnsupportedEventWriteControl(control));
+    }
+    if event_index != 4 {
+        return Err(AgcSubmissionError::PartialFlushEventIndex {
+            event_type,
+            actual: event_index,
+        });
+    }
+    Ok(remu_gpu::GpuPipelineBarrier { wait_for })
+}
+
 fn agc_handle_submission_packet(
     packet: AgcSubmissionPacket,
     graphics: &mut AgcGraphicsState,
@@ -6193,12 +6262,14 @@ fn agc_handle_submission_packet(
     index_resources: &BTreeMap<u64, u64>,
     video_out: &VideoOutState,
     flips: &mut Vec<(u32, u32, u64)>,
+    future_scanout_target: Option<AgcVideoOutTarget>,
 ) -> Result<(), AgcSubmissionError> {
     let AgcSubmissionPacket {
         address: packet_address,
         length,
         opcode,
         register,
+        predicated: _,
     } = packet;
     if opcode == AGC_IT_CLEAR_STATE {
         agc_apply_clear_state(packet_address, length, graphics)?;
@@ -6210,6 +6281,9 @@ fn agc_handle_submission_packet(
     agc_apply_submission_registers(packet_address, length, opcode, register, graphics)?;
     if opcode == AGC_IT_SET_BASE {
         agc_apply_set_base(packet_address, length, graphics)?;
+    }
+    if opcode == AGC_IT_EVENT_WRITE {
+        remu_gpu::pipeline_barrier(decode_agc_pipeline_barrier(packet_address, length)?);
     }
     if opcode == AGC_IT_NOP && register == AGC_R_ACQUIRE_MEM && length >= 8 {
         remu_gpu::acquire_memory(decode_agc_memory_acquire(packet_address));
@@ -6232,7 +6306,7 @@ fn agc_handle_submission_packet(
         graphics.instance_count = read_guest_u32(packet_address + 4).max(1);
     }
     if opcode == AGC_IT_DRAW_INDEX_OFFSET && length >= 5 {
-        agc_emit_indexed_draw(packet_address, graphics, shaders);
+        agc_emit_indexed_draw(packet_address, graphics, shaders, future_scanout_target);
     }
     if opcode == AGC_IT_DRAW_INDEX_AUTO && length >= 3 {
         agc_emit_draw(
@@ -6242,6 +6316,7 @@ fn agc_handle_submission_packet(
             0,
             read_guest_u32(packet_address + 4),
             read_guest_u32(packet_address + 8),
+            future_scanout_target,
         );
     }
     if opcode == AGC_IT_NOP && register == AGC_R_DRAW_INDEX_AUTO && length >= 2 {
@@ -6252,6 +6327,7 @@ fn agc_handle_submission_packet(
             0,
             read_guest_u32(packet_address + 4),
             0,
+            future_scanout_target,
         );
     }
     if matches!(opcode, AGC_IT_DISPATCH_DIRECT | AGC_IT_DISPATCH_INDIRECT) {
@@ -6280,13 +6356,7 @@ fn agc_handle_submission_packet(
         let buffer_index = read_guest_u32(packet_address + 8);
         let flip_argument = u64::from(read_guest_u32(packet_address + 16))
             | (u64::from(read_guest_u32(packet_address + 20)) << 32);
-        if agc_submit_ordered_video_out_flip(
-            graphics,
-            video_out,
-            handle,
-            buffer_index,
-            flip_argument,
-        ) {
+        if agc_submit_ordered_video_out_flip(video_out, handle, buffer_index, flip_argument) {
             flips.push((handle, buffer_index, flip_argument));
         }
     }
@@ -6318,13 +6388,57 @@ struct AgcSubmissionContext<'a> {
     flips: &'a mut Vec<(u32, u32, u64)>,
 }
 
+fn agc_packet_video_out_target(
+    packet: AgcSubmissionPacket,
+    video_out: &VideoOutState,
+) -> Option<AgcVideoOutTarget> {
+    if packet.opcode != AGC_IT_NOP || packet.register != AGC_R_FLIP || packet.length < 6 {
+        return None;
+    }
+    agc_video_out_target(
+        video_out,
+        read_guest_u32(packet.address + 4),
+        read_guest_u32(packet.address + 8),
+    )
+}
+
+fn agc_scanout_inference_boundary(packet: AgcSubmissionPacket) -> bool {
+    packet.predicated
+        || matches!(
+            packet.opcode,
+            AGC_IT_SET_PREDICATION | AGC_IT_COND_EXEC | AGC_IT_INDIRECT_BUFFER | AGC_IT_CLEAR_STATE
+        )
+        || (packet.opcode == AGC_IT_NOP
+            && matches!(packet.register, AGC_R_DRAW_RESET | AGC_R_ACB_RESET))
+}
+
+fn agc_future_scanout_targets(
+    packets: &[AgcSubmissionPacket],
+    video_out: &VideoOutState,
+) -> Vec<Option<AgcVideoOutTarget>> {
+    let mut future = vec![None; packets.len()];
+    let mut next = None;
+    for (index, packet) in packets.iter().copied().enumerate().rev() {
+        if agc_scanout_inference_boundary(packet) {
+            next = None;
+            continue;
+        }
+        future[index] = next;
+        if let Some(target) = agc_packet_video_out_target(packet, video_out) {
+            next = Some(target);
+        }
+    }
+    future
+}
+
 fn agc_parse_submission(
     command_address: u64,
     dword_count: u32,
     context: &mut AgcSubmissionContext<'_>,
 ) -> Result<(), AgcSubmissionError> {
     let mut offset = 0_u32;
-    let mut packets = BTreeMap::<(u32, u32), u32>::new();
+    let mut packet_counts = BTreeMap::<(u32, u32), u32>::new();
+    let mut packets = Vec::new();
     while offset < dword_count {
         let packet_address = command_address + u64::from(offset) * 4;
         let header = read_guest_u32(packet_address);
@@ -6351,26 +6465,45 @@ fn agc_parse_submission(
         }
         let opcode = (header >> 8) & 0xff;
         let register = (header >> 2) & 0x3f;
-        *packets.entry((opcode, register)).or_default() += 1;
+        *packet_counts.entry((opcode, register)).or_default() += 1;
+        packets.push(AgcSubmissionPacket {
+            address: packet_address,
+            length,
+            opcode,
+            register,
+            predicated: header & 1 != 0,
+        });
+        offset += length;
+    }
+
+    // Validate newly decoded order-visible packet forms before emitting any GPU side effect from
+    // the submission. Unsupported cache/query EVENT_WRITE variants remain fail-loud.
+    for packet in &packets {
+        if packet.opcode == AGC_IT_EVENT_WRITE {
+            decode_agc_pipeline_barrier(packet.address, packet.length)?;
+        }
+    }
+
+    let future_scanout_targets = agc_future_scanout_targets(&packets, context.video_out);
+    for (packet, future_scanout_target) in packets
+        .iter()
+        .copied()
+        .zip(future_scanout_targets.into_iter())
+    {
         agc_handle_submission_packet(
-            AgcSubmissionPacket {
-                address: packet_address,
-                length,
-                opcode,
-                register,
-            },
+            packet,
             context.graphics,
             context.shaders,
             context.index_resources,
             context.video_out,
             context.flips,
+            future_scanout_target,
         )?;
-        offset += length;
     }
 
     *context.submission_count = context.submission_count.saturating_add(1);
     if *context.submission_count <= 8 {
-        let packet_summary = packets
+        let packet_summary = packet_counts
             .iter()
             .map(|(&(opcode, register), &count)| {
                 format!("op={opcode:#04x}/reg={register:#04x}:{count}")
@@ -9990,20 +10123,20 @@ mod platform_independent_tests {
         SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED, VideoOutBufferAttributes,
         VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_color_target_state,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
-        agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4,
-        agc_submit_ordered_video_out_flip, allocate_direct_memory, allocate_pthread_thread_object,
-        create_pthread_attr, decode_agc_memory_acquire, destroy_pthread_attr,
-        dispatch_guest_numeric_parser, dispatch_probe_import, guest_clock_gettime, guest_free,
-        guest_global_locale, guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_lseek,
-        guest_kernel_read, guest_posix_file_result, guest_qsort, guest_tolower_table,
-        guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
-        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
-        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_detach_state,
-        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
-        read_guest_u32, read_guest_u64, resolve_guest_path, sanitize_save_segment,
-        save_data_commit, save_data_create_transaction_resource, save_data_dir_name_search,
-        save_data_mount3, save_data_pattern_matches, save_data_prepare, save_data_save_icon,
-        save_data_set_param, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
+        agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, allocate_direct_memory,
+        allocate_pthread_thread_object, create_pthread_attr, decode_agc_memory_acquire,
+        destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
+        guest_clock_gettime, guest_free, guest_global_locale, guest_kernel_fstat,
+        guest_kernel_ftruncate, guest_kernel_lseek, guest_kernel_read, guest_posix_file_result,
+        guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp,
+        guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory, kernel_stat_payload,
+        kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity, pthread_attr_get_stack,
+        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
+        resolve_guest_path, sanitize_save_segment, save_data_commit,
+        save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
+        save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
+        save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
         system_service_param_get_int, take_exit_callbacks, video_out_open, write_guest_u32,
         write_guest_u64, write_import_stub,
     };
@@ -10112,6 +10245,86 @@ mod platform_independent_tests {
             shader_registers: Vec::new(),
             user_config_registers: Vec::new(),
         }
+    }
+
+    fn targetless_scanout_test_video(address: u64) -> VideoOutState {
+        VideoOutState {
+            is_open: true,
+            width: 1_280,
+            height: 720,
+            display_buffers: vec![address],
+            display_buffer_attributes: vec![Some(VideoOutBufferAttributes {
+                width: 1_280,
+                height: 720,
+                pitch: 1_280,
+                pixel_format: 0x8000_0000_2200_0000,
+                tiling_mode: 0,
+            })],
+            ..VideoOutState::default()
+        }
+    }
+
+    fn targetless_scanout_test_shader_state(
+        pixel_address: u64,
+        target: remu_gpu::GpuColorTarget,
+    ) -> (AgcGraphicsState, AgcShaderRegistry) {
+        let mut graphics = AgcGraphicsState::default();
+        graphics.known_color_targets.insert(target.address, target);
+        let mut template = targetless_scanout_test_draw();
+        template.pixel_shader_address = pixel_address;
+        let mut pixel_snapshot = template.pixel_shader.take().expect("test pixel shader");
+        pixel_snapshot.program = Arc::new(remu_shader::Program::new(
+            pixel_address,
+            pixel_snapshot.program.instructions.clone(),
+        ));
+        graphics.context_registers.extend(
+            template
+                .context_registers
+                .iter()
+                .map(|register| (register.offset, register.value)),
+        );
+        graphics.shader_registers.extend([
+            (super::AGC_SPI_SHADER_PGM_LO_PS, low_u32(pixel_address >> 8)),
+            (
+                super::AGC_SPI_SHADER_PGM_HI_PS,
+                low_u32(pixel_address >> 40),
+            ),
+            (0x00b, 0),
+        ]);
+        let mut shaders = AgcShaderRegistry::default();
+        shaders.snapshots.insert(pixel_address, pixel_snapshot);
+        (graphics, shaders)
+    }
+
+    fn targetless_barrier_acquire_flip_commands() -> (Vec<u32>, remu_gpu::GpuMemoryAcquire) {
+        let acquire = [
+            agc_pm4(8, AGC_IT_NOP, super::AGC_R_ACQUIRE_MEM),
+            0x8000_1234,
+            0x3456_789a,
+            0x0000_00ab,
+            0x7654_3210,
+            0x0000_cdef,
+            0xabcd_2468,
+            0xfff5_4321,
+        ];
+        let expected_acquire = decode_agc_memory_acquire(acquire.as_ptr().addr() as u64);
+        let mut commands = vec![
+            agc_pm4(3, super::AGC_IT_DRAW_INDEX_AUTO, 0),
+            3,
+            0,
+            agc_pm4(2, super::AGC_IT_EVENT_WRITE, 0),
+            0x410,
+        ];
+        commands.extend(acquire);
+        commands.extend([
+            agc_pm4(6, AGC_IT_NOP, super::AGC_R_FLIP),
+            1,
+            0,
+            0,
+            0x1234,
+            0,
+        ]);
+        (commands, expected_acquire)
     }
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -11198,6 +11411,47 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn decodes_partial_flush_events_without_inventing_completion_notifications() {
+        for (event_type, wait_for) in [
+            (0x07, remu_gpu::GpuPipelineStage::ComputeShader),
+            (0x0f, remu_gpu::GpuPipelineStage::VertexShader),
+            (0x10, remu_gpu::GpuPipelineStage::PixelShader),
+        ] {
+            let packet = [agc_pm4(2, super::AGC_IT_EVENT_WRITE, 0), 0x400 | event_type];
+            assert_eq!(
+                super::decode_agc_pipeline_barrier(packet.as_ptr().addr() as u64, 2)
+                    .expect("supported partial flush"),
+                remu_gpu::GpuPipelineBarrier { wait_for }
+            );
+        }
+
+        let wrong_index = [agc_pm4(2, super::AGC_IT_EVENT_WRITE, 0), 0x10];
+        assert!(matches!(
+            super::decode_agc_pipeline_barrier(wrong_index.as_ptr().addr() as u64, 2),
+            Err(super::AgcSubmissionError::PartialFlushEventIndex {
+                event_type: 0x10,
+                actual: 0,
+            })
+        ));
+        let unsupported = [agc_pm4(2, super::AGC_IT_EVENT_WRITE, 0), 0x416];
+        assert!(matches!(
+            super::decode_agc_pipeline_barrier(unsupported.as_ptr().addr() as u64, 2),
+            Err(super::AgcSubmissionError::UnsupportedEventWrite {
+                event_type: 0x16,
+                event_index: 4,
+                length: 2,
+            })
+        ));
+        let reserved = [agc_pm4(2, super::AGC_IT_EVENT_WRITE, 0), 0x8000_0410];
+        assert!(matches!(
+            super::decode_agc_pipeline_barrier(reserved.as_ptr().addr() as u64, 2),
+            Err(super::AgcSubmissionError::UnsupportedEventWriteControl(
+                0x8000_0410
+            ))
+        ));
+    }
+
+    #[test]
     fn applies_native_gen5_indirect_register_packets_to_each_register_space() {
         let context_registers = [0x318, 0x1234_5678, 0x390, 0x5a, u32::MAX, 0xfeed_face];
         let shader_registers = [
@@ -11303,7 +11557,6 @@ mod platform_independent_tests {
         graphics.compute_indirect_args_address = 0x3000;
         graphics.emitted_draws = 11;
         graphics.known_color_targets.insert(address, target);
-        graphics.pending_targetless_draw = Some(Box::new(targetless_scanout_test_draw()));
 
         super::agc_handle_submission_packet(
             super::AgcSubmissionPacket {
@@ -11311,12 +11564,14 @@ mod platform_independent_tests {
                 length: 2,
                 opcode: super::AGC_IT_CLEAR_STATE,
                 register: 0,
+                predicated: false,
             },
             &mut graphics,
             &mut AgcShaderRegistry::default(),
             &BTreeMap::new(),
             &VideoOutState::default(),
             &mut Vec::new(),
+            None,
         )
         .expect("valid CLEAR_STATE packet");
 
@@ -11330,7 +11585,6 @@ mod platform_independent_tests {
         assert_eq!(graphics.instance_count, 1);
         assert_eq!(graphics.draw_index_offset, 0);
         assert_eq!(graphics.compute_indirect_args_address, 0);
-        assert!(graphics.pending_targetless_draw.is_none());
         assert_eq!(graphics.emitted_draws, 11);
         assert_eq!(graphics.known_color_targets.get(&address), Some(&target));
     }
@@ -11351,12 +11605,14 @@ mod platform_independent_tests {
                     length,
                     opcode: super::AGC_IT_CLEAR_STATE,
                     register: 0,
+                    predicated: false,
                 },
                 graphics,
                 &mut shaders,
                 &index_resources,
                 &video_out,
                 &mut flips,
+                None,
             )
         };
         assert!(matches!(
@@ -11407,7 +11663,165 @@ mod platform_independent_tests {
     }
 
     #[test]
-    fn emits_deferred_scanout_draw_immediately_before_its_flip() {
+    fn scanout_lookahead_is_submission_bounded_and_not_limited_by_channel_capacity() {
+        let address = 0x0070_1234_5600_u64;
+        let video_out = VideoOutState {
+            is_open: true,
+            display_buffers: vec![address],
+            display_buffer_attributes: vec![Some(VideoOutBufferAttributes {
+                width: 1_280,
+                height: 720,
+                pitch: 1_280,
+                pixel_format: 0x8000_0000_2200_0000,
+                tiling_mode: 0,
+            })],
+            ..VideoOutState::default()
+        };
+        let flip = [agc_pm4(6, AGC_IT_NOP, super::AGC_R_FLIP), 1, 0, 0, 0, 0];
+        let draw_packet = || super::AgcSubmissionPacket {
+            address: 0,
+            length: 3,
+            opcode: super::AGC_IT_DRAW_INDEX_AUTO,
+            register: 0,
+            predicated: false,
+        };
+        let mut packets = vec![draw_packet()];
+        packets.extend((0..(remu_gpu::GPU_EVENT_QUEUE_CAPACITY + 17)).map(|_| {
+            super::AgcSubmissionPacket {
+                address: 0,
+                length: 2,
+                opcode: AGC_IT_NOP,
+                register: 0,
+                predicated: false,
+            }
+        }));
+        let second_draw = packets.len();
+        packets.push(draw_packet());
+        packets.push(super::AgcSubmissionPacket {
+            address: flip.as_ptr().addr() as u64,
+            length: 6,
+            opcode: AGC_IT_NOP,
+            register: super::AGC_R_FLIP,
+            predicated: false,
+        });
+
+        let future = super::agc_future_scanout_targets(&packets, &video_out);
+        assert_eq!(future[0].map(|target| target.address), Some(address));
+        assert_eq!(
+            future[second_draw].map(|target| target.address),
+            Some(address)
+        );
+
+        let boundary_packets = [
+            draw_packet(),
+            super::AgcSubmissionPacket {
+                address: 0,
+                length: 2,
+                opcode: super::AGC_IT_CLEAR_STATE,
+                register: 0,
+                predicated: false,
+            },
+            draw_packet(),
+            *packets.last().expect("flip packet"),
+        ];
+        let boundary_future = super::agc_future_scanout_targets(&boundary_packets, &video_out);
+        assert_eq!(boundary_future[0], None);
+        assert_eq!(
+            boundary_future[2].map(|target| target.address),
+            Some(address)
+        );
+    }
+
+    #[test]
+    fn targetless_scanout_resolution_requires_complete_unambiguous_draw_state() {
+        let target = super::AgcVideoOutTarget {
+            address: 0x0070_1234_5600,
+            attributes: VideoOutBufferAttributes {
+                width: 1_280,
+                height: 720,
+                pitch: 1_280,
+                pixel_format: 0x8000_0000_2200_0000,
+                tiling_mode: 0,
+            },
+        };
+        let mut graphics = AgcGraphicsState::default();
+        let mut draw = targetless_scanout_test_draw();
+
+        super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
+        assert_eq!(
+            draw.scanout_target, None,
+            "failed resource evaluation is not guessed"
+        );
+
+        draw.pixel_shader_evaluation = Some(Arc::new(remu_shader::ShaderEvaluation {
+            initial_scalar_registers: Vec::new(),
+            scalar_registers: Vec::new(),
+            image_bindings: Vec::new(),
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            runtime_scalar_registers: std::collections::BTreeSet::new(),
+            vertex_inputs: Vec::new(),
+        }));
+        super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
+        assert_eq!(
+            draw.scanout_target.map(|scanout| scanout.address),
+            Some(target.address)
+        );
+
+        draw.scanout_target = None;
+        graphics
+            .context_registers
+            .insert(super::AGC_DB_DEPTH_CONTROL, 0x2);
+        super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
+        assert_eq!(
+            draw.scanout_target, None,
+            "active depth state is not inferred as scanout"
+        );
+
+        graphics.context_registers.clear();
+        super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, None);
+        assert_eq!(
+            draw.scanout_target, None,
+            "association never crosses a missing flip"
+        );
+
+        let pixel = draw.pixel_shader.as_mut().expect("test pixel shader");
+        let mut instructions = pixel.program.instructions.clone();
+        instructions.push(remu_shader::Instruction {
+            pc: 8,
+            encoding: remu_shader::ShaderEncoding::Exp,
+            opcode: remu_shader::Opcode::EXPORT,
+            words: vec![0, 0],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: Some(remu_shader::InstructionControl::Export(
+                remu_shader::ExportControl {
+                    target: 1,
+                    enable_mask: 0xf,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                },
+            )),
+        });
+        pixel.program = Arc::new(remu_shader::Program::new(
+            pixel.program.address,
+            instructions,
+        ));
+        draw.context_registers
+            .iter_mut()
+            .find(|register| register.offset == super::AGC_CB_SHADER_MASK)
+            .expect("test shader mask")
+            .value = 0xff;
+        super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
+        assert_eq!(
+            draw.scanout_target, None,
+            "multiple color exports are ambiguous"
+        );
+    }
+
+    #[test]
+    fn resolves_constant_targetless_draw_before_ordered_barrier_acquire_and_flip() {
         let _event_guard = GPU_EVENT_SINK_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -11421,36 +11835,33 @@ mod platform_independent_tests {
             attrib2: ((1_280 - 1) << 14) | (720 - 1),
             attrib3: (27 << 14) | (1 << 24),
         };
-        let mut graphics = AgcGraphicsState::default();
-        graphics.known_color_targets.insert(address, target);
-        graphics.pending_targetless_draw = Some(Box::new(targetless_scanout_test_draw()));
-        let video_out = VideoOutState {
-            is_open: true,
-            width: 1_280,
-            height: 720,
-            display_buffers: vec![address],
-            display_buffer_attributes: vec![Some(VideoOutBufferAttributes {
-                width: 1_280,
-                height: 720,
-                pitch: 1_280,
-                pixel_format: 0x8000_0000_2200_0000,
-                tiling_mode: 0,
-            })],
-            ..VideoOutState::default()
-        };
+        let pixel_code = AlignedComputeProgram([0; 4]);
+        let pixel_address = pixel_code.0.as_ptr().addr() as u64;
+        let (mut graphics, mut shaders) =
+            targetless_scanout_test_shader_state(pixel_address, target);
+        let video_out = targetless_scanout_test_video(address);
+        let (commands, expected_acquire) = targetless_barrier_acquire_flip_commands();
         let (sender, receiver) = remu_gpu::gpu_event_channel();
         remu_gpu::install_event_sink(sender);
 
-        assert!(agc_submit_ordered_video_out_flip(
-            &mut graphics,
-            &video_out,
-            1,
-            0,
-            0x1234,
-        ));
+        let mut submission_count = 0;
+        let mut flips = Vec::new();
+        super::agc_parse_submission(
+            commands.as_ptr().addr() as u64,
+            u32::try_from(commands.len()).expect("command dword count"),
+            &mut super::AgcSubmissionContext {
+                graphics: &mut graphics,
+                shaders: &mut shaders,
+                index_resources: &BTreeMap::new(),
+                video_out: &video_out,
+                submission_count: &mut submission_count,
+                flips: &mut flips,
+            },
+        )
+        .expect("ordered targetless submission");
         remu_gpu::clear_event_sink();
 
-        let remu_gpu::GpuEvent::IndexedDraw(draw) = receiver.recv().expect("deferred draw event")
+        let remu_gpu::GpuEvent::IndexedDraw(draw) = receiver.recv().expect("resolved draw event")
         else {
             panic!("draw must precede flip");
         };
@@ -11468,6 +11879,16 @@ mod platform_independent_tests {
                 color_surface: Some(target),
             })
         );
+        assert_eq!(
+            receiver.recv().expect("pixel partial flush"),
+            remu_gpu::GpuEvent::PipelineBarrier(remu_gpu::GpuPipelineBarrier {
+                wait_for: remu_gpu::GpuPipelineStage::PixelShader,
+            })
+        );
+        assert_eq!(
+            receiver.recv().expect("memory acquire"),
+            remu_gpu::GpuEvent::MemoryAcquire(expected_acquire)
+        );
         let remu_gpu::GpuEvent::Flip {
             address: flipped_address,
             width,
@@ -11479,6 +11900,7 @@ mod platform_independent_tests {
         };
         assert_eq!(flipped_address, address);
         assert_eq!((width, height), (1_280, 720));
+        assert_eq!(flips, vec![(1, 0, 0x1234)]);
         assert!(receiver.try_recv().is_err());
     }
 

@@ -521,10 +521,27 @@ pub enum GpuEvent {
         pixel_format: u64,
         tiling_mode: u32,
     },
+    PipelineBarrier(GpuPipelineBarrier),
     MemoryAcquire(GpuMemoryAcquire),
     ComputeDispatch(Box<ComputeDispatch>),
     IndexedDraw(Box<IndexedDraw>),
     Shutdown,
+}
+
+/// A guest pipeline-stage completion boundary emitted by a PM4 partial-flush event.
+///
+/// Backends may use a lighter native primitive than a CPU wait, but following GPU work must not
+/// overtake work from the named stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuPipelineBarrier {
+    pub wait_for: GpuPipelineStage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuPipelineStage {
+    ComputeShader,
+    VertexShader,
+    PixelShader,
 }
 
 /// A decoded Gen5 `ACQUIRE_MEM` packet in guest byte-address form.
@@ -634,6 +651,11 @@ pub fn emit_event(event: GpuEvent) {
 /// between preceding and following guest GPU work without stalling the guest command processor.
 pub fn acquire_memory(acquire: GpuMemoryAcquire) {
     emit_event(GpuEvent::MemoryAcquire(acquire));
+}
+
+/// Emits an ordered guest pipeline-stage completion boundary.
+pub fn pipeline_barrier(barrier: GpuPipelineBarrier) {
+    emit_event(GpuEvent::PipelineBarrier(barrier));
 }
 
 #[cfg(test)]

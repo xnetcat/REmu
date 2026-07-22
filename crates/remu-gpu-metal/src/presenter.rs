@@ -811,6 +811,14 @@ impl MetalPresenter {
                     });
                     self.redraw_pending = true;
                 }
+                GpuEvent::PipelineBarrier(_barrier) => {
+                    // EVENT_WRITE partial flushes are GPU ordering boundaries, not CPU waits.
+                    // Closing the current batch places all following work in a later command
+                    // buffer on the same serial Metal queue.
+                    if let Err(error) = self.flush_guest_command_batch(false) {
+                        eprintln!("[REMu][METAL] pipeline barrier failed: {error}");
+                    }
+                }
                 GpuEvent::MemoryAcquire(acquire) => {
                     if let Err(error) = self.synchronize_cpu_written_guest_resources(acquire) {
                         eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
@@ -4320,8 +4328,8 @@ mod tests {
         RenderPipelineDescriptor, TextureDescriptor,
     };
     use remu_gpu::{
-        ComputeGrid, ComputeLaunch, GpuColorTarget, GpuEvent, GpuRegister, GpuScanoutTarget,
-        IndexedDraw, gpu_event_channel,
+        ComputeGrid, ComputeLaunch, GpuColorTarget, GpuEvent, GpuMemoryAcquire, GpuRegister,
+        GpuScanoutTarget, IndexedDraw, gpu_event_channel,
     };
     use remu_shader::PixelOutputKind;
 
@@ -4479,7 +4487,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_compile_gate_replays_one_shot_draw_before_flip() {
+    fn ordered_compile_gate_replays_draw_before_barrier_acquire_and_flip() {
         let (sender, receiver) = gpu_event_channel();
         let mut ordered = OrderedGpuEventReceiver::new(receiver);
         let key = GraphicsPipelineKey {
@@ -4490,6 +4498,21 @@ mod tests {
         let mut draw = indexed_draw(0, 0, 0);
         draw.sequence = 17;
         ordered.block_draw(key, Box::new(draw));
+        sender
+            .send(GpuEvent::PipelineBarrier(remu_gpu::GpuPipelineBarrier {
+                wait_for: remu_gpu::GpuPipelineStage::PixelShader,
+            }))
+            .expect("queue later barrier");
+        sender
+            .send(GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+                engine: 0,
+                cb_db_control: 0,
+                base_address: 0x2000,
+                size_bytes: 0x1000,
+                poll_interval: 0,
+                gcr_control: 0,
+            }))
+            .expect("queue later acquire");
         sender
             .send(GpuEvent::Flip {
                 address: 0x7000_0000,
@@ -4517,6 +4540,20 @@ mod tests {
             }
             other => panic!("expected the blocked draw exactly once, got {other:?}"),
         }
+        assert!(matches!(
+            ordered.try_recv(|_| true),
+            OrderedEventPoll::Event(GpuEvent::PipelineBarrier(remu_gpu::GpuPipelineBarrier {
+                wait_for: remu_gpu::GpuPipelineStage::PixelShader,
+            }))
+        ));
+        assert!(matches!(
+            ordered.try_recv(|_| true),
+            OrderedEventPoll::Event(GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+                base_address: 0x2000,
+                size_bytes: 0x1000,
+                ..
+            }))
+        ));
         assert!(matches!(
             ordered.try_recv(|_| true),
             OrderedEventPoll::Event(GpuEvent::Flip {

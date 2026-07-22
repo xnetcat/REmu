@@ -39,6 +39,17 @@ synthetic tests. No game bytes or proprietary SDK material are included.
 - AGC shader-header pointer relocation, program-register patching, and the VideoOut buffer-attribute
   and registration layouts were adapted from SharpEmu's GPL-2.0-or-later `AgcExports.cs` and
   `VideoOutExports.cs` at local snapshot `ada67a19`.
+- Submission-bounded targetless scanout association was cross-checked against SharpEmu's retained
+  draw-to-VideoOut association in GPL-2.0-or-later snapshot `2ee32b8`, particularly
+  `SharpEmu.Libs/Agc/AgcExports.cs`. Partial-flush `EVENT_WRITE` encodings and their ordering role
+  were independently checked against KytyPS5 snapshot
+  `8a4600c5e99ab3b3873b9ea57b70044f0fa34807` (`src/libs/agc.cpp`,
+  `pm4Handlers.cpp`, and `graphicsRun.cpp`), Mesa snapshot
+  `d3d45a7fb41433149924d0bbbf9d9bd1ddb9c33a` (`sid.h`, `gfx10.json`, and `radv_cs.c`), and Linux
+  snapshot `248951ddc14de84de3910f9b13f51491a8cd91df` (`soc15d.h`). KytyPS5 is
+  GPL-2.0-only and was used only as behavioral research; no source was copied. REmu independently
+  validates a complete submission, associates only unambiguous straight-line draws, preserves
+  packet order, and transports partial flushes as GPU stage barriers rather than CPU notifications.
 - Read-only app filesystem path resolution and libc stdio forwarding follow SharpEmu's
   GPL-2.0-or-later `LibcStdioExports.cs` design at local snapshot `ada67a19`; REmu uses native
   `FILE` objects directly because the Rosetta guest and host share the x86-64 libc ABI.
