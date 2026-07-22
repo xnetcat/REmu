@@ -163,6 +163,7 @@ struct MetalPresenter {
     compiling_shader_pairs: HashSet<(u64, u64)>,
     failed_shader_pairs: HashSet<(u64, u64)>,
     failed_draw_execution: HashSet<(u64, u64)>,
+    traced_binding_pairs: Option<HashSet<(u64, u64)>>,
     pending_shader_draws: HashMap<(u64, u64), Box<IndexedDraw>>,
     resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
@@ -225,6 +226,8 @@ impl MetalPresenter {
             compiling_shader_pairs: HashSet::new(),
             failed_shader_pairs: HashSet::new(),
             failed_draw_execution: HashSet::new(),
+            traced_binding_pairs: std::env::var_os("REMU_TRACE_METAL_BINDINGS")
+                .map(|_| HashSet::new()),
             pending_shader_draws: HashMap::new(),
             resident_guest_textures: HashMap::new(),
             sampled_texture_cache: HashMap::new(),
@@ -788,6 +791,118 @@ impl MetalPresenter {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn trace_draw_bindings(
+        &mut self,
+        draw: &IndexedDraw,
+        target: GuestTextureDescriptor,
+        export_evaluation: &ShaderEvaluation,
+        pixel_evaluation: &ShaderEvaluation,
+    ) {
+        let key = (draw.export_shader_address, draw.pixel_shader_address);
+        let Some(traced_binding_pairs) = self.traced_binding_pairs.as_mut() else {
+            return;
+        };
+        if !traced_binding_pairs.insert(key) {
+            return;
+        }
+        let scissor = decode_scissor(draw, target.width, target.height);
+        let viewport = scissor
+            .as_ref()
+            .map(|scissor| decode_viewport(draw, target.width, target.height, *scissor));
+        eprintln!(
+            "[REMu][METAL][BIND] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={} target={target:?} scissor={scissor:?}",
+            draw.sequence,
+            key.0,
+            key.1,
+            draw.indexed,
+            draw.index_count,
+            draw.instance_count,
+            draw.primitive_type,
+        );
+        if let Ok(viewport) = viewport {
+            eprintln!(
+                "[REMu][METAL][BIND] viewport=({}, {}) {}x{} depth={}..{}",
+                viewport.originX,
+                viewport.originY,
+                viewport.width,
+                viewport.height,
+                viewport.znear,
+                viewport.zfar,
+            );
+        }
+        for (stage, evaluation) in [("ES", export_evaluation), ("PS", pixel_evaluation)] {
+            let nonzero_scalars = evaluation
+                .initial_scalar_registers
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| **value != 0)
+                .map(|(index, value)| format!("s{index}={value:#010x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("[REMu][METAL][BIND] {stage} initial {nonzero_scalars}");
+            for (index, binding) in evaluation.global_memory_bindings.iter().enumerate() {
+                let words = binding
+                    .data
+                    .chunks(4)
+                    .take(8)
+                    .map(|bytes| {
+                        let mut word = [0_u8; 4];
+                        word[..bytes.len()].copy_from_slice(bytes);
+                        u32::from_le_bytes(word)
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[REMu][METAL][BIND] {stage} b{index} scalar=s{} guest={:#x} bytes={} writable={} writeback={} words={words:08x?}",
+                    binding.scalar_address,
+                    binding.base_address,
+                    binding.data.len(),
+                    binding.writable,
+                    binding.write_back_to_guest,
+                );
+            }
+            for (index, binding) in evaluation.image_bindings.iter().enumerate() {
+                match decode_image_descriptor(&binding.resource_descriptor) {
+                    Ok(descriptor) => {
+                        let mut aliases = self
+                            .resident_guest_textures
+                            .values()
+                            .filter(|resident| {
+                                guest_texture_descriptors_overlap(
+                                    resident.descriptor,
+                                    descriptor.guest,
+                                )
+                            })
+                            .map(|resident| {
+                                format!(
+                                    "{:?}/gpu={}/v{}",
+                                    resident.descriptor,
+                                    resident.gpu_written,
+                                    resident.content_version,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        aliases.sort_unstable();
+                        eprintln!(
+                            "[REMu][METAL][BIND] {stage} tex{index} pc={:#x} op={} decoded={:?} select={:#x} resident=[{}] resource={:08x?} sampler={:08x?}",
+                            binding.pc,
+                            binding.opcode,
+                            descriptor.guest,
+                            descriptor.destination_select,
+                            aliases.join(", "),
+                            binding.resource_descriptor,
+                            binding.sampler_descriptor,
+                        );
+                    }
+                    Err(error) => eprintln!(
+                        "[REMu][METAL][BIND] {stage} tex{index} pc={:#x} op={} decode={error} resource={:08x?}",
+                        binding.pc, binding.opcode, binding.resource_descriptor,
+                    ),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn execute_compiled_draw(&mut self, draw: &IndexedDraw) -> Result<(), String> {
         self.retire_completed_guest_batches();
         let started = Instant::now();
@@ -818,6 +933,7 @@ impl MetalPresenter {
         let target_texture = self
             .ensure_resident_texture(&device, target)
             .map_err(|error| format!("render target guest memory is unreadable: {error}"))?;
+        self.trace_draw_bindings(draw, target, export_evaluation, pixel_evaluation);
 
         for evaluation in [export_evaluation, pixel_evaluation] {
             for binding in evaluation.image_bindings.iter().filter(|binding| {
