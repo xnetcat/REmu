@@ -2017,7 +2017,8 @@ mod tests {
             let frame = decode_frame(0, &[word, extra]).expect("MTBUF frame");
             assert_eq!(frame.encoding, ShaderEncoding::Mtbuf);
             assert!(frame.opcode.is(name), "opcode 0x{opcode:02X}");
-            let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+            let instruction =
+                create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
             let Some(InstructionControl::BufferMemory(control)) = instruction.control else {
                 panic!("expected MTBUF control");
             };
@@ -2029,13 +2030,8 @@ mod tests {
 
     #[test]
     fn decodes_global_vdst_vdata_address_modes_and_twelve_bit_offset() {
-        let word = 0xdc00_0000
-            | (0x32 << 18)
-            | (2 << 14)
-            | (1 << 12)
-            | (1 << 16)
-            | (1 << 17)
-            | 0x800;
+        let word =
+            0xdc00_0000 | (0x32 << 18) | (2 << 14) | (1 << 12) | (1 << 16) | (1 << 17) | 0x800;
         let extra = 1 | (16 << 8) | (0x7f << 16) | (32 << 24);
         let frame = decode_frame(0, &[word, extra]).expect("GLOBAL frame");
         let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);

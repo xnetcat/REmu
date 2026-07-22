@@ -167,6 +167,28 @@ impl<'a> Compiler<'a> {
             return Err(MetalCompileError::EmptyProgram);
         }
         validate_interface(options)?;
+        if let Some(system_registers) = evaluation.compute_system_registers {
+            if options.stage != MetalShaderStage::Compute {
+                return Err(MetalCompileError::InvalidInterface(
+                    "compute system SGPRs require a compute shader stage".into(),
+                ));
+            }
+            for register in [
+                system_registers.work_group_x,
+                system_registers.work_group_y,
+                system_registers.work_group_z,
+                system_registers.thread_group_size,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if register >= SCALAR_REGISTER_COUNT {
+                    return Err(MetalCompileError::InvalidInterface(format!(
+                        "compute system SGPR s{register} exceeds the scalar register file"
+                    )));
+                }
+            }
+        }
 
         let mut vertex_outputs = BTreeSet::new();
         let mut pixel_attributes = BTreeSet::new();
@@ -498,6 +520,15 @@ impl<'a> Compiler<'a> {
                     .push("uint3 remu_local_id [[thread_position_in_threadgroup]]".to_owned());
                 parameters.push("uint3 remu_group_id [[threadgroup_position_in_grid]]".to_owned());
                 parameters.push("uint remu_lane [[thread_index_in_simdgroup]]".to_owned());
+                if self
+                    .evaluation
+                    .compute_system_registers
+                    .is_some_and(|registers| registers.thread_group_size.is_some())
+                {
+                    parameters
+                        .push("uint remu_thread_index [[thread_index_in_threadgroup]]".to_owned());
+                    parameters.push("uint3 remu_group_size [[threads_per_threadgroup]]".to_owned());
+                }
             }
         }
         let signature = match self.options.stage {
@@ -533,6 +564,7 @@ impl<'a> Compiler<'a> {
                 source.push_str(
                     "    v[0] = remu_local_id.x; v[1] = remu_local_id.y; v[2] = remu_local_id.z;\n",
                 );
+                self.emit_compute_system_registers(&mut source);
             }
         }
         source.push_str(
@@ -555,6 +587,35 @@ impl<'a> Compiler<'a> {
         }
         source.push_str("}\n");
         source
+    }
+
+    fn emit_compute_system_registers(&self, source: &mut String) {
+        let Some(registers) = self.evaluation.compute_system_registers else {
+            return;
+        };
+        for (register, component) in [
+            (registers.work_group_x, "x"),
+            (registers.work_group_y, "y"),
+            (registers.work_group_z, "z"),
+        ] {
+            if let Some(register) = register {
+                let _ = writeln!(source, "    s[{register}] = remu_group_id.{component};");
+            }
+        }
+        if let Some(register) = registers.thread_group_size {
+            source.push_str(
+                "    uint remu_wave_id = remu_thread_index >> 5u;\n\
+                 \x20   uint remu_threadgroup_threads = remu_group_size.x * remu_group_size.y * remu_group_size.z;\n\
+                 \x20   uint remu_threadgroup_waves = (remu_threadgroup_threads + 31u) >> 5u;\n",
+            );
+            // Ordinary compute dispatches have a zero ordered-append term. The remaining fields
+            // match the RDNA2 initial-wave SGPR layout: FIRST_WAVE[31], WAVE_ID[24:20], and the
+            // number of wave32s in this threadgroup in [5:0].
+            let _ = writeln!(
+                source,
+                "    s[{register}] = (remu_wave_id == 0u ? 0x80000000u : 0u) | ((remu_wave_id & 31u) << 20u) | (remu_threadgroup_waves & 63u);"
+            );
+        }
     }
 
     fn emit_vertex_interface(&self, source: &mut String) {
@@ -3984,8 +4045,8 @@ fn image_component_type(binding: &ImageBinding) -> &'static str {
 #[cfg(test)]
 mod tests {
     use remu_shader::{
-        DataShareControl, Dpp8Control, DppControl, Instruction, Program, ShaderEvaluation,
-        Vop3pControl, decode_program,
+        ComputeSystemRegisters, DataShareControl, Dpp8Control, DppControl, Instruction, Program,
+        ShaderEvaluation, Vop3pControl, decode_program,
     };
 
     use super::*;
@@ -4297,7 +4358,11 @@ mod tests {
                     encoding,
                     opcode: Opcode::Known(name),
                     words: vec![0, 0],
-                    sources: vec![Operand::vector(1), Operand::scalar(0), Operand::source(128, None)],
+                    sources: vec![
+                        Operand::vector(1),
+                        Operand::scalar(0),
+                        Operand::source(128, None),
+                    ],
                     destinations: Vec::new(),
                     control: Some(control),
                 }
@@ -4321,14 +4386,16 @@ mod tests {
         evaluation.initial_scalar_registers[3] = selectors | (60 << 12) | (1 << 24) | (3 << 28);
         evaluation.initial_scalar_registers[8] = 0x1000;
         evaluation.scalar_registers = evaluation.initial_scalar_registers.clone();
-        evaluation.global_memory_bindings.push(remu_shader::GlobalMemoryBinding {
-            scalar_address: 0,
-            base_address: 0x1000,
-            instruction_pcs: pcs,
-            data: vec![0; 64 * 1024],
-            writable: true,
-            write_back_to_guest: true,
-        });
+        evaluation
+            .global_memory_bindings
+            .push(remu_shader::GlobalMemoryBinding {
+                scalar_address: 0,
+                base_address: 0x1000,
+                instruction_pcs: pcs,
+                data: vec![0; 64 * 1024],
+                writable: true,
+                write_back_to_guest: true,
+            });
         (Program::new(0x1000, instructions), evaluation)
     }
 
@@ -4350,6 +4417,90 @@ mod tests {
         assert!(shader.source.contains("0xFFFF0000u"));
         assert!(shader.source.contains("0xFFFFFF00u"));
         assert!(shader.source.contains("remu_range_valid"));
+    }
+
+    #[test]
+    fn initializes_complete_rdna2_compute_system_register_state() {
+        let program = Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            }],
+        );
+        let mut evaluation = empty_evaluation();
+        evaluation.compute_system_registers = Some(ComputeSystemRegisters {
+            work_group_x: Some(4),
+            work_group_y: Some(5),
+            work_group_z: Some(6),
+            thread_group_size: Some(7),
+        });
+
+        let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+            .expect("compute system register lowering");
+
+        assert!(shader.source.contains("v[0] = remu_local_id.x"));
+        assert!(shader.source.contains("s[4] = remu_group_id.x;"));
+        assert!(shader.source.contains("s[5] = remu_group_id.y;"));
+        assert!(shader.source.contains("s[6] = remu_group_id.z;"));
+        assert!(
+            shader
+                .source
+                .contains("uint remu_thread_index [[thread_index_in_threadgroup]]")
+        );
+        assert!(
+            shader
+                .source
+                .contains("uint3 remu_group_size [[threads_per_threadgroup]]")
+        );
+        assert!(
+            shader
+                .source
+                .contains("(remu_wave_id == 0u ? 0x80000000u : 0u)")
+        );
+        assert!(shader.source.contains("((remu_wave_id & 31u) << 20u)"));
+        assert!(shader.source.contains("(remu_threadgroup_waves & 63u)"));
+    }
+
+    #[test]
+    fn rejects_compute_system_registers_outside_compute_and_sgpr_bounds() {
+        let program = Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            }],
+        );
+        let mut evaluation = empty_evaluation();
+        evaluation.compute_system_registers = Some(ComputeSystemRegisters {
+            work_group_x: Some(128),
+            ..ComputeSystemRegisters::default()
+        });
+        let error = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+            .expect_err("out-of-range system SGPR must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the scalar register file")
+        );
+
+        evaluation.compute_system_registers = Some(ComputeSystemRegisters {
+            work_group_x: Some(4),
+            ..ComputeSystemRegisters::default()
+        });
+        let error = compile_msl(&program, &evaluation, &MetalCompileOptions::vertex(0))
+            .expect_err("graphics stage must reject compute system SGPRs");
+        assert!(error.to_string().contains("require a compute shader stage"));
     }
 
     #[cfg(target_os = "macos")]
@@ -4386,7 +4537,13 @@ mod tests {
             eprintln!("skipping Apple Metal memory compile test: no metal compiler found");
             return;
         };
-        let (program, evaluation) = complete_memory_program();
+        let (program, mut evaluation) = complete_memory_program();
+        evaluation.compute_system_registers = Some(ComputeSystemRegisters {
+            work_group_x: Some(116),
+            work_group_y: Some(117),
+            work_group_z: Some(118),
+            thread_group_size: Some(119),
+        });
         let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
             .expect("complete decoded VMEM surface should lower");
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);

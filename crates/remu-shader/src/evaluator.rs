@@ -1719,12 +1719,7 @@ mod tests {
     #[test]
     fn sizes_swizzled_buffers_in_records_even_with_raw_oob_selection() {
         let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
-        registers[..4].copy_from_slice(&[
-            0x2000,
-            (16 << 16) | (1 << 31),
-            32,
-            3 << 28,
-        ]);
+        registers[..4].copy_from_slice(&[0x2000, (16 << 16) | (1 << 31), 32, 3 << 28]);
 
         let descriptor = decode_buffer_descriptor(&registers, 0, true).expect("descriptor");
 
