@@ -35,6 +35,11 @@ fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
+bundled_metal_compiler="$repo_dir/.remu/toolchains/Metal.xctoolchain/usr/bin/metal"
+if [ -z "${REMU_METAL_COMPILER:-}" ] && [ -x "$bundled_metal_compiler" ]; then
+    REMU_METAL_COMPILER=$bundled_metal_compiler
+    export REMU_METAL_COMPILER
+fi
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 run_dir="$repo_dir/.remu/runs/$run_id-$game_name"
 frame_dir="$run_dir/frames"
@@ -69,6 +74,9 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 echo "[REMu] launching $game_name; artifacts: $run_dir"
+if [ -n "${REMU_METAL_COMPILER:-}" ]; then
+    echo "[REMu] using offline Metal compiler: $REMU_METAL_COMPILER"
+fi
 set +e
 if [ "$capture_frames" = 1 ]; then
     env REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \

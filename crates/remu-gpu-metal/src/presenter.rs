@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -12,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
-    Buffer, CompileOptions, Device, Function, MTLCommandBufferStatus, MTLIndexType, MTLLoadAction,
-    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
+    Buffer, CompileOptions, Device, Function, Library, MTLCommandBufferStatus, MTLIndexType,
+    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
     MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLScissorRect, MTLSize,
     MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer,
     RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
@@ -493,13 +494,8 @@ impl MetalPresenter {
         let vertex_msl =
             remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)
                 .map_err(|error| format!("vertex lowering: {error}"))?;
-        let compile_options = CompileOptions::new();
-        let vertex_library = device
-            .new_library_with_source(&vertex_msl.source, &compile_options)
-            .map_err(|error| format!("Metal vertex compilation: {error}"))?;
-        let pixel_library = device
-            .new_library_with_source(&pixel_msl.source, &compile_options)
-            .map_err(|error| format!("Metal pixel compilation: {error}"))?;
+        let (vertex_library, pixel_library) =
+            compile_metal_libraries(device, &vertex_msl.source, &pixel_msl.source)?;
         let vertex_function = vertex_library
             .get_function(&vertex_msl.entry_point, None)
             .map_err(|error| format!("Metal vertex function: {error}"))?;
@@ -1070,6 +1066,119 @@ impl MetalPresenter {
         }
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+    }
+}
+
+fn compile_metal_libraries(
+    device: &Device,
+    vertex_source: &str,
+    pixel_source: &str,
+) -> Result<(Library, Library), String> {
+    if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+        return compile_metal_libraries_with_tools(device, vertex_source, pixel_source);
+    }
+
+    let compile_options = CompileOptions::new();
+    let vertex = device
+        .new_library_with_source(vertex_source, &compile_options)
+        .map_err(|error| format!("Metal vertex compilation: {error}"))?;
+    let pixel = device
+        .new_library_with_source(pixel_source, &compile_options)
+        .map_err(|error| format!("Metal pixel compilation: {error}"))?;
+    Ok((vertex, pixel))
+}
+
+fn compile_metal_libraries_with_tools(
+    device: &Device,
+    vertex_source: &str,
+    pixel_source: &str,
+) -> Result<(Library, Library), String> {
+    static NEXT_COMPILE_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+    let compiler = std::env::var_os("REMU_METAL_COMPILER")
+        .map(PathBuf::from)
+        .ok_or("REMU_METAL_COMPILER is not configured")?;
+    if !compiler.is_file() {
+        return Err(format!("{} is not a file", compiler.display()));
+    }
+    let linker = compiler.with_file_name("metallib");
+    if !linker.is_file() {
+        return Err(format!("{} is not a file", linker.display()));
+    }
+    let sequence = NEXT_COMPILE_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory =
+        std::env::temp_dir().join(format!("remu-metal-{}-{sequence}", std::process::id()));
+    std::fs::create_dir(&directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+    let directory = MetalCompileDirectory(directory);
+    let vertex_path = directory.0.join("vertex.metal");
+    let pixel_path = directory.0.join("pixel.metal");
+    let vertex_air = directory.0.join("vertex.air");
+    let pixel_air = directory.0.join("pixel.air");
+    let vertex_library_path = directory.0.join("vertex.metallib");
+    let pixel_library_path = directory.0.join("pixel.metallib");
+    std::fs::write(&vertex_path, vertex_source)
+        .map_err(|error| format!("could not write {}: {error}", vertex_path.display()))?;
+    std::fs::write(&pixel_path, pixel_source)
+        .map_err(|error| format!("could not write {}: {error}", pixel_path.display()))?;
+    run_metal_tool(
+        Command::new(&compiler)
+            .arg("-c")
+            .arg(&vertex_path)
+            .arg("-o")
+            .arg(&vertex_air),
+        "vertex compilation",
+    )?;
+    run_metal_tool(
+        Command::new(&compiler)
+            .arg("-c")
+            .arg(&pixel_path)
+            .arg("-o")
+            .arg(&pixel_air),
+        "pixel compilation",
+    )?;
+    run_metal_tool(
+        Command::new(&linker)
+            .arg(&vertex_air)
+            .arg("-o")
+            .arg(&vertex_library_path),
+        "vertex library link",
+    )?;
+    run_metal_tool(
+        Command::new(&linker)
+            .arg(&pixel_air)
+            .arg("-o")
+            .arg(&pixel_library_path),
+        "pixel library link",
+    )?;
+    let vertex_library = device
+        .new_library_with_file(&vertex_library_path)
+        .map_err(|error| format!("could not load {}: {error}", vertex_library_path.display()))?;
+    let pixel_library = device
+        .new_library_with_file(&pixel_library_path)
+        .map_err(|error| format!("could not load {}: {error}", pixel_library_path.display()))?;
+    Ok((vertex_library, pixel_library))
+}
+
+fn run_metal_tool(command: &mut Command, operation: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("could not start {operation}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "{operation} exited with {}: {}",
+        output.status,
+        diagnostics.trim()
+    ))
+}
+
+struct MetalCompileDirectory(PathBuf);
+
+impl Drop for MetalCompileDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
