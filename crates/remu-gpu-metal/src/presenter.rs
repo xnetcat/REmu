@@ -2503,7 +2503,13 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     let mut presenter = MetalPresenter::new(receiver)?;
     let mut builder = EventLoop::builder();
     builder
-        .with_activation_policy(ActivationPolicy::Regular)
+        // REmu currently runs as a Rosetta command-line process rather than an application
+        // bundle. Registering that process as a regular app gives the Dock ownership of its
+        // lifecycle; the Dock may then terminate a long compatibility run even though the Winit
+        // event loop is healthy. Accessory applications still own interactive windows and receive
+        // keyboard input, but remain attached to the launching terminal until the future GUI ships
+        // as a real `.app` bundle.
+        .with_activation_policy(ActivationPolicy::Accessory)
         .with_activate_ignoring_other_apps(true);
     let event_loop = builder
         .build()
