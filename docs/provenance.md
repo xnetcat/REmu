@@ -146,6 +146,12 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   macOS SDK's `libproc.h`/`sys/proc_info.h` declarations for `proc_pidinfo(PROC_PIDTASKINFO)` live
   resident memory. Audio-underrun percentage comes from REmu's own CoreAudio callback frame and
   missing-sample counts; the title never relabels the Metal HUD's overlay cadence as guest FPS.
+- Immutable sampler argument-buffer reuse follows the installed macOS SDK's public
+  `MTLArgumentEncoder` contract: an encoder reports the exact storage length, selects a destination
+  buffer, and writes sampler-state bindings into that buffer. REmu independently retains that
+  encoded buffer and its sampler objects under an exact compiled-function/buffer-index/descriptor
+  key, with a fixed 1,024-entry bound. No upstream emulator implementation was copied for this
+  cache.
 - REmu independently implements a checked readback ticket: a backed single-sample texture is blitted
   into an aligned shared buffer on the producing command queue, the source and staging resources are
   retained through command-buffer completion, and padding is removed into the exact native pixel

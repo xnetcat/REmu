@@ -121,6 +121,15 @@ milestone completion claim.
   telemetry every 500 ms: completed presentation FPS/frame time, guest flip rate, average Metal
   completion latency, live RSS, encoded draw/compute rates, guest GPU/presentation queue depths,
   and the exact percentage of CoreAudio callback frames with a guest-port underrun.
+- The first clean telemetry run at `e071d2f` displayed no HUD and reported 36.0 completed presents
+  and guest flips per second, 1.4 ms average Metal completion latency, empty GPU/presentation
+  queues, 254 encoded draws per second, 332 MiB RSS, and 23.9% CoreAudio callback-frame underruns.
+  This locates the immediate pacing/audio problem on the host CPU presentation path rather than in
+  GPU completion. A live process sample identified repeated `MTLFunction` argument reflection,
+  argument-buffer allocation, and sampler creation on that per-draw path. The current increment
+  retains a bounded cache of immutable sampler argument buffers, keyed by compiled Metal function,
+  buffer slot, and the complete ordered guest sampler descriptors. A device-backed regression
+  compiles a real sampler argument-buffer function and proves identical bindings reuse one buffer.
 
 ## Subsystem ledger
 
@@ -131,7 +140,7 @@ milestone completion claim.
 | Metal resources / readback | Persistent guest textures, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, MSAA resolve targets, and supported depth readback are covered by GPU tests. Internal Metal compression is handled by the blit and remains separate from guest tiling. | Move diagnostic capture to bounded asynchronous tickets and a reusable staging pool after correctness evidence; add explicit block-compressed and combined depth/stencil aspect layouts when guest formats exercise them. |
 | Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, and guest metadata are covered. `MAP_NO_COALESCE` mappings retain private identities for exact `VirtualQuery` boundaries; direct release invalidates all overlapping aliases and preserves unaffected tails. Containment-first/find-next query behavior and cross-VMA atomic unmap have synthetic coverage, and the `ad2b208` title run validated the corrected sequence. | Complete mapping lifecycle counters and exact query error/flag behavior for all exercised cases. |
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, and translated shader pipelines are present. | Complete reusable blend, depth/stencil, rasterization, culling, front-face, multisampling, resolve, and full structural cache identity; audit old blend commit `a0388df` without wholesale cherry-picking. |
-| Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, and observed compute geometry are implemented with offline Metal compilation tests. | Complete the unimplemented RDNA2 instruction/resource/CFG surface and replace large per-draw shader snapshots with bounded content-addressed immutable spans. |
+| Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, and observed compute geometry are implemented with offline Metal compilation tests. Immutable sampler argument buffers are cached by exact compiled function, binding slot, and ordered descriptor content. | Complete the unimplemented RDNA2 instruction/resource/CFG surface, replace large per-draw shader snapshots with bounded content-addressed immutable spans, and eliminate remaining per-draw Metal buffer churn without weakening guest-memory visibility. |
 | Presentation / frame capture | Guest display size is independent of host drawable size; headless Metal is opt-in; interactive runs use a regular app bundle; direct scanout avoids routine GPU-to-CPU presentation round trips and preserves composed draws across separate render passes. Completed-present, flip, queue, memory, draw/compute, and audio-underrun statistics update in the title bar without an overlay. | Resolve the post-boot near-black fullscreen triangles into the first real scene, then use completed-presentation and guest-flip rates to measure frame pacing. Do not infer playability from splash/transition frames. |
 | Runtime / ABI | Whole-process import auditing reports 379 HLE routes, 130 guest-libc routes, one host route, and one unresolved weak `__pthread_cxa_finalize`. Condition waits now use explicit FIFO tickets with distinct signal/broadcast cardinality, atomic mutex release/reacquisition, recursive-depth preservation, dynamic mutex binding, timeout arbitration, and SCE/POSIX error encodings. | Validate the BackgroundLoader crash correlation, then complete opaque guest condition-object lifecycle, guest-thread identity, cancellation, condition clock attributes, and POSIX absolute timed waits. Continue source-backed AGC fusion/event queues, save-dialog lifecycle, semaphore poll, unlink, pad/thread/save/sysmodule lifecycle, and researched anonymous NIDs. |
 | Audio | Host output, guest port/config validation, bounded queues, resampling, and stereo downmixing exist. | Audit timing/backpressure/device change/pause/teardown/A-V synchronization against actual title use and add deterministic offline mixer evidence. |
@@ -160,9 +169,12 @@ milestone completion claim.
    composition lifetime, but captured only near-black post-boot triangles. A clean windowed run and
    user screenshot independently confirmed that the title remained black; the HUD's presentation
    cadence was not treated as game FPS.
-10. Complete for the title-bar telemetry increment: checks 1-6 plus `sh -n scripts/run-game.sh`
-    pass natively and through Rosetta. Its next evidence step is a clean windowed launch with the
-    Metal HUD absent and live title statistics visible.
+10. Complete at `e071d2f`: checks 1-6 plus `sh -n scripts/run-game.sh` passed natively and through
+    Rosetta. A clean windowed run had no Metal HUD and exposed live title statistics; its measured
+    36.0 FPS/flip cadence, 1.4 ms Metal latency, empty queues, and 23.9% audio underruns identify a
+    host CPU presentation bottleneck rather than saturated GPU execution.
+11. The sampler argument-buffer cache has a focused device-backed Metal regression. Complete checks
+    1-6, then compare one clean windowed Dreaming Sarah run against the `e071d2f` telemetry baseline.
 
 Reference implementation provenance is recorded in [provenance](provenance.md); architectural and
 licensing constraints remain in [architecture](architecture.md) and [source policy](source-policy.md).

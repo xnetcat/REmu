@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
+use metal::foreign_types::ForeignType;
 use metal::{
     Buffer, CommandBuffer, CompileOptions, ComputePipelineState, Device, Function, Library,
     MTLBlitOption, MTLClearColor, MTLColorWriteMask, MTLCommandBufferStatus, MTLIndexType,
@@ -44,6 +45,7 @@ use winit::window::{Window, WindowId};
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const GPU_EVENTS_PER_TICK: usize = 16;
 const SHADER_COMPILE_QUEUE_CAPACITY: usize = 1;
+const SAMPLER_ARGUMENT_CACHE_CAPACITY: usize = 1_024;
 const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -362,6 +364,18 @@ struct CompiledComputePipeline {
     shader: remu_shader_metal::MetalShader,
 }
 
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct SamplerArgumentCacheKey {
+    function: usize,
+    buffer_index: u32,
+    descriptors: Vec<Vec<u32>>,
+}
+
+struct CachedSamplerArguments {
+    buffer: Buffer,
+    samplers: Vec<SamplerState>,
+}
+
 #[derive(Clone)]
 struct ProgramIdentity(Arc<remu_shader::Program>);
 
@@ -652,6 +666,7 @@ struct MetalPresenter {
     resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     direct_scanout_textures: HashMap<u64, DirectScanoutTexture>,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
+    sampler_argument_cache: HashMap<SamplerArgumentCacheKey, CachedSamplerArguments>,
     resident_content_version: u64,
     open_guest_batch: Option<GuestCommandBatch>,
     committed_guest_batches: VecDeque<GuestCommandBatch>,
@@ -723,6 +738,7 @@ impl MetalPresenter {
             resident_guest_textures: HashMap::new(),
             direct_scanout_textures: HashMap::new(),
             sampled_texture_cache: HashMap::new(),
+            sampler_argument_cache: HashMap::new(),
             resident_content_version: 0,
             open_guest_batch: None,
             committed_guest_batches: VecDeque::new(),
@@ -1185,6 +1201,42 @@ impl MetalPresenter {
         texture
     }
 
+    fn cached_sampler_argument_buffer(
+        &mut self,
+        device: &Device,
+        function: &Function,
+        buffer_index: Option<u32>,
+        evaluation: &ShaderEvaluation,
+    ) -> Result<(Option<Buffer>, Vec<SamplerState>), String> {
+        let sampled_descriptors = sampled_image_bindings(evaluation)
+            .map(|binding| binding.sampler_descriptor.clone())
+            .collect::<Vec<_>>();
+        let key = buffer_index.map(|buffer_index| SamplerArgumentCacheKey {
+            function: function.as_ptr() as usize,
+            buffer_index,
+            descriptors: sampled_descriptors,
+        });
+        if let Some(cached) = key
+            .as_ref()
+            .and_then(|key| self.sampler_argument_cache.get(key))
+        {
+            return Ok((Some(cached.buffer.clone()), cached.samplers.clone()));
+        }
+        let created = create_sampler_argument_buffer(device, function, buffer_index, evaluation)?;
+        if self.sampler_argument_cache.len() < SAMPLER_ARGUMENT_CACHE_CAPACITY
+            && let (Some(key), Some(buffer)) = (key, created.0.as_ref())
+        {
+            self.sampler_argument_cache.insert(
+                key,
+                CachedSamplerArguments {
+                    buffer: buffer.clone(),
+                    samplers: created.1.clone(),
+                },
+            );
+        }
+        Ok(created)
+    }
+
     fn direct_scanout_needs_initial_clear(&self, address: u64) -> bool {
         self.direct_scanout_textures
             .get(&address)
@@ -1643,7 +1695,7 @@ impl MetalPresenter {
             &mut self.resident_guest_textures,
             &mut self.sampled_texture_cache,
         )?;
-        let (sampler_buffer, _samplers) = create_sampler_argument_buffer(
+        let (sampler_buffer, _samplers) = self.cached_sampler_argument_buffer(
             &device,
             &function,
             bindings.sampler_argument_buffer_index,
@@ -1821,27 +1873,41 @@ impl MetalPresenter {
             &mut self.resident_guest_textures,
             &mut self.sampled_texture_cache,
         )?;
-        let compiled = self
-            .compiled_shader_pairs
-            .get(&key)
-            .ok_or("shader pair has no compiled Metal pipeline")?;
-        let (export_sampler_buffer, _export_samplers) = create_sampler_argument_buffer(
+        let (
+            pipeline,
+            vertex_function,
+            pixel_function,
+            vertex_scalar_buffer_index,
+            pixel_scalar_buffer_index,
+            vertex_sampler_buffer_index,
+            pixel_sampler_buffer_index,
+        ) = {
+            let compiled = self
+                .compiled_shader_pairs
+                .get(&key)
+                .ok_or("shader pair has no compiled Metal pipeline")?;
+            (
+                compiled.pipeline.clone(),
+                compiled.vertex_function.clone(),
+                compiled.pixel_function.clone(),
+                compiled.vertex.bindings.initial_scalar_buffer_index,
+                compiled.pixel.bindings.initial_scalar_buffer_index,
+                compiled.vertex.bindings.sampler_argument_buffer_index,
+                compiled.pixel.bindings.sampler_argument_buffer_index,
+            )
+        };
+        let (export_sampler_buffer, _export_samplers) = self.cached_sampler_argument_buffer(
             &device,
-            &compiled.vertex_function,
-            compiled.vertex.bindings.sampler_argument_buffer_index,
+            &vertex_function,
+            vertex_sampler_buffer_index,
             export_evaluation,
         )?;
-        let (pixel_sampler_buffer, _pixel_samplers) = create_sampler_argument_buffer(
+        let (pixel_sampler_buffer, _pixel_samplers) = self.cached_sampler_argument_buffer(
             &device,
-            &compiled.pixel_function,
-            compiled.pixel.bindings.sampler_argument_buffer_index,
+            &pixel_function,
+            pixel_sampler_buffer_index,
             pixel_evaluation,
         )?;
-        let pipeline = compiled.pipeline.clone();
-        let vertex_scalar_buffer_index = compiled.vertex.bindings.initial_scalar_buffer_index;
-        let pixel_scalar_buffer_index = compiled.pixel.bindings.initial_scalar_buffer_index;
-        let vertex_sampler_buffer_index = compiled.vertex.bindings.sampler_argument_buffer_index;
-        let pixel_sampler_buffer_index = compiled.pixel.bindings.sampler_argument_buffer_index;
 
         let pass = RenderPassDescriptor::new();
         for (location, (texture, clear_uninitialized)) in target_textures
@@ -4510,16 +4576,16 @@ mod tests {
         ComputeGrid, ComputeLaunch, GpuColorTarget, GpuEvent, GpuMemoryAcquire, GpuRegister,
         GpuScanoutTarget, IndexedDraw, gpu_event_channel,
     };
-    use remu_shader::PixelOutputKind;
+    use remu_shader::{ImageBinding, ImageControl, Opcode, PixelOutputKind, ShaderEvaluation};
 
     use super::{
         CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
         CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
-        GraphicsPipelineKey, GuestTextureDescriptor, OrderedEventPoll, OrderedGpuEventReceiver,
-        PendingTextureReadback, PresentationResolution, TextureReadbackLayout,
-        apply_image_destination_select, decode_image_descriptor, decode_render_target_format,
-        decode_render_targets_from_registers, decode_scanout_target, decode_scissor,
-        decode_viewport, effective_linear_pitch, effective_linear_rgba_pitch,
+        GraphicsPipelineKey, GuestTextureDescriptor, MetalPresenter, OrderedEventPoll,
+        OrderedGpuEventReceiver, PendingTextureReadback, PresentationResolution,
+        TextureReadbackLayout, apply_image_destination_select, decode_image_descriptor,
+        decode_render_target_format, decode_render_targets_from_registers, decode_scanout_target,
+        decode_scissor, decode_viewport, effective_linear_pitch, effective_linear_rgba_pitch,
         guest_texture_byte_count, guest_texture_descriptors_overlap, guest_texture_raw_matches,
         headless_metal_value_is_enabled, metal_color_write_mask, metal_nonindexed_vertex_count,
         mode27_block_dimensions, mode27_source_byte_offset, mode27_within_block_byte_offset,
@@ -4546,6 +4612,81 @@ mod tests {
     #[test]
     fn reads_live_process_resident_memory_for_window_telemetry() {
         assert!(process_resident_bytes().is_some_and(|bytes| bytes > 0));
+    }
+
+    #[test]
+    fn reuses_immutable_sampler_argument_buffers() {
+        let (_sender, receiver) = gpu_event_channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+        let device = presenter
+            .device
+            .as_ref()
+            .expect("presenter retains its Metal device")
+            .clone();
+        let source = r"
+#include <metal_stdlib>
+using namespace metal;
+struct RemuSamplers {
+    sampler s0 [[id(0)]];
+};
+kernel void remu_sampler_cache_test(
+    constant RemuSamplers& samplers [[buffer(0)]],
+    device float4* output [[buffer(1)]],
+    texture2d<float> texture [[texture(0)]],
+    uint gid [[thread_position_in_grid]]) {
+    output[gid] = texture.sample(samplers.s0, float2(0.5f));
+}
+";
+        let library = device
+            .new_library_with_source(source, &CompileOptions::new())
+            .expect("sampler argument-buffer MSL compiles");
+        let function = library
+            .get_function("remu_sampler_cache_test", None)
+            .expect("sampler cache function exists");
+        let evaluation = ShaderEvaluation {
+            initial_scalar_registers: Vec::new(),
+            scalar_registers: Vec::new(),
+            image_bindings: vec![ImageBinding {
+                pc: 0x100,
+                opcode: Opcode::Known("ImageSample"),
+                control: ImageControl {
+                    dmask: 0xf,
+                    vector_address: 0,
+                    address_registers: vec![0, 1],
+                    vector_data: 4,
+                    scalar_resource: 0,
+                    scalar_sampler: 8,
+                    dimension: 1,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                },
+                resource_descriptor: vec![0; 8],
+                sampler_descriptor: vec![0; 4],
+                mip_level: None,
+            }],
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            runtime_scalar_registers: std::collections::BTreeSet::new(),
+            vertex_inputs: Vec::new(),
+        };
+
+        let (first_buffer, first_samplers) = presenter
+            .cached_sampler_argument_buffer(&device, &function, Some(0), &evaluation)
+            .expect("first sampler argument buffer is created");
+        let (second_buffer, second_samplers) = presenter
+            .cached_sampler_argument_buffer(&device, &function, Some(0), &evaluation)
+            .expect("identical sampler argument buffer is reused");
+
+        assert_eq!(presenter.sampler_argument_cache.len(), 1);
+        assert_eq!(first_samplers.len(), 1);
+        assert_eq!(second_samplers.len(), 1);
+        assert_eq!(
+            first_buffer.expect("first buffer").contents(),
+            second_buffer.expect("second buffer").contents()
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
