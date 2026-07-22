@@ -36,7 +36,8 @@ cargo run -p remu-cli -- gpu-info
 For repeatable Apple Silicon game runs, use the runner. It builds the x86-64 release, injects
 periodic Cross presses, records unresolved NIDs, and keeps logs and optional captures under
 `.remu/runs/`. With no second argument it is interactive and has no timer; pass a positive number of
-seconds only for a bounded diagnostic run:
+seconds only for a bounded diagnostic run. Interactive launches run from a generated `REmu.app`
+bundle so AppKit registers the process as a regular Dock application:
 
 ```sh
 scripts/run-game.sh DREAMING

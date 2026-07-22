@@ -46,7 +46,8 @@ fi
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 run_dir="$repo_dir/.remu/runs/$run_id-$game_name"
 frame_dir="$run_dir/frames"
-binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
+raw_binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
+app_bundle="$repo_dir/target/x86_64-apple-darwin/release/REmu.app"
 mkdir -p "$frame_dir"
 
 if [ "${REMU_SKIP_BUILD:-0}" != 1 ]; then
@@ -55,9 +56,16 @@ if [ "${REMU_SKIP_BUILD:-0}" != 1 ]; then
         --release --target x86_64-apple-darwin -p remu-cli
 fi
 
-if [ ! -x "$binary" ]; then
-    echo "error: Rosetta runner not found: $binary" >&2
+if [ ! -x "$raw_binary" ]; then
+    echo "error: Rosetta runner not found: $raw_binary" >&2
     exit 69
+fi
+
+if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
+    binary=$raw_binary
+else
+    "$script_dir/build-macos-app.sh" "$raw_binary" "$app_bundle" >/dev/null
+    binary="$app_bundle/Contents/MacOS/remu"
 fi
 
 # Interactive runs never inject controller input unless the caller explicitly supplies a schedule.
@@ -93,6 +101,9 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 echo "[REMu] launching $game_name; artifacts: $run_dir"
+if [ "${REMU_HEADLESS_METAL:-0}" != 1 ]; then
+    echo "[REMu] launching the interactive REmu.app bundle"
+fi
 if [ -n "${REMU_METAL_COMPILER:-}" ]; then
     echo "[REMu] using offline Metal compiler: $REMU_METAL_COMPILER"
 fi
