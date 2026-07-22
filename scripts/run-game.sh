@@ -59,7 +59,22 @@ if [ ! -x "$binary" ]; then
 fi
 
 auto_cross=${REMU_AUTO_CROSS:-8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,100,102,104,106,108,110,112,114,116,118}
-capture_frames=${REMU_CAPTURE_FRAMES:-1}
+# Capturing a 4K PPM writes roughly 32 MiB per image and fingerprints the full frame on the
+# presenter thread. Keep it explicit so ordinary game runs measure the emulator rather than the
+# diagnostic I/O path.
+capture_frames=${REMU_CAPTURE_FRAMES:-0}
+
+# Apple documents these variables as the command-line equivalent of Xcode's Metal Performance
+# HUD options. Preserve explicit MTL_* settings so callers can customize the HUD directly.
+if [ "${REMU_METAL_HUD:-0}" = 1 ]; then
+    MTL_HUD_ENABLED=${MTL_HUD_ENABLED:-1}
+    export MTL_HUD_ENABLED
+fi
+if [ "${REMU_METAL_HUD_LOG:-0}" = 1 ]; then
+    MTL_HUD_ENABLED=${MTL_HUD_ENABLED:-1}
+    MTL_HUD_LOG_ENABLED=${MTL_HUD_LOG_ENABLED:-1}
+    export MTL_HUD_ENABLED MTL_HUD_LOG_ENABLED
+fi
 revision=$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)
 started_at=$(date +%s)
 child_pid=
@@ -77,6 +92,12 @@ trap cleanup EXIT HUP INT TERM
 echo "[REMu] launching $game_name; artifacts: $run_dir"
 if [ -n "${REMU_METAL_COMPILER:-}" ]; then
     echo "[REMu] using offline Metal compiler: $REMU_METAL_COMPILER"
+fi
+if [ "${MTL_HUD_ENABLED:-0}" = 1 ]; then
+    echo "[REMu] Metal Performance HUD enabled"
+fi
+if [ "${MTL_HUD_LOG_ENABLED:-0}" = 1 ]; then
+    echo "[REMu] Metal Performance HUD logging enabled"
 fi
 set +e
 if [ "$capture_frames" = 1 ]; then
