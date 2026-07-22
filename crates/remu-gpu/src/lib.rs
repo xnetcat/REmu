@@ -424,7 +424,9 @@ pub fn compute_program_address(shader_registers: &[GpuRegister]) -> Option<u64> 
         .iter()
         .find(|register| register.offset == COMPUTE_PGM_HI_REGISTER)?
         .value;
-    Some((u64::from(high) << 40) | (u64::from(low) << 8))
+    // GFX10 COMPUTE_PGM_HI carries only address bits 47:40. Reserved high bits are not part of
+    // the virtual address (Kyty's command processor applies the same 8-bit mask).
+    Some((u64::from(high & 0xff) << 40) | (u64::from(low) << 8))
 }
 
 #[must_use]
@@ -722,7 +724,7 @@ mod tests {
             },
             GpuRegister {
                 offset: COMPUTE_PGM_HI_REGISTER,
-                value: 0x5a,
+                value: 0xdead_be5a,
             },
             GpuRegister {
                 offset: COMPUTE_PGM_RSRC2_REGISTER,

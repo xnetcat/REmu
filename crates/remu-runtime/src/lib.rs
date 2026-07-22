@@ -2117,6 +2117,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "rKBUtgRrtbk" => "sceVideoOutRegisterBuffers2",
         "UglJIZjGssM" => "sceAgcDriverSubmitDcb",
         "6UzEidRZwkg" => "sceAgcDriverSubmitMultiDcbs",
+        "gSRnr79F8tQ" => "sceAgcDriverSubmitAcb",
+        "HF3YllT3mXU" => "sceAgcDriverSubmitMultiAcbs",
         "YUeqkyT7mEQ" => "sceAgcDcbSetFlip",
         "h9z6+0hEydk" => "sceAgcSuspendPoint",
         "1G3lF1Gg1k8" => "sceKernelOpen",
@@ -2205,6 +2207,8 @@ struct ProbeDispatchState {
     np_trophy: np::TrophyState,
     agc_submission_count: u64,
     agc_graphics: AgcGraphicsState,
+    agc_compute_queues: BTreeMap<u32, AgcGraphicsState>,
+    agc_shader_registry: AgcShaderRegistry,
     agc_index_resources: BTreeMap<u64, u64>,
     pending_events: VecDeque<KernelQueuedEvent>,
     next_kernel_fd: i32,
@@ -2363,11 +2367,17 @@ struct AgcGraphicsState {
     index_size: u32,
     instance_count: u32,
     draw_index_offset: u32,
+    compute_indirect_args_address: u64,
     emitted_draws: u64,
+    emitted_compute_dispatches: u64,
     traced_shader_pairs: BTreeSet<(u64, u64)>,
-    shader_headers: BTreeMap<u64, u64>,
-    shader_snapshots: BTreeMap<u64, remu_gpu::ShaderSnapshot>,
-    shader_decode_failures: BTreeSet<u64>,
+}
+
+#[derive(Debug, Default)]
+struct AgcShaderRegistry {
+    headers: BTreeMap<u64, u64>,
+    snapshots: BTreeMap<u64, remu_gpu::ShaderSnapshot>,
+    decode_failures: BTreeSet<u64>,
 }
 
 impl AgcGraphicsState {
@@ -2381,6 +2391,7 @@ impl AgcGraphicsState {
         self.index_size = 0;
         self.instance_count = 1;
         self.draw_index_offset = 0;
+        self.compute_indirect_args_address = 0;
     }
 }
 
@@ -2614,6 +2625,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.np_trophy = np::TrophyState::default();
     state.agc_submission_count = 0;
     state.agc_graphics = AgcGraphicsState::default();
+    state.agc_compute_queues.clear();
+    state.agc_shader_registry = AgcShaderRegistry::default();
     state.agc_index_resources.clear();
     state.pending_events.clear();
     state.next_kernel_fd = 3;
@@ -3692,6 +3705,8 @@ fn dispatch_probe_import(
         "YUeqkyT7mEQ" => agc_dcb_set_flip(arguments),
         "UglJIZjGssM" => agc_driver_submit_dcb(arguments, state),
         "6UzEidRZwkg" => agc_driver_submit_multi_dcbs(arguments, state),
+        "gSRnr79F8tQ" => agc_driver_submit_acb(arguments, state),
+        "HF3YllT3mXU" => agc_driver_submit_multi_acbs(arguments, state),
         "PjS5uASwcV8" => video_out_set_buffer_attribute2(arguments, state),
         "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
         "HXzjK9yI30k" => video_out_add_flip_event(arguments, state),
@@ -4223,7 +4238,10 @@ const AGC_COMMAND_BUFFER_CURSOR_DOWN_OFFSET: u64 = 0x18;
 const AGC_COMMAND_BUFFER_RESERVED_DWORDS_OFFSET: u64 = 0x30;
 
 const AGC_IT_NOP: u32 = 0x10;
+const AGC_IT_SET_BASE: u32 = 0x11;
 const AGC_IT_INDEX_BUFFER_SIZE: u32 = 0x13;
+const AGC_IT_DISPATCH_DIRECT: u32 = 0x15;
+const AGC_IT_DISPATCH_INDIRECT: u32 = 0x16;
 const AGC_IT_INDEX_BASE: u32 = 0x26;
 const AGC_IT_INDEX_TYPE: u32 = 0x2a;
 const AGC_IT_DRAW_INDEX_AUTO: u32 = 0x2d;
@@ -4231,12 +4249,16 @@ const AGC_IT_NUM_INSTANCES: u32 = 0x2f;
 const AGC_IT_DRAW_INDEX_OFFSET: u32 = 0x35;
 const AGC_IT_WAIT_REG_MEM: u32 = 0x3c;
 const AGC_IT_EVENT_WRITE: u32 = 0x46;
+const AGC_IT_SET_SH_REG_INDIRECT: u32 = 0x63;
+const AGC_IT_SET_UCONFIG_REG_INDIRECT: u32 = 0x64;
 const AGC_IT_SET_CONTEXT_REG: u32 = 0x69;
 const AGC_IT_SET_SH_REG: u32 = 0x76;
 const AGC_IT_SET_UCONFIG_REG: u32 = 0x79;
+const AGC_IT_SET_CONTEXT_REG_INDIRECT: u32 = 0x9f;
 const AGC_R_ZERO: u32 = 0x00;
 const AGC_R_DRAW_INDEX_AUTO: u32 = 0x04;
 const AGC_R_DRAW_RESET: u32 = 0x05;
+const AGC_R_ACB_RESET: u32 = 0x09;
 const AGC_R_WAIT_MEM_32: u32 = 0x0a;
 const AGC_R_SH_REGS_INDIRECT: u32 = 0x11;
 const AGC_R_CX_REGS_INDIRECT: u32 = 0x12;
@@ -4256,6 +4278,7 @@ const AGC_SPI_SHADER_PGM_LO_ES: u32 = 0x0c8;
 const AGC_SPI_SHADER_PGM_HI_ES: u32 = 0x0c9;
 const AGC_CB_COLOR0_BASE: u32 = 0x318;
 const AGC_CB_COLOR0_BASE_EXT: u32 = 0x390;
+const AGC_COMPUTE_USER_DATA_0: u32 = 0x240;
 
 const AGC_SHADER_SPECIAL_GE_CNTL_OFFSET: u64 = 0x00;
 const AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET: u64 = 0x08;
@@ -4302,9 +4325,9 @@ fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
     if !patch_agc_shader_program_registers(header, code) {
         return u64::MAX;
     }
-    state.agc_graphics.shader_headers.insert(code, header);
-    state.agc_graphics.shader_snapshots.remove(&code);
-    state.agc_graphics.shader_decode_failures.remove(&code);
+    state.agc_shader_registry.headers.insert(code, header);
+    state.agc_shader_registry.snapshots.remove(&code);
+    state.agc_shader_registry.decode_failures.remove(&code);
     if destination != 0 {
         write_guest_u64(destination, header);
     }
@@ -5035,13 +5058,13 @@ fn agc_apply_submission_registers(
     opcode: u32,
     register: u32,
     graphics: &mut AgcGraphicsState,
-) {
+) -> Result<(), AgcSubmissionError> {
     if matches!(
         opcode,
         AGC_IT_SET_CONTEXT_REG | AGC_IT_SET_SH_REG | AGC_IT_SET_UCONFIG_REG
     ) {
         if length < 3 {
-            return;
+            return Ok(());
         }
         let first_register = read_guest_u32(packet_address + 4);
         let destination = match opcode {
@@ -5055,7 +5078,37 @@ fn agc_apply_submission_registers(
                 read_guest_u32(packet_address + u64::from(index + 2) * 4),
             );
         }
-        return;
+        return Ok(());
+    }
+
+    if matches!(
+        opcode,
+        AGC_IT_SET_CONTEXT_REG_INDIRECT
+            | AGC_IT_SET_SH_REG_INDIRECT
+            | AGC_IT_SET_UCONFIG_REG_INDIRECT
+    ) {
+        if length != 5 {
+            return Err(AgcSubmissionError::NativeIndirectRegisterPacketLength {
+                opcode,
+                actual: length,
+            });
+        }
+        let registers_address = u64::from(read_guest_u32(packet_address + 4) & !0x3)
+            | (u64::from(read_guest_u32(packet_address + 8)) << 32);
+        let register_count = read_guest_u32(packet_address + 16) & 0x3fff;
+        let (destination, normalize_selector) = match opcode {
+            AGC_IT_SET_CONTEXT_REG_INDIRECT => (&mut graphics.context_registers, false),
+            AGC_IT_SET_SH_REG_INDIRECT => (&mut graphics.shader_registers, true),
+            _ => (&mut graphics.user_config_registers, true),
+        };
+        agc_apply_indirect_register_table(
+            opcode,
+            registers_address,
+            register_count,
+            normalize_selector,
+            destination,
+        )?;
+        return Ok(());
     }
 
     if opcode != AGC_IT_NOP
@@ -5065,29 +5118,73 @@ fn agc_apply_submission_registers(
         )
         || length < 4
     {
-        return;
+        return Ok(());
     }
     let register_count = read_guest_u32(packet_address + 4).min(4_096);
     let registers_address = read_guest_u64(packet_address + 8);
-    if registers_address == 0 {
-        return;
-    }
     let destination = match register {
         AGC_R_CX_REGS_INDIRECT => &mut graphics.context_registers,
         AGC_R_SH_REGS_INDIRECT => &mut graphics.shader_registers,
         _ => &mut graphics.user_config_registers,
     };
-    for index in 0..register_count {
-        let entry = registers_address + u64::from(index) * 8;
-        destination.insert(read_guest_u32(entry), read_guest_u32(entry + 4));
+    agc_apply_indirect_register_table(
+        opcode,
+        registers_address,
+        register_count,
+        false,
+        destination,
+    )
+}
+
+fn agc_apply_indirect_register_table(
+    opcode: u32,
+    registers_address: u64,
+    register_count: u32,
+    normalize_selector: bool,
+    destination: &mut BTreeMap<u32, u32>,
+) -> Result<(), AgcSubmissionError> {
+    if register_count == 0 {
+        return Ok(());
     }
+    if registers_address == 0 {
+        return Err(AgcSubmissionError::NullIndirectRegisterTable {
+            opcode,
+            register_count,
+        });
+    }
+    let byte_count =
+        usize::try_from(register_count).expect("14-bit indirect register count fits usize") * 8;
+    let mut bytes = vec![0_u8; byte_count];
+    if registers_address
+        .checked_add(u64::try_from(byte_count).expect("register table length fits u64"))
+        .is_none()
+        || !ProcessGuestMemory.read(registers_address, &mut bytes)
+    {
+        return Err(AgcSubmissionError::UnreadableIndirectRegister(
+            registers_address,
+        ));
+    }
+    for pair in bytes.chunks_exact(8) {
+        let raw_offset = u32::from_le_bytes(pair[..4].try_into().expect("register offset dword"));
+        if raw_offset == u32::MAX {
+            continue;
+        }
+        let offset = if normalize_selector {
+            raw_offset & !0x7000_0000
+        } else {
+            raw_offset
+        };
+        let value = u32::from_le_bytes(pair[4..].try_into().expect("register value dword"));
+        destination.insert(offset, value);
+    }
+    Ok(())
 }
 
 fn agc_program_address(registers: &BTreeMap<u32, u32>, low: u32, high: u32) -> u64 {
     let Some((&low, &high)) = registers.get(&low).zip(registers.get(&high)) else {
         return 0;
     };
-    (u64::from(high) << 40) | (u64::from(low) << 8)
+    (u64::from(high & 0xff) << 40) | (u64::from(low) << 8)
 }
 
 fn agc_color_target_address(registers: &BTreeMap<u32, u32>) -> u64 {
@@ -5171,29 +5268,25 @@ impl GuestMemoryReader for ProcessGuestMemory {
 }
 
 fn agc_shader_snapshot(
-    graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
     address: u64,
 ) -> Option<remu_gpu::ShaderSnapshot> {
-    if address == 0 || graphics.shader_decode_failures.contains(&address) {
+    if address == 0 || shaders.decode_failures.contains(&address) {
         return None;
     }
-    if let Some(snapshot) = graphics.shader_snapshots.get(&address) {
+    if let Some(snapshot) = shaders.snapshots.get(&address) {
         return Some(snapshot.clone());
     }
     let memory = ProcessGuestMemory;
     let program = match remu_shader::read_program(&memory, address) {
         Ok(program) => Arc::new(program),
         Err(error) => {
-            graphics.shader_decode_failures.insert(address);
+            shaders.decode_failures.insert(address);
             eprintln!("[REMu][AGC][SHADER] decode failed at {address:#x}: {error}");
             return None;
         }
     };
-    let header_address = graphics
-        .shader_headers
-        .get(&address)
-        .copied()
-        .unwrap_or_default();
+    let header_address = shaders.headers.get(&address).copied().unwrap_or_default();
     let metadata = (header_address != 0)
         .then(|| remu_shader::read_shader_metadata(&memory, header_address))
         .transpose()
@@ -5207,12 +5300,191 @@ fn agc_shader_snapshot(
         program,
         metadata,
     };
-    graphics.shader_snapshots.insert(address, snapshot.clone());
+    shaders.snapshots.insert(address, snapshot.clone());
     Some(snapshot)
+}
+
+#[derive(Debug, Error)]
+enum AgcComputeDispatchError {
+    #[error(transparent)]
+    Decode(#[from] remu_gpu::ComputeDispatchDecodeError),
+    #[error("base-relative DISPATCH_INDIRECT has no active compute indirect-argument base")]
+    MissingIndirectBase,
+    #[error("compute indirect dimensions address overflows the guest address space")]
+    IndirectAddressOverflow,
+    #[error("compute indirect dimensions at 0x{0:016X} are not readable")]
+    UnreadableIndirectDimensions(u64),
+    #[error("compute program registers COMPUTE_PGM_LO/HI are incomplete")]
+    MissingProgramAddress,
+    #[error("compute program address is null")]
+    NullProgramAddress,
+    #[error("compute shader at 0x{0:016X} could not be decoded")]
+    ShaderDecode(u64),
+    #[error("compute shader at 0x{address:016X} could not be evaluated: {reason}")]
+    ShaderEvaluation { address: u64, reason: String },
+}
+
+#[derive(Debug, Error)]
+enum AgcSubmissionError {
+    #[error("unsupported PM4 packet type {packet_type} at dword {dword} (header 0x{header:08X})")]
+    UnsupportedPacketType {
+        dword: u32,
+        packet_type: u32,
+        header: u32,
+    },
+    #[error("PM4 packet at dword {dword} declares {length} dwords with {remaining} remaining")]
+    InvalidPacketLength {
+        dword: u32,
+        length: u32,
+        remaining: u32,
+    },
+    #[error("SET_BASE packet has {actual} dwords, expected 4")]
+    SetBasePacketLength { actual: u32 },
+    #[error("SET_BASE selects unsupported base index {0}")]
+    UnsupportedBaseIndex(u32),
+    #[error("SET_BASE selects unsupported shader type {0}")]
+    UnsupportedSetBaseShaderType(u32),
+    #[error("native indirect-register opcode 0x{opcode:02X} has {actual} dwords, expected 5")]
+    NativeIndirectRegisterPacketLength { opcode: u32, actual: u32 },
+    #[error(
+        "indirect-register opcode 0x{opcode:02X} has null table address with {register_count} entries"
+    )]
+    NullIndirectRegisterTable { opcode: u32, register_count: u32 },
+    #[error("indirect register entry at 0x{0:016X} is not readable")]
+    UnreadableIndirectRegister(u64),
+    #[error("ACB descriptor has address 0x{address:016X} and {dword_count} dwords")]
+    InvalidAcbDescriptor { address: u64, dword_count: u32 },
+    #[error("compute dispatch at 0x{packet_address:016X}: {source}")]
+    Compute {
+        packet_address: u64,
+        #[source]
+        source: AgcComputeDispatchError,
+    },
+}
+
+fn agc_packet_words(packet_address: u64, length: u32) -> Vec<u32> {
+    (0..length)
+        .map(|index| read_guest_u32(packet_address + u64::from(index) * 4))
+        .collect()
+}
+
+fn agc_read_compute_dimensions(address: u64) -> Result<[u32; 3], AgcComputeDispatchError> {
+    let mut bytes = [0_u8; 12];
+    address
+        .checked_add(u64::try_from(bytes.len()).expect("dimension byte count fits u64"))
+        .ok_or(AgcComputeDispatchError::IndirectAddressOverflow)?;
+    if !ProcessGuestMemory.read(address, &mut bytes) {
+        return Err(AgcComputeDispatchError::UnreadableIndirectDimensions(
+            address,
+        ));
+    }
+    Ok(std::array::from_fn(|axis| {
+        let start = axis * 4;
+        u32::from_le_bytes(
+            bytes[start..start + 4]
+                .try_into()
+                .expect("dimension chunk is four bytes"),
+        )
+    }))
+}
+
+fn agc_apply_set_base(
+    packet_address: u64,
+    length: u32,
+    graphics: &mut AgcGraphicsState,
+) -> Result<(), AgcSubmissionError> {
+    if length != 4 {
+        return Err(AgcSubmissionError::SetBasePacketLength { actual: length });
+    }
+    let base_index = read_guest_u32(packet_address + 4) & 0xf;
+    if base_index != 1 {
+        return Err(AgcSubmissionError::UnsupportedBaseIndex(base_index));
+    }
+    let header = read_guest_u32(packet_address);
+    let shader_type = (header >> 1) & 0x3;
+    if shader_type > 1 {
+        return Err(AgcSubmissionError::UnsupportedSetBaseShaderType(
+            shader_type,
+        ));
+    }
+    if shader_type == 1 {
+        let low = read_guest_u32(packet_address + 8) & !0x7;
+        let high = read_guest_u32(packet_address + 12) & 0xffff;
+        graphics.compute_indirect_args_address = u64::from(low) | (u64::from(high) << 32);
+    }
+    Ok(())
+}
+
+fn agc_decode_compute_dispatch(
+    packet_address: u64,
+    length: u32,
+    opcode: u32,
+    graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
+) -> Result<remu_gpu::ComputeDispatch, AgcComputeDispatchError> {
+    let packet = agc_packet_words(packet_address, length);
+    let shader_registers = agc_register_snapshot(&graphics.shader_registers);
+    let (source, launch) = if opcode == AGC_IT_DISPATCH_DIRECT {
+        (
+            remu_gpu::ComputeDispatchSource::Direct,
+            remu_gpu::decode_compute_dispatch_direct(&packet, &shader_registers)?,
+        )
+    } else {
+        let indirect = remu_gpu::decode_compute_dispatch_indirect(&packet)?;
+        let dimensions_address = match indirect.dimensions {
+            remu_gpu::ComputeIndirectDimensions::BaseOffset(offset) => {
+                if graphics.compute_indirect_args_address == 0 {
+                    return Err(AgcComputeDispatchError::MissingIndirectBase);
+                }
+                graphics
+                    .compute_indirect_args_address
+                    .checked_add(u64::from(offset))
+                    .ok_or(AgcComputeDispatchError::IndirectAddressOverflow)?
+            }
+            remu_gpu::ComputeIndirectDimensions::Absolute(address) => address,
+        };
+        let dimensions = agc_read_compute_dimensions(dimensions_address)?;
+        (
+            remu_gpu::ComputeDispatchSource::Indirect { dimensions_address },
+            remu_gpu::decode_compute_launch(dimensions, indirect.initiator, &shader_registers)?,
+        )
+    };
+
+    let shader_address = remu_gpu::compute_program_address(&shader_registers)
+        .ok_or(AgcComputeDispatchError::MissingProgramAddress)?;
+    if shader_address == 0 {
+        return Err(AgcComputeDispatchError::NullProgramAddress);
+    }
+    let shader = agc_shader_snapshot(shaders, shader_address)
+        .ok_or(AgcComputeDispatchError::ShaderDecode(shader_address))?;
+    let compute_system_registers = remu_gpu::decode_compute_system_registers(&shader_registers);
+    let shader_evaluation = evaluate_shader_register_snapshot(
+        &shader_registers,
+        &shader,
+        AGC_COMPUTE_USER_DATA_0,
+        0,
+        Some(compute_system_registers),
+    )
+    .map_err(|reason| AgcComputeDispatchError::ShaderEvaluation {
+        address: shader_address,
+        reason,
+    })?;
+    graphics.emitted_compute_dispatches = graphics.emitted_compute_dispatches.saturating_add(1);
+    Ok(remu_gpu::ComputeDispatch {
+        sequence: graphics.emitted_compute_dispatches,
+        source,
+        launch,
+        shader_address,
+        shader_prefix: agc_shader_prefix_snapshot(shader_address),
+        shader: Some(shader),
+        shader_evaluation: Some(Arc::new(shader_evaluation)),
+        shader_registers,
+    })
 }
 
 fn agc_emit_draw(
     graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
     indexed: bool,
     element_offset: u32,
     element_count: u32,
@@ -5240,8 +5512,8 @@ fn agc_emit_draw(
         .get(&AGC_VGT_PRIMITIVE_TYPE)
         .copied()
         .unwrap_or_default();
-    let export_shader = agc_shader_snapshot(graphics, export_shader_address);
-    let pixel_shader = agc_shader_snapshot(graphics, pixel_shader_address);
+    let export_shader = agc_shader_snapshot(shaders, export_shader_address);
+    let pixel_shader = agc_shader_snapshot(shaders, pixel_shader_address);
     let mut draw = remu_gpu::IndexedDraw {
         sequence: graphics.emitted_draws,
         indexed,
@@ -5394,14 +5666,30 @@ fn evaluate_shader_snapshot(
     user_data_register: u32,
     scalar_register_base: u32,
 ) -> Result<remu_shader::ShaderEvaluation, String> {
+    evaluate_shader_register_snapshot(
+        &draw.shader_registers,
+        snapshot,
+        user_data_register,
+        scalar_register_base,
+        None,
+    )
+}
+
+fn evaluate_shader_register_snapshot(
+    shader_registers: &[remu_gpu::GpuRegister],
+    snapshot: &remu_gpu::ShaderSnapshot,
+    user_data_register: u32,
+    scalar_register_base: u32,
+    compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
+) -> Result<remu_shader::ShaderEvaluation, String> {
     let state = remu_shader::build_shader_state(
         Arc::clone(&snapshot.program),
         snapshot.metadata.clone(),
         user_data_register,
         scalar_register_base,
-        None,
+        compute_system_registers,
         |offset| {
-            draw.shader_registers
+            shader_registers
                 .iter()
                 .find(|register| register.offset == offset)
                 .map(|register| register.value)
@@ -5557,9 +5845,14 @@ fn trace_shader_evaluation(
     }
 }
 
-fn agc_emit_indexed_draw(packet_address: u64, graphics: &mut AgcGraphicsState) {
+fn agc_emit_indexed_draw(
+    packet_address: u64,
+    graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
+) {
     agc_emit_draw(
         graphics,
+        shaders,
         true,
         read_guest_u32(packet_address + 8),
         read_guest_u32(packet_address + 12),
@@ -5567,51 +5860,62 @@ fn agc_emit_indexed_draw(packet_address: u64, graphics: &mut AgcGraphicsState) {
     );
 }
 
-fn agc_handle_submission_packet(
-    packet_address: u64,
+#[derive(Clone, Copy)]
+struct AgcSubmissionPacket {
+    address: u64,
     length: u32,
     opcode: u32,
     register: u32,
-    state: &mut ProbeDispatchState,
+}
+
+fn agc_handle_submission_packet(
+    packet: AgcSubmissionPacket,
+    graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
+    index_resources: &BTreeMap<u64, u64>,
     flips: &mut Vec<(u32, u32, u64)>,
-) {
-    if opcode == AGC_IT_NOP && register == AGC_R_DRAW_RESET && length >= 2 {
-        state.agc_graphics.reset_pipeline();
-    }
-    agc_apply_submission_registers(
-        packet_address,
+) -> Result<(), AgcSubmissionError> {
+    let AgcSubmissionPacket {
+        address: packet_address,
         length,
         opcode,
         register,
-        &mut state.agc_graphics,
-    );
+    } = packet;
+    if opcode == AGC_IT_NOP && matches!(register, AGC_R_DRAW_RESET | AGC_R_ACB_RESET) && length >= 2
+    {
+        graphics.reset_pipeline();
+    }
+    agc_apply_submission_registers(packet_address, length, opcode, register, graphics)?;
+    if opcode == AGC_IT_SET_BASE {
+        agc_apply_set_base(packet_address, length, graphics)?;
+    }
     if opcode == AGC_IT_NOP && register == AGC_R_ACQUIRE_MEM && length >= 8 {
         remu_gpu::acquire_memory(decode_agc_memory_acquire(packet_address));
     }
     if opcode == AGC_IT_INDEX_BASE && length >= 3 {
-        state.agc_graphics.index_buffer_address = u64::from(read_guest_u32(packet_address + 4))
+        graphics.index_buffer_address = u64::from(read_guest_u32(packet_address + 4))
             | (u64::from(read_guest_u32(packet_address + 8)) << 32);
-        state.agc_graphics.index_resource_address = state
-            .agc_index_resources
-            .get(&state.agc_graphics.index_buffer_address)
+        graphics.index_resource_address = index_resources
+            .get(&graphics.index_buffer_address)
             .copied()
             .unwrap_or_default();
     }
     if opcode == AGC_IT_INDEX_BUFFER_SIZE && length >= 2 {
-        state.agc_graphics.index_buffer_count = read_guest_u32(packet_address + 4);
+        graphics.index_buffer_count = read_guest_u32(packet_address + 4);
     }
     if opcode == AGC_IT_INDEX_TYPE && length >= 2 {
-        state.agc_graphics.index_size = read_guest_u32(packet_address + 4) & 0x3;
+        graphics.index_size = read_guest_u32(packet_address + 4) & 0x3;
     }
     if opcode == AGC_IT_NUM_INSTANCES && length >= 2 {
-        state.agc_graphics.instance_count = read_guest_u32(packet_address + 4).max(1);
+        graphics.instance_count = read_guest_u32(packet_address + 4).max(1);
     }
     if opcode == AGC_IT_DRAW_INDEX_OFFSET && length >= 5 {
-        agc_emit_indexed_draw(packet_address, &mut state.agc_graphics);
+        agc_emit_indexed_draw(packet_address, graphics, shaders);
     }
     if opcode == AGC_IT_DRAW_INDEX_AUTO && length >= 3 {
         agc_emit_draw(
-            &mut state.agc_graphics,
+            graphics,
+            shaders,
             false,
             0,
             read_guest_u32(packet_address + 4),
@@ -5620,12 +5924,34 @@ fn agc_handle_submission_packet(
     }
     if opcode == AGC_IT_NOP && register == AGC_R_DRAW_INDEX_AUTO && length >= 2 {
         agc_emit_draw(
-            &mut state.agc_graphics,
+            graphics,
+            shaders,
             false,
             0,
             read_guest_u32(packet_address + 4),
             0,
         );
+    }
+    if matches!(opcode, AGC_IT_DISPATCH_DIRECT | AGC_IT_DISPATCH_INDIRECT) {
+        let dispatch =
+            agc_decode_compute_dispatch(packet_address, length, opcode, graphics, shaders)
+                .map_err(|source| AgcSubmissionError::Compute {
+                    packet_address,
+                    source,
+                })?;
+        if dispatch.sequence <= 8 {
+            eprintln!(
+                "[REMu][AGC] compute={} source={:?} grid={:?} base={:?} local={:?} wave={} cs={:#x}",
+                dispatch.sequence,
+                dispatch.source,
+                dispatch.launch.grid,
+                dispatch.launch.base_group,
+                dispatch.launch.threads_per_group,
+                dispatch.launch.wave_lane_count,
+                dispatch.shader_address,
+            );
+        }
+        remu_gpu::emit_event(remu_gpu::GpuEvent::ComputeDispatch(Box::new(dispatch)));
     }
     if opcode == AGC_IT_NOP && register == AGC_R_FLIP && length >= 6 {
         let handle = read_guest_u32(packet_address + 4);
@@ -5634,6 +5960,7 @@ fn agc_handle_submission_packet(
             | (u64::from(read_guest_u32(packet_address + 20)) << 32);
         flips.push((handle, buffer_index, flip_argument));
     }
+    Ok(())
 }
 
 fn decode_agc_memory_acquire(packet_address: u64) -> remu_gpu::GpuMemoryAcquire {
@@ -5652,7 +5979,14 @@ fn decode_agc_memory_acquire(packet_address: u64) -> remu_gpu::GpuMemoryAcquire 
     }
 }
 
-fn agc_parse_submission(command_address: u64, dword_count: u32, state: &mut ProbeDispatchState) {
+fn agc_parse_submission(
+    command_address: u64,
+    dword_count: u32,
+    graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
+    index_resources: &BTreeMap<u64, u64>,
+    submission_count: &mut u64,
+) -> Result<Vec<(u32, u32, u64)>, AgcSubmissionError> {
     let mut offset = 0_u32;
     let mut packets = BTreeMap::<(u32, u32), u32>::new();
     let mut flips = Vec::new();
@@ -5665,28 +5999,41 @@ fn agc_parse_submission(command_address: u64, dword_count: u32, state: &mut Prob
             continue;
         }
         if packet_type != 3 {
-            eprintln!(
-                "[REMu][AGC] stopped submission parse at dw={offset}: unsupported packet type {packet_type} header={header:#010x}"
-            );
-            break;
+            return Err(AgcSubmissionError::UnsupportedPacketType {
+                dword: offset,
+                packet_type,
+                header,
+            });
         }
         let length = ((header >> 16) & 0x3fff) + 2;
-        if length == 0 || length > dword_count - offset {
-            eprintln!(
-                "[REMu][AGC] stopped submission parse at dw={offset}: length={length} remaining={}",
-                dword_count - offset
-            );
-            break;
+        let remaining = dword_count - offset;
+        if length > remaining {
+            return Err(AgcSubmissionError::InvalidPacketLength {
+                dword: offset,
+                length,
+                remaining,
+            });
         }
         let opcode = (header >> 8) & 0xff;
         let register = (header >> 2) & 0x3f;
         *packets.entry((opcode, register)).or_default() += 1;
-        agc_handle_submission_packet(packet_address, length, opcode, register, state, &mut flips);
+        agc_handle_submission_packet(
+            AgcSubmissionPacket {
+                address: packet_address,
+                length,
+                opcode,
+                register,
+            },
+            graphics,
+            shaders,
+            index_resources,
+            &mut flips,
+        )?;
         offset += length;
     }
 
-    state.agc_submission_count = state.agc_submission_count.saturating_add(1);
-    if state.agc_submission_count <= 8 {
+    *submission_count = submission_count.saturating_add(1);
+    if *submission_count <= 8 {
         let packet_summary = packets
             .iter()
             .map(|(&(opcode, register), &count)| {
@@ -5696,13 +6043,11 @@ fn agc_parse_submission(command_address: u64, dword_count: u32, state: &mut Prob
             .join(",");
         eprintln!(
             "[REMu][AGC] submit={} address={command_address:#x} dwords={dword_count} parsed={offset} packets=[{packet_summary}] flips={}",
-            state.agc_submission_count,
+            submission_count,
             flips.len()
         );
     }
-    for (handle, buffer_index, flip_argument) in flips {
-        queue_video_out_flip(state, handle, buffer_index, flip_argument);
-    }
+    Ok(flips)
 }
 
 fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -5715,8 +6060,25 @@ fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
     if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
         return u64::MAX;
     }
-    agc_parse_submission(command_address, dword_count, state);
-    0
+    match agc_parse_submission(
+        command_address,
+        dword_count,
+        &mut state.agc_graphics,
+        &mut state.agc_shader_registry,
+        &state.agc_index_resources,
+        &mut state.agc_submission_count,
+    ) {
+        Ok(flips) => {
+            for (handle, buffer_index, flip_argument) in flips {
+                queue_video_out_flip(state, handle, buffer_index, flip_argument);
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("[REMu][AGC] rejected DCB submission: {error}");
+            u64::MAX
+        }
+    }
 }
 
 fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -5730,7 +6092,121 @@ fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
         let command_address = read_guest_u64(addresses + u64::from(index) * 8);
         let dword_count = read_guest_u32(sizes + u64::from(index) * 4);
         if command_address != 0 && dword_count != 0 && dword_count <= 1_000_000 {
-            agc_parse_submission(command_address, dword_count, state);
+            match agc_parse_submission(
+                command_address,
+                dword_count,
+                &mut state.agc_graphics,
+                &mut state.agc_shader_registry,
+                &state.agc_index_resources,
+                &mut state.agc_submission_count,
+            ) {
+                Ok(flips) => {
+                    for (handle, buffer_index, flip_argument) in flips {
+                        queue_video_out_flip(state, handle, buffer_index, flip_argument);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[REMu][AGC] rejected DCB {index} in multi-submission: {error}");
+                    return u64::MAX;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn agc_resolve_acb_descriptor(
+    command_address: u64,
+    dword_count: u32,
+) -> Result<(u64, u32), AgcSubmissionError> {
+    const ACB_DESCRIPTOR_MAGIC: u32 = 0x5533_ccaa;
+    if dword_count < 5
+        || read_guest_u32(command_address + 16) != ACB_DESCRIPTOR_MAGIC
+        || read_guest_u32(command_address + 12) != 0
+    {
+        return Ok((command_address, dword_count));
+    }
+    let descriptor_address = read_guest_u64(command_address);
+    let descriptor_dword_count = read_guest_u32(command_address + 8);
+    if descriptor_address == 0 || descriptor_dword_count == 0 || descriptor_dword_count > 1_000_000
+    {
+        return Err(AgcSubmissionError::InvalidAcbDescriptor {
+            address: descriptor_address,
+            dword_count: descriptor_dword_count,
+        });
+    }
+    Ok((descriptor_address, descriptor_dword_count))
+}
+
+fn agc_submit_compute_commands(
+    owner: u32,
+    command_address: u64,
+    dword_count: u32,
+    state: &mut ProbeDispatchState,
+) -> Result<Vec<(u32, u32, u64)>, AgcSubmissionError> {
+    let (command_address, dword_count) = agc_resolve_acb_descriptor(command_address, dword_count)?;
+    let graphics = state.agc_compute_queues.entry(owner).or_default();
+    agc_parse_submission(
+        command_address,
+        dword_count,
+        graphics,
+        &mut state.agc_shader_registry,
+        &state.agc_index_resources,
+        &mut state.agc_submission_count,
+    )
+}
+
+fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let owner = low_u32(arguments[0]);
+    let packet = arguments[1];
+    if packet == 0 {
+        return u64::MAX;
+    }
+    let command_address = read_guest_u64(packet);
+    let dword_count = read_guest_u32(packet + 8);
+    if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+        return u64::MAX;
+    }
+    match agc_submit_compute_commands(owner, command_address, dword_count, state) {
+        Ok(flips) => {
+            for (handle, buffer_index, flip_argument) in flips {
+                queue_video_out_flip(state, handle, buffer_index, flip_argument);
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("[REMu][AGC] rejected ACB submission for owner {owner}: {error}");
+            u64::MAX
+        }
+    }
+}
+
+fn agc_driver_submit_multi_acbs(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let owner = low_u32(arguments[0]);
+    let addresses = arguments[1];
+    let sizes = arguments[2];
+    let count = low_u32(arguments[3]);
+    if addresses == 0 || sizes == 0 || count == 0 || count > 4096 {
+        return u64::MAX;
+    }
+    for index in 0..count {
+        let command_address = read_guest_u64(addresses + u64::from(index) * 8);
+        let dword_count = read_guest_u32(sizes + u64::from(index) * 4);
+        if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+            return u64::MAX;
+        }
+        match agc_submit_compute_commands(owner, command_address, dword_count, state) {
+            Ok(flips) => {
+                for (handle, buffer_index, flip_argument) in flips {
+                    queue_video_out_flip(state, handle, buffer_index, flip_argument);
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "[REMu][AGC] rejected ACB {index} for owner {owner} in multi-submission: {error}"
+                );
+                return u64::MAX;
+            }
         }
     }
     0
@@ -9147,13 +9623,19 @@ fn terminate_probe(code: i32) -> ! {
 #[cfg(test)]
 mod platform_independent_tests {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     use super::{
-        AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
-        AGC_R_DRAW_INDEX_AUTO, DEFAULT_THREAD_AFFINITY_MASK, GuestExitCallback, ProbeDispatchState,
-        PthreadAttrState, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
-        SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED, agc_dcb_draw_index_auto,
-        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_pm4, allocate_direct_memory,
+        AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_INDEX_BASE,
+        AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
+        AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT,
+        AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO,
+        AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry, DEFAULT_THREAD_AFFINITY_MASK,
+        GuestExitCallback, ProbeDispatchState, PthreadAttrState, SAVE_DATA_ERROR_EXISTS,
+        SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_FOUND,
+        SCE_KERNEL_ERROR_NOT_IMPLEMENTED, agc_apply_set_base, agc_apply_submission_registers,
+        agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
+        agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, allocate_direct_memory,
         allocate_pthread_thread_object, create_pthread_attr, decode_agc_memory_acquire,
         destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
         guest_clock_gettime, guest_free, guest_global_locale, guest_kernel_fstat,
@@ -9170,6 +9652,56 @@ mod platform_independent_tests {
         system_service_param_get_int, take_exit_callbacks, video_out_open, write_guest_u32,
         write_guest_u64, write_import_stub,
     };
+
+    #[repr(C, align(256))]
+    struct AlignedComputeProgram([u32; 4]);
+
+    #[repr(C, align(8))]
+    struct AlignedIndirectArguments([u32; 8]);
+
+    #[repr(C)]
+    struct AgcSubmitPacket {
+        address: u64,
+        dword_count: u32,
+        flags: [u8; 4],
+    }
+
+    static GPU_EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
+
+    fn compute_graphics_state(program_address: u64) -> (AgcGraphicsState, AgcShaderRegistry) {
+        let mut graphics = AgcGraphicsState::default();
+        for (offset, value) in [
+            (
+                remu_gpu::COMPUTE_PGM_LO_REGISTER,
+                low_u32(program_address >> 8),
+            ),
+            (
+                remu_gpu::COMPUTE_PGM_HI_REGISTER,
+                ((program_address >> 40) & 0xff) as u32,
+            ),
+            (
+                remu_gpu::COMPUTE_PGM_RSRC2_REGISTER,
+                (2 << 1) | (1 << 7) | (1 << 9) | (1 << 10),
+            ),
+            (remu_gpu::COMPUTE_NUM_THREAD_X_REGISTER, 64),
+            (remu_gpu::COMPUTE_NUM_THREAD_Y_REGISTER, 2),
+            (remu_gpu::COMPUTE_NUM_THREAD_Z_REGISTER, 1),
+            (0x240, 0x1234_5678),
+            (0x241, 0x9abc_def0),
+        ] {
+            graphics.shader_registers.insert(offset, value);
+        }
+        let mut shaders = AgcShaderRegistry::default();
+        shaders.snapshots.insert(
+            program_address,
+            remu_gpu::ShaderSnapshot {
+                header_address: 0,
+                program: Arc::new(remu_shader::Program::new(program_address, Vec::new())),
+                metadata: None,
+            },
+        );
+        (graphics, shaders)
+    }
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
         // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
@@ -10252,6 +10784,270 @@ mod platform_independent_tests {
         assert_eq!(decoded.size_bytes, 0xab34_5678_9a00);
         assert_eq!(decoded.poll_interval, 0x2468);
         assert_eq!(decoded.gcr_control, 0x5_4321);
+    }
+
+    #[test]
+    fn applies_native_gen5_indirect_register_packets_to_each_register_space() {
+        let context_registers = [0x318, 0x1234_5678, 0x390, 0x5a, u32::MAX, 0xfeed_face];
+        let shader_registers = [
+            0x2000_020c,
+            0x7654_3210,
+            0x2000_020d,
+            0x44,
+            0x2000_0213,
+            0x388,
+        ];
+        let user_config_registers = [0x4000_0242, 4];
+        let packet = |opcode, registers: &[u32]| {
+            let address = registers.as_ptr().addr() as u64;
+            [
+                agc_pm4(5, opcode, 0),
+                low_u32(address),
+                (address >> 32) as u32,
+                0x8000_0000,
+                u32::try_from(registers.len() / 2).expect("register pair count"),
+            ]
+        };
+        let mut graphics = AgcGraphicsState::default();
+
+        for (opcode, registers) in [
+            (AGC_IT_SET_CONTEXT_REG_INDIRECT, &context_registers[..]),
+            (AGC_IT_SET_SH_REG_INDIRECT, &shader_registers[..]),
+            (AGC_IT_SET_UCONFIG_REG_INDIRECT, &user_config_registers[..]),
+        ] {
+            let command = packet(opcode, registers);
+            agc_apply_submission_registers(
+                command.as_ptr().addr() as u64,
+                5,
+                opcode,
+                0,
+                &mut graphics,
+            )
+            .expect("native indirect register packet");
+        }
+
+        assert_eq!(graphics.context_registers.get(&0x318), Some(&0x1234_5678));
+        assert_eq!(graphics.context_registers.get(&0x390), Some(&0x5a));
+        assert!(!graphics.context_registers.contains_key(&u32::MAX));
+        assert_eq!(
+            graphics
+                .shader_registers
+                .get(&remu_gpu::COMPUTE_PGM_LO_REGISTER),
+            Some(&0x7654_3210)
+        );
+        assert_eq!(
+            graphics
+                .shader_registers
+                .get(&remu_gpu::COMPUTE_PGM_HI_REGISTER),
+            Some(&0x44)
+        );
+        assert_eq!(graphics.user_config_registers.get(&0x242), Some(&4));
+    }
+
+    #[test]
+    fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
+        let _event_guard = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let program = AlignedComputeProgram([0, 0, 0, 0]);
+        let program_address = program.0.as_ptr().addr() as u64;
+        let (_, shaders) = compute_graphics_state(program_address);
+        let register_pairs = [
+            remu_gpu::COMPUTE_PGM_LO_REGISTER,
+            low_u32(program_address >> 8),
+            remu_gpu::COMPUTE_PGM_HI_REGISTER,
+            ((program_address >> 40) & 0xff) as u32,
+            remu_gpu::COMPUTE_PGM_RSRC2_REGISTER,
+            0,
+            remu_gpu::COMPUTE_NUM_THREAD_X_REGISTER,
+            64,
+            remu_gpu::COMPUTE_NUM_THREAD_Y_REGISTER,
+            1,
+            remu_gpu::COMPUTE_NUM_THREAD_Z_REGISTER,
+            1,
+        ];
+        let registers_address = register_pairs.as_ptr().addr() as u64;
+        let commands = [
+            agc_pm4(2, AGC_IT_NOP, AGC_R_ACB_RESET),
+            0,
+            agc_pm4(5, AGC_IT_SET_SH_REG_INDIRECT, 0),
+            low_u32(registers_address),
+            (registers_address >> 32) as u32,
+            0x8000_0000,
+            6,
+            agc_pm4(5, AGC_IT_DISPATCH_DIRECT, 0),
+            3,
+            2,
+            1,
+            0x8045,
+        ];
+        let command_address = commands.as_ptr().addr() as u64;
+        let descriptor = [
+            low_u32(command_address),
+            (command_address >> 32) as u32,
+            u32::try_from(commands.len()).expect("command dword count"),
+            0,
+            0x5533_ccaa,
+        ];
+        let packet = AgcSubmitPacket {
+            address: descriptor.as_ptr().addr() as u64,
+            dword_count: 5,
+            flags: [0; 4],
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        remu_gpu::install_event_sink(sender);
+        let mut state = ProbeDispatchState {
+            agc_shader_registry: shaders,
+            ..ProbeDispatchState::default()
+        };
+
+        let result = agc_driver_submit_acb(
+            [7, (&raw const packet).addr() as u64, 0, 0, 0, 0],
+            &mut state,
+        );
+        let event = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        remu_gpu::clear_event_sink();
+
+        assert_eq!(result, 0);
+        let remu_gpu::GpuEvent::ComputeDispatch(dispatch) = event.expect("compute dispatch event")
+        else {
+            panic!("ACB emitted a non-compute event");
+        };
+        assert_eq!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct);
+        assert_eq!(
+            dispatch.launch.grid,
+            remu_gpu::ComputeGrid::Threadgroups([3, 2, 1])
+        );
+        assert_eq!(dispatch.shader_address, program_address);
+        assert!(state.agc_graphics.shader_registers.is_empty());
+        assert_eq!(
+            state.agc_compute_queues.get(&7).and_then(|queue| queue
+                .shader_registers
+                .get(&remu_gpu::COMPUTE_PGM_LO_REGISTER)),
+            Some(&low_u32(program_address >> 8))
+        );
+    }
+
+    #[test]
+    fn decodes_and_evaluates_a_complete_direct_compute_dispatch_snapshot() {
+        let program = AlignedComputeProgram([0xbeef_cafe, 0x1234_5678, 0, 0]);
+        let program_address = program.0.as_ptr().addr() as u64;
+        let (mut graphics, mut shaders) = compute_graphics_state(program_address);
+        let packet = [agc_pm4(5, AGC_IT_DISPATCH_DIRECT, 0), 10, 4, 2, 0x8045];
+
+        let dispatch = agc_decode_compute_dispatch(
+            packet.as_ptr().addr() as u64,
+            5,
+            AGC_IT_DISPATCH_DIRECT,
+            &mut graphics,
+            &mut shaders,
+        )
+        .expect("complete direct compute dispatch");
+
+        assert_eq!(dispatch.sequence, 1);
+        assert_eq!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct);
+        assert_eq!(
+            dispatch.launch.grid,
+            remu_gpu::ComputeGrid::Threadgroups([10, 4, 2])
+        );
+        assert_eq!(dispatch.launch.threads_per_group, [64, 2, 1]);
+        assert_eq!(dispatch.launch.wave_lane_count, 32);
+        assert_eq!(dispatch.shader_address, program_address);
+        assert_eq!(dispatch.shader_prefix, program.0);
+        let evaluation = dispatch
+            .shader_evaluation
+            .as_ref()
+            .expect("compute evaluation");
+        assert_eq!(evaluation.initial_scalar_registers[0], 0x1234_5678);
+        assert_eq!(evaluation.initial_scalar_registers[1], 0x9abc_def0);
+        let system = evaluation
+            .compute_system_registers
+            .expect("compute system registers");
+        assert_eq!(system.work_group_x, Some(2));
+        assert_eq!(system.work_group_y, None);
+        assert_eq!(system.work_group_z, Some(3));
+        assert_eq!(system.thread_group_size, Some(4));
+    }
+
+    #[test]
+    fn resolves_base_relative_and_absolute_compute_indirect_dimensions() {
+        let program = AlignedComputeProgram([0, 0, 0, 0]);
+        let program_address = program.0.as_ptr().addr() as u64;
+        let (mut graphics, mut shaders) = compute_graphics_state(program_address);
+        let arguments = AlignedIndirectArguments([0, 0, 7, 3, 1, 11, 5, 2]);
+        let arguments_address = arguments.0.as_ptr().addr() as u64;
+        let set_base = [
+            agc_pm4(4, AGC_IT_SET_BASE, 0) | (1 << 1),
+            1,
+            low_u32(arguments_address),
+            (arguments_address >> 32) as u32,
+        ];
+        agc_apply_set_base(set_base.as_ptr().addr() as u64, 4, &mut graphics)
+            .expect("compute indirect base");
+        assert_eq!(graphics.compute_indirect_args_address, arguments_address);
+
+        let relative = [agc_pm4(3, AGC_IT_DISPATCH_INDIRECT, 0), 8, 0x8041];
+        let relative_dispatch = agc_decode_compute_dispatch(
+            relative.as_ptr().addr() as u64,
+            3,
+            AGC_IT_DISPATCH_INDIRECT,
+            &mut graphics,
+            &mut shaders,
+        )
+        .expect("base-relative compute dispatch");
+        assert_eq!(
+            relative_dispatch.source,
+            remu_gpu::ComputeDispatchSource::Indirect {
+                dimensions_address: arguments_address + 8,
+            }
+        );
+        assert_eq!(
+            relative_dispatch.launch.grid,
+            remu_gpu::ComputeGrid::Threadgroups([7, 3, 1])
+        );
+
+        let absolute_address = arguments_address + 20;
+        let absolute = [
+            agc_pm4(4, AGC_IT_DISPATCH_INDIRECT, 0),
+            low_u32(absolute_address),
+            (absolute_address >> 32) as u32,
+            0x8041,
+        ];
+        let absolute_dispatch = agc_decode_compute_dispatch(
+            absolute.as_ptr().addr() as u64,
+            4,
+            AGC_IT_DISPATCH_INDIRECT,
+            &mut graphics,
+            &mut shaders,
+        )
+        .expect("absolute compute dispatch");
+        assert_eq!(
+            absolute_dispatch.source,
+            remu_gpu::ComputeDispatchSource::Indirect {
+                dimensions_address: absolute_address,
+            }
+        );
+        assert_eq!(
+            absolute_dispatch.launch.grid,
+            remu_gpu::ComputeGrid::Threadgroups([11, 5, 2])
+        );
+    }
+
+    #[test]
+    fn rejects_indirect_compute_without_a_compute_set_base_packet() {
+        let program = AlignedComputeProgram([0; 4]);
+        let (mut graphics, mut shaders) = compute_graphics_state(program.0.as_ptr().addr() as u64);
+        let packet = [agc_pm4(3, AGC_IT_DISPATCH_INDIRECT, 0), 0x80, 0x8041];
+        assert!(matches!(
+            agc_decode_compute_dispatch(
+                packet.as_ptr().addr() as u64,
+                3,
+                AGC_IT_DISPATCH_INDIRECT,
+                &mut graphics,
+                &mut shaders,
+            ),
+            Err(AgcComputeDispatchError::MissingIndirectBase)
+        ));
     }
 
     #[test]
