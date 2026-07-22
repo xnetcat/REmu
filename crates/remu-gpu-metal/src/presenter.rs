@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,6 +43,20 @@ use winit::window::{Window, WindowId};
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_GPU_EVENTS_PER_TICK: usize = 8_192;
 const GPU_EVENT_COALESCE_THRESHOLD: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PresenterFlow {
+    Continue,
+    Shutdown,
+}
+
+fn headless_metal_value_is_enabled(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+fn headless_metal_requested() -> bool {
+    headless_metal_value_is_enabled(std::env::var_os("REMU_HEADLESS_METAL").as_deref())
+}
 
 fn latest_complete_frame_start(events: &[GpuEvent]) -> usize {
     let mut flips = events
@@ -296,7 +310,7 @@ impl MetalPresenter {
         Ok(())
     }
 
-    fn receive_events(&mut self, event_loop: &ActiveEventLoop) {
+    fn receive_events(&mut self) -> PresenterFlow {
         self.receive_shader_compilations();
         self.retire_completed_guest_batches();
         let mut events = Vec::with_capacity(GPU_EVENT_COALESCE_THRESHOLD);
@@ -330,14 +344,15 @@ impl MetalPresenter {
             {
                 continue;
             }
-            if self.process_gpu_event(event, event_loop) {
-                return;
+            if self.process_gpu_event(event) == PresenterFlow::Shutdown {
+                return PresenterFlow::Shutdown;
             }
         }
+        PresenterFlow::Continue
     }
 
     #[allow(clippy::too_many_lines)]
-    fn process_gpu_event(&mut self, event: GpuEvent, event_loop: &ActiveEventLoop) -> bool {
+    fn process_gpu_event(&mut self, event: GpuEvent) -> PresenterFlow {
         match event {
             GpuEvent::DisplayRegistered {
                 width,
@@ -387,7 +402,7 @@ impl MetalPresenter {
                     // Retain the latest draw for a new pair: static screens may submit only once,
                     // and dropping that draw leaves the already-flipped buffer black.
                     self.pending_shader_draws.insert(key, draw);
-                    return false;
+                    return PresenterFlow::Continue;
                 }
                 if let Err(error) = self.execute_compiled_draw(&draw) {
                     self.log_draw_execution_failure(&draw, &error);
@@ -397,11 +412,10 @@ impl MetalPresenter {
                 if let Err(error) = self.wait_for_guest_command_batches() {
                     eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
                 }
-                event_loop.exit();
-                return true;
+                return PresenterFlow::Shutdown;
             }
         }
-        false
+        PresenterFlow::Continue
     }
 
     fn compile_draw_shaders(&mut self, draw: &IndexedDraw) {
@@ -2869,7 +2883,10 @@ impl ApplicationHandler for MetalPresenter {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.receive_events(event_loop);
+        if self.receive_events() == PresenterFlow::Shutdown {
+            event_loop.exit();
+            return;
+        }
         if let Err(error) = self.flush_guest_command_batch(false) {
             eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
         }
@@ -2885,7 +2902,40 @@ impl ApplicationHandler for MetalPresenter {
     }
 }
 
+fn run_headless_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
+    eprintln!("[REMu][METAL] starting headless Metal event loop");
+    let mut presenter = MetalPresenter::new(receiver)?;
+    eprintln!(
+        "[REMu][METAL] headless presenter started on {}",
+        presenter
+            .device
+            .as_ref()
+            .ok_or("Metal presenter resources are unavailable")?
+            .name()
+    );
+    loop {
+        let (flow, submission) = objc::rc::autoreleasepool(|| {
+            let flow = presenter.receive_events();
+            let submission = if flow == PresenterFlow::Continue {
+                presenter.flush_guest_command_batch(false)
+            } else {
+                Ok(())
+            };
+            (flow, submission)
+        });
+        submission.map_err(|error| format!("guest command batch submission failed: {error}"))?;
+        if flow == PresenterFlow::Shutdown {
+            eprintln!("[REMu][METAL] headless event loop stopped");
+            return Ok(());
+        }
+        std::thread::sleep(EVENT_POLL_INTERVAL);
+    }
+}
+
 pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
+    if headless_metal_requested() {
+        return run_headless_presenter(receiver);
+    }
     eprintln!("[REMu][METAL] starting AppKit event loop");
     let mut presenter = MetalPresenter::new(receiver)?;
     let mut builder = EventLoop::builder();
@@ -2962,12 +3012,26 @@ mod tests {
         GuestBlendAttachmentState, GuestBlendPipelineState, GuestTextureDescriptor,
         apply_image_destination_select, decode_blend_pipeline_state, decode_image_descriptor,
         decode_scissor, decode_viewport, effective_linear_rgba_pitch,
-        guest_texture_descriptors_overlap, guest_texture_raw_matches, latest_complete_frame_start,
-        metal_blend_factor, metal_blend_operation, metal_color_write_mask,
-        metal_nonindexed_vertex_count, mode27_source_byte_offset, mode27_within_block_byte_offset,
-        read_draw_indices, snapshot_guest_texture_raw, snapshot_guest_texture_rgba,
-        write_guest_texture_rgba,
+        guest_texture_descriptors_overlap, guest_texture_raw_matches,
+        headless_metal_value_is_enabled, latest_complete_frame_start, metal_blend_factor,
+        metal_blend_operation, metal_color_write_mask, metal_nonindexed_vertex_count,
+        mode27_source_byte_offset, mode27_within_block_byte_offset, read_draw_indices,
+        snapshot_guest_texture_raw, snapshot_guest_texture_rgba, write_guest_texture_rgba,
     };
+
+    #[test]
+    fn headless_metal_is_an_explicit_opt_in() {
+        assert!(!headless_metal_value_is_enabled(None));
+        assert!(!headless_metal_value_is_enabled(Some(
+            std::ffi::OsStr::new("0")
+        )));
+        assert!(!headless_metal_value_is_enabled(Some(
+            std::ffi::OsStr::new("true")
+        )));
+        assert!(headless_metal_value_is_enabled(Some(std::ffi::OsStr::new(
+            "1"
+        ))));
+    }
 
     fn flip(address: u64) -> GpuEvent {
         GpuEvent::Flip {
