@@ -13,10 +13,10 @@ use core_graphics_types::geometry::CGSize;
 use metal::{
     Buffer, CompileOptions, Device, Function, MTLCommandBufferStatus, MTLIndexType, MTLLoadAction,
     MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
-    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer, RenderPassDescriptor,
-    RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor, SamplerState, Texture,
-    TextureDescriptor,
+    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLScissorRect, MTLSize,
+    MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer,
+    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
+    SamplerState, Texture, TextureDescriptor,
 };
 use objc::runtime::{Class, Object, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -127,6 +127,13 @@ struct UploadedImageTexture {
 struct DecodedImageDescriptor {
     guest: GuestTextureDescriptor,
     destination_select: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GuestScissor {
+    Full,
+    Rect(MTLScissorRect),
+    Empty,
 }
 
 struct MetalPresenter {
@@ -543,14 +550,28 @@ impl MetalPresenter {
         let command_buffer = queue.new_command_buffer();
         let encoder = command_buffer.new_render_command_encoder(pass);
         encoder.set_render_pipeline_state(&compiled.pipeline);
-        encoder.set_viewport(MTLViewport {
-            originX: 0.0,
-            originY: 0.0,
-            width: f64::from(target.width),
-            height: f64::from(target.height),
-            znear: 0.0,
-            zfar: 1.0,
-        });
+        let scissor = decode_scissor(draw, target.width, target.height)?;
+        let viewport = decode_viewport(draw, target.width, target.height, scissor);
+        encoder.set_viewport(viewport);
+        if let GuestScissor::Rect(rect) = scissor {
+            encoder.set_scissor_rect(rect);
+        }
+        if trace {
+            eprintln!(
+                "[REMu][METAL] Gen5 draw={} viewport=({:.1},{:.1} {:.1}x{:.1} {:.3}..{:.3}) scissor={scissor:?} registers=[{:08x},{:08x},{:08x},{:08x}]",
+                draw.sequence,
+                viewport.originX,
+                viewport.originY,
+                viewport.width,
+                viewport.height,
+                viewport.znear,
+                viewport.zfar,
+                register_value(&draw.context_registers, 0x10f).unwrap_or_default(),
+                register_value(&draw.context_registers, 0x110).unwrap_or_default(),
+                register_value(&draw.context_registers, 0x111).unwrap_or_default(),
+                register_value(&draw.context_registers, 0x112).unwrap_or_default(),
+            );
+        }
         for (index, buffer) in export_buffers.iter().enumerate() {
             encoder.set_vertex_buffer(
                 u64::try_from(index).map_err(|_| "vertex buffer index overflow")?,
@@ -609,7 +630,10 @@ impl MetalPresenter {
         }
 
         let primitive = metal_primitive_type(draw.primitive_type)?;
-        if draw.indexed {
+        if matches!(scissor, GuestScissor::Empty) {
+            // An empty guest scissor is a valid no-op draw. Metal rejects zero-sized scissors, so
+            // retain the render pass and omit the primitive command instead.
+        } else if draw.indexed {
             let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
             let index_buffer = device.new_buffer_with_data(
                 indices.as_ptr().cast::<c_void>(),
@@ -625,10 +649,11 @@ impl MetalPresenter {
                 u64::from(draw.instance_count),
             );
         } else {
+            let vertex_count = metal_nonindexed_vertex_count(draw.primitive_type, draw.index_count);
             encoder.draw_primitives_instanced(
                 primitive,
                 u64::from(draw.index_offset),
-                u64::from(draw.index_count),
+                u64::from(vertex_count),
                 u64::from(draw.instance_count),
             );
         }
@@ -992,6 +1017,167 @@ impl MetalPresenter {
         }
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+    }
+}
+
+fn decode_scissor(
+    draw: &IndexedDraw,
+    target_width: u32,
+    target_height: u32,
+) -> Result<GuestScissor, String> {
+    let mut bounds = [0_i64, 0, i64::from(target_width), i64::from(target_height)];
+    let window_scissor_tl = register_value(&draw.context_registers, 0x081);
+    let enable_window_offset = window_scissor_tl.is_none_or(|value| value & 0x8000_0000 == 0);
+    let (window_offset_x, window_offset_y) = if enable_window_offset {
+        register_value(&draw.context_registers, 0x080).map_or((0_i64, 0_i64), |value| {
+            (
+                i64::from(i16::from_ne_bytes(
+                    u16::try_from(value & 0xffff)
+                        .expect("masked window X offset fits u16")
+                        .to_ne_bytes(),
+                )),
+                i64::from(i16::from_ne_bytes(
+                    u16::try_from(value >> 16)
+                        .expect("window Y offset fits u16")
+                        .to_ne_bytes(),
+                )),
+            )
+        })
+    } else {
+        (0, 0)
+    };
+    intersect_scissor_pair(draw, 0x00c, 0x00d, 0, 0, true, &mut bounds);
+    intersect_scissor_pair(
+        draw,
+        0x081,
+        0x082,
+        window_offset_x,
+        window_offset_y,
+        false,
+        &mut bounds,
+    );
+    intersect_scissor_pair(
+        draw,
+        0x090,
+        0x091,
+        window_offset_x,
+        window_offset_y,
+        false,
+        &mut bounds,
+    );
+    if register_value(&draw.context_registers, 0x292).is_none_or(|mode| mode & 0x2 != 0) {
+        intersect_scissor_pair(draw, 0x094, 0x095, 0, 0, false, &mut bounds);
+    }
+    bounds[0] = bounds[0].clamp(0, i64::from(target_width));
+    bounds[1] = bounds[1].clamp(0, i64::from(target_height));
+    bounds[2] = bounds[2].clamp(bounds[0], i64::from(target_width));
+    bounds[3] = bounds[3].clamp(bounds[1], i64::from(target_height));
+    if bounds == [0, 0, i64::from(target_width), i64::from(target_height)] {
+        return Ok(GuestScissor::Full);
+    }
+    let width = bounds[2] - bounds[0];
+    let height = bounds[3] - bounds[1];
+    if width == 0 || height == 0 {
+        return Ok(GuestScissor::Empty);
+    }
+    Ok(GuestScissor::Rect(MTLScissorRect {
+        x: u64::try_from(bounds[0]).map_err(|_| "scissor X does not fit Metal")?,
+        y: u64::try_from(bounds[1]).map_err(|_| "scissor Y does not fit Metal")?,
+        width: u64::try_from(width).map_err(|_| "scissor width does not fit Metal")?,
+        height: u64::try_from(height).map_err(|_| "scissor height does not fit Metal")?,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn intersect_scissor_pair(
+    draw: &IndexedDraw,
+    top_left_register: u32,
+    bottom_right_register: u32,
+    offset_x: i64,
+    offset_y: i64,
+    ignore_all_zero: bool,
+    bounds: &mut [i64; 4],
+) {
+    let (Some(top_left), Some(bottom_right)) = (
+        register_value(&draw.context_registers, top_left_register),
+        register_value(&draw.context_registers, bottom_right_register),
+    ) else {
+        return;
+    };
+    if ignore_all_zero && top_left == 0 && bottom_right == 0 {
+        return;
+    }
+    let pair = [
+        i64::from(top_left & 0x7fff) + offset_x,
+        i64::from((top_left >> 16) & 0x7fff) + offset_y,
+        i64::from(bottom_right & 0x7fff) + offset_x,
+        i64::from((bottom_right >> 16) & 0x7fff) + offset_y,
+    ];
+    bounds[0] = bounds[0].max(pair[0]);
+    bounds[1] = bounds[1].max(pair[1]);
+    bounds[2] = bounds[2].min(pair[2]);
+    bounds[3] = bounds[3].min(pair[3]);
+}
+
+fn decode_viewport(
+    draw: &IndexedDraw,
+    target_width: u32,
+    target_height: u32,
+    scissor: GuestScissor,
+) -> MTLViewport {
+    let mut minimum_depth = 0.0_f32;
+    let mut maximum_depth = 1.0_f32;
+    if let (Some(minimum), Some(maximum)) = (
+        register_value(&draw.context_registers, 0x0b4).map(f32::from_bits),
+        register_value(&draw.context_registers, 0x0b5).map(f32::from_bits),
+    ) && minimum.is_finite()
+        && maximum.is_finite()
+        && maximum > minimum
+    {
+        minimum_depth = minimum;
+        maximum_depth = maximum;
+    }
+    let programmed = [0x10f, 0x110, 0x111, 0x112]
+        .map(|register| register_value(&draw.context_registers, register).map(f32::from_bits));
+    if let [Some(x_scale), Some(x_offset), Some(y_scale), Some(y_offset)] = programmed
+        && [x_scale, x_offset, y_scale, y_offset]
+            .into_iter()
+            .all(f32::is_finite)
+        && x_scale > 0.0
+        && y_scale != 0.0
+    {
+        let mut origin_y = y_offset - y_scale;
+        let mut height = y_scale * 2.0;
+        if height < 0.0 {
+            origin_y += height;
+            height = -height;
+        }
+        return MTLViewport {
+            originX: f64::from(x_offset - x_scale),
+            originY: f64::from(origin_y),
+            width: f64::from(x_scale * 2.0),
+            height: f64::from(height),
+            znear: f64::from(minimum_depth),
+            zfar: f64::from(maximum_depth),
+        };
+    }
+    let (x, y, width, height) = match scissor {
+        GuestScissor::Rect(rect) => (rect.x, rect.y, rect.width, rect.height),
+        GuestScissor::Full | GuestScissor::Empty => {
+            (0, 0, u64::from(target_width), u64::from(target_height))
+        }
+    };
+    MTLViewport {
+        #[allow(clippy::cast_precision_loss)]
+        originX: x as f64,
+        #[allow(clippy::cast_precision_loss)]
+        originY: y as f64,
+        #[allow(clippy::cast_precision_loss)]
+        width: width as f64,
+        #[allow(clippy::cast_precision_loss)]
+        height: height as f64,
+        znear: f64::from(minimum_depth),
+        zfar: f64::from(maximum_depth),
     }
 }
 
@@ -1499,6 +1685,14 @@ fn metal_primitive_type(guest: u32) -> Result<MTLPrimitiveType, String> {
         6 | 0x11 => Ok(MTLPrimitiveType::TriangleStrip),
         5 => Err("triangle-fan topology requires explicit Metal index expansion".to_owned()),
         _ => Err(format!("unknown guest primitive topology {guest:#x}")),
+    }
+}
+
+const fn metal_nonindexed_vertex_count(guest_primitive_type: u32, guest_count: u32) -> u32 {
+    if guest_primitive_type == 0x11 {
+        4
+    } else {
+        guest_count
     }
 }
 
@@ -2582,8 +2776,9 @@ mod tests {
         DREAMING_FILL_ES_PREFIX, DREAMING_FILL_PS_PREFIX, GuestPresentConstants,
         GuestTextureDescriptor, apply_image_destination_select, blend_premultiplied_rgba,
         blit_guest_texture_bytes, convert_guest_rgba_to_bgra, convert_mode27_rgba_to_bgra,
-        decode_image_descriptor, effective_linear_rgba_pitch, execute_dreaming_fill_draw,
-        mode27_source_byte_offset, read_draw_indices, transform_sprite_position,
+        decode_image_descriptor, decode_scissor, decode_viewport, effective_linear_rgba_pitch,
+        execute_dreaming_fill_draw, metal_nonindexed_vertex_count, mode27_source_byte_offset,
+        read_draw_indices, transform_sprite_position,
     };
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
@@ -2630,6 +2825,77 @@ mod tests {
         assert_eq!(effective_linear_rgba_pitch(320), Some(320));
         assert_eq!(effective_linear_rgba_pitch(980), Some(1024));
         assert_eq!(effective_linear_rgba_pitch(250), Some(256));
+    }
+
+    #[test]
+    fn expands_nonindexed_rect_lists_to_a_four_vertex_triangle_strip() {
+        assert_eq!(metal_nonindexed_vertex_count(0x11, 3), 4);
+        assert_eq!(metal_nonindexed_vertex_count(4, 3), 3);
+    }
+
+    #[test]
+    fn decodes_programmed_negative_height_viewport_and_intersected_scissors() {
+        let mut draw = indexed_draw(0x10_000, 0, 3);
+        draw.context_registers = vec![
+            GpuRegister {
+                offset: 0x081,
+                value: (50 << 16) | 100,
+            },
+            GpuRegister {
+                offset: 0x082,
+                value: (900 << 16) | 1_500,
+            },
+            GpuRegister {
+                offset: 0x090,
+                value: (100 << 16) | 200,
+            },
+            GpuRegister {
+                offset: 0x091,
+                value: (800 << 16) | 1_200,
+            },
+            GpuRegister {
+                offset: 0x10f,
+                value: 1_920.0_f32.to_bits(),
+            },
+            GpuRegister {
+                offset: 0x110,
+                value: 1_920.0_f32.to_bits(),
+            },
+            GpuRegister {
+                offset: 0x111,
+                value: (-1_080.0_f32).to_bits(),
+            },
+            GpuRegister {
+                offset: 0x112,
+                value: 1_080.0_f32.to_bits(),
+            },
+        ];
+        draw.context_registers
+            .sort_by_key(|register| register.offset);
+
+        let scissor = decode_scissor(&draw, 3_840, 2_160).expect("valid guest scissors");
+        let super::GuestScissor::Rect(scissor_rect) = scissor else {
+            panic!("expected an intersected scissor rectangle");
+        };
+        assert_eq!(
+            (
+                scissor_rect.x,
+                scissor_rect.y,
+                scissor_rect.width,
+                scissor_rect.height
+            ),
+            (200, 100, 1_000, 700)
+        );
+        let viewport = decode_viewport(&draw, 3_840, 2_160, scissor);
+        assert_eq!(
+            (
+                viewport.originX,
+                viewport.originY,
+                viewport.width,
+                viewport.height
+            ),
+            (0.0, 0.0, 3_840.0, 2_160.0)
+        );
     }
 
     #[test]
