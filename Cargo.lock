@@ -1381,6 +1381,7 @@ dependencies = [
  "metal",
  "objc",
  "remu-gpu",
+ "remu-memory",
  "remu-shader",
  "remu-shader-metal",
  "winit",

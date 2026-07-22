@@ -1,7 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -13,21 +13,22 @@ use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
-    Buffer, CompileOptions, Device, Function, Library, MTLCommandBufferStatus, MTLIndexType,
-    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
-    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLScissorRect, MTLSize,
-    MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer,
-    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
-    SamplerState, Texture, TextureDescriptor,
+    Buffer, CommandBuffer, CompileOptions, Device, Function, Library, MTLCommandBufferStatus,
+    MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion,
+    MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
+    MTLViewport, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState,
+    SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use objc::runtime::{Class, Object, YES};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{
-    GpuEvent, GpuRegister, HostPadState, IndexedDraw, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS,
-    PAD_BUTTON_DOWN, PAD_BUTTON_L1, PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS,
-    PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE,
-    PAD_BUTTON_UP, set_host_pad_state,
+    GpuEvent, GpuMemoryAcquire, GpuRegister, HostPadState, IndexedDraw, PAD_BUTTON_CIRCLE,
+    PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1, PAD_BUTTON_L2, PAD_BUTTON_LEFT,
+    PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE,
+    PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
 };
+use remu_memory::CpuWriteWatch;
 use remu_shader::{ImageBinding, ShaderEvaluation};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -55,7 +56,7 @@ struct PendingFlip {
     sequence: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct GuestTextureDescriptor {
     address: u64,
     width: u32,
@@ -81,6 +82,37 @@ struct UploadedImageTexture {
     texture: Texture,
     descriptor: DecodedImageDescriptor,
     writable: bool,
+}
+
+struct ResidentGuestTexture {
+    texture: Texture,
+    descriptor: GuestTextureDescriptor,
+    write_watch: CpuWriteWatch,
+    gpu_written: bool,
+    content_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SampledTextureKey {
+    descriptor: GuestTextureDescriptor,
+    destination_select: u32,
+}
+
+struct CachedSampledTexture {
+    texture: Texture,
+    write_watch: CpuWriteWatch,
+}
+
+struct PendingGlobalWriteback {
+    buffer: Buffer,
+    guest_address: u64,
+    byte_count: usize,
+}
+
+struct GuestCommandBatch {
+    command_buffer: CommandBuffer,
+    draws: Vec<(u64, u64)>,
+    global_writebacks: Vec<PendingGlobalWriteback>,
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +150,11 @@ struct MetalPresenter {
     compiling_shader_pairs: HashSet<(u64, u64)>,
     failed_shader_pairs: HashSet<(u64, u64)>,
     failed_draw_execution: HashSet<(u64, u64)>,
+    resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
+    resident_content_version: u64,
+    open_guest_batch: Option<GuestCommandBatch>,
+    committed_guest_batches: VecDeque<GuestCommandBatch>,
     capture_directory: Option<PathBuf>,
     pressed_keys: HashSet<KeyCode>,
     shader_compile_sender: Sender<IndexedDraw>,
@@ -173,6 +210,11 @@ impl MetalPresenter {
             compiling_shader_pairs: HashSet::new(),
             failed_shader_pairs: HashSet::new(),
             failed_draw_execution: HashSet::new(),
+            resident_guest_textures: HashMap::new(),
+            sampled_texture_cache: HashMap::new(),
+            resident_content_version: 0,
+            open_guest_batch: None,
+            committed_guest_batches: VecDeque::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
             pressed_keys: HashSet::new(),
             shader_compile_sender,
@@ -227,6 +269,7 @@ impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
     fn receive_events(&mut self, event_loop: &ActiveEventLoop) {
         self.receive_shader_compilations();
+        self.retire_completed_guest_batches();
         // A bounded batch prevents a continuously producing guest from starving redraw and input
         // delivery. The bounded sender applies backpressure until the next AppKit iteration.
         for _ in 0..16 {
@@ -257,12 +300,20 @@ impl MetalPresenter {
                     );
                 }
                 Ok(GpuEvent::Flip { address, .. }) => {
+                    if let Err(error) = self.synchronize_flip_target(address) {
+                        eprintln!("[REMu][METAL] flip synchronization failed: {error}");
+                    }
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
                     self.pending_flip = Some(PendingFlip {
                         address,
                         sequence: self.next_flip_sequence,
                     });
                     self.redraw_pending = true;
+                }
+                Ok(GpuEvent::MemoryAcquire(acquire)) => {
+                    if let Err(error) = self.synchronize_cpu_written_guest_resources(acquire) {
+                        eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
+                    }
                 }
                 Ok(GpuEvent::IndexedDraw(draw)) => {
                     self.compile_draw_shaders(&draw);
@@ -299,6 +350,9 @@ impl MetalPresenter {
                     }
                 }
                 Ok(GpuEvent::Shutdown) | Err(TryRecvError::Disconnected) => {
+                    if let Err(error) = self.wait_for_guest_command_batches() {
+                        eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
+                    }
                     event_loop.exit();
                     return;
                 }
@@ -433,15 +487,263 @@ impl MetalPresenter {
         })
     }
 
+    fn ensure_resident_texture(
+        &mut self,
+        device: &Device,
+        descriptor: GuestTextureDescriptor,
+    ) -> Result<Texture, String> {
+        if let Some(resident) = self.resident_guest_textures.get(&descriptor) {
+            return Ok(resident.texture.clone());
+        }
+        let mut aliases = self
+            .resident_guest_textures
+            .values()
+            .filter(|resident| guest_texture_descriptors_overlap(resident.descriptor, descriptor))
+            .map(|resident| (resident.content_version, resident.descriptor))
+            .collect::<Vec<_>>();
+        if !aliases.is_empty() {
+            self.wait_for_guest_command_batches()?;
+            aliases.sort_by_key(|(version, _)| *version);
+            for (_, alias) in aliases {
+                let resident = self
+                    .resident_guest_textures
+                    .remove(&alias)
+                    .expect("collected resident alias exists");
+                if resident.gpu_written {
+                    let rgba = read_texture_rgba(&resident.texture, resident.descriptor)?;
+                    write_guest_texture_rgba(resident.descriptor, &rgba)?;
+                }
+            }
+            self.sampled_texture_cache
+                .retain(|key, _| !guest_texture_descriptors_overlap(key.descriptor, descriptor));
+        }
+        ensure_resident_texture_in_map(device, descriptor, &mut self.resident_guest_textures)
+    }
+
+    fn synchronize_cpu_written_guest_resources(
+        &mut self,
+        acquire: GpuMemoryAcquire,
+    ) -> Result<(), String> {
+        if !acquire.invalidates_guest_resources() {
+            return Ok(());
+        }
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+
+        for resident in self.resident_guest_textures.values_mut() {
+            let (_, byte_count) = resident.write_watch.range();
+            if !acquire.overlaps(resident.descriptor.address, byte_count)
+                || !resident.write_watch.is_dirty()
+            {
+                continue;
+            }
+            let raw =
+                snapshot_watched_guest_texture_raw(resident.descriptor, &resident.write_watch)?;
+            let rgba = decode_guest_texture_rgba_from_raw(resident.descriptor, &raw)?;
+            let texture = create_rgba_texture(
+                &device,
+                resident.descriptor.width,
+                resident.descriptor.height,
+                MTLTextureUsage::RenderTarget
+                    | MTLTextureUsage::ShaderRead
+                    | MTLTextureUsage::ShaderWrite,
+                &rgba,
+            )?;
+            texture.set_label(&format!(
+                "REMu guest image {:#x}",
+                resident.descriptor.address
+            ));
+            // Replace instead of mutating the old texture. Already encoded Metal work retains the
+            // old allocation, while following draws observe the CPU update without a GPU wait.
+            resident.texture = texture;
+            resident.gpu_written = false;
+        }
+
+        for (key, cached) in &mut self.sampled_texture_cache {
+            let (_, byte_count) = cached.write_watch.range();
+            if !acquire.overlaps(key.descriptor.address, byte_count)
+                || !cached.write_watch.is_dirty()
+            {
+                continue;
+            }
+            let raw = snapshot_watched_guest_texture_raw(key.descriptor, &cached.write_watch)?;
+            let mut rgba = decode_guest_texture_rgba_from_raw(key.descriptor, &raw)?;
+            apply_image_destination_select(&mut rgba, key.destination_select)?;
+            let texture = create_rgba_texture(
+                &device,
+                key.descriptor.width,
+                key.descriptor.height,
+                MTLTextureUsage::ShaderRead,
+                &rgba,
+            )?;
+            texture.set_label(&format!(
+                "REMu sampled guest image {:#x}",
+                key.descriptor.address
+            ));
+            cached.texture = texture;
+        }
+        Ok(())
+    }
+
+    fn mark_resident_texture_written(&mut self, descriptor: GuestTextureDescriptor) {
+        self.resident_content_version = self.resident_content_version.saturating_add(1);
+        if let Some(resident) = self.resident_guest_textures.get_mut(&descriptor) {
+            resident.gpu_written = true;
+            resident.content_version = self.resident_content_version;
+        }
+        self.sampled_texture_cache
+            .retain(|key, _| key.descriptor != descriptor);
+    }
+
+    fn synchronize_sampled_aliases(
+        &mut self,
+        evaluations: [&ShaderEvaluation; 2],
+    ) -> Result<(), String> {
+        let mut aliases = Vec::new();
+        for evaluation in evaluations {
+            for binding in evaluation.image_bindings.iter().filter(|binding| {
+                !binding.opcode.starts_with("ImageStore")
+                    && !binding.opcode.starts_with("ImageAtomic")
+            }) {
+                let sampled = decode_image_descriptor(&binding.resource_descriptor)
+                    .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+                let identity_select = matches!(sampled.destination_select, 0 | 0xfac);
+                aliases.extend(
+                    self.resident_guest_textures
+                        .values()
+                        .filter(|resident| resident.gpu_written)
+                        .filter(|resident| {
+                            guest_texture_descriptors_overlap(resident.descriptor, sampled.guest)
+                                && (!identity_select || resident.descriptor != sampled.guest)
+                        })
+                        .map(|resident| resident.descriptor),
+                );
+            }
+        }
+        aliases.sort_unstable_by_key(|descriptor| descriptor.address);
+        aliases.dedup();
+        if aliases.is_empty() {
+            return Ok(());
+        }
+        self.wait_for_guest_command_batches()?;
+        for descriptor in aliases {
+            let resident = self
+                .resident_guest_textures
+                .get_mut(&descriptor)
+                .expect("collected sampled alias exists");
+            let rgba = read_texture_rgba(&resident.texture, descriptor)?;
+            write_guest_texture_rgba(descriptor, &rgba)?;
+            rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
+            resident.gpu_written = false;
+        }
+        Ok(())
+    }
+
+    fn retire_completed_guest_batches(&mut self) {
+        loop {
+            let Some(batch) = self.committed_guest_batches.front() else {
+                return;
+            };
+            match batch.command_buffer.status() {
+                MTLCommandBufferStatus::Completed => {
+                    let batch = self
+                        .committed_guest_batches
+                        .pop_front()
+                        .expect("front batch exists");
+                    if let Err(error) = write_back_pending_globals(&batch.global_writebacks) {
+                        eprintln!("[REMu][METAL] completed guest batch writeback failed: {error}");
+                    }
+                }
+                MTLCommandBufferStatus::Error => {
+                    let batch = self
+                        .committed_guest_batches
+                        .pop_front()
+                        .expect("front batch exists");
+                    eprintln!("[REMu][METAL] guest command batch {:?} failed", batch.draws);
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn flush_guest_command_batch(&mut self, wait: bool) -> Result<(), String> {
+        let Some(batch) = self.open_guest_batch.take() else {
+            return Ok(());
+        };
+        batch.command_buffer.commit();
+        if wait {
+            batch.command_buffer.wait_until_completed();
+            if batch.command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(format!(
+                    "Metal guest command batch {:?} ended in {:?}",
+                    batch.draws,
+                    batch.command_buffer.status()
+                ));
+            }
+            write_back_pending_globals(&batch.global_writebacks)?;
+        } else {
+            self.committed_guest_batches.push_back(batch);
+        }
+        Ok(())
+    }
+
+    fn wait_for_guest_command_batches(&mut self) -> Result<(), String> {
+        self.flush_guest_command_batch(false)?;
+        while let Some(batch) = self.committed_guest_batches.pop_front() {
+            batch.command_buffer.wait_until_completed();
+            if batch.command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(format!(
+                    "Metal guest command batch {:?} ended in {:?}",
+                    batch.draws,
+                    batch.command_buffer.status()
+                ));
+            }
+            write_back_pending_globals(&batch.global_writebacks)?;
+        }
+        Ok(())
+    }
+
+    fn synchronize_flip_target(&mut self, address: u64) -> Result<(), String> {
+        let display = self.display;
+        let descriptor = self
+            .resident_guest_textures
+            .values()
+            .filter(|resident| resident.descriptor.address == address && resident.gpu_written)
+            .filter(|resident| {
+                display.is_none_or(|display| {
+                    resident.descriptor.width == display.width
+                        && resident.descriptor.height == display.height
+                })
+            })
+            .max_by_key(|resident| resident.content_version)
+            .map(|resident| resident.descriptor);
+        let Some(descriptor) = descriptor else {
+            return Ok(());
+        };
+        self.wait_for_guest_command_batches()?;
+        let resident = self
+            .resident_guest_textures
+            .get_mut(&descriptor)
+            .expect("selected resident texture exists");
+        let rgba = read_texture_rgba(&resident.texture, descriptor)?;
+        write_guest_texture_rgba(descriptor, &rgba)?;
+        rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
+        resident.gpu_written = false;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_compiled_draw(&mut self, draw: &IndexedDraw) -> Result<(), String> {
+        self.retire_completed_guest_batches();
         let started = Instant::now();
         let trace = draw.sequence <= 4;
         let key = (draw.export_shader_address, draw.pixel_shader_address);
-        let compiled = self
-            .compiled_shader_pairs
-            .get(&key)
-            .ok_or("shader pair has no compiled Metal pipeline")?;
+        if !self.compiled_shader_pairs.contains_key(&key) {
+            return Err("shader pair has no compiled Metal pipeline".to_owned());
+        }
         let export_evaluation = draw
             .export_shader_evaluation
             .as_ref()
@@ -450,52 +752,76 @@ impl MetalPresenter {
             .pixel_shader_evaluation
             .as_ref()
             .ok_or("draw has no pixel resource evaluation")?;
-        let device = self.device.as_ref().ok_or("Metal device is unavailable")?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
         let queue = self
             .command_queue
             .as_ref()
-            .ok_or("Metal command queue is unavailable")?;
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
         let target = decode_render_target(draw).ok_or("unsupported render-target descriptor")?;
-        let target_bytes = snapshot_guest_texture_rgba(target)
+        let target_texture = self
+            .ensure_resident_texture(&device, target)
             .map_err(|error| format!("render target guest memory is unreadable: {error}"))?;
-        if trace {
-            eprintln!(
-                "[REMu][METAL] Gen5 draw={} target snapshot completed in {:?}",
-                draw.sequence,
-                started.elapsed()
-            );
-        }
-        let target_texture = create_rgba_texture(
-            device,
-            target.width,
-            target.height,
-            MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
-            &target_bytes,
-        )?;
 
-        let export_buffers = upload_global_buffers(device, export_evaluation)?;
-        let pixel_buffers = upload_global_buffers(device, pixel_evaluation)?;
-        let export_textures = upload_image_textures(device, export_evaluation)?;
-        let pixel_textures = upload_image_textures(device, pixel_evaluation)?;
+        for evaluation in [export_evaluation, pixel_evaluation] {
+            for binding in evaluation.image_bindings.iter().filter(|binding| {
+                binding.opcode.starts_with("ImageStore")
+                    || binding.opcode.starts_with("ImageAtomic")
+            }) {
+                let descriptor = decode_image_descriptor(&binding.resource_descriptor)
+                    .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+                if descriptor.guest != target
+                    && guest_texture_descriptors_overlap(descriptor.guest, target)
+                {
+                    return Err(format!(
+                        "writable image at PC {:#x} aliases the render target through an incompatible view",
+                        binding.pc
+                    ));
+                }
+                self.ensure_resident_texture(&device, descriptor.guest)?;
+            }
+        }
+        self.synchronize_sampled_aliases([export_evaluation, pixel_evaluation])?;
+
+        let export_buffers = upload_global_buffers(&device, export_evaluation)?;
+        let pixel_buffers = upload_global_buffers(&device, pixel_evaluation)?;
+        let export_textures = upload_image_textures(
+            &device,
+            export_evaluation,
+            &mut self.resident_guest_textures,
+            &mut self.sampled_texture_cache,
+        )?;
+        let pixel_textures = upload_image_textures(
+            &device,
+            pixel_evaluation,
+            &mut self.resident_guest_textures,
+            &mut self.sampled_texture_cache,
+        )?;
+        let compiled = self
+            .compiled_shader_pairs
+            .get(&key)
+            .ok_or("shader pair has no compiled Metal pipeline")?;
         let (export_sampler_buffer, _export_samplers) = create_sampler_argument_buffer(
-            device,
+            &device,
             &compiled.vertex_function,
             compiled.vertex.bindings.sampler_argument_buffer_index,
             export_evaluation,
         )?;
         let (pixel_sampler_buffer, _pixel_samplers) = create_sampler_argument_buffer(
-            device,
+            &device,
             &compiled.pixel_function,
             compiled.pixel.bindings.sampler_argument_buffer_index,
             pixel_evaluation,
         )?;
-        if trace {
-            eprintln!(
-                "[REMu][METAL] Gen5 draw={} resources uploaded in {:?}",
-                draw.sequence,
-                started.elapsed()
-            );
-        }
+        let pipeline = compiled.pipeline.clone();
+        let vertex_scalar_buffer_index = compiled.vertex.bindings.initial_scalar_buffer_index;
+        let pixel_scalar_buffer_index = compiled.pixel.bindings.initial_scalar_buffer_index;
+        let vertex_sampler_buffer_index = compiled.vertex.bindings.sampler_argument_buffer_index;
+        let pixel_sampler_buffer_index = compiled.pixel.bindings.sampler_argument_buffer_index;
 
         let pass = RenderPassDescriptor::new();
         let attachment = pass
@@ -505,154 +831,152 @@ impl MetalPresenter {
         attachment.set_texture(Some(&target_texture));
         attachment.set_load_action(MTLLoadAction::Load);
         attachment.set_store_action(MTLStoreAction::Store);
-        let command_buffer = queue.new_command_buffer();
-        command_buffer.set_label("REMu translated guest draw");
-        let encoder = command_buffer.new_render_command_encoder(pass);
-        encoder.set_label("REMu translated guest render pass");
-        encoder.set_render_pipeline_state(&compiled.pipeline);
-        let scissor = decode_scissor(draw, target.width, target.height)?;
-        let viewport = decode_viewport(draw, target.width, target.height, scissor);
-        encoder.set_viewport(viewport);
-        if let GuestScissor::Rect(rect) = scissor {
-            encoder.set_scissor_rect(rect);
+        if self.open_guest_batch.is_none() {
+            let command_buffer = queue.new_command_buffer().to_owned();
+            command_buffer.set_label("REMu translated guest batch");
+            self.open_guest_batch = Some(GuestCommandBatch {
+                command_buffer,
+                draws: Vec::new(),
+                global_writebacks: Vec::new(),
+            });
+        }
+        {
+            let batch = self
+                .open_guest_batch
+                .as_mut()
+                .expect("guest command batch was opened above");
+            batch.draws.push(key);
+            collect_pending_global_writebacks(
+                &export_buffers,
+                export_evaluation,
+                &mut batch.global_writebacks,
+            )?;
+            collect_pending_global_writebacks(
+                &pixel_buffers,
+                pixel_evaluation,
+                &mut batch.global_writebacks,
+            )?;
+            let encoder = batch.command_buffer.new_render_command_encoder(pass);
+            encoder.set_label("REMu translated guest render pass");
+            encoder.set_render_pipeline_state(&pipeline);
+            let scissor = decode_scissor(draw, target.width, target.height)?;
+            let viewport = decode_viewport(draw, target.width, target.height, scissor);
+            encoder.set_viewport(viewport);
+            if let GuestScissor::Rect(rect) = scissor {
+                encoder.set_scissor_rect(rect);
+            }
+            for (index, buffer) in export_buffers.iter().enumerate() {
+                encoder.set_vertex_buffer(
+                    u64::try_from(index).map_err(|_| "vertex buffer index overflow")?,
+                    Some(buffer),
+                    0,
+                );
+            }
+            for (index, buffer) in pixel_buffers.iter().enumerate() {
+                encoder.set_fragment_buffer(
+                    u64::try_from(index).map_err(|_| "pixel buffer index overflow")?,
+                    Some(buffer),
+                    0,
+                );
+            }
+            encoder.set_vertex_bytes(
+                u64::from(vertex_scalar_buffer_index),
+                u64::try_from(export_evaluation.initial_scalar_registers.len() * 4)
+                    .map_err(|_| "vertex scalar byte count overflow")?,
+                export_evaluation
+                    .initial_scalar_registers
+                    .as_ptr()
+                    .cast::<c_void>(),
+            );
+            encoder.set_fragment_bytes(
+                u64::from(pixel_scalar_buffer_index),
+                u64::try_from(pixel_evaluation.initial_scalar_registers.len() * 4)
+                    .map_err(|_| "pixel scalar byte count overflow")?,
+                pixel_evaluation
+                    .initial_scalar_registers
+                    .as_ptr()
+                    .cast::<c_void>(),
+            );
+            for (index, texture) in export_textures.iter().enumerate() {
+                encoder.set_vertex_texture(
+                    u64::try_from(index).map_err(|_| "vertex texture index overflow")?,
+                    Some(&texture.texture),
+                );
+            }
+            for (index, texture) in pixel_textures.iter().enumerate() {
+                encoder.set_fragment_texture(
+                    u64::try_from(index).map_err(|_| "pixel texture index overflow")?,
+                    Some(&texture.texture),
+                );
+            }
+            if let (Some(index), Some(buffer)) =
+                (vertex_sampler_buffer_index, export_sampler_buffer.as_ref())
+            {
+                encoder.set_vertex_buffer(u64::from(index), Some(buffer), 0);
+            }
+            if let (Some(index), Some(buffer)) =
+                (pixel_sampler_buffer_index, pixel_sampler_buffer.as_ref())
+            {
+                encoder.set_fragment_buffer(u64::from(index), Some(buffer), 0);
+            }
+
+            let primitive = metal_primitive_type(draw.primitive_type)?;
+            if matches!(scissor, GuestScissor::Empty) {
+                // Metal rejects an empty scissor, so a guest empty-scissor draw encodes no
+                // primitive while preserving command-stream ordering.
+            } else if draw.indexed {
+                let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
+                let index_buffer = device.new_buffer_with_data(
+                    indices.as_ptr().cast::<c_void>(),
+                    u64::try_from(indices.len() * 4).map_err(|_| "index byte count overflow")?,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                encoder.draw_indexed_primitives_instanced(
+                    primitive,
+                    u64::try_from(indices.len()).map_err(|_| "index count overflow")?,
+                    MTLIndexType::UInt32,
+                    &index_buffer,
+                    0,
+                    u64::from(draw.instance_count),
+                );
+            } else {
+                encoder.draw_primitives_instanced(
+                    primitive,
+                    u64::from(draw.index_offset),
+                    u64::from(metal_nonindexed_vertex_count(
+                        draw.primitive_type,
+                        draw.index_count,
+                    )),
+                    u64::from(draw.instance_count),
+                );
+            }
+            encoder.end_encoding();
+        }
+
+        self.mark_resident_texture_written(target);
+        for texture in export_textures.iter().chain(&pixel_textures) {
+            if texture.writable {
+                self.mark_resident_texture_written(texture.descriptor.guest);
+            }
+        }
+        let capture_due = self.capture_directory.is_some()
+            && self
+                .last_guest_capture
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
+        let batch_full = self
+            .open_guest_batch
+            .as_ref()
+            .is_some_and(|batch| batch.draws.len() >= 32);
+        if capture_due {
+            self.wait_for_guest_command_batches()?;
+            let rendered = read_texture_rgba(&target_texture, target)?;
+            self.capture_translated_frame_if_changed(target, &rendered);
+        } else if batch_full {
+            self.flush_guest_command_batch(false)?;
         }
         if trace {
             eprintln!(
-                "[REMu][METAL] Gen5 draw={} viewport=({:.1},{:.1} {:.1}x{:.1} {:.3}..{:.3}) scissor={scissor:?} registers=[{:08x},{:08x},{:08x},{:08x}]",
-                draw.sequence,
-                viewport.originX,
-                viewport.originY,
-                viewport.width,
-                viewport.height,
-                viewport.znear,
-                viewport.zfar,
-                register_value(&draw.context_registers, 0x10f).unwrap_or_default(),
-                register_value(&draw.context_registers, 0x110).unwrap_or_default(),
-                register_value(&draw.context_registers, 0x111).unwrap_or_default(),
-                register_value(&draw.context_registers, 0x112).unwrap_or_default(),
-            );
-        }
-        for (index, buffer) in export_buffers.iter().enumerate() {
-            encoder.set_vertex_buffer(
-                u64::try_from(index).map_err(|_| "vertex buffer index overflow")?,
-                Some(buffer),
-                0,
-            );
-        }
-        for (index, buffer) in pixel_buffers.iter().enumerate() {
-            encoder.set_fragment_buffer(
-                u64::try_from(index).map_err(|_| "pixel buffer index overflow")?,
-                Some(buffer),
-                0,
-            );
-        }
-        let export_scalar_bytes = export_evaluation.initial_scalar_registers.len() * 4;
-        encoder.set_vertex_bytes(
-            u64::from(compiled.vertex.bindings.initial_scalar_buffer_index),
-            u64::try_from(export_scalar_bytes).map_err(|_| "vertex scalar byte count overflow")?,
-            export_evaluation
-                .initial_scalar_registers
-                .as_ptr()
-                .cast::<c_void>(),
-        );
-        let pixel_scalar_bytes = pixel_evaluation.initial_scalar_registers.len() * 4;
-        encoder.set_fragment_bytes(
-            u64::from(compiled.pixel.bindings.initial_scalar_buffer_index),
-            u64::try_from(pixel_scalar_bytes).map_err(|_| "pixel scalar byte count overflow")?,
-            pixel_evaluation
-                .initial_scalar_registers
-                .as_ptr()
-                .cast::<c_void>(),
-        );
-        for (index, texture) in export_textures.iter().enumerate() {
-            encoder.set_vertex_texture(
-                u64::try_from(index).map_err(|_| "vertex texture index overflow")?,
-                Some(&texture.texture),
-            );
-        }
-        for (index, texture) in pixel_textures.iter().enumerate() {
-            encoder.set_fragment_texture(
-                u64::try_from(index).map_err(|_| "pixel texture index overflow")?,
-                Some(&texture.texture),
-            );
-        }
-        if let (Some(index), Some(buffer)) = (
-            compiled.vertex.bindings.sampler_argument_buffer_index,
-            export_sampler_buffer.as_ref(),
-        ) {
-            encoder.set_vertex_buffer(u64::from(index), Some(buffer), 0);
-        }
-        if let (Some(index), Some(buffer)) = (
-            compiled.pixel.bindings.sampler_argument_buffer_index,
-            pixel_sampler_buffer.as_ref(),
-        ) {
-            encoder.set_fragment_buffer(u64::from(index), Some(buffer), 0);
-        }
-
-        let primitive = metal_primitive_type(draw.primitive_type)?;
-        if matches!(scissor, GuestScissor::Empty) {
-            // An empty guest scissor is a valid no-op draw. Metal rejects zero-sized scissors, so
-            // retain the render pass and omit the primitive command instead.
-        } else if draw.indexed {
-            let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
-            let index_buffer = device.new_buffer_with_data(
-                indices.as_ptr().cast::<c_void>(),
-                u64::try_from(indices.len() * 4).map_err(|_| "index byte count overflow")?,
-                MTLResourceOptions::StorageModeShared,
-            );
-            encoder.draw_indexed_primitives_instanced(
-                primitive,
-                u64::try_from(indices.len()).map_err(|_| "index count overflow")?,
-                MTLIndexType::UInt32,
-                &index_buffer,
-                0,
-                u64::from(draw.instance_count),
-            );
-        } else {
-            let vertex_count = metal_nonindexed_vertex_count(draw.primitive_type, draw.index_count);
-            encoder.draw_primitives_instanced(
-                primitive,
-                u64::from(draw.index_offset),
-                u64::from(vertex_count),
-                u64::from(draw.instance_count),
-            );
-        }
-        encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "Metal command buffer ended in {:?}",
-                command_buffer.status()
-            ));
-        }
-        if trace {
-            eprintln!(
-                "[REMu][METAL] Gen5 draw={} GPU completed in {:?}",
-                draw.sequence,
-                started.elapsed()
-            );
-        }
-
-        write_back_global_buffers(&export_buffers, export_evaluation)?;
-        write_back_global_buffers(&pixel_buffers, pixel_evaluation)?;
-        write_back_image_textures(&export_textures)?;
-        write_back_image_textures(&pixel_textures)?;
-
-        let mut rendered = vec![0_u8; target_bytes.len()];
-        target_texture.get_bytes(
-            rendered.as_mut_ptr().cast::<c_void>(),
-            u64::from(target.width) * 4,
-            MTLRegion::new_2d(0, 0, u64::from(target.width), u64::from(target.height)),
-            0,
-        );
-        write_guest_texture_rgba(target, &rendered).map_err(|error| {
-            format!("could not write Metal render target back to guest memory: {error}")
-        })?;
-        self.capture_translated_frame_if_changed(target, &rendered);
-        if trace {
-            eprintln!(
-                "[REMu][METAL] executed Gen5 draw={} es={:#x} ps={:#x} in {:?}",
+                "[REMu][METAL] encoded Gen5 draw={} es={:#x} ps={:#x} in {:?}",
                 draw.sequence,
                 key.0,
                 key.1,
@@ -1151,7 +1475,7 @@ fn decode_viewport(
     }
 }
 
-fn snapshot_guest_texture_rgba(descriptor: GuestTextureDescriptor) -> Result<Vec<u8>, String> {
+fn guest_texture_raw_range(descriptor: GuestTextureDescriptor) -> Result<(usize, usize), String> {
     let byte_count = guest_texture_byte_count(descriptor)
         .ok_or("guest texture byte count overflows the host address space")?;
     if descriptor.address < 0x10_000 || byte_count > 128 * 1024 * 1024 {
@@ -1164,14 +1488,86 @@ fn snapshot_guest_texture_rgba(descriptor: GuestTextureDescriptor) -> Result<Vec
         .map_err(|_| "guest texture address does not fit usize")?;
     let source_length =
         usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
+    Ok((source_address, source_length))
+}
+
+fn snapshot_guest_texture_raw(descriptor: GuestTextureDescriptor) -> Result<Vec<u8>, String> {
+    let (source_address, source_length) = guest_texture_raw_range(descriptor)?;
+    // SAFETY: The decoded resource descriptor names a live guest direct-memory mapping. The
+    // runtime owns that mapping while GPU events referencing it may be processed.
+    Ok(unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) }.to_vec())
+}
+
+fn watch_guest_texture(descriptor: GuestTextureDescriptor) -> Result<CpuWriteWatch, String> {
+    let (_, byte_count) = guest_texture_raw_range(descriptor)?;
+    let byte_count =
+        u64::try_from(byte_count).map_err(|_| "guest texture byte count does not fit u64")?;
+    // SAFETY: the validated descriptor identifies a live guest direct-memory allocation. The
+    // runtime retains guest mappings while GPU events and their resident resources are alive.
+    unsafe { CpuWriteWatch::new(descriptor.address, byte_count) }
+        .map_err(|error| format!("could not watch guest texture CPU writes: {error}"))
+}
+
+fn snapshot_watched_guest_texture_raw(
+    descriptor: GuestTextureDescriptor,
+    write_watch: &CpuWriteWatch,
+) -> Result<Vec<u8>, String> {
+    loop {
+        let _ = write_watch.consume_dirty();
+        write_watch
+            .rearm()
+            .map_err(|error| format!("could not rearm guest texture CPU writes: {error}"))?;
+        let generation = write_watch.generation();
+        let raw = snapshot_guest_texture_raw(descriptor)?;
+        if write_watch.generation() == generation && !write_watch.is_dirty() {
+            return Ok(raw);
+        }
+    }
+}
+
+fn rearm_guest_texture_after_gpu_writeback(write_watch: &CpuWriteWatch) -> Result<(), String> {
+    loop {
+        let generation = write_watch.generation();
+        let _ = write_watch.consume_dirty();
+        write_watch
+            .rearm()
+            .map_err(|error| format!("could not rearm guest texture CPU writes: {error}"))?;
+        if write_watch.generation() == generation && !write_watch.is_dirty() {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+fn guest_texture_raw_matches(
+    descriptor: GuestTextureDescriptor,
+    shadow: &[u8],
+) -> Result<bool, String> {
+    let (source_address, source_length) = guest_texture_raw_range(descriptor)?;
+    // SAFETY: See snapshot_guest_texture_raw; the comparison does not retain the borrowed range.
+    let source = unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) };
+    Ok(source == shadow)
+}
+
+fn decode_guest_texture_rgba_from_raw(
+    descriptor: GuestTextureDescriptor,
+    source: &[u8],
+) -> Result<Vec<u8>, String> {
     let output_length = u64::from(descriptor.width)
         .checked_mul(u64::from(descriptor.height))
         .and_then(|pixels| pixels.checked_mul(4))
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or("guest texture dimensions overflow")?;
-    // SAFETY: The resource descriptor points into a live guest direct-memory mapping. The decoded
-    // dimensions, pitch, and supported tiling modes bound the view to at most 128 MiB.
-    let source = unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) };
+    let expected_source = usize::try_from(
+        guest_texture_byte_count(descriptor).ok_or("guest texture byte count overflows")?,
+    )
+    .map_err(|_| "guest texture byte count does not fit usize")?;
+    if source.len() != expected_source {
+        return Err(format!(
+            "guest texture source has {} bytes, expected {expected_source}",
+            source.len()
+        ));
+    }
     let width =
         usize::try_from(descriptor.width).map_err(|_| "texture width does not fit usize")?;
     let height =
@@ -1202,6 +1598,14 @@ fn snapshot_guest_texture_rgba(descriptor: GuestTextureDescriptor) -> Result<Vec
         copy_mode27_to_linear(source, descriptor, &mut output)?;
     }
     Ok(output)
+}
+
+#[cfg(test)]
+fn snapshot_guest_texture_rgba(descriptor: GuestTextureDescriptor) -> Result<Vec<u8>, String> {
+    let (source_address, source_length) = guest_texture_raw_range(descriptor)?;
+    // SAFETY: See snapshot_guest_texture_raw; decoding completes before this function returns.
+    let source = unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) };
+    decode_guest_texture_rgba_from_raw(descriptor, source)
 }
 
 fn write_guest_texture_rgba(descriptor: GuestTextureDescriptor, rgba: &[u8]) -> Result<(), String> {
@@ -1299,6 +1703,62 @@ fn create_rgba_texture(
     Ok(texture)
 }
 
+fn read_texture_rgba(
+    texture: &Texture,
+    descriptor: GuestTextureDescriptor,
+) -> Result<Vec<u8>, String> {
+    let length = u64::from(descriptor.width)
+        .checked_mul(u64::from(descriptor.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or("Metal texture readback dimensions overflow")?;
+    let mut rgba = vec![0_u8; length];
+    texture.get_bytes(
+        rgba.as_mut_ptr().cast::<c_void>(),
+        u64::from(descriptor.width) * 4,
+        MTLRegion::new_2d(
+            0,
+            0,
+            u64::from(descriptor.width),
+            u64::from(descriptor.height),
+        ),
+        0,
+    );
+    Ok(rgba)
+}
+
+fn ensure_resident_texture_in_map(
+    device: &Device,
+    descriptor: GuestTextureDescriptor,
+    resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+) -> Result<Texture, String> {
+    if let Some(resident) = resident_guest_textures.get(&descriptor) {
+        return Ok(resident.texture.clone());
+    }
+    let write_watch = watch_guest_texture(descriptor)?;
+    let raw = snapshot_watched_guest_texture_raw(descriptor, &write_watch)?;
+    let rgba = decode_guest_texture_rgba_from_raw(descriptor, &raw)?;
+    let texture = create_rgba_texture(
+        device,
+        descriptor.width,
+        descriptor.height,
+        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite,
+        &rgba,
+    )?;
+    texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));
+    resident_guest_textures.insert(
+        descriptor,
+        ResidentGuestTexture {
+            texture: texture.clone(),
+            descriptor,
+            write_watch,
+            gpu_written: false,
+            content_version: 0,
+        },
+    );
+    Ok(texture)
+}
+
 fn upload_global_buffers(
     device: &Device,
     evaluation: &ShaderEvaluation,
@@ -1324,9 +1784,10 @@ fn upload_global_buffers(
         .collect()
 }
 
-fn write_back_global_buffers(
+fn collect_pending_global_writebacks(
     buffers: &[Buffer],
     evaluation: &ShaderEvaluation,
+    pending: &mut Vec<PendingGlobalWriteback>,
 ) -> Result<(), String> {
     if buffers.len() != evaluation.global_memory_bindings.len() {
         return Err("Metal/global buffer binding count mismatch".to_owned());
@@ -1343,15 +1804,26 @@ fn write_back_global_buffers(
                 binding.data.len()
             ));
         }
-        let destination = usize::try_from(binding.base_address)
+        pending.push(PendingGlobalWriteback {
+            buffer: buffer.clone(),
+            guest_address: binding.base_address,
+            byte_count: binding.data.len(),
+        });
+    }
+    Ok(())
+}
+
+fn write_back_pending_globals(pending: &[PendingGlobalWriteback]) -> Result<(), String> {
+    for writeback in pending {
+        let destination = usize::try_from(writeback.guest_address)
             .map_err(|_| "writable global buffer address does not fit usize")?;
-        // SAFETY: Shader evaluation retained this live writable guest binding, whose captured data
-        // length is the exact range represented by the corresponding Metal buffer.
+        // SAFETY: Shader evaluation captured this live writable guest binding, and the completed
+        // command buffer owns a Metal buffer of the same exact byte length.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                buffer.contents().cast::<u8>(),
+                writeback.buffer.contents().cast::<u8>(),
                 destination as *mut u8,
-                binding.data.len(),
+                writeback.byte_count,
             );
         }
     }
@@ -1462,6 +1934,8 @@ fn apply_image_destination_select(rgba: &mut [u8], destination_select: u32) -> R
 fn upload_image_textures(
     device: &Device,
     evaluation: &ShaderEvaluation,
+    resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    sampled_texture_cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
 ) -> Result<Vec<UploadedImageTexture>, String> {
     evaluation
         .image_bindings
@@ -1477,24 +1951,53 @@ fn upload_image_textures(
                     binding.pc, descriptor.destination_select
                 ));
             }
-            let mut rgba = snapshot_guest_texture_rgba(descriptor.guest)
-                .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-            if !writable {
-                apply_image_destination_select(&mut rgba, descriptor.destination_select)
-                    .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-            }
-            let usage = if writable {
-                MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+            let identity_select = matches!(descriptor.destination_select, 0 | 0xfac);
+            let texture = if writable {
+                ensure_resident_texture_in_map(device, descriptor.guest, resident_guest_textures)?
+            } else if identity_select
+                && let Some(resident) = resident_guest_textures.get(&descriptor.guest)
+            {
+                resident.texture.clone()
             } else {
-                MTLTextureUsage::ShaderRead
+                let key = SampledTextureKey {
+                    descriptor: descriptor.guest,
+                    destination_select: descriptor.destination_select,
+                };
+                if let Some(cached) = sampled_texture_cache.get(&key) {
+                    cached.texture.clone()
+                } else {
+                    let write_watch = watch_guest_texture(descriptor.guest)
+                        .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+                    let raw = snapshot_watched_guest_texture_raw(descriptor.guest, &write_watch)
+                        .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+                    let mut rgba = decode_guest_texture_rgba_from_raw(descriptor.guest, &raw)
+                        .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+                    apply_image_destination_select(&mut rgba, descriptor.destination_select)
+                        .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+                    let texture = create_rgba_texture(
+                        device,
+                        descriptor.guest.width,
+                        descriptor.guest.height,
+                        MTLTextureUsage::ShaderRead,
+                        &rgba,
+                    )?;
+                    texture.set_label(&format!(
+                        "REMu sampled guest image {:#x}",
+                        descriptor.guest.address
+                    ));
+                    if sampled_texture_cache.len() >= 2_048 {
+                        sampled_texture_cache.clear();
+                    }
+                    sampled_texture_cache.insert(
+                        key,
+                        CachedSampledTexture {
+                            texture: texture.clone(),
+                            write_watch,
+                        },
+                    );
+                    texture
+                }
             };
-            let texture = create_rgba_texture(
-                device,
-                descriptor.guest.width,
-                descriptor.guest.height,
-                usage,
-                &rgba,
-            )?;
             Ok(UploadedImageTexture {
                 texture,
                 descriptor,
@@ -1502,31 +2005,6 @@ fn upload_image_textures(
             })
         })
         .collect()
-}
-
-fn write_back_image_textures(textures: &[UploadedImageTexture]) -> Result<(), String> {
-    for uploaded in textures.iter().filter(|texture| texture.writable) {
-        let descriptor = uploaded.descriptor.guest;
-        let length = u64::from(descriptor.width)
-            .checked_mul(u64::from(descriptor.height))
-            .and_then(|pixels| pixels.checked_mul(4))
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .ok_or("writable image dimensions overflow")?;
-        let mut rgba = vec![0_u8; length];
-        uploaded.texture.get_bytes(
-            rgba.as_mut_ptr().cast::<c_void>(),
-            u64::from(descriptor.width) * 4,
-            MTLRegion::new_2d(
-                0,
-                0,
-                u64::from(descriptor.width),
-                u64::from(descriptor.height),
-            ),
-            0,
-        );
-        write_guest_texture_rgba(descriptor, &rgba)?;
-    }
-    Ok(())
 }
 
 fn sampler_address_mode(value: u32) -> MTLSamplerAddressMode {
@@ -1880,6 +2358,21 @@ fn guest_texture_byte_count(descriptor: GuestTextureDescriptor) -> Option<u64> {
     }
 }
 
+fn guest_texture_descriptors_overlap(
+    left: GuestTextureDescriptor,
+    right: GuestTextureDescriptor,
+) -> bool {
+    let Some(left_bytes) = guest_texture_byte_count(left) else {
+        return false;
+    };
+    let Some(right_bytes) = guest_texture_byte_count(right) else {
+        return false;
+    };
+    let left_end = left.address.saturating_add(left_bytes);
+    let right_end = right.address.saturating_add(right_bytes);
+    left.address < right_end && right.address < left_end
+}
+
 #[cfg(test)]
 fn mode27_source_byte_offset(x: usize, y: usize, width: usize) -> usize {
     let blocks_per_row = width.div_ceil(128);
@@ -1990,6 +2483,9 @@ impl ApplicationHandler for MetalPresenter {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.receive_events(event_loop);
+        if let Err(error) = self.flush_guest_command_batch(false) {
+            eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
+        }
         if self.redraw_pending
             && let Some(window) = self.window.as_ref()
         {
@@ -2071,8 +2567,10 @@ mod tests {
     use super::{
         GuestTextureDescriptor, apply_image_destination_select, decode_image_descriptor,
         decode_scissor, decode_viewport, effective_linear_rgba_pitch,
+        guest_texture_descriptors_overlap, guest_texture_raw_matches,
         metal_nonindexed_vertex_count, mode27_source_byte_offset, mode27_within_block_byte_offset,
-        read_draw_indices, snapshot_guest_texture_rgba, write_guest_texture_rgba,
+        read_draw_indices, snapshot_guest_texture_raw, snapshot_guest_texture_rgba,
+        write_guest_texture_rgba,
     };
 
     fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
@@ -2266,5 +2764,58 @@ mod tests {
             snapshot_guest_texture_rgba(descriptor).expect("mode 27 snapshot succeeds"),
             linear
         );
+    }
+
+    #[test]
+    fn exact_raw_shadow_detects_cpu_writes_without_guessing_dirty_pages() {
+        let mut pixels = vec![0x5a_u8; 16 * 8 * 4];
+        let descriptor = GuestTextureDescriptor {
+            address: u64::try_from(pixels.as_mut_ptr() as usize).expect("test address fits u64"),
+            width: 8,
+            height: 8,
+            pitch: 16,
+            tile_mode: 0,
+        };
+        let shadow = snapshot_guest_texture_raw(descriptor).expect("raw snapshot succeeds");
+        assert!(guest_texture_raw_matches(descriptor, &shadow).expect("raw comparison succeeds"));
+        pixels[16 * 4 + 3] ^= 0xff;
+        assert!(!guest_texture_raw_matches(descriptor, &shadow).expect("raw comparison succeeds"));
+    }
+
+    #[test]
+    fn guest_resource_aliasing_uses_byte_ranges_not_descriptor_identity() {
+        let base = GuestTextureDescriptor {
+            address: 0x1_0000,
+            width: 64,
+            height: 64,
+            pitch: 64,
+            tile_mode: 0,
+        };
+        let overlapping_view = GuestTextureDescriptor {
+            address: base.address + 8_192,
+            width: 32,
+            height: 32,
+            pitch: 32,
+            tile_mode: 0,
+        };
+        let adjacent = GuestTextureDescriptor {
+            address: base.address + 16_384,
+            ..overlapping_view
+        };
+        assert!(guest_texture_descriptors_overlap(base, overlapping_view));
+        assert!(!guest_texture_descriptors_overlap(base, adjacent));
+    }
+
+    #[test]
+    fn persistent_target_removes_per_draw_full_surface_transfers() {
+        let frame_bytes = 3_840_u64 * 2_160 * 4;
+        let draws = 100_u64;
+        // The replaced path copied guest-to-CPU, CPU-to-Metal, Metal-to-CPU, and CPU-to-guest for
+        // every draw. A resident target needs one initial upload and one present-boundary readback.
+        let previous_target_traffic = frame_bytes * 4 * draws;
+        let persistent_target_traffic = frame_bytes * 2;
+        assert_eq!(previous_target_traffic, 13_271_040_000);
+        assert_eq!(persistent_target_traffic, 66_355_200);
+        assert_eq!(previous_target_traffic / persistent_target_traffic, 200);
     }
 }

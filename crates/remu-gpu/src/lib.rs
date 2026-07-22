@@ -167,8 +167,75 @@ pub enum GpuEvent {
         buffer_index: u32,
         flip_argument: u64,
     },
+    MemoryAcquire(GpuMemoryAcquire),
     IndexedDraw(Box<IndexedDraw>),
     Shutdown,
+}
+
+/// A decoded Gen5 `ACQUIRE_MEM` packet in guest byte-address form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMemoryAcquire {
+    pub engine: u32,
+    pub cb_db_control: u32,
+    pub base_address: u64,
+    pub size_bytes: u64,
+    pub poll_interval: u32,
+    pub gcr_control: u32,
+}
+
+impl GpuMemoryAcquire {
+    const GLI_INVALIDATE_MASK: u32 = 0x3;
+    const GL1_RANGE_SHIFT: u32 = 2;
+    const GL1_RANGE_MASK: u32 = 0x3;
+    const GLM_INVALIDATE: u32 = 1 << 5;
+    const GLK_INVALIDATE: u32 = 1 << 7;
+    const GLV_INVALIDATE: u32 = 1 << 8;
+    const GL1_INVALIDATE: u32 = 1 << 9;
+    const GL2_RANGE_SHIFT: u32 = 11;
+    const GL2_RANGE_MASK: u32 = 0x3;
+    const GL2_DISCARD: u32 = 1 << 13;
+    const GL2_INVALIDATE: u32 = 1 << 14;
+
+    /// Returns whether this packet invalidates host-cached guest resources.
+    #[must_use]
+    pub const fn invalidates_guest_resources(self) -> bool {
+        self.gcr_control
+            & (Self::GLI_INVALIDATE_MASK
+                | Self::GLM_INVALIDATE
+                | Self::GLK_INVALIDATE
+                | Self::GLV_INVALIDATE
+                | Self::GL1_INVALIDATE
+                | Self::GL2_DISCARD
+                | Self::GL2_INVALIDATE)
+            != 0
+    }
+
+    /// Returns whether the packet's effective invalidation scope covers all guest memory.
+    #[must_use]
+    pub const fn covers_all_guest_memory(self) -> bool {
+        self.size_bytes == 0
+            || self.gcr_control & Self::GLI_INVALIDATE_MASK == 1
+            || (self.gcr_control
+                & (Self::GLM_INVALIDATE
+                    | Self::GLK_INVALIDATE
+                    | Self::GLV_INVALIDATE
+                    | Self::GL1_INVALIDATE)
+                != 0
+                && (self.gcr_control >> Self::GL1_RANGE_SHIFT) & Self::GL1_RANGE_MASK == 0)
+            || (self.gcr_control & (Self::GL2_DISCARD | Self::GL2_INVALIDATE) != 0
+                && (self.gcr_control >> Self::GL2_RANGE_SHIFT) & Self::GL2_RANGE_MASK == 0)
+    }
+
+    /// Returns whether a guest resource intersects the packet's effective invalidation scope.
+    #[must_use]
+    pub const fn overlaps(self, address: u64, byte_count: u64) -> bool {
+        if self.covers_all_guest_memory() {
+            return true;
+        }
+        let resource_end = address.saturating_add(byte_count);
+        let acquire_end = self.base_address.saturating_add(self.size_bytes);
+        address < acquire_end && self.base_address < resource_end
+    }
 }
 
 static GPU_EVENT_SINK: OnceLock<Mutex<Option<SyncSender<GpuEvent>>>> = OnceLock::new();
@@ -202,9 +269,15 @@ pub fn emit_event(event: GpuEvent) {
     }
 }
 
+/// Emits an explicit guest GPU cache-invalidation boundary. Event ordering keeps the invalidation
+/// between preceding and following guest GPU work without stalling the guest command processor.
+pub fn acquire_memory(acquire: GpuMemoryAcquire) {
+    emit_event(GpuEvent::MemoryAcquire(acquire));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HostPadState, host_pad_state, set_host_pad_state};
+    use super::{GpuMemoryAcquire, HostPadState, host_pad_state, set_host_pad_state};
 
     #[test]
     fn shares_a_host_pad_snapshot_across_the_gpu_runtime_seam() {
@@ -220,5 +293,30 @@ mod tests {
         set_host_pad_state(state);
         assert_eq!(host_pad_state(), state);
         set_host_pad_state(HostPadState::default());
+    }
+
+    #[test]
+    fn decodes_acquire_invalidation_scope_without_backend_assumptions() {
+        let range = GpuMemoryAcquire {
+            engine: 1,
+            cb_db_control: 0x7fc0,
+            base_address: 0x1234_0000,
+            size_bytes: 0x8000,
+            poll_interval: 10,
+            gcr_control: 0x1_0388,
+        };
+        assert!(range.invalidates_guest_resources());
+        assert!(!range.covers_all_guest_memory());
+        assert!(range.overlaps(0x1234_7000, 0x2000));
+        assert!(!range.overlaps(0x1235_0000, 0x1000));
+
+        let all = GpuMemoryAcquire {
+            size_bytes: 0,
+            gcr_control: 0x280,
+            ..range
+        };
+        assert!(all.invalidates_guest_resources());
+        assert!(all.covers_all_guest_memory());
+        assert!(all.overlaps(0x7000_0000_0000, 0x1000));
     }
 }
