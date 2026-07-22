@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 use core_graphics_types::geometry::CGSize;
 use metal::{
     Buffer, CommandBuffer, CompileOptions, ComputePipelineState, Device, Function, Library,
-    MTLClearColor, MTLColorWriteMask, MTLCommandBufferStatus, MTLIndexType, MTLLoadAction,
-    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLScissorRect, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer, RenderPassDescriptor,
-    RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor, SamplerState, Texture,
-    TextureDescriptor,
+    MTLBlitOption, MTLClearColor, MTLColorWriteMask, MTLCommandBufferStatus, MTLIndexType,
+    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLScissorRect, MTLSize,
+    MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, MetalLayer,
+    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
+    SamplerState, Texture, TextureDescriptor,
 };
 use objc::runtime::{Object, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -44,6 +44,7 @@ use winit::window::{Window, WindowId};
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const GPU_EVENTS_PER_TICK: usize = 16;
 const SHADER_COMPILE_QUEUE_CAPACITY: usize = 1;
+const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PresenterFlow {
@@ -158,6 +159,134 @@ struct GuestTextureDescriptor {
     tile_mode: u32,
     pixel_format: MTLPixelFormat,
     bytes_per_pixel: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextureReadbackLayout {
+    packed_bytes_per_row: u64,
+    staging_bytes_per_row: u64,
+    staging_length: u64,
+}
+
+impl TextureReadbackLayout {
+    fn new(width: u32, height: u32, bytes_per_pixel: u32) -> Result<Self, String> {
+        if width == 0 || height == 0 || bytes_per_pixel == 0 {
+            return Err(format!(
+                "invalid Metal texture readback extent {width}x{height} at {bytes_per_pixel} bytes per pixel"
+            ));
+        }
+        let packed_bytes_per_row = u64::from(width)
+            .checked_mul(u64::from(bytes_per_pixel))
+            .ok_or("Metal texture readback row size overflows")?;
+        let staging_bytes_per_row = packed_bytes_per_row
+            .checked_add(METAL_TEXTURE_BUFFER_ROW_ALIGNMENT - 1)
+            .map(|value| value & !(METAL_TEXTURE_BUFFER_ROW_ALIGNMENT - 1))
+            .ok_or("Metal texture readback aligned row size overflows")?;
+        let staging_length = staging_bytes_per_row
+            .checked_mul(u64::from(height))
+            .ok_or("Metal texture readback staging size overflows")?;
+        Ok(Self {
+            packed_bytes_per_row,
+            staging_bytes_per_row,
+            staging_length,
+        })
+    }
+
+    fn packed_length(self, height: u32) -> Result<usize, String> {
+        self.packed_bytes_per_row
+            .checked_mul(u64::from(height))
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| "Metal texture readback packed size overflows".to_owned())
+    }
+}
+
+struct PendingTextureReadback {
+    command_buffer: CommandBuffer,
+    staging: Buffer,
+    // Keep the source alive independently of Metal command-buffer retention policy.
+    _source: Texture,
+    layout: TextureReadbackLayout,
+    height: u32,
+}
+
+impl PendingTextureReadback {
+    // Every source writer must already be committed. The presenter either completes guest batches
+    // first or relies on this queue's serial order, so the blit cannot overtake its producer.
+    fn encode(
+        device: &Device,
+        queue: &metal::CommandQueue,
+        texture: &Texture,
+        descriptor: GuestTextureDescriptor,
+    ) -> Result<Self, String> {
+        validate_texture_readback_source(texture, descriptor)?;
+        let layout = TextureReadbackLayout::new(
+            descriptor.width,
+            descriptor.height,
+            descriptor.bytes_per_pixel,
+        )?;
+        let staging = device.new_buffer(
+            layout.staging_length,
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeDefaultCache,
+        );
+        staging.set_label("REMu texture readback staging");
+        let command_buffer = queue.new_command_buffer().to_owned();
+        command_buffer.set_label("REMu texture readback");
+        let encoder = command_buffer.new_blit_command_encoder();
+        encoder.set_label("REMu texture-to-buffer readback blit");
+        encoder.copy_from_texture_to_buffer(
+            texture,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize::new(u64::from(descriptor.width), u64::from(descriptor.height), 1),
+            &staging,
+            0,
+            layout.staging_bytes_per_row,
+            layout.staging_length,
+            MTLBlitOption::None,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        Ok(Self {
+            command_buffer,
+            staging,
+            _source: texture.clone(),
+            layout,
+            height: descriptor.height,
+        })
+    }
+
+    fn finish(self) -> Result<Vec<u8>, String> {
+        self.command_buffer.wait_until_completed();
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "Metal texture readback ended in {:?}",
+                self.command_buffer.status()
+            ));
+        }
+        let packed_row = usize::try_from(self.layout.packed_bytes_per_row)
+            .map_err(|_| "Metal texture readback packed row does not fit usize")?;
+        let staging_row = usize::try_from(self.layout.staging_bytes_per_row)
+            .map_err(|_| "Metal texture readback staging row does not fit usize")?;
+        let staging_length = usize::try_from(self.layout.staging_length)
+            .map_err(|_| "Metal texture readback staging size does not fit usize")?;
+        let packed_length = self.layout.packed_length(self.height)?;
+        let contents = self.staging.contents().cast::<u8>();
+        if contents.is_null() {
+            return Err("Metal shared texture readback buffer has no CPU mapping".to_owned());
+        }
+        // SAFETY: The shared buffer remains owned by `self`, its completed blit wrote exactly
+        // `staging_length` bytes, and `contents` is non-null for this CPU-visible storage mode.
+        let staged = unsafe { std::slice::from_raw_parts(contents, staging_length) };
+        let mut packed = vec![0_u8; packed_length];
+        for row in 0..usize::try_from(self.height).map_err(|_| "height does not fit usize")? {
+            let source = row * staging_row;
+            let destination = row * packed_row;
+            packed[destination..destination + packed_row]
+                .copy_from_slice(&staged[source..source + packed_row]);
+        }
+        Ok(packed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -919,6 +1048,11 @@ impl MetalPresenter {
             .collect::<Vec<_>>();
         if !aliases.is_empty() {
             self.wait_for_guest_command_batches()?;
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
             aliases.sort_by_key(|(version, _)| *version);
             for (_, alias) in aliases {
                 let resident = self
@@ -926,7 +1060,12 @@ impl MetalPresenter {
                     .remove(&alias)
                     .expect("collected resident alias exists");
                 if resident.gpu_written {
-                    let linear = read_texture_linear(&resident.texture, resident.descriptor)?;
+                    let linear = read_texture_linear(
+                        device,
+                        &queue,
+                        &resident.texture,
+                        resident.descriptor,
+                    )?;
                     write_guest_texture_linear(resident.descriptor, &linear)?;
                 }
             }
@@ -1068,12 +1207,22 @@ impl MetalPresenter {
             return Ok(());
         }
         self.wait_for_guest_command_batches()?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
         for descriptor in aliases {
             let resident = self
                 .resident_guest_textures
                 .get_mut(&descriptor)
                 .expect("collected sampled alias exists");
-            let linear = read_texture_linear(&resident.texture, descriptor)?;
+            let linear = read_texture_linear(&device, &queue, &resident.texture, descriptor)?;
             write_guest_texture_linear(descriptor, &linear)?;
             rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
             resident.gpu_written = false;
@@ -1166,11 +1315,21 @@ impl MetalPresenter {
             return Ok(());
         };
         self.wait_for_guest_command_batches()?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
         let resident = self
             .resident_guest_textures
             .get_mut(&descriptor)
             .expect("selected resident texture exists");
-        let linear = read_texture_linear(&resident.texture, descriptor)?;
+        let linear = read_texture_linear(&device, &queue, &resident.texture, descriptor)?;
         write_guest_texture_linear(descriptor, &linear)?;
         rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
         resident.gpu_written = false;
@@ -1685,7 +1844,8 @@ impl MetalPresenter {
                     | MTLPixelFormat::BGRA8Unorm
                     | MTLPixelFormat::BGRA8Unorm_sRGB
             ) {
-                let rendered = read_texture_linear(&target_textures[0], primary_target)?;
+                let rendered =
+                    read_texture_linear(&device, &queue, &target_textures[0], primary_target)?;
                 self.capture_translated_frame_if_changed(primary_target, &rendered);
             }
         } else if batch_full {
@@ -1771,7 +1931,11 @@ impl MetalPresenter {
                 pixel_format: MTLPixelFormat::BGRA8Unorm,
                 bytes_per_pixel: 4,
             };
-            read_texture_linear(texture, descriptor).map(|bytes| (descriptor, bytes))
+            self.command_queue
+                .as_ref()
+                .ok_or_else(|| "Metal command queue is unavailable".to_owned())
+                .and_then(|queue| read_texture_linear(device, queue, texture, descriptor))
+                .map(|bytes| (descriptor, bytes))
         });
         self.uploaded_flip_sequence = flip.sequence;
         if flip.sequence == 1 {
@@ -1835,7 +1999,7 @@ impl MetalPresenter {
         }
         self.guest_bgra_bytes.resize(native_bytes.len(), 0);
         match descriptor.pixel_format {
-            MTLPixelFormat::RGBA8Unorm | MTLPixelFormat::RGBA8Unorm_sRGB => {
+            MTLPixelFormat::RGBA8Unorm => {
                 for (source, destination) in native_bytes
                     .chunks_exact(4)
                     .zip(self.guest_bgra_bytes.chunks_exact_mut(4))
@@ -1843,8 +2007,34 @@ impl MetalPresenter {
                     destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
                 }
             }
-            MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB => {
+            MTLPixelFormat::RGBA8Unorm_sRGB => {
+                for (source, destination) in native_bytes
+                    .chunks_exact(4)
+                    .zip(self.guest_bgra_bytes.chunks_exact_mut(4))
+                {
+                    destination.copy_from_slice(&[
+                        srgb_unorm8_to_linear_unorm8(source[2]),
+                        srgb_unorm8_to_linear_unorm8(source[1]),
+                        srgb_unorm8_to_linear_unorm8(source[0]),
+                        source[3],
+                    ]);
+                }
+            }
+            MTLPixelFormat::BGRA8Unorm => {
                 self.guest_bgra_bytes.copy_from_slice(native_bytes);
+            }
+            MTLPixelFormat::BGRA8Unorm_sRGB => {
+                for (source, destination) in native_bytes
+                    .chunks_exact(4)
+                    .zip(self.guest_bgra_bytes.chunks_exact_mut(4))
+                {
+                    destination.copy_from_slice(&[
+                        srgb_unorm8_to_linear_unorm8(source[0]),
+                        srgb_unorm8_to_linear_unorm8(source[1]),
+                        srgb_unorm8_to_linear_unorm8(source[2]),
+                        source[3],
+                    ]);
+                }
             }
             _ => return,
         }
@@ -1959,6 +2149,25 @@ impl MetalPresenter {
         command_buffer.commit();
         self.redraw_pending = false;
     }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn srgb_unorm8_to_linear_unorm8(encoded: u8) -> u8 {
+    static LUT: OnceLock<[u8; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|encoded| {
+            let encoded =
+                f64::from(u8::try_from(encoded).expect("sRGB table index fits u8")) / 255.0;
+            let linear = if encoded <= 0.040_45 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            };
+            // Both transfer-function branches map the unorm input into 0..=1, so rounding the
+            // scaled result cannot produce a negative value or exceed u8.
+            (linear * 255.0).round() as u8
+        })
+    })[usize::from(encoded)]
 }
 
 fn validate_compute_launch_for_metal(
@@ -2569,28 +2778,123 @@ fn create_guest_texture(
     Ok(texture)
 }
 
+fn validate_texture_readback_source(
+    texture: &Texture,
+    descriptor: GuestTextureDescriptor,
+) -> Result<(), String> {
+    if texture.framebuffer_only() {
+        return Err("Metal framebuffer-only textures cannot be copied for readback".to_owned());
+    }
+    if texture.storage_mode() == MTLStorageMode::Memoryless {
+        return Err("Metal memoryless textures have no stored contents to read back".to_owned());
+    }
+    if texture.sample_count() != 1 {
+        return Err(format!(
+            "Metal texture readback requires the single-sample resolve target, got {} samples",
+            texture.sample_count()
+        ));
+    }
+    if texture.texture_type() != MTLTextureType::D2 {
+        return Err(format!(
+            "Metal texture readback requires a 2D single-slice source, got {:?}",
+            texture.texture_type()
+        ));
+    }
+    if texture.width() != u64::from(descriptor.width)
+        || texture.height() != u64::from(descriptor.height)
+    {
+        return Err(format!(
+            "Metal texture readback extent mismatch: texture={}x{} descriptor={}x{}",
+            texture.width(),
+            texture.height(),
+            descriptor.width,
+            descriptor.height
+        ));
+    }
+    if texture.pixel_format() != descriptor.pixel_format {
+        return Err(format!(
+            "Metal texture readback format mismatch: texture={:?} descriptor={:?}",
+            texture.pixel_format(),
+            descriptor.pixel_format
+        ));
+    }
+    let expected_bytes =
+        metal_uncompressed_bytes_per_pixel(descriptor.pixel_format).ok_or_else(|| {
+            format!(
+                "Metal texture readback has no exact uncompressed layout for {:?}",
+                descriptor.pixel_format
+            )
+        })?;
+    if descriptor.bytes_per_pixel != expected_bytes {
+        return Err(format!(
+            "Metal texture readback format {:?} requires {expected_bytes} bytes per pixel, got {}",
+            descriptor.pixel_format, descriptor.bytes_per_pixel
+        ));
+    }
+    Ok(())
+}
+
+fn metal_uncompressed_bytes_per_pixel(format: MTLPixelFormat) -> Option<u32> {
+    match format {
+        MTLPixelFormat::R8Unorm
+        | MTLPixelFormat::R8Snorm
+        | MTLPixelFormat::R8Uint
+        | MTLPixelFormat::R8Sint
+        | MTLPixelFormat::R8Unorm_sRGB
+        | MTLPixelFormat::Stencil8 => Some(1),
+        MTLPixelFormat::R16Unorm
+        | MTLPixelFormat::R16Snorm
+        | MTLPixelFormat::R16Uint
+        | MTLPixelFormat::R16Sint
+        | MTLPixelFormat::R16Float
+        | MTLPixelFormat::RG8Unorm
+        | MTLPixelFormat::RG8Snorm
+        | MTLPixelFormat::RG8Uint
+        | MTLPixelFormat::RG8Sint
+        | MTLPixelFormat::RG8Unorm_sRGB
+        | MTLPixelFormat::Depth16Unorm => Some(2),
+        MTLPixelFormat::R32Uint
+        | MTLPixelFormat::R32Sint
+        | MTLPixelFormat::R32Float
+        | MTLPixelFormat::RG16Unorm
+        | MTLPixelFormat::RG16Snorm
+        | MTLPixelFormat::RG16Uint
+        | MTLPixelFormat::RG16Sint
+        | MTLPixelFormat::RG16Float
+        | MTLPixelFormat::RG11B10Float
+        | MTLPixelFormat::RGB10A2Unorm
+        | MTLPixelFormat::BGR10A2Unorm
+        | MTLPixelFormat::RGBA8Unorm
+        | MTLPixelFormat::RGBA8Snorm
+        | MTLPixelFormat::RGBA8Uint
+        | MTLPixelFormat::RGBA8Sint
+        | MTLPixelFormat::RGBA8Unorm_sRGB
+        | MTLPixelFormat::BGRA8Unorm
+        | MTLPixelFormat::BGRA8Unorm_sRGB
+        | MTLPixelFormat::RGB9E5Float
+        | MTLPixelFormat::Depth32Float => Some(4),
+        MTLPixelFormat::RG32Uint
+        | MTLPixelFormat::RG32Sint
+        | MTLPixelFormat::RG32Float
+        | MTLPixelFormat::RGBA16Unorm
+        | MTLPixelFormat::RGBA16Snorm
+        | MTLPixelFormat::RGBA16Uint
+        | MTLPixelFormat::RGBA16Sint
+        | MTLPixelFormat::RGBA16Float => Some(8),
+        MTLPixelFormat::RGBA32Uint | MTLPixelFormat::RGBA32Sint | MTLPixelFormat::RGBA32Float => {
+            Some(16)
+        }
+        _ => None,
+    }
+}
+
 fn read_texture_linear(
+    device: &Device,
+    queue: &metal::CommandQueue,
     texture: &Texture,
     descriptor: GuestTextureDescriptor,
 ) -> Result<Vec<u8>, String> {
-    let length = u64::from(descriptor.width)
-        .checked_mul(u64::from(descriptor.height))
-        .and_then(|pixels| pixels.checked_mul(u64::from(descriptor.bytes_per_pixel)))
-        .and_then(|bytes| usize::try_from(bytes).ok())
-        .ok_or("Metal texture readback dimensions overflow")?;
-    let mut linear = vec![0_u8; length];
-    texture.get_bytes(
-        linear.as_mut_ptr().cast::<c_void>(),
-        u64::from(descriptor.width) * u64::from(descriptor.bytes_per_pixel),
-        MTLRegion::new_2d(
-            0,
-            0,
-            u64::from(descriptor.width),
-            u64::from(descriptor.height),
-        ),
-        0,
-    );
-    Ok(linear)
+    PendingTextureReadback::encode(device, queue, texture, descriptor)?.finish()
 }
 
 fn ensure_resident_texture_in_map(
@@ -4010,7 +4314,11 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use metal::{CompileOptions, Device, MTLPixelFormat, RenderPipelineDescriptor};
+    use metal::{
+        CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLStorageMode,
+        MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor,
+        RenderPipelineDescriptor, TextureDescriptor,
+    };
     use remu_gpu::{
         ComputeGrid, ComputeLaunch, GpuColorTarget, GpuEvent, GpuRegister, GpuScanoutTarget,
         IndexedDraw, gpu_event_channel,
@@ -4021,15 +4329,17 @@ mod tests {
         CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
         CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
         GraphicsPipelineKey, GuestTextureDescriptor, OrderedEventPoll, OrderedGpuEventReceiver,
-        PresentationResolution, apply_image_destination_select, decode_image_descriptor,
-        decode_render_target_format, decode_render_targets_from_registers, decode_scanout_target,
-        decode_scissor, decode_viewport, effective_linear_pitch, effective_linear_rgba_pitch,
+        PendingTextureReadback, PresentationResolution, TextureReadbackLayout,
+        apply_image_destination_select, decode_image_descriptor, decode_render_target_format,
+        decode_render_targets_from_registers, decode_scanout_target, decode_scissor,
+        decode_viewport, effective_linear_pitch, effective_linear_rgba_pitch,
         guest_texture_byte_count, guest_texture_descriptors_overlap, guest_texture_raw_matches,
         headless_metal_value_is_enabled, metal_color_write_mask, metal_nonindexed_vertex_count,
         mode27_block_dimensions, mode27_source_byte_offset, mode27_within_block_byte_offset,
         parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
         read_draw_indices, snapshot_guest_texture_linear, snapshot_guest_texture_raw,
-        validate_compute_launch_for_metal, write_guest_texture_linear,
+        srgb_unorm8_to_linear_unorm8, validate_compute_launch_for_metal,
+        write_guest_texture_linear,
     };
 
     #[test]
@@ -4218,6 +4528,176 @@ mod tests {
             ordered.try_recv(|_| true),
             OrderedEventPoll::Empty
         ));
+    }
+
+    #[test]
+    fn texture_readback_layout_keeps_exact_packed_rows_and_aligned_staging_rows() {
+        let layout = TextureReadbackLayout::new(3, 2, 4).expect("valid layout");
+        assert_eq!(layout.packed_bytes_per_row, 12);
+        assert_eq!(layout.staging_bytes_per_row, 256);
+        assert_eq!(layout.staging_length, 512);
+        assert_eq!(layout.packed_length(2).expect("packed length"), 24);
+    }
+
+    #[test]
+    fn capture_linearizes_srgb_storage_bytes_with_the_standard_transfer() {
+        assert_eq!(srgb_unorm8_to_linear_unorm8(0), 0);
+        assert_eq!(srgb_unorm8_to_linear_unorm8(10), 1);
+        assert_eq!(srgb_unorm8_to_linear_unorm8(38), 5);
+        assert_eq!(srgb_unorm8_to_linear_unorm8(56), 10);
+        assert_eq!(srgb_unorm8_to_linear_unorm8(85), 23);
+        assert_eq!(srgb_unorm8_to_linear_unorm8(255), 255);
+    }
+
+    #[test]
+    fn private_render_target_readback_uses_owned_staging_resources() {
+        let device = Device::system_default().expect("Metal device");
+        let queue = device.new_command_queue();
+        let descriptor = GuestTextureDescriptor {
+            address: 0,
+            width: 3,
+            height: 2,
+            pitch: 3,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::BGRA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let metal_descriptor = TextureDescriptor::new();
+        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_pixel_format(descriptor.pixel_format);
+        metal_descriptor.set_width(u64::from(descriptor.width));
+        metal_descriptor.set_height(u64::from(descriptor.height));
+        metal_descriptor.set_storage_mode(MTLStorageMode::Private);
+        metal_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&metal_descriptor);
+
+        let pass = RenderPassDescriptor::new();
+        let attachment = pass
+            .color_attachments()
+            .object_at(0)
+            .expect("color attachment zero");
+        attachment.set_texture(Some(&texture));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_store_action(MTLStoreAction::Store);
+        attachment.set_clear_color(MTLClearColor::new(1.0, 0.0, 0.0, 1.0));
+        let render = queue.new_command_buffer().to_owned();
+        let encoder = render.new_render_command_encoder(pass);
+        encoder.end_encoding();
+        render.commit();
+
+        let pending = PendingTextureReadback::encode(&device, &queue, &texture, descriptor)
+            .expect("encode private readback");
+        drop(texture);
+        let bytes = pending.finish().expect("finish private readback");
+        assert_eq!(bytes.len(), 24);
+        assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 0, 255, 255]));
+    }
+
+    #[test]
+    fn multisample_resolve_target_is_readable_after_ordered_resolve() {
+        let device = Device::system_default().expect("Metal device");
+        if !device.supports_texture_sample_count(4) {
+            return;
+        }
+        let queue = device.new_command_queue();
+        let descriptor = GuestTextureDescriptor {
+            address: 0,
+            width: 2,
+            height: 2,
+            pitch: 2,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let multisample_descriptor = TextureDescriptor::new();
+        multisample_descriptor.set_texture_type(MTLTextureType::D2Multisample);
+        multisample_descriptor.set_pixel_format(descriptor.pixel_format);
+        multisample_descriptor.set_width(u64::from(descriptor.width));
+        multisample_descriptor.set_height(u64::from(descriptor.height));
+        multisample_descriptor.set_sample_count(4);
+        multisample_descriptor.set_storage_mode(MTLStorageMode::Private);
+        multisample_descriptor.set_usage(MTLTextureUsage::RenderTarget);
+        let multisample = device.new_texture(&multisample_descriptor);
+        let unresolved_error =
+            PendingTextureReadback::encode(&device, &queue, &multisample, descriptor)
+                .err()
+                .expect("unresolved multisample readback must fail");
+        assert!(unresolved_error.contains("single-sample resolve target"));
+
+        let resolve_descriptor = TextureDescriptor::new();
+        resolve_descriptor.set_texture_type(MTLTextureType::D2);
+        resolve_descriptor.set_pixel_format(descriptor.pixel_format);
+        resolve_descriptor.set_width(u64::from(descriptor.width));
+        resolve_descriptor.set_height(u64::from(descriptor.height));
+        resolve_descriptor.set_storage_mode(MTLStorageMode::Private);
+        resolve_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let resolve = device.new_texture(&resolve_descriptor);
+
+        let pass = RenderPassDescriptor::new();
+        let attachment = pass
+            .color_attachments()
+            .object_at(0)
+            .expect("color attachment zero");
+        attachment.set_texture(Some(&multisample));
+        attachment.set_resolve_texture(Some(&resolve));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_store_action(MTLStoreAction::MultisampleResolve);
+        attachment.set_clear_color(MTLClearColor::new(0.0, 1.0, 0.0, 1.0));
+        let render = queue.new_command_buffer().to_owned();
+        let encoder = render.new_render_command_encoder(pass);
+        encoder.end_encoding();
+        render.commit();
+
+        let bytes = PendingTextureReadback::encode(&device, &queue, &resolve, descriptor)
+            .expect("encode resolve readback")
+            .finish()
+            .expect("finish resolve readback");
+        assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn private_depth32_target_readback_preserves_float_samples() {
+        let device = Device::system_default().expect("Metal device");
+        let queue = device.new_command_queue();
+        let descriptor = GuestTextureDescriptor {
+            address: 0,
+            width: 2,
+            height: 2,
+            pitch: 2,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::Depth32Float,
+            bytes_per_pixel: 4,
+        };
+        let metal_descriptor = TextureDescriptor::new();
+        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_pixel_format(descriptor.pixel_format);
+        metal_descriptor.set_width(u64::from(descriptor.width));
+        metal_descriptor.set_height(u64::from(descriptor.height));
+        metal_descriptor.set_storage_mode(MTLStorageMode::Private);
+        metal_descriptor.set_usage(MTLTextureUsage::RenderTarget);
+        let texture = device.new_texture(&metal_descriptor);
+
+        let pass = RenderPassDescriptor::new();
+        let attachment = pass.depth_attachment().expect("depth attachment");
+        attachment.set_texture(Some(&texture));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_store_action(MTLStoreAction::Store);
+        attachment.set_clear_depth(0.25);
+        let render = queue.new_command_buffer().to_owned();
+        let encoder = render.new_render_command_encoder(pass);
+        encoder.end_encoding();
+        render.commit();
+
+        let bytes = PendingTextureReadback::encode(&device, &queue, &texture, descriptor)
+            .expect("encode depth readback")
+            .finish()
+            .expect("finish depth readback");
+        assert!(
+            bytes
+                .chunks_exact(4)
+                .map(|sample| f32::from_ne_bytes(sample.try_into().expect("four-byte depth")))
+                .all(|sample| (sample - 0.25).abs() <= f32::EPSILON)
+        );
     }
 
     #[test]

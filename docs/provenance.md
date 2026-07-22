@@ -86,3 +86,16 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   PC/opcode failures instead of substitute shaders, uses draw-evaluated resource bindings, and is
   validated against complete live shader pairs from the authorized local dumps. No game shader
   bytes, game fingerprints, or proprietary SDK material are included in the source tree.
+
+## `remu-gpu-metal`
+
+- Texture readback storage, synchronization, resolve, and row-layout rules follow Apple's public
+  Metal documentation for `MTLStorageMode`, `MTLBlitCommandEncoder`, `MTLCommandBuffer`,
+  `MTLTexture.getBytes`, load/store actions, and the published Metal feature limits. They were also
+  checked against the corresponding public framework headers in the installed macOS SDK.
+- REmu independently implements a checked readback ticket: a backed single-sample texture is blitted
+  into an aligned shared buffer on the producing command queue, the source and staging resources are
+  retained through command-buffer completion, and padding is removed into the exact native pixel
+  layout before any guest tiling conversion. Diagnostic conversion of sRGB storage bytes uses the
+  standard IEC 61966-2-1 transfer function before writing the linear reference-frame corpus. No
+  upstream emulator code was copied for this path.

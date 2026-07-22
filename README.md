@@ -5,11 +5,12 @@ legally dumped games directly on desktop operating systems without emulating the
 
 The project maps and runs authorized x86-64 game dumps under Rosetta. Dreaming Sarah currently
 boots through resource loading, submits AGC draw streams, compiles observed RDNA2 shaders to Metal,
-and flips its display buffers. Complete render-target state propagation is still in progress; the
-latest captured guest buffers are black, so visual game output is not claimed yet.
+and flips its display buffers. A bounded headless run renders and captures the real Ratalaika splash;
+complete render state and later gameplay draws are still in progress, so playability is not claimed.
 
 See the [architecture](docs/architecture.md), [implementation roadmap](docs/roadmap.md), and
-[reference audit](docs/reference-audit.md). Adapted implementation sources are tracked in
+[reference audit](docs/reference-audit.md). Current subsystem evidence and concrete gaps are tracked
+in [engineering status](docs/engineering-status.md); adapted implementation sources are tracked in
 [provenance](docs/provenance.md).
 
 ## Direction
