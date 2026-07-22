@@ -18,7 +18,10 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use remu_core::GuestAddress;
-use remu_loader::{DynamicInfo, Elf64Rela, Elf64Symbol, LoadedExecutable};
+use remu_loader::{
+    DynamicInfo, Elf64Rela, Elf64Symbol, ImportedSymbol, InspectError, LoadedExecutable,
+    ModuleDependencyGraphError, UnresolvedModuleDependency, resolve_module_dependency_graph,
+};
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage, MappingError};
 use remu_shader::GuestMemoryReader;
 use thiserror::Error;
@@ -46,7 +49,8 @@ const IMPORT_STUB_SIZE_USIZE: usize = 32;
 const PT_TLS: u32 = 7;
 const PT_SCE_PROC_PARAM: u32 = 0x6100_0001;
 const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
-const DW_EH_PE_PCREL_SDATA4: u8 = 0x1b;
+const DW_EH_PE_OMIT: u8 = 0xff;
+const DW_EH_PE_INDIRECT: u8 = 0x80;
 const GUEST_TLS_PREFIX_SIZE: u64 = 0x20_000;
 const GUEST_TLS_TCB_SIZE: u64 = 0x10_000;
 const TLS_HELPER_SIZE: u64 = 96;
@@ -60,6 +64,14 @@ const MACOS_GUEST_PAGE_ALIGNMENT: u64 = 0x4000;
 pub struct ImportStub {
     pub nid: String,
     pub address: GuestAddress,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ImportResolutionStats {
+    pub bundled_guest: usize,
+    pub host_direct: usize,
+    pub hle_dispatch: usize,
+    pub unresolved_weak: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -84,6 +96,13 @@ impl RelocationStats {
     }
 }
 
+impl ImportResolutionStats {
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.bundled_guest + self.host_direct + self.hle_dispatch + self.unresolved_weak
+    }
+}
+
 #[derive(Debug)]
 pub struct LinkedImage {
     pub memory: GuestImage,
@@ -91,9 +110,21 @@ pub struct LinkedImage {
     pub relocation_stats: RelocationStats,
     pub tls: GuestTls,
     pub process_param: Option<GuestAddress>,
+    import_resolution_stats: ImportResolutionStats,
     unwind_fdes: Vec<GuestAddress>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     module_initializers: Vec<GuestAddress>,
+}
+
+/// Filesystem and dependency information retained from linking a complete guest process image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleLinkReport {
+    pub app_root: PathBuf,
+    pub entry_path: PathBuf,
+    /// Bundled PRX/SPRX objects in the dependency-first order used for mapping and initialization.
+    pub loaded_modules: Vec<PathBuf>,
+    /// Dependencies that must be supplied by the emulator's system-module implementations.
+    pub unresolved_dependencies: Vec<UnresolvedModuleDependency>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +137,10 @@ pub struct ProbeOutcome {
 pub enum LinkError {
     #[error(transparent)]
     Mapping(#[from] MappingError),
+    #[error(transparent)]
+    Inspect(#[from] InspectError),
+    #[error(transparent)]
+    ModuleGraph(#[from] ModuleDependencyGraphError),
     #[error("executable does not contain an ELF image")]
     MissingElf,
     #[error("executable does not contain dynamic-linker metadata")]
@@ -116,6 +151,8 @@ pub enum LinkError {
     MissingSymbol { index: u32 },
     #[error("unresolved non-weak symbol {index} has no import stub")]
     MissingImportStub { index: u32 },
+    #[error("dynamic symbol {symbol:?} refers to an unknown Sony library or module namespace")]
+    InvalidSymbolNamespace { symbol: String },
     #[error("unsupported x86-64 relocation type {relocation_type} at {offset}")]
     UnsupportedRelocation {
         relocation_type: u32,
@@ -144,6 +181,10 @@ pub enum LinkError {
     UnsupportedEhFrameEncoding(u8),
     #[error("malformed guest .eh_frame data: {0}")]
     MalformedEhFrame(&'static str),
+    #[error("guest {kind} byte size 0x{size:x} is not a multiple of eight")]
+    InvalidInitializerArraySize { kind: &'static str, size: u64 },
+    #[error("guest initializer address {address} is outside the process image")]
+    InitializerOutsideImage { address: GuestAddress },
     #[error("native macOS C++ unwind runtime is unavailable")]
     NativeCxxRuntimeUnavailable,
     #[error("native macOS unwind symbol {0} is unavailable")]
@@ -151,13 +192,51 @@ pub enum LinkError {
 }
 
 impl LinkedImage {
+    /// Discovers, loads, maps, and relocates the complete bundled dependency graph for `path`.
+    ///
+    /// Missing system PRXs remain explicit in the returned report because those dependencies are
+    /// fulfilled by `REMu`'s HLE services rather than files from the game dump.
+    pub fn link_path(path: impl AsRef<Path>) -> Result<(Self, ModuleLinkReport), LinkError> {
+        let graph = resolve_module_dependency_graph(path)?;
+        let executable = remu_loader::load_path(&graph.entry.path)?;
+        let mut modules = Vec::with_capacity(graph.dependency_order.len());
+        for node in &graph.dependency_order {
+            let name = node
+                .original_filename
+                .clone()
+                .or_else(|| {
+                    node.path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| node.path.display().to_string());
+            modules.push((name, remu_loader::load_path(&node.path)?));
+        }
+        let module_refs = modules
+            .iter()
+            .map(|(name, executable)| (name.as_str(), executable))
+            .collect::<Vec<_>>();
+        let image = Self::link_main_with_modules(&executable, &module_refs)?;
+        let report = ModuleLinkReport {
+            app_root: graph.app_root,
+            entry_path: graph.entry.path,
+            loaded_modules: graph
+                .dependency_order
+                .into_iter()
+                .map(|node| node.path)
+                .collect(),
+            unresolved_dependencies: graph.unresolved_dependencies,
+        };
+        Ok((image, report))
+    }
+
     pub fn link_main(executable: &LoadedExecutable) -> Result<Self, LinkError> {
         Self::link_main_with_modules(executable, &[])
     }
 
-    /// Links the main executable and selected game-bundled PRX modules into one guest address
-    /// space. Module exports are currently preferred only for ABI families that must share hidden
-    /// runtime state, such as all libc allocators.
+    /// Links the main executable and dependency-ordered game-bundled PRX modules into one process
+    /// address space and symbol scope.
     pub fn link_main_with_modules(
         executable: &LoadedExecutable,
         modules: &[(&str, &LoadedExecutable)],
@@ -167,38 +246,26 @@ impl LinkedImage {
             .dynamic
             .as_ref()
             .ok_or(LinkError::MissingDynamicMetadata)?;
-        let mut memory = GuestImage::map_main(executable)?;
-        let mut linked_modules = Vec::with_capacity(modules.len());
-        for (index, (name, module)) in modules.iter().enumerate() {
-            let dynamic = module
-                .info
-                .elf
-                .as_ref()
-                .ok_or(LinkError::MissingElf)?
-                .dynamic
-                .as_ref()
-                .ok_or(LinkError::MissingDynamicMetadata)?;
-            let base = memory.map_module(module, MACOS_GUEST_PAGE_ALIGNMENT)?;
-            linked_modules.push(LinkedModuleInput {
-                name,
-                executable: module,
-                dynamic,
-                base,
-                tls_module_id: u64::try_from(index + 2).map_err(|_| LinkError::AddressOverflow)?,
-            });
-        }
+        let auxiliary_reserve = calculate_process_auxiliary_reserve(dynamic, modules)?;
+        let mut memory =
+            GuestImage::map_main_with_auxiliary_reserve(executable, auxiliary_reserve)?;
+        let linked_modules = map_bundled_modules(&mut memory, modules)?;
 
-        let module_exports = selected_module_exports(&linked_modules)?;
+        let main_export = main_base_export_input(executable, dynamic, memory.image_base());
+        let process_exports = collect_process_exports(&memory, &main_export, &linked_modules)?;
+        let import_resolution_stats = collect_import_resolution_stats(
+            std::iter::once(dynamic).chain(linked_modules.iter().map(|module| module.dynamic)),
+            &process_exports,
+        )?;
         let mut import_stubs = Vec::new();
         let mut relocation_stats = RelocationStats::default();
         let mut unwind_fdes = Vec::new();
-        let mut module_initializers = Vec::new();
         for module in &linked_modules {
             let (module_stubs, symbol_stubs) = create_import_stubs(
                 &mut memory,
                 module.dynamic,
                 import_stubs.len(),
-                &BTreeMap::new(),
+                &process_exports,
             )?;
             import_stubs.extend(module_stubs);
             add_relocation_stats(
@@ -209,6 +276,7 @@ impl LinkedImage {
                     module.tls_module_id,
                     module.dynamic,
                     &symbol_stubs,
+                    &process_exports,
                 )?,
             );
             unwind_fdes.extend(collect_unwind_fdes_at(
@@ -216,27 +284,41 @@ impl LinkedImage {
                 module.base,
                 module.executable,
             )?);
-            if module.dynamic.init_address != 0 {
-                module_initializers.push(GuestAddress::new(
-                    module
-                        .base
-                        .get()
-                        .checked_add(module.dynamic.init_address)
-                        .ok_or(LinkError::AddressOverflow)?,
-                ));
-            }
         }
 
         let (main_stubs, symbol_stubs) =
-            create_import_stubs(&mut memory, dynamic, import_stubs.len(), &module_exports)?;
+            create_import_stubs(&mut memory, dynamic, import_stubs.len(), &process_exports)?;
         import_stubs.extend(main_stubs);
         let main_base = memory.image_base();
         let process_param = resolve_process_param(elf, main_base)?;
         add_relocation_stats(
             &mut relocation_stats,
-            apply_relocations_at(&mut memory, main_base, 1, dynamic, &symbol_stubs)?,
+            apply_relocations_at(
+                &mut memory,
+                main_base,
+                1,
+                dynamic,
+                &symbol_stubs,
+                &process_exports,
+            )?,
         );
         unwind_fdes.extend(collect_unwind_fdes_at(&memory, main_base, executable)?);
+        let mut module_initializers = collect_initializer_array(
+            &memory,
+            main_base,
+            dynamic.preinit_array_address,
+            dynamic.preinit_array_size,
+            "DT_PREINIT_ARRAY",
+        )?;
+        for module in &linked_modules {
+            append_object_initializers(
+                &mut module_initializers,
+                &memory,
+                module.base,
+                module.dynamic,
+            )?;
+        }
+        append_object_initializers(&mut module_initializers, &memory, main_base, dynamic)?;
         let tls_inputs = std::iter::once(TlsImageInput {
             executable,
             base: main_base,
@@ -256,6 +338,7 @@ impl LinkedImage {
             relocation_stats,
             tls,
             process_param,
+            import_resolution_stats,
             unwind_fdes,
             module_initializers,
         })
@@ -281,6 +364,11 @@ impl LinkedImage {
     pub fn unwind_record_count(&self) -> usize {
         self.unwind_fdes.len()
     }
+
+    #[must_use]
+    pub fn import_resolution_stats(&self) -> ImportResolutionStats {
+        self.import_resolution_stats
+    }
 }
 
 fn resolve_process_param(
@@ -301,11 +389,97 @@ fn resolve_process_param(
 }
 
 struct LinkedModuleInput<'a> {
-    name: &'a str,
     executable: &'a LoadedExecutable,
     dynamic: &'a DynamicInfo,
     base: GuestAddress,
     tls_module_id: u64,
+}
+
+fn map_bundled_modules<'a>(
+    memory: &mut GuestImage,
+    modules: &[(&'a str, &'a LoadedExecutable)],
+) -> Result<Vec<LinkedModuleInput<'a>>, LinkError> {
+    let mut linked_modules = Vec::with_capacity(modules.len());
+    for (index, (_name, module)) in modules.iter().enumerate() {
+        let dynamic = module
+            .info
+            .elf
+            .as_ref()
+            .ok_or(LinkError::MissingElf)?
+            .dynamic
+            .as_ref()
+            .ok_or(LinkError::MissingDynamicMetadata)?;
+        let base = memory.map_module(module, MACOS_GUEST_PAGE_ALIGNMENT)?;
+        linked_modules.push(LinkedModuleInput {
+            executable: module,
+            dynamic,
+            base,
+            tls_module_id: u64::try_from(index + 2).map_err(|_| LinkError::AddressOverflow)?,
+        });
+    }
+    Ok(linked_modules)
+}
+
+fn calculate_process_auxiliary_reserve(
+    main_dynamic: &DynamicInfo,
+    modules: &[(&str, &LoadedExecutable)],
+) -> Result<u64, LinkError> {
+    let mut cursor = 0_u64;
+    let mut import_count = main_dynamic.imports.len();
+    for (_, module) in modules {
+        cursor =
+            align_up_u64(cursor, MACOS_GUEST_PAGE_ALIGNMENT).ok_or(LinkError::AddressOverflow)?;
+        let module_size = module
+            .load_segments
+            .iter()
+            .try_fold(0_u64, |maximum, segment| {
+                segment
+                    .virtual_address
+                    .get()
+                    .checked_add(segment.memory_size)
+                    .map(|end| maximum.max(end))
+                    .ok_or(LinkError::AddressOverflow)
+            })?;
+        if module_size == 0 {
+            return Err(LinkError::Mapping(MappingError::NoLoadSegments));
+        }
+        cursor = cursor
+            .checked_add(module_size)
+            .ok_or(LinkError::AddressOverflow)?;
+        let dynamic = module
+            .info
+            .elf
+            .as_ref()
+            .ok_or(LinkError::MissingElf)?
+            .dynamic
+            .as_ref()
+            .ok_or(LinkError::MissingDynamicMetadata)?;
+        import_count = import_count
+            .checked_add(dynamic.imports.len())
+            .ok_or(LinkError::StubAllocationOverflow)?;
+    }
+
+    cursor = align_up_u64(cursor, IMPORT_STUB_SIZE).ok_or(LinkError::AddressOverflow)?;
+    let maximum_stub_bytes = u64::try_from(import_count)
+        .map_err(|_| LinkError::StubAllocationOverflow)?
+        .checked_mul(IMPORT_STUB_SIZE)
+        .ok_or(LinkError::StubAllocationOverflow)?;
+    cursor = cursor
+        .checked_add(maximum_stub_bytes)
+        .ok_or(LinkError::AddressOverflow)?;
+    cursor = align_up_u64(cursor, 16).ok_or(LinkError::AddressOverflow)?;
+    cursor = cursor
+        .checked_add(TLS_HELPER_REGION_SIZE)
+        .ok_or(LinkError::AddressOverflow)?;
+    cursor = align_up_u64(cursor, MACOS_GUEST_PAGE_ALIGNMENT).ok_or(LinkError::AddressOverflow)?;
+    cursor = cursor
+        .checked_add(GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
+        .ok_or(LinkError::AddressOverflow)?;
+    // Keep one guard-sized cushion for alignment changes without hiding unbounded allocations.
+    cursor = cursor
+        .checked_add(MACOS_GUEST_PAGE_ALIGNMENT)
+        .ok_or(LinkError::AddressOverflow)?;
+    align_up_u64(cursor, MACOS_GUEST_PAGE_ALIGNMENT).ok_or(LinkError::AddressOverflow)
 }
 
 #[derive(Clone, Copy)]
@@ -322,51 +496,389 @@ fn add_relocation_stats(total: &mut RelocationStats, addition: RelocationStats) 
     total.relative += addition.relative;
 }
 
-const LLE_LIBC_RUNTIME_NIDS: [&str; 13] = [
-    "bzQExy189ZI",
-    "gQX+4GDQjpM",
-    "tIhsqj0qsFE",
-    "2X5agFjKxMc",
-    "Y7aJ1uydPMo",
-    "Ujf3KzMvRmI",
-    "2Btkg8k24Zg",
-    "cVSk9y8URbc",
-    // Dinkumware multibyte conversion shares hidden locale and per-thread mbstate with libc.
-    // Resolve the complete ABI family to the bundled runtime instead of splitting that state
-    // between guest code and host approximations.
-    "QxqK-IdpumU", // _Getpmbstate
-    "zS94yyJRSUs", // _Getpwcstate
-    "-9SIhUr4Iuo", // _Mbtowcx
-    "stv1S3BKfgw", // _Wctombx
-    "ATpTPg64JhM", // _Wctombx.initial
-];
+fn append_object_initializers(
+    output: &mut Vec<GuestAddress>,
+    memory: &GuestImage,
+    image_base: GuestAddress,
+    dynamic: &DynamicInfo,
+) -> Result<(), LinkError> {
+    if dynamic.init_address != 0 {
+        output.push(normalize_process_address(
+            memory,
+            image_base,
+            dynamic.init_address,
+        )?);
+    }
+    output.extend(collect_initializer_array(
+        memory,
+        image_base,
+        dynamic.init_array_address,
+        dynamic.init_array_size,
+        "DT_INIT_ARRAY",
+    )?);
+    Ok(())
+}
 
-fn selected_module_exports(
-    modules: &[LinkedModuleInput<'_>],
-) -> Result<BTreeMap<String, u64>, LinkError> {
-    let mut exports = BTreeMap::new();
-    for module in modules {
-        if module.name != "libc.prx" {
-            continue;
+fn collect_initializer_array(
+    memory: &GuestImage,
+    image_base: GuestAddress,
+    address: u64,
+    size: u64,
+    kind: &'static str,
+) -> Result<Vec<GuestAddress>, LinkError> {
+    if address == 0 || size == 0 {
+        return Ok(Vec::new());
+    }
+    if !size.is_multiple_of(8) {
+        return Err(LinkError::InvalidInitializerArraySize { kind, size });
+    }
+    let count = usize::try_from(size / 8).map_err(|_| LinkError::AddressOverflow)?;
+    let byte_length = usize::try_from(size).map_err(|_| LinkError::AddressOverflow)?;
+    let array = runtime_address_at(memory, image_base, GuestAddress::new(address), byte_length)?;
+    let mut bytes = vec![0_u8; byte_length];
+    memory.read(array, &mut bytes)?;
+    let mut initializers = Vec::with_capacity(count);
+    for entry in bytes.chunks_exact(8) {
+        let value = u64::from_le_bytes(entry.try_into().expect("fixed initializer pointer"));
+        if value != 0 && value != u64::MAX {
+            initializers.push(normalize_process_address(memory, image_base, value)?);
         }
-        for symbol in module
-            .dynamic
-            .symbols
-            .iter()
-            .filter(|symbol| !symbol.is_undefined())
-        {
-            let nid = extract_nid(&symbol.name);
-            if LLE_LIBC_RUNTIME_NIDS.contains(&nid) {
-                let address = module
-                    .base
-                    .get()
-                    .checked_add(symbol.value.get())
-                    .ok_or(LinkError::AddressOverflow)?;
-                exports.insert(nid.to_owned(), address);
+    }
+    Ok(initializers)
+}
+
+fn normalize_process_address(
+    memory: &GuestImage,
+    image_base: GuestAddress,
+    address: u64,
+) -> Result<GuestAddress, LinkError> {
+    let address = GuestAddress::new(address);
+    if memory.contains(address, 1) {
+        return Ok(address);
+    }
+    let rebased = GuestAddress::new(
+        image_base
+            .get()
+            .checked_add(address.get())
+            .ok_or(LinkError::AddressOverflow)?,
+    );
+    if memory.contains(rebased, 1) {
+        Ok(rebased)
+    } else {
+        Err(LinkError::InitializerOutsideImage { address: rebased })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProcessExport {
+    address: u64,
+    weak: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ProcessSymbolKey {
+    Scoped {
+        nid: String,
+        library: String,
+        library_version: u16,
+        module: String,
+        module_version_major: u8,
+        module_version_minor: u8,
+        symbol_type: u8,
+    },
+    Unscoped {
+        nid: String,
+        symbol_type: u8,
+    },
+}
+
+impl ProcessSymbolKey {
+    fn nid(&self) -> &str {
+        match self {
+            Self::Scoped { nid, .. } | Self::Unscoped { nid, .. } => nid,
+        }
+    }
+}
+
+fn main_base_export_input<'a>(
+    executable: &'a LoadedExecutable,
+    dynamic: &'a DynamicInfo,
+    base: GuestAddress,
+) -> LinkedModuleInput<'a> {
+    LinkedModuleInput {
+        executable,
+        dynamic,
+        base,
+        tls_module_id: 1,
+    }
+}
+
+fn collect_process_exports(
+    memory: &GuestImage,
+    main: &LinkedModuleInput<'_>,
+    modules: &[LinkedModuleInput<'_>],
+) -> Result<BTreeMap<ProcessSymbolKey, u64>, LinkError> {
+    let mut exports = BTreeMap::<ProcessSymbolKey, ProcessExport>::new();
+    for module in std::iter::once(main).chain(modules) {
+        for symbol in module.dynamic.symbols.iter().filter(|symbol| {
+            !symbol.is_undefined() && !symbol.name.is_empty() && matches!(symbol.binding(), 1 | 2)
+        }) {
+            let key = process_symbol_key(module.dynamic, symbol)?;
+            if key.nid().is_empty() {
+                continue;
+            }
+            let address = defined_symbol_address_at(memory, module.base, symbol)?;
+            let candidate = ProcessExport {
+                address,
+                weak: symbol.is_weak(),
+            };
+            match exports.get_mut(&key) {
+                None => {
+                    exports.insert(key, candidate);
+                }
+                Some(current) if current.weak && !candidate.weak => {
+                    *current = candidate;
+                }
+                Some(_) => {}
             }
         }
     }
-    Ok(exports)
+    Ok(exports
+        .into_iter()
+        .map(|(nid, export)| (nid, export.address))
+        .collect())
+}
+
+fn process_symbol_key(
+    dynamic: &DynamicInfo,
+    symbol: &Elf64Symbol,
+) -> Result<ProcessSymbolKey, LinkError> {
+    let mut ids = symbol.name.split('#');
+    let nid = ids.next().unwrap_or_default();
+    let library_id = ids.next();
+    let module_id = ids.next();
+    if ids.next().is_none()
+        && let (Some(library_id), Some(module_id)) = (library_id, module_id)
+        && let Some(library) = dynamic
+            .imported_libraries
+            .iter()
+            .chain(&dynamic.exported_libraries)
+            .find(|library| encode_sce_id(library.id) == library_id)
+        && let Some(module) = dynamic
+            .required_modules
+            .iter()
+            .chain(&dynamic.exported_modules)
+            .find(|module| encode_sce_id(module.id) == module_id)
+    {
+        return Ok(ProcessSymbolKey::Scoped {
+            nid: nid.to_owned(),
+            library: library.name.clone(),
+            library_version: library.version,
+            module: module.name.clone(),
+            module_version_major: module.version_major,
+            module_version_minor: module.version_minor,
+            symbol_type: symbol.symbol_type(),
+        });
+    }
+    if library_id.is_some()
+        && module_id.is_some()
+        && (!dynamic.imported_libraries.is_empty()
+            || !dynamic.exported_libraries.is_empty()
+            || !dynamic.required_modules.is_empty()
+            || !dynamic.exported_modules.is_empty())
+    {
+        return Err(LinkError::InvalidSymbolNamespace {
+            symbol: symbol.name.clone(),
+        });
+    }
+    Ok(ProcessSymbolKey::Unscoped {
+        nid: nid.to_owned(),
+        symbol_type: symbol.symbol_type(),
+    })
+}
+
+fn encode_sce_id(id: u16) -> String {
+    const CODES: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
+    let mut encoded = String::with_capacity(3);
+    if id < 0x40 {
+        encoded.push(char::from(CODES[usize::from(id)]));
+    } else if id < 0x1000 {
+        encoded.push(char::from(CODES[usize::from((id >> 6) & 0x3f)]));
+        encoded.push(char::from(CODES[usize::from(id & 0x3f)]));
+    } else {
+        encoded.push(char::from(CODES[usize::from((id >> 12) & 0x3f)]));
+        encoded.push(char::from(CODES[usize::from((id >> 6) & 0x3f)]));
+        encoded.push(char::from(CODES[usize::from(id & 0x3f)]));
+    }
+    encoded
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImportResolution {
+    BundledGuest,
+    HostDirect,
+    HleDispatch,
+    UnresolvedWeak,
+}
+
+fn imported_symbol<'a>(
+    dynamic: &'a DynamicInfo,
+    import: &ImportedSymbol,
+) -> Result<&'a Elf64Symbol, LinkError> {
+    let index = usize::try_from(import.symbol_index).map_err(|_| LinkError::MissingSymbol {
+        index: import.symbol_index,
+    })?;
+    dynamic.symbols.get(index).ok_or(LinkError::MissingSymbol {
+        index: import.symbol_index,
+    })
+}
+
+fn classify_import(
+    dynamic: &DynamicInfo,
+    import: &ImportedSymbol,
+    process_exports: &BTreeMap<ProcessSymbolKey, u64>,
+) -> Result<ImportResolution, LinkError> {
+    let symbol = imported_symbol(dynamic, import)?;
+    let key = process_symbol_key(dynamic, symbol)?;
+    if process_exports.contains_key(&key) {
+        return Ok(ImportResolution::BundledGuest);
+    }
+    let nid = key.nid();
+    if native_import_target(nid).is_some() || synthetic_data_import_target(nid).is_some() {
+        return Ok(ImportResolution::HostDirect);
+    }
+    if import.weak {
+        Ok(ImportResolution::UnresolvedWeak)
+    } else {
+        Ok(ImportResolution::HleDispatch)
+    }
+}
+
+fn collect_import_resolution_stats<'a>(
+    dynamics: impl IntoIterator<Item = &'a DynamicInfo>,
+    process_exports: &BTreeMap<ProcessSymbolKey, u64>,
+) -> Result<ImportResolutionStats, LinkError> {
+    let mut stats = ImportResolutionStats::default();
+    for dynamic in dynamics {
+        for import in &dynamic.imports {
+            match classify_import(dynamic, import, process_exports)? {
+                ImportResolution::BundledGuest => stats.bundled_guest += 1,
+                ImportResolution::HostDirect => stats.host_direct += 1,
+                ImportResolution::HleDispatch => stats.hle_dispatch += 1,
+                ImportResolution::UnresolvedWeak => stats.unresolved_weak += 1,
+            }
+        }
+    }
+    Ok(stats)
+}
+
+#[cfg(test)]
+mod linker_metadata_tests {
+    use remu_core::GuestAddress;
+    use remu_loader::{DynamicInfo, Elf64Symbol, SceLibraryReference, SceModuleReference};
+
+    use super::{ProcessSymbolKey, encode_sce_id, process_symbol_key};
+
+    #[test]
+    fn encodes_sony_namespace_ids_in_the_dynamic_symbol_alphabet() {
+        assert_eq!(encode_sce_id(0), "A");
+        assert_eq!(encode_sce_id(63), "-");
+        assert_eq!(encode_sce_id(64), "BA");
+        assert_eq!(encode_sce_id(0x0fff), "--");
+        assert_eq!(encode_sce_id(0x1000), "BAA");
+        assert_eq!(encode_sce_id(u16::MAX), "P--");
+    }
+
+    #[test]
+    fn resolves_symbols_by_namespace_versions_and_type_not_local_encoded_ids() {
+        let imported = dynamic_namespace(false, 4, 3, 7, 2, 1);
+        let exported = dynamic_namespace(true, 11, 10, 7, 2, 1);
+        let import_symbol = symbol("someNid#E#D", 0x12, 0);
+        let export_symbol = symbol("someNid#L#K", 0x12, 1);
+
+        let import_key = process_symbol_key(&imported, &import_symbol).unwrap();
+        let export_key = process_symbol_key(&exported, &export_symbol).unwrap();
+        assert_eq!(import_key, export_key);
+        assert!(matches!(import_key, ProcessSymbolKey::Scoped { .. }));
+
+        let different_version = dynamic_namespace(true, 11, 10, 8, 2, 1);
+        assert_ne!(
+            process_symbol_key(&different_version, &export_symbol).unwrap(),
+            export_key
+        );
+        let object_export = symbol("someNid#L#K", 0x11, 1);
+        assert_ne!(
+            process_symbol_key(&exported, &object_export).unwrap(),
+            export_key
+        );
+        assert!(process_symbol_key(&exported, &symbol("someNid#Z#Z", 0x12, 1)).is_err());
+    }
+
+    fn symbol(name: &str, info: u8, section_index: u16) -> Elf64Symbol {
+        Elf64Symbol {
+            name_offset: 0,
+            info,
+            other: 0,
+            section_index,
+            value: GuestAddress::new(0x100),
+            size: 8,
+            name: name.to_owned(),
+        }
+    }
+
+    fn dynamic_namespace(
+        exports: bool,
+        library_id: u16,
+        module_id: u16,
+        library_version: u16,
+        module_version_major: u8,
+        module_version_minor: u8,
+    ) -> DynamicInfo {
+        let library = SceLibraryReference {
+            name: "GuestLibrary".to_owned(),
+            id: library_id,
+            version: library_version,
+        };
+        let module = SceModuleReference {
+            name: "GuestModule".to_owned(),
+            id: module_id,
+            version_major: module_version_major,
+            version_minor: module_version_minor,
+        };
+        let (required_modules, exported_modules, imported_libraries, exported_libraries) =
+            if exports {
+                (Vec::new(), vec![module], Vec::new(), vec![library])
+            } else {
+                (vec![module], Vec::new(), vec![library], Vec::new())
+            };
+        DynamicInfo {
+            entries: Vec::new(),
+            needed_libraries: Vec::new(),
+            original_filename: None,
+            required_modules,
+            exported_modules,
+            imported_libraries,
+            exported_libraries,
+            string_table_address: 0,
+            string_table_size: 0,
+            symbol_table_address: 0,
+            symbol_table_size: 0,
+            rela_address: 0,
+            rela_size: 0,
+            jump_relocation_address: 0,
+            jump_relocation_size: 0,
+            plt_got_address: 0,
+            init_address: 0,
+            init_array_address: 0,
+            init_array_size: 0,
+            preinit_array_address: 0,
+            preinit_array_size: 0,
+            symbols: Vec::new(),
+            relocations: Vec::new(),
+            jump_relocations: Vec::new(),
+            imports: Vec::new(),
+        }
+    }
 }
 
 /// Returns the number of guest pthread workers that are still executing.
@@ -1015,19 +1527,24 @@ fn create_import_stubs(
     memory: &mut GuestImage,
     dynamic: &DynamicInfo,
     first_dispatch_index: usize,
-    module_targets: &BTreeMap<String, u64>,
+    process_exports: &BTreeMap<ProcessSymbolKey, u64>,
 ) -> Result<(Vec<ImportStub>, BTreeMap<u32, GuestAddress>), LinkError> {
-    let nids = dynamic
-        .imports
-        .iter()
-        .filter(|import| !import.weak)
-        .map(|import| extract_nid(&import.name).to_owned())
-        .collect::<BTreeSet<_>>();
-    if nids.is_empty() {
+    let mut dispatch_imports = BTreeMap::<ProcessSymbolKey, Vec<u32>>::new();
+    for import in &dynamic.imports {
+        if classify_import(dynamic, import, process_exports)? != ImportResolution::HleDispatch {
+            continue;
+        }
+        let symbol = imported_symbol(dynamic, import)?;
+        dispatch_imports
+            .entry(process_symbol_key(dynamic, symbol)?)
+            .or_default()
+            .push(import.symbol_index);
+    }
+    if dispatch_imports.is_empty() {
         return Ok((Vec::new(), BTreeMap::new()));
     }
 
-    let stub_bytes = u64::try_from(nids.len())
+    let stub_bytes = u64::try_from(dispatch_imports.len())
         .map_err(|_| LinkError::StubAllocationOverflow)?
         .checked_mul(IMPORT_STUB_SIZE)
         .ok_or(LinkError::StubAllocationOverflow)?;
@@ -1035,46 +1552,30 @@ fn create_import_stubs(
         memory.allocate_staging(stub_bytes, IMPORT_STUB_SIZE, GUEST_READ | GUEST_EXECUTE)?;
     let bytes_len = usize::try_from(stub_bytes).map_err(|_| LinkError::StubAllocationOverflow)?;
     let mut bytes = vec![0_u8; bytes_len];
-    let mut import_stubs = Vec::with_capacity(nids.len());
-    let mut by_nid = BTreeMap::new();
+    let mut import_stubs = Vec::with_capacity(dispatch_imports.len());
+    let mut symbol_stubs = BTreeMap::new();
     let dispatcher = import_dispatch_trampoline as *const () as usize as u64;
-    for (index, nid) in nids.into_iter().enumerate() {
+    for (index, (key, symbol_indices)) in dispatch_imports.into_iter().enumerate() {
         let byte_offset = index * IMPORT_STUB_SIZE_USIZE;
-        if let Some(target) = module_targets.get(&nid).copied() {
-            write_native_import_stub(&mut bytes[byte_offset..], target);
-        } else if let Some(target) = native_import_target(&nid) {
-            write_native_import_stub(&mut bytes[byte_offset..], target);
-        } else {
-            let dispatch_index = first_dispatch_index
-                .checked_add(index)
-                .ok_or(LinkError::StubAllocationOverflow)?;
-            write_import_stub(&mut bytes[byte_offset..], dispatch_index, dispatcher)?;
-        }
+        let dispatch_index = first_dispatch_index
+            .checked_add(index)
+            .ok_or(LinkError::StubAllocationOverflow)?;
+        write_import_stub(&mut bytes[byte_offset..], dispatch_index, dispatcher)?;
         let address = GuestAddress::new(
             stub_base
                 .get()
                 .checked_add(byte_offset as u64)
                 .ok_or(LinkError::AddressOverflow)?,
         );
-        by_nid.insert(nid.clone(), address);
-        import_stubs.push(ImportStub { nid, address });
+        for symbol_index in symbol_indices {
+            symbol_stubs.insert(symbol_index, address);
+        }
+        import_stubs.push(ImportStub {
+            nid: key.nid().to_owned(),
+            address,
+        });
     }
     memory.write(stub_base, &bytes)?;
-
-    let mut symbol_stubs = BTreeMap::new();
-    for import in &dynamic.imports {
-        if import.weak {
-            continue;
-        }
-        let nid = extract_nid(&import.name);
-        let address = by_nid
-            .get(nid)
-            .copied()
-            .ok_or(LinkError::MissingImportStub {
-                index: import.symbol_index,
-            })?;
-        symbol_stubs.insert(import.symbol_index, address);
-    }
     Ok((import_stubs, symbol_stubs))
 }
 
@@ -1084,6 +1585,7 @@ fn apply_relocations_at(
     tls_module_id: u64,
     dynamic: &DynamicInfo,
     symbol_stubs: &BTreeMap<u32, GuestAddress>,
+    process_exports: &BTreeMap<ProcessSymbolKey, u64>,
 ) -> Result<RelocationStats, LinkError> {
     let mut stats = RelocationStats::default();
     for relocation in dynamic.relocations.iter().chain(&dynamic.jump_relocations) {
@@ -1095,16 +1597,37 @@ fn apply_relocations_at(
             }
             R_X86_64_64 => {
                 stats.absolute += 1;
-                resolve_symbol_at(memory, image_base, dynamic, symbol_stubs, relocation)?
-                    .wrapping_add_signed(relocation.addend)
+                resolve_symbol_at(
+                    memory,
+                    image_base,
+                    dynamic,
+                    symbol_stubs,
+                    process_exports,
+                    relocation,
+                )?
+                .wrapping_add_signed(relocation.addend)
             }
             R_X86_64_GLOB_DAT => {
                 stats.global_data += 1;
-                resolve_symbol_at(memory, image_base, dynamic, symbol_stubs, relocation)?
+                resolve_symbol_at(
+                    memory,
+                    image_base,
+                    dynamic,
+                    symbol_stubs,
+                    process_exports,
+                    relocation,
+                )?
             }
             R_X86_64_JUMP_SLOT => {
                 stats.jump_slots += 1;
-                resolve_symbol_at(memory, image_base, dynamic, symbol_stubs, relocation)?
+                resolve_symbol_at(
+                    memory,
+                    image_base,
+                    dynamic,
+                    symbol_stubs,
+                    process_exports,
+                    relocation,
+                )?
             }
             R_X86_64_DTPMOD64 => tls_module_id,
             relocation_type => {
@@ -1124,6 +1647,7 @@ fn resolve_symbol_at(
     image_base: GuestAddress,
     dynamic: &DynamicInfo,
     symbol_stubs: &BTreeMap<u32, GuestAddress>,
+    process_exports: &BTreeMap<ProcessSymbolKey, u64>,
     relocation: &Elf64Rela,
 ) -> Result<u64, LinkError> {
     let index = usize::try_from(relocation.symbol_index).map_err(|_| LinkError::MissingSymbol {
@@ -1133,14 +1657,19 @@ fn resolve_symbol_at(
         index: relocation.symbol_index,
     })?;
     if symbol.is_undefined() {
+        let key = process_symbol_key(dynamic, symbol)?;
+        let nid = key.nid();
+        if let Some(address) = process_exports.get(&key).copied() {
+            return Ok(address);
+        }
+        if let Some(address) = native_import_target(nid) {
+            return Ok(address);
+        }
+        if let Some(address) = synthetic_data_import_target(nid) {
+            return Ok(address);
+        }
         if symbol.is_weak() {
             return Ok(0);
-        }
-        if let Some(address) = native_import_target(extract_nid(&symbol.name)) {
-            return Ok(address);
-        }
-        if let Some(address) = synthetic_data_import_target(extract_nid(&symbol.name)) {
-            return Ok(address);
         }
         return symbol_stubs
             .get(&relocation.symbol_index)
@@ -1197,101 +1726,206 @@ fn collect_unwind_fdes_at(
                 .iter()
                 .find(|header| header.program_type == PT_GNU_EH_FRAME)
         })
-        .filter(|header| header.file_size >= 12)
+        .filter(|header| header.file_size >= 4)
     else {
         return Ok(Vec::new());
     };
-    let header_address = runtime_address_at(memory, image_base, header.virtual_address, 12)?;
-    let mut header_bytes = [0_u8; 12];
+    let header_size = usize::try_from(header.file_size)
+        .map_err(|_| LinkError::MalformedEhFrame(".eh_frame_hdr is too large"))?;
+    let header_address =
+        runtime_address_at(memory, image_base, header.virtual_address, header_size)?;
+    let mut header_bytes = vec![0_u8; header_size];
     memory.read(header_address, &mut header_bytes)?;
     if header_bytes[0] != 1 {
         return Err(LinkError::MalformedEhFrame(
             "unsupported .eh_frame_hdr version",
         ));
     }
-    if header_bytes[1] != DW_EH_PE_PCREL_SDATA4 {
-        return Err(LinkError::UnsupportedEhFrameEncoding(header_bytes[1]));
-    }
-    if header_bytes[2] != 0x03 {
+    let mut cursor = 4;
+    let frame_address = decode_eh_pointer(
+        memory,
+        &header_bytes,
+        &mut cursor,
+        header_bytes[1],
+        header_address,
+    )?;
+    if !memory.contains(GuestAddress::new(frame_address), 4) {
         return Err(LinkError::MalformedEhFrame(
-            "unsupported FDE count encoding",
+            ".eh_frame pointer is outside the process image",
         ));
     }
-
-    let displacement = i32::from_le_bytes(
-        header_bytes[4..8]
-            .try_into()
-            .expect("fixed-width .eh_frame displacement"),
-    );
-    let frame_address = header_address
-        .get()
-        .checked_add(4)
-        .and_then(|address| address.checked_add_signed(i64::from(displacement)))
-        .ok_or(LinkError::MalformedEhFrame(".eh_frame address overflow"))?;
-    if frame_address >= header_address.get() {
+    let expected_fdes = if header_bytes[2] == DW_EH_PE_OMIT {
+        0
+    } else {
+        usize::try_from(decode_eh_pointer(
+            memory,
+            &header_bytes,
+            &mut cursor,
+            header_bytes[2],
+            header_address,
+        )?)
+        .map_err(|_| LinkError::MalformedEhFrame("FDE count is too large"))?
+    };
+    let table_encoding = header_bytes[3];
+    if expected_fdes != 0 && table_encoding == DW_EH_PE_OMIT {
         return Err(LinkError::MalformedEhFrame(
-            ".eh_frame does not precede its header",
+            "nonempty .eh_frame_hdr omits its search table",
         ));
     }
-    let expected_fdes = usize::try_from(u32::from_le_bytes(
-        header_bytes[8..12]
-            .try_into()
-            .expect("fixed-width FDE count"),
-    ))
-    .map_err(|_| LinkError::MalformedEhFrame("FDE count is too large"))?;
     let mut fdes = Vec::with_capacity(expected_fdes);
-    let mut cursor = frame_address;
-    while cursor < header_address.get() {
-        let mut length_bytes = [0_u8; 4];
-        memory.read(GuestAddress::new(cursor), &mut length_bytes)?;
-        let short_length = u32::from_le_bytes(length_bytes);
-        if short_length == 0 {
-            break;
-        }
-
-        let (length_field_size, entry_length, cie_pointer_size) = if short_length == u32::MAX {
-            let mut extended = [0_u8; 8];
-            memory.read(GuestAddress::new(cursor + 4), &mut extended)?;
-            (12_u64, u64::from_le_bytes(extended), 8_usize)
-        } else {
-            (4_u64, u64::from(short_length), 4_usize)
-        };
-        if entry_length < cie_pointer_size as u64 {
-            return Err(LinkError::MalformedEhFrame(
-                "entry is shorter than its CIE pointer",
-            ));
-        }
-        let entry_end = cursor
-            .checked_add(length_field_size)
-            .and_then(|address| address.checked_add(entry_length))
-            .ok_or(LinkError::MalformedEhFrame("entry address overflow"))?;
-        if entry_end > header_address.get() {
-            return Err(LinkError::MalformedEhFrame(
-                "entry extends beyond .eh_frame",
-            ));
-        }
-        let mut cie_pointer = [0_u8; 8];
-        memory.read(
-            GuestAddress::new(cursor + length_field_size),
-            &mut cie_pointer[..cie_pointer_size],
+    let mut unique_fdes = BTreeSet::new();
+    for _ in 0..expected_fdes {
+        let _initial_location = decode_eh_pointer(
+            memory,
+            &header_bytes,
+            &mut cursor,
+            table_encoding,
+            header_address,
         )?;
-        if u64::from_le_bytes(cie_pointer) != 0 {
-            fdes.push(GuestAddress::new(cursor));
+        let fde = decode_eh_pointer(
+            memory,
+            &header_bytes,
+            &mut cursor,
+            table_encoding,
+            header_address,
+        )?;
+        validate_fde(memory, fde)?;
+        if unique_fdes.insert(fde) {
+            fdes.push(GuestAddress::new(fde));
         }
-        cursor = entry_end;
     }
     if fdes.len() != expected_fdes {
         return Err(LinkError::MalformedEhFrame(
-            "decoded FDE count differs from .eh_frame_hdr",
+            ".eh_frame_hdr contains duplicate FDE pointers",
         ));
     }
     Ok(fdes)
 }
 
-fn extract_nid(symbol_name: &str) -> &str {
-    symbol_name
-        .split_once('#')
-        .map_or(symbol_name, |(nid, _)| nid)
+fn decode_eh_pointer(
+    memory: &GuestImage,
+    bytes: &[u8],
+    cursor: &mut usize,
+    encoding: u8,
+    data_relative_base: GuestAddress,
+) -> Result<u64, LinkError> {
+    if encoding == DW_EH_PE_OMIT {
+        return Err(LinkError::UnsupportedEhFrameEncoding(encoding));
+    }
+    let field_address = data_relative_base
+        .get()
+        .checked_add(u64::try_from(*cursor).map_err(|_| LinkError::AddressOverflow)?)
+        .ok_or(LinkError::AddressOverflow)?;
+    let (raw, width, signed) = match encoding & 0x0f {
+        0x00 | 0x04 => (read_eh_unsigned(bytes, *cursor, 8)?, 8, false),
+        0x02 => (read_eh_unsigned(bytes, *cursor, 2)?, 2, false),
+        0x03 => (read_eh_unsigned(bytes, *cursor, 4)?, 4, false),
+        0x0a => (read_eh_unsigned(bytes, *cursor, 2)?, 2, true),
+        0x0b => (read_eh_unsigned(bytes, *cursor, 4)?, 4, true),
+        0x0c => (read_eh_unsigned(bytes, *cursor, 8)?, 8, true),
+        _ => return Err(LinkError::UnsupportedEhFrameEncoding(encoding)),
+    };
+    *cursor = cursor
+        .checked_add(width)
+        .ok_or(LinkError::AddressOverflow)?;
+    let value = if signed {
+        sign_extend_eh_value(raw, width)
+    } else {
+        i128::from(raw)
+    };
+    let base = match encoding & 0x70 {
+        0x00 => 0_i128,
+        0x10 => i128::from(field_address),
+        0x30 => i128::from(data_relative_base.get()),
+        _ => return Err(LinkError::UnsupportedEhFrameEncoding(encoding)),
+    };
+    let resolved = base.checked_add(value).ok_or(LinkError::MalformedEhFrame(
+        "encoded unwind pointer overflows the guest address space",
+    ))?;
+    let resolved = u64::try_from(resolved).map_err(|_| {
+        LinkError::MalformedEhFrame("encoded unwind pointer overflows the guest address space")
+    })?;
+    if encoding & DW_EH_PE_INDIRECT == 0 {
+        return Ok(resolved);
+    }
+    let mut indirect = [0_u8; 8];
+    memory.read(GuestAddress::new(resolved), &mut indirect)?;
+    Ok(u64::from_le_bytes(indirect))
+}
+
+fn read_eh_unsigned(bytes: &[u8], offset: usize, width: usize) -> Result<u64, LinkError> {
+    let end = offset
+        .checked_add(width)
+        .ok_or(LinkError::AddressOverflow)?;
+    let source = bytes.get(offset..end).ok_or(LinkError::MalformedEhFrame(
+        "encoded unwind pointer exceeds .eh_frame_hdr",
+    ))?;
+    let mut value = [0_u8; 8];
+    value[..width].copy_from_slice(source);
+    Ok(u64::from_le_bytes(value))
+}
+
+fn sign_extend_eh_value(value: u64, width: usize) -> i128 {
+    let shift = 64 - width * 8;
+    i128::from((value << shift).cast_signed() >> shift)
+}
+
+fn validate_fde(memory: &GuestImage, address: u64) -> Result<(), LinkError> {
+    let mut short_header = [0_u8; 12];
+    memory.read(GuestAddress::new(address), &mut short_header)?;
+    let short_length = u32::from_le_bytes(short_header[..4].try_into().expect("FDE length"));
+    if short_length == 0 {
+        return Err(LinkError::MalformedEhFrame("FDE has a zero length"));
+    }
+    let (length_field_size, entry_length, cie_pointer_size, cie_pointer) =
+        if short_length == u32::MAX {
+            (
+                12_u64,
+                u64::from_le_bytes(short_header[4..12].try_into().expect("extended FDE length")),
+                8_usize,
+                None,
+            )
+        } else {
+            (
+                4_u64,
+                u64::from(short_length),
+                4_usize,
+                Some(u64::from(u32::from_le_bytes(
+                    short_header[4..8].try_into().expect("FDE CIE pointer"),
+                ))),
+            )
+        };
+    if entry_length < cie_pointer_size as u64 {
+        return Err(LinkError::MalformedEhFrame(
+            "FDE is shorter than its CIE pointer",
+        ));
+    }
+    let entry_size = length_field_size
+        .checked_add(entry_length)
+        .ok_or(LinkError::MalformedEhFrame("FDE size overflow"))?;
+    let entry_size =
+        usize::try_from(entry_size).map_err(|_| LinkError::MalformedEhFrame("FDE is too large"))?;
+    if !memory.contains(GuestAddress::new(address), entry_size) {
+        return Err(LinkError::MalformedEhFrame(
+            "FDE extends outside the process image",
+        ));
+    }
+    let cie_pointer = if let Some(pointer) = cie_pointer {
+        pointer
+    } else {
+        let mut pointer = [0_u8; 8];
+        let pointer_address = address
+            .checked_add(length_field_size)
+            .ok_or(LinkError::MalformedEhFrame("FDE address overflow"))?;
+        memory.read(GuestAddress::new(pointer_address), &mut pointer)?;
+        u64::from_le_bytes(pointer)
+    };
+    if cie_pointer == 0 {
+        return Err(LinkError::MalformedEhFrame(
+            ".eh_frame_hdr table points to a CIE instead of an FDE",
+        ));
+    }
+    Ok(())
 }
 
 /// Returns the service name for NIDs whose ABI is currently implemented or under active bring-up.
@@ -1469,16 +2103,6 @@ fn write_import_stub(slot: &mut [u8], index: usize, dispatcher: u64) -> Result<(
     slot[7..15].copy_from_slice(&dispatcher.to_le_bytes());
     slot[15..18].copy_from_slice(&[0x41, 0xff, 0xe3]);
     Ok(())
-}
-
-fn write_native_import_stub(slot: &mut [u8], target: u64) {
-    // movabs rax, target; jmp rax. The tail jump leaves no synthetic frame between the guest and
-    // libc++abi, which lets the host unwinder return directly to the guest call site.
-    slot[0] = 0x48;
-    slot[1] = 0xb8;
-    slot[2..10].copy_from_slice(&target.to_le_bytes());
-    slot[10] = 0xff;
-    slot[11] = 0xe0;
 }
 
 #[derive(Debug, Default)]
@@ -2059,7 +2683,9 @@ unsafe extern "C" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
 
 #[cfg(not(target_arch = "x86_64"))]
 extern "C" fn import_dispatch_trampoline() {
-    let _dispatch: extern "C" fn(*const ImportCallFrame) -> ProbeImportReturn = import_dispatch;
+    std::hint::black_box(
+        import_dispatch as extern "C" fn(*const ImportCallFrame) -> ProbeImportReturn,
+    );
     unreachable!("x86-64 guest import stubs cannot execute on this host architecture");
 }
 

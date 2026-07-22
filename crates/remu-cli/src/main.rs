@@ -171,39 +171,7 @@ fn inspect(path: &Path) -> ExitCode {
                     );
                 }
                 if let Some(dynamic) = elf.dynamic {
-                    println!("dynamic.entries={}", dynamic.entries.len());
-                    println!(
-                        "dynamic.string_table=0x{:x}:0x{:x}",
-                        dynamic.string_table_address, dynamic.string_table_size
-                    );
-                    println!(
-                        "dynamic.symbol_table=0x{:x}:0x{:x}",
-                        dynamic.symbol_table_address, dynamic.symbol_table_size
-                    );
-                    println!(
-                        "dynamic.rela=0x{:x}:0x{:x}",
-                        dynamic.rela_address, dynamic.rela_size
-                    );
-                    println!(
-                        "dynamic.jump_relocations=0x{:x}:0x{:x}",
-                        dynamic.jump_relocation_address, dynamic.jump_relocation_size
-                    );
-                    println!("dynamic.init=0x{:x}", dynamic.init_address);
-                    println!(
-                        "dynamic.init_array=0x{:x}:0x{:x}",
-                        dynamic.init_array_address, dynamic.init_array_size
-                    );
-                    println!(
-                        "dynamic.preinit_array=0x{:x}:0x{:x}",
-                        dynamic.preinit_array_address, dynamic.preinit_array_size
-                    );
-                    println!("dynamic.symbols={}", dynamic.symbols.len());
-                    println!("dynamic.relocations={}", dynamic.relocations.len());
-                    println!("dynamic.plt_relocations={}", dynamic.jump_relocations.len());
-                    println!("dynamic.imports={}", dynamic.imports.len());
-                    for library in dynamic.needed_libraries {
-                        println!("dynamic.needed={library}");
-                    }
+                    print_dynamic_info(dynamic);
                 }
             }
             ExitCode::SUCCESS
@@ -212,6 +180,42 @@ fn inspect(path: &Path) -> ExitCode {
             eprintln!("error: {}: {error}", path.display());
             ExitCode::FAILURE
         }
+    }
+}
+
+fn print_dynamic_info(dynamic: remu_loader::DynamicInfo) {
+    println!("dynamic.entries={}", dynamic.entries.len());
+    println!(
+        "dynamic.string_table=0x{:x}:0x{:x}",
+        dynamic.string_table_address, dynamic.string_table_size
+    );
+    println!(
+        "dynamic.symbol_table=0x{:x}:0x{:x}",
+        dynamic.symbol_table_address, dynamic.symbol_table_size
+    );
+    println!(
+        "dynamic.rela=0x{:x}:0x{:x}",
+        dynamic.rela_address, dynamic.rela_size
+    );
+    println!(
+        "dynamic.jump_relocations=0x{:x}:0x{:x}",
+        dynamic.jump_relocation_address, dynamic.jump_relocation_size
+    );
+    println!("dynamic.init=0x{:x}", dynamic.init_address);
+    println!(
+        "dynamic.init_array=0x{:x}:0x{:x}",
+        dynamic.init_array_address, dynamic.init_array_size
+    );
+    println!(
+        "dynamic.preinit_array=0x{:x}:0x{:x}",
+        dynamic.preinit_array_address, dynamic.preinit_array_size
+    );
+    println!("dynamic.symbols={}", dynamic.symbols.len());
+    println!("dynamic.relocations={}", dynamic.relocations.len());
+    println!("dynamic.plt_relocations={}", dynamic.jump_relocations.len());
+    println!("dynamic.imports={}", dynamic.imports.len());
+    for library in dynamic.needed_libraries {
+        println!("dynamic.needed={library}");
     }
 }
 
@@ -388,29 +392,10 @@ fn map(path: &Path) -> ExitCode {
 }
 
 fn link(path: &Path) -> ExitCode {
-    let executable = match remu_loader::load_path(path) {
-        Ok(executable) => executable,
-        Err(error) => {
-            eprintln!("error: {}: {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let modules = match load_bundled_runtime_modules(path) {
-        Ok(modules) => modules,
+    let (linked, module_report) = match load_process_image(path) {
+        Ok(process) => process,
         Err(error) => {
             eprintln!("error: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let module_refs = modules
-        .iter()
-        .map(|(name, executable)| (name.as_str(), executable))
-        .collect::<Vec<_>>();
-    let linked = match remu_runtime::LinkedImage::link_main_with_modules(&executable, &module_refs)
-    {
-        Ok(linked) => linked,
-        Err(error) => {
-            eprintln!("error: {}: {error}", path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -418,7 +403,20 @@ fn link(path: &Path) -> ExitCode {
     println!("image_base={}", linked.memory.image_base());
     println!("entry={}", linked.memory.entry_address());
     println!("import_stubs={}", linked.import_stubs.len());
+    let import_resolutions = linked.import_resolution_stats();
+    println!("imports.bundled_guest={}", import_resolutions.bundled_guest);
+    println!("imports.host_direct={}", import_resolutions.host_direct);
+    println!("imports.hle_dispatch={}", import_resolutions.hle_dispatch);
+    println!(
+        "imports.unresolved_weak={}",
+        import_resolutions.unresolved_weak
+    );
     println!("unwind_records={}", linked.unwind_record_count());
+    println!("bundled_modules={}", module_report.loaded_modules.len());
+    println!(
+        "system_module_dependencies={}",
+        module_report.unresolved_dependencies.len()
+    );
     println!("relocations={}", linked.relocation_stats.total());
     println!("tls.thread_pointer={}", linked.tls.thread_pointer);
     println!("tls.static_block_size=0x{:x}", linked.tls.static_block_size);
@@ -438,29 +436,10 @@ fn link(path: &Path) -> ExitCode {
 }
 
 fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
-    let executable = match remu_loader::load_path(path) {
-        Ok(executable) => executable,
-        Err(error) => {
-            eprintln!("error: {}: {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let modules = match load_bundled_runtime_modules(path) {
-        Ok(modules) => modules,
+    let (linked, module_report) = match load_process_image(path) {
+        Ok(process) => process,
         Err(error) => {
             eprintln!("error: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let module_refs = modules
-        .iter()
-        .map(|(name, executable)| (name.as_str(), executable))
-        .collect::<Vec<_>>();
-    let linked = match remu_runtime::LinkedImage::link_main_with_modules(&executable, &module_refs)
-    {
-        Ok(linked) => linked,
-        Err(error) => {
-            eprintln!("error: {}: {error}", path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -472,12 +451,17 @@ fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
         linked.tls.thread_pointer,
         linked.tls.patched_loads,
     );
-    let image_name = path
+    let image_name = module_report
+        .entry_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("eboot.bin");
-    let game_root = path.parent().unwrap_or_else(|| Path::new("."));
-    match linked.probe_entry(image_name, game_root, import_limit, timeout_seconds) {
+    match linked.probe_entry(
+        image_name,
+        &module_report.app_root,
+        import_limit,
+        timeout_seconds,
+    ) {
         Ok(outcome) => {
             println!("return_value={}", outcome.return_value);
             println!("import_hits={}", outcome.import_hits);
@@ -491,38 +475,20 @@ fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
 }
 
 fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
-    let executable = match remu_loader::load_path(path) {
-        Ok(executable) => executable,
-        Err(error) => {
-            eprintln!("error: {}: {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let modules = match load_bundled_runtime_modules(path) {
-        Ok(modules) => modules,
+    let (linked, module_report) = match load_process_image(path) {
+        Ok(process) => process,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
-    let module_refs = modules
-        .iter()
-        .map(|(name, executable)| (name.as_str(), executable))
-        .collect::<Vec<_>>();
-    let linked = match remu_runtime::LinkedImage::link_main_with_modules(&executable, &module_refs)
-    {
-        Ok(linked) => linked,
-        Err(error) => {
-            eprintln!("error: {}: {error}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let image_name = path
+    let image_name = module_report
+        .entry_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("eboot.bin")
         .to_owned();
-    let game_root = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
+    let game_root = module_report.app_root;
     // Do not block the guest while it holds the import-dispatch lock. Explicit GPU ordering events
     // still serialize cache invalidation with preceding and following translated work.
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -574,19 +540,19 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
     }
 }
 
-fn load_bundled_runtime_modules(
+fn load_process_image(
     executable_path: &Path,
-) -> Result<Vec<(String, remu_loader::LoadedExecutable)>, String> {
-    let Some(game_root) = executable_path.parent() else {
-        return Ok(Vec::new());
-    };
-    let mut modules = Vec::new();
-    let libc_path = game_root.join("sce_module/libc.prx");
-    if libc_path.is_file() {
-        let executable = remu_loader::load_path(&libc_path)
-            .map_err(|error| format!("{}: {error}", libc_path.display()))?;
-        eprintln!("[REMu][MODULE] loading {}", libc_path.display());
-        modules.push(("libc.prx".to_owned(), executable));
+) -> Result<(remu_runtime::LinkedImage, remu_runtime::ModuleLinkReport), String> {
+    let (image, report) = remu_runtime::LinkedImage::link_path(executable_path)
+        .map_err(|error| format!("{}: {error}", executable_path.display()))?;
+    for module in &report.loaded_modules {
+        eprintln!("[REMu][MODULE] loaded {}", module.display());
     }
-    Ok(modules)
+    eprintln!(
+        "[REMu][MODULE] dependency graph: bundled={} system/HLE={} app_root={}",
+        report.loaded_modules.len(),
+        report.unresolved_dependencies.len(),
+        report.app_root.display()
+    );
+    Ok((image, report))
 }

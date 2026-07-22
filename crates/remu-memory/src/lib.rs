@@ -99,9 +99,26 @@ impl GuestImage {
         Self::map_at(executable, PS5_MAIN_IMAGE_BASE)
     }
 
+    /// Maps a main executable while reserving an explicitly preflighted amount of contiguous
+    /// address space for PRX images, import trampolines, and process TLS.
+    pub fn map_main_with_auxiliary_reserve(
+        executable: &LoadedExecutable,
+        auxiliary_reserve_size: u64,
+    ) -> Result<Self, MappingError> {
+        Self::map_at_with_auxiliary_reserve(executable, PS5_MAIN_IMAGE_BASE, auxiliary_reserve_size)
+    }
+
     pub fn map_at(
         executable: &LoadedExecutable,
         image_base: GuestAddress,
+    ) -> Result<Self, MappingError> {
+        Self::map_at_with_auxiliary_reserve(executable, image_base, AUXILIARY_RESERVE_SIZE)
+    }
+
+    pub fn map_at_with_auxiliary_reserve(
+        executable: &LoadedExecutable,
+        image_base: GuestAddress,
+        auxiliary_reserve_size: u64,
     ) -> Result<Self, MappingError> {
         let page_size = host_page_size()?;
         let mut minimum = u64::MAX;
@@ -124,7 +141,7 @@ impl GuestImage {
         let mapping_start = align_down(minimum, page_size);
         let image_end = align_up(maximum, page_size)?;
         let mapping_end = image_end
-            .checked_add(AUXILIARY_RESERVE_SIZE)
+            .checked_add(auxiliary_reserve_size)
             .ok_or(MappingError::AddressOverflow)?;
         let mapping_size = mapping_end
             .checked_sub(mapping_start)
