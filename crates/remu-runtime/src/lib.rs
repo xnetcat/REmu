@@ -3640,6 +3640,21 @@ fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
     }
 
     if !patch_agc_shader_program_registers(header, code) {
+        if trace_agc_shaders() {
+            let registers = read_guest_u64(header + AGC_SHADER_SH_REGISTERS_OFFSET);
+            let first = if registers == 0 {
+                (0, 0)
+            } else {
+                (read_guest_u32(registers), read_guest_u32(registers + 8))
+            };
+            eprintln!(
+                "[REMu][AGC][SHADER] create rejected header={header:#x} code={code:#x} type={} sh_count={} sh_regs={registers:#x} first={:#x}/{:#x}",
+                read_guest_u8(header + AGC_SHADER_TYPE_OFFSET),
+                read_guest_u8(header + AGC_SHADER_SH_REGISTER_COUNT_OFFSET),
+                first.0,
+                first.1,
+            );
+        }
         return u64::MAX;
     }
     state.agc_graphics.shader_headers.insert(code, header);
@@ -3647,6 +3662,20 @@ fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
     state.agc_graphics.shader_decode_failures.remove(&code);
     if destination != 0 {
         write_guest_u64(destination, header);
+    }
+    if trace_agc_shaders() {
+        eprintln!(
+            "[REMu][AGC][SHADER] created unique={} dst={destination:#x} header={header:#x} code={code:#x} type={} cx={:#x} sh={:#x} specials={:#x} input={:#x}/{} output={:#x}/{}",
+            state.agc_graphics.shader_headers.len(),
+            read_guest_u8(header + AGC_SHADER_TYPE_OFFSET),
+            read_guest_u64(header + AGC_SHADER_CX_REGISTERS_OFFSET),
+            read_guest_u64(header + AGC_SHADER_SH_REGISTERS_OFFSET),
+            read_guest_u64(header + AGC_SHADER_SPECIALS_OFFSET),
+            read_guest_u64(header + AGC_SHADER_INPUT_SEMANTICS_OFFSET),
+            read_guest_u32(header + AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET),
+            read_guest_u64(header + AGC_SHADER_OUTPUT_SEMANTICS_OFFSET),
+            read_guest_u32(header + AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET),
+        );
     }
     0
 }
