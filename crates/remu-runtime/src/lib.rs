@@ -1037,7 +1037,7 @@ fn create_import_stubs(
     let mut bytes = vec![0_u8; bytes_len];
     let mut import_stubs = Vec::with_capacity(nids.len());
     let mut by_nid = BTreeMap::new();
-    let dispatcher = import_dispatch as *const () as usize as u64;
+    let dispatcher = import_dispatch_trampoline as *const () as usize as u64;
     for (index, nid) in nids.into_iter().enumerate() {
         let byte_offset = index * IMPORT_STUB_SIZE_USIZE;
         if let Some(target) = module_targets.get(&nid).copied() {
@@ -1458,17 +1458,16 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
 }
 
 fn write_import_stub(slot: &mut [u8], index: usize, dispatcher: u64) -> Result<(), LinkError> {
-    let index = u32::try_from(index).map_err(|_| LinkError::StubAllocationOverflow)?;
-    // push imm32; movabs rax, dispatcher; call rax; add rsp, 8; ret
+    let index = i32::try_from(index).map_err(|_| LinkError::StubAllocationOverflow)?;
+    // Push the dispatch index without altering the guest's argument registers, then tail-jump via
+    // R11 into the shared frame-capture trampoline. The trampoline removes this word before
+    // returning to the original guest call site.
     slot[0] = 0x68;
     slot[1..5].copy_from_slice(&index.to_le_bytes());
-    slot[5] = 0x48;
-    slot[6] = 0xb8;
+    slot[5] = 0x49;
+    slot[6] = 0xbb;
     slot[7..15].copy_from_slice(&dispatcher.to_le_bytes());
-    slot[15] = 0xff;
-    slot[16] = 0xd0;
-    slot[17..21].copy_from_slice(&[0x48, 0x83, 0xc4, 0x08]);
-    slot[21] = 0xc3;
+    slot[15..18].copy_from_slice(&[0x41, 0xff, 0xe3]);
     Ok(())
 }
 
@@ -1921,35 +1920,146 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     set_current_guest_thread_handle(main_thread);
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-extern "C" fn import_dispatch(
-    argument0: u64,
-    argument1: u64,
-    argument2: u64,
-    argument3: u64,
-    argument4: u64,
-    argument5: u64,
-    float_argument0: f64,
-    index: u64,
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Default)]
+struct ImportCallFrame {
+    integer_arguments: [u64; 6],
+    rax: u64,
+    guest_rsp: u64,
     guest_return_address: u64,
-    stack_argument0: u64,
-    stack_argument1: u64,
-    stack_argument2: u64,
-    stack_argument3: u64,
-    stack_argument4: u64,
-    stack_argument5: u64,
-) -> ProbeImportReturn {
-    let call_args = [
-        argument0, argument1, argument2, argument3, argument4, argument5,
-    ];
-    let stack_args = [
-        stack_argument0,
-        stack_argument1,
-        stack_argument2,
-        stack_argument3,
-        stack_argument4,
-        stack_argument5,
-    ];
+    dispatch_index: u64,
+    xmm_arguments: [u128; 8],
+}
+
+const IMPORT_CALL_FRAME_SIZE: usize = 0xd0;
+const _: () = {
+    assert!(std::mem::size_of::<ImportCallFrame>() == IMPORT_CALL_FRAME_SIZE);
+    assert!(std::mem::align_of::<ImportCallFrame>() == 16);
+    assert!(std::mem::offset_of!(ImportCallFrame, rax) == 0x30);
+    assert!(std::mem::offset_of!(ImportCallFrame, guest_rsp) == 0x38);
+    assert!(std::mem::offset_of!(ImportCallFrame, guest_return_address) == 0x40);
+    assert!(std::mem::offset_of!(ImportCallFrame, dispatch_index) == 0x48);
+    assert!(std::mem::offset_of!(ImportCallFrame, xmm_arguments) == 0x50);
+};
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn import_dispatch_trampoline() {
+    core::arch::naked_asm!(
+        "sub rsp, 0xd0",
+        "mov [rsp + 0x00], rdi",
+        "mov [rsp + 0x08], rsi",
+        "mov [rsp + 0x10], rdx",
+        "mov [rsp + 0x18], rcx",
+        "mov [rsp + 0x20], r8",
+        "mov [rsp + 0x28], r9",
+        "mov [rsp + 0x30], rax",
+        "lea r10, [rsp + 0xd8]",
+        "mov [rsp + 0x38], r10",
+        "mov r10, [rsp + 0xd8]",
+        "mov [rsp + 0x40], r10",
+        "mov r10, [rsp + 0xd0]",
+        "mov [rsp + 0x48], r10",
+        "movdqu [rsp + 0x50], xmm0",
+        "movdqu [rsp + 0x60], xmm1",
+        "movdqu [rsp + 0x70], xmm2",
+        "movdqu [rsp + 0x80], xmm3",
+        "movdqu [rsp + 0x90], xmm4",
+        "movdqu [rsp + 0xa0], xmm5",
+        "movdqu [rsp + 0xb0], xmm6",
+        "movdqu [rsp + 0xc0], xmm7",
+        "mov rdi, rsp",
+        "call {dispatch}",
+        "add rsp, 0xd0",
+        "add rsp, 8",
+        "ret",
+        dispatch = sym import_dispatch,
+    );
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+const TEST_CAPTURE_DISPATCH_INDEX: u64 = i32::MAX as u64;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+static TEST_CAPTURED_IMPORT_FRAME: Mutex<Option<ImportCallFrame>> = Mutex::new(None);
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[unsafe(naked)]
+unsafe extern "C" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
+    core::arch::naked_asm!(
+        "mov r11, rdi",
+        "mov rdi, 0x11",
+        "mov rsi, 0x22",
+        "mov rdx, 0x33",
+        "mov rcx, 0x44",
+        "mov r8, 0x55",
+        "mov r9, 0x66",
+        "mov rax, 0x0102030405060708",
+        "mov r10, 0x101",
+        "movq xmm0, r10",
+        "mov r10, 0x202",
+        "movq xmm1, r10",
+        "mov r10, 0x303",
+        "movq xmm2, r10",
+        "mov r10, 0x404",
+        "movq xmm3, r10",
+        "mov r10, 0x505",
+        "movq xmm4, r10",
+        "mov r10, 0x606",
+        "movq xmm5, r10",
+        "mov r10, 0x707",
+        "movq xmm6, r10",
+        "mov r10, 0x808",
+        "movq xmm7, r10",
+        "sub rsp, 8",
+        "call r11",
+        "add rsp, 8",
+        "ret",
+    );
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+extern "C" fn import_dispatch_trampoline() {
+    let _dispatch: extern "C" fn(*const ImportCallFrame) -> ProbeImportReturn = import_dispatch;
+    unreachable!("x86-64 guest import stubs cannot execute on this host architecture");
+}
+
+fn low_xmm_f64(value: u128) -> f64 {
+    let bytes = value.to_le_bytes();
+    f64::from_bits(u64::from_le_bytes(
+        bytes[..8].try_into().expect("fixed XMM lane"),
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportReturn {
+    if frame.is_null() {
+        eprintln!("[REMu][IMPORT] null captured register frame");
+        terminate_probe(87);
+    }
+    // SAFETY: import_dispatch_trampoline supplies one aligned, fully initialized frame that stays
+    // live until this call returns.
+    let frame = unsafe { &*frame };
+    #[cfg(all(test, target_arch = "x86_64"))]
+    if frame.dispatch_index == TEST_CAPTURE_DISPATCH_INDEX {
+        *TEST_CAPTURED_IMPORT_FRAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(*frame);
+        return ProbeImportReturn {
+            integer: frame.rax,
+            float: low_xmm_f64(frame.xmm_arguments[7]),
+        };
+    }
+    let call_args = frame.integer_arguments;
+    let mut stack_args = [0_u64; 6];
+    for (argument, output) in stack_args.iter_mut().enumerate() {
+        let offset = u64::try_from((argument + 1) * std::mem::size_of::<u64>())
+            .expect("fixed stack argument offset fits u64");
+        *output = read_guest_u64(frame.guest_rsp.saturating_add(offset));
+    }
+    let float_argument0 = low_xmm_f64(frame.xmm_arguments[0]);
+    let index = frame.dispatch_index;
+    let guest_return_address = frame.guest_return_address;
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = state
         .write()
@@ -1967,8 +2077,16 @@ extern "C" fn import_dispatch(
     if state.seen_nids.insert(nid.clone()) {
         let name = known_nid_name(&nid).unwrap_or("unknown");
         eprintln!(
-            "[REMu][IMPORT] first_hit={} nid={} name={} return={guest_return_address:#x} args={argument0:#x},{argument1:#x},{argument2:#x},{argument3:#x},{argument4:#x},{argument5:#x}",
-            state.hits, nid, name,
+            "[REMu][IMPORT] first_hit={} nid={} name={} return={guest_return_address:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+            state.hits,
+            nid,
+            name,
+            call_args[0],
+            call_args[1],
+            call_args[2],
+            call_args[3],
+            call_args[4],
+            call_args[5],
         );
     }
     if state.maximum_hits != 0 && state.hits >= state.maximum_hits {
@@ -8168,7 +8286,7 @@ mod platform_independent_tests {
         save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
         save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
         save_data_umount2, sce_kernel_error, system_service_param_get_int, take_exit_callbacks,
-        write_guest_u32, write_guest_u64,
+        write_guest_u32, write_guest_u64, write_import_stub,
     };
 
     unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
@@ -8336,6 +8454,87 @@ mod platform_independent_tests {
             sce_kernel_error(SCE_KERNEL_ERROR_NOT_IMPLEMENTED)
         );
         assert_eq!(state.unimplemented_nids.len(), 1);
+    }
+
+    #[test]
+    fn import_stubs_preserve_guest_rax_for_frame_capture() {
+        let mut slot = [0_u8; super::IMPORT_STUB_SIZE_USIZE];
+        write_import_stub(&mut slot, 0x1234, 0x1122_3344_5566_7788).unwrap();
+
+        assert_eq!(slot[0], 0x68);
+        assert_eq!(i32::from_le_bytes(slot[1..5].try_into().unwrap()), 0x1234);
+        assert_eq!(&slot[5..7], &[0x49, 0xbb]);
+        assert_eq!(
+            u64::from_le_bytes(slot[7..15].try_into().unwrap()),
+            0x1122_3344_5566_7788
+        );
+        assert_eq!(&slot[15..18], &[0x41, 0xff, 0xe3]);
+        assert!(slot[18..].iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn import_trampoline_captures_the_complete_sysv_register_frame() {
+        const PAGE_SIZE: usize = 0x4000;
+        let mut slot = [0_u8; super::IMPORT_STUB_SIZE_USIZE];
+        write_import_stub(
+            &mut slot,
+            usize::try_from(super::TEST_CAPTURE_DISPATCH_INDEX).unwrap(),
+            super::import_dispatch_trampoline as *const () as usize as u64,
+        )
+        .unwrap();
+        // SAFETY: This test owns one anonymous page and changes it from writable to executable
+        // before calling the complete import stub copied into it.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        // SAFETY: mapping owns PAGE_SIZE writable bytes and slot fits at its start.
+        unsafe { std::ptr::copy_nonoverlapping(slot.as_ptr(), mapping.cast::<u8>(), slot.len()) };
+        // SAFETY: mapping and its exact size came from mmap above.
+        assert_eq!(
+            unsafe { libc::mprotect(mapping, PAGE_SIZE, libc::PROT_READ | libc::PROT_EXEC) },
+            0
+        );
+        *super::TEST_CAPTURED_IMPORT_FRAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        // SAFETY: the page now contains a complete executable import stub targeting the real
+        // trampoline, and invoke_test_import_stub establishes the guest SysV register state.
+        let result = unsafe { super::invoke_test_import_stub(mapping.addr() as u64) };
+        let frame = super::TEST_CAPTURED_IMPORT_FRAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("test dispatch captured its frame");
+        // SAFETY: mapping and its exact size came from mmap and are no longer in use.
+        assert_eq!(unsafe { libc::munmap(mapping, PAGE_SIZE) }, 0);
+
+        assert_eq!(
+            frame.integer_arguments,
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
+        assert_eq!(frame.rax, 0x0102_0304_0506_0708);
+        assert_eq!(frame.dispatch_index, super::TEST_CAPTURE_DISPATCH_INDEX);
+        assert_ne!(frame.guest_return_address, 0);
+        assert_eq!(frame.guest_rsp & 0xf, 8);
+        for (index, xmm) in frame.xmm_arguments.iter().enumerate() {
+            let bytes = xmm.to_le_bytes();
+            let low = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let high = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+            assert_eq!(low, u64::try_from(index + 1).unwrap() * 0x101);
+            assert_eq!(high, 0);
+        }
+        assert_eq!(result.integer, frame.rax);
+        assert_eq!(result.float.to_bits(), 0x808);
     }
 
     #[test]
