@@ -95,15 +95,27 @@ milestone completion claim.
   overlapping virtual alias while preserving adjusted tails before physical ownership becomes
   reusable. Synthetic address-space and kernel-memory tests reproduce these invariants without
   title data.
+- The first mapping-lifetime validation at `ad2b208` ran for 84 seconds and reached `END C2 BOOT`,
+  save-data mount/unmount, and a fifth capture before a new deterministic SIGSEGV. The mapping trace
+  now shows exact independent query, unmap, and release ranges; no failed VM operation precedes the
+  crash. The fifth capture is another fully black frame with the existing
+  `2d02539a60a0d952d92b30e455ac5aeb2ab13510993224e7c94cdd4e29fbb581` hash, so this is execution
+  progress rather than visible-rendering progress. The retained IPS proves the crash is the missing
+  `__tls_get_addr` (`vNe1w4diLCs`) ABI: libc adds `0x280` to REmu's sign-extended not-implemented
+  result, producing IPS register `0xffffffff800202ce`, then faults on its `+8` field at
+  `0xffffffff800202d6`. The current increment resolves the two-word module/offset descriptor from
+  the current guest thread's DTV and corrects DTV slots from an erroneous 16-byte stride to the
+  FreeBSD AMD64 one-pointer-per-module layout. Its module-2 regression clones two workers, proves
+  their rebased TLS blocks do not alias, and covers invalid module IDs and address overflow.
 
 ## Subsystem ledger
 
 | Subsystem | Implemented invariant / evidence | Concrete next gap |
 | --- | --- | --- |
-| CPU, loader, linker | x86-64 guest execution remains behind the native CPU backend and runs under Rosetta; ELF/SELF mapping, observed relocations, TLS, and import trampolines have synthetic coverage. | Continue source-backed HLE import closure; do not begin the AArch64 translator before a milestone requires it. |
+| CPU, loader, linker | x86-64 guest execution remains behind the native CPU backend and runs under Rosetta; ELF/SELF mapping, observed relocations, compact AMD64 DTV slots, per-thread `__tls_get_addr`, TLS clone rebasing, and import trampolines have synthetic coverage. | Validate libc TLS resolution in the next single Dreaming Sarah run, then continue source-backed HLE import closure. Do not begin the AArch64 translator before a milestone requires it. |
 | AGC / PM4 ordering | Native Gen5 command routing, type-2 packets, clear state, ABI-side packet-predication patching, submission-bounded targetless scanout association, compute submission, a backpressured 64-event transport channel, and a one-entry shader compile gate are implemented. Partial-flush `EVENT_WRITE` types 7/15/16 become ordered compute/vertex/pixel GPU barriers; a blocked draw replays once before barrier/acquire/flip successors. | Implement execution-side `SET_PREDICATION`/header-bit semantics, then source-backed release/wait, cache visibility, fence writes, and graphics-equeue completion. Keep those operations distinct; a partial flush alone is not a CPU notification. |
 | Metal resources / readback | Persistent guest textures, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, MSAA resolve targets, and supported depth readback are covered by GPU tests. Internal Metal compression is handled by the blit and remains separate from guest tiling. | Move diagnostic capture to bounded asynchronous tickets and a reusable staging pool after correctness evidence; add explicit block-compressed and combined depth/stencil aspect layouts when guest formats exercise them. |
-| Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, and guest metadata are covered. `MAP_NO_COALESCE` mappings retain private identities for exact `VirtualQuery` boundaries; direct release invalidates all overlapping aliases and preserves unaffected tails. Containment-first/find-next query behavior and cross-VMA atomic unmap have synthetic coverage. | The full native/Rosetta gate is green. Validate the corrected query/unmap/release sequence in the next single controlled title run, then complete mapping lifecycle counters and exact query error/flag behavior for all exercised cases. |
+| Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, and guest metadata are covered. `MAP_NO_COALESCE` mappings retain private identities for exact `VirtualQuery` boundaries; direct release invalidates all overlapping aliases and preserves unaffected tails. Containment-first/find-next query behavior and cross-VMA atomic unmap have synthetic coverage, and the `ad2b208` title run validated the corrected sequence. | Complete mapping lifecycle counters and exact query error/flag behavior for all exercised cases. |
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, and translated shader pipelines are present. | Complete reusable blend, depth/stencil, rasterization, culling, front-face, multisampling, resolve, and full structural cache identity; audit old blend commit `a0388df` without wholesale cherry-picking. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, and observed compute geometry are implemented with offline Metal compilation tests. | Complete the unimplemented RDNA2 instruction/resource/CFG surface and replace large per-draw shader snapshots with bounded content-addressed immutable spans. |
 | Presentation / frame capture | Guest display size is independent of host drawable size; headless Metal is opt-in; interactive runs use a regular app bundle; direct scanout avoids routine GPU-to-CPU presentation round trips. The bounded scanout/barrier run captured the correct splash and the expected later opaque-black transition from both alternating buffers. | Reach and capture the first post-transition scene after another concrete fix or diagnostic feature, then measure frame pacing. Do not infer playability from splash/transition frames. |
@@ -127,6 +139,9 @@ milestone completion claim.
    adjacent-map query-boundary defect now covered synthetically. The mapping-identity increment has
    passed checks 1-6; its next evidence step is one controlled direct-shell run, not an interactive
    or routine launch loop.
+8. Complete at `ad2b208`: that controlled run proved the mapping fix and reached the next exact
+   blocker, `__tls_get_addr`, at 84 seconds. The resulting TLS/DTV increment has passed checks 1-6;
+   its next evidence step is one controlled direct-shell title run.
 
 Reference implementation provenance is recorded in [provenance](provenance.md); architectural and
 licensing constraints remain in [architecture](architecture.md) and [source policy](source-policy.md).

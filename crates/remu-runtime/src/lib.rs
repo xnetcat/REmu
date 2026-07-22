@@ -1059,7 +1059,7 @@ fn seed_tls_thread_control(
         thread_pointer.get(),
     )?;
     write_u64(memory, subtract_address(thread_pointer, 0xf0)?, 0)?;
-    // DTV generation, maximum module ID, and one two-word entry per TLS-bearing module.
+    // DTV generation, maximum module ID, and one pointer slot per module ID.
     write_u64(memory, dtv, 1)?;
     let maximum_module_id = module_blocks
         .iter()
@@ -1068,12 +1068,17 @@ fn seed_tls_thread_control(
         .unwrap_or(0);
     write_u64(memory, add_address(dtv, 8)?, maximum_module_id)?;
     for (module_id, block) in module_blocks {
-        let entry_offset = module_id
-            .checked_mul(16)
-            .ok_or(LinkError::AddressOverflow)?;
+        let entry_offset = tls_dtv_entry_offset(*module_id).ok_or(LinkError::AddressOverflow)?;
         write_u64(memory, add_address(dtv, entry_offset)?, block.get())?;
     }
     Ok(())
+}
+
+fn tls_dtv_entry_offset(module_id: u64) -> Option<u64> {
+    if module_id == 0 {
+        return None;
+    }
+    module_id.checked_mul(8)?.checked_add(8)
 }
 
 fn calculate_static_tls_offset(
@@ -1988,6 +1993,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "959qrazPIrg" => "sceKernelGetProcParam",
         "p5EcQeEeJAE" => "_sceKernelRtldSetApplicationHeapAPI",
         "bnZxYgAFeA0" => "sceKernelGetSanitizerNewReplaceExternal",
+        "vNe1w4diLCs" => "__tls_get_addr",
         "NWtTN10cJzE" => "sceLibcHeapGetTraceInfo",
         "mkx2fVhNMsg" => "pthread_cond_broadcast",
         "kDh-NfxgMtE" => "scePthreadCondSignal",
@@ -3223,7 +3229,9 @@ fn clone_guest_tls(template: &[u8]) -> GuestThreadTls {
             .expect("DTV module count is present in TLS template"),
     );
     for module_id in 1..=maximum_module_id {
-        let Ok(entry_offset) = usize::try_from(module_id.saturating_mul(16)) else {
+        let Some(entry_offset) =
+            tls_dtv_entry_offset(module_id).and_then(|offset| usize::try_from(offset).ok())
+        else {
             continue;
         };
         let entry_offset = dtv_offset + entry_offset;
@@ -3779,6 +3787,7 @@ fn dispatch_probe_import(
             0
         }
         "bnZxYgAFeA0" => sanitizer_new_replace_external(),
+        "vNe1w4diLCs" => guest_tls_get_addr(arguments[0]),
         "NWtTN10cJzE" => libc_heap_get_trace_info(arguments[0], state),
         "6c3rCVE-fTU" | "wuCroIGjt2g" => {
             guest_posix_file_result(guest_kernel_open(arguments, state))
@@ -7717,6 +7726,42 @@ fn guest_errno_address() -> u64 {
     }
 }
 
+fn guest_tls_get_addr(descriptor: u64) -> u64 {
+    let thread_pointer = current_guest_thread_pointer();
+    let Some(descriptor_offset) = descriptor.checked_add(8) else {
+        return 0;
+    };
+    if descriptor == 0 || thread_pointer == 0 {
+        return 0;
+    }
+    let module_id = read_guest_u64(descriptor);
+    let offset = read_guest_u64(descriptor_offset);
+    let Some(dtv_pointer_address) = thread_pointer.checked_add(8) else {
+        return 0;
+    };
+    let dtv = read_guest_u64(dtv_pointer_address);
+    let Some(maximum_module_address) = dtv.checked_add(8) else {
+        return 0;
+    };
+    if dtv == 0 || module_id == 0 {
+        return 0;
+    }
+    let maximum_module_id = read_guest_u64(maximum_module_address);
+    if module_id > maximum_module_id {
+        return 0;
+    }
+    let Some(entry_address) =
+        tls_dtv_entry_offset(module_id).and_then(|entry_offset| dtv.checked_add(entry_offset))
+    else {
+        return 0;
+    };
+    let block = read_guest_u64(entry_address);
+    if block == 0 {
+        return 0;
+    }
+    block.checked_add(offset).unwrap_or(0)
+}
+
 fn dispatch_guest_numeric_parser(nid: &str, arguments: [u64; 6]) -> ProbeImportReturn {
     if arguments[0] == 0 {
         return ProbeImportReturn::integer(0);
@@ -10337,21 +10382,21 @@ mod platform_independent_tests {
         VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_color_target_state,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
         agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, allocate_direct_memory,
-        allocate_pthread_thread_object, create_pthread_attr, decode_agc_memory_acquire,
-        destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
-        guest_clock_gettime, guest_free, guest_global_locale, guest_kernel_fstat,
-        guest_kernel_ftruncate, guest_kernel_lseek, guest_kernel_read, guest_posix_file_result,
-        guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp,
-        guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory, kernel_stat_payload,
-        kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity, pthread_attr_get_stack,
-        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        allocate_pthread_thread_object, clone_guest_tls, create_pthread_attr,
+        decode_agc_memory_acquire, destroy_pthread_attr, dispatch_guest_numeric_parser,
+        dispatch_probe_import, guest_clock_gettime, guest_free, guest_global_locale,
+        guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_lseek, guest_kernel_read,
+        guest_posix_file_result, guest_qsort, guest_tolower_table, guest_toupper_table,
+        guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory,
+        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity,
+        pthread_attr_get_stack, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
         pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
         resolve_guest_path, sanitize_save_segment, save_data_commit,
         save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
         save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
         save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
-        system_service_param_get_int, take_exit_callbacks, video_out_open, write_guest_u32,
-        write_guest_u64, write_import_stub,
+        system_service_param_get_int, take_exit_callbacks, tls_dtv_entry_offset, video_out_open,
+        write_guest_u32, write_guest_u64, write_import_stub,
     };
 
     #[repr(C, align(256))]
@@ -10930,6 +10975,99 @@ mod platform_independent_tests {
             libc::EINVAL.cast_unsigned()
         );
         set_current_guest_thread_pointer(0);
+    }
+
+    #[test]
+    fn tls_get_addr_uses_compact_per_thread_module_slots() {
+        fn write_template_word(template: &mut [u8], offset: usize, value: u64) {
+            template[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let template_size =
+            usize::try_from(super::GUEST_TLS_PREFIX_SIZE + super::GUEST_TLS_TCB_SIZE)
+                .expect("TLS template size fits usize");
+        let thread_pointer_offset =
+            usize::try_from(super::GUEST_TLS_PREFIX_SIZE).expect("TLS prefix fits usize");
+        let dtv_offset = thread_pointer_offset + 0x100;
+        let original_thread_pointer = 0x7000_1000_0000_u64;
+        let module1_block = original_thread_pointer - 0x40;
+        let module2_block = original_thread_pointer - 0x600;
+        let mut template = vec![0_u8; template_size];
+        write_template_word(
+            &mut template,
+            thread_pointer_offset,
+            original_thread_pointer,
+        );
+        write_template_word(&mut template, dtv_offset, 1);
+        write_template_word(&mut template, dtv_offset + 8, 2);
+        assert_eq!(tls_dtv_entry_offset(1), Some(16));
+        assert_eq!(tls_dtv_entry_offset(2), Some(24));
+        write_template_word(&mut template, dtv_offset + 16, module1_block);
+        write_template_word(&mut template, dtv_offset + 24, module2_block);
+
+        let first = clone_guest_tls(&template);
+        let second = clone_guest_tls(&template);
+        let first_module2 = first.thread_pointer - 0x600;
+        let second_module2 = second.thread_pointer - 0x600;
+        assert_ne!(first_module2, second_module2);
+        assert_eq!(
+            read_guest_u64(first.thread_pointer + 0x100 + 24),
+            first_module2
+        );
+        assert_eq!(
+            read_guest_u64(second.thread_pointer + 0x100 + 24),
+            second_module2
+        );
+        assert_eq!(read_guest_u64(first.thread_pointer + 0x100 + 32), 0);
+
+        let mut descriptor = [2_u64, 0x280];
+        let descriptor_address = descriptor.as_mut_ptr().addr() as u64;
+        let mut state = ProbeDispatchState::default();
+        set_current_guest_thread_pointer(first.thread_pointer);
+        assert_eq!(
+            dispatch_probe_import(
+                "vNe1w4diLCs",
+                [descriptor_address, 0, 0, 0, 0, 0],
+                [0; 6],
+                &mut state,
+            ),
+            first_module2 + 0x280
+        );
+        assert!(state.unimplemented_nids.is_empty());
+        assert_eq!(super::known_nid_name("vNe1w4diLCs"), Some("__tls_get_addr"));
+
+        write_guest_u32(first_module2 + 0x280, 0x1122_3344);
+        assert_eq!(read_guest_u32(first_module2 + 0x280), 0x1122_3344);
+        assert_eq!(read_guest_u32(second_module2 + 0x280), 0);
+        set_current_guest_thread_pointer(second.thread_pointer);
+        assert_eq!(
+            dispatch_probe_import(
+                "vNe1w4diLCs",
+                [descriptor_address, 0, 0, 0, 0, 0],
+                [0; 6],
+                &mut state,
+            ),
+            second_module2 + 0x280
+        );
+
+        write_guest_u64(second.thread_pointer + 0x100 + 24, 0);
+        assert_eq!(super::guest_tls_get_addr(descriptor_address), 0);
+        write_guest_u64(second.thread_pointer + 0x100 + 24, second_module2);
+        write_guest_u64(second.thread_pointer + 8, 0);
+        assert_eq!(super::guest_tls_get_addr(descriptor_address), 0);
+        write_guest_u64(second.thread_pointer + 8, second.thread_pointer + 0x100);
+
+        descriptor[0] = 0;
+        assert_eq!(super::guest_tls_get_addr(descriptor_address), 0);
+        descriptor[0] = 3;
+        assert_eq!(super::guest_tls_get_addr(descriptor_address), 0);
+        descriptor[0] = 2;
+        descriptor[1] = u64::MAX;
+        std::hint::black_box(descriptor[1]);
+        assert_eq!(super::guest_tls_get_addr(descriptor_address), 0);
+        assert_eq!(super::guest_tls_get_addr(0), 0);
+        set_current_guest_thread_pointer(0);
+        assert_eq!(super::guest_tls_get_addr(descriptor_address), 0);
     }
 
     #[test]

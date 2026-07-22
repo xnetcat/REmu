@@ -58,6 +58,17 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   REmu independently assigns private identities only to guest no-coalesce mappings, preserves those
   identities through VMA surgery, and removes every overlapping virtual alias before released
   physical pages can be reused. No upstream source was copied.
+- AMD64 DTV slot layout and `__tls_get_addr` (`vNe1w4diLCs`) were cross-checked against FreeBSD src
+  snapshot `afa048d159f64e1c609475314e19fb030ffd595f` (`sys/x86/include/tls.h` and
+  `libexec/rtld-elf/rtld.c`), shadPS4 snapshot
+  `4c72de0732ce7443a1631bf190e2606294f58f65` (`src/core/linker.cpp` and
+  `src/core/libraries/kernel/threads/tcb.cpp`), KytyPS5 snapshot
+  `8a4600c5e99ab3b3873b9ea57b70044f0fa34807` (`src/loader/runtimeLinker.cpp` and
+  `src/libs/libKernel.cpp`), and SharpEmu snapshot
+  `ada67a192495829b5d5408c08453cdfdc8553bb0` (`GuestTlsTemplate.cs` and
+  `KernelMemoryCompatExports.cs`). REmu independently uses its existing per-thread TLS allocation,
+  resolves the guest's two-word module/offset descriptor through compact pointer slots, and rebases
+  every populated slot when cloning a worker. No upstream source was copied.
 - AGC shader-header pointer relocation, program-register patching, and the VideoOut buffer-attribute
   and registration layouts were adapted from SharpEmu's GPL-2.0-or-later `AgcExports.cs` and
   `VideoOutExports.cs` at local snapshot `ada67a19`.
