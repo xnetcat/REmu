@@ -7,7 +7,7 @@
 //! semantics or compilation fails with the instruction PC and opcode; this crate never substitutes
 //! a placeholder color, drops an unknown memory access, or selects behavior by game identity.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use remu_shader::{
@@ -109,6 +109,21 @@ pub struct MetalShader {
     pub bindings: MetalBindingLayout,
     pub vertex_inputs: Vec<VertexInputBinding>,
     pub interpolated_attribute_count: u32,
+    /// Architectural register values which remain as independent MSL locals after lowering.
+    ///
+    /// The old backend forced all 384 guest registers into two addressable arrays. Keeping the
+    /// values independent lets Metal's SSA and liveness passes allocate only the values which are
+    /// actually referenced by the translated program.
+    pub register_footprint: MetalRegisterFootprint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetalRegisterFootprint {
+    pub scalar_values: u32,
+    pub vector_values: u32,
+    /// True when all reachable control flow was statically resolved and no PC dispatcher was
+    /// emitted.
+    pub direct_control_flow: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -148,6 +163,22 @@ struct Compiler<'a> {
     vertex_outputs: BTreeSet<u32>,
     pixel_attributes: BTreeSet<u32>,
     image_kinds: Vec<ImageKind>,
+    control_flow: ControlFlowLowering,
+}
+
+#[derive(Clone, Debug)]
+enum ControlFlowLowering {
+    /// Instruction indices in their exact execution order. This includes forward or backward
+    /// unconditional branches, provided the resulting path is acyclic.
+    Direct(Vec<usize>),
+    /// Conditional control flow or a cycle still requires the bounded architectural PC machine.
+    Dispatcher,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RegisterReferences {
+    scalar: BTreeSet<u32>,
+    vector: BTreeSet<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -230,6 +261,7 @@ impl<'a> Compiler<'a> {
                 }
             })
             .collect();
+        let control_flow = analyze_control_flow(program)?;
 
         Ok(Self {
             program,
@@ -240,23 +272,40 @@ impl<'a> Compiler<'a> {
             vertex_outputs,
             pixel_attributes,
             image_kinds,
+            control_flow,
         })
     }
 
     fn compile(mut self) -> Result<MetalShader, MetalCompileError> {
-        for (index, instruction) in self.program.instructions.iter().enumerate() {
-            self.line(2, &format!("case {}u: {{", instruction.pc));
-            self.emit_instruction(instruction, index)
-                .map_err(|message| MetalCompileError::Instruction {
-                    pc: instruction.pc,
-                    opcode: instruction.opcode,
-                    message,
-                })?;
-            self.line(3, "break;");
-            self.line(2, "}");
+        match self.control_flow.clone() {
+            ControlFlowLowering::Direct(indices) => {
+                for index in indices {
+                    let instruction = &self.program.instructions[index];
+                    self.emit_instruction(instruction, index, false)
+                        .map_err(|message| MetalCompileError::Instruction {
+                            pc: instruction.pc,
+                            opcode: instruction.opcode,
+                            message,
+                        })?;
+                }
+            }
+            ControlFlowLowering::Dispatcher => {
+                for (index, instruction) in self.program.instructions.iter().enumerate() {
+                    self.line(2, &format!("case {}u: {{", instruction.pc));
+                    self.emit_instruction(instruction, index, true)
+                        .map_err(|message| MetalCompileError::Instruction {
+                            pc: instruction.pc,
+                            opcode: instruction.opcode,
+                            message,
+                        })?;
+                    self.line(3, "break;");
+                    self.line(2, "}");
+                }
+            }
         }
 
-        let source = self.emit_module();
+        let direct_control_flow = matches!(self.control_flow, ControlFlowLowering::Direct(_));
+        let (source, register_references) = self.emit_module()?;
         let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
             .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
         let sampler_count = self
@@ -296,10 +345,24 @@ impl<'a> Compiler<'a> {
                 .pixel_attributes
                 .last()
                 .map_or(0, |attribute| attribute + 1),
+            register_footprint: MetalRegisterFootprint {
+                scalar_values: u32::try_from(register_references.scalar.len()).map_err(|_| {
+                    MetalCompileError::InvalidInterface("too many live scalar values".into())
+                })?,
+                vector_values: u32::try_from(register_references.vector.len()).map_err(|_| {
+                    MetalCompileError::InvalidInterface("too many live vector values".into())
+                })?,
+                direct_control_flow,
+            },
         })
     }
 
-    fn emit_instruction(&mut self, instruction: &Instruction, index: usize) -> Result<(), String> {
+    fn emit_instruction(
+        &mut self,
+        instruction: &Instruction,
+        index: usize,
+        dispatched: bool,
+    ) -> Result<(), String> {
         let next_pc = self.program.instructions.get(index + 1).map(|next| next.pc);
         let name = instruction
             .opcode
@@ -308,16 +371,23 @@ impl<'a> Compiler<'a> {
 
         match name {
             "SEndpgm" => {
-                self.line(3, "active = false;");
+                if dispatched {
+                    self.line(3, "active = false;");
+                }
                 return Ok(());
             }
             "SBranch" => {
-                let target = branch_target(instruction)?;
-                self.line(3, &format!("pc = {target}u;"));
+                if dispatched {
+                    let target = branch_target(instruction)?;
+                    self.line(3, &format!("pc = {target}u;"));
+                }
                 return Ok(());
             }
             "SCbranchScc0" | "SCbranchScc1" | "SCbranchVccz" | "SCbranchVccnz"
             | "SCbranchExecz" | "SCbranchExecnz" => {
+                if !dispatched {
+                    return Err("conditional branch reached direct control-flow lowering".into());
+                }
                 let target = branch_target(instruction)?;
                 let fallthrough =
                     next_pc.ok_or_else(|| "conditional branch has no fallthrough".to_owned())?;
@@ -389,16 +459,18 @@ impl<'a> Compiler<'a> {
             _ if instruction.opcode.starts_with("S") => self.emit_scalar_alu(instruction)?,
             _ => return Err("unsupported instruction family".to_owned()),
         }
-        if let Some(next_pc) = next_pc {
-            self.line(3, &format!("pc = {next_pc}u;"));
-        } else {
-            self.line(3, "active = false;");
+        if dispatched {
+            if let Some(next_pc) = next_pc {
+                self.line(3, &format!("pc = {next_pc}u;"));
+            } else {
+                self.line(3, "active = false;");
+            }
         }
         Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
-    fn emit_module(&self) -> String {
+    fn emit_module(&self) -> Result<(String, RegisterReferences), MetalCompileError> {
         let global_count = self.evaluation.global_memory_bindings.len();
         let initial_index = global_count;
         let sampler_count = self
@@ -523,7 +595,8 @@ impl<'a> Compiler<'a> {
                 if self
                     .evaluation
                     .compute_system_registers
-                    .is_some_and(|registers| registers.thread_group_size.is_some())
+                    .and_then(|registers| registers.thread_group_size)
+                    .is_some_and(|register| contains_register_reference(&self.body, 's', register))
                 {
                     parameters
                         .push("uint remu_thread_index [[thread_index_in_threadgroup]]".to_owned());
@@ -541,10 +614,11 @@ impl<'a> Compiler<'a> {
             "{signature}(\n    {}\n) {{",
             parameters.join(",\n    ")
         );
-        source.push_str("    uint s[128] = {};\n    uint v[256] = {};\n");
+        source.push_str("    /* REMU_REGISTER_STATE */\n");
         source.push_str("    bool exec = true;\n    bool vcc = false;\n    bool scc = false;\n");
-        source.push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
-        source.push_str("    for (uint i = 0u; i < 128u; ++i) s[i] = remu_initial_s[i];\n");
+        if matches!(self.control_flow, ControlFlowLowering::Dispatcher) {
+            source.push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
+        }
         if self.options.stage != MetalShaderStage::Compute {
             // Graphics stages cannot declare thread_index_in_simdgroup, but the exclusive prefix
             // of one is the architectural lane index. Wave operations are emitted before the
@@ -554,28 +628,51 @@ impl<'a> Compiler<'a> {
         match self.options.stage {
             MetalShaderStage::Vertex => {
                 source.push_str("    RemuVsOut remu_out = {};\n");
-                source.push_str("    v[5] = remu_vertex_id;\n    v[8] = remu_instance_id;\n");
+                if contains_register_reference(&self.body, 'v', 5) {
+                    source.push_str("    v[5] = remu_vertex_id;\n");
+                }
+                if contains_register_reference(&self.body, 'v', 8) {
+                    source.push_str("    v[8] = remu_instance_id;\n");
+                }
             }
             MetalShaderStage::Pixel => {
                 source.push_str("    RemuPsOut remu_out = {};\n");
                 self.emit_pixel_input_state(&mut source);
             }
             MetalShaderStage::Compute => {
-                source.push_str(
-                    "    v[0] = remu_local_id.x; v[1] = remu_local_id.y; v[2] = remu_local_id.z;\n",
-                );
+                for (register, component) in [(0, "x"), (1, "y"), (2, "z")] {
+                    if contains_register_reference(&self.body, 'v', register) {
+                        let _ = writeln!(source, "    v[{register}] = remu_local_id.{component};");
+                    }
+                }
                 self.emit_compute_system_registers(&mut source);
             }
         }
-        source.push_str(
-            "    s[106] = 0u; s[107] = 0u; s[126] = (uint)(uint64_t)simd_ballot(true); s[127] = 0u;\n",
-        );
-        source.push_str("    while (active) {\n        switch (pc) {\n");
-        source.push_str(&self.body);
-        source.push_str(
-            "        default: active = false; break;\n        }\n\
-             \x20       if (++steps >= 16384u) active = false;\n    }\n",
-        );
+        for register in [VCC_LO, VCC_HI] {
+            if contains_register_reference(&self.body, 's', register) {
+                let _ = writeln!(source, "    s[{register}] = 0u;");
+            }
+        }
+        if contains_register_reference(&self.body, 's', EXEC_LO) {
+            let _ = writeln!(
+                source,
+                "    s[{EXEC_LO}] = (uint)(uint64_t)simd_ballot(true);"
+            );
+        }
+        if contains_register_reference(&self.body, 's', EXEC_HI) {
+            let _ = writeln!(source, "    s[{EXEC_HI}] = 0u;");
+        }
+        match self.control_flow {
+            ControlFlowLowering::Direct(_) => source.push_str(&self.body),
+            ControlFlowLowering::Dispatcher => {
+                source.push_str("    while (active) {\n        switch (pc) {\n");
+                source.push_str(&self.body);
+                source.push_str(
+                    "        default: active = false; break;\n        }\n\
+                     \x20       if (++steps >= 16384u) active = false;\n    }\n",
+                );
+            }
+        }
         match self.options.stage {
             MetalShaderStage::Vertex | MetalShaderStage::Pixel => {
                 if self.options.stage == MetalShaderStage::Pixel {
@@ -586,7 +683,7 @@ impl<'a> Compiler<'a> {
             MetalShaderStage::Compute => {}
         }
         source.push_str("}\n");
-        source
+        scalarize_register_state(&source)
     }
 
     fn emit_compute_system_registers(&self, source: &mut String) {
@@ -598,11 +695,15 @@ impl<'a> Compiler<'a> {
             (registers.work_group_y, "y"),
             (registers.work_group_z, "z"),
         ] {
-            if let Some(register) = register {
+            if let Some(register) = register
+                && contains_register_reference(&self.body, 's', register)
+            {
                 let _ = writeln!(source, "    s[{register}] = remu_group_id.{component};");
             }
         }
-        if let Some(register) = registers.thread_group_size {
+        if let Some(register) = registers.thread_group_size
+            && contains_register_reference(&self.body, 's', register)
+        {
             source.push_str(
                 "    uint remu_wave_id = remu_thread_index >> 5u;\n\
                  \x20   uint remu_threadgroup_threads = remu_group_size.x * remu_group_size.y * remu_group_size.z;\n\
@@ -691,7 +792,9 @@ impl<'a> Compiler<'a> {
         for (bit, component) in [(8, "x"), (9, "y"), (10, "z"), (11, "w")] {
             let mask = 1_u32 << bit;
             if self.options.pixel_input_address & mask != 0 {
-                if self.options.pixel_input_enable & mask != 0 {
+                if self.options.pixel_input_enable & mask != 0
+                    && contains_register_reference(&self.body, 'v', vgpr)
+                {
                     let _ = writeln!(
                         source,
                         "    v[{vgpr}] = as_type<uint>(remu_in.frag_coord.{component});"
@@ -3215,6 +3318,9 @@ fn validate_interface(options: &MetalCompileOptions) -> Result<(), MetalCompileE
 }
 
 fn branch_target(instruction: &Instruction) -> Result<u32, String> {
+    if instruction.encoding != ShaderEncoding::Sopp || instruction.words.len() != 1 {
+        return Err("scalar branch is not one complete SOPP instruction".to_owned());
+    }
     let word = instruction
         .words
         .first()
@@ -3228,6 +3334,183 @@ fn branch_target(instruction: &Instruction) -> Result<u32, String> {
             .map_err(|_| "branch instruction size overflow".to_owned())?;
     let target = end + i64::from(immediate) * 4;
     u32::try_from(target).map_err(|_| "branch target is outside the Gen5 PC range".to_owned())
+}
+
+fn analyze_control_flow(program: &Program) -> Result<ControlFlowLowering, MetalCompileError> {
+    let mut instruction_by_pc = BTreeMap::new();
+    for (index, instruction) in program.instructions.iter().enumerate() {
+        if instruction_by_pc.insert(instruction.pc, index).is_some() {
+            return Err(MetalCompileError::InvalidInterface(format!(
+                "duplicate instruction pc 0x{:X}",
+                instruction.pc
+            )));
+        }
+    }
+
+    // Validate every encoded branch, including unreachable code. An invalid target previously
+    // fell through the dispatcher's default arm and silently terminated the shader.
+    for instruction in &program.instructions {
+        if !is_scalar_branch(instruction.opcode) {
+            continue;
+        }
+        let target =
+            branch_target(instruction).map_err(|message| MetalCompileError::Instruction {
+                pc: instruction.pc,
+                opcode: instruction.opcode,
+                message,
+            })?;
+        if !instruction_by_pc.contains_key(&target) {
+            return Err(MetalCompileError::Instruction {
+                pc: instruction.pc,
+                opcode: instruction.opcode,
+                message: format!("branch target 0x{target:X} is not an instruction boundary"),
+            });
+        }
+    }
+
+    let mut path = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut index = 0_usize;
+    while let Some(instruction) = program.instructions.get(index) {
+        if !visited.insert(index) {
+            return Ok(ControlFlowLowering::Dispatcher);
+        }
+        path.push(index);
+        match instruction.opcode.known_name() {
+            Some("SEndpgm") => break,
+            Some("SBranch") => {
+                let target = branch_target(instruction).expect("all branch targets were validated");
+                index = instruction_by_pc[&target];
+            }
+            Some(name) if name.starts_with("SCbranch") => {
+                return Ok(ControlFlowLowering::Dispatcher);
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    Ok(ControlFlowLowering::Direct(path))
+}
+
+fn is_scalar_branch(opcode: Opcode) -> bool {
+    opcode
+        .known_name()
+        .is_some_and(|name| name == "SBranch" || name.starts_with("SCbranch"))
+}
+
+fn contains_register_reference(source: &str, kind: char, register: u32) -> bool {
+    register_references(source).is_ok_and(|references| match kind {
+        's' => references.scalar.contains(&register),
+        'v' => references.vector.contains(&register),
+        _ => false,
+    })
+}
+
+fn scalarize_register_state(
+    source: &str,
+) -> Result<(String, RegisterReferences), MetalCompileError> {
+    const MARKER: &str = "    /* REMU_REGISTER_STATE */\n";
+    let references = register_references(source)?;
+    let mut rewritten = String::with_capacity(source.len());
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if let Some((kind, register, end)) = parse_register_reference(bytes, cursor)? {
+            let _ = write!(rewritten, "remu_{kind}_{register}");
+            cursor = end;
+        } else {
+            rewritten.push(char::from(bytes[cursor]));
+            cursor += 1;
+        }
+    }
+
+    let mut declarations = String::new();
+    for register in &references.scalar {
+        let _ = writeln!(
+            declarations,
+            "    uint remu_s_{register} = remu_initial_s[{register}];"
+        );
+    }
+    for register in &references.vector {
+        let _ = writeln!(declarations, "    uint remu_v_{register} = 0u;");
+    }
+    if !rewritten.contains(MARKER) {
+        return Err(MetalCompileError::InvalidInterface(
+            "internal register-state marker was lost".into(),
+        ));
+    }
+    Ok((rewritten.replacen(MARKER, &declarations, 1), references))
+}
+
+fn register_references(source: &str) -> Result<RegisterReferences, MetalCompileError> {
+    let bytes = source.as_bytes();
+    let mut references = RegisterReferences::default();
+    for cursor in 0..bytes.len() {
+        let Some((kind, register, _)) = parse_register_reference(bytes, cursor)? else {
+            continue;
+        };
+        match kind {
+            's' => {
+                references.scalar.insert(register);
+            }
+            'v' => {
+                references.vector.insert(register);
+            }
+            _ => unreachable!("register parser accepts only scalar and vector files"),
+        }
+    }
+    Ok(references)
+}
+
+fn parse_register_reference(
+    bytes: &[u8],
+    start: usize,
+) -> Result<Option<(char, u32, usize)>, MetalCompileError> {
+    let Some(&kind @ (b's' | b'v')) = bytes.get(start) else {
+        return Ok(None);
+    };
+    if start != 0
+        && bytes
+            .get(start - 1)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return Ok(None);
+    }
+    if bytes.get(start + 1) != Some(&b'[') {
+        return Ok(None);
+    }
+    let mut cursor = start + 2;
+    let digits_start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if cursor == digits_start || bytes.get(cursor) != Some(&b']') {
+        return Err(MetalCompileError::InvalidInterface(format!(
+            "dynamic {} register indexing survived lowering",
+            char::from(kind)
+        )));
+    }
+    let register = std::str::from_utf8(&bytes[digits_start..cursor])
+        .ok()
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .ok_or_else(|| {
+            MetalCompileError::InvalidInterface("invalid generated register index".into())
+        })?;
+    let limit = if kind == b's' {
+        SCALAR_REGISTER_COUNT
+    } else {
+        VECTOR_REGISTER_COUNT
+    };
+    if register >= limit {
+        return Err(MetalCompileError::InvalidInterface(format!(
+            "generated {} register {} exceeds architectural limit {}",
+            char::from(kind),
+            register,
+            limit
+        )));
+    }
+    Ok(Some((char::from(kind), register, cursor + 1)))
 }
 
 fn format_u32(value: u32) -> String {
@@ -4251,6 +4534,224 @@ mod tests {
         .expect("vector instruction should lower")
     }
 
+    #[test]
+    fn directly_lowers_single_path_control_flow_and_scalarizes_live_registers() {
+        let program = Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Sop1,
+                    opcode: Opcode::Known("SMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand::scalar(12)],
+                    destinations: vec![Operand::scalar(80)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand::scalar(80)],
+                    destinations: vec![Operand::vector(200)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0xbf81_0000],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("single-path program should lower directly");
+
+        assert!(shader.register_footprint.direct_control_flow);
+        assert_eq!(shader.register_footprint.scalar_values, 2);
+        assert_eq!(shader.register_footprint.vector_values, 1);
+        assert!(
+            shader
+                .source
+                .contains("uint remu_s_12 = remu_initial_s[12];")
+        );
+        assert!(shader.source.contains("uint remu_v_200 = 0u;"));
+        assert!(!shader.source.contains("uint s[128]"));
+        assert!(!shader.source.contains("uint v[256]"));
+        assert!(!shader.source.contains("while (active)"));
+        assert!(!shader.source.contains("switch (pc)"));
+    }
+
+    #[test]
+    fn resolves_acyclic_unconditional_branches_without_lowering_dead_instructions() {
+        let program = Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::Known("SBranch"),
+                    // PC 0 + 4-byte instruction + one dword = PC 8.
+                    words: vec![1],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(99)],
+                    destinations: vec![Operand::vector(100)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0xbf81_0000],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("static unconditional path should lower");
+
+        assert!(shader.register_footprint.direct_control_flow);
+        assert_eq!(shader.register_footprint.vector_values, 0);
+        assert!(!shader.source.contains("remu_v_99"));
+        assert!(!shader.source.contains("switch (pc)"));
+    }
+
+    #[test]
+    fn conditional_control_flow_keeps_exact_dispatcher_but_not_register_arrays() {
+        let program = Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::Known("SCbranchScc1"),
+                    words: vec![1],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0xbf81_0000],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0xbf81_0000],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("conditional program should retain dispatcher");
+
+        assert!(!shader.register_footprint.direct_control_flow);
+        assert!(shader.source.contains("while (active)"));
+        assert!(shader.source.contains("switch (pc)"));
+        assert!(!shader.source.contains("uint s[128]"));
+        assert!(!shader.source.contains("uint v[256]"));
+    }
+
+    #[test]
+    fn rejects_branches_to_non_instruction_boundaries() {
+        let program = Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SBranch"),
+                words: vec![1],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            }],
+        );
+        let error = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(0),
+        )
+        .expect_err("invalid branch target must not silently end the shader");
+        assert!(error.to_string().contains("is not an instruction boundary"));
+    }
+
+    #[test]
+    fn reports_bounded_codegen_footprint_for_a_long_straight_line_shader() {
+        let mut instructions = (0..64_u32)
+            .map(|index| Instruction {
+                pc: index * 4,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(8)],
+                control: None,
+            })
+            .collect::<Vec<_>>();
+        instructions.push(Instruction {
+            pc: 64 * 4,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0xbf81_0000],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        });
+        let shader = compile_msl(
+            &Program::new(0x1000, instructions),
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("long straight-line shader should lower");
+
+        eprintln!(
+            "remu Metal codegen: guest_instructions=65 source_bytes={} scalar_values={} vector_values={} dispatcher={}",
+            shader.source.len(),
+            shader.register_footprint.scalar_values,
+            shader.register_footprint.vector_values,
+            !shader.register_footprint.direct_control_flow,
+        );
+        assert_eq!(shader.register_footprint.scalar_values, 0);
+        assert_eq!(shader.register_footprint.vector_values, 2);
+        assert!(shader.register_footprint.direct_control_flow);
+        assert!(!shader.source.contains("case 0u"));
+        assert!(!shader.source.contains("steps"));
+    }
+
     const BUFFER_MEMORY_OPCODES: [&str; 60] = [
         "BufferLoadFormatX",
         "BufferLoadFormatXy",
@@ -4515,15 +5016,39 @@ mod tests {
     fn initializes_complete_rdna2_compute_system_register_state() {
         let program = Program::new(
             0x1000,
-            vec![Instruction {
-                pc: 0,
-                encoding: ShaderEncoding::Sopp,
-                opcode: Opcode::END_PROGRAM,
-                words: vec![0],
-                sources: Vec::new(),
-                destinations: Vec::new(),
-                control: None,
-            }],
+            [4_u32, 5, 6, 7]
+                .into_iter()
+                .enumerate()
+                .map(|(index, source)| Instruction {
+                    pc: u32::try_from(index * 4).expect("small system-register program"),
+                    encoding: ShaderEncoding::Sop1,
+                    opcode: Opcode::Known("SMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand::scalar(source)],
+                    destinations: vec![Operand::scalar(20 + source)],
+                    control: None,
+                })
+                .chain([
+                    Instruction {
+                        pc: 16,
+                        encoding: ShaderEncoding::Vop1,
+                        opcode: Opcode::Known("VMovB32"),
+                        words: vec![0],
+                        sources: vec![Operand::vector(0)],
+                        destinations: vec![Operand::vector(20)],
+                        control: None,
+                    },
+                    Instruction {
+                        pc: 20,
+                        encoding: ShaderEncoding::Sopp,
+                        opcode: Opcode::END_PROGRAM,
+                        words: vec![0],
+                        sources: Vec::new(),
+                        destinations: Vec::new(),
+                        control: None,
+                    },
+                ])
+                .collect(),
         );
         let mut evaluation = empty_evaluation();
         evaluation.compute_system_registers = Some(ComputeSystemRegisters {
@@ -4536,10 +5061,10 @@ mod tests {
         let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
             .expect("compute system register lowering");
 
-        assert!(shader.source.contains("v[0] = remu_local_id.x"));
-        assert!(shader.source.contains("s[4] = remu_group_id.x;"));
-        assert!(shader.source.contains("s[5] = remu_group_id.y;"));
-        assert!(shader.source.contains("s[6] = remu_group_id.z;"));
+        assert!(shader.source.contains("remu_v_0 = remu_local_id.x"));
+        assert!(shader.source.contains("remu_s_4 = remu_group_id.x;"));
+        assert!(shader.source.contains("remu_s_5 = remu_group_id.y;"));
+        assert!(shader.source.contains("remu_s_6 = remu_group_id.z;"));
         assert!(
             shader
                 .source
@@ -4735,7 +5260,7 @@ mod tests {
         assert!(shader.source.contains("remu_ds_cmpst"));
         assert!(shader.source.contains("if (exec &&"));
         assert!(shader.source.contains("< 8192u"));
-        assert!(shader.source.contains("<= (s[124] >> 2)"));
+        assert!(shader.source.contains("<= (remu_s_124 >> 2)"));
         assert!(
             shader
                 .source
@@ -4862,14 +5387,12 @@ mod tests {
         assert!(
             shader
                 .source
-                .contains("as_type<float>(v[1]) * as_type<float>(v[2])")
+                .contains("as_type<float>(remu_v_1) * as_type<float>(remu_v_2)")
         );
-        assert!(
-            shader
-                .source
-                .contains("fma(as_type<float>(v[3]), as_type<float>(v[4]), as_type<float>(v[0]))")
-        );
-        assert!(shader.source.contains("1.0f / as_type<float>(v[0])"));
+        assert!(shader.source.contains(
+            "fma(as_type<float>(remu_v_3), as_type<float>(remu_v_4), as_type<float>(remu_v_0))"
+        ));
+        assert!(shader.source.contains("1.0f / as_type<float>(remu_v_0)"));
     }
 
     #[test]
@@ -4904,7 +5427,7 @@ mod tests {
             &MetalCompileOptions::vertex(0),
         )
         .expect("SDWA float arithmetic should lower");
-        assert!(shader.source.contains("(v[1]) & 0xFFFFu"));
+        assert!(shader.source.contains("(remu_v_1) & 0xFFFFu"));
         assert!(shader.source.contains("fabs(as_type<float>"));
         assert!(shader.source.contains("* 4.0f"));
         assert!(shader.source.contains("clamp("));
@@ -5003,31 +5526,31 @@ mod tests {
         assert!(
             shader
                 .source
-                .contains("as_type<float>(v[1]) < as_type<float>(v[2])")
+                .contains("as_type<float>(remu_v_1) < as_type<float>(remu_v_2)")
         );
         assert!(
             shader
                 .source
-                .contains("!(as_type<float>(v[1]) >= as_type<float>(v[2]))")
+                .contains("!(as_type<float>(remu_v_1) >= as_type<float>(remu_v_2))")
         );
         assert!(
             shader
                 .source
-                .contains("as_type<int>(v[1]) < as_type<int>(v[2])")
+                .contains("as_type<int>(remu_v_1) < as_type<int>(remu_v_2)")
         );
-        assert!(shader.source.contains("((v[1]) < (v[2]))"));
+        assert!(shader.source.contains("((remu_v_1) < (remu_v_2))"));
         assert!(shader.source.contains("exec = t"));
         assert!(
             shader
                 .source
-                .contains("s[126] = (uint)(uint64_t)simd_ballot(t")
+                .contains("remu_s_126 = (uint)(uint64_t)simd_ballot(t")
         );
         assert!(
             shader
                 .source
-                .contains("s[12] = (uint)(uint64_t)simd_ballot(t")
+                .contains("remu_s_12 = (uint)(uint64_t)simd_ballot(t")
         );
-        assert!(shader.source.contains("s[13] = 0u;"));
+        assert!(shader.source.contains("remu_s_13 = 0u;"));
     }
 
     #[test]
@@ -5324,7 +5847,7 @@ mod tests {
         let mix = compile_vector_instruction(mix, MetalShaderStage::Vertex);
         assert!(
             mix.source
-                .contains("remu_f16_to_f32_bits(((v[1] >> 16) & 0xFFFFu))")
+                .contains("remu_f16_to_f32_bits(((remu_v_1 >> 16) & 0xFFFFu))")
         );
         assert!(mix.source.contains("as_type<float>(0x3F800000u)"));
         assert!(mix.source.contains("& 0x7FFFFFFFu"));
@@ -5335,12 +5858,12 @@ mod tests {
             vop3p_instruction("VFmaMixloF16", mix_control),
             MetalShaderStage::Vertex,
         );
-        assert!(low.source.contains("(v[8] & 0xFFFF0000u) |"));
+        assert!(low.source.contains("(remu_v_8 & 0xFFFF0000u) |"));
         let high = compile_vector_instruction(
             vop3p_instruction("VFmaMixhiF16", mix_control),
             MetalShaderStage::Vertex,
         );
-        assert!(high.source.contains("(v[8] & 0x0000FFFFu) |"));
+        assert!(high.source.contains("(remu_v_8 & 0x0000FFFFu) |"));
         assert!(high.source.contains("<< 16)"));
     }
 
@@ -5685,7 +6208,7 @@ mod tests {
             ),
             MetalShaderStage::Compute,
         );
-        assert!(shader.source.contains("simd_shuffle(v[1], (ushort)"));
+        assert!(shader.source.contains("simd_shuffle(remu_v_1, (ushort)"));
         assert!(
             shader
                 .source
@@ -5693,11 +6216,11 @@ mod tests {
         );
         assert!(shader.source.contains("(remu_lane & 15u) >= 1u"));
         assert!(shader.source.contains("fabs(as_type<float>"));
-        assert!(shader.source.contains("-(as_type<float>(v[2]))"));
+        assert!(shader.source.contains("-(as_type<float>(remu_v_2))"));
         assert!(shader.source.contains("5u >> (remu_lane >> 4)"));
         assert!(shader.source.contains("10u >> (remu_lane & 3u)"));
         assert!(shader.source.contains("? t"));
-        assert!(shader.source.contains(": v[8]"));
+        assert!(shader.source.contains(": remu_v_8"));
 
         let fetch_inactive = compile_vector_instruction(
             vector_instruction(
@@ -5738,7 +6261,7 @@ mod tests {
         );
         assert!(dpp8.source.contains("342391u >> ((remu_lane & 7u) * 3u)"));
         assert!(dpp8.source.contains("remu_lane & 0xFFFFFFF8u"));
-        assert!(dpp8.source.contains("simd_shuffle(v[1], (ushort)"));
+        assert!(dpp8.source.contains("simd_shuffle(remu_v_1, (ushort)"));
         assert!(
             dpp8.source
                 .contains("simd_shuffle(exec ? 1u : 0u, (ushort)")
@@ -5761,8 +6284,8 @@ mod tests {
         compare.destinations.clear();
         let compare = compile_vector_instruction(compare, MetalShaderStage::Vertex);
         assert!(compare.source.contains(": vcc"));
-        assert!(compare.source.contains("s[106] ="));
-        assert!(compare.source.contains("s[107] = 0u"));
+        assert!(compare.source.contains("remu_s_106 ="));
+        assert!(compare.source.contains("remu_s_107 = 0u"));
     }
 
     #[test]
@@ -5783,19 +6306,15 @@ mod tests {
                 .source
                 .contains("uint remu_lane = simd_prefix_exclusive_sum(1u)")
         );
-        assert!(shader.source.contains("simd_shuffle(v[1], (ushort)"));
-        assert!(
-            shader
-                .source
-                .contains("s[126] = (uint)(uint64_t)simd_ballot(true)")
-        );
+        assert!(shader.source.contains("simd_shuffle(remu_v_1, (ushort)"));
+        assert_eq!(shader.register_footprint.scalar_values, 0);
         let shuffle = shader
             .source
-            .find("simd_shuffle(v[1], (ushort)")
+            .find("simd_shuffle(remu_v_1, (ushort)")
             .expect("DPP8 shuffle");
         let write = shader
             .source
-            .find("if (exec) v[8]")
+            .find("if (exec) remu_v_8")
             .expect("EXEC-guarded destination write");
         assert!(
             shuffle < write,
