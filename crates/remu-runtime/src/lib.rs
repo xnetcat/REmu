@@ -2802,6 +2802,37 @@ fn dispatch_kernel_file_import(
     })
 }
 
+fn uses_title_proven_agc_command_abi(nid: &str) -> bool {
+    matches!(
+        nid,
+        "TRO721eVt4g"
+            | "ZvwO9euwYzc"
+            | "-HOOCn0JY48"
+            | "hvUfkUIQcOE"
+            | "vcmNN+AAXnY"
+            | "Qrj4c+61z4A"
+            | "6lNcCp+fxi4"
+            | "d-6uF9sZDIU"
+            | "z2duB-hHQSM"
+            | "vRoArM9zaIk"
+            | "n2fD4A+pb+g"
+            | "aJf+j5yntiU"
+            | "LtTouSCZjHM"
+            | "WmAc2MEj6Io"
+            | "wr23dPKyWc0"
+            | "VmW0Tdpy420"
+            | "IxYiarKlXxM"
+            | "3KDcnM3lrcU"
+            | "0fWWK5uG9rQ"
+            | "57labkp+rSQ"
+            | "GIIW2J37e70"
+            | "B+aG9DUnTKA"
+            | "tSBxhAPyytQ"
+            | "Yw0jKSqop+E"
+            | "YUeqkyT7mEQ"
+    )
+}
+
 #[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn dispatch_probe_import(
     nid: &str,
@@ -2812,7 +2843,9 @@ fn dispatch_probe_import(
     if let Some(result) = dispatch_kernel_file_import(nid, arguments, state) {
         return result;
     }
-    if let Some(result) = agc_command_abi::dispatch_agc_command_abi(nid, arguments, stack_arguments)
+    if !uses_title_proven_agc_command_abi(nid)
+        && let Some(result) =
+            agc_command_abi::dispatch_agc_command_abi(nid, arguments, stack_arguments)
     {
         return result;
     }
@@ -9203,6 +9236,44 @@ mod platform_independent_tests {
             read_guest_u64(command_buffer_address + 0x10),
             commands_address + 36
         );
+    }
+
+    #[test]
+    fn preserves_the_title_proven_deferred_shader_register_payload_abi() {
+        let mut command_buffer = vec![0_u8; 0x40];
+        let mut commands = vec![0_u32; 16];
+        let command_buffer_address =
+            u64::try_from(command_buffer.as_mut_ptr().addr()).expect("command buffer address");
+        let commands_address =
+            u64::try_from(commands.as_mut_ptr().addr()).expect("command storage address");
+        write_guest_u64(command_buffer_address + 0x10, commands_address);
+        write_guest_u64(command_buffer_address + 0x18, commands_address + 64);
+        write_guest_u32(command_buffer_address + 0x30, 0);
+
+        let mut state = ProbeDispatchState::default();
+        let command = dispatch_probe_import(
+            "n2fD4A+pb+g",
+            [command_buffer_address, 0x8c, 0, 4, 0, 0],
+            [0; 6],
+            &mut state,
+        );
+        let mut payload = 0_u64;
+        assert_eq!(
+            dispatch_probe_import(
+                "V++UgBtQhn0",
+                [(&raw mut payload).addr() as u64, command, 1, 0, 0, 0,],
+                [0; 6],
+                &mut state,
+            ),
+            0
+        );
+
+        assert_eq!(command, commands_address + 8);
+        assert_eq!(commands[0], agc_pm4(2, AGC_IT_NOP, super::AGC_R_ZERO));
+        assert_eq!(commands[2], agc_pm4(6, super::AGC_IT_SET_SH_REG, 0));
+        assert_eq!(commands[3], 0x8c);
+        assert_eq!(&commands[4..8], &[0; 4]);
+        assert_eq!(payload, command + 8);
     }
 }
 
