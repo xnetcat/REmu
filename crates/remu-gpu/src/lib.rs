@@ -25,9 +25,11 @@ pub const PAD_BUTTON_CROSS: u32 = 0x4000;
 pub const PAD_BUTTON_SQUARE: u32 = 0x8000;
 
 /// Maximum number of decoded GPU events retained between the guest command processor and the
-/// host presenter. A bounded queue prevents shader compilation stalls from growing memory without
-/// limit while preserving producer order through backpressure.
-pub const GPU_EVENT_QUEUE_CAPACITY: usize = 64;
+/// host presenter. Modern Unity frames contain hundreds of draws plus synchronization packets;
+/// retaining several thousand events lets the guest command processor and Metal encoder run in
+/// parallel instead of context-switching every few draws. The queue remains bounded so a shader
+/// compilation stall cannot grow memory without limit.
+pub const GPU_EVENT_QUEUE_CAPACITY: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostPadState {
@@ -58,6 +60,7 @@ static HOST_PAD_BUTTONS: AtomicU32 = AtomicU32::new(0);
 static HOST_PAD_AXES: AtomicU32 = AtomicU32::new(0x8080_8080);
 static HOST_PAD_TRIGGERS: AtomicU32 = AtomicU32::new(0);
 static GPU_EVENTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static GPU_COMPLETED_SUBMISSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AUDIO_OUTPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
 static AUDIO_UNDERRUN_FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -150,7 +153,7 @@ pub struct GpuRegister {
 pub struct ShaderSnapshot {
     pub header_address: u64,
     pub program: Arc<Program>,
-    pub metadata: Option<ShaderMetadata>,
+    pub metadata: Option<Arc<ShaderMetadata>>,
 }
 
 /// Exact GFX10 color-surface state retained for a display buffer that is named by a later
@@ -195,6 +198,11 @@ pub struct IndexedDraw {
     pub index_size: u32,
     pub index_offset: u32,
     pub index_count: u32,
+    /// Immutable indices captured while the guest submission still owns its transient ring data.
+    /// The presenter can lag command decoding during shader compilation, so retaining only the
+    /// guest address would allow Unity to recycle and overwrite the indices before Metal reads
+    /// them.
+    pub index_snapshot: Option<Arc<[u32]>>,
     pub draw_flags: u32,
     pub primitive_type: u32,
     pub export_shader_address: u64,
@@ -558,8 +566,18 @@ pub enum GpuEvent {
     },
     PipelineBarrier(GpuPipelineBarrier),
     MemoryAcquire(GpuMemoryAcquire),
+    MemoryCopy(GpuMemoryCopy),
+    MemoryWrite(GpuMemoryWrite),
+    MemoryRelease(GpuMemoryRelease),
+    MemoryWait(GpuMemoryWait),
     ComputeDispatch(Box<ComputeDispatch>),
     IndexedDraw(Box<IndexedDraw>),
+    /// An ordered CPU-visible end-of-pipe boundary for one guest graphics submission.
+    ///
+    /// The backend records this sequence only after all preceding translated GPU work and guest
+    /// memory writebacks have completed. The kernel equeue implementation uses the resulting
+    /// monotonic value to deliver `sceAgcDriverAddEqEvent` completion notifications.
+    SubmissionBoundary(u64),
     Shutdown,
 }
 
@@ -588,6 +606,73 @@ pub struct GpuMemoryAcquire {
     pub size_bytes: u64,
     pub poll_interval: u32,
     pub gcr_control: u32,
+}
+
+/// An ordered command-processor byte copy emitted by a Gen5 `DMA_DATA` packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMemoryCopy {
+    pub source_address: u64,
+    pub destination_address: u64,
+    pub byte_count: u64,
+    pub source_selection: u32,
+    pub destination_selection: u32,
+    /// The command parser already mirrored this raw guest-memory copy for CPU-side shader
+    /// descriptor discovery. Backends still consume the event for ordering and resource-cache
+    /// invalidation, and must redo it if an earlier GPU write supplies the source.
+    pub cpu_applied: bool,
+}
+
+/// An ordered CPU-visible label write produced by a Gen5 end-of-pipe packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMemoryRelease {
+    pub address: u64,
+    pub value: GpuMemoryReleaseValue,
+}
+
+/// An ordered command-processor write of one or more dwords to guest memory.
+///
+/// `WRITE_DATA` can either advance the destination for every dword or repeatedly update one
+/// address. The latter is used for register-like labels, while Unity's submit-done fence uses an
+/// incrementing memory destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuMemoryWrite {
+    pub address: u64,
+    pub values: Vec<u32>,
+    pub increment_address: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuMemoryReleaseValue {
+    Immediate32(u32),
+    Immediate64(u64),
+    Timestamp,
+}
+
+/// An ordered Gen5 command-processor wait on a guest-memory label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMemoryWait {
+    pub address: u64,
+    pub reference: u64,
+    pub mask: u64,
+    pub compare_function: u32,
+    pub is_64_bit: bool,
+}
+
+impl GpuMemoryWait {
+    #[must_use]
+    pub const fn is_satisfied_by(self, value: u64) -> bool {
+        let value = value & self.mask;
+        match self.compare_function {
+            0 => true,
+            1 => value < self.reference,
+            2 => value <= self.reference,
+            3 => value == self.reference,
+            4 => value != self.reference,
+            5 => value >= self.reference,
+            6 => value > self.reference,
+            _ => true,
+        }
+    }
 }
 
 impl GpuMemoryAcquire {
@@ -655,6 +740,7 @@ pub fn gpu_event_channel() -> (SyncSender<GpuEvent>, Receiver<GpuEvent>) {
 
 pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
     GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
+    GPU_COMPLETED_SUBMISSION_SEQUENCE.store(0, Ordering::Release);
     AUDIO_OUTPUT_FRAMES.store(0, Ordering::Relaxed);
     AUDIO_UNDERRUN_FRAMES.store(0, Ordering::Relaxed);
     let sink = GPU_EVENT_SINK.get_or_init(|| Mutex::new(None));
@@ -665,12 +751,27 @@ pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
 
 pub fn clear_event_sink() {
     GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
+    GPU_COMPLETED_SUBMISSION_SEQUENCE.store(0, Ordering::Release);
     let Some(sink) = GPU_EVENT_SINK.get() else {
         return;
     };
     *sink
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// Returns the newest guest submission whose ordered backend work is fully complete.
+#[must_use]
+pub fn gpu_completed_submission_sequence() -> u64 {
+    GPU_COMPLETED_SUBMISSION_SEQUENCE.load(Ordering::Acquire)
+}
+
+/// Publishes completion of an ordered guest submission.
+///
+/// Backends may retire more than one boundary between guest polls, so completion is monotonic
+/// even if callbacks are observed out of order on a future multi-queue implementation.
+pub fn record_gpu_submission_completed(sequence: u64) {
+    let _ = GPU_COMPLETED_SUBMISSION_SEQUENCE.fetch_max(sequence, Ordering::AcqRel);
 }
 
 pub fn emit_event(event: GpuEvent) {
@@ -707,12 +808,13 @@ mod tests {
         COMPUTE_NUM_THREAD_Z_REGISTER, COMPUTE_PGM_HI_REGISTER, COMPUTE_PGM_LO_REGISTER,
         COMPUTE_PGM_RSRC2_REGISTER, COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER,
         COMPUTE_START_Z_REGISTER, ComputeDispatchDecodeError, ComputeGrid,
-        GPU_EVENT_QUEUE_CAPACITY, GpuEvent, GpuMemoryAcquire, GpuRegister, HostPadState,
-        audio_output_frames, audio_underrun_frames, clear_event_sink, compute_program_address,
-        decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
-        decode_compute_system_registers, emit_event, gpu_event_channel, gpu_events_in_flight,
-        host_pad_state, install_event_sink, record_gpu_event_consumed, report_audio_frames,
-        set_host_pad_state,
+        GPU_EVENT_QUEUE_CAPACITY, GpuEvent, GpuMemoryAcquire, GpuMemoryWait, GpuRegister,
+        HostPadState, audio_output_frames, audio_underrun_frames, clear_event_sink,
+        compute_program_address, decode_compute_dispatch_direct, decode_compute_dispatch_indirect,
+        decode_compute_launch, decode_compute_system_registers, emit_event,
+        gpu_completed_submission_sequence, gpu_event_channel, gpu_events_in_flight, host_pad_state,
+        install_event_sink, record_gpu_event_consumed, record_gpu_submission_completed,
+        report_audio_frames, set_host_pad_state,
     };
 
     #[test]
@@ -742,6 +844,10 @@ mod tests {
         assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
         record_gpu_event_consumed();
         assert_eq!(gpu_events_in_flight(), 0);
+
+        record_gpu_submission_completed(7);
+        record_gpu_submission_completed(3);
+        assert_eq!(gpu_completed_submission_sequence(), 7);
 
         report_audio_frames(480, 12);
         assert_eq!(audio_output_frames(), 480);
@@ -788,6 +894,26 @@ mod tests {
         assert!(all.invalidates_guest_resources());
         assert!(all.covers_all_guest_memory());
         assert!(all.overlaps(0x7000_0000_0000, 0x1000));
+    }
+
+    #[test]
+    fn memory_wait_comparisons_apply_the_packet_mask() {
+        let wait = GpuMemoryWait {
+            address: 0x1000,
+            reference: 0x34,
+            mask: 0xff,
+            compare_function: 3,
+            is_64_bit: false,
+        };
+        assert!(wait.is_satisfied_by(0xabcd_1234));
+        assert!(!wait.is_satisfied_by(0xabcd_1235));
+        assert!(
+            GpuMemoryWait {
+                compare_function: 4,
+                ..wait
+            }
+            .is_satisfied_by(0xabcd_1235)
+        );
     }
 
     fn compute_registers(thread_words: [u32; 3], starts: [u32; 3]) -> Vec<GpuRegister> {
