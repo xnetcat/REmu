@@ -38,6 +38,14 @@ pub struct MetalCompileOptions {
     pub pixel_outputs: Vec<PixelOutputBinding>,
     pub pixel_input_enable: u32,
     pub pixel_input_address: u32,
+    /// Diagnostic-only overrides used to isolate translated geometry from fixed-function state.
+    /// Production callers leave all overrides disabled.
+    pub diagnostic_force_visible_clip_depth: bool,
+    pub diagnostic_force_vertex_pattern: bool,
+    pub diagnostic_force_vertex_fetch_id: bool,
+    pub diagnostic_capture_vertex_position: bool,
+    pub diagnostic_capture_pixel_output: bool,
+    pub diagnostic_force_pixel_color: bool,
     /// Bytes of guest LDS allocated to each compute workgroup.
     ///
     /// A non-zero, dword-aligned value is required only when the program contains an LDS memory
@@ -46,6 +54,9 @@ pub struct MetalCompileOptions {
     /// guest allocations are rejected instead of being silently wrapped or spilled with different
     /// synchronization semantics.
     pub lds_size_bytes: u32,
+    /// Architectural lanes per guest compute wave. Apple executes SIMD32; wave64 shaders whose
+    /// cross-lane operations are split-safe use this to place ballot masks in the correct half.
+    pub wave_lane_count: u32,
 }
 
 impl MetalCompileOptions {
@@ -57,7 +68,14 @@ impl MetalCompileOptions {
             pixel_outputs: Vec::new(),
             pixel_input_enable: 0,
             pixel_input_address: 0,
+            diagnostic_force_visible_clip_depth: false,
+            diagnostic_force_vertex_pattern: false,
+            diagnostic_force_vertex_fetch_id: false,
+            diagnostic_capture_vertex_position: false,
+            diagnostic_capture_pixel_output: false,
+            diagnostic_force_pixel_color: false,
             lds_size_bytes: 0,
+            wave_lane_count: 32,
         }
     }
 
@@ -73,7 +91,14 @@ impl MetalCompileOptions {
             pixel_outputs,
             pixel_input_enable,
             pixel_input_address,
+            diagnostic_force_visible_clip_depth: false,
+            diagnostic_force_vertex_pattern: false,
+            diagnostic_force_vertex_fetch_id: false,
+            diagnostic_capture_vertex_position: false,
+            diagnostic_capture_pixel_output: false,
+            diagnostic_force_pixel_color: false,
             lds_size_bytes: 0,
+            wave_lane_count: 32,
         }
     }
 
@@ -85,7 +110,33 @@ impl MetalCompileOptions {
             pixel_outputs: Vec::new(),
             pixel_input_enable: 0,
             pixel_input_address: 0,
+            diagnostic_force_visible_clip_depth: false,
+            diagnostic_force_vertex_pattern: false,
+            diagnostic_force_vertex_fetch_id: false,
+            diagnostic_capture_vertex_position: false,
+            diagnostic_capture_pixel_output: false,
+            diagnostic_force_pixel_color: false,
             lds_size_bytes,
+            wave_lane_count: 32,
+        }
+    }
+
+    #[must_use]
+    pub const fn compute_wave(lds_size_bytes: u32, wave_lane_count: u32) -> Self {
+        Self {
+            stage: MetalShaderStage::Compute,
+            required_vertex_output_count: 0,
+            pixel_outputs: Vec::new(),
+            pixel_input_enable: 0,
+            pixel_input_address: 0,
+            diagnostic_force_visible_clip_depth: false,
+            diagnostic_force_vertex_pattern: false,
+            diagnostic_force_vertex_fetch_id: false,
+            diagnostic_capture_vertex_position: false,
+            diagnostic_capture_pixel_output: false,
+            diagnostic_force_pixel_color: false,
+            lds_size_bytes,
+            wave_lane_count,
         }
     }
 }
@@ -185,10 +236,63 @@ struct RegisterReferences {
 struct ImageKind {
     component: &'static str,
     storage: bool,
+    comparison: bool,
     sampler_slot: Option<u32>,
+    dimension: u32,
+    texture_type: u32,
 }
 
 impl<'a> Compiler<'a> {
+    fn split_wave64(&self) -> bool {
+        self.options.stage == MetalShaderStage::Compute && self.options.wave_lane_count == 64
+    }
+
+    fn architectural_lane(&self) -> &'static str {
+        if self.split_wave64() {
+            "remu_wave_lane"
+        } else {
+            "remu_lane"
+        }
+    }
+
+    fn lane_mask_predicate(&self, low: &str, high: &str) -> String {
+        if self.split_wave64() {
+            format!(
+                "(remu_wave_half == 0u ? ((({low}) >> remu_lane) & 1u) : ((({high}) >> remu_lane) & 1u)) != 0u"
+            )
+        } else {
+            format!("((({low}) >> remu_lane) & 1u) != 0u")
+        }
+    }
+
+    fn ballot_words(&self, condition: &str) -> (String, String) {
+        let ballot = Self::ballot(condition);
+        if self.split_wave64() {
+            (
+                format!("remu_wave_half == 0u ? {ballot} : 0u"),
+                format!("remu_wave_half == 0u ? 0u : {ballot}"),
+            )
+        } else {
+            (ballot, "0u".to_owned())
+        }
+    }
+
+    fn global_metadata_word(&self, binding_index: usize, word: usize) -> String {
+        let scalar_words = self.evaluation.initial_scalar_registers.len();
+        let index = scalar_words + binding_index * 4 + word;
+        format!("remu_initial_s[{index}]")
+    }
+
+    fn global_binding_base(&self, binding_index: usize) -> String {
+        let low = self.global_metadata_word(binding_index, 0);
+        let high = self.global_metadata_word(binding_index, 1);
+        format!("((ulong){low} | ((ulong){high} << 32))")
+    }
+
+    fn global_binding_length(&self, binding_index: usize) -> String {
+        self.global_metadata_word(binding_index, 2)
+    }
+
     fn new(
         program: &'a Program,
         evaluation: &'a ShaderEvaluation,
@@ -249,6 +353,7 @@ impl<'a> Compiler<'a> {
             .iter()
             .map(|binding| {
                 let storage = is_storage_image(binding.opcode);
+                let comparison = binding.opcode.contains("SampleC");
                 let sampler_slot = (!storage).then(|| {
                     let slot = sampler_count;
                     sampler_count += 1;
@@ -257,7 +362,13 @@ impl<'a> Compiler<'a> {
                 ImageKind {
                     component: image_component_type(binding),
                     storage,
+                    comparison,
                     sampler_slot,
+                    dimension: binding.control.dimension,
+                    texture_type: binding
+                        .resource_descriptor
+                        .get(3)
+                        .map_or(0, |word| (word >> 28) & 0xf),
                 }
             })
             .collect();
@@ -290,14 +401,27 @@ impl<'a> Compiler<'a> {
                 }
             }
             ControlFlowLowering::Dispatcher => {
-                for (index, instruction) in self.program.instructions.iter().enumerate() {
-                    self.line(2, &format!("case {}u: {{", instruction.pc));
-                    self.emit_instruction(instruction, index, true)
-                        .map_err(|message| MetalCompileError::Instruction {
-                            pc: instruction.pc,
-                            opcode: instruction.opcode,
-                            message,
-                        })?;
+                // Dispatch whole basic blocks instead of one instruction per switch iteration.
+                // The architectural PC only has to be materialized at control-flow boundaries;
+                // straight-line instructions inside a block execute in their original order.
+                // Large Unity pixel shaders contain hundreds of instructions but only a handful
+                // of branches, so this avoids hundreds of divergent switch operations per pixel
+                // without changing branch, loop, or EXEC/VCC semantics.
+                for block in dispatcher_basic_blocks(self.program) {
+                    let first = &self.program.instructions[block.start];
+                    let block_instruction_count = block.len();
+                    self.line(2, &format!("case {}u: {{", first.pc));
+                    let last = block.end - 1;
+                    for index in block {
+                        let instruction = &self.program.instructions[index];
+                        self.emit_instruction(instruction, index, index == last)
+                            .map_err(|message| MetalCompileError::Instruction {
+                                pc: instruction.pc,
+                                opcode: instruction.opcode,
+                                message,
+                            })?;
+                    }
+                    self.line(3, &format!("steps += {block_instruction_count}u;"));
                     self.line(3, "break;");
                     self.line(2, "}");
                 }
@@ -566,9 +690,31 @@ impl<'a> Compiler<'a> {
             } else {
                 ""
             };
-            parameters.push(format!(
-                "texture2d<{}{access}> tex{index} [[texture({index})]]",
+            let texture_kind = if kind.comparison {
+                match kind.dimension {
+                    3 => "depthcube",
+                    _ => "depth2d",
+                }
+            } else if kind.storage {
+                if kind.texture_type == 10 {
+                    "texture3d"
+                } else {
+                    "texture2d"
+                }
+            } else {
+                match kind.dimension {
+                    2 => "texture3d",
+                    3 => "texturecube",
+                    _ => "texture2d",
+                }
+            };
+            let component = if kind.comparison {
+                "float"
+            } else {
                 kind.component
+            };
+            parameters.push(format!(
+                "{texture_kind}<{component}{access}> tex{index} [[texture({index})]]"
             ));
         }
         if sampler_count != 0 {
@@ -576,6 +722,16 @@ impl<'a> Compiler<'a> {
                 "constant RemuSamplers& remu_samplers [[buffer({})]]",
                 initial_index + 1
             ));
+        }
+        if self.options.stage == MetalShaderStage::Vertex
+            && self.options.diagnostic_capture_vertex_position
+        {
+            parameters.push("device uint* remu_debug_position [[buffer(30)]]".to_owned());
+        }
+        if self.options.stage == MetalShaderStage::Pixel
+            && self.options.diagnostic_capture_pixel_output
+        {
+            parameters.push("device atomic_uint* remu_debug_pixel [[buffer(30)]]".to_owned());
         }
         match self.options.stage {
             MetalShaderStage::Vertex => {
@@ -592,11 +748,14 @@ impl<'a> Compiler<'a> {
                     .push("uint3 remu_local_id [[thread_position_in_threadgroup]]".to_owned());
                 parameters.push("uint3 remu_group_id [[threadgroup_position_in_grid]]".to_owned());
                 parameters.push("uint remu_lane [[thread_index_in_simdgroup]]".to_owned());
-                if self
-                    .evaluation
-                    .compute_system_registers
-                    .and_then(|registers| registers.thread_group_size)
-                    .is_some_and(|register| contains_register_reference(&self.body, 's', register))
+                if self.split_wave64()
+                    || self
+                        .evaluation
+                        .compute_system_registers
+                        .and_then(|registers| registers.thread_group_size)
+                        .is_some_and(|register| {
+                            contains_register_reference(&self.body, 's', register)
+                        })
                 {
                     parameters
                         .push("uint remu_thread_index [[thread_index_in_threadgroup]]".to_owned());
@@ -616,6 +775,12 @@ impl<'a> Compiler<'a> {
         );
         source.push_str("    /* REMU_REGISTER_STATE */\n");
         source.push_str("    bool exec = true;\n    bool vcc = false;\n    bool scc = false;\n");
+        if self.split_wave64() {
+            source.push_str(
+                "    uint remu_wave_half = (remu_thread_index >> 5u) & 1u;\n\
+                 \x20   uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);\n",
+            );
+        }
         if matches!(self.control_flow, ControlFlowLowering::Dispatcher) {
             source.push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
         }
@@ -653,14 +818,16 @@ impl<'a> Compiler<'a> {
                 let _ = writeln!(source, "    s[{register}] = 0u;");
             }
         }
-        if contains_register_reference(&self.body, 's', EXEC_LO) {
-            let _ = writeln!(
-                source,
-                "    s[{EXEC_LO}] = (uint)(uint64_t)simd_ballot(true);"
-            );
-        }
-        if contains_register_reference(&self.body, 's', EXEC_HI) {
-            let _ = writeln!(source, "    s[{EXEC_HI}] = 0u;");
+        if contains_register_reference(&self.body, 's', EXEC_LO)
+            || contains_register_reference(&self.body, 's', EXEC_HI)
+        {
+            let (low, high) = self.ballot_words("true");
+            if contains_register_reference(&self.body, 's', EXEC_LO) {
+                let _ = writeln!(source, "    s[{EXEC_LO}] = {low};");
+            }
+            if contains_register_reference(&self.body, 's', EXEC_HI) {
+                let _ = writeln!(source, "    s[{EXEC_HI}] = {high};");
+            }
         }
         match self.control_flow {
             ControlFlowLowering::Direct(_) => source.push_str(&self.body),
@@ -669,14 +836,90 @@ impl<'a> Compiler<'a> {
                 source.push_str(&self.body);
                 source.push_str(
                     "        default: active = false; break;\n        }\n\
-                     \x20       if (++steps >= 16384u) active = false;\n    }\n",
+                     \x20       if (steps >= 16384u) active = false;\n    }\n",
                 );
             }
         }
         match self.options.stage {
             MetalShaderStage::Vertex | MetalShaderStage::Pixel => {
                 if self.options.stage == MetalShaderStage::Pixel {
-                    source.push_str("    if (!exec) discard_fragment();\n");
+                    if self.options.diagnostic_capture_pixel_output
+                        && let Some(output) = self.options.pixel_outputs.first()
+                    {
+                        let field = format!("remu_out.mrt{}", output.guest_slot);
+                        source.push_str(
+                            "    uint2 remu_debug_pixel_xy = uint2(remu_in.frag_coord.xy);\n\
+                             \x20   if (remu_debug_pixel_xy.x < 1920u && remu_debug_pixel_xy.y < 1080u) {\n\
+                             \x20       uint remu_debug_pixel_base = (remu_debug_pixel_xy.y * 1920u + remu_debug_pixel_xy.x) * 5u;\n",
+                        );
+                        for component in 0..4 {
+                            let value = match output.kind {
+                                PixelOutputKind::Float => {
+                                    format!("as_type<uint>({field}[{component}])")
+                                }
+                                PixelOutputKind::Uint => format!("{field}[{component}]"),
+                                PixelOutputKind::Sint => {
+                                    format!("as_type<uint>({field}[{component}])")
+                                }
+                            };
+                            let _ = writeln!(
+                                source,
+                                "        atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base + {}u], {value}, memory_order_relaxed);",
+                                component + 1
+                            );
+                        }
+                        source.push_str(
+                            "        atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base], 1u, memory_order_relaxed);\n\
+                             \x20   }\n",
+                        );
+                    }
+                    if self.options.diagnostic_force_pixel_color {
+                        for output in &self.options.pixel_outputs {
+                            let value = match output.kind {
+                                PixelOutputKind::Float => "float4(1.0f, 0.0f, 1.0f, 1.0f)",
+                                PixelOutputKind::Uint => {
+                                    "uint4(0xffffffffu, 0u, 0xffffffffu, 0xffffffffu)"
+                                }
+                                PixelOutputKind::Sint => {
+                                    "int4(0x7fffffff, 0, 0x7fffffff, 0x7fffffff)"
+                                }
+                            };
+                            let _ = writeln!(
+                                source,
+                                "    remu_out.mrt{} = {value};",
+                                output.guest_slot
+                            );
+                        }
+                    } else {
+                        source.push_str("    if (!exec) discard_fragment();\n");
+                    }
+                } else if self.options.diagnostic_force_vertex_pattern {
+                    source.push_str(
+                        "    uint remu_diagnostic_vertex = remu_vertex_id % 3u;\n\
+                         \x20   float2 remu_diagnostic_xy = remu_diagnostic_vertex == 0u ? float2(-1.0f, -1.0f) : (remu_diagnostic_vertex == 1u ? float2(3.0f, -1.0f) : float2(-1.0f, 3.0f));\n\
+                         \x20   remu_out.position = float4(remu_diagnostic_xy, 0.5f, 1.0f);\n",
+                    );
+                } else if self.options.diagnostic_force_visible_clip_depth {
+                    // Keep the guest X/Y projection intact while forcing a finite positive W and
+                    // an in-range Metal clip-space Z. This is a diagnostic for separating broken
+                    // vertex/resource evaluation from Z/W clipping; it is never enabled by
+                    // default and deliberately does not alter ordinary translated shaders.
+                    source.push_str(
+                        "    float remu_diagnostic_w = max(fabs(remu_out.position.w), 1.0e-6f);\n\
+                         \x20   remu_out.position.w = remu_diagnostic_w;\n\
+                         \x20   remu_out.position.z = 0.5f * remu_diagnostic_w;\n",
+                    );
+                }
+                if self.options.diagnostic_capture_vertex_position {
+                    source.push_str(
+                        "    if (remu_vertex_id < 262144u) {\n\
+                         \x20       uint remu_debug_base = remu_vertex_id * 4u;\n\
+                         \x20       remu_debug_position[remu_debug_base + 0u] = as_type<uint>(remu_out.position.x);\n\
+                         \x20       remu_debug_position[remu_debug_base + 1u] = as_type<uint>(remu_out.position.y);\n\
+                         \x20       remu_debug_position[remu_debug_base + 2u] = as_type<uint>(remu_out.position.z);\n\
+                         \x20       remu_debug_position[remu_debug_base + 3u] = as_type<uint>(remu_out.position.w);\n\
+                         \x20   }\n",
+                    );
                 }
                 source.push_str("    return remu_out;\n");
             }
@@ -1407,6 +1650,42 @@ impl<'a> Compiler<'a> {
         if name.starts_with("VCmp") {
             return self.emit_vector_compare(instruction, name);
         }
+        if matches!(
+            name,
+            "VAddcU32"
+                | "VSubbU32"
+                | "VSubbrevU32"
+                | "VAddCoU32"
+                | "VSubCoU32"
+                | "VSubrevCoU32"
+                | "VAddCoCiU32"
+        ) {
+            return self.emit_vector_carry(instruction, name);
+        }
+        if name == "VReadlaneB32" {
+            let destination = destination_scalar(instruction)?;
+            let value = self.raw_source(instruction, 0)?;
+            let lane = self.raw_source(instruction, 1)?;
+            let selected = self.temp(
+                "uint",
+                &format!("simd_shuffle({value}, (ushort)({lane} & 31u))"),
+            );
+            // V_READLANE is a wave operation and is architecturally independent of EXEC.
+            self.store_scalar(destination, &selected);
+            return Ok(());
+        }
+        if name == "VWritelaneB32" {
+            let destination = destination_vector(instruction)?;
+            let value = self.raw_source(instruction, 0)?;
+            let lane = self.raw_source(instruction, 1)?;
+            // V_WRITELANE also ignores EXEC: exactly the selected physical lane is replaced and
+            // all other lanes retain the old VGPR value.
+            self.line(
+                3,
+                &format!("if (remu_lane == (({lane}) & 31u)) v[{destination}] = {value};"),
+            );
+            return Ok(());
+        }
         let destination = destination_vector(instruction)?;
         let expression = match name {
             "VCndmaskB32" => {
@@ -1420,6 +1699,7 @@ impl<'a> Compiler<'a> {
                 format!("({mask}) ? ({true_value}) : ({false_value})")
             }
             "VMovB32" => self.raw_source(instruction, 0)?,
+            "VBfrevB32" => format!("reverse_bits({})", self.raw_source(instruction, 0)?),
             "VAddF32" => self.float_result(
                 instruction,
                 &format!(
@@ -1468,6 +1748,73 @@ impl<'a> Compiler<'a> {
                     self.float_source(instruction, 1)?
                 ),
             ),
+            "VMin3F32" => self.float_result(
+                instruction,
+                &format!(
+                    "fmin(fmin({}, {}), {})",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?,
+                    self.float_source(instruction, 2)?
+                ),
+            ),
+            "VMax3F32" => self.float_result(
+                instruction,
+                &format!(
+                    "fmax(fmax({}, {}), {})",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?,
+                    self.float_source(instruction, 2)?
+                ),
+            ),
+            "VMed3F32" => {
+                let first = self.float_source(instruction, 0)?;
+                let second = self.float_source(instruction, 1)?;
+                let third = self.float_source(instruction, 2)?;
+                self.float_result(
+                    instruction,
+                    &format!(
+                        "fmax(fmin({first}, {second}), fmin(fmax({first}, {second}), {third}))"
+                    ),
+                )
+            }
+            "VMin3I32" => format!(
+                "as_type<uint>(min(min(as_type<int>({}), as_type<int>({})), as_type<int>({})))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
+            ),
+            "VMax3I32" => format!(
+                "as_type<uint>(max(max(as_type<int>({}), as_type<int>({})), as_type<int>({})))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
+            ),
+            "VMed3I32" => {
+                let first = format!("as_type<int>({})", self.raw_source(instruction, 0)?);
+                let second = format!("as_type<int>({})", self.raw_source(instruction, 1)?);
+                let third = format!("as_type<int>({})", self.raw_source(instruction, 2)?);
+                format!(
+                    "as_type<uint>(max(min({first}, {second}), min(max({first}, {second}), {third})))"
+                )
+            }
+            "VMin3U32" => format!(
+                "min(min({}, {}), {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
+            ),
+            "VMax3U32" => format!(
+                "max(max({}, {}), {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
+            ),
+            "VMed3U32" => {
+                let first = self.raw_source(instruction, 0)?;
+                let second = self.raw_source(instruction, 1)?;
+                let third = self.raw_source(instruction, 2)?;
+                format!("max(min({first}, {second}), min(max({first}, {second}), {third}))")
+            }
             "VFmacF32" | "VMacF32" => self.float_result(
                 instruction,
                 &format!(
@@ -1535,8 +1882,74 @@ impl<'a> Compiler<'a> {
                 self.raw_source(instruction, 0)?,
                 self.raw_source(instruction, 1)?
             ),
+            "VOrB32" => format!(
+                "({} | {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VXorB32" => format!(
+                "({} ^ {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VXnorB32" => format!(
+                "~({} ^ {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VNotB32" => format!("~{}", self.raw_source(instruction, 0)?),
+            "VAddI32" => format!(
+                "({} + {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VSubI32" => format!(
+                "({} - {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VSubrevI32" => format!(
+                "({} - {})",
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 0)?
+            ),
+            "VMinI32" => format!(
+                "as_type<uint>(min(as_type<int>({}), as_type<int>({})))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VMaxI32" => format!(
+                "as_type<uint>(max(as_type<int>({}), as_type<int>({})))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VLshrB32" => format!(
+                "({} >> ({} & 31u))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
             "VLshrrevB32" => format!(
                 "({} >> ({} & 31u))",
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 0)?
+            ),
+            "VAshrI32" => format!(
+                "as_type<uint>(as_type<int>({}) >> ({} & 31u))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VAshrrevI32" => format!(
+                "as_type<uint>(as_type<int>({}) >> ({} & 31u))",
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 0)?
+            ),
+            "VLshlB32" => format!(
+                "({} << ({} & 31u))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VLshlrevB32" => format!(
+                "({} << ({} & 31u))",
                 self.raw_source(instruction, 1)?,
                 self.raw_source(instruction, 0)?
             ),
@@ -1550,6 +1963,57 @@ impl<'a> Compiler<'a> {
                 instruction,
                 &format!("(float)as_type<int>({})", self.raw_source(instruction, 0)?),
             ),
+            "VCvtF32U32" => self.float_result(
+                instruction,
+                &format!("(float){}", self.raw_source(instruction, 0)?),
+            ),
+            "VMinU32" => format!(
+                "min({}, {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VMaxU32" => format!(
+                "max({}, {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VMulLoU32" => format!(
+                "({} * {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VMulU32U24" => format!(
+                "(({} & 0xFFFFFFu) * ({} & 0xFFFFFFu))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VMulHiU32U24" => format!(
+                "(uint)(((ulong)({} & 0xFFFFFFu) * (ulong)({} & 0xFFFFFFu)) >> 32)",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VCvtU32F32" => {
+                let source = self.temp("float", &self.float_source(instruction, 0)?);
+                format!(
+                    "(isnan({source}) || {source} <= 0.0f) ? 0u : ({source} >= 4294967296.0f ? 0xFFFFFFFFu : (uint)trunc({source}))"
+                )
+            }
+            "VCvtI32F32" => {
+                let source = self.temp("float", &self.float_source(instruction, 0)?);
+                format!(
+                    "isnan({source}) ? 0u : ({source} <= -2147483648.0f ? 0x80000000u : ({source} >= 2147483648.0f ? 0x7FFFFFFFu : as_type<uint>((int)trunc({source}))))"
+                )
+            }
+            "VCvtOffF32I4" => {
+                let source = self.temp("uint", &self.raw_source(instruction, 0)?);
+                self.float_result(
+                    instruction,
+                    &format!("(float)((int)({source} << 28) >> 28) * 0.0625f"),
+                )
+            }
+            "VCubeidF32" | "VCubescF32" | "VCubetcF32" | "VCubemaF32" => {
+                self.cube_result(instruction, name)?
+            }
             "VCvtPkrtzF16F32" => {
                 let first = self.temp(
                     "float",
@@ -1600,6 +2064,119 @@ impl<'a> Compiler<'a> {
             };
         self.store_vector(destination, &expression);
         Ok(())
+    }
+
+    fn emit_vector_carry(&mut self, instruction: &Instruction, name: &str) -> Result<(), String> {
+        let destination = destination_vector(instruction)?;
+        let first = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let second = self.temp("uint", &self.raw_source(instruction, 1)?);
+        let carry_in = match name {
+            "VAddcU32" | "VSubbU32" | "VSubbrevU32" => self.temp("bool", "vcc"),
+            "VAddCoCiU32" => {
+                let operand = instruction
+                    .sources
+                    .get(2)
+                    .copied()
+                    .ok_or_else(|| "missing VOP3 carry-in lane mask".to_owned())?;
+                self.temp("bool", &self.mask_source(operand)?)
+            }
+            _ => self.temp("bool", "false"),
+        };
+        let (expression, carry) = match name {
+            "VAddcU32" | "VAddCoCiU32" => {
+                let wide = self.temp(
+                    "ulong",
+                    &format!("(ulong){first} + (ulong){second} + (ulong){carry_in}"),
+                );
+                (format!("(uint){wide}"), format!("({wide} >> 32) != 0ul"))
+            }
+            "VAddCoU32" => {
+                let wide = self.temp("ulong", &format!("(ulong){first} + (ulong){second}"));
+                (format!("(uint){wide}"), format!("({wide} >> 32) != 0ul"))
+            }
+            "VSubbU32" | "VSubCoU32" => {
+                let subtrahend = self.temp(
+                    "ulong",
+                    &format!(
+                        "(ulong){second} + (ulong){}",
+                        if name == "VSubbU32" {
+                            carry_in.as_str()
+                        } else {
+                            "false"
+                        }
+                    ),
+                );
+                (
+                    format!("{first} - (uint){subtrahend}"),
+                    format!("(ulong){first} < {subtrahend}"),
+                )
+            }
+            "VSubbrevU32" | "VSubrevCoU32" => {
+                let subtrahend = self.temp(
+                    "ulong",
+                    &format!(
+                        "(ulong){first} + (ulong){}",
+                        if name == "VSubbrevU32" {
+                            carry_in.as_str()
+                        } else {
+                            "false"
+                        }
+                    ),
+                );
+                (
+                    format!("{second} - (uint){subtrahend}"),
+                    format!("(ulong){second} < {subtrahend}"),
+                )
+            }
+            _ => unreachable!("carry opcode was selected from a closed set"),
+        };
+        let result = self.temp("uint", &expression);
+        let mut carry = self.temp("bool", &format!("exec && ({carry})"));
+        let expression =
+            if let Some(InstructionControl::Dpp(control)) = instruction.control.as_ref() {
+                let write_enabled = self.emit_dpp_write_enabled(*control)?;
+                carry = self.temp("bool", &format!("({write_enabled}) ? {carry} : vcc"));
+                format!("({write_enabled}) ? {result} : v[{destination}]")
+            } else if matches!(instruction.control, Some(InstructionControl::Dpp8(_))) {
+                result
+            } else if let Some(InstructionControl::Sdwa(control)) = instruction.control.as_ref()
+                && control.scalar_destination.is_none()
+            {
+                self.apply_sdwa_destination(control, &result, &format!("v[{destination}]"))?
+            } else {
+                result
+            };
+        let scalar_destination = match instruction.control.as_ref() {
+            Some(InstructionControl::Vop3(control)) => control.scalar_destination.unwrap_or(VCC_LO),
+            _ => VCC_LO,
+        };
+        self.store_lane_mask(scalar_destination, &carry);
+        self.store_vector(destination, &expression);
+        Ok(())
+    }
+
+    fn cube_result(&mut self, instruction: &Instruction, name: &str) -> Result<String, String> {
+        let x = self.temp("float", &self.float_source(instruction, 0)?);
+        let y = self.temp("float", &self.float_source(instruction, 1)?);
+        let z = self.temp("float", &self.float_source(instruction, 2)?);
+        let z_major = format!("(fabs({z}) >= fabs({x}) && fabs({z}) >= fabs({y}))");
+        let y_major = format!("(fabs({y}) >= fabs({x}))");
+        let value = match name {
+            "VCubeidF32" => format!(
+                "{z_major} ? ({z} < 0.0f ? 5.0f : 4.0f) : ({y_major} ? ({y} < 0.0f ? 3.0f : 2.0f) : ({x} < 0.0f ? 1.0f : 0.0f))"
+            ),
+            "VCubescF32" => format!(
+                "{z_major} ? ({z} < 0.0f ? -{x} : {x}) : ({y_major} ? {x} : ({x} < 0.0f ? {z} : -{z}))"
+            ),
+            "VCubetcF32" => {
+                format!("{z_major} ? -{y} : ({y_major} ? ({y} < 0.0f ? -{z} : {z}) : -{y})")
+            }
+            "VCubemaF32" => {
+                format!("2.0f * ({z_major} ? {z} : ({y_major} ? {y} : {x}))")
+            }
+            _ => unreachable!("cube result is selected from a closed opcode set"),
+        };
+        Ok(self.float_result(instruction, &value))
     }
 
     fn emit_vector_compare(&mut self, instruction: &Instruction, name: &str) -> Result<(), String> {
@@ -1687,18 +2264,18 @@ impl<'a> Compiler<'a> {
     }
 
     fn store_lane_mask(&mut self, register: u32, condition: &str) {
-        let ballot = Self::ballot(condition);
+        let (low, high) = self.ballot_words(condition);
         match register {
             VCC_LO => {
                 self.line(3, &format!("vcc = {condition};"));
-                self.line(3, &format!("s[{VCC_LO}] = {ballot};"));
-                self.line(3, &format!("s[{VCC_HI}] = 0u;"));
+                self.line(3, &format!("s[{VCC_LO}] = {low};"));
+                self.line(3, &format!("s[{VCC_HI}] = {high};"));
             }
             EXEC_LO => self.store_exec_mask(condition),
             register if register < SCALAR_REGISTER_COUNT => {
-                self.line(3, &format!("s[{register}] = {ballot};"));
+                self.line(3, &format!("s[{register}] = {low};"));
                 if register + 1 < SCALAR_REGISTER_COUNT {
-                    self.line(3, &format!("s[{}] = 0u;", register + 1));
+                    self.line(3, &format!("s[{}] = {high};", register + 1));
                 }
             }
             _ => {}
@@ -1706,10 +2283,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn store_exec_mask(&mut self, condition: &str) {
-        let ballot = Self::ballot(condition);
+        let (low, high) = self.ballot_words(condition);
         self.line(3, &format!("exec = {condition};"));
-        self.line(3, &format!("s[{EXEC_LO}] = {ballot};"));
-        self.line(3, &format!("s[{EXEC_HI}] = 0u;"));
+        self.line(3, &format!("s[{EXEC_LO}] = {low};"));
+        self.line(3, &format!("s[{EXEC_HI}] = {high};"));
     }
 
     fn ballot(condition: &str) -> String {
@@ -1817,6 +2394,9 @@ impl<'a> Compiler<'a> {
             self.store_scalar(destination + 1, &format_u32(high));
             return Ok(());
         }
+        if name.ends_with("SaveexecB64") {
+            return self.emit_saveexec64(instruction, name, destination);
+        }
         if name.ends_with("B64") || matches!(name, "SBfeU64" | "SBfeI64") {
             return self.emit_scalar64(instruction, name, destination);
         }
@@ -1848,6 +2428,22 @@ impl<'a> Compiler<'a> {
             _ => {}
         }
         let right = self.raw_source(instruction, 1)?;
+        if matches!(name, "SAddcU32" | "SSubbU32") {
+            let carry = self.temp("ulong", "scc ? 1ul : 0ul");
+            if name == "SAddcU32" {
+                let wide = self.temp(
+                    "ulong",
+                    &format!("(ulong){left} + (ulong){right} + {carry}"),
+                );
+                self.store_scalar(destination, &format!("(uint){wide}"));
+                self.line(3, &format!("scc = ({wide} >> 32) != 0ul;"));
+            } else {
+                let subtrahend = self.temp("ulong", &format!("(ulong){right} + {carry}"));
+                self.store_scalar(destination, &format!("{left} - (uint){subtrahend}"));
+                self.line(3, &format!("scc = (ulong){left} < {subtrahend};"));
+            }
+            return Ok(());
+        }
         let (expression, scc) = match name {
             "SAddU32" => (
                 format!("({left} + {right})"),
@@ -1887,6 +2483,10 @@ impl<'a> Compiler<'a> {
             "SAshrI32" => (
                 format!("as_type<uint>(as_type<int>({left}) >> ({right} & 31u))"),
                 Some("RESULT != 0u".into()),
+            ),
+            "SBfmB32" => (
+                format!("(((1u << ({left} & 31u)) - 1u) << ({right} & 31u))"),
+                None,
             ),
             "SBfeU32" | "SBfeI32" => {
                 let offset = self.temp("uint", &format!("{right} & 31u"));
@@ -1931,6 +2531,52 @@ impl<'a> Compiler<'a> {
         if let Some(scc) = scc {
             self.line(3, &format!("scc = {};", scc.replace("RESULT", &result)));
         }
+        Ok(())
+    }
+
+    fn emit_saveexec64(
+        &mut self,
+        instruction: &Instruction,
+        name: &str,
+        destination: u32,
+    ) -> Result<(), String> {
+        let source = self.raw_source64(instruction, 0)?;
+        // Preserve the complete local portion of old EXEC in its architectural 64-bit position.
+        // A split guest wave64 runs as two SIMD32 groups: the first group owns bits 0..31 and the
+        // second owns bits 32..63. Keeping masks half-local lets structured EXEC predication and
+        // later B64 restore operations remain exact without cross-SIMD communication.
+        let old_expression = if self.split_wave64() {
+            "((ulong)(uint64_t)simd_ballot(exec) << (remu_wave_half * 32u))"
+        } else {
+            "(ulong)(uint64_t)simd_ballot(exec)"
+        };
+        let old = self.temp("ulong", old_expression);
+        let expression = match name {
+            "SAndSaveexecB64" => format!("({old} & {source})"),
+            "SOrSaveexecB64" => format!("({old} | {source})"),
+            "SXorSaveexecB64" => format!("({old} ^ {source})"),
+            "SAndn1SaveexecB64" => format!("(~{source} & {old})"),
+            "SAndn2SaveexecB64" => format!("({source} & ~{old})"),
+            "SOrn1SaveexecB64" => format!("(~{source} | {old})"),
+            "SOrn2SaveexecB64" => format!("({source} | ~{old})"),
+            "SNandSaveexecB64" => format!("~({source} & {old})"),
+            "SNorSaveexecB64" => format!("~({source} | {old})"),
+            "SXnorSaveexecB64" => format!("~({source} ^ {old})"),
+            _ => return Err(format!("unsupported 64-bit saveexec opcode {name}")),
+        };
+        let architectural_mask = if self.split_wave64() {
+            "0xFFFFFFFFFFFFFFFFul"
+        } else {
+            "0xFFFFFFFFul"
+        };
+        let new = self.temp("ulong", &format!("({expression}) & {architectural_mask}"));
+        self.store_scalar_pair(destination, &old);
+        self.line(3, &format!("s[{EXEC_LO}] = (uint){new};"));
+        self.line(3, &format!("s[{EXEC_HI}] = (uint)({new} >> 32);"));
+        let exec =
+            self.lane_mask_predicate(&format!("(uint){new}"), &format!("(uint)({new} >> 32)"));
+        self.line(3, &format!("exec = {exec};"));
+        self.line(3, &format!("scc = {new} != 0ul;"));
         Ok(())
     }
 
@@ -2028,19 +2674,26 @@ impl<'a> Compiler<'a> {
                 let right = self.raw_source64(instruction, 1)?;
                 (format!("(scc ? {left} : {right})"), false)
             }
-            "SAndB64" => {
+            "SAndB64" | "SOrB64" | "SXorB64" | "SAndn2B64" | "SOrn2B64" | "SNandB64"
+            | "SNorB64" | "SXnorB64" => {
                 let right = self.raw_source64(instruction, 1)?;
-                (format!("({left} & {right})"), true)
-            }
-            "SOrB64" => {
-                let right = self.raw_source64(instruction, 1)?;
-                (format!("({left} | {right})"), true)
+                let expression = match name {
+                    "SAndB64" => format!("({left} & {right})"),
+                    "SOrB64" => format!("({left} | {right})"),
+                    "SXorB64" => format!("({left} ^ {right})"),
+                    "SAndn2B64" => format!("({left} & ~{right})"),
+                    "SOrn2B64" => format!("({left} | ~{right})"),
+                    "SNandB64" => format!("~({left} & {right})"),
+                    "SNorB64" => format!("~({left} | {right})"),
+                    "SXnorB64" => format!("~({left} ^ {right})"),
+                    _ => unreachable!("64-bit bitwise opcode is matched above"),
+                };
+                (expression, true)
             }
             _ => return Err(format!("unsupported 64-bit scalar opcode {name}")),
         };
         let result = self.temp("ulong", &value);
-        self.store_scalar(destination, &format!("(uint){result}"));
-        self.store_scalar(destination + 1, &format!("(uint)({result} >> 32)"));
+        self.store_scalar_pair(destination, &result);
         if sets_scc {
             self.line(3, &format!("scc = {result} != 0ul;"));
         }
@@ -2057,7 +2710,7 @@ impl<'a> Compiler<'a> {
             .iter()
             .position(|binding| binding.instruction_pcs.contains(&instruction.pc))
             .ok_or_else(|| "scalar load has no evaluated memory binding".to_owned())?;
-        let binding = &self.evaluation.global_memory_bindings[binding_index];
+        let binding_length = self.global_binding_length(binding_index);
         let dynamic = control
             .dynamic_offset_register
             .map_or_else(|| "0u".to_owned(), |register| format!("s[{register}]"));
@@ -2075,10 +2728,8 @@ impl<'a> Compiler<'a> {
             let offset = u32::try_from(index)
                 .map_err(|_| "scalar load destination count overflow".to_owned())?
                 * 4;
-            let expression = format!(
-                "remu_load_u32(b{binding_index}, {address} + {offset}u, {}u)",
-                binding.data.len()
-            );
+            let expression =
+                format!("remu_load_u32(b{binding_index}, {address} + {offset}u, {binding_length})");
             self.store_scalar(destination.value, &expression);
         }
         Ok(())
@@ -2131,11 +2782,15 @@ impl<'a> Compiler<'a> {
             .iter()
             .position(|binding| binding.instruction_pcs.contains(&instruction.pc))
             .ok_or_else(|| format!("{} has no evaluated buffer binding", instruction.opcode))?;
-        let binding = &self.evaluation.global_memory_bindings[binding_index];
-        let binding_length = binding.data.len();
-        let binding_base = binding.base_address;
+        let binding_length = self.global_binding_length(binding_index);
         let scalar_offset = self.raw_source(instruction, 2)?;
-        let vector_index = if control.index_enabled {
+        let vector_index = if self.options.stage == MetalShaderStage::Vertex
+            && self.options.diagnostic_force_vertex_fetch_id
+            && name.starts_with("BufferLoadFormat")
+            && control.index_enabled
+        {
+            "remu_vertex_id".to_owned()
+        } else if control.index_enabled {
             format!("v[{}]", control.vector_address)
         } else {
             "0u".to_owned()
@@ -2156,16 +2811,16 @@ impl<'a> Compiler<'a> {
             "ulong",
             &format!("(ulong){resource0} | (((ulong){resource1} & 0xFFFFul) << 32)"),
         );
-        let resource_bias = self.temp(
-            "uint",
-            &format!("(uint)({resource_base} - 0x{binding_base:X}ul)"),
-        );
+        let resource_bias = self.temp("uint", &format!("(uint)({resource_base} & 3ul)"));
         let stride = self.temp("uint", &format!("({resource1} >> 16) & 0x3FFFu"));
         let swizzled = self.temp("bool", &format!("({resource1} & 0x80000000u) != 0u"));
         let add_tid = self.temp("bool", &format!("({resource3} & 0x00800000u) != 0u"));
         let index = self.temp(
             "uint",
-            &format!("{vector_index} + ({add_tid} ? (remu_lane & 63u) : 0u)"),
+            &format!(
+                "{vector_index} + ({add_tid} ? ({} & 63u) : 0u)",
+                self.architectural_lane()
+            ),
         );
         let offset = self.temp(
             "uint",
@@ -2236,7 +2891,7 @@ impl<'a> Compiler<'a> {
                 instruction,
                 control,
                 binding_index,
-                binding_length,
+                &binding_length,
                 &address,
                 &oob,
             );
@@ -2270,7 +2925,7 @@ impl<'a> Compiler<'a> {
             control.vector_data,
             control.dword_count,
             binding_index,
-            binding_length,
+            &binding_length,
             &address,
             &oob,
             component_oobs.as_deref(),
@@ -2324,15 +2979,10 @@ impl<'a> Compiler<'a> {
                 "GLOBAL with a VGPR-only address has no statically resolved guest memory range"
                     .to_owned()
             })?;
-        let binding = &self.evaluation.global_memory_bindings[binding_index];
-        let local_address = self.temp(
-            "uint",
-            &format!("(uint)({guest_address} - 0x{:X}ul)", binding.base_address),
-        );
-        let before = self.temp(
-            "bool",
-            &format!("{guest_address} < 0x{:X}ul", binding.base_address),
-        );
+        let binding_base = self.temp("ulong", &self.global_binding_base(binding_index));
+        let binding_length = self.global_binding_length(binding_index);
+        let local_address = self.temp("uint", &format!("(uint)({guest_address} - {binding_base})"));
+        let before = self.temp("bool", &format!("{guest_address} < {binding_base}"));
         let oob = self.temp("bool", &before);
         self.emit_raw_memory_operation(
             name,
@@ -2340,7 +2990,7 @@ impl<'a> Compiler<'a> {
             control.vector_destination,
             control.dword_count,
             binding_index,
-            binding.data.len(),
+            &binding_length,
             &local_address,
             &oob,
             None,
@@ -2645,7 +3295,7 @@ impl<'a> Compiler<'a> {
         vector_destination: u32,
         dword_count: u32,
         binding_index: usize,
-        binding_length: usize,
+        binding_length: &str,
         address: &str,
         descriptor_oob: &str,
         component_descriptor_oobs: Option<&[String]>,
@@ -2694,18 +3344,18 @@ impl<'a> Compiler<'a> {
                 };
                 let loaded = match width {
                     1 => format!(
-                        "remu_load_u8(b{binding_index}, {component_address}, {binding_length}u)"
+                        "remu_load_u8(b{binding_index}, {component_address}, {binding_length})"
                     ),
                     2 => format!(
-                        "remu_load_u16(b{binding_index}, {component_address}, {binding_length}u)"
+                        "remu_load_u16(b{binding_index}, {component_address}, {binding_length})"
                     ),
                     4 => format!(
-                        "remu_load_u32(b{binding_index}, {component_address}, {binding_length}u)"
+                        "remu_load_u32(b{binding_index}, {component_address}, {binding_length})"
                     ),
                     _ => unreachable!("raw load widths are fixed"),
                 };
                 let in_range = format!(
-                    "!{descriptor_oob} && remu_range_valid({component_address}, {width}u, {binding_length}u)"
+                    "!{descriptor_oob} && remu_range_valid({component_address}, {width}u, {binding_length})"
                 );
                 let raw = self.temp("uint", &format!("{in_range} ? {loaded} : 0u"));
                 let converted = if signed && width == 1 {
@@ -2763,7 +3413,7 @@ impl<'a> Compiler<'a> {
                 self.line(
                     3,
                     &format!(
-                        "if (exec && !{descriptor_oob} && remu_range_valid({component_address}, {width}u, {binding_length}u)) remu_store_u{bits}(b{binding_index}, {component_address}, {value});",
+                        "if (exec && !{descriptor_oob} && remu_range_valid({component_address}, {width}u, {binding_length})) remu_store_u{bits}(b{binding_index}, {component_address}, {value});",
                         bits = width * 8
                     ),
                 );
@@ -2809,7 +3459,7 @@ impl<'a> Compiler<'a> {
         self.line(
             3,
             &format!(
-                "if (exec && !{descriptor_oob} && remu_range_valid({atomic_address}, 4u, {binding_length}u)) {old} = {operation};"
+                "if (exec && !{descriptor_oob} && remu_range_valid({atomic_address}, 4u, {binding_length})) {old} = {operation};"
             ),
         );
         if glc {
@@ -2824,7 +3474,7 @@ impl<'a> Compiler<'a> {
         instruction: &Instruction,
         control: &remu_shader::BufferMemoryControl,
         binding_index: usize,
-        binding_length: usize,
+        binding_length: &str,
         address: &str,
         descriptor_oob: &str,
     ) -> Result<(), String> {
@@ -2842,14 +3492,13 @@ impl<'a> Compiler<'a> {
         let data_format = self.temp("uint", &format!("{table_entry} & 0xFFu"));
         let number_format = self.temp("uint", &format!("({table_entry} >> 8) & 0xFFu"));
         let element_size = self.temp("uint", &format!("remu_format_size({data_format})"));
-        let aligned = self.temp(
-            "bool",
-            &format!("{element_size} != 0u && ({address} % {element_size}) == 0u"),
-        );
         let oob = self.temp(
             "bool",
-            &format!(
-                "{descriptor_oob} || !{aligned} || !remu_range_valid({address}, {element_size}, {binding_length}u)"
+            &format_buffer_element_oob_expression(
+                descriptor_oob,
+                address,
+                &element_size,
+                binding_length,
             ),
         );
         if instruction.opcode.contains("Store") {
@@ -3098,13 +3747,19 @@ impl<'a> Compiler<'a> {
             .opcode
             .known_name()
             .ok_or_else(|| "raw image opcode".to_owned())?;
+        if name.starts_with("ImageLoad") {
+            return self.emit_image_load(image, name, binding_index);
+        }
+        if name.starts_with("ImageStore") {
+            return self.emit_image_store(image, name, binding_index);
+        }
         if !name.starts_with("ImageSample") {
             return Err(format!("unsupported image opcode {name}"));
         }
         if kind.storage {
             return Err("sample operation resolved to a storage image".to_owned());
         }
-        if image.is_array || !matches!(image.dimension, 0 | 1) {
+        if image.is_array || !matches!(image.dimension, 0 | 1 | 2 | 3) {
             return Err(format!(
                 "sampled image dimension {} array={} requires its matching Metal texture type",
                 image.dimension, image.is_array
@@ -3130,6 +3785,231 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    fn image_destination_select(&mut self, image: &ImageControl) -> String {
+        let descriptor_word = format!("s[{}] & 0xFFFu", image.scalar_resource + 3);
+        // A zeroed descriptor is used by a few partially initialized Unity paths; retain the
+        // architectural XYZW identity fallback while keeping real component selection dynamic.
+        // The latter prevents render-material swizzles from creating new MSL functions.
+        self.temp(
+            "uint",
+            &format!("({descriptor_word}) == 0u ? 0xFACu : ({descriptor_word})"),
+        )
+    }
+
+    fn emit_image_store(
+        &mut self,
+        image: &ImageControl,
+        _name: &str,
+        binding_index: usize,
+    ) -> Result<(), String> {
+        // GFX10 DIM still describes the address operand layout for storage operations, but a
+        // descriptor-backed storage view remains a 2D resource. In particular Unity emits DIM=5
+        // for its single-layer stores; the third address component must not change the Metal view.
+        let image_kind = self.image_kinds[binding_index];
+        let is_3d = image_kind.texture_type == 10;
+        if !(matches!(image.dimension, 0 | 1 | 4 | 5) || (is_3d && image.dimension == 2)) {
+            return Err(format!(
+                "storage image dimension {} requires a non-2D Metal texture type",
+                image.dimension
+            ));
+        }
+        let raw_x = self.image_uint_address(image, 0);
+        let raw_y = if matches!(image.dimension, 0 | 4) {
+            "0u".to_owned()
+        } else {
+            self.image_uint_address(image, 1)
+        };
+        let x = self.temp("int", &format!("as_type<int>({raw_x})"));
+        let y = self.temp("int", &format!("as_type<int>({raw_y})"));
+        let z = is_3d.then(|| {
+            let raw_z = self.image_uint_address(image, 2);
+            self.temp("int", &format!("as_type<int>({raw_z})"))
+        });
+        let kind = image_kind.component;
+        let destination_select = self.image_destination_select(image);
+        let mut logical_components = Vec::with_capacity(4);
+        let mut input = 0_u32;
+        for component in 0..4 {
+            if image.dmask & (1 << component) == 0 {
+                logical_components.push(if kind == "float" { "0.0f" } else { "0" }.to_owned());
+                continue;
+            }
+            let raw = self.image_store_raw_component(image, kind, input);
+            logical_components.push(match kind {
+                "uint" => raw,
+                "int" => format!("as_type<int>({raw})"),
+                "float" => format!("as_type<float>({raw})"),
+                _ => unreachable!("image component type is selected from a closed set"),
+            });
+            input += 1;
+        }
+        let zero = if kind == "float" { "0.0f" } else { "0" };
+        let physical_components = std::array::from_fn::<_, 4, _>(|physical| {
+            let physical_selector = 4 + physical;
+            (0..4).rev().fold(zero.to_owned(), |fallback, logical| {
+                let shift = logical * 3;
+                format!(
+                    "((({destination_select} >> {shift}u) & 7u) == {physical_selector}u ? {} : {fallback})",
+                    logical_components[logical]
+                )
+            })
+        });
+        let z_bounds = z.as_ref().map_or_else(String::new, |z| {
+            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.get_depth()")
+        });
+        let coordinates = z.as_ref().map_or_else(
+            || format!("uint2((uint){x}, (uint){y})"),
+            |z| format!("uint3((uint){x}, (uint){y}, (uint){z})"),
+        );
+        self.line(3, &format!("if (exec && {x} >= 0 && {y} >= 0 && {x} < (int)tex{binding_index}.get_width() && {y} < (int)tex{binding_index}.get_height(){z_bounds}) {{"));
+        self.line(
+            4,
+            &format!(
+                "tex{binding_index}.write(vec<{kind}, 4>({}, {}, {}, {}), {coordinates});",
+                physical_components[0],
+                physical_components[1],
+                physical_components[2],
+                physical_components[3]
+            ),
+        );
+        self.line(3, "}");
+        Ok(())
+    }
+
+    fn emit_image_load(
+        &mut self,
+        image: &ImageControl,
+        _name: &str,
+        binding_index: usize,
+    ) -> Result<(), String> {
+        let image_kind = self.image_kinds[binding_index];
+        let is_3d = image_kind.texture_type == 10;
+        if !(matches!(image.dimension, 0 | 1 | 4 | 5) || (is_3d && image.dimension == 2)) {
+            return Err(format!(
+                "storage image dimension {} requires a non-2D Metal texture type",
+                image.dimension
+            ));
+        }
+        let raw_x = self.image_uint_address(image, 0);
+        let raw_y = if matches!(image.dimension, 0 | 4) {
+            "0u".to_owned()
+        } else {
+            self.image_uint_address(image, 1)
+        };
+        let x = self.temp(
+            "uint",
+            &format!(
+                "(uint)clamp(as_type<int>({raw_x}), 0, (int)tex{binding_index}.get_width() - 1)"
+            ),
+        );
+        let y = self.temp(
+            "uint",
+            &format!(
+                "(uint)clamp(as_type<int>({raw_y}), 0, (int)tex{binding_index}.get_height() - 1)"
+            ),
+        );
+        let z = is_3d.then(|| {
+            let raw_z = self.image_uint_address(image, 2);
+            self.temp(
+                "uint",
+                &format!(
+                    "(uint)clamp(as_type<int>({raw_z}), 0, (int)tex{binding_index}.get_depth() - 1)"
+                ),
+            )
+        });
+        let coordinates = z.as_ref().map_or_else(
+            || format!("uint2({x}, {y})"),
+            |z| format!("uint3({x}, {y}, {z})"),
+        );
+        let loaded = self.temp(
+            &format!("vec<{}, 4>", self.image_kinds[binding_index].component),
+            &format!("tex{binding_index}.read({coordinates})"),
+        );
+        let destination_select = self.image_destination_select(image);
+        let mut values = Vec::with_capacity(4);
+        for component in 0..4 {
+            if image.dmask & (1 << component) == 0 {
+                continue;
+            }
+            let kind = self.image_kinds[binding_index];
+            let selector = format!("(({destination_select} >> {}u) & 7u)", component * 3);
+            let one = if kind.component == "float" {
+                "0x3F800000u"
+            } else {
+                "1u"
+            };
+            let physical = match kind.component {
+                "uint" => format!("{loaded}[{selector} - 4u]"),
+                "int" | "float" => {
+                    format!("as_type<uint>({loaded}[{selector} - 4u])")
+                }
+                _ => unreachable!("image component type is selected from a closed set"),
+            };
+            let raw = format!(
+                "({selector} == 1u ? {one} : ({selector} >= 4u && {selector} <= 7u ? {physical} : 0u))"
+            );
+            values.push(raw);
+        }
+        if image.d16 {
+            for (index, pair) in values.chunks(2).enumerate() {
+                let low = &pair[0];
+                let high = pair.get(1).map_or("0u", String::as_str);
+                let packed =
+                    self.pack_image_d16(self.image_kinds[binding_index].component, low, high);
+                self.store_vector(
+                    image.vector_data
+                        + u32::try_from(index).map_err(|_| "D16 image output overflow")?,
+                    &packed,
+                );
+            }
+        } else {
+            for (index, raw) in values.iter().enumerate() {
+                self.store_vector(
+                    image.vector_data
+                        + u32::try_from(index).map_err(|_| "image output overflow")?,
+                    raw,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    fn image_store_raw_component(
+        &self,
+        image: &ImageControl,
+        kind: &str,
+        component: u32,
+    ) -> String {
+        if !image.d16 {
+            return format!("v[{}]", image.vector_data + component);
+        }
+        let packed = format!("v[{}]", image.vector_data + component / 2);
+        if kind == "float" {
+            return format!(
+                "as_type<uint>((float)as_type<half2>({packed})[{}])",
+                component & 1
+            );
+        }
+        let low = format!("(({packed} >> {}u) & 0xFFFFu)", (component & 1) * 16);
+        if kind == "int" {
+            format!("(uint)extract_bits(as_type<int>({low}), 0u, 16u)")
+        } else {
+            low
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn pack_image_d16(&self, kind: &str, low: &str, high: &str) -> String {
+        if kind == "float" {
+            format!(
+                "((uint)as_type<ushort>(half(as_type<float>({low}))) | ((uint)as_type<ushort>(half(as_type<float>({high}))) << 16))"
+            )
+        } else {
+            format!("(({low} & 0xFFFFu) | (({high} & 0xFFFFu) << 16))")
+        }
+    }
+
     fn emit_image_sample(
         &mut self,
         image: &ImageControl,
@@ -3146,6 +4026,7 @@ impl<'a> Compiler<'a> {
         let mut cursor = 0_usize;
         let mut offset_x = "0".to_owned();
         let mut offset_y = "0".to_owned();
+        let mut offset_z = "0".to_owned();
         if has_offset {
             cursor = align_full_image_address(image, cursor);
             let packed = self.temp(
@@ -3157,6 +4038,9 @@ impl<'a> Compiler<'a> {
             );
             offset_x = self.temp("int", &format!("extract_bits({packed}, 0u, 6u)"));
             offset_y = self.temp("int", &format!("extract_bits({packed}, 8u, 6u)"));
+            if image.dimension == 2 {
+                offset_z = self.temp("int", &format!("extract_bits({packed}, 16u, 6u)"));
+            }
             cursor += image_full_address_slots(image);
         }
         let bias = if has_bias {
@@ -3166,61 +4050,135 @@ impl<'a> Compiler<'a> {
         } else {
             "0.0f".to_owned()
         };
-        if has_compare {
-            return Err("comparison sampling requires depth-texture Metal typing".to_owned());
-        }
+        let compare = if has_compare {
+            let value = self.image_float_address(image, cursor);
+            cursor += 1;
+            self.temp("float", &value)
+        } else {
+            String::new()
+        };
         let mut gradient_x = String::new();
         let mut gradient_y = String::new();
         if has_gradients {
+            let gradient_components = if matches!(image.dimension, 2 | 3) {
+                3
+            } else {
+                2
+            };
+            let gradient_kind = if gradient_components == 3 {
+                "float3"
+            } else {
+                "float2"
+            };
             gradient_x = self.temp(
-                "float2",
-                &format!(
+                gradient_kind,
+                &if gradient_components == 3 {
+                    format!(
+                        "float3({}, {}, {})",
+                        self.image_float_address(image, cursor),
+                        self.image_float_address(image, cursor + 1),
+                        self.image_float_address(image, cursor + 2)
+                    )
+                } else {
+                    format!(
+                        "float2({}, {})",
+                        self.image_float_address(image, cursor),
+                        self.image_float_address(image, cursor + 1)
+                    )
+                },
+            );
+            gradient_y = self.temp(
+                gradient_kind,
+                &if gradient_components == 3 {
+                    format!(
+                        "float3({}, {}, {})",
+                        self.image_float_address(image, cursor + 3),
+                        self.image_float_address(image, cursor + 4),
+                        self.image_float_address(image, cursor + 5)
+                    )
+                } else {
+                    format!(
+                        "float2({}, {})",
+                        self.image_float_address(image, cursor + 2),
+                        self.image_float_address(image, cursor + 3)
+                    )
+                },
+            );
+            cursor += gradient_components * 2;
+        }
+        let coordinate_kind = if matches!(image.dimension, 2 | 3) {
+            "float3"
+        } else {
+            "float2"
+        };
+        let mut coordinates = self.temp(
+            coordinate_kind,
+            &if matches!(image.dimension, 2 | 3) {
+                format!(
+                    "float3({}, {}, {})",
+                    self.image_float_address(image, cursor),
+                    self.image_float_address(image, cursor + 1),
+                    self.image_float_address(image, cursor + 2)
+                )
+            } else {
+                format!(
                     "float2({}, {})",
                     self.image_float_address(image, cursor),
                     self.image_float_address(image, cursor + 1)
-                ),
-            );
-            gradient_y = self.temp(
-                "float2",
-                &format!(
-                    "float2({}, {})",
-                    self.image_float_address(image, cursor + 2),
-                    self.image_float_address(image, cursor + 3)
-                ),
-            );
-            cursor += 4;
-        }
-        let mut coordinates = self.temp(
-            "float2",
-            &format!(
-                "float2({}, {})",
-                self.image_float_address(image, cursor),
-                self.image_float_address(image, cursor + 1)
-            ),
+                )
+            },
         );
         let lod = if has_zero_lod {
             "0.0f".to_owned()
         } else if has_lod {
-            self.temp("float", &self.image_float_address(image, cursor + 2))
+            self.temp(
+                "float",
+                &self.image_float_address(
+                    image,
+                    cursor
+                        + if matches!(image.dimension, 2 | 3) {
+                            3
+                        } else {
+                            2
+                        },
+                ),
+            )
         } else {
             bias.clone()
         };
         if has_offset {
+            if image.dimension == 3 {
+                return Err("cube sampling does not support integer texel offsets".to_owned());
+            }
             let offset_lod = if (has_zero_lod || has_lod) && !has_gradients {
                 lod.clone()
             } else {
                 "0.0f".to_owned()
             };
             let mip = self.temp("uint", &format!("(uint)max((int)({offset_lod}), 0)"));
-            coordinates = self.temp(
-                "float2",
-                &format!(
-                    "{coordinates} + float2((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}))"
-                ),
-            );
+            coordinates = if image.dimension == 2 {
+                self.temp(
+                    "float3",
+                    &format!(
+                        "{coordinates} + float3((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}), (float){offset_z} / (float)tex{binding_index}.get_depth({mip}))"
+                    ),
+                )
+            } else {
+                self.temp(
+                    "float2",
+                    &format!(
+                        "{coordinates} + float2((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}))"
+                    ),
+                )
+            };
         }
         let extra = if has_gradients {
-            format!(", gradient2d({gradient_x}, {gradient_y})")
+            let gradient = match image.dimension {
+                2 => "gradient3d",
+                3 => "gradientcube",
+                _ => "gradient2d",
+            };
+            format!(", {gradient}({gradient_x}, {gradient_y})")
         } else if has_zero_lod || has_lod {
             format!(", level({lod})")
         } else if has_bias {
@@ -3228,10 +4186,54 @@ impl<'a> Compiler<'a> {
         } else {
             String::new()
         };
+        let kind = self.image_kinds[binding_index];
+        let vector_kind = format!("vec<{}, 4>", kind.component);
+        let physical = if has_compare {
+            let compared = self.temp(
+                "float",
+                &format!(
+                    "tex{binding_index}.sample_compare(remu_samplers.s{sampler_slot}, {coordinates}, {compare}{extra})"
+                ),
+            );
+            self.temp(
+                &vector_kind,
+                &format!("{vector_kind}({compared}, {compared}, {compared}, {compared})"),
+            )
+        } else {
+            self.temp(
+                &vector_kind,
+                &format!(
+                    "tex{binding_index}.sample(remu_samplers.s{sampler_slot}, {coordinates}{extra})"
+                ),
+            )
+        };
+        let zero = if kind.component == "float" {
+            "0.0f"
+        } else if kind.component == "uint" {
+            "0u"
+        } else {
+            "0"
+        };
+        let one = if kind.component == "float" {
+            "1.0f"
+        } else if kind.component == "uint" {
+            "1u"
+        } else {
+            "1"
+        };
+        let destination_select = self.image_destination_select(image);
+        let mut logical = Vec::with_capacity(4);
+        for component in 0..4 {
+            let selector = format!("(({destination_select} >> {}u) & 7u)", component * 3);
+            logical.push(format!(
+                "({selector} == 1u ? {one} : ({selector} >= 4u && {selector} <= 7u ? {physical}[{selector} - 4u] : {zero}))"
+            ));
+        }
         Ok(self.temp(
-            &format!("vec<{}, 4>", self.image_kinds[binding_index].component),
+            &vector_kind,
             &format!(
-                "tex{binding_index}.sample(remu_samplers.s{sampler_slot}, {coordinates}{extra})"
+                "{vector_kind}({}, {}, {}, {})",
+                logical[0], logical[1], logical[2], logical[3]
             ),
         ))
     }
@@ -3243,6 +4245,16 @@ impl<'a> Compiler<'a> {
             format!("(float)as_type<half2>(v[{register}])[{}]", component & 1)
         } else {
             format!("as_type<float>(v[{register}])")
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn image_uint_address(&self, image: &ImageControl, component: usize) -> String {
+        let register = image.address_register(image_address_register(image, component));
+        if image.a16 {
+            format!("((v[{register}] >> {}u) & 0xFFFFu)", (component & 1) * 16)
+        } else {
+            format!("v[{register}]")
         }
     }
 
@@ -3272,17 +4284,41 @@ impl<'a> Compiler<'a> {
             return;
         }
         match register {
-            VCC_LO => {
+            VCC_LO | VCC_HI => {
                 let value = self.temp("uint", expression);
-                self.line(3, &format!("s[{VCC_LO}] = {value};"));
-                self.line(3, &format!("vcc = (({value} >> remu_lane) & 1u) != 0u;"));
+                self.line(3, &format!("s[{register}] = {value};"));
+                let predicate =
+                    self.lane_mask_predicate(&format!("s[{VCC_LO}]"), &format!("s[{VCC_HI}]"));
+                self.line(3, &format!("vcc = {predicate};"));
             }
-            EXEC_LO => {
+            EXEC_LO | EXEC_HI => {
                 let value = self.temp("uint", expression);
-                self.line(3, &format!("s[{EXEC_LO}] = {value};"));
-                self.line(3, &format!("exec = (({value} >> remu_lane) & 1u) != 0u;"));
+                self.line(3, &format!("s[{register}] = {value};"));
+                let predicate =
+                    self.lane_mask_predicate(&format!("s[{EXEC_LO}]"), &format!("s[{EXEC_HI}]"));
+                self.line(3, &format!("exec = {predicate};"));
             }
             _ => self.line(3, &format!("s[{register}] = {expression};")),
+        }
+    }
+
+    fn store_scalar_pair(&mut self, register: u32, expression: &str) {
+        if register + 1 >= SCALAR_REGISTER_COUNT {
+            return;
+        }
+        self.line(3, &format!("s[{register}] = (uint){expression};"));
+        self.line(
+            3,
+            &format!("s[{}] = (uint)({expression} >> 32);", register + 1),
+        );
+        if register == VCC_LO {
+            let predicate =
+                self.lane_mask_predicate(&format!("s[{VCC_LO}]"), &format!("s[{VCC_HI}]"));
+            self.line(3, &format!("vcc = {predicate};"));
+        } else if register == EXEC_LO {
+            let predicate =
+                self.lane_mask_predicate(&format!("s[{EXEC_LO}]"), &format!("s[{EXEC_HI}]"));
+            self.line(3, &format!("exec = {predicate};"));
         }
     }
 }
@@ -3397,6 +4433,41 @@ fn is_scalar_branch(opcode: Opcode) -> bool {
     opcode
         .known_name()
         .is_some_and(|name| name == "SBranch" || name.starts_with("SCbranch"))
+}
+
+fn dispatcher_basic_blocks(program: &Program) -> Vec<std::ops::Range<usize>> {
+    let mut instruction_by_pc = BTreeMap::new();
+    for (index, instruction) in program.instructions.iter().enumerate() {
+        instruction_by_pc.insert(instruction.pc, index);
+    }
+
+    let mut leaders = BTreeSet::from([0_usize]);
+    for (index, instruction) in program.instructions.iter().enumerate() {
+        let terminator = is_scalar_branch(instruction.opcode)
+            || instruction.opcode.known_name() == Some("SEndpgm");
+        if terminator && index + 1 < program.instructions.len() {
+            leaders.insert(index + 1);
+        }
+        if is_scalar_branch(instruction.opcode) {
+            let target = branch_target(instruction)
+                .expect("dispatcher block construction follows validated control flow");
+            leaders.insert(instruction_by_pc[&target]);
+        }
+    }
+
+    let leaders = leaders.into_iter().collect::<Vec<_>>();
+    leaders
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = leaders
+                .get(index + 1)
+                .copied()
+                .unwrap_or(program.instructions.len());
+            start..end
+        })
+        .collect()
 }
 
 fn contains_register_reference(source: &str, kind: char, register: u32) -> bool {
@@ -3583,6 +4654,21 @@ fn buffer_oob_expression(
     };
     format!(
         "{descriptor_null} || ({oob_select} == 0u ? ({index} >= {record_count} || {offset} >= {stride}) : {oob_select} == 1u ? ({index} >= {record_count}) : {oob_select} == 2u ? ({record_count} == 0u) : ({swizzled} && {stride} != 0u ? ({index} >= {record_count} || !remu_range_valid({offset}, {payload}, {stride})) : !remu_range_valid({buffer_offset}, {payload}, {reduced_records})))"
+    )
+}
+
+fn format_buffer_element_oob_expression(
+    descriptor_oob: &str,
+    address: &str,
+    element_size: &str,
+    binding_length: &str,
+) -> String {
+    // A structured buffer's stride, not the total formatted element size, positions records.
+    // Requiring a float3 payload to begin at a multiple of 12 would reject legal records in a
+    // 28-byte vertex layout. The bytewise format loader below already handles every component at
+    // its architectural byte offset, so only format validity and the actual bound range matter.
+    format!(
+        "{descriptor_oob} || {element_size} == 0u || !remu_range_valid({address}, {element_size}, {binding_length})"
     )
 }
 
@@ -4407,12 +5493,12 @@ mod tests {
 
     fn empty_evaluation() -> ShaderEvaluation {
         ShaderEvaluation {
-            initial_scalar_registers: vec![0; 128],
-            scalar_registers: vec![0; 128],
+            initial_scalar_registers: vec![0; 128].into(),
+            scalar_registers: vec![0; 128].into(),
+            scalar_memory_reads: Vec::new(),
             image_bindings: Vec::new(),
             global_memory_bindings: Vec::new(),
             compute_system_registers: None,
-            runtime_scalar_registers: BTreeSet::new(),
             vertex_inputs: Vec::new(),
         }
     }
@@ -4528,10 +5614,220 @@ mod tests {
                 pixel_outputs: Vec::new(),
                 pixel_input_enable: 0,
                 pixel_input_address: 0,
+                diagnostic_force_visible_clip_depth: false,
+                diagnostic_force_vertex_pattern: false,
+                diagnostic_force_vertex_fetch_id: false,
+                diagnostic_capture_vertex_position: false,
+                diagnostic_capture_pixel_output: false,
+                diagnostic_force_pixel_color: false,
                 lds_size_bytes: 0,
+                wave_lane_count: 32,
             },
         )
         .expect("vector instruction should lower")
+    }
+
+    #[test]
+    fn lowers_observed_64_bit_and_not_scalar_operation() {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0x30,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SAndn2B64"),
+                words: vec![0],
+                sources: vec![Operand::scalar(10), Operand::scalar(12)],
+                destinations: vec![Operand::scalar(20)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+
+        assert!(shader.source.contains("& ~"));
+        assert!(shader.source.contains("s[20]"));
+        assert!(shader.source.contains("s[21]"));
+    }
+
+    #[test]
+    fn lowers_observed_bit_reverse_and_wave32_saveexec_operations() {
+        let reverse = compile_vector_instruction(
+            Instruction {
+                pc: 0x194,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VBfrevB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(2)],
+                destinations: vec![Operand::vector(8)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+        assert!(reverse.source.contains("reverse_bits(remu_v_2)"));
+
+        let saveexec = compile_vector_instruction(
+            Instruction {
+                pc: 0x74,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SAndSaveexecB64"),
+                words: vec![0],
+                sources: vec![Operand::scalar(10)],
+                destinations: vec![Operand::scalar(20)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+        assert!(saveexec.source.contains("simd_ballot(exec)"));
+        assert!(saveexec.source.contains("& 0xFFFFFFFFul"));
+        assert!(saveexec.source.contains("remu_s_20 = (uint)"));
+        assert!(saveexec.source.contains("exec = (("));
+    }
+
+    #[test]
+    fn lowers_structured_wave64_saveexec_into_the_correct_simd32_half() {
+        let program = Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0x7cc,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SAndSaveexecB64"),
+                words: vec![0],
+                sources: vec![Operand::scalar(10)],
+                destinations: vec![Operand::scalar(20)],
+                control: None,
+            }],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute_wave(0, 64),
+        )
+        .expect("split wave64 saveexec should lower");
+
+        assert!(
+            shader
+                .source
+                .contains("uint remu_thread_index [[thread_index_in_threadgroup]]")
+        );
+        assert!(shader.source.contains("uint remu_wave_half ="));
+        assert!(shader.source.contains("remu_wave_half * 32u"));
+        assert!(shader.source.contains("0xFFFFFFFFFFFFFFFFul"));
+        assert!(shader.source.contains("remu_s_127 = (uint)(t"));
+        assert!(shader.source.contains("remu_wave_half == 0u ?"));
+    }
+
+    #[test]
+    fn lowers_readlane_and_writelane_independently_of_exec() {
+        let read = compile_vector_instruction(
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VReadlaneB32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(2), Operand::scalar(4)],
+                destinations: vec![Operand::scalar(8)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+        assert!(
+            read.source
+                .contains("simd_shuffle(remu_v_2, (ushort)(remu_s_4 & 31u))")
+        );
+        assert!(read.source.contains("remu_s_8 = "));
+
+        let write = compile_vector_instruction(
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VWritelaneB32"),
+                words: vec![0, 0],
+                sources: vec![Operand::scalar(2), Operand::scalar(4)],
+                destinations: vec![Operand::vector(8)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+        assert!(
+            write
+                .source
+                .contains("if (remu_lane == ((remu_s_4) & 31u)) remu_v_8 = remu_s_2;")
+        );
+        assert!(!write.source.contains("if (exec) remu_v_8 ="));
+    }
+
+    #[test]
+    fn lowers_vector_carry_and_borrow_with_wave32_lane_masks() {
+        let mut instructions = ["VAddcU32", "VSubbU32", "VSubbrevU32"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| Instruction {
+                pc: u32::try_from(index * 4).expect("small test pc"),
+                encoding: ShaderEncoding::Vop2,
+                opcode: Opcode::Known(name),
+                words: vec![0],
+                sources: vec![Operand::vector(1), Operand::vector(2)],
+                destinations: vec![Operand::vector(
+                    8 + u32::try_from(index).expect("small destination"),
+                )],
+                control: None,
+            })
+            .collect::<Vec<_>>();
+        for (index, name) in ["VAddCoU32", "VSubCoU32", "VSubrevCoU32", "VAddCoCiU32"]
+            .into_iter()
+            .enumerate()
+        {
+            instructions.push(Instruction {
+                pc: 12 + u32::try_from(index * 8).expect("small test pc"),
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known(name),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(1), Operand::vector(2), Operand::scalar(20)],
+                destinations: vec![Operand::vector(
+                    12 + u32::try_from(index).expect("small destination"),
+                )],
+                control: Some(InstructionControl::Vop3(remu_shader::Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: Some(12),
+                })),
+            });
+        }
+        let shader = compile_msl(
+            &Program::new(0x1000, instructions),
+            &empty_evaluation(),
+            &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+        )
+        .expect("carry and borrow operations should lower");
+
+        assert!(shader.source.contains("ulong t"));
+        assert!(shader.source.contains(">> 32) != 0ul"));
+        assert!(shader.source.contains(" + (ulong)"));
+        assert!(shader.source.contains(" < t"));
+        assert!(shader.source.contains("simd_ballot"));
+        assert!(shader.source.contains("remu_s_12 ="));
+        assert!(shader.source.contains("remu_s_106 ="));
+    }
+
+    #[test]
+    fn lowers_scalar_bitfield_mask_operation() {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0x220,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SBfmB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(10), Operand::scalar(12)],
+                destinations: vec![Operand::scalar(20)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+
+        assert!(shader.source.contains("1u << ("));
+        assert!(shader.source.contains("& 31u)) - 1u) << ("));
+        assert!(shader.source.contains("remu_s_20"));
     }
 
     #[test]
@@ -4684,6 +5980,85 @@ mod tests {
         assert!(shader.source.contains("switch (pc)"));
         assert!(!shader.source.contains("uint s[128]"));
         assert!(!shader.source.contains("uint v[256]"));
+    }
+
+    #[test]
+    fn dispatcher_switches_once_per_basic_block_instead_of_once_per_instruction() {
+        let program = Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::Known("SCbranchScc1"),
+                    // PC 0 + 4-byte instruction + three dwords = PC 16.
+                    words: vec![3],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(1)],
+                    destinations: vec![Operand::vector(2)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(2)],
+                    destinations: vec![Operand::vector(3)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 12,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::Known("SBranch"),
+                    // PC 12 + 4-byte instruction + one dword = PC 20.
+                    words: vec![1],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+                Instruction {
+                    pc: 16,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(4)],
+                    destinations: vec![Operand::vector(5)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 20,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0xbf81_0000],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("conditional blocks should lower");
+
+        for pc in [0, 4, 16, 20] {
+            assert!(shader.source.contains(&format!("case {pc}u")));
+        }
+        for pc in [8, 12] {
+            assert!(!shader.source.contains(&format!("case {pc}u")));
+        }
+        assert_eq!(shader.source.matches("case ").count(), 4);
     }
 
     #[test]
@@ -4940,6 +6315,52 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
+        let image_pc = u32::try_from(instructions.len() * 8).expect("small memory test program");
+        let image_control = remu_shader::ImageControl {
+            dmask: 0xf,
+            vector_address: 1,
+            address_registers: vec![1, 2],
+            vector_data: 64,
+            scalar_resource: 16,
+            scalar_sampler: 24,
+            dimension: 1,
+            is_array: false,
+            glc: true,
+            slc: true,
+            a16: false,
+            d16: false,
+        };
+        instructions.push(Instruction {
+            pc: image_pc,
+            encoding: ShaderEncoding::Mimg,
+            opcode: Opcode::Known("ImageLoad"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(1), Operand::vector(2), Operand::scalar(16)],
+            destinations: (64..68).map(Operand::vector).collect(),
+            control: Some(InstructionControl::Image(image_control.clone())),
+        });
+        let image_store_pc = image_pc + 8;
+        let mut image_store_control = image_control.clone();
+        image_store_control.vector_data = 68;
+        image_store_control.dimension = 5;
+        image_store_control.is_array = true;
+        instructions.push(Instruction {
+            pc: image_store_pc,
+            encoding: ShaderEncoding::Mimg,
+            opcode: Opcode::Known("ImageStore"),
+            words: vec![0, 0],
+            sources: vec![
+                Operand::vector(1),
+                Operand::vector(2),
+                Operand::scalar(16),
+                Operand::vector(68),
+                Operand::vector(69),
+                Operand::vector(70),
+                Operand::vector(71),
+            ],
+            destinations: Vec::new(),
+            control: Some(InstructionControl::Image(image_store_control.clone())),
+        });
         let end_pc = u32::try_from(instructions.len() * 8).expect("small memory test program");
         instructions.push(Instruction {
             pc: end_pc,
@@ -4963,11 +6384,32 @@ mod tests {
             .push(remu_shader::GlobalMemoryBinding {
                 scalar_address: 0,
                 base_address: 0x1000,
-                instruction_pcs: pcs,
+                instruction_pcs: pcs.into(),
+                byte_count: 64 * 1024,
                 data: vec![0; 64 * 1024],
                 writable: true,
                 write_back_to_guest: true,
             });
+        let mut identity_image_descriptor = vec![0; 8];
+        identity_image_descriptor[3] = 0xfac;
+        evaluation.image_bindings.push(remu_shader::ImageBinding {
+            pc: image_pc,
+            opcode: Opcode::Known("ImageLoad"),
+            control: image_control,
+            resource_descriptor: identity_image_descriptor.clone().into(),
+            sampler_descriptor: Vec::new().into(),
+            mip_level: None,
+        });
+        let mut swizzled_store_descriptor = identity_image_descriptor;
+        swizzled_store_descriptor[3] = 0x9f5;
+        evaluation.image_bindings.push(remu_shader::ImageBinding {
+            pc: image_store_pc,
+            opcode: Opcode::Known("ImageStore"),
+            control: image_store_control,
+            resource_descriptor: swizzled_store_descriptor.into(),
+            sampler_descriptor: Vec::new().into(),
+            mip_level: None,
+        });
         (Program::new(0x1000, instructions), evaluation)
     }
 
@@ -4989,6 +6431,128 @@ mod tests {
         assert!(shader.source.contains("0xFFFF0000u"));
         assert!(shader.source.contains("0xFFFFFF00u"));
         assert!(shader.source.contains("remu_range_valid"));
+        assert!(
+            shader
+                .source
+                .contains("texture2d<float, access::read_write> tex0")
+        );
+        assert!(shader.source.contains("tex0.read(uint2("));
+        assert!(shader.source.contains("tex1.write("));
+        assert!(
+            shader.source.contains(" & 3ul"),
+            "buffer descriptors must address their dynamically bound, dword-aligned Metal buffer without embedding the evaluated guest base"
+        );
+    }
+
+    #[test]
+    fn sampled_images_apply_dynamic_descriptor_component_selection_in_the_shader() {
+        let control = ImageControl {
+            dmask: 0xf,
+            vector_address: 0,
+            address_registers: vec![0, 1],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 8,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+        };
+        let instruction = Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Mimg,
+            opcode: Opcode::Known("ImageSample"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(0), Operand::vector(1), Operand::scalar(0)],
+            destinations: (4..8).map(Operand::vector).collect(),
+            control: Some(InstructionControl::Image(control.clone())),
+        };
+        let mut evaluation = empty_evaluation();
+        let mut resource_descriptor = vec![0; 8];
+        // R32F sampled as R,R,R,R, the live Superliminal descriptor that previously failed
+        // because the host tried to materialize the swizzle by changing the texture format.
+        resource_descriptor[3] = 0x924;
+        evaluation.image_bindings.push(ImageBinding {
+            pc: 0,
+            opcode: Opcode::Known("ImageSample"),
+            control,
+            resource_descriptor: resource_descriptor.into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        });
+        let shader = compile_msl(
+            &Program::new(0x1000, vec![instruction]),
+            &evaluation,
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("sampled R32 swizzle should lower");
+        assert!(shader.source.contains("remu_s_3 & 0xFFFu"));
+        assert!(shader.source.contains("== 0u ? 0xFACu"));
+        assert!(shader.source.contains(">= 4u &&"));
+        assert!(shader.source.contains("<= 7u ?"));
+        assert!(shader.source.contains("tex0.sample("));
+    }
+
+    #[test]
+    fn comparison_samples_use_depth_texture_typing_and_the_z_reference_operand() {
+        let control = ImageControl {
+            dmask: 1,
+            vector_address: 0,
+            address_registers: vec![0, 1, 2],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 8,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+        };
+        let instruction = Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Mimg,
+            opcode: Opcode::Known("ImageSampleCLz"),
+            words: vec![0, 0],
+            sources: vec![
+                Operand::vector(0),
+                Operand::vector(1),
+                Operand::vector(2),
+                Operand::scalar(0),
+                Operand::scalar(8),
+            ],
+            destinations: vec![Operand::vector(4)],
+            control: Some(InstructionControl::Image(control.clone())),
+        };
+        let mut evaluation = empty_evaluation();
+        let mut resource_descriptor = vec![0; 8];
+        resource_descriptor[3] = 0x204 | (9 << 28);
+        evaluation.image_bindings.push(ImageBinding {
+            pc: 0,
+            opcode: Opcode::Known("ImageSampleCLz"),
+            control,
+            resource_descriptor: resource_descriptor.into(),
+            sampler_descriptor: vec![3 << 12, 0, 0, 0].into(),
+            mip_level: None,
+        });
+        let shader = compile_msl(
+            &Program::new(0x1000, vec![instruction]),
+            &evaluation,
+            &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+        )
+        .expect("depth comparison sample should lower");
+
+        assert!(shader.source.contains("depth2d<float> tex0"));
+        assert!(shader.source.contains("tex0.sample_compare("));
+        assert!(shader.source.contains("as_type<float>(remu_v_0)"));
+        assert!(
+            shader
+                .source
+                .contains("float2(as_type<float>(remu_v_1), as_type<float>(remu_v_2))")
+        );
+        assert!(shader.source.contains(", level(0.0f))"));
     }
 
     #[test]
@@ -5010,6 +6574,21 @@ mod tests {
         assert!(expression.contains("offset + 12u >= stride"));
         assert!(expression.contains("remu_range_valid(offset + 12u, 4u, stride)"));
         assert!(expression.contains("remu_range_valid(buffer_offset + 12u, 4u, reduced_records)"));
+    }
+
+    #[test]
+    fn formatted_elements_use_record_stride_without_total_size_alignment() {
+        let expression =
+            format_buffer_element_oob_expression("descriptor_oob", "record_address", "12u", "28u");
+
+        assert_eq!(
+            expression,
+            "descriptor_oob || 12u == 0u || !remu_range_valid(record_address, 12u, 28u)"
+        );
+        assert!(
+            !expression.contains('%'),
+            "a 12-byte float3 at offsets 0, 28, and 56 is legal in a 28-byte record layout"
+        );
     }
 
     #[test]
@@ -5576,7 +7155,14 @@ mod tests {
                 pixel_outputs: Vec::new(),
                 pixel_input_enable: 0,
                 pixel_input_address: 0,
+                diagnostic_force_visible_clip_depth: false,
+                diagnostic_force_vertex_pattern: false,
+                diagnostic_force_vertex_fetch_id: false,
+                diagnostic_capture_vertex_position: false,
+                diagnostic_capture_pixel_output: false,
+                diagnostic_force_pixel_color: false,
                 lds_size_bytes: 0,
+                wave_lane_count: 32,
             },
         )
         .expect("compute compare should lower");
@@ -5620,7 +7206,7 @@ mod tests {
 
     #[test]
     fn lowers_dpp_and_dpp8_for_every_otherwise_supported_vector_alu() {
-        const ALU: [(&str, usize); 34] = [
+        const ALU: [(&str, usize); 56] = [
             ("VCndmaskB32", 2),
             ("VMovB32", 1),
             ("VAddF32", 2),
@@ -5629,6 +7215,15 @@ mod tests {
             ("VMulF32", 2),
             ("VMinF32", 2),
             ("VMaxF32", 2),
+            ("VMin3F32", 3),
+            ("VMax3F32", 3),
+            ("VMed3F32", 3),
+            ("VMin3I32", 3),
+            ("VMax3I32", 3),
+            ("VMed3I32", 3),
+            ("VMin3U32", 3),
+            ("VMax3U32", 3),
+            ("VMed3U32", 3),
             ("VFmacF32", 2),
             ("VMacF32", 2),
             ("VFloorF32", 1),
@@ -5645,9 +7240,22 @@ mod tests {
             ("VSinF32", 1),
             ("VCosF32", 1),
             ("VAndB32", 2),
+            ("VAddI32", 2),
             ("VLshrrevB32", 2),
+            ("VLshlrevB32", 2),
             ("VLshlAddU32", 3),
             ("VCvtF32I32", 1),
+            ("VCvtF32U32", 1),
+            ("VMinU32", 2),
+            ("VMaxU32", 2),
+            ("VMulLoU32", 2),
+            ("VCvtU32F32", 1),
+            ("VCvtI32F32", 1),
+            ("VCvtOffF32I4", 1),
+            ("VCubeidF32", 3),
+            ("VCubescF32", 3),
+            ("VCubetcF32", 3),
+            ("VCubemaF32", 3),
             ("VCvtPkrtzF16F32", 2),
             ("VMadF32", 3),
             ("VFmaF32", 3),
@@ -6052,7 +7660,14 @@ mod tests {
                     pixel_outputs: Vec::new(),
                     pixel_input_enable: 0,
                     pixel_input_address: 0,
+                    diagnostic_force_visible_clip_depth: false,
+                    diagnostic_force_vertex_pattern: false,
+                    diagnostic_force_vertex_fetch_id: false,
+                    diagnostic_capture_vertex_position: false,
+                    diagnostic_capture_pixel_output: false,
+                    diagnostic_force_pixel_color: false,
                     lds_size_bytes: 0,
+                    wave_lane_count: 32,
                 },
             };
             let shader = compile_msl(&program, &empty_evaluation(), &options)
