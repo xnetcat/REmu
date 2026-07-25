@@ -19603,10 +19603,7 @@ fn probe_entry(
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     invoke_guest_module_initializers(&image.module_initializers, 0, 0);
     if timeout_seconds != 0 {
-        // SAFETY: Alarm only bounds this diagnostic process; its default action terminates it.
-        unsafe {
-            libc::alarm(timeout_seconds);
-        }
+        start_diagnostic_timeout(timeout_seconds);
     }
     let return_value = invoke_guest_entry_with_exit(
         image.memory.entry_address().get(),
@@ -19614,10 +19611,7 @@ fn probe_entry(
         guest_exit as *const () as usize as u64,
     ) as i32;
     set_current_guest_thread_pointer(0);
-    // SAFETY: Cancels the diagnostic alarm after a normal return.
-    unsafe {
-        libc::alarm(0);
-    }
+    DIAGNOSTIC_TIMEOUT_CANCELLED.store(true, Ordering::Release);
     let import_hits = IMPORT_TELEMETRY.get().map_or(0, |telemetry| {
         telemetry
             .read()
@@ -19658,6 +19652,37 @@ pub fn report_shader_opcode_coverage() {
     for line in remu_shader::opcode_coverage_report() {
         eprintln!("[REMu][SHADER-OPCODES] {line}");
     }
+}
+
+/// Set once the guest has returned, so a run that finishes just as its limit expires still
+/// reports the status the guest produced rather than the watchdog's.
+static DIAGNOSTIC_TIMEOUT_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// The exit status a bounded diagnostic run reports when its time limit expires.
+///
+/// This matches what the shell reports for a process killed by `SIGALRM`, which is how the limit
+/// used to be enforced, so scripts reading the status keep working.
+const DIAGNOSTIC_TIMEOUT_EXIT_STATUS: i32 = 142;
+
+/// Ends the process once a bounded diagnostic run reaches its time limit.
+///
+/// A watchdog thread is used rather than `alarm`, whose default action terminates the process
+/// outright: that discarded every end-of-run report, which is most of the reason for bounding a
+/// run in the first place. The thread runs even when every guest thread is wedged, so it remains
+/// a backstop against a hang and not merely a timer.
+fn start_diagnostic_timeout(timeout_seconds: u32) {
+    let limit = Duration::from_secs(u64::from(timeout_seconds));
+    std::thread::Builder::new()
+        .name("remu-timeout".to_owned())
+        .spawn(move || {
+            std::thread::sleep(limit);
+            if DIAGNOSTIC_TIMEOUT_CANCELLED.load(Ordering::Acquire) {
+                return;
+            }
+            eprintln!("[REMu] diagnostic time limit of {timeout_seconds}s reached");
+            terminate_probe(DIAGNOSTIC_TIMEOUT_EXIT_STATUS);
+        })
+        .ok();
 }
 
 fn terminate_probe(code: i32) -> ! {
