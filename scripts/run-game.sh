@@ -3,7 +3,9 @@
 set -eu
 
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-    echo "usage: $0 {DREAMING|SUPERLIMINAL|/path/to/eboot.bin} [timeout-seconds]" >&2
+    echo "usage: $0 {SHORTCUT|/path/to/eboot.bin} [timeout-seconds]" >&2
+    echo "  A non-path SHORTCUT resolves through the REMU_EBOOT_<SHORTCUT> environment" >&2
+    echo "  variable, e.g. REMU_EBOOT_MYGAME=/path/to/eboot.bin $0 MYGAME" >&2
     exit 64
 fi
 
@@ -12,21 +14,21 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 69
 fi
 
-game_name=$1
-case "$game_name" in
-    DREAMING|dreaming|dreaming-sarah)
-        game_name=dreaming-sarah
-        game_path=${REMU_DREAMING_SARAH_EBOOT:-/Volumes/Untitled/sharpemu/games/test-game/PPSA02929-app0/eboot.bin}
-        ;;
-    SUPERLIMINAL|superliminal)
-        game_name=superliminal
-        game_path=${REMU_SUPERLIMINAL_EBOOT:-/Volumes/Untitled/sharpemu/games/PPSA06084-app/PPSA06084-app0/decrypted/eboot.bin}
-        ;;
-    *)
-        game_path=$game_name
-        game_name=$(basename -- "$(dirname -- "$game_path")")
-        ;;
-esac
+game_arg=$1
+if [ -f "$game_arg" ]; then
+    game_path=$game_arg
+    game_name=$(basename -- "$(dirname -- "$game_path")")
+else
+    # A non-path argument names a launch shortcut configured entirely by the caller's
+    # environment, keeping game locations out of the repository.
+    shortcut=$(printf '%s' "$game_arg" | tr '[:lower:]' '[:upper:]' | tr '-' '_' | tr -cd 'A-Z0-9_')
+    game_path=$(printenv "REMU_EBOOT_$shortcut" || true)
+    if [ -z "$game_path" ]; then
+        echo "error: no file at '$game_arg' and REMU_EBOOT_$shortcut is not set" >&2
+        exit 64
+    fi
+    game_name=$(printf '%s' "$shortcut" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+fi
 # Interactive launches stay open until the guest exits or the user closes the window. Pass a
 # positive second argument only for a deliberately bounded diagnostic run.
 timeout_seconds=${2:-0}

@@ -59,9 +59,9 @@ const GPU_EVENTS_PER_TICK: usize = 512;
 const SHADER_COMPILE_QUEUE_CAPACITY: usize = 64;
 // Unity can introduce dozens of distinct 200-400 KiB pixel programs at a scene boundary. Four
 // workers let the ordered GPU queue grow by several thousand events while Apple's compiler is
-// busy, which in turn withholds real guest flips and starves the guest audio producers. The M4
-// has enough performance cores for eight independent offline compiler processes without making
-// pipeline construction on the presenter thread synchronous.
+// busy, which in turn withholds real guest flips and starves the guest audio producers. Current
+// Apple silicon has enough performance cores for eight independent offline compiler processes
+// without making pipeline construction on the presenter thread synchronous.
 const SHADER_COMPILER_WORKER_COUNT: usize = 8;
 const GUEST_BATCH_WORK_CAPACITY: usize = 256;
 const SAMPLER_ARGUMENT_CACHE_CAPACITY: usize = 1_024;

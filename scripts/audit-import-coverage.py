@@ -10,8 +10,8 @@ The audit deliberately separates four facts which runtime first-hit logs conflat
 * another emulator registers the same NID.
 
 Reference registrations are evidence to inspect, not proof that an implementation is complete.
-The default paths point at the two local regression titles and the read-only reference snapshots
-used by this repository. Every path can be overridden for other machines and titles.
+Game executables are supplied as repeatable ``--game LABEL=/path/to/eboot.bin`` arguments.
+Reference snapshot locations default to ``research/upstreams/`` and can be overridden.
 """
 
 from __future__ import annotations
@@ -30,20 +30,7 @@ from typing import Iterable, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GAMES = (
-    (
-        "dreaming-sarah",
-        Path("/Volumes/Untitled/sharpemu/games/test-game/PPSA02929-app0/eboot.bin"),
-    ),
-    (
-        "superliminal",
-        Path(
-            "/Volumes/Untitled/sharpemu/games/PPSA06084-app/"
-            "PPSA06084-app0/decrypted/eboot.bin"
-        ),
-    ),
-)
-DEFAULT_SHARPEMU = Path("/Volumes/Untitled/sharpemu/repo")
+DEFAULT_SHARPEMU = REPO_ROOT / "research/upstreams/SharpEmu"
 DEFAULT_SHADPS4 = REPO_ROOT / "research/upstreams/shadPS4"
 DEFAULT_KYTY = REPO_ROOT / "research/upstreams/Kyty"
 DEFAULT_KYTY_PS5 = REPO_ROOT / "research/upstreams/KytyPS5"
@@ -522,7 +509,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--game",
         action="append",
         type=parse_game_argument,
-        help="title and executable as LABEL=/path/to/eboot.bin; repeatable",
+        help="title and executable as LABEL=/path/to/eboot.bin; repeatable and required",
     )
     parser.add_argument("--remu-binary", type=Path, help="existing remu CLI binary")
     parser.add_argument(
@@ -542,7 +529,13 @@ def create_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = create_parser().parse_args(argv)
-    games = args.game if args.game else list(DEFAULT_GAMES)
+    games = args.game
+    if not games:
+        print(
+            "error: at least one --game LABEL=/path/to/eboot.bin argument is required",
+            file=sys.stderr,
+        )
+        return 1
     try:
         runtime = inspect_runtime_source(args.runtime_source)
         references = inspect_references(args.sharpemu, args.shadps4, args.kyty, args.kyty_ps5)

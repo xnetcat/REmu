@@ -3,7 +3,9 @@
 set -eu
 
 if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
-    echo "usage: $0 {DREAMING|SUPERLIMINAL|/path/to/eboot.bin} [import-limit] [timeout-seconds]" >&2
+    echo "usage: $0 {SHORTCUT|/path/to/eboot.bin} [import-limit] [timeout-seconds]" >&2
+    echo "  A non-path SHORTCUT resolves through the REMU_EBOOT_<SHORTCUT> environment" >&2
+    echo "  variable, e.g. REMU_EBOOT_MYGAME=/path/to/eboot.bin $0 MYGAME" >&2
     exit 64
 fi
 
@@ -12,15 +14,19 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 69
 fi
 
-game_path=$1
-case "$game_path" in
-    DREAMING|dreaming|dreaming-sarah)
-        game_path=${REMU_DREAMING_SARAH_EBOOT:-/Volumes/Untitled/sharpemu/games/test-game/PPSA02929-app0/eboot.bin}
-        ;;
-    SUPERLIMINAL|superliminal)
-        game_path=${REMU_SUPERLIMINAL_EBOOT:-/Volumes/Untitled/sharpemu/games/PPSA06084-app/PPSA06084-app0/decrypted/eboot.bin}
-        ;;
-esac
+game_arg=$1
+if [ -f "$game_arg" ]; then
+    game_path=$game_arg
+else
+    # A non-path argument names a launch shortcut configured entirely by the caller's
+    # environment, keeping game locations out of the repository.
+    shortcut=$(printf '%s' "$game_arg" | tr '[:lower:]' '[:upper:]' | tr '-' '_' | tr -cd 'A-Z0-9_')
+    game_path=$(printenv "REMU_EBOOT_$shortcut" || true)
+    if [ -z "$game_path" ]; then
+        echo "error: no file at '$game_arg' and REMU_EBOOT_$shortcut is not set" >&2
+        exit 64
+    fi
+fi
 import_limit=${2:-2000000}
 timeout_seconds=${3:-120}
 if [ ! -f "$game_path" ]; then
@@ -31,7 +37,10 @@ fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
-run_dir="$repo_dir/.remu/runs/$run_id"
+# Runtime artifacts are diagnostics rather than project sources; keep them in the user's
+# temporary directory by default, matching run-game.sh.
+run_root=${REMU_RUN_ROOT:-"${TMPDIR:-/tmp}/remu-runs"}
+run_dir="$run_root/$run_id-probe"
 binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
 mkdir -p "$run_dir"
 
