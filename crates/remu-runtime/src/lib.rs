@@ -4755,9 +4755,10 @@ fn report_failed_import(frame: *const ImportCallFrame) -> ProbeImportReturn {
     let (index, arguments) = unsafe { ((*frame).dispatch_index, (*frame).integer_arguments) };
     let result = import_dispatch(frame);
     let value = result.integer;
-    // Errors reach the guest sign-extended from a negative 32-bit status, so the upper word is
-    // all ones. Counters, handles and identifiers with a high bit set are not failures.
-    let failed = value >> 32 == 0xffff_ffff;
+    // Kernel errors reach the guest sign-extended from a negative 32-bit status. Graphics
+    // errors instead carry their own facility in a plain 32-bit value, so match that facility
+    // directly rather than widening the sign test and catching ordinary counters.
+    let failed = value >> 32 == 0xffff_ffff || value >> 16 == 0x8a6c;
     if failed {
         // SAFETY: the telemetry Arc is retained by this thread's cache for the whole call.
         let telemetry = unsafe { &*cached_import_telemetry() };
