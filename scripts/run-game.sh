@@ -38,17 +38,30 @@ fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
 bundled_metal_compiler="$repo_dir/.remu/toolchains/Metal.xctoolchain/usr/bin/metal"
-if [ "${REMU_USE_BUNDLED_METAL_COMPILER:-0}" = 1 ] && \
+# Offline libraries can be retained across launches, avoiding tens of seconds of repeated cold
+# runtime compilation for Unity's large shader set. Set REMU_USE_BUNDLED_METAL_COMPILER=0 to
+# diagnose Apple's in-process source compiler explicitly.
+if [ "${REMU_USE_BUNDLED_METAL_COMPILER:-1}" != 0 ] && \
     [ -z "${REMU_METAL_COMPILER:-}" ] && [ -x "$bundled_metal_compiler" ]; then
     REMU_METAL_COMPILER=$bundled_metal_compiler
     export REMU_METAL_COMPILER
 fi
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
-run_dir="$repo_dir/.remu/runs/$run_id-$game_name"
+# Keeping the live app's redirected stdout under Documents makes macOS attribute inherited log
+# writes to REmu and present a modal Documents-folder consent sheet. Runtime artifacts are
+# diagnostics rather than project sources, so default them to the user's temporary directory.
+run_root=${REMU_RUN_ROOT:-"${TMPDIR:-/tmp}/remu-runs"}
+run_dir="$run_root/$run_id-$game_name"
 frame_dir="$run_dir/frames"
 raw_binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
-app_bundle="$repo_dir/target/x86_64-apple-darwin/release/REmu.app"
+app_bundle=${REMU_APP_BUNDLE:-"$repo_dir/target/x86_64-apple-darwin/release/REMu.app"}
+launch_working_directory=${REMU_LAUNCH_WORKING_DIRECTORY:-"$repo_dir"}
 mkdir -p "$frame_dir"
+
+if [ ! -d "$launch_working_directory" ]; then
+    echo "error: launch working directory not found: $launch_working_directory" >&2
+    exit 66
+fi
 
 if [ "${REMU_SKIP_BUILD:-0}" != 1 ]; then
     echo "[REMu] building the Rosetta release runner"
@@ -120,13 +133,17 @@ if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
 fi
 set +e
 if [ "$capture_frames" = 1 ]; then
-    env REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \
-        arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path" \
-        > "$run_dir/guest.log" 2>&1 &
+    (
+        cd "$launch_working_directory"
+        env REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \
+            arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
+    ) > "$run_dir/guest.log" 2>&1 &
 else
-    env -u REMU_CAPTURE_DIR REMU_AUTO_CROSS="$auto_cross" \
-        arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path" \
-        > "$run_dir/guest.log" 2>&1 &
+    (
+        cd "$launch_working_directory"
+        env -u REMU_CAPTURE_DIR REMU_AUTO_CROSS="$auto_cross" \
+            arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
+    ) > "$run_dir/guest.log" 2>&1 &
 fi
 child_pid=$!
 wait "$child_pid"
