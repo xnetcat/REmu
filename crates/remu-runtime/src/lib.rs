@@ -2343,6 +2343,10 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "kBJzF8x4SyE" => "sceKernelBatchMap2",
         "9bfdLIyuwCY" => "sceKernelMtypeprotect",
         "D0OdFMjp46I" => "sceKernelCreateEqueue",
+        "jpFjmgAC5AE" => "sceKernelDeleteEqueue",
+        "QcteRwbsnV0" => "usleep",
+        "kmSe30JTs+E" => "sceVideoOutAddOutputModeEvent",
+        "MTxxrOCeSig" => "sceVideoOutSetWindowModeMargins",
         "fzyMKs9kim0" => "sceKernelWaitEqueue",
         "WDszmSbWuDk" => "sceKernelAddUserEventEdge",
         "bBfz7kMF2Ho" => "sceKernelAddAmprEvent",
@@ -3777,6 +3781,8 @@ const KERNEL_EVENT_FILTER_USER: i16 = -11;
 /// Gen5 AP/AMPR command-buffer completion. The Gen4 filter set ends at the high-resolution timer,
 /// so the console assigns this newer source the next identifier below it.
 const KERNEL_EVENT_FILTER_AMPR: i16 = -16;
+/// Display output events, including mode changes and flips.
+const KERNEL_EVENT_FILTER_VIDEO_OUT: i16 = -13;
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
 static KERNEL_EQUEUE_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
@@ -7520,6 +7526,8 @@ fn dispatch_stateless_import(
             0
         }
         "1jfXLRVzisc" => guest_usleep(arguments[0]),
+        // The POSIX spelling shares the sleep and reports errno rather than an SCE code.
+        "QcteRwbsnV0" => posix_pthread_result(guest_usleep(arguments[0])),
         "lLMT9vJAck0" | "QBi7HCK03hw" => guest_clock_gettime(arguments[0], arguments[1]),
         "ejekcaNQNq0" => guest_kernel_gettimeofday(arguments[0]),
         "0NTHN1NKONI" => guest_kernel_convert_localtime_to_utc(arguments),
@@ -7990,6 +7998,9 @@ fn dispatch_probe_import(
             .cast_unsigned()
             .into(),
         "D0OdFMjp46I" => kernel_create_equeue(arguments[0], state),
+        "jpFjmgAC5AE" => kernel_delete_equeue(arguments[0], state),
+        "kmSe30JTs+E" => video_out_add_output_mode_event(arguments, state),
+        "MTxxrOCeSig" => video_out_set_window_mode_margins(arguments, state),
         "WDszmSbWuDk" => kernel_add_user_event_edge(arguments, state),
         "bBfz7kMF2Ho" => kernel_add_ampr_event(arguments, state),
         "kwGyyjohI50" => kernel_get_event_data(arguments[0]),
@@ -8061,6 +8072,38 @@ fn dispatch_probe_import(
             sce_kernel_error(SCE_KERNEL_ERROR_NOT_IMPLEMENTED)
         }
     }
+}
+
+/// Destroys an event queue and discards the registrations and undelivered events it owned.
+fn kernel_delete_equeue(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    if !state.kernel_equeues.remove(&handle) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    }
+    state
+        .kernel_event_registrations
+        .retain(|&(equeue, _, _), _| equeue != handle);
+    state.pending_events.retain(|event| event.equeue != handle);
+    0
+}
+
+/// Registers interest in display output-mode changes.
+///
+/// REmu presents a single fixed output mode, so no change is ever announced; the registration is
+/// still recorded so the queue reports the same shape the console would.
+fn video_out_add_output_mode_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let (equeue, handle, user_data) = (arguments[0], arguments[1], arguments[2]);
+    if low_i32(handle) != 1 || !state.video_out.is_open {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+    }
+    kernel_register_event(state, equeue, 0, KERNEL_EVENT_FILTER_VIDEO_OUT, user_data)
+}
+
+/// Accepts window-mode margins. REmu scales presentation rather than insetting the guest surface.
+fn video_out_set_window_mode_margins(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if low_i32(arguments[0]) != 1 || !state.video_out.is_open {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+    }
+    0
 }
 
 fn kernel_create_equeue(output: u64, state: &mut ProbeDispatchState) -> u64 {
