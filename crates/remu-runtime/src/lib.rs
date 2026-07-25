@@ -5328,6 +5328,31 @@ fn dispatch_audio_out_import(nid: &str, arguments: [u64; 6]) -> u64 {
     }
 }
 
+/// Validates an audio-output argument that REmu treats as a writable guest pointer.
+///
+/// These queries are documented only by their names, so an argument position can be a handle or a
+/// selector rather than the output buffer. Writing through a small integer corrupts whatever the
+/// host has mapped there, so a value that cannot be a guest address is refused and reported once
+/// with the whole argument list, which is what identifies the real signature.
+fn audio_out2_output_pointer(nid: &str, arguments: [u64; 6], candidate: u64) -> Option<u64> {
+    if process_guest_range_is_readable(candidate, 32) {
+        return Some(candidate);
+    }
+    static REPORTED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let first = REPORTED
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(nid.to_owned());
+    if first {
+        eprintln!(
+            "[REMu][AUDIO2] {nid} output {candidate:#x} is not a writable guest address; args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+            arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]
+        );
+    }
+    None
+}
+
 fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
     let state = AUDIO_OUT2.get_or_init(|| Mutex::new(AudioOut2State::default()));
     let mut state = state
@@ -5341,32 +5366,34 @@ fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
         // The mixer drains every pushed block before returning, so no audio is ever queued behind
         // the port. Reporting an empty queue keeps the guest supplying the next block instead of
         // waiting for space that is already free.
+        // The queue level is reported through the third argument; the first two select the
+        // context and port.
         "R7d0F1g2qsU" => {
-            if arguments[1] != 0 {
-                write_guest_u32(arguments[1], 0);
-            }
-            if arguments[2] != 0 {
-                write_guest_u32(arguments[2], AUDIO_OUT2_QUEUE_DEPTH);
-            }
+            let Some(level) = audio_out2_output_pointer(nid, arguments, arguments[2]) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            write_guest_u32(level, 0);
             0
         }
         "gatEUKG+Ea4" => {
-            if arguments[1] == 0 {
+            let Some(state) = audio_out2_output_pointer(nid, arguments, arguments[1]) else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-            }
+            };
             // SceAudioOut2PortState: the queue counters lead the structure and the remaining
             // fields describe volume and reroute state REmu does not alter.
-            guest_memset(arguments[1], 0, AUDIO_OUT2_PORT_STATE_SIZE);
-            write_guest_u32(arguments[1] + 4, AUDIO_OUT2_QUEUE_DEPTH);
+            guest_memset(state, 0, AUDIO_OUT2_PORT_STATE_SIZE);
+            write_guest_u32(state + 4, AUDIO_OUT2_QUEUE_DEPTH);
             0
         }
+        // The speaker description is written through the first argument; the rest select the
+        // user and output type.
         "DImz2Ft9E2g" => {
-            if arguments[1] == 0 {
+            let Some(info) = audio_out2_output_pointer(nid, arguments, arguments[0]) else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-            }
+            };
             // REmu mixes to a stereo host device, so one speaker pair is reported.
-            guest_memset(arguments[1], 0, AUDIO_OUT2_SPEAKER_INFO_SIZE);
-            write_guest_u32(arguments[1], 2);
+            guest_memset(info, 0, AUDIO_OUT2_SPEAKER_INFO_SIZE);
+            write_guest_u32(info, 2);
             0
         }
         "t5YrizufpQc" => {
