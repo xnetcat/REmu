@@ -6099,6 +6099,28 @@ fn guest_condition_destroy(address: u64) -> u64 {
     }
 }
 
+/// Lists every event registration the guest is waiting on.
+///
+/// A queue with waiters but no registration, or a registration REmu never posts to, identifies
+/// the notification the guest expects and is not receiving.
+fn report_kernel_event_registrations() {
+    let Some(state) = PROBE_DISPATCH.get() else {
+        return;
+    };
+    let Ok(state) = state.try_read() else {
+        eprintln!("[REMu][STALL] event registrations unavailable while dispatch is busy");
+        return;
+    };
+    for (&(equeue, filter, ident), &user_data) in &state.kernel_event_registrations {
+        eprintln!(
+            "[REMu][STALL] registration equeue={equeue:#x} filter={filter} ident={ident:#x} user_data={user_data:#x}"
+        );
+    }
+    for equeue in &state.kernel_equeues {
+        eprintln!("[REMu][STALL] equeue={equeue:#x} exists");
+    }
+}
+
 /// How long an unbounded guest wait may run before it reports itself once.
 ///
 /// Opt-in through `REMU_TRACE_STALL_SECONDS`, because worker threads legitimately park for a long
@@ -6238,6 +6260,7 @@ where
                             "[REMu][STALL] condition={address:#x} waiters={waiters} notifies={notifies} timeouts={timeouts}"
                         );
                     }
+                    report_kernel_event_registrations();
                 }
             }
         }
@@ -10534,6 +10557,11 @@ fn ampr_command_buffer_write_kernel_event_queue(
         ident,
         user_data,
     });
+    if trace_ampr_reads() {
+        eprintln!(
+            "[REMu][AMPR] record completion buffer={command_buffer:#x} equeue={equeue:#x} ident={ident:#x} data={user_data:#x}"
+        );
+    }
     0
 }
 
@@ -10905,6 +10933,13 @@ fn ampr_submit_command_buffer(arguments: [u64; 6], state: &mut ProbeDispatchStat
         .map(|command| std::mem::take(&mut command.pending_completions))
         .unwrap_or_default();
     let announced = !completions.is_empty();
+    if trace_ampr_reads() {
+        eprintln!(
+            "[REMu][AMPR] submit buffer={:#x} id={id} completions={}",
+            arguments[0],
+            completions.len()
+        );
+    }
     for completion in completions {
         queue_kernel_event(
             state,
