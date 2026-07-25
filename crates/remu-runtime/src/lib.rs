@@ -5180,6 +5180,12 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     let av_player_callbacks = std::mem::take(&mut state.av_player.pending_callbacks);
     drop(state);
     invoke_av_player_event_callbacks(av_player_callbacks);
+    // Paced after the dispatch lock is released: the submitting thread waits for its own vblank,
+    // exactly as it would on the console, without stalling other guest threads.
+    let queued_flips = QUEUED_FLIPS.with(|queued| queued.replace(0));
+    for _ in 0..queued_flips {
+        pace_video_out_flip();
+    }
     ProbeImportReturn::integer(result)
 }
 
@@ -10193,13 +10199,79 @@ fn video_out_get_output_status(arguments: [u64; 6], state: &mut ProbeDispatchSta
     0
 }
 
+thread_local! {
+    /// Flips this dispatch queued, paced once the dispatch lock is released. Titles reach the
+    /// display through either the video-out call or an AGC flip packet, so the count is kept
+    /// where both paths converge.
+    static QUEUED_FLIPS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Interval the display holds each flip, in microseconds. Zero disables pacing entirely.
+static VIDEO_OUT_FLIP_INTERVAL: AtomicU64 = AtomicU64::new(DEFAULT_FLIP_INTERVAL_MICROSECONDS);
+/// Earliest instant the next flip may complete.
+static VIDEO_OUT_NEXT_FLIP: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+/// The console's default flip rate is one flip per 60 Hz vblank.
+const DEFAULT_FLIP_INTERVAL_MICROSECONDS: u64 = 1_000_000 / 60;
+
+/// Microseconds per flip for a `sceVideoOutSetFlipRate` selector.
+const fn flip_interval_microseconds(rate: i32) -> u64 {
+    match rate {
+        1 => 1_000_000 / 30,
+        2 => 1_000_000 / 20,
+        _ => DEFAULT_FLIP_INTERVAL_MICROSECONDS,
+    }
+}
+
+/// Overrides the paced flip rate, in Hz. `0` presents as fast as the guest submits.
+fn flip_rate_override() -> Option<u64> {
+    static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("REMU_FLIP_RATE_HZ")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    })
+}
+
+/// Holds the submitting thread until its flip is due.
+///
+/// Without this the guest's frame loop is never gated: flips complete the instant they are
+/// submitted, so a title that advances simulation once per displayed frame runs as fast as the
+/// host can retire draws instead of at the rate it selected.
+fn pace_video_out_flip() {
+    let interval = match flip_rate_override() {
+        Some(0) => return,
+        Some(hertz) => 1_000_000 / hertz.max(1),
+        None => VIDEO_OUT_FLIP_INTERVAL.load(Ordering::Relaxed),
+    };
+    if interval == 0 {
+        return;
+    }
+    let interval = Duration::from_micros(interval);
+    let now = Instant::now();
+    let mut next = VIDEO_OUT_NEXT_FLIP
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A guest that falls behind resumes from the present instant rather than accumulating debt
+    // and then running unbounded to catch up.
+    let due = (*next).filter(|due| *due > now).unwrap_or(now);
+    *next = Some(due + interval);
+    drop(next);
+    let delay = due.saturating_duration_since(now);
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
 fn video_out_set_flip_rate(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     if low_i32(arguments[0]) != 1 || !state.video_out.is_open {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
     }
-    if low_i32(arguments[1]) < 0 || low_i32(arguments[1]) > 2 {
+    let rate = low_i32(arguments[1]);
+    if !(0..=2).contains(&rate) {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_VALUE);
     }
+    VIDEO_OUT_FLIP_INTERVAL.store(flip_interval_microseconds(rate), Ordering::Relaxed);
     0
 }
 
@@ -10830,6 +10902,7 @@ fn queue_video_out_flip(
         eprintln!("[REMu][VIDEO] ignored flip for unregistered buffer index {buffer_index}");
         return;
     };
+    QUEUED_FLIPS.with(|queued| queued.set(queued.get().saturating_add(1)));
     let event_data = 6 | ((flip_argument & 0x0000_ffff_ffff_ffff) << 16);
     let registrations = state
         .video_out
@@ -18863,6 +18936,7 @@ mod platform_independent_tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use super::{
         AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_INDEX_BASE,
@@ -18870,11 +18944,12 @@ mod platform_independent_tests {
         AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG_INDEX,
         AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO,
         AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
-        BATCH_MAP_OPERATION_MAP_DIRECT, GuestExitCallback, KERNEL_FILES, KernelFileState,
-        ProbeDispatchState, PthreadAttrState, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND,
-        SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND,
-        SCE_KERNEL_ERROR_NOT_IMPLEMENTED, VideoOutBufferAttributes, VideoOutState,
-        agc_apply_set_base, agc_apply_submission_registers, agc_color_target_state,
+        BATCH_MAP_OPERATION_MAP_DIRECT, DEFAULT_FLIP_INTERVAL_MICROSECONDS, GuestExitCallback,
+        KERNEL_FILES, KernelFileState, ProbeDispatchState, PthreadAttrState,
+        SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
+        SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND,
+        SCE_KERNEL_ERROR_NOT_IMPLEMENTED, VIDEO_OUT_FLIP_INTERVAL, VideoOutBufferAttributes,
+        VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_color_target_state,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
         agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, ajm_finalize, ajm_initialize,
         ajm_instance_create, ajm_instance_destroy, ajm_module_register, ajm_module_unregister,
@@ -18882,17 +18957,18 @@ mod platform_independent_tests {
         ampr_command_buffer_write_kernel_event_queue, ampr_submit_command_buffer,
         civil_from_unix_seconds, clone_guest_tls, create_pthread_attr, decode_agc_memory_acquire,
         destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
-        guest_clock_gettime, guest_free, guest_global_locale,
+        flip_interval_microseconds, guest_clock_gettime, guest_free, guest_global_locale,
         guest_kernel_convert_localtime_to_utc, guest_kernel_convert_utc_to_localtime,
         guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_gettimeofday, guest_kernel_lseek,
         guest_kernel_read, guest_posix_file_result, guest_pthread_once, guest_qsort,
         guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy,
         guest_wmemmove, kernel_add_ampr_event, kernel_batch_map, kernel_release_direct_memory,
-        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity,
-        pthread_attr_get_stack, pthread_attr_set_affinity, pthread_attr_set_detach_state,
-        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
-        read_guest_u32, read_guest_u64, resolve_guest_path, rtc_get_current_clock_local_time,
-        rtc_get_current_tick, rtc_get_tick, rtc_set_tick, sanitize_save_segment, save_data_commit,
+        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pace_video_out_flip,
+        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_affinity,
+        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
+        resolve_guest_path, rtc_get_current_clock_local_time, rtc_get_current_tick, rtc_get_tick,
+        rtc_set_tick, sanitize_save_segment, save_data_commit,
         save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
         save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
         save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
@@ -21007,6 +21083,34 @@ mod platform_independent_tests {
                 + i64::from(second);
             assert_eq!(rebuilt, seconds, "round trip failed for {seconds}");
         }
+    }
+
+    /// The selector chooses the display's hold time; an unrecognized value keeps the 60 Hz
+    /// default rather than disabling pacing.
+    #[test]
+    fn flip_rate_selectors_map_to_display_intervals() {
+        assert_eq!(flip_interval_microseconds(0), 16_666);
+        assert_eq!(flip_interval_microseconds(1), 33_333);
+        assert_eq!(flip_interval_microseconds(2), 50_000);
+        assert_eq!(flip_interval_microseconds(7), 16_666);
+    }
+
+    /// Pacing must gate the guest's frame loop: submitting flips in a tight loop has to take at
+    /// least the display interval per flip.
+    #[test]
+    fn paced_flips_are_held_for_the_display_interval() {
+        VIDEO_OUT_FLIP_INTERVAL.store(4_000, Ordering::Relaxed);
+        pace_video_out_flip();
+        let start = Instant::now();
+        for _ in 0..5 {
+            pace_video_out_flip();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_micros(4_000 * 4),
+            "five paced flips returned in {elapsed:?}"
+        );
+        VIDEO_OUT_FLIP_INTERVAL.store(DEFAULT_FLIP_INTERVAL_MICROSECONDS, Ordering::Relaxed);
     }
 
     #[test]
