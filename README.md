@@ -3,15 +3,16 @@
 REmu is an experimental PlayStation 5 compatibility layer written in Rust. Its goal is to run
 legally dumped games directly on desktop operating systems without emulating the PlayStation shell.
 
-The project maps and runs authorized x86-64 game dumps under Rosetta. Dreaming Sarah currently
-boots through resource loading, submits AGC draw streams, compiles observed RDNA2 shaders to Metal,
-and flips its display buffers. A bounded headless run renders and captures the real Ratalaika splash;
-complete render state and later gameplay draws are still in progress, so playability is not claimed.
+The project maps and runs authorized x86-64 game dumps under Rosetta. The first small test title
+currently boots through resource loading, submits AGC draw streams, compiles observed RDNA2 shaders
+to Metal, and flips its display buffers. Early splash frames render correctly through the translated
+path; complete render state and later gameplay draws are still in progress, so playability is not
+claimed.
 
 See the [architecture](docs/architecture.md), [implementation roadmap](docs/roadmap.md), and
-[reference audit](docs/reference-audit.md). Current subsystem evidence and concrete gaps are tracked
-in [engineering status](docs/engineering-status.md); adapted implementation sources are tracked in
-[provenance](docs/provenance.md).
+[subsystem status](docs/status.md); adapted implementation sources are tracked in
+[provenance](docs/provenance.md). Contributions are welcome — start with
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Direction
 
@@ -34,16 +35,23 @@ cargo run -p remu-cli -- run /path/to/eboot.bin
 cargo run -p remu-cli -- gpu-info
 ```
 
-For repeatable Apple Silicon game runs, use the runner. It builds the x86-64 release, injects
-periodic Cross presses, records unresolved NIDs, and keeps logs and optional captures under
-`.remu/runs/`. With no second argument it is interactive and has no timer; pass a positive number of
-seconds only for a bounded diagnostic run. Interactive launches run from a generated `REmu.app`
+For repeatable Apple Silicon game runs, use the runner. It builds the x86-64 release, records
+unresolved NIDs, and keeps logs and optional captures under `$TMPDIR/remu-runs` (override with
+`REMU_RUN_ROOT`). With no second argument it is interactive and has no timer; pass a positive number
+of seconds only for a bounded diagnostic run. Interactive launches run from a generated `REmu.app`
 bundle so AppKit registers the process as a regular Dock application:
 
 ```sh
-scripts/run-game.sh DREAMING
-scripts/run-game.sh SUPERLIMINAL
-scripts/run-game.sh DREAMING 120
+scripts/run-game.sh /path/to/eboot.bin
+scripts/run-game.sh /path/to/eboot.bin 120
+```
+
+A non-path argument names a shortcut resolved from the environment, so frequently used titles do
+not need their paths repeated:
+
+```sh
+export REMU_EBOOT_MYGAME=/path/to/eboot.bin
+scripts/run-game.sh MYGAME
 ```
 
 Frame capture is disabled by default because reading and writing a 4K guest buffer is expensive;
@@ -63,7 +71,7 @@ default.
 
 On Apple Silicon, use the crash-capturing probe wrapper during game bring-up. It builds the
 x86-64 release binary, launches it under Rosetta and LLDB, and keeps the guest logs, backtraces,
-registers, revision, and launch settings together under `.remu/runs/`:
+registers, revision, and launch settings together under `$TMPDIR/remu-runs`:
 
 ```sh
 scripts/probe-game.sh /path/to/eboot.bin 2000000 120

@@ -17,7 +17,7 @@ Status: complete.
 - Parse ELF program headers, dynamic entries, symbols, relocations, and PS5-specific metadata.
 - Parse executable-container metadata without copying protected payloads into the repository.
 - Produce deterministic inspection output and precise validation errors.
-- Inventory required libraries/imports for the decrypted Superliminal executable and Dreaming Sarah.
+- Inventory required libraries/imports for the first authorized test titles.
 
 This milestone does not map or execute guest code.
 
@@ -47,13 +47,13 @@ This milestone does not map or execute guest code.
 
 ## M5: first game loop
 
-- Bring Dreaming Sarah through module initialization, frame submission, input, and audio.
+- Bring the first small test title through module initialization, frame submission, input, and audio.
 - Add deterministic boot checkpoints and opt-in local smoke-test configuration.
 - Fix correctness blockers by subsystem instead of adding title-specific binary patches.
 
 ## M6: compatibility growth
 
-- Use Superliminal, Void Terrarium, and larger titles as progressively broader regression targets.
+- Use progressively larger titles as broader regression targets.
 - Add codecs, savedata, richer audio, controller behavior, and synchronization as demanded.
 - Build a compatibility database from structured, non-copyrightable observations.
 

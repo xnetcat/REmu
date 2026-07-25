@@ -36,8 +36,8 @@ The fixed header is 32 bytes, little-endian:
 | `0x1c` | 4 | reserved |
 
 The fixed header is followed by `segment_count` 32-byte descriptors. The embedded ELF header starts
-at `0x20 + segment_count * 0x20`. All current Dreaming Sarah and Superliminal samples contain 12
-descriptors and place the ELF header at `0x1a0`.
+at `0x20 + segment_count * 0x20`. All container samples observed so far contain 12 descriptors and
+place the ELF header at `0x1a0`.
 
 Each descriptor contains four little-endian 64-bit values: properties, stored file offset, stored
 size, and expanded size. Bits 20 through 31 of properties select the associated ELF program-header

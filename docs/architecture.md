@@ -26,17 +26,21 @@ SELF / ELF / PRX
        -> SPIR-V -> Vulkan on Linux
 ```
 
-## Initial crate boundaries
+## Crate boundaries
 
 - `remu-core`: guest-domain value types shared across subsystems.
-- `remu-loader`: executable identification and, incrementally, SELF/ELF/PRX loading.
 - `remu-platform`: host OS and execution-environment discovery.
+- `remu-loader`: SELF/ELF executable parsing and module dependency graphs.
+- `remu-memory`: guest address-space reservation, mapping, and CPU write watching.
+- `remu-runtime`: dynamic linking, HLE kernel and library services, audio, and guest execution.
 - `remu-gpu`: backend-neutral host GPU contracts expressed in guest-domain terms.
-- `remu-gpu-metal`: direct macOS Metal implementation.
-- `remu-cli`: inspection, diagnostics, and later game launch orchestration.
+- `remu-gpu-metal`: direct macOS Metal presenter and resource backend.
+- `remu-shader`: RDNA2 shader decoding, typed IR, and static evaluation.
+- `remu-shader-metal`: MSL lowering for the typed shader IR.
+- `remu-cli`: inspection, diagnostics, and game launch orchestration.
 
-CPU, memory, HLE, AGC, shader-IR, audio, input, and debugger crates will be introduced only when a
-vertical slice requires them. This avoids cementing placeholder APIs before their invariants are
+Further crates (a debugger, other GPU backends, a native CPU translator) are introduced only when
+a vertical slice requires them. This avoids cementing placeholder APIs before their invariants are
 understood.
 
 ## Graphics rules
