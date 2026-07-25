@@ -3,6 +3,7 @@
 
 //! Backend-neutral Gen5/RDNA2 shader decoding, evaluation, and intermediate representation.
 
+mod coverage;
 mod decoder;
 mod evaluator;
 mod format;
@@ -11,6 +12,7 @@ mod ir;
 mod metadata;
 mod state;
 
+pub use coverage::{OpcodeHistogram, OpcodeUsage, opcode_coverage_report};
 pub use decoder::{DecodeError, decode_program, read_program};
 pub use evaluator::{EvaluationError, EvaluationOptions, evaluate_shader};
 pub use format::decode_unified_format;

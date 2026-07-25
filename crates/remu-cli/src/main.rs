@@ -465,12 +465,14 @@ fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("eboot.bin");
-    match linked.probe_entry(
+    let outcome = linked.probe_entry(
         image_name,
         &module_report.app_root,
         import_limit,
         timeout_seconds,
-    ) {
+    );
+    remu_runtime::report_shader_opcode_coverage();
+    match outcome {
         Ok(outcome) => {
             println!("return_value={}", outcome.return_value);
             println!("import_hits={}", outcome.import_hits);
@@ -528,6 +530,7 @@ fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode 
 
     let presenter_result = remu_gpu_metal::run_presenter(receiver);
     remu_gpu::clear_event_sink();
+    remu_runtime::report_shader_opcode_coverage();
     if let Err(error) = presenter_result {
         eprintln!("error: {error}");
         return ExitCode::FAILURE;
