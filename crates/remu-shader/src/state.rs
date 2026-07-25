@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::{ComputeSystemRegisters, Program, ShaderMetadata, ShaderState};
+use crate::{ComputeSystemRegisters, Program, ShaderState};
 
 const PS_USER_DATA_REGISTER: u32 = 0x00c;
 const VS_USER_DATA_REGISTER: u32 = 0x04c;
@@ -28,7 +28,6 @@ pub enum ShaderStateError {
 /// to a particular packet or backend type.
 pub fn build_shader_state(
     program: Arc<Program>,
-    metadata: Option<ShaderMetadata>,
     user_data_base_register: u32,
     user_data_scalar_register_base: u32,
     compute_system_registers: Option<ComputeSystemRegisters>,
@@ -72,7 +71,6 @@ pub fn build_shader_state(
     Ok(ShaderState {
         program,
         user_data,
-        metadata,
         compute_system_registers,
         user_data_scalar_register_base,
     })
@@ -86,13 +84,18 @@ mod tests {
     #[test]
     fn decodes_stage_specific_user_sgpr_count_bits() {
         let program = Arc::new(Program::new(0x1000, Vec::<Instruction>::new()));
-        let state = build_shader_state(program, None, PS_USER_DATA_REGISTER, 0, None, |register| {
-            match register {
-                0x00b => Some((3 << 1) | (1 << 27)),
-                _ => Some(register),
-            }
-        })
-        .expect("pixel user data");
+        let state =
+            build_shader_state(
+                program,
+                PS_USER_DATA_REGISTER,
+                0,
+                None,
+                |register| match register {
+                    0x00b => Some((3 << 1) | (1 << 27)),
+                    _ => Some(register),
+                },
+            )
+            .expect("pixel user data");
         assert_eq!(state.user_data.len(), 35);
         assert_eq!(state.user_data[0], PS_USER_DATA_REGISTER);
         assert_eq!(state.user_data[34], PS_USER_DATA_REGISTER + 34);
@@ -101,7 +104,7 @@ mod tests {
     #[test]
     fn es_does_not_interpret_the_stage_specific_msb() {
         let program = Arc::new(Program::new(0x1000, Vec::<Instruction>::new()));
-        let state = build_shader_state(program, None, ES_USER_DATA_REGISTER, 0, None, |register| {
+        let state = build_shader_state(program, ES_USER_DATA_REGISTER, 0, None, |register| {
             (register == 0x0cb).then_some((7 << 1) | (1 << 27))
         })
         .expect("export user data");

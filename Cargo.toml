@@ -27,6 +27,8 @@ iced-x86 = "1.21"
 libc = "0.2"
 metal = "0.33"
 objc = "0.2"
+sha1 = "0.10"
+smallvec = "1.15"
 thiserror = "2.0"
 winit = "0.30"
 

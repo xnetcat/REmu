@@ -1,7 +1,11 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+
+use smallvec::SmallVec;
 
 use crate::{
     BufferMemoryControl, GlobalMemoryBinding, GlobalMemoryControl, GuestMemoryReader, ImageBinding,
@@ -10,19 +14,32 @@ use crate::{
     decode_inline_constant, decode_unified_format,
 };
 
+// Descriptor-control fields can retain extended scalar indices even when ordinary source operand
+// encodings in the same range denote inline constants. Keep the full decoder address space here;
+// reducing this to the architectural SGPR count made those controls index past the path state.
 const SCALAR_REGISTER_COUNT: usize = 256;
 const SCALAR_REGISTER_COUNT_U32: u32 = 256;
+// Gen5 export shaders are merged ES+GS programs. Hardware places the merged-wave descriptor in
+// s3 and starts GS user data at s8. Metal launches the translated vertex function in SIMD32
+// groups, while these guest prologues use the wave64 mask idiom `exec >> (64 - count)`. Present a
+// full virtual wave here so the prologue preserves Metal's exact active-lane ballot; the Metal
+// draw's vertex count still supplies the real tail mask for partial groups.
+const MERGED_EXPORT_WAVE_INFO: u32 = 64 | (64 << 8);
 const IMAGE_DESCRIPTOR_DWORDS: usize = 8;
 const SAMPLER_DESCRIPTOR_DWORDS: usize = 4;
 const MAX_PATH_STEPS: usize = 1 << 20;
 const RDNA_WAVE_MASK: u64 = u32::MAX as u64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct EvaluationOptions {
     pub resolve_vertex_inputs: bool,
     pub required_vertex_record_count: Option<u32>,
     pub maximum_binding_bytes: usize,
     pub discover_static_control_flow: bool,
+    /// Retain CPU copies of global bindings in the result. Runtime backends that bind
+    /// identity-mapped guest memory directly can disable this to avoid copying multi-megabyte
+    /// buffers once per draw.
+    pub capture_global_binding_data: bool,
 }
 
 impl Default for EvaluationOptions {
@@ -32,6 +49,7 @@ impl Default for EvaluationOptions {
             required_vertex_record_count: None,
             maximum_binding_bytes: 16 * 1024 * 1024,
             discover_static_control_flow: true,
+            capture_global_binding_data: true,
         }
     }
 }
@@ -96,6 +114,75 @@ struct ScalarPath {
     supplemental: bool,
 }
 
+struct VisitedPaths {
+    small: Vec<(u32, u64)>,
+    large: Option<HashSet<(u32, u64)>>,
+}
+
+struct ScalarMemoryReads {
+    sorted: Vec<(u64, u32)>,
+}
+
+impl ScalarMemoryReads {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            sorted: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn insert(&mut self, address: u64, value: u32) {
+        match self.sorted.last_mut() {
+            Some((last_address, last_value)) if *last_address == address => {
+                *last_value = value;
+                return;
+            }
+            Some((last_address, _)) if *last_address < address => {
+                self.sorted.push((address, value));
+                return;
+            }
+            _ => {}
+        }
+        match self
+            .sorted
+            .binary_search_by_key(&address, |(current, _)| *current)
+        {
+            Ok(index) => self.sorted[index].1 = value,
+            Err(index) => self.sorted.insert(index, (address, value)),
+        }
+    }
+
+    fn into_sorted_vec(self) -> Vec<(u64, u32)> {
+        self.sorted
+    }
+}
+
+impl VisitedPaths {
+    fn new() -> Self {
+        Self {
+            small: Vec::with_capacity(8),
+            large: None,
+        }
+    }
+
+    fn insert(&mut self, key: (u32, u64)) -> bool {
+        if let Some(large) = self.large.as_mut() {
+            return large.insert(key);
+        }
+        if self.small.contains(&key) {
+            return false;
+        }
+        if self.small.len() < 16 {
+            self.small.push(key);
+            return true;
+        }
+        let mut large = HashSet::with_capacity(32);
+        large.extend(self.small.drain(..));
+        let inserted = large.insert(key);
+        self.large = Some(large);
+        inserted
+    }
+}
+
 struct Evaluator<'a, M> {
     memory: &'a M,
     state: &'a ShaderState,
@@ -103,11 +190,10 @@ struct Evaluator<'a, M> {
     initial_registers: [u32; SCALAR_REGISTER_COUNT],
     final_registers: [u32; SCALAR_REGISTER_COUNT],
     pending_paths: Vec<ScalarPath>,
-    visited_paths: BTreeSet<(u32, u64)>,
+    visited_paths: VisitedPaths,
     image_bindings: Vec<ImageBinding>,
-    image_by_pc: BTreeMap<u32, usize>,
+    scalar_memory_reads: ScalarMemoryReads,
     global_bindings: Vec<GlobalMemoryBinding>,
-    global_by_address: BTreeMap<(u32, u64), usize>,
     vertex_inputs: Vec<VertexInputBinding>,
     evaluated_steps: usize,
 }
@@ -129,6 +215,9 @@ pub fn evaluate_shader(
         };
         *register = value;
     }
+    if state.user_data_scalar_register_base == 8 {
+        registers[3] = MERGED_EXPORT_WAVE_INFO;
+    }
     if let Some(system_registers) = state.compute_system_registers {
         system_registers.clear_static_values(&mut registers);
     }
@@ -142,13 +231,14 @@ pub fn evaluate_shader(
         options,
         initial_registers: registers,
         final_registers: registers,
-        pending_paths: Vec::new(),
-        visited_paths: BTreeSet::new(),
-        image_bindings: Vec::new(),
-        image_by_pc: BTreeMap::new(),
-        global_bindings: Vec::new(),
-        global_by_address: BTreeMap::new(),
-        vertex_inputs: Vec::new(),
+        pending_paths: Vec::with_capacity(4),
+        visited_paths: VisitedPaths::new(),
+        image_bindings: Vec::with_capacity(state.program.image_binding_capacity_hint()),
+        scalar_memory_reads: ScalarMemoryReads::with_capacity(
+            state.program.scalar_memory_read_capacity_hint(),
+        ),
+        global_bindings: Vec::with_capacity(state.program.global_binding_capacity_hint()),
+        vertex_inputs: Vec::with_capacity(4),
         evaluated_steps: 0,
     };
     if !state.program.instructions.is_empty() {
@@ -163,25 +253,45 @@ pub fn evaluate_shader(
     while let Some(path) = evaluator.pending_paths.pop() {
         evaluator.execute_path(path)?;
     }
+    let scalar_register_count = state
+        .program
+        .runtime_scalar_registers()
+        .last()
+        .and_then(|register| usize::try_from(*register).ok())
+        .and_then(|register| register.checked_add(1))
+        .unwrap_or_default();
     Ok(ShaderEvaluation {
-        initial_scalar_registers: evaluator.initial_registers.to_vec(),
-        scalar_registers: evaluator.final_registers.to_vec(),
+        initial_scalar_registers: SmallVec::from_slice(
+            &evaluator.initial_registers[..scalar_register_count],
+        ),
+        scalar_registers: SmallVec::from_slice(&evaluator.final_registers[..scalar_register_count]),
+        scalar_memory_reads: evaluator.scalar_memory_reads.into_sorted_vec(),
         image_bindings: evaluator.image_bindings,
         global_memory_bindings: evaluator.global_bindings,
         compute_system_registers: state.compute_system_registers,
-        runtime_scalar_registers: state.program.runtime_scalar_registers().clone(),
         vertex_inputs: evaluator.vertex_inputs,
     })
 }
 
 impl<M: GuestMemoryReader> Evaluator<'_, M> {
-    fn queue_path(&mut self, path: ScalarPath) {
-        let Some(instruction) = self.state.program.instructions.get(path.instruction_index) else {
+    fn queue_path(&mut self, mut path: ScalarPath) {
+        let Some(instruction_index) = self
+            .state
+            .program
+            .next_evaluation_instruction_index(path.instruction_index)
+        else {
             return;
         };
+        path.instruction_index = instruction_index;
+        let instruction = &self.state.program.instructions[instruction_index];
         let key = (
             instruction.pc,
-            scalar_state_hash(&path.registers, path.exec_mask, path.scalar_condition),
+            scalar_state_hash(
+                &path.registers,
+                self.state.program.runtime_scalar_register_indices(),
+                path.exec_mask,
+                path.scalar_condition,
+            ),
         );
         if self.visited_paths.insert(key) {
             self.pending_paths.push(path);
@@ -190,7 +300,14 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
 
     #[allow(clippy::too_many_lines)]
     fn execute_path(&mut self, mut path: ScalarPath) -> Result<(), EvaluationError> {
-        while let Some(instruction) = self.state.program.instructions.get(path.instruction_index) {
+        let mut backward_branch_visits = Vec::<(u32, usize)>::with_capacity(4);
+        while let Some(instruction_index) = self
+            .state
+            .program
+            .next_evaluation_instruction_index(path.instruction_index)
+        {
+            path.instruction_index = instruction_index;
+            let instruction = &self.state.program.instructions[instruction_index];
             self.evaluated_steps = self.evaluated_steps.saturating_add(1);
             if self.evaluated_steps > MAX_PATH_STEPS {
                 return Err(EvaluationError::ControlFlowLimit);
@@ -216,7 +333,14 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     path.exec_mask,
                     path.scalar_condition,
                 )?;
-                if self.options.discover_static_control_flow {
+                let backward = target_pc <= instruction.pc;
+                let backward_visits = backward_branch_visits
+                    .iter()
+                    .find(|(pc, _)| *pc == instruction.pc)
+                    .map(|(_, visits)| *visits)
+                    .unwrap_or_default();
+                if self.options.discover_static_control_flow && (!backward || backward_visits == 0)
+                {
                     let alternate_index = if taken {
                         path.instruction_index.saturating_add(1)
                     } else {
@@ -230,6 +354,38 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 if taken {
                     if path.supplemental && target_pc <= instruction.pc {
                         break;
+                    }
+                    if backward {
+                        // EXEC/VCC loops are controlled by vector lane state that static scalar
+                        // evaluation intentionally does not execute. Follow one iteration to
+                        // discover in-loop resources, then continue through the already queued
+                        // exit path. Scalar SCC loops can still initialize bounded tables exactly.
+                        let maximum_visits = if matches!(
+                            instruction.opcode.known_name(),
+                            Some(
+                                "SBranch"
+                                    | "SCbranchVccz"
+                                    | "SCbranchVccnz"
+                                    | "SCbranchExecz"
+                                    | "SCbranchExecnz"
+                            )
+                        ) {
+                            1
+                        } else {
+                            4_096
+                        };
+                        if backward_visits >= maximum_visits {
+                            path.instruction_index = path.instruction_index.saturating_add(1);
+                            continue;
+                        }
+                        if let Some((_, visits)) = backward_branch_visits
+                            .iter_mut()
+                            .find(|(pc, _)| *pc == instruction.pc)
+                        {
+                            *visits = visits.saturating_add(1);
+                        } else {
+                            backward_branch_visits.push((instruction.pc, 1));
+                        }
                     }
                     path.instruction_index = target_index;
                 } else {
@@ -345,7 +501,6 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                         .map_err(|_| EvaluationError::BindingSizeOverflow { pc: instruction.pc })?,
                 )
                 .ok_or(EvaluationError::BindingSizeOverflow { pc: instruction.pc })?
-                .max(256 * 1024)
         };
         self.record_global_binding(
             instruction,
@@ -359,22 +514,67 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             },
         )?;
 
-        for (index, destination) in instruction.destinations.iter().enumerate() {
+        for destination in &instruction.destinations {
             if destination.kind != OperandKind::ScalarRegister
                 || destination.value >= SCALAR_REGISTER_COUNT_U32
             {
                 return Err(invalid(instruction, "scalar-memory destination"));
             }
-            if unbound {
+        }
+        if unbound {
+            for destination in &instruction.destinations {
                 registers[destination.value as usize] = 0;
-                continue;
             }
+            return Ok(());
+        }
+
+        // Hardware scalar loads fetch a contiguous vector. Read the complete vector in one guest
+        // access as well: ProcessGuestMemory can validate one mapped range and copy it directly,
+        // instead of repeating its TLS generation/range lookup for every four-byte component.
+        // GFX10 scalar loads top out at 16 dwords, so this stays allocation-free.
+        let component_byte_count = instruction.destinations.len().saturating_mul(4);
+        let bulk_in_bounds = descriptor.is_none_or(|descriptor| {
+            byte_offset
+                .checked_add(component_byte_count as u64)
+                .is_some_and(|end| end <= descriptor.size_bytes)
+        });
+        if component_byte_count <= 64 && bulk_in_bounds {
+            let mut bytes = [0_u8; 64];
+            if !self
+                .memory
+                .read(address, &mut bytes[..component_byte_count])
+            {
+                return Err(EvaluationError::MemoryFault {
+                    pc: instruction.pc,
+                    address,
+                    length: component_byte_count,
+                });
+            }
+            for (index, destination) in instruction.destinations.iter().enumerate() {
+                let component_address = address.wrapping_add((index as u64) * 4);
+                let component = index * 4;
+                let value = u32::from_le_bytes(
+                    bytes[component..component + 4]
+                        .try_into()
+                        .expect("scalar component is four bytes"),
+                );
+                self.scalar_memory_reads.insert(component_address, value);
+                registers[destination.value as usize] = value;
+            }
+            return Ok(());
+        }
+
+        for (index, destination) in instruction.destinations.iter().enumerate() {
             let component_offset = byte_offset.wrapping_add((index as u64) * 4);
             if descriptor.is_some_and(|descriptor| {
                 component_offset
                     .checked_add(4)
                     .is_none_or(|end| end > descriptor.size_bytes)
             }) {
+                if supplemental {
+                    registers[destination.value as usize] = 0;
+                    continue;
+                }
                 return Err(invalid(instruction, "scalar buffer load bounds"));
             }
             let component_address = address.wrapping_add((index as u64) * 4);
@@ -386,7 +586,9 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     length: 4,
                 });
             }
-            registers[destination.value as usize] = u32::from_le_bytes(bytes);
+            let value = u32::from_le_bytes(bytes);
+            self.scalar_memory_reads.insert(component_address, value);
+            registers[destination.value as usize] = value;
         }
         Ok(())
     }
@@ -469,7 +671,10 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 },
             );
         }
-        if self.options.resolve_vertex_inputs && is_vertex_fetch(instruction, control, descriptor) {
+        let bounded_vertex_fetch = is_vertex_fetch(instruction, control, descriptor)
+            && (self.options.resolve_vertex_inputs
+                || self.options.required_vertex_record_count.is_some());
+        if bounded_vertex_fetch {
             let scalar_offset = instruction
                 .sources
                 .get(2)
@@ -486,20 +691,36 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 self.options.required_vertex_record_count,
             )
             .min(self.options.maximum_binding_bytes as u64);
-            let data =
-                self.read_exact_binding(instruction.pc, descriptor.base_address, desired_size)?;
-            self.vertex_inputs.push(VertexInputBinding {
-                pc: instruction.pc,
-                location: u32::try_from(self.vertex_inputs.len())
-                    .map_err(|_| EvaluationError::BindingSizeOverflow { pc: instruction.pc })?,
-                component_count: control.dword_count,
-                data_format: descriptor.data_format,
-                number_format: descriptor.number_format,
-                base_address: descriptor.base_address,
-                stride: descriptor.stride,
-                offset_bytes: binding_offset,
-                data,
-            });
+            if self.options.resolve_vertex_inputs {
+                let data =
+                    self.read_exact_binding(instruction.pc, descriptor.base_address, desired_size)?;
+                self.vertex_inputs.push(VertexInputBinding {
+                    pc: instruction.pc,
+                    location: u32::try_from(self.vertex_inputs.len())
+                        .map_err(|_| EvaluationError::BindingSizeOverflow { pc: instruction.pc })?,
+                    component_count: control.dword_count,
+                    data_format: descriptor.data_format,
+                    number_format: descriptor.number_format,
+                    base_address: descriptor.base_address,
+                    stride: descriptor.stride,
+                    offset_bytes: binding_offset,
+                    data,
+                });
+            } else {
+                let binding_base = descriptor.base_address & !3;
+                let prefix_bytes = descriptor.base_address - binding_base;
+                self.record_global_binding(
+                    instruction,
+                    BindingRequest {
+                        scalar_address: control.scalar_resource,
+                        base_address: binding_base,
+                        requested_bytes: desired_size.saturating_add(prefix_bytes),
+                        writable,
+                        supplemental,
+                        allow_shorter: false,
+                    },
+                )?;
+            }
             return Ok(());
         }
         let binding_base = descriptor.base_address & !3;
@@ -524,17 +745,22 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         registers: &[u32; SCALAR_REGISTER_COUNT],
         supplemental: bool,
     ) -> Result<(), EvaluationError> {
-        if supplemental && self.image_by_pc.contains_key(&instruction.pc) {
+        if supplemental
+            && self
+                .image_bindings
+                .iter()
+                .any(|binding| binding.pc == instruction.pc)
+        {
             return Ok(());
         }
         let resource_descriptor =
-            copy_registers(registers, control.scalar_resource, IMAGE_DESCRIPTOR_DWORDS)
+            copy_registers::<8>(registers, control.scalar_resource, IMAGE_DESCRIPTOR_DWORDS)
                 .ok_or_else(|| invalid(instruction, "image resource descriptor registers"))?;
         let sampler_descriptor = if uses_sampler(instruction.opcode) {
-            copy_registers(registers, control.scalar_sampler, SAMPLER_DESCRIPTOR_DWORDS)
+            copy_registers::<4>(registers, control.scalar_sampler, SAMPLER_DESCRIPTOR_DWORDS)
                 .ok_or_else(|| invalid(instruction, "image sampler descriptor registers"))?
         } else {
-            Vec::new()
+            SmallVec::new()
         };
         let mip_level = (instruction.opcode.is("ImageLoadMip")
             || instruction.opcode.is("ImageStoreMip"))
@@ -548,7 +774,11 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             sampler_descriptor,
             mip_level,
         };
-        if let Some(index) = self.image_by_pc.get(&instruction.pc).copied() {
+        if let Some(index) = self
+            .image_bindings
+            .iter()
+            .position(|existing| existing.pc == instruction.pc)
+        {
             let existing = &self.image_bindings[index];
             let existing_null = existing.resource_descriptor.iter().all(|word| *word == 0);
             let candidate_null = binding.resource_descriptor.iter().all(|word| *word == 0);
@@ -561,8 +791,6 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 return Err(EvaluationError::DynamicImageDescriptor { pc: instruction.pc });
             }
         } else {
-            self.image_by_pc
-                .insert(instruction.pc, self.image_bindings.len());
             self.image_bindings.push(binding);
         }
         Ok(())
@@ -573,8 +801,17 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         instruction: &Instruction,
         request: BindingRequest,
     ) -> Result<(), EvaluationError> {
-        let key = (request.scalar_address, request.base_address);
-        if let Some(index) = self.global_by_address.get(&key).copied() {
+        if let Some(index) = self.global_bindings.iter().position(|binding| {
+            binding.scalar_address == request.scalar_address
+                && binding.base_address == request.base_address
+        }) {
+            if request.requested_bytes > self.global_bindings[index].byte_count as u64 {
+                let (byte_count, expanded) = self.read_binding_request(instruction.pc, request)?;
+                if byte_count > self.global_bindings[index].byte_count {
+                    self.global_bindings[index].byte_count = byte_count;
+                    self.global_bindings[index].data = expanded;
+                }
+            }
             let binding = &mut self.global_bindings[index];
             if !binding.instruction_pcs.contains(&instruction.pc) {
                 binding.instruction_pcs.push(instruction.pc);
@@ -582,33 +819,72 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             binding.writable |= request.writable;
             return Ok(());
         }
-        let data = if request.base_address == 0 && request.supplemental {
-            vec![0; usize::try_from(request.requested_bytes.clamp(4, 4096)).unwrap_or(4)]
-        } else if request.allow_shorter {
-            self.read_adaptive_binding(
-                instruction.pc,
-                request.base_address,
-                request.requested_bytes,
-            )?
-        } else {
-            self.read_exact_binding(
-                instruction.pc,
-                request.base_address,
-                request.requested_bytes,
-            )?
-        };
+        let (byte_count, data) = self.read_binding_request(instruction.pc, request)?;
+        let mut instruction_pcs = SmallVec::new();
+        instruction_pcs.push(instruction.pc);
         let binding = GlobalMemoryBinding {
             scalar_address: request.scalar_address,
             base_address: request.base_address,
-            instruction_pcs: vec![instruction.pc],
+            instruction_pcs,
+            byte_count,
             data,
             writable: request.writable,
             write_back_to_guest: request.base_address != 0,
         };
-        self.global_by_address
-            .insert(key, self.global_bindings.len());
         self.global_bindings.push(binding);
         Ok(())
+    }
+
+    fn read_binding_request(
+        &self,
+        pc: u32,
+        request: BindingRequest,
+    ) -> Result<(usize, Vec<u8>), EvaluationError> {
+        let data = if request.base_address == 0 && request.supplemental {
+            vec![0; usize::try_from(request.requested_bytes.clamp(4, 4096)).unwrap_or(4)]
+        } else if !self.options.capture_global_binding_data {
+            let maximum_length = usize::try_from(
+                request
+                    .requested_bytes
+                    .max(4)
+                    .min(self.options.maximum_binding_bytes as u64),
+            )
+            .map_err(|_| EvaluationError::BindingSizeOverflow { pc })?;
+            if let Some(readable_length) = self
+                .memory
+                .readable_prefix_length(request.base_address, maximum_length)
+            {
+                let byte_count = if request.allow_shorter {
+                    readable_length.min(maximum_length)
+                } else if readable_length >= maximum_length {
+                    maximum_length
+                } else {
+                    return Err(EvaluationError::MemoryFault {
+                        pc,
+                        address: request.base_address,
+                        length: maximum_length,
+                    });
+                };
+                if byte_count < 4 {
+                    return Err(EvaluationError::MemoryFault {
+                        pc,
+                        address: request.base_address,
+                        length: maximum_length,
+                    });
+                }
+                return Ok((byte_count, Vec::new()));
+            }
+            if request.allow_shorter {
+                self.read_adaptive_binding(pc, request.base_address, request.requested_bytes)?
+            } else {
+                self.read_exact_binding(pc, request.base_address, request.requested_bytes)?
+            }
+        } else if request.allow_shorter {
+            self.read_adaptive_binding(pc, request.base_address, request.requested_bytes)?
+        } else {
+            self.read_exact_binding(pc, request.base_address, request.requested_bytes)?
+        };
+        Ok((data.len(), data))
     }
 
     fn read_exact_binding(
@@ -663,12 +939,17 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
     }
 }
 
-fn scalar_state_hash(registers: &[u32], exec_mask: u64, scalar_condition: bool) -> u64 {
+fn scalar_state_hash(
+    registers: &[u32],
+    register_indices: &[u8],
+    exec_mask: u64,
+    scalar_condition: bool,
+) -> u64 {
     const OFFSET: u64 = 14_695_981_039_346_656_037;
     const PRIME: u64 = 1_099_511_628_211;
     let mut hash = OFFSET;
-    for value in registers {
-        hash = (hash ^ u64::from(*value)).wrapping_mul(PRIME);
+    for &index in register_indices {
+        hash = (hash ^ u64::from(registers[usize::from(index)])).wrapping_mul(PRIME);
     }
     hash = (hash ^ exec_mask).wrapping_mul(PRIME);
     (hash ^ u64::from(scalar_condition)).wrapping_mul(PRIME)
@@ -1579,14 +1860,17 @@ fn required_vertex_bytes(
         .min(last_record.saturating_add(record_span))
 }
 
-fn copy_registers(
+fn copy_registers<const N: usize>(
     registers: &[u32; SCALAR_REGISTER_COUNT],
     start: u32,
     count: usize,
-) -> Option<Vec<u32>> {
+) -> Option<SmallVec<[u32; N]>>
+where
+    [u32; N]: smallvec::Array<Item = u32>,
+{
     let start = usize::try_from(start).ok()?;
     let end = start.checked_add(count)?;
-    Some(registers.get(start..end)?.to_vec())
+    Some(SmallVec::from_slice(registers.get(start..end)?))
 }
 
 fn uses_sampler(opcode: Opcode) -> bool {
@@ -1626,7 +1910,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{ExportControl, Program, ShaderMetadata};
+    use crate::{ExportControl, Program};
 
     #[derive(Default)]
     struct TestMemory(BTreeMap<u64, u8>);
@@ -1684,11 +1968,49 @@ mod tests {
     fn state(instructions: Vec<Instruction>, user_data: Vec<u32>) -> ShaderState {
         ShaderState {
             program: Arc::new(Program::new(0x1000, instructions)),
-            user_data,
-            metadata: Some(ShaderMetadata::default()),
+            user_data: user_data.into(),
             compute_system_registers: None,
             user_data_scalar_register_base: 0,
         }
+    }
+
+    #[test]
+    fn initializes_merged_export_wave_info_before_user_sgprs() {
+        let shader = ShaderState {
+            program: Arc::new(Program::new(
+                0x1000,
+                vec![
+                    instruction(
+                        0,
+                        ShaderEncoding::Sop1,
+                        "SMovB32",
+                        vec![Operand::scalar(3)],
+                        vec![Operand::scalar(4)],
+                        None,
+                    ),
+                    instruction(
+                        4,
+                        ShaderEncoding::Sop1,
+                        "SMovB32",
+                        vec![Operand::scalar(8)],
+                        vec![Operand::scalar(5)],
+                        None,
+                    ),
+                    end(8),
+                ],
+            )),
+            user_data: vec![0x1234_5678].into(),
+            compute_system_registers: None,
+            user_data_scalar_register_base: 8,
+        };
+
+        let evaluation = evaluate_shader(&TestMemory::default(), &shader, Default::default())
+            .expect("merged export evaluation");
+
+        assert_eq!(evaluation.initial_scalar_registers[3], 0x4040);
+        assert_eq!(evaluation.scalar_registers[4], 0x4040);
+        assert_eq!(evaluation.initial_scalar_registers[8], 0x1234_5678);
+        assert_eq!(evaluation.scalar_registers[5], 0x1234_5678);
     }
 
     #[test]
@@ -1725,6 +2047,59 @@ mod tests {
 
         assert!(descriptor.swizzle_enabled);
         assert_eq!(descriptor.size_bytes, 512);
+    }
+
+    #[test]
+    fn bounds_runtime_vertex_buffers_to_the_draws_referenced_records() {
+        let mut memory = TestMemory::default();
+        memory.write(0x2000, &[0; 96]);
+        let selectors = 4 | (5 << 3) | (6 << 6) | (7 << 9);
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Mubuf,
+                    "BufferLoadFormatX",
+                    vec![
+                        Operand::vector(5),
+                        Operand::scalar(0),
+                        Operand::source(128, None),
+                    ],
+                    vec![Operand::vector(7)],
+                    Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                        dword_count: 1,
+                        vector_address: 5,
+                        vector_data: 7,
+                        scalar_resource: 0,
+                        instruction_format: None,
+                        offset_bytes: 0,
+                        index_enabled: true,
+                        offset_enabled: false,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                        tfe: false,
+                    })),
+                ),
+                end(8),
+            ],
+            vec![0x2000, 24 << 16, 0xaaaa, selectors | (60 << 12) | (3 << 28)],
+        );
+
+        let evaluation = evaluate_shader(
+            &memory,
+            &shader,
+            EvaluationOptions {
+                required_vertex_record_count: Some(4),
+                ..EvaluationOptions::default()
+            },
+        )
+        .expect("bounded runtime vertex fetch evaluation");
+
+        assert!(evaluation.vertex_inputs.is_empty());
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].data.len(), 96);
     }
 
     #[test]
@@ -1814,6 +2189,95 @@ mod tests {
     }
 
     #[test]
+    fn bounds_vector_controlled_backward_loops_during_scalar_discovery() {
+        let mut branch = instruction(
+            4,
+            ShaderEncoding::Sopp,
+            "SCbranchExecnz",
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        branch.words[0] = u32::from((-2_i16).cast_unsigned());
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Vop1,
+                    "VMovB32",
+                    vec![Operand::vector(0)],
+                    vec![Operand::vector(1)],
+                    None,
+                ),
+                branch,
+                end(8),
+            ],
+            Vec::new(),
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("vector-controlled runtime loop must not exhaust static discovery");
+        assert!(evaluation.global_memory_bindings.is_empty());
+    }
+
+    #[test]
+    fn exits_an_unconditional_back_edge_after_discovering_the_vector_loop_once() {
+        let mut exit = instruction(
+            4,
+            ShaderEncoding::Sopp,
+            "SCbranchExecz",
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        exit.words[0] = 2;
+        let mut back_edge = instruction(
+            12,
+            ShaderEncoding::Sopp,
+            "SBranch",
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        back_edge.words[0] = u32::from((-3_i16).cast_unsigned());
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Vop1,
+                    "VMovB32",
+                    vec![Operand::vector(0)],
+                    vec![Operand::vector(1)],
+                    None,
+                ),
+                exit,
+                instruction(
+                    8,
+                    ShaderEncoding::Vop1,
+                    "VMovB32",
+                    vec![Operand::vector(1)],
+                    vec![Operand::vector(2)],
+                    None,
+                ),
+                back_edge,
+                end(16),
+            ],
+            Vec::new(),
+        );
+
+        evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("unconditional vector loop back edge must remain bounded");
+    }
+
+    #[test]
     fn executes_scalar_loads_and_records_the_backing_binding() {
         let mut memory = TestMemory::default();
         memory.write(0x2000, &0x1122_3344_u32.to_le_bytes());
@@ -1840,8 +2304,48 @@ mod tests {
             .expect("scalar load evaluation");
         assert_eq!(evaluation.scalar_registers[4], 0x1122_3344);
         assert_eq!(evaluation.scalar_registers[5], 0xaabb_ccdd);
+        assert_eq!(
+            evaluation.scalar_memory_reads,
+            vec![(0x2000, 0x1122_3344), (0x2004, 0xaabb_ccdd)]
+        );
         assert_eq!(evaluation.global_memory_bindings.len(), 1);
         assert_eq!(evaluation.global_memory_bindings[0].data.len(), 8);
+    }
+
+    #[test]
+    fn grows_shared_scalar_binding_to_the_largest_observed_load() {
+        let mut memory = TestMemory::default();
+        memory.write(0x2000, &[0; 68]);
+        let scalar_load = |pc, immediate_offset_bytes, destination| {
+            instruction(
+                pc,
+                ShaderEncoding::Smem,
+                "SLoadDword",
+                vec![Operand::scalar(0)],
+                vec![Operand::scalar(destination)],
+                Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                    destination_count: 1,
+                    immediate_offset_bytes,
+                    dynamic_offset_register: None,
+                })),
+            )
+        };
+        let shader = state(
+            vec![scalar_load(0, 0, 4), scalar_load(8, 64, 5), end(16)],
+            vec![0x2000, 0],
+        );
+
+        let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
+            .expect("scalar binding growth evaluation");
+
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].data.len(), 68);
+        assert_eq!(
+            evaluation.global_memory_bindings[0]
+                .instruction_pcs
+                .as_slice(),
+            [0, 8]
+        );
     }
 
     #[test]
@@ -1896,12 +2400,12 @@ mod tests {
         .expect("image evaluation");
         assert_eq!(evaluation.image_bindings.len(), 1);
         assert_eq!(
-            evaluation.image_bindings[0].resource_descriptor,
-            (1..=8).collect::<Vec<_>>()
+            evaluation.image_bindings[0].resource_descriptor.as_slice(),
+            (1..=8).collect::<Vec<_>>().as_slice()
         );
         assert_eq!(
-            evaluation.image_bindings[0].sampler_descriptor,
-            (9..=12).collect::<Vec<_>>()
+            evaluation.image_bindings[0].sampler_descriptor.as_slice(),
+            (9..=12).collect::<Vec<_>>().as_slice()
         );
     }
 }

@@ -51,8 +51,8 @@ struct Frame {
     dwords: usize,
 }
 
-/// Decodes one bounded Gen5/RDNA shader stream. The input must end at an `S_ENDPGM`; trailing
-/// allocation contents are deliberately ignored after that architectural terminator.
+/// Decodes one bounded Gen5/RDNA shader stream. The input must end at an `S_ENDPGM` that is not
+/// before any statically encoded forward branch target; trailing allocation contents are ignored.
 pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeError> {
     if words.is_empty() {
         return Err(DecodeError::Empty);
@@ -60,6 +60,7 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
 
     let mut instructions = Vec::new();
     let mut word_index = 0usize;
+    let mut furthest_forward_branch_target = None;
     while instructions.len() < MAX_INSTRUCTIONS {
         let pc = u32::try_from(
             word_index
@@ -81,10 +82,15 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
         }
         let instruction_words = remaining[..frame.dwords].to_vec();
         let instruction = create_instruction(pc, frame.encoding, frame.opcode, instruction_words);
+        if let Some(target) = forward_branch_target(&instruction)? {
+            furthest_forward_branch_target = Some(
+                furthest_forward_branch_target.map_or(target, |current: u32| current.max(target)),
+            );
+        }
         word_index += frame.dwords;
         let ended = instruction.opcode == Opcode::END_PROGRAM;
         instructions.push(instruction);
-        if ended {
+        if ended && furthest_forward_branch_target.is_none_or(|target| pc >= target) {
             return Ok(Program::new(address, instructions));
         }
     }
@@ -96,6 +102,7 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
 /// cause speculative reads into the following page.
 pub fn read_program(memory: &impl GuestMemoryReader, address: u64) -> Result<Program, DecodeError> {
     let mut raw_words = Vec::new();
+    let mut furthest_forward_branch_target = None;
     for _ in 0..MAX_INSTRUCTIONS {
         let pc = u32::try_from(
             raw_words
@@ -118,13 +125,49 @@ pub fn read_program(memory: &impl GuestMemoryReader, address: u64) -> Result<Pro
         for index in prefix.len()..frame.dwords {
             prefix.push(read_memory_word(memory, address, pc, index)?);
         }
+        let instruction = create_instruction(pc, frame.encoding, frame.opcode, prefix.clone());
+        if let Some(target) = forward_branch_target(&instruction)? {
+            furthest_forward_branch_target = Some(
+                furthest_forward_branch_target.map_or(target, |current: u32| current.max(target)),
+            );
+        }
         let ended = frame.opcode == Opcode::END_PROGRAM;
         raw_words.extend(prefix);
-        if ended {
+        if ended && furthest_forward_branch_target.is_none_or(|target| pc >= target) {
             return decode_program(address, &raw_words);
         }
     }
     Err(DecodeError::Unterminated)
+}
+
+fn forward_branch_target(instruction: &Instruction) -> Result<Option<u32>, DecodeError> {
+    if instruction.encoding != ShaderEncoding::Sopp
+        || !matches!(
+            instruction.opcode.known_name(),
+            Some(
+                "SBranch"
+                    | "SCbranchScc0"
+                    | "SCbranchScc1"
+                    | "SCbranchVccz"
+                    | "SCbranchVccnz"
+                    | "SCbranchExecz"
+                    | "SCbranchExecnz"
+            )
+        )
+    {
+        return Ok(None);
+    }
+    let offset = i16::from_ne_bytes(
+        u16::try_from(instruction.words[0] & u32::from(u16::MAX))
+            .expect("masked branch offset fits u16")
+            .to_ne_bytes(),
+    );
+    let next_pc = i64::from(instruction.pc)
+        + i64::try_from(instruction.words.len().saturating_mul(4))
+            .map_err(|_| DecodeError::ProgramCounterOverflow)?;
+    let target = next_pc + i64::from(offset) * 4;
+    let target = u32::try_from(target).map_err(|_| DecodeError::ProgramCounterOverflow)?;
+    Ok((target > instruction.pc).then_some(target))
 }
 
 fn read_memory_word(
@@ -1760,6 +1803,32 @@ mod tests {
         assert_eq!(program.instructions[2].opcode, Opcode::EXPORT);
         assert_eq!(program.instructions[3].opcode, Opcode::END_PROGRAM);
         assert_eq!(program.pixel_color_export_masks(), 0x0f);
+    }
+
+    #[test]
+    fn decodes_past_an_early_endpgm_needed_by_a_forward_branch() {
+        let words = [
+            0xbf82_0002, // s_branch from pc 0 to pc 12
+            0xbf81_0000, // early fallthrough endpgm at pc 4
+            0xbf80_0000, // padding/fallthrough instruction at pc 8
+            0xbf80_0000, // forward target at pc 12
+            0xbf81_0000, // terminating endpgm at pc 16
+            0xdead_beef,
+        ];
+
+        let program = decode_program(0x1000, &words).expect("forward branch program");
+
+        assert_eq!(program.instructions.len(), 5);
+        assert_eq!(program.instructions[1].opcode, Opcode::END_PROGRAM);
+        assert_eq!(program.instructions[3].pc, 12);
+        assert_eq!(program.instructions[4].opcode, Opcode::END_PROGRAM);
+
+        let memory = SliceMemory {
+            base: 0x1000,
+            words: words.to_vec(),
+        };
+        let program = read_program(&memory, memory.base).expect("memory-backed forward branch");
+        assert_eq!(program.instructions.len(), 5);
     }
 
     #[test]

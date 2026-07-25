@@ -13,6 +13,17 @@ const MAX_METADATA_ENTRIES: u16 = 4096;
 
 pub trait GuestMemoryReader {
     fn read(&self, address: u64, output: &mut [u8]) -> bool;
+
+    /// Returns the readable prefix of `maximum_length` bytes starting at `address` when the
+    /// backing implementation can answer without copying the range.
+    ///
+    /// Evaluating a shader needs the extent of global buffers, but it does not necessarily need
+    /// a CPU snapshot of their contents. Readers backed by identity-mapped guest memory can use
+    /// this hook to keep large bindings zero-copy. `None` asks the evaluator to fall back to a
+    /// validating read, preserving the behavior of simple/test readers.
+    fn readable_prefix_length(&self, _address: u64, _maximum_length: usize) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
