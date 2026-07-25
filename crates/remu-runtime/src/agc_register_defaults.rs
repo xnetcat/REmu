@@ -26,6 +26,23 @@ impl RegisterDefaultGroup {
             registers,
         }
     }
+
+    fn type_metadata(self) -> Option<u32> {
+        let register_count = u32::try_from(self.registers.len()).ok()?;
+        let class: u32 = match self.kind {
+            0x569f7444 | 0x7690af6f | 0xbda98653 => 0x0040_0000,
+            0xef550356 | 0x38e92c91 | 0xaaa964b9 | 0x4cc673a0 => 0x0020_0000,
+            0x1f2d8149 | 0xb2609506 | 0xb26219ca | 0xb25b6cf9 | 0xb2f86101 | 0x195d37d2
+            | 0xf9ec4f85 => 0x0010_0000,
+            0x48531062 | 0xbdbd1d0f | 0xbd946fd4 | 0xbdf02a4c => 0x0080_0000,
+            0x4626b750 | 0xac0f9e76 => 0x0008_0000,
+            0x036ac8a6 => 0x000c_0000,
+            _ => 0x0004_0000,
+        };
+        class
+            .checked_add(register_count.checked_shl(10)?)?
+            .checked_add(self.index.checked_mul(4)?.checked_add(self.space)?)
+    }
 }
 
 pub(crate) struct RegisterDefaultsLayout {
@@ -99,7 +116,7 @@ impl RegisterDefaultsLayout {
             write_u32(
                 &mut blob,
                 type_entry_offset.checked_add(4)?,
-                group.index.checked_mul(4)?.checked_add(group.space)?,
+                group.type_metadata()?,
             )?;
             for (register_index, &(offset, value)) in group.registers.iter().enumerate() {
                 let destination =
@@ -529,7 +546,27 @@ const INTERNAL_REGISTER_DEFAULTS: &[RegisterDefaultGroup] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::RegisterDefaultsLayout;
+    use super::{PRIMARY_REGISTER_DEFAULTS, RegisterDefaultsLayout};
+
+    #[test]
+    fn encodes_group_class_count_and_table_selector() {
+        assert_eq!(
+            PRIMARY_REGISTER_DEFAULTS[0].type_metadata(),
+            Some(0x0004_0400)
+        );
+        assert_eq!(
+            PRIMARY_REGISTER_DEFAULTS[58].type_metadata(),
+            Some(0x0004_10e8)
+        );
+        assert_eq!(
+            PRIMARY_REGISTER_DEFAULTS[59].type_metadata(),
+            Some(0x0020_04ec)
+        );
+        assert_eq!(
+            PRIMARY_REGISTER_DEFAULTS[72].type_metadata(),
+            Some(0x0020_4120)
+        );
+    }
 
     #[test]
     fn builds_primary_and_internal_pointer_graphs() {

@@ -237,6 +237,13 @@ impl UniversalDataState {
         Ok(())
     }
 
+    pub fn create_property_object(&mut self) -> Result<u64, u32> {
+        self.require_initialized()?;
+        let object = allocate_u64_id(&mut self.next_property);
+        self.objects.insert(object, EventObject::default());
+        Ok(object)
+    }
+
     pub fn object_set_i32(&mut self, object: u64, key: String, value: i32) -> Result<(), u32> {
         validate_property_key(&key)?;
         self.object_set_value(object, key, EventValue::Int32(value))

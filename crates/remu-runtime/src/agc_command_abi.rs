@@ -1641,12 +1641,31 @@ fn wait_kind(command: u64) -> Option<(u64, u64, u64)> {
 fn patch_wait_address(arguments: [u64; 6]) -> u64 {
     let command = arguments[0];
     let address = arguments[1];
-    let alignment = if is_packet(command, IT_NOP, Some(R_WAIT_MEM_32)) {
+    let header = super::try_read_process_guest_u32(command);
+    let is_wait_32 = header.is_some_and(|header| {
+        (header >> 8) & 0xff == IT_NOP && (header >> 2) & 0x3f == R_WAIT_MEM_32
+    });
+    let is_wait_64 = header.is_some_and(|header| {
+        (header >> 8) & 0xff == IT_NOP && (header >> 2) & 0x3f == R_WAIT_MEM_64
+    });
+    let alignment = if is_wait_32 {
         4
-    } else if is_packet(command, IT_NOP, Some(R_WAIT_MEM_64)) {
+    } else if is_wait_64 {
         8
     } else {
-        return GRAPHICS5_ERROR_INVALID_PACKET;
+        // Newer Gen5 SDKs pass (address-or-offset, pointer-to-address-field). The first argument
+        // may be a GPU-only virtual address in the host's PROT_NONE aperture, so never probe it as
+        // a packet. The second argument is the CPU-writable field returned by the packet builder.
+        if command == 0
+            || command & 3 != 0
+            || address == 0
+            || !address.is_multiple_of(4)
+            || !super::process_guest_range_is_readable(address, 8)
+        {
+            return GRAPHICS5_ERROR_INVALID_PACKET;
+        }
+        write_u64(address, command);
+        return 0;
     };
     if address == 0 || address & (alignment - 1) != 0 || address >> 50 != 0 {
         return GRAPHICS5_ERROR_INVALID_PACKET;

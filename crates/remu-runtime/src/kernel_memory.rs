@@ -34,6 +34,14 @@ pub(super) struct KernelVirtualMapping {
     pub direct_start: u64,
     pub protection: i32,
     pub memory_type: i32,
+    pub kind: KernelVirtualMappingKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum KernelVirtualMappingKind {
+    Reserved,
+    Flexible,
+    Direct,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +50,13 @@ pub(super) struct KernelDirectMapOptions {
     pub direct_start: u64,
     pub memory_type: Option<i32>,
     pub coalescing: GuestMapCoalescing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct KernelDirectAllocation {
+    pub start: u64,
+    pub end: u64,
+    pub memory_type: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +206,26 @@ impl DirectMemory {
         }
         Ok(segments)
     }
+
+    fn query(&self, offset: u64, find_next: bool) -> Option<DirectAllocation> {
+        if let Some(allocation) = self
+            .allocations
+            .range(..=offset)
+            .next_back()
+            .map(|(_, allocation)| *allocation)
+            .filter(|allocation| offset < allocation.end)
+        {
+            return Some(allocation);
+        }
+        find_next
+            .then(|| {
+                self.allocations
+                    .range(offset..)
+                    .next()
+                    .map(|(_, value)| *value)
+            })
+            .flatten()
+    }
 }
 
 #[derive(Debug)]
@@ -216,6 +251,75 @@ impl KernelMemory {
         address >= self.virtual_memory.base() && address < self.virtual_memory.end()
     }
 
+    /// Reserves a zero-filled CPU-accessible virtual range for the Gen5 virtual-range ABI.
+    ///
+    /// The console reports these ranges as protection zero through `sceKernelVirtualQuery`, but
+    /// callers use them immediately as allocator arenas. Backing them read/write matches that
+    /// observable ABI while the metadata remains protection zero.
+    pub fn reserve_virtual(
+        &mut self,
+        placement: GuestMapPlacement,
+        size: u64,
+        alignment: u64,
+    ) -> Result<GuestAddress, KernelMemoryError> {
+        Ok(self.virtual_memory.map_anonymous(
+            placement,
+            size,
+            alignment,
+            GuestProtection::READ.union(GuestProtection::WRITE),
+        )?)
+    }
+
+    /// Maps zero-filled flexible memory with the guest-visible protection metadata intact.
+    pub fn map_flexible(
+        &mut self,
+        placement: GuestMapPlacement,
+        size: u64,
+        alignment: u64,
+        raw_protection: i32,
+    ) -> Result<GuestAddress, KernelMemoryError> {
+        let mapped = self.virtual_memory.map_anonymous(
+            placement,
+            size,
+            alignment,
+            translate_protection(raw_protection),
+        )?;
+        if let Err(error) = self.virtual_memory.set_metadata(
+            mapped,
+            size,
+            encode_metadata(raw_protection, 0) | FLEXIBLE_METADATA_BIT,
+        ) {
+            let _ = self.virtual_memory.unmap(mapped, size);
+            return Err(error.into());
+        }
+        Ok(mapped)
+    }
+
+    /// Returns the currently readable identity-mapped virtual ranges.
+    ///
+    /// GPU command decoding uses this snapshot to validate process-local copies without issuing a
+    /// Mach VM read syscall for every small shader resource. Callers must refresh their snapshot
+    /// after changing a mapping or its protection.
+    pub fn readable_ranges(&self) -> Vec<(u64, u64)> {
+        self.virtual_memory
+            .vmas()
+            .into_iter()
+            .filter(|mapping| {
+                matches!(
+                    mapping.state,
+                    GuestVmaState::Anonymous | GuestVmaState::Shared
+                ) && mapping.protection.contains(GuestProtection::READ)
+            })
+            .filter_map(|mapping| {
+                mapping
+                    .start
+                    .get()
+                    .checked_add(mapping.size)
+                    .map(|end| (mapping.start.get(), end))
+            })
+            .collect()
+    }
+
     pub fn allocate_direct(
         &mut self,
         search_start: u64,
@@ -228,45 +332,21 @@ impl KernelMemory {
             .allocate(search_start, search_end, size, alignment, memory_type)
     }
 
-    pub fn release_direct(&mut self, start: u64, size: u64) -> Result<bool, KernelMemoryError> {
-        if self
-            .direct_memory
-            .containing_allocation(start, size)?
-            .is_none()
-        {
-            return Ok(false);
-        }
-        let end = start
-            .checked_add(size)
-            .ok_or(KernelMemoryError::DirectMemoryOverflow { start, size })?;
-        let aliases = self
-            .virtual_memory
-            .vmas()
-            .into_iter()
-            .filter_map(|vma| {
-                if vma.state != GuestVmaState::Shared
-                    || vma.backing_id != Some(self.direct_memory.backing.id())
-                {
-                    return None;
-                }
-                let backing_end = vma.backing_offset.checked_add(vma.size)?;
-                let overlap_start = start.max(vma.backing_offset);
-                let overlap_end = end.min(backing_end);
-                (overlap_start < overlap_end).then_some((
-                    GuestAddress::new(vma.start.get() + overlap_start - vma.backing_offset),
-                    overlap_end - overlap_start,
-                ))
+    pub fn query_direct(&self, offset: u64, find_next: bool) -> Option<KernelDirectAllocation> {
+        self.direct_memory
+            .query(offset, find_next)
+            .map(|allocation| KernelDirectAllocation {
+                start: allocation.start,
+                end: allocation.end,
+                memory_type: allocation.memory_type,
             })
-            .collect::<Vec<_>>();
-        for (address, alias_size) in aliases {
-            self.virtual_memory.unmap(address, alias_size)?;
-        }
-        let released = self.direct_memory.release(start, size)?;
-        assert!(
-            released,
-            "validated direct allocation remains owned until release"
-        );
-        Ok(true)
+    }
+
+    pub fn release_direct(&mut self, start: u64, size: u64) -> Result<bool, KernelMemoryError> {
+        // Physical allocation ownership and virtual alias lifetime are separate in the kernel
+        // ABI. Unity releases the direct range first and then explicitly munmaps its virtual view;
+        // tearing the alias down here makes that legal sequence fault before sceKernelMunmap.
+        self.direct_memory.release(start, size)
     }
 
     #[cfg(test)]
@@ -363,7 +443,8 @@ impl KernelMemory {
             self.virtual_memory.set_metadata(
                 vma.start,
                 vma.size,
-                encode_metadata(raw_protection, decode_memory_type(vma.metadata)),
+                encode_metadata(raw_protection, decode_memory_type(vma.metadata))
+                    | (vma.metadata & FLEXIBLE_METADATA_BIT),
             )?;
         }
         Ok(())
@@ -375,38 +456,47 @@ impl KernelMemory {
     }
 
     pub fn query(&self, address: GuestAddress, find_next: bool) -> Option<KernelVirtualMapping> {
-        let exact = self.virtual_memory.query(address).ok().and_then(|vma| {
-            (vma.state == GuestVmaState::Shared
-                && vma.backing_id == Some(self.direct_memory.backing.id()))
-            .then_some(vma)
-        });
+        let exact = self
+            .virtual_memory
+            .query(address)
+            .ok()
+            .filter(|vma| vma.state != GuestVmaState::Free);
         let info = exact.or_else(|| {
             if !find_next {
                 return None;
             }
-            self.virtual_memory.vmas().into_iter().find(|vma| {
-                vma.start >= address
-                    && vma.state == GuestVmaState::Shared
-                    && vma.backing_id == Some(self.direct_memory.backing.id())
-            })
+            self.virtual_memory
+                .vmas()
+                .into_iter()
+                .find(|vma| vma.start >= address)
         })?;
         Some(mapping_from_vma(info))
     }
 }
 
 fn mapping_from_vma(info: GuestVmaInfo) -> KernelVirtualMapping {
+    let kind = if info.state == GuestVmaState::Shared {
+        KernelVirtualMappingKind::Direct
+    } else if info.metadata & FLEXIBLE_METADATA_BIT != 0 {
+        KernelVirtualMappingKind::Flexible
+    } else {
+        KernelVirtualMappingKind::Reserved
+    };
     KernelVirtualMapping {
         address: info.start,
         size: info.size,
         direct_start: info.backing_offset,
         protection: decode_protection(info.metadata),
         memory_type: decode_memory_type(info.metadata),
+        kind,
     }
 }
 
 const fn translate_protection(raw: i32) -> GuestProtection {
     let mut protection = GuestProtection::NONE;
-    if raw & (0x01 | 0x10) != 0 {
+    // CPU_READ_WRITE is encoded as bit 1, not as CPU_READ | CPU_WRITE. Treat it as readable as
+    // well as writable so protection 2 matches the console ABI.
+    if raw & (0x01 | 0x02 | 0x10) != 0 {
         protection = protection.union(GuestProtection::READ);
     }
     if raw & (0x02 | 0x20) != 0 {
@@ -417,6 +507,8 @@ const fn translate_protection(raw: i32) -> GuestProtection {
     }
     protection
 }
+
+const FLEXIBLE_METADATA_BIT: u64 = 1 << 63;
 
 fn encode_metadata(protection: i32, memory_type: i32) -> u64 {
     u64::from(protection.cast_unsigned()) | (u64::from(memory_type.cast_unsigned()) << 32)
@@ -429,7 +521,7 @@ fn decode_protection(metadata: u64) -> i32 {
 }
 
 fn decode_memory_type(metadata: u64) -> i32 {
-    u32::try_from(metadata >> 32)
+    u32::try_from((metadata >> 32) & 0x7fff_ffff)
         .expect("shifted memory-type metadata fits u32")
         .cast_signed()
 }
@@ -513,12 +605,71 @@ mod tests {
                 direct_start: 0,
                 protection: 0x33,
                 memory_type: 12,
+                kind: KernelVirtualMappingKind::Direct,
             })
         );
     }
 
     #[test]
-    fn direct_release_invalidates_every_alias_and_preserves_unaffected_tails() {
+    fn flexible_mapping_is_read_write_and_preserves_query_metadata() {
+        let mut memory = KernelMemory::new().unwrap();
+        let mapped = memory
+            .map_flexible(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x02,
+            )
+            .unwrap();
+
+        // SAFETY: CPU_READ_WRITE protection makes the returned anonymous mapping accessible.
+        unsafe {
+            (mapped.get() as *mut u8).write_volatile(0x5a);
+            assert_eq!((mapped.get() as *const u8).read_volatile(), 0x5a);
+        }
+        assert!(
+            memory
+                .readable_ranges()
+                .iter()
+                .any(|&(start, end)| start <= mapped.get() && end > mapped.get())
+        );
+        assert_eq!(
+            memory.query(mapped, false),
+            Some(KernelVirtualMapping {
+                address: mapped,
+                size: GUEST_PAGE_SIZE,
+                direct_start: 0,
+                protection: 0x02,
+                memory_type: 0,
+                kind: KernelVirtualMappingKind::Flexible,
+            })
+        );
+    }
+
+    #[test]
+    fn reserved_virtual_range_is_immediately_cpu_accessible_and_queryable() {
+        let mut memory = KernelMemory::new().unwrap();
+        let reserved = memory
+            .reserve_virtual(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+            )
+            .unwrap();
+        // SAFETY: reserve_virtual deliberately grants CPU read/write access for the guest ABI.
+        unsafe {
+            (reserved.get() as *mut u8).write_volatile(0x5a);
+            assert_eq!((reserved.get() as *const u8).read_volatile(), 0x5a);
+        }
+        let mapping = memory.query(reserved, false).unwrap();
+        assert_eq!(mapping.address, reserved);
+        assert_eq!(mapping.size, GUEST_PAGE_SIZE);
+        assert_eq!(mapping.protection, 0);
+        assert_eq!(mapping.kind, KernelVirtualMappingKind::Reserved);
+    }
+
+    #[test]
+    fn direct_release_preserves_virtual_aliases_until_explicit_unmap() {
         let mut memory = KernelMemory::new().unwrap();
         memory
             .allocate_direct(
@@ -555,12 +706,12 @@ mod tests {
         );
         for alias in [first, second] {
             assert!(memory.query(alias, false).is_some());
-            assert!(memory.query(page(alias, 1), false).is_none());
-            let right = memory.query(page(alias, 2), false).unwrap();
-            assert_eq!(right.address, page(alias, 2));
-            assert_eq!(right.size, GUEST_PAGE_SIZE);
-            assert_eq!(right.direct_start, 2 * GUEST_PAGE_SIZE);
+            assert!(memory.query(page(alias, 1), false).is_some());
+            assert!(memory.query(page(alias, 2), false).is_some());
         }
+        memory.unmap(page(first, 1), GUEST_PAGE_SIZE).unwrap();
+        assert!(memory.query(page(first, 1), false).is_none());
+        assert!(memory.query(page(second, 1), false).is_some());
         assert!(
             !memory
                 .release_direct(GUEST_PAGE_SIZE, GUEST_PAGE_SIZE)

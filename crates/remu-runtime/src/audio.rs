@@ -77,6 +77,7 @@ struct AudioPort {
     format: AudioFormat,
     channel_volume: [f32; 8],
     next_deadline: Option<Instant>,
+    resampler: Option<StreamingStereoResampler>,
 }
 
 impl AudioPort {
@@ -91,8 +92,14 @@ impl AudioPort {
 }
 
 #[derive(Debug, Default)]
+struct AudioQueue {
+    frames: VecDeque<[f32; 2]>,
+    started: bool,
+}
+
+#[derive(Debug, Default)]
 struct AudioMixer {
-    queues: BTreeMap<i32, VecDeque<[f32; 2]>>,
+    queues: BTreeMap<i32, AudioQueue>,
 }
 
 impl AudioMixer {
@@ -108,7 +115,8 @@ impl AudioMixer {
         let Some(queue) = self.queues.get_mut(&handle) else {
             return false;
         };
-        queue.extend(frames);
+        queue.frames.extend(frames);
+        queue.started = true;
         true
     }
 
@@ -117,22 +125,22 @@ impl AudioMixer {
             output.fill(0.0);
             return;
         }
-        let has_open_port = !self.queues.is_empty();
+        let has_started_port = self.queues.values().any(|queue| queue.started);
         let mut output_frames = 0_u64;
         let mut underrun_frames = 0_u64;
         for frame in output.chunks_mut(channels) {
             output_frames = output_frames.saturating_add(1);
             let mut mixed = [0.0_f32; 2];
             let mut missing_port_sample = false;
-            for queue in self.queues.values_mut() {
-                if let Some(sample) = queue.pop_front() {
+            for queue in self.queues.values_mut().filter(|queue| queue.started) {
+                if let Some(sample) = queue.frames.pop_front() {
                     mixed[0] += sample[0];
                     mixed[1] += sample[1];
                 } else {
                     missing_port_sample = true;
                 }
             }
-            if has_open_port && missing_port_sample {
+            if has_started_port && missing_port_sample {
                 underrun_frames = underrun_frames.saturating_add(1);
             }
             frame.fill(0.0);
@@ -143,7 +151,7 @@ impl AudioMixer {
                 frame[1] = mixed[1].clamp(-1.0, 1.0);
             }
         }
-        if has_open_port {
+        if has_started_port {
             remu_gpu::report_audio_frames(output_frames, underrun_frames);
         }
     }
@@ -181,12 +189,19 @@ impl HostAudio {
             .map_err(|error| error.to_string())?
             .filter(|config| config.sample_format() == cpal::SampleFormat::F32)
             .collect::<Vec<_>>();
-        configs.sort_unstable_by_key(|config| (config.channels() != 2, config.channels()));
+        let preferred_rate: cpal::SampleRate = 48_000;
+        configs.sort_unstable_by_key(|config| {
+            (
+                config.channels() != 2,
+                !(config.min_sample_rate() <= preferred_rate
+                    && preferred_rate <= config.max_sample_rate()),
+                config.channels(),
+            )
+        });
         let range = configs
             .into_iter()
             .next()
             .ok_or_else(|| "default output device has no f32 stream".to_owned())?;
-        let preferred_rate: cpal::SampleRate = 48_000;
         let sample_rate = if range.min_sample_rate() <= preferred_rate
             && preferred_rate <= range.max_sample_rate()
         {
@@ -295,6 +310,10 @@ impl AudioOutState {
                 format,
                 channel_volume: [1.0; 8],
                 next_deadline: None,
+                resampler: self.host.as_ref().and_then(|host| {
+                    (frequency != host.sample_rate)
+                        .then(|| StreamingStereoResampler::new(frequency, host.sample_rate))
+                }),
             },
         );
         if let Some(host) = self.host.as_ref() {
@@ -399,12 +418,18 @@ impl AudioOutState {
             unsafe { std::slice::from_raw_parts(source_address as *const u8, byte_length) };
         let stereo = decode_stereo_frames(source, port);
         if let Some(host) = self.host.as_ref() {
-            let resampled = resample_stereo(&stereo, port.frequency, host.sample_rate);
+            let resampled = port
+                .resampler
+                .as_mut()
+                .map_or_else(|| stereo.clone(), |resampler| resampler.process(&stereo));
             let mut mixer = host
                 .mixer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let queued = mixer.queues.get(&handle).map_or(0, VecDeque::len);
+            let queued = mixer
+                .queues
+                .get(&handle)
+                .map_or(0, |queue| queue.frames.len());
             let maximum =
                 usize::try_from(host.sample_rate).unwrap_or(48_000) * MAX_QUEUED_AUDIO_SECONDS;
             if queued.saturating_add(resampled.len()) > maximum || !mixer.push(handle, resampled) {
@@ -461,32 +486,64 @@ fn read_sample(frame: &[u8], channel: usize, format: AudioFormat) -> f32 {
     }
 }
 
-fn resample_stereo(source: &[[f32; 2]], source_rate: u32, destination_rate: u32) -> Vec<[f32; 2]> {
-    if source.is_empty() || source_rate == destination_rate {
-        return source.to_vec();
+#[derive(Debug)]
+struct StreamingStereoResampler {
+    source_rate: u32,
+    destination_rate: u32,
+    source_frames_seen: u64,
+    next_output_frame: u64,
+    previous: Option<[f32; 2]>,
+}
+
+impl StreamingStereoResampler {
+    const fn new(source_rate: u32, destination_rate: u32) -> Self {
+        Self {
+            source_rate,
+            destination_rate,
+            source_frames_seen: 0,
+            next_output_frame: 0,
+            previous: None,
+        }
     }
-    let destination_frames = source
-        .len()
-        .saturating_mul(usize::try_from(destination_rate).unwrap_or(0))
-        .div_ceil(usize::try_from(source_rate).unwrap_or(1));
-    (0..destination_frames)
-        .map(|index| {
-            let numerator = u64::try_from(index)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(u64::from(source_rate));
-            let left_index = usize::try_from(numerator / u64::from(destination_rate))
-                .unwrap_or(source.len() - 1)
-                .min(source.len() - 1);
-            let right_index = (left_index + 1).min(source.len() - 1);
-            let remainder = numerator % u64::from(destination_rate);
-            let fraction_q16 = remainder.saturating_mul(65_536) / u64::from(destination_rate);
-            let fraction = f32::from(u16::try_from(fraction_q16).unwrap_or(u16::MAX)) / 65_536.0;
-            [
-                source[left_index][0] + (source[right_index][0] - source[left_index][0]) * fraction,
-                source[left_index][1] + (source[right_index][1] - source[left_index][1]) * fraction,
-            ]
-        })
-        .collect()
+
+    fn process(&mut self, source: &[[f32; 2]]) -> Vec<[f32; 2]> {
+        if source.is_empty() {
+            return Vec::new();
+        }
+        debug_assert_ne!(self.source_rate, self.destination_rate);
+        let block_start = self.source_frames_seen;
+        let block_end = block_start.saturating_add(u64::try_from(source.len()).unwrap_or(u64::MAX));
+        let mut output = Vec::new();
+        loop {
+            let position_numerator = self
+                .next_output_frame
+                .saturating_mul(u64::from(self.source_rate));
+            let left_index = position_numerator / u64::from(self.destination_rate);
+            let right_index = left_index.saturating_add(1);
+            if right_index >= block_end {
+                break;
+            }
+            let left = if left_index < block_start {
+                self.previous
+                    .expect("only the immediately preceding streaming sample is retained")
+            } else {
+                source[usize::try_from(left_index - block_start)
+                    .expect("current resampler block index fits usize")]
+            };
+            let right = source[usize::try_from(right_index - block_start)
+                .expect("current resampler block index fits usize")];
+            let remainder = position_numerator % u64::from(self.destination_rate);
+            let fraction = remainder as f64 / f64::from(self.destination_rate);
+            output.push([
+                (f64::from(left[0]) + f64::from(right[0] - left[0]) * fraction) as f32,
+                (f64::from(left[1]) + f64::from(right[1] - left[1]) * fraction) as f32,
+            ]);
+            self.next_output_frame = self.next_output_frame.saturating_add(1);
+        }
+        self.source_frames_seen = block_end;
+        self.previous = source.last().copied();
+        output
+    }
 }
 
 const fn low_u32(value: u64) -> u32 {
@@ -501,7 +558,9 @@ const fn low_i32(value: u64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioFormat, AudioPort, SampleEncoding, decode_stereo_frames, resample_stereo};
+    use super::{
+        AudioFormat, AudioPort, SampleEncoding, StreamingStereoResampler, decode_stereo_frames,
+    };
 
     #[test]
     fn decodes_and_downmixes_float_surround_audio() {
@@ -522,6 +581,7 @@ mod tests {
             },
             channel_volume: [1.0; 8],
             next_deadline: None,
+            resampler: None,
         };
         let output = decode_stereo_frames(&bytes, &port);
         assert_eq!(output.len(), 1);
@@ -530,9 +590,19 @@ mod tests {
     }
 
     #[test]
-    fn linearly_resamples_stereo_frames() {
-        let source = [[0.0, 1.0], [1.0, 0.0]];
-        let output = resample_stereo(&source, 24_000, 48_000);
-        assert_eq!(output, [[0.0, 1.0], [0.5, 0.5], [1.0, 0.0], [1.0, 0.0]]);
+    fn continuously_resamples_across_guest_buffer_boundaries() {
+        let source = (0..512)
+            .map(|index| [index as f32, -(index as f32)])
+            .collect::<Vec<_>>();
+        let mut whole = StreamingStereoResampler::new(48_000, 44_100);
+        let expected = whole.process(&source);
+
+        let mut streamed = StreamingStereoResampler::new(48_000, 44_100);
+        let mut actual = streamed.process(&source[..256]);
+        actual.extend(streamed.process(&source[256..]));
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 470);
+        assert!(actual.windows(2).all(|pair| pair[1][0] > pair[0][0]));
     }
 }
