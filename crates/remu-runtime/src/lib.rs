@@ -4000,6 +4000,9 @@ struct GuestSyncState {
 struct GuestConditionState {
     waiters: VecDeque<u64>,
     bound_mutex: Option<u64>,
+    /// Signals delivered to this condition. A stalled waiter on a condition that has never been
+    /// signaled is a missing producer; one on a signaled condition is a lost wakeup.
+    notifies: u64,
 }
 
 impl GuestConditionState {
@@ -4219,6 +4222,23 @@ extern "C" fn current_guest_thread_pointer() -> u64 {
 
 fn set_current_guest_thread_pointer(thread_pointer: u64) {
     CURRENT_GUEST_THREAD_POINTER.set(thread_pointer);
+}
+
+thread_local! {
+    /// Name the guest gave this thread, retained so diagnostics can attribute a stall without
+    /// correlating against a separate creation log.
+    static CURRENT_GUEST_THREAD_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn set_current_guest_thread_name(name: Option<String>) {
+    CURRENT_GUEST_THREAD_NAME.with_borrow_mut(|current| *current = name);
+}
+
+/// Reports the current guest thread's name, or `main` for the thread that entered the guest.
+fn current_guest_thread_name() -> String {
+    CURRENT_GUEST_THREAD_NAME
+        .with_borrow(|name| name.clone())
+        .unwrap_or_else(|| "main".to_owned())
 }
 
 fn current_guest_thread_handle() -> u64 {
@@ -5061,6 +5081,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
                 );
             }
             set_current_guest_thread_handle(handle);
+            set_current_guest_thread_name(trace_name.clone());
             set_current_guest_thread_pointer(guest_tls.thread_pointer);
             let result = run_guest_thread(entry, thread_argument);
             set_current_guest_thread_pointer(0);
@@ -6045,6 +6066,21 @@ fn guest_condition_destroy(address: u64) -> u64 {
     }
 }
 
+/// How long an unbounded guest wait may run before it reports itself once.
+///
+/// Opt-in through `REMU_TRACE_STALL_SECONDS`, because worker threads legitimately park for a long
+/// time waiting for work and would otherwise dominate the log.
+fn stall_report_interval() -> Option<Duration> {
+    static INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("REMU_TRACE_STALL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+    })
+}
+
 #[cfg(test)]
 fn guest_condition_wait(condition: u64, mutex_address: u64, timeout_usec: Option<u64>) -> u64 {
     guest_condition_wait_with_interrupt(condition, mutex_address, timeout_usec, || {})
@@ -6111,6 +6147,39 @@ where
             wait_result.timed_out() && !state.condition_waiter_released(waiter) && !interrupted,
             interrupted,
         )
+    } else if let Some(report_after) = stall_report_interval() {
+        // An unbounded wait that never completes is the hardest stall class to attribute, because
+        // the thread is parked with no record of what it wanted. Wake periodically to name the
+        // wait once; the predicate is unchanged, so this cannot alter wait semantics.
+        let mut reported = false;
+        loop {
+            let (next_state, wait_result) = sync
+                .1
+                .wait_timeout_while(state, report_after, |state| {
+                    !state.condition_waiter_released(waiter)
+                        && !guest_exception_is_pending(guest_thread)
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if !wait_result.timed_out() {
+                break;
+            }
+            if !reported {
+                reported = true;
+                let notifies = state
+                    .conditions
+                    .get(&condition)
+                    .map_or(0, |guest_condition| guest_condition.notifies);
+                eprintln!(
+                    "[REMu][STALL] condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} notifies={notifies}",
+                    report_after.as_secs(),
+                    current_guest_thread_name()
+                );
+            }
+        }
+        let interrupted =
+            !state.condition_waiter_released(waiter) && guest_exception_is_pending(guest_thread);
+        (false, interrupted)
     } else {
         state = sync
             .1
@@ -6170,6 +6239,7 @@ fn guest_condition_notify(condition: u64, broadcast: bool) -> u64 {
     state.condition_notify_count = state.condition_notify_count.saturating_add(1);
     let notify_sequence = state.condition_notify_count;
     let guest_condition = state.conditions.entry(condition).or_default();
+    guest_condition.notifies = guest_condition.notifies.saturating_add(1);
     let pending_before = guest_condition.waiters.len();
     let selected = if broadcast {
         guest_condition.release_all()
