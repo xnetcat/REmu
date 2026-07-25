@@ -13,7 +13,14 @@ use remu_memory::{
 use thiserror::Error;
 
 pub(super) const DIRECT_MEMORY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
-const VIRTUAL_MEMORY_SIZE: u64 = 64 * 1024 * 1024 * 1024;
+/// Size of the managed guest virtual address space.
+///
+/// This is address space, not memory: the host reservation is one `PROT_NONE` mapping and pages
+/// are committed only when the guest maps them. Console user address space spans roughly a
+/// terabyte, and engines reserve very large sparse ranges up front — Unreal reserves hundreds of
+/// gigabytes for its virtual-memory allocator before committing any of it — so a space sized for
+/// expected residency instead of the architectural range fails those reservations.
+const VIRTUAL_MEMORY_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub(super) enum KernelMemoryError {
@@ -251,23 +258,20 @@ impl KernelMemory {
         address >= self.virtual_memory.base() && address < self.virtual_memory.end()
     }
 
-    /// Reserves a zero-filled CPU-accessible virtual range for the Gen5 virtual-range ABI.
+    /// Reserves an inaccessible virtual range for the Gen5 virtual-range ABI.
     ///
-    /// The console reports these ranges as protection zero through `sceKernelVirtualQuery`, but
-    /// callers use them immediately as allocator arenas. Backing them read/write matches that
-    /// observable ABI while the metadata remains protection zero.
+    /// A reservation claims addresses without committing pages: the range reports protection zero
+    /// through `sceKernelVirtualQuery` and grants no CPU access. Its purpose is to let the guest
+    /// place later fixed mappings, so the range must stay replaceable — committing it as an
+    /// ordinary anonymous mapping makes every subsequent `MAP_FIXED` into the reservation fail as
+    /// an overlap.
     pub fn reserve_virtual(
         &mut self,
         placement: GuestMapPlacement,
         size: u64,
         alignment: u64,
     ) -> Result<GuestAddress, KernelMemoryError> {
-        Ok(self.virtual_memory.map_anonymous(
-            placement,
-            size,
-            alignment,
-            GuestProtection::READ.union(GuestProtection::WRITE),
-        )?)
+        Ok(self.virtual_memory.reserve(placement, size, alignment)?)
     }
 
     /// Maps zero-filled flexible memory with the guest-visible protection metadata intact.
@@ -423,6 +427,20 @@ impl KernelMemory {
         size: u64,
         raw_protection: i32,
     ) -> Result<(), KernelMemoryError> {
+        self.protect_with_type(address, size, raw_protection, None)
+    }
+
+    /// Changes protection and, when `memory_type` is supplied, the guest-visible memory type.
+    ///
+    /// `sceKernelMtypeprotect` retypes a range in the same operation that reprotects it, while
+    /// plain `sceKernelMprotect` must preserve each affected mapping's existing type.
+    pub fn protect_with_type(
+        &mut self,
+        address: GuestAddress,
+        size: u64,
+        raw_protection: i32,
+        memory_type: Option<i32>,
+    ) -> Result<(), KernelMemoryError> {
         self.virtual_memory
             .protect(address, size, translate_protection(raw_protection))?;
         let end = address.get().checked_add(size).ok_or_else(|| {
@@ -443,8 +461,10 @@ impl KernelMemory {
             self.virtual_memory.set_metadata(
                 vma.start,
                 vma.size,
-                encode_metadata(raw_protection, decode_memory_type(vma.metadata))
-                    | (vma.metadata & FLEXIBLE_METADATA_BIT),
+                encode_metadata(
+                    raw_protection,
+                    memory_type.unwrap_or_else(|| decode_memory_type(vma.metadata)),
+                ) | (vma.metadata & FLEXIBLE_METADATA_BIT),
             )?;
         }
         Ok(())
@@ -647,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_virtual_range_is_immediately_cpu_accessible_and_queryable() {
+    fn reserved_virtual_range_reports_no_protection_and_is_queryable() {
         let mut memory = KernelMemory::new().unwrap();
         let reserved = memory
             .reserve_virtual(
@@ -656,16 +676,55 @@ mod tests {
                 GUEST_PAGE_SIZE,
             )
             .unwrap();
-        // SAFETY: reserve_virtual deliberately grants CPU read/write access for the guest ABI.
-        unsafe {
-            (reserved.get() as *mut u8).write_volatile(0x5a);
-            assert_eq!((reserved.get() as *const u8).read_volatile(), 0x5a);
-        }
         let mapping = memory.query(reserved, false).unwrap();
         assert_eq!(mapping.address, reserved);
         assert_eq!(mapping.size, GUEST_PAGE_SIZE);
         assert_eq!(mapping.protection, 0);
         assert_eq!(mapping.kind, KernelVirtualMappingKind::Reserved);
+    }
+
+    /// A reservation exists so the guest can choose where a later mapping lands. Unreal's PS5
+    /// allocator reserves one arena up front and then commits direct memory into it with
+    /// `MAP_FIXED`; committing the reservation eagerly turns that second call into an overlap
+    /// rejection and deadlocks the guest allocator.
+    #[test]
+    fn fixed_direct_mapping_commits_inside_a_reserved_range() {
+        let mut memory = KernelMemory::new().unwrap();
+        let reserved = memory
+            .reserve_virtual(
+                GuestMapPlacement::Anywhere,
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+            )
+            .unwrap();
+        memory
+            .allocate_direct(
+                0,
+                DIRECT_MEMORY_SIZE,
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                12,
+            )
+            .unwrap();
+        let mapped = memory
+            .map_direct(
+                GuestMapPlacement::Fixed(reserved),
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x33,
+                0,
+            )
+            .expect("a fixed mapping may commit reserved pages");
+        assert_eq!(mapped, reserved);
+        let mapping = memory.query(mapped, false).unwrap();
+        assert_eq!(mapping.kind, KernelVirtualMappingKind::Direct);
+        assert_eq!(mapping.size, 2 * GUEST_PAGE_SIZE);
+        // The untouched tail of the reservation stays reserved and independently mappable.
+        let tail = page(reserved, 2);
+        assert_eq!(
+            memory.query(tail, false).map(|mapping| mapping.kind),
+            Some(KernelVirtualMappingKind::Reserved)
+        );
     }
 
     #[test]
