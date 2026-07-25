@@ -2325,6 +2325,9 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "DGMG3JshrZU" => "sceKernelSetVirtualRangeName",
         "rVjRvHJ0X6c" => "sceKernelVirtualQuery",
         "cQke9UuBQOk" => "sceKernelMunmap",
+        "2SKEx6bSq-4" => "sceKernelBatchMap",
+        "kBJzF8x4SyE" => "sceKernelBatchMap2",
+        "9bfdLIyuwCY" => "sceKernelMtypeprotect",
         "D0OdFMjp46I" => "sceKernelCreateEqueue",
         "fzyMKs9kim0" => "sceKernelWaitEqueue",
         "WDszmSbWuDk" => "sceKernelAddUserEventEdge",
@@ -2449,6 +2452,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "eaFXjfJv3xs" => "sceImeKeyboardOpen",
         "-4GCfYdNF1s" => "sceImeUpdate",
         "18B2NS1y9UU" => "sceRtcGetCurrentTick",
+        "ZPD1YOKI+Kw" => "sceRtcGetCurrentClockLocalTime",
+        "8zLSfEfW5AU" => "sceCoredumpRegisterCoredumpHandler",
         "dKadqZFgKKQ" => "sceImeKeyboardGetResourceId",
         "VkqLPArfFdc" => "sceImeKeyboardGetInfo",
         "rnEhHqG-4xo" => "sceUserServiceGetAccessibilityChatTranscription",
@@ -2711,6 +2716,12 @@ struct ProbeDispatchState {
     next_apr_submission_id: u32,
     apr_submissions: BTreeSet<u32>,
     exit_callbacks: Vec<GuestExitCallback>,
+    /// Registered guest coredump handler and its requested stack size.
+    ///
+    /// The console runs this on a dedicated thread when the process faults. REmu records the
+    /// registration so the ABI's already-registered and parameter errors are exact; generating a
+    /// coredump to invoke it is a separate unimplemented capability.
+    coredump_handler: Option<(u64, u64)>,
     process_param_address: u64,
     thread_atexit_count_callback: u64,
     thread_atexit_report_callback: u64,
@@ -4513,7 +4524,67 @@ fn low_xmm_f64(value: u128) -> f64 {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Number of leading guest imports to trace with their return values.
+///
+/// Boot-order defects are easier to read as an exact call/return sequence than as first-hit
+/// records, because a wrong result only becomes visible in the guest's next branch. The trace is
+/// bounded so it cannot dominate a long run.
+fn import_call_trace_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("REMU_TRACE_IMPORT_CALLS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+static IMPORT_CALL_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportReturn {
+    let limit = import_call_trace_limit();
+    if limit == 0 {
+        return import_dispatch_traced(frame);
+    }
+    let sequence = IMPORT_CALL_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence > limit || frame.is_null() {
+        return import_dispatch_traced(frame);
+    }
+    // SAFETY: the caller supplies one aligned, fully initialized frame that stays live for the
+    // complete call, and the null case returned above.
+    let (index, arguments, guest_return_address) = unsafe {
+        (
+            (*frame).dispatch_index,
+            (*frame).integer_arguments,
+            (*frame).guest_return_address,
+        )
+    };
+    // SAFETY: the telemetry Arc is retained by this thread's cache for the whole call.
+    let telemetry = unsafe { &*cached_import_telemetry() };
+    let nid = usize::try_from(index)
+        .ok()
+        .and_then(|index| telemetry.nids.get(index))
+        .map_or("?", String::as_str);
+    let name = known_nid_name(nid).unwrap_or("unknown");
+    eprintln!(
+        "[REMu][CALL] seq={sequence} nid={nid} name={name} thread={} return={guest_return_address:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+        current_guest_thread_handle(),
+        arguments[0],
+        arguments[1],
+        arguments[2],
+        arguments[3],
+        arguments[4],
+        arguments[5],
+    );
+    let result = import_dispatch_traced(frame);
+    eprintln!(
+        "[REMu][CALL] seq={sequence} nid={nid} name={name} result={:#x}",
+        result.integer
+    );
+    result
+}
+
+extern "C" fn import_dispatch_traced(frame: *const ImportCallFrame) -> ProbeImportReturn {
     if frame.is_null() {
         eprintln!("[REMu][IMPORT] null captured register frame");
         terminate_probe(87);
@@ -6992,6 +7063,7 @@ fn dispatch_stateless_import(
         "99b82IKXpH4" => app_content_app_param_get_int(arguments),
         "eaFXjfJv3xs" | "-4GCfYdNF1s" => 0,
         "18B2NS1y9UU" => rtc_get_current_tick(arguments[0]),
+        "ZPD1YOKI+Kw" => rtc_get_current_clock_local_time(arguments[0]),
         "dKadqZFgKKQ" => ime_keyboard_get_resource_ids(arguments),
         "VkqLPArfFdc" => ime_keyboard_get_info(arguments[1]),
         "x8qnXqh-tiM" => 0,
@@ -7138,6 +7210,10 @@ fn dispatch_probe_import(
         // success without filling VirtualQuery makes libc feed uninitialized lengths into munmap.
         "rVjRvHJ0X6c" => kernel_virtual_query(arguments, state),
         "cQke9UuBQOk" => kernel_munmap(arguments, state),
+        "8zLSfEfW5AU" => coredump_register_handler(arguments, state),
+        "2SKEx6bSq-4" => kernel_batch_map(arguments, state),
+        "kBJzF8x4SyE" => kernel_batch_map_2(arguments, state),
+        "9bfdLIyuwCY" => kernel_mtypeprotect(arguments, state),
         "hwVSPCmp5tM" => kernel_checked_release_direct_memory(arguments, state),
         "MBuItvba6z8" => kernel_release_direct_memory(arguments, state),
         "7oxv3PPCumo" => kernel_reserve_virtual_range(arguments, state),
@@ -8320,8 +8396,6 @@ fn app_content_app_param_get_int(arguments: [u64; 6]) -> u64 {
 }
 
 fn rtc_get_current_tick(output: u64) -> u64 {
-    const UNIX_EPOCH_DOTNET_MICROSECONDS: u64 = 62_135_596_800_000_000;
-    const RTC_ERROR_INVALID_POINTER: u32 = 0x80b5_0002;
     if output == 0 {
         return sce_kernel_error(RTC_ERROR_INVALID_POINTER);
     }
@@ -8335,9 +8409,94 @@ fn rtc_get_current_tick(output: u64) -> u64 {
         });
     write_guest_u64(
         output,
-        UNIX_EPOCH_DOTNET_MICROSECONDS.saturating_add(unix_microseconds),
+        RTC_UNIX_EPOCH_TICK_MICROSECONDS.saturating_add(unix_microseconds),
     );
     0
+}
+
+const COREDUMP_ERROR_ALREADY_REGISTERED: u32 = 0x8002_0011;
+const COREDUMP_ERROR_PARAM: u32 = 0x8002_0016;
+/// Largest handler stack the console accepts.
+const COREDUMP_MAXIMUM_STACK_SIZE: u64 = 0x2000_0000;
+
+/// Records the guest's coredump handler so a later fault path can run it.
+fn coredump_register_handler(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let (handler, stack_size) = (arguments[0], arguments[1]);
+    if state.coredump_handler.is_some() {
+        return sce_kernel_error(COREDUMP_ERROR_ALREADY_REGISTERED);
+    }
+    if handler == 0 || stack_size >= COREDUMP_MAXIMUM_STACK_SIZE {
+        return sce_kernel_error(COREDUMP_ERROR_PARAM);
+    }
+    state.coredump_handler = Some((handler, stack_size));
+    0
+}
+
+/// Number of microseconds in the RTC tick epoch before the Unix epoch.
+const RTC_UNIX_EPOCH_TICK_MICROSECONDS: u64 = 62_135_596_800_000_000;
+const RTC_ERROR_INVALID_POINTER: u32 = 0x80b5_0002;
+
+/// Fills an `SceRtcDateTime` with the current wall-clock time in the host's local zone.
+///
+/// The layout is six 16-bit fields followed by the microsecond remainder. Leaving it untouched is
+/// not a benign failure: engines validate the decomposed date and abort the process when every
+/// field reads zero, because year zero is not a representable date.
+fn rtc_get_current_clock_local_time(output: u64) -> u64 {
+    if output == 0 {
+        return sce_kernel_error(RTC_ERROR_INVALID_POINTER);
+    }
+    let now = std::time::SystemTime::now();
+    let (unix_seconds, microsecond) = match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => (
+            i64::try_from(duration.as_secs()).unwrap_or(0),
+            duration.subsec_micros(),
+        ),
+        Err(error) => (-i64::try_from(error.duration().as_secs()).unwrap_or(0), 0),
+    };
+    let (offset_seconds, _) = guest_local_timezone(unix_seconds);
+    let local_seconds = unix_seconds.saturating_add(offset_seconds);
+    let (year, month, day, hour, minute, second) = civil_from_unix_seconds(local_seconds);
+    write_guest_u16(output, year);
+    write_guest_u16(output + 2, month);
+    write_guest_u16(output + 4, day);
+    write_guest_u16(output + 6, hour);
+    write_guest_u16(output + 8, minute);
+    write_guest_u16(output + 10, second);
+    write_guest_u32(output + 12, microsecond);
+    0
+}
+
+/// Decomposes a Unix timestamp into a proleptic Gregorian civil date and time of day.
+///
+/// This is Howard Hinnant's `civil_from_days` algorithm: it shifts the era origin to 0000-03-01 so
+/// the leap day falls at the end of a 400-year era, which keeps the arithmetic branch-free and
+/// correct for dates before 1970.
+fn civil_from_unix_seconds(seconds: i64) -> (u16, u16, u16, u16, u16, u16) {
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    // March is month 0 in the shifted calendar, so months 10 and 11 belong to the next year.
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (
+        u16::try_from(year).unwrap_or(0),
+        u16::try_from(month).unwrap_or(0),
+        u16::try_from(day).unwrap_or(0),
+        u16::try_from(seconds_of_day / 3_600).unwrap_or(0),
+        u16::try_from(seconds_of_day / 60 % 60).unwrap_or(0),
+        u16::try_from(seconds_of_day % 60).unwrap_or(0),
+    )
 }
 
 fn ime_keyboard_get_resource_ids(arguments: [u64; 6]) -> u64 {
@@ -13751,7 +13910,14 @@ fn map_direct_memory_core(
     );
     let mapped = match result {
         Ok(mapped) => mapped,
-        Err(error) => return kernel_memory_error(&error),
+        Err(error) => {
+            if trace_guest_vm() {
+                eprintln!(
+                    "[REMu][VM] map direct failed direct={direct_start:#x} requested={requested:#x} length={length:#x} protection={protection:#x} flags={flags:#x} error={error}"
+                );
+            }
+            return kernel_memory_error(&error);
+        }
     };
     refresh_kernel_memory_readable_ranges(memory);
     write_guest_u64(output, mapped.get());
@@ -13799,7 +13965,21 @@ fn map_named_flexible_memory(arguments: [u64; 6], state: &mut ProbeDispatchState
     if name.len() >= 32 {
         return sce_kernel_error(SCE_KERNEL_ERROR_NAME_TOO_LONG);
     }
+    map_flexible_memory_core(output, length, protection, flags, &name, state)
+}
 
+/// Shared placement and mapping behavior for every flexible-memory entry point.
+///
+/// The named, unnamed, and batch forms differ only in how the caller supplies the range name.
+#[cfg(target_os = "macos")]
+fn map_flexible_memory_core(
+    output: u64,
+    length: u64,
+    protection: i32,
+    flags: u64,
+    name: &str,
+    state: &mut ProbeDispatchState,
+) -> u64 {
     let requested = read_guest_u64(output);
     let fixed = flags & 0x10 != 0;
     if fixed && requested == 0 {
@@ -13834,6 +14014,143 @@ fn map_named_flexible_memory(arguments: [u64; 6], state: &mut ProbeDispatchState
 
 #[cfg(not(target_os = "macos"))]
 fn map_named_flexible_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+/// Byte size of one `sceKernelBatchMap` entry: `start`, `offset`, `length`, `protection`, `type`,
+/// two reserved bytes, and `operation`.
+const BATCH_MAP_ENTRY_SIZE: u64 = 32;
+const BATCH_MAP_OPERATION_MAP_DIRECT: u32 = 0;
+const BATCH_MAP_OPERATION_UNMAP: u32 = 1;
+const BATCH_MAP_OPERATION_PROTECT: u32 = 2;
+const BATCH_MAP_OPERATION_MAP_FLEXIBLE: u32 = 3;
+const BATCH_MAP_OPERATION_TYPE_PROTECT: u32 = 4;
+/// `MAP_FIXED`. The single-argument batch entry point always maps at the caller's addresses.
+const KERNEL_MAP_FIXED: u64 = 0x10;
+
+#[cfg(target_os = "macos")]
+fn kernel_batch_map(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    kernel_batch_map_core(arguments, KERNEL_MAP_FIXED, state)
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_batch_map_2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    kernel_batch_map_core(arguments, arguments[3], state)
+}
+
+/// Applies one ordered batch of guest memory operations.
+///
+/// Each entry is executed in order and the batch stops at the first rejected entry, reporting how
+/// many entries completed. The count is written even when the batch fails, because the guest uses
+/// it to resume or unwind a partially applied batch; only a null output pointer skips it.
+#[cfg(target_os = "macos")]
+fn kernel_batch_map_core(arguments: [u64; 6], flags: u64, state: &mut ProbeDispatchState) -> u64 {
+    let (entries, output) = (arguments[0], arguments[2]);
+    let count = low_i32(arguments[1]);
+    let mut result = 0;
+    let mut processed = 0_i32;
+    for index in 0..count.max(0) {
+        let Some(entry) = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(BATCH_MAP_ENTRY_SIZE))
+            .and_then(|offset| entries.checked_add(offset))
+            .filter(|_| entries != 0)
+        else {
+            result = sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            break;
+        };
+        let start = read_guest_u64(entry);
+        let direct_offset = read_guest_u64(entry + 8);
+        let length = read_guest_u64(entry + 16);
+        let protection = u64::from(read_guest_u8(entry + 24));
+        let memory_type = i32::from(read_guest_u8(entry + 25));
+        let operation = read_guest_u32(entry + 28);
+        if length == 0 || operation > BATCH_MAP_OPERATION_TYPE_PROTECT {
+            result = sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            break;
+        }
+        result = match operation {
+            // The entry's own `start` field is the in/out address, exactly as the standalone
+            // mapping calls use their caller-supplied pointer.
+            BATCH_MAP_OPERATION_MAP_DIRECT => map_direct_memory_core(
+                [entry, length, protection, flags, direct_offset, 0],
+                Some(memory_type),
+                state,
+            ),
+            BATCH_MAP_OPERATION_UNMAP => kernel_munmap([start, length, 0, 0, 0, 0], state),
+            BATCH_MAP_OPERATION_PROTECT => {
+                kernel_mprotect([start, length, protection, 0, 0, 0], state)
+            }
+            BATCH_MAP_OPERATION_MAP_FLEXIBLE => {
+                map_flexible_memory_core(entry, length, low_i32(protection), flags, "anon", state)
+            }
+            _ => kernel_mtypeprotect(
+                [
+                    start,
+                    length,
+                    memory_type.cast_unsigned().into(),
+                    protection,
+                    0,
+                    0,
+                ],
+                state,
+            ),
+        };
+        if result != 0 {
+            break;
+        }
+        processed += 1;
+    }
+    if output != 0 {
+        write_guest_u32(output, processed.cast_unsigned());
+    }
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_batch_map(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_batch_map_2(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+/// Reprotects a range and assigns it a new guest memory type in the same operation.
+#[cfg(target_os = "macos")]
+fn kernel_mtypeprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let (address, length) = (arguments[0], arguments[1]);
+    let memory_type = low_i32(arguments[2]);
+    let protection = low_i32(arguments[3]);
+    if address == 0 || length == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let aligned_address = address & !(GUEST_PAGE_SIZE - 1);
+    let Some(aligned_end) = address
+        .checked_add(length)
+        .and_then(|end| align_up_u64(end, GUEST_PAGE_SIZE))
+    else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let memory = match kernel_memory_mut(state) {
+        Ok(memory) => memory,
+        Err(error) => return kernel_memory_error(&error),
+    };
+    if let Err(error) = memory.protect_with_type(
+        GuestAddress::new(aligned_address),
+        aligned_end - aligned_address,
+        protection,
+        Some(memory_type),
+    ) {
+        return kernel_memory_error(&error);
+    }
+    refresh_kernel_memory_readable_ranges(memory);
+    0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_mtypeprotect(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
@@ -17349,25 +17666,27 @@ mod platform_independent_tests {
         AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG_INDEX,
         AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO,
         AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
-        GuestExitCallback, KERNEL_FILES, KernelFileState, ProbeDispatchState, PthreadAttrState,
-        SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
-        SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_NOT_IMPLEMENTED, VideoOutBufferAttributes,
-        VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_color_target_state,
+        BATCH_MAP_OPERATION_MAP_DIRECT, GuestExitCallback, KERNEL_FILES, KernelFileState,
+        ProbeDispatchState, PthreadAttrState, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND,
+        SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND,
+        SCE_KERNEL_ERROR_NOT_IMPLEMENTED, VideoOutBufferAttributes, VideoOutState,
+        agc_apply_set_base, agc_apply_submission_registers, agc_color_target_state,
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
         agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, ajm_finalize, ajm_initialize,
         ajm_instance_create, ajm_instance_destroy, ajm_module_register, ajm_module_unregister,
-        allocate_direct_memory, allocate_pthread_thread_object, clone_guest_tls,
-        create_pthread_attr, decode_agc_memory_acquire, destroy_pthread_attr,
+        allocate_direct_memory, allocate_pthread_thread_object, civil_from_unix_seconds,
+        clone_guest_tls, create_pthread_attr, decode_agc_memory_acquire, destroy_pthread_attr,
         dispatch_guest_numeric_parser, dispatch_probe_import, guest_clock_gettime, guest_free,
         guest_global_locale, guest_kernel_convert_localtime_to_utc,
         guest_kernel_convert_utc_to_localtime, guest_kernel_fstat, guest_kernel_ftruncate,
         guest_kernel_gettimeofday, guest_kernel_lseek, guest_kernel_read, guest_posix_file_result,
         guest_pthread_once, guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr,
-        guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_release_direct_memory,
-        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity,
-        pthread_attr_get_stack, pthread_attr_set_affinity, pthread_attr_set_detach_state,
-        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
-        read_guest_u32, read_guest_u64, resolve_guest_path, sanitize_save_segment,
+        guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_batch_map,
+        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
+        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_affinity,
+        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+        pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
+        resolve_guest_path, rtc_get_current_clock_local_time, sanitize_save_segment,
         save_data_commit, save_data_create_transaction_resource, save_data_dir_name_search,
         save_data_mount3, save_data_pattern_matches, save_data_prepare, save_data_save_icon,
         save_data_set_param, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
@@ -19278,6 +19597,143 @@ mod platform_independent_tests {
                 .len(),
             4
         );
+    }
+
+    #[test]
+    fn civil_decomposition_matches_known_timestamps() {
+        // Epoch, a leap day, the end of a non-leap century year, and a pre-epoch date.
+        assert_eq!(civil_from_unix_seconds(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(
+            civil_from_unix_seconds(1_709_164_800),
+            (2024, 2, 29, 0, 0, 0)
+        );
+        // Year 2000 is a leap year despite being a century, so the day after February 28 exists.
+        assert_eq!(
+            civil_from_unix_seconds(951_782_399),
+            (2000, 2, 28, 23, 59, 59)
+        );
+        assert_eq!(civil_from_unix_seconds(951_782_400), (2000, 2, 29, 0, 0, 0));
+        // Year 1900 is not a leap year, so February ends after the 28th.
+        assert_eq!(
+            civil_from_unix_seconds(-2_203_891_201),
+            (1900, 2, 28, 23, 59, 59)
+        );
+        assert_eq!(civil_from_unix_seconds(-1), (1969, 12, 31, 23, 59, 59));
+    }
+
+    #[test]
+    fn current_local_time_is_a_valid_date_and_rejects_a_null_output() {
+        let mut time = [0_u16; 8];
+        assert_eq!(
+            rtc_get_current_clock_local_time(time.as_mut_ptr().addr() as u64),
+            0
+        );
+        // Engines abort on an all-zero date, so every field must be in its calendar range.
+        assert!(time[0] >= 2020, "year was {}", time[0]);
+        assert!((1..=12).contains(&time[1]), "month was {}", time[1]);
+        assert!((1..=31).contains(&time[2]), "day was {}", time[2]);
+        assert!(time[3] < 24 && time[4] < 60 && time[5] < 60);
+        assert_ne!(rtc_get_current_clock_local_time(0), 0);
+    }
+
+    /// Builds one `sceKernelBatchMap` entry: start, direct offset, length, protection, type, and
+    /// operation at the console's fixed field offsets.
+    #[cfg(target_os = "macos")]
+    fn batch_map_entry(
+        start: u64,
+        offset: u64,
+        length: u64,
+        protection: u8,
+        memory_type: u8,
+        operation: u32,
+    ) -> [u8; 32] {
+        let mut entry = [0_u8; 32];
+        entry[0..8].copy_from_slice(&start.to_le_bytes());
+        entry[8..16].copy_from_slice(&offset.to_le_bytes());
+        entry[16..24].copy_from_slice(&length.to_le_bytes());
+        entry[24] = protection;
+        entry[25] = memory_type;
+        entry[28..32].copy_from_slice(&operation.to_le_bytes());
+        entry
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn batch_map_applies_entries_in_order_and_reports_the_completed_count() {
+        let mut state = ProbeDispatchState::default();
+        let mut physical = 0_u64;
+        // A non-positive search end means the whole direct-memory range.
+        assert_eq!(
+            allocate_direct_memory(
+                [0, 0, 0x8000, 0x4000, 12, (&raw mut physical).addr() as u64,],
+                &mut state,
+            ),
+            0
+        );
+        let mut entries = [
+            batch_map_entry(0, 0, 0x4000, 0x03, 12, BATCH_MAP_OPERATION_MAP_DIRECT),
+            batch_map_entry(0, 0x4000, 0x4000, 0x03, 12, BATCH_MAP_OPERATION_MAP_DIRECT),
+        ];
+        let mut completed = 0_u32;
+        assert_eq!(
+            kernel_batch_map(
+                [
+                    entries.as_mut_ptr().addr() as u64,
+                    2,
+                    (&raw mut completed).addr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(completed, 2);
+        // Each entry's own start field receives the address the kernel chose for it.
+        let first = u64::from_le_bytes(entries[0][0..8].try_into().unwrap());
+        let second = u64::from_le_bytes(entries[1][0..8].try_into().unwrap());
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn batch_map_stops_at_the_first_invalid_entry_and_still_reports_progress() {
+        let mut state = ProbeDispatchState::default();
+        let mut physical = 0_u64;
+        assert_eq!(
+            allocate_direct_memory(
+                [0, 0, 0x8000, 0x4000, 12, (&raw mut physical).addr() as u64,],
+                &mut state,
+            ),
+            0
+        );
+        let mut entries = [
+            batch_map_entry(0, 0, 0x4000, 0x03, 12, BATCH_MAP_OPERATION_MAP_DIRECT),
+            // An operation outside the defined set is rejected before anything is applied.
+            batch_map_entry(0, 0x4000, 0x4000, 0x03, 12, 5),
+            batch_map_entry(0, 0x4000, 0x4000, 0x03, 12, BATCH_MAP_OPERATION_MAP_DIRECT),
+        ];
+        let mut completed = 0_u32;
+        assert_eq!(
+            kernel_batch_map(
+                [
+                    entries.as_mut_ptr().addr() as u64,
+                    3,
+                    (&raw mut completed).addr() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &mut state,
+            ),
+            sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        );
+        assert_eq!(completed, 1);
+        // The entry after the rejected one is never applied.
+        assert_eq!(u64::from_le_bytes(entries[2][0..8].try_into().unwrap()), 0);
     }
 
     #[cfg(target_os = "macos")]
