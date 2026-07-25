@@ -6,6 +6,7 @@ mod agc_register_defaults;
 mod audio;
 #[cfg(target_os = "macos")]
 mod kernel_memory;
+mod nid_names;
 mod np;
 
 use std::cell::{Cell, RefCell};
@@ -2689,6 +2690,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "vRoArM9zaIk" => "sceAgcSetUcRegIndirectPatchAddRegisters",
         "aJf+j5yntiU" => "sceAgcDcbEventWrite",
         "LtTouSCZjHM" => "sceAgcCbNop",
+        "dolOmWH+huQ" => "sceAgcGetFusedShaderSize",
+        "fd5Bp5tGTgo" => "sceAgcFuseShaderHalves",
         "WmAc2MEj6Io" => "sceAgcDcbDmaData",
         "wr23dPKyWc0" => "sceAgcCbReleaseMem",
         "VmW0Tdpy420" => "sceAgcDcbWaitRegMem",
@@ -2757,6 +2760,17 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "rcQCUr0EaRU" => "_Getptoupper",
         _ => return None,
     })
+}
+
+/// Returns the best name available for a NID when reporting it to a human.
+///
+/// [`known_nid_name`] covers the NIDs this runtime has an ABI for; the generated table covers
+/// every symbol recovered from a scan of PS5 modules, which is most of the rest.  Naming an
+/// import says nothing about whether it is implemented -- it only keeps an unimplemented call
+/// from being reported as an opaque eleven-character NID that nobody can act on.
+#[must_use]
+pub fn nid_display_name(nid: &str) -> Option<&'static str> {
+    known_nid_name(nid).or_else(|| nid_names::generated_nid_name(nid))
 }
 
 fn write_import_stub(slot: &mut [u8], index: usize, dispatcher: u64) -> Result<(), LinkError> {
@@ -4768,7 +4782,7 @@ fn report_failed_import(frame: *const ImportCallFrame) -> ProbeImportReturn {
             .map_or("?", String::as_str);
         eprintln!(
             "[REMu][FAIL] nid={nid} name={} thread={:?} result={value:#x} args={:#x},{:#x},{:#x},{:#x}",
-            known_nid_name(nid).unwrap_or("unknown"),
+            nid_display_name(nid).unwrap_or("unknown"),
             current_guest_thread_name(),
             arguments[0],
             arguments[1],
@@ -4825,7 +4839,7 @@ extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImpor
         .ok()
         .and_then(|index| telemetry.nids.get(index))
         .map_or("?", String::as_str);
-    let name = known_nid_name(nid).unwrap_or("unknown");
+    let name = nid_display_name(nid).unwrap_or("unknown");
     eprintln!(
         "[REMu][CALL] seq={sequence} nid={nid} name={name} thread={} return={guest_return_address:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
         current_guest_thread_handle(),
@@ -4933,7 +4947,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             .map(|(nid, count)| {
                 format!(
                     "{}:{}={count}",
-                    known_nid_name(nid).unwrap_or("unknown"),
+                    nid_display_name(nid).unwrap_or("unknown"),
                     nid
                 )
             })
@@ -4942,7 +4956,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         eprintln!("[REMu][IMPORT] hits={hit} hot=[{summary}]");
     }
     if !telemetry.seen[index].swap(true, Ordering::Relaxed) {
-        let name = known_nid_name(nid).unwrap_or("unknown");
+        let name = nid_display_name(nid).unwrap_or("unknown");
         eprintln!(
             "[REMu][IMPORT] first_hit={} nid={} name={} return={guest_return_address:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
             hit,
@@ -5096,7 +5110,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             eprintln!(
                 "[REMu][IMPORT][LOCK] waited={:.3}ms nid={nid} name={} thread={:?} guest={:#x}",
                 waited.as_secs_f64() * 1_000.0,
-                known_nid_name(nid).unwrap_or("unknown"),
+                nid_display_name(nid).unwrap_or("unknown"),
                 std::thread::current().name().unwrap_or("unnamed"),
                 current_guest_thread_handle(),
             );
@@ -5326,6 +5340,15 @@ fn dispatch_audio_out_import(nid: &str, arguments: [u64; 6]) -> u64 {
         }
         _ => unreachable!("caller filters audio-out imports"),
     }
+}
+
+/// Validates an argument REmu treats as a guest output pointer.
+///
+/// A null check alone is not enough: when an argument position is inferred rather than
+/// documented, the value can be a handle or selector, and writing through it corrupts whatever
+/// the host has mapped at that address instead of failing the call.
+fn guest_output_pointer(address: u64, size: usize) -> Option<u64> {
+    (address != 0 && process_guest_range_is_readable(address, size)).then_some(address)
 }
 
 /// Validates an audio-output argument that REmu treats as a writable guest pointer.
@@ -7582,6 +7605,8 @@ fn dispatch_stateless_import(
         "V++UgBtQhn0" => agc_get_data_packet_payload_address(arguments),
         "aJf+j5yntiU" => agc_dcb_event_write(arguments),
         "LtTouSCZjHM" => agc_cb_nop(arguments),
+        "dolOmWH+huQ" => agc_get_fused_shader_size(arguments),
+        "fd5Bp5tGTgo" => agc_fuse_shader_halves(arguments),
         "WmAc2MEj6Io" => agc_dcb_dma_data(arguments, stack_arguments),
         "wr23dPKyWc0" => agc_cb_release_mem(arguments, stack_arguments),
         "VmW0Tdpy420" => agc_dcb_wait_reg_mem(arguments, stack_arguments),
@@ -8065,13 +8090,13 @@ fn dispatch_probe_import(
         // REmu presents in standard dynamic range, so tone mapping reports the SDR reference
         // luminance rather than an HDR display's peak.
         "mPpPxv5CZt4" => {
-            if arguments[0] == 0 {
+            let Some(output) = guest_output_pointer(arguments[0], 12) else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-            }
-            guest_memset(arguments[0], 0, 12);
-            write_guest_u32(arguments[0], 100);
-            write_guest_u32(arguments[0] + 4, 100);
-            write_guest_u32(arguments[0] + 8, 100);
+            };
+            guest_memset(output, 0, 12);
+            write_guest_u32(output, 100);
+            write_guest_u32(output + 4, 100);
+            write_guest_u32(output + 8, 100);
             0
         }
         // libSceSaveData uses durable host-side transactions while preserving the guest ABI.
@@ -9258,9 +9283,9 @@ fn rtc_set_tick(arguments: [u64; 6]) -> u64 {
 /// The console lets users shrink the safe area; REmu presents the guest's full requested surface,
 /// so the ratio is one and the insets are zero.
 fn system_service_get_display_safe_area_info(output: u64) -> u64 {
-    if output == 0 {
+    let Some(output) = guest_output_pointer(output, 32) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
+    };
     guest_memset(output, 0, 32);
     write_guest_u32(output, 1.0_f32.to_bits());
     0
@@ -9673,9 +9698,9 @@ fn message_dialog_get_result(output: u64, state: &ProbeDispatchState) -> u64 {
     if state.services.message_dialog_status == COMMON_DIALOG_STATUS_NONE {
         return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
     }
-    if output == 0 {
+    let Some(output) = guest_output_pointer(output, 12) else {
         return sce_kernel_error(COMMON_DIALOG_ERROR_ARG_NULL);
-    }
+    };
     write_guest_u32(output, 0);
     write_guest_u32(output + 4, MESSAGE_DIALOG_RESULT_USER_CANCELED);
     write_guest_u32(output + 8, MESSAGE_DIALOG_BUTTON_INVALID);
@@ -10196,6 +10221,149 @@ fn agc_dcb_event_write(arguments: [u64; 6]) -> u64 {
     write_guest_u32(command, agc_pm4(2, AGC_IT_EVENT_WRITE, 0));
     write_guest_u32(command + 4, event_type);
     command
+}
+
+/// Gen5 shader header field offsets, as the toolchain emits them.
+const SHADER_HEADER_CODE_OFFSET: u64 = 0x10;
+const SHADER_HEADER_SH_REGISTERS_OFFSET: u64 = 0x20;
+const SHADER_HEADER_TYPE_OFFSET: u64 = 0x5a;
+const SHADER_HEADER_NUM_SH_REGISTERS_OFFSET: u64 = 0x5c;
+const SHADER_HEADER_SIZE: u64 = 0x60;
+/// One `(offset, value)` pair of a shader register.
+const SHADER_REGISTER_SIZE: u64 = 8;
+
+const SHADER_BINARY_TYPE_GS: u8 = 2;
+const SHADER_BINARY_TYPE_HS: u8 = 3;
+const SHADER_BINARY_TYPE_GS_FRONT: u8 = 4;
+const SHADER_BINARY_TYPE_HS_FRONT: u8 = 5;
+const SHADER_BINARY_TYPE_GS_BACK: u8 = 6;
+const SHADER_BINARY_TYPE_HS_BACK: u8 = 7;
+
+const SPI_SHADER_PGM_CHKSUM_GS: u32 = 0x80;
+const SPI_SHADER_PGM_LO_ES: u32 = 0xc8;
+const SPI_SHADER_PGM_LO_LS: u32 = 0x148;
+const GRAPHICS_ERROR_INVALID_SHADER_HALVES: u64 = 0x8a6c_000b;
+
+/// Confirms two shader halves form a fusable merged pair and reports which stage they produce.
+fn fused_shader_stage(front: u64, back: u64) -> Option<u8> {
+    if front == 0 || back == 0 {
+        return None;
+    }
+    let front_type = read_guest_u8(front + SHADER_HEADER_TYPE_OFFSET);
+    let back_type = read_guest_u8(back + SHADER_HEADER_TYPE_OFFSET);
+    match (front_type, back_type) {
+        (SHADER_BINARY_TYPE_GS_FRONT, SHADER_BINARY_TYPE_GS_BACK) => Some(SHADER_BINARY_TYPE_GS),
+        (SHADER_BINARY_TYPE_HS_FRONT, SHADER_BINARY_TYPE_HS_BACK) => Some(SHADER_BINARY_TYPE_HS),
+        _ => None,
+    }
+}
+
+/// Reports the scratch size needed to fuse two merged shader halves.
+///
+/// The fused stage keeps the back half's shader registers, so the caller must supply storage for
+/// exactly that many register pairs.
+fn agc_get_fused_shader_size(arguments: [u64; 6]) -> u64 {
+    let (output, front, back) = (arguments[0], arguments[1], arguments[2]);
+    if output == 0 || fused_shader_stage(front, back).is_none() {
+        return GRAPHICS_ERROR_INVALID_SHADER_HALVES;
+    }
+    let registers = u64::from(read_guest_u8(back + SHADER_HEADER_NUM_SH_REGISTERS_OFFSET));
+    write_guest_u64(output, registers * SHADER_REGISTER_SIZE);
+    write_guest_u64(output + 8, 4);
+    0
+}
+
+/// Finds a shader register by its hardware offset, skipping earlier occurrences.
+fn find_shader_register(registers: u64, count: u64, offset: u32, occurrence: u32) -> Option<u64> {
+    let mut seen = 0;
+    for index in 0..count {
+        let entry = registers + index * SHADER_REGISTER_SIZE;
+        if read_guest_u32(entry) == offset {
+            if seen == occurrence {
+                return Some(entry);
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
+/// Fuses a merged shader's two halves into one stage description.
+///
+/// The fused stage is the back half with the front half's entry point: its register block is
+/// copied into caller-supplied scratch, the front half's checksum registers are carried over, and
+/// the program address registers are repointed at the front half's code.
+fn agc_fuse_shader_halves(arguments: [u64; 6]) -> u64 {
+    let (fused, front, back, scratch) = (arguments[0], arguments[1], arguments[2], arguments[3]);
+    let Some(stage) = fused_shader_stage(front, back) else {
+        return GRAPHICS_ERROR_INVALID_SHADER_HALVES;
+    };
+    if fused == 0 {
+        return GRAPHICS_ERROR_INVALID_SHADER_HALVES;
+    }
+    guest_memcpy(fused, back, SHADER_HEADER_SIZE);
+    write_guest_u8(fused + SHADER_HEADER_TYPE_OFFSET, stage);
+
+    let back_registers = read_guest_u64(back + SHADER_HEADER_SH_REGISTERS_OFFSET);
+    let register_count = u64::from(read_guest_u8(back + SHADER_HEADER_NUM_SH_REGISTERS_OFFSET));
+    let fused_registers = if scratch != 0 && back_registers != 0 && register_count != 0 {
+        guest_memcpy(
+            scratch,
+            back_registers,
+            register_count * SHADER_REGISTER_SIZE,
+        );
+        write_guest_u64(fused + SHADER_HEADER_SH_REGISTERS_OFFSET, scratch);
+        scratch
+    } else {
+        back_registers
+    };
+
+    let front_registers = read_guest_u64(front + SHADER_HEADER_SH_REGISTERS_OFFSET);
+    let front_count = u64::from(read_guest_u8(front + SHADER_HEADER_NUM_SH_REGISTERS_OFFSET));
+    if stage == SHADER_BINARY_TYPE_GS && fused_registers != 0 && front_registers != 0 {
+        // Both checksum halves belong to the front program.
+        for occurrence in 0..2 {
+            let destination = find_shader_register(
+                fused_registers,
+                register_count,
+                SPI_SHADER_PGM_CHKSUM_GS,
+                occurrence,
+            );
+            let source = find_shader_register(
+                front_registers,
+                front_count,
+                SPI_SHADER_PGM_CHKSUM_GS,
+                occurrence,
+            );
+            if let (Some(destination), Some(source)) = (destination, source) {
+                write_guest_u32(destination + 4, read_guest_u32(source + 4));
+            }
+        }
+    }
+
+    // The merged stage begins at the front half's code, so its address registers name that
+    // program rather than the back half's.
+    let code = read_guest_u64(front + SHADER_HEADER_CODE_OFFSET);
+    let address_register = if stage == SHADER_BINARY_TYPE_GS {
+        SPI_SHADER_PGM_LO_ES
+    } else {
+        SPI_SHADER_PGM_LO_LS
+    };
+    if fused_registers != 0 && code != 0 {
+        if let Some(entry) =
+            find_shader_register(fused_registers, register_count, address_register, 0)
+        {
+            write_guest_u32(entry + 4, low_u32(code >> 8));
+        }
+        if let Some(entry) =
+            find_shader_register(fused_registers, register_count, address_register + 1, 0)
+        {
+            write_guest_u32(entry + 4, low_u32(code >> 40));
+        }
+    }
+    // The fused description owns no user data of its own.
+    write_guest_u64(fused + 8, 0);
+    0
 }
 
 fn agc_cb_nop(arguments: [u64; 6]) -> u64 {
@@ -19495,7 +19663,8 @@ mod platform_independent_tests {
     };
     use super::{
         AMPR_INVALID_FILE_ID, AmprCommandBufferState, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE,
-        KernelDirectory, ampr_resolve_file_paths, ampr_resolve_paths_core, join_guest_path,
+        KernelDirectory, agc_get_fused_shader_size, ampr_resolve_file_paths,
+        ampr_resolve_paths_core, join_guest_path,
     };
 
     #[repr(C, align(256))]
@@ -20492,6 +20661,44 @@ mod platform_independent_tests {
     /// the game root must resolve rather than be refused.
     /// Dumps are frequently stored with normalized names while titles request the original
     /// casing, and console lookups do not distinguish case.
+    /// A merged shader's fused stage keeps the back half's register block, so the reported
+    /// scratch size must cover exactly those registers; mismatched halves are refused.
+    #[test]
+    fn fused_shader_size_covers_the_back_half_registers() {
+        let mut front = [0_u8; 0x60];
+        let mut back = [0_u8; 0x60];
+        front[0x5a] = 4; // GsFront
+        back[0x5a] = 6; // GsBack
+        back[0x5c] = 7; // seven shader registers
+        let mut output = [0_u64; 2];
+        assert_eq!(
+            agc_get_fused_shader_size([
+                output.as_mut_ptr().addr() as u64,
+                front.as_ptr().addr() as u64,
+                back.as_ptr().addr() as u64,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(output, [7 * 8, 4]);
+
+        // A tessellation back half does not fuse with a geometry front half.
+        back[0x5a] = 7; // HsBack
+        assert_ne!(
+            agc_get_fused_shader_size([
+                output.as_mut_ptr().addr() as u64,
+                front.as_ptr().addr() as u64,
+                back.as_ptr().addr() as u64,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+    }
+
     #[test]
     fn resolves_guest_paths_that_differ_only_by_case() {
         let root = std::env::temp_dir().join(format!("remu-case-{}", std::process::id()));

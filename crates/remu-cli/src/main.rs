@@ -260,7 +260,7 @@ fn imports(path: &Path) -> ExitCode {
         let nid = symbol_name
             .split_once('#')
             .map_or(symbol_name, |(nid, _)| nid);
-        let resolved_name = remu_runtime::known_nid_name(nid).unwrap_or("unknown");
+        let resolved_name = remu_runtime::nid_display_name(nid).unwrap_or("unknown");
         println!(
             "plt[{index}]=offset:{} symbol:{} nid:{} resolved:{} name:{}",
             relocation.offset, relocation.symbol_index, nid, resolved_name, symbol_name

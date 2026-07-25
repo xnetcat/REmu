@@ -1959,6 +1959,32 @@ impl<'a> Compiler<'a> {
                 self.raw_source(instruction, 1)?,
                 self.raw_source(instruction, 2)?
             ),
+            // Three-operand integer forms fold a second ALU step into one instruction. The shift
+            // amount is masked because the hardware uses only the low five bits.
+            "VAdd3U32" => format!(
+                "({} + {} + {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
+            ),
+            "VOr3U32" => format!(
+                "({} | {} | {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
+            ),
+            "VAndOrB32" => format!(
+                "(({} & {}) | {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
+            ),
+            "VLshlOrU32" => format!(
+                "(({} << ({} & 31u)) | {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
+            ),
             "VCvtF32I32" => self.float_result(
                 instruction,
                 &format!("(float)as_type<int>({})", self.raw_source(instruction, 0)?),
@@ -7206,7 +7232,7 @@ mod tests {
 
     #[test]
     fn lowers_dpp_and_dpp8_for_every_otherwise_supported_vector_alu() {
-        const ALU: [(&str, usize); 56] = [
+        const ALU: [(&str, usize); 60] = [
             ("VCndmaskB32", 2),
             ("VMovB32", 1),
             ("VAddF32", 2),
@@ -7244,6 +7270,10 @@ mod tests {
             ("VLshrrevB32", 2),
             ("VLshlrevB32", 2),
             ("VLshlAddU32", 3),
+            ("VAdd3U32", 3),
+            ("VOr3U32", 3),
+            ("VAndOrB32", 3),
+            ("VLshlOrU32", 3),
             ("VCvtF32I32", 1),
             ("VCvtF32U32", 1),
             ("VMinU32", 2),
