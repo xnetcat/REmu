@@ -13835,11 +13835,17 @@ fn agc_parse_submission(
 fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let packet = arguments[0];
     if packet == 0 {
+        eprintln!("[REMu][AGC] rejected DCB submission: null packet");
         return u64::MAX;
     }
     let command_address = read_guest_u64(packet);
     let dword_count = read_guest_u32(packet + 8);
     if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+        // The guest treats a refused submission as fatal, so name the packet it rejected.
+        eprintln!(
+            "[REMu][AGC] rejected DCB submission: packet={packet:#x} commands={command_address:#x} dwords={dword_count} args={:#x},{:#x},{:#x}",
+            arguments[1], arguments[2], arguments[3]
+        );
         return u64::MAX;
     }
     let mut flips = Vec::new();
@@ -13971,11 +13977,18 @@ fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
     let owner = low_u32(arguments[0]);
     let packet = arguments[1];
     if packet == 0 {
+        eprintln!("[REMu][AGC] rejected ACB submission for owner {owner}: null packet");
         return u64::MAX;
     }
     let command_address = read_guest_u64(packet);
     let dword_count = read_guest_u32(packet + 8);
     if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+        // A submission the driver refuses is fatal to the guest, so describe the packet it
+        // rejected rather than returning a bare error the title can only assert on.
+        eprintln!(
+            "[REMu][AGC] rejected ACB submission for owner {owner}: packet={packet:#x} commands={command_address:#x} dwords={dword_count} args={:#x},{:#x},{:#x},{:#x}",
+            arguments[2], arguments[3], arguments[4], arguments[5]
+        );
         return u64::MAX;
     }
     let mut flips = Vec::new();
