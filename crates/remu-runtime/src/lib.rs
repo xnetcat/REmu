@@ -5103,6 +5103,13 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             retire_detached_guest_thread(handle);
             result
         }) else {
+            // A refused thread is invisible to the guest beyond an error code it may not check,
+            // and the work that thread was meant to perform then never happens.
+            eprintln!(
+                "[REMu][THREAD] host spawn refused name={:?} entry={entry:#x} stack={:#x}",
+                thread_name.as_deref().unwrap_or(""),
+                attributes.stack_size
+            );
             if let Some(object) = state.pthread_threads.remove(&handle) {
                 guest_free(object.handle);
             }
