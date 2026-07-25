@@ -4737,6 +4737,47 @@ fn low_xmm_f64(value: u128) -> f64 {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Whether every failing guest import is reported with its arguments.
+///
+/// Titles routinely treat a refused call as fatal, so the first error a subsystem receives is
+/// usually the defect; without this the failure is only visible as the assert it triggers.
+fn trace_import_errors() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_IMPORT_ERRORS").is_some_and(|value| value == "1")
+    })
+}
+
+/// Reports an import that returned a console error code or a negative status.
+fn report_failed_import(frame: *const ImportCallFrame) -> ProbeImportReturn {
+    // SAFETY: the caller supplies one aligned, fully initialized frame that stays live for the
+    // complete call and checked for null.
+    let (index, arguments) = unsafe { ((*frame).dispatch_index, (*frame).integer_arguments) };
+    let result = import_dispatch(frame);
+    let value = result.integer;
+    // Errors reach the guest sign-extended from a negative 32-bit status, so the upper word is
+    // all ones. Counters, handles and identifiers with a high bit set are not failures.
+    let failed = value >> 32 == 0xffff_ffff;
+    if failed {
+        // SAFETY: the telemetry Arc is retained by this thread's cache for the whole call.
+        let telemetry = unsafe { &*cached_import_telemetry() };
+        let nid = usize::try_from(index)
+            .ok()
+            .and_then(|index| telemetry.nids.get(index))
+            .map_or("?", String::as_str);
+        eprintln!(
+            "[REMu][FAIL] nid={nid} name={} thread={:?} result={value:#x} args={:#x},{:#x},{:#x},{:#x}",
+            known_nid_name(nid).unwrap_or("unknown"),
+            current_guest_thread_name(),
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+        );
+    }
+    result
+}
+
 /// Number of leading guest imports to trace with their return values.
 ///
 /// Boot-order defects are easier to read as an exact call/return sequence than as first-hit
@@ -4759,6 +4800,9 @@ static STALL_SNAPSHOT_EMITTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImportReturn {
     let limit = import_call_trace_limit();
     if limit == 0 {
+        if trace_import_errors() && !frame.is_null() {
+            return report_failed_import(frame);
+        }
         return import_dispatch(frame);
     }
     let sequence = IMPORT_CALL_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
