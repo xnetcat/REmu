@@ -2307,6 +2307,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "aI+OeCz8xrQ" => "scePthreadSelf",
         "EotR8a3ASf4" => "pthread_self",
         "3kg7rT0NQIs" => "scePthreadExit",
+        "FJrT5LuUBAU" => "pthread_exit",
+        "h9CcP3J0oVM" => "pthread_join",
         "7Xl257M4VNI" => "pthread_equal",
         "pO96TwzOm5E" => "sceKernelGetDirectMemorySize",
         "rTXw65xmLIA" => "sceKernelAllocateDirectMemory",
@@ -2457,6 +2459,16 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "18B2NS1y9UU" => "sceRtcGetCurrentTick",
         "ZPD1YOKI+Kw" => "sceRtcGetCurrentClockLocalTime",
         "8w-H19ip48I" => "sceRtcGetTick",
+        "ueega6v3GUw" => "sceRtcSetTick",
+        "1n37q1Bvc5Y" => "sceSystemServiceGetDisplaySafeAreaInfo",
+        "naInUjYt3so" => "sceKernelRmdir",
+        "27bAgiJmOh0" => "pthread_cond_timedwait",
+        "9vA2aW+CHuA" => "sceNetInetNtop",
+        "C4UgDHHPvdw" => "sceNetResolverCreate",
+        "obuxdTiwkF8" => "sceNetCtlGetInfo",
+        "A9cVMUtEp4Y" => "sceHttpInit",
+        "0gYjPTR-6cY" => "sceHttpCreateTemplate",
+        "nBDD66kiFW8" => "sceShareInitialize",
         "8zLSfEfW5AU" => "sceCoredumpRegisterCoredumpHandler",
         "j2AIqSqJP0w" => "sceKernelGetdents",
         "2G6i6hMIUUY" => "posix_getdents",
@@ -3098,12 +3110,22 @@ struct PthreadMutexAttrObject {
     attributes: PthreadMutexAttrState,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct AmprCommandBufferState {
     buffer: u64,
     size: u64,
     write_offset: u64,
     command_count: u64,
+    /// Queue completions recorded into this buffer, announced when it is submitted.
+    pending_completions: Vec<AmprCompletion>,
+}
+
+/// One recorded request to signal an event queue when a command buffer completes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmprCompletion {
+    equeue: u64,
+    ident: u64,
+    user_data: u64,
 }
 
 const PTHREAD_THREAD_OBJECT_SIZE: u64 = 0x1000;
@@ -4763,7 +4785,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         eprintln!("[REMu][IMPORT] invalid stub index {index}");
         terminate_probe(87);
     };
-    if nid == "3kg7rT0NQIs" {
+    if matches!(nid, "3kg7rT0NQIs" | "FJrT5LuUBAU") {
         guest_pthread_exit(call_args[0]);
     }
     let hit = telemetry.hits.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5066,14 +5088,21 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         }
         return ProbeImportReturn::integer(0);
     }
-    if nid == "onNY9Byn-W8" {
+    if matches!(nid, "onNY9Byn-W8" | "h9CcP3J0oVM") {
+        let posix = nid == "h9CcP3J0oVM";
         if call_args[0] == 0 || state.detached_threads.contains(&call_args[0]) {
-            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+            return ProbeImportReturn::integer(join_result(
+                sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT),
+                posix,
+            ));
         }
         let thread_id = call_args[0];
         let handle = state.thread_handles.remove(&thread_id);
         let Some(handle) = handle else {
-            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
+            return ProbeImportReturn::integer(join_result(
+                sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND),
+                posix,
+            ));
         };
         let object = state.pthread_threads.remove(&thread_id);
         state.thread_attributes.remove(&call_args[0]);
@@ -5489,6 +5518,7 @@ fn is_guest_sync_import(nid: &str) -> bool {
             | "RXXqi4CtF8w"
             | "WKAXJ4XBPQ4"
             | "BmMjYxmew1w"
+            | "27bAgiJmOh0"
             | "kDh-NfxgMtE"
             | "JGgj7Uvrl+A"
             | "mkx2fVhNMsg"
@@ -5570,6 +5600,18 @@ fn dispatch_guest_sync_import_at_import(
                 }
             },
         ),
+        // The POSIX form takes an absolute deadline as a timespec; the console form takes a
+        // relative microsecond count. Convert against the same realtime clock the deadline names.
+        "27bAgiJmOh0" => posix_pthread_result(guest_condition_wait_with_interrupt(
+            arguments[0],
+            arguments[1],
+            Some(relative_microseconds_until(arguments[2])),
+            || {
+                if let Some(frame) = frame {
+                    deliver_pending_guest_exception_at_import(frame);
+                }
+            },
+        )),
         "kDh-NfxgMtE" => guest_condition_notify(arguments[0], false),
         "2MOy+rUfuhQ" => posix_pthread_result(guest_condition_notify(arguments[0], false)),
         "JGgj7Uvrl+A" => guest_condition_notify(arguments[0], true),
@@ -5588,6 +5630,36 @@ fn dispatch_guest_sync_import_at_import(
         "PZku4ZrXJqg" => guest_event_flag_cancel(arguments),
         _ => 0,
     }
+}
+
+/// Applies the caller's error convention to a thread-join result.
+fn join_result(result: u64, posix: bool) -> u64 {
+    if posix {
+        posix_pthread_result(result)
+    } else {
+        result
+    }
+}
+
+/// Converts an absolute `timespec` deadline into microseconds from now.
+///
+/// A deadline already in the past yields zero, which the wait treats as an immediate timeout
+/// rather than an unbounded block.
+fn relative_microseconds_until(deadline: u64) -> u64 {
+    if deadline == 0 {
+        return 0;
+    }
+    let seconds = i64::from_ne_bytes(read_guest_u64(deadline).to_ne_bytes());
+    let nanoseconds = i64::from_ne_bytes(read_guest_u64(deadline + 8).to_ne_bytes());
+    let deadline_microseconds = seconds
+        .saturating_mul(1_000_000)
+        .saturating_add(nanoseconds.div_euclid(1_000));
+    let now_microseconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX)
+        });
+    u64::try_from(deadline_microseconds.saturating_sub(now_microseconds)).unwrap_or(0)
 }
 
 fn posix_pthread_result(result: u64) -> u64 {
@@ -6543,6 +6615,7 @@ fn dispatch_kernel_file_import(
     Some(match nid {
         "1G3lF1Gg1k8" => guest_kernel_open(arguments, state),
         "1-LFLmRFxxM" => guest_kernel_mkdir(arguments, state),
+        "naInUjYt3so" => guest_kernel_rmdir(arguments, state),
         "eV9wAD2riIA" => guest_kernel_stat(arguments, state),
         "Cg4srZ6TKbU" => guest_kernel_read(arguments),
         "UK2Tl2DWUns" => guest_kernel_close(arguments),
@@ -6575,6 +6648,29 @@ fn dispatch_kernel_fd_import(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         "4wSze92BhLI" => guest_kernel_write(arguments),
         _ => return None,
     })
+}
+
+fn guest_kernel_rmdir(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let Some(guest_path) = read_guest_cstring(arguments[0]) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    };
+    let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    if !writable {
+        return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
+    }
+    if !host_path.exists() {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    }
+    if !host_path.is_dir() {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_DIRECTORY);
+    }
+    // Only an empty directory may be removed; the guest deletes contents explicitly first.
+    match std::fs::remove_dir(&host_path) {
+        Ok(()) => 0,
+        Err(error) => sce_kernel_io_error(&error),
+    }
 }
 
 fn guest_kernel_mkdir(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
@@ -7154,7 +7250,9 @@ fn dispatch_stateless_import(
         "Q4qBuN-c0ZM" => guest_net_unavailable(45),
         "dgJBaeJnGpo" => NEXT_NET_POOL_HANDLE.fetch_add(1, Ordering::Relaxed) as u64,
         "hdpVEUDFW3s" => NEXT_SSL_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64,
-        "3JCe3lCbQ8A" => NEXT_HTTP_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64,
+        "3JCe3lCbQ8A" | "A9cVMUtEp4Y" | "0gYjPTR-6cY" => {
+            NEXT_HTTP_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64
+        }
         "+o9816YQhqQ" => np_web_api2_initialize(arguments),
         "MmpF1XsQiHw" => ajm_batch_initialize(arguments),
         "cK6bYHf-Q5E" | "-hJRce8wn1U" => guest_zeroed_constructor(arguments[0], 8),
@@ -7204,6 +7302,14 @@ fn dispatch_stateless_import(
         "18B2NS1y9UU" => rtc_get_current_tick(arguments[0]),
         "ZPD1YOKI+Kw" => rtc_get_current_clock_local_time(arguments[0]),
         "8w-H19ip48I" => rtc_get_tick(arguments),
+        "ueega6v3GUw" => rtc_set_tick(arguments),
+        "1n37q1Bvc5Y" => system_service_get_display_safe_area_info(arguments[0]),
+        "9vA2aW+CHuA" => net_inet_ntop(arguments),
+        // The console reports no connection when the title runs offline. Name resolution and
+        // network status must fail explicitly so online features disable themselves instead of
+        // waiting on a link that never appears.
+        "C4UgDHHPvdw" | "obuxdTiwkF8" => guest_net_unavailable(50),
+        "nBDD66kiFW8" => 0,
         "zE-wXIZjLoM" => kernel_debug_raise_exception_on_release_mode(arguments),
         "j2AIqSqJP0w" | "2G6i6hMIUUY" => guest_kernel_getdents(arguments, false),
         "taRWhTJFTgE" | "sfKygSjIbI8" => guest_kernel_getdents(arguments, true),
@@ -7742,32 +7848,20 @@ fn pthread_set_schedule_parameters(arguments: [u64; 6]) -> u64 {
     0
 }
 
-/// Registers an equeue event for APR/AMPR command-buffer completion.
+/// Registers interest in APR/AMPR command-buffer completion on an event queue.
 ///
-/// REmu services APR command buffers synchronously: by the time the guest registers interest, the
-/// transfers that event describes have already finished. The completion is therefore queued
-/// immediately, because a title that registers the event and then waits would otherwise block on
-/// work that can never complete again.
+/// Registration only expresses interest. Completions are delivered when a command buffer that
+/// recorded a queue-write command is submitted; announcing one here would wake the guest's
+/// listener for a transfer that never ran, and it would then resolve an event context that does
+/// not exist yet.
 fn kernel_add_ampr_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let (equeue, ident, user_data) = (arguments[0], arguments[1], arguments[3]);
-    let result = kernel_register_event(state, equeue, ident, KERNEL_EVENT_FILTER_AMPR, user_data);
-    if result != 0 {
-        return result;
-    }
-    queue_kernel_event(
+    kernel_register_event(
         state,
-        KernelQueuedEvent {
-            equeue,
-            ident,
-            filter: KERNEL_EVENT_FILTER_AMPR,
-            flags: 0,
-            fflags: 1,
-            data: ident,
-            user_data,
-        },
-    );
-    notify_kernel_equeue_waiters();
-    0
+        arguments[0],
+        arguments[1],
+        KERNEL_EVENT_FILTER_AMPR,
+        arguments[2],
+    )
 }
 
 fn agc_driver_add_eq_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -8638,6 +8732,88 @@ fn app_content_app_param_get_int(arguments: [u64; 6]) -> u64 {
     let value = if low_u32(arguments[0]) == 0 { 3 } else { 0 };
     write_guest_u32(arguments[1], value);
     0
+}
+
+/// Decomposes a tick count into an `SceRtcDateTime`.
+///
+/// This is the inverse of [`rtc_get_tick`] and the accessor engines use to turn a stored
+/// timestamp back into a calendar date. Leaving the structure untouched leaves the caller with
+/// whatever the stack held, which fails date validation with implausible field values.
+fn rtc_set_tick(arguments: [u64; 6]) -> u64 {
+    let (output, input) = (arguments[0], arguments[1]);
+    if output == 0 || input == 0 {
+        return sce_kernel_error(RTC_ERROR_INVALID_POINTER);
+    }
+    let ticks = read_guest_u64(input);
+    let epoch_ticks = RTC_UNIX_EPOCH_TICK_MICROSECONDS;
+    // Ticks count from year one; convert to the Unix origin the civil decomposition uses.
+    let unix_microseconds = i128::from(ticks) - i128::from(epoch_ticks);
+    let seconds = i64::try_from(unix_microseconds.div_euclid(1_000_000)).unwrap_or(0);
+    let microsecond = u32::try_from(unix_microseconds.rem_euclid(1_000_000)).unwrap_or(0);
+    let (year, month, day, hour, minute, second) = civil_from_unix_seconds(seconds);
+    if year == 0 {
+        return sce_kernel_error(RTC_ERROR_INVALID_ARGUMENT);
+    }
+    write_guest_u16(output, year);
+    write_guest_u16(output + 2, month);
+    write_guest_u16(output + 4, day);
+    write_guest_u16(output + 6, hour);
+    write_guest_u16(output + 8, minute);
+    write_guest_u16(output + 10, second);
+    write_guest_u32(output + 12, microsecond);
+    0
+}
+
+/// Reports the display's safe area as the full display.
+///
+/// The console lets users shrink the safe area; REmu presents the guest's full requested surface,
+/// so the ratio is one and the insets are zero.
+fn system_service_get_display_safe_area_info(output: u64) -> u64 {
+    if output == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    guest_memset(output, 0, 32);
+    write_guest_u32(output, 1.0_f32.to_bits());
+    0
+}
+
+/// Converts a binary network address into its textual form.
+fn net_inet_ntop(arguments: [u64; 6]) -> u64 {
+    const AF_INET: i32 = 2;
+    const AF_INET6: i32 = 28;
+    let (family, source, destination, capacity) = (
+        low_i32(arguments[0]),
+        arguments[1],
+        arguments[2],
+        arguments[3],
+    );
+    if source == 0 || destination == 0 {
+        return 0;
+    }
+    let text = match family {
+        AF_INET => {
+            let octets = [
+                read_guest_u8(source),
+                read_guest_u8(source + 1),
+                read_guest_u8(source + 2),
+                read_guest_u8(source + 3),
+            ];
+            format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+        }
+        AF_INET6 => {
+            let groups: Vec<String> = (0..8)
+                .map(|group| format!("{:x}", read_guest_u16(source + group * 2).to_be()))
+                .collect();
+            groups.join(":")
+        }
+        _ => return 0,
+    };
+    if capacity <= text.len() as u64 {
+        return 0;
+    }
+    write_guest_bytes(destination, text.as_bytes());
+    write_guest_bytes(destination + text.len() as u64, b"\0");
+    destination
 }
 
 /// Converts an `SceRtcDateTime` into a tick count.
@@ -10004,20 +10180,13 @@ fn ampr_command_buffer_write_kernel_event_queue(
     write_guest_u64(record + 0x18, user_data);
     command.write_offset += AMPR_COMMAND_RECORD_SIZE;
     command.command_count += 1;
-    // The transfers this completion describes have already been performed, so deliver it now.
-    queue_kernel_event(
-        state,
-        KernelQueuedEvent {
-            equeue,
-            ident,
-            filter: KERNEL_EVENT_FILTER_AMPR,
-            flags: 0,
-            fflags: 1,
-            data: ident,
-            user_data,
-        },
-    );
-    notify_kernel_equeue_waiters();
+    // The completion belongs to the submission, not to recording it. Retain it so submitting the
+    // buffer announces it in the order the guest recorded.
+    command.pending_completions.push(AmprCompletion {
+        equeue,
+        ident,
+        user_data,
+    });
     0
 }
 
@@ -10147,14 +10316,38 @@ fn ampr_command_buffer_read_file(
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let Some(host_path) = state.ampr_files.get(&file_id).cloned() else {
+        eprintln!(
+            "[REMu][AMPR] read rejected unknown file id={file_id:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x} stack={:#x},{:#x} known=[{}]",
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+            stack_arguments[0],
+            stack_arguments[1],
+            state
+                .ampr_files
+                .keys()
+                .map(|id| format!("{id:#x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     let Ok(capacity) = usize::try_from(size) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     if !state.ampr_file_handles.contains_key(&file_id) {
-        let Ok(file) = std::fs::File::open(&host_path) else {
-            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+        let file = match std::fs::File::open(&host_path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!(
+                    "[REMu][AMPR] read could not open id={file_id:#x} host={:?}: {error}",
+                    host_path.display()
+                );
+                return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+            }
         };
         state.ampr_file_handles.insert(file_id, file);
     }
@@ -10174,8 +10367,16 @@ fn ampr_command_buffer_read_file(
             let Some(offset) = file_offset.checked_add(total as u64) else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
             };
-            let Ok(read) = file.read_at(&mut destination[total..], offset) else {
-                return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+            let read = match file.read_at(&mut destination[total..], offset) {
+                Ok(read) => read,
+                Err(error) => {
+                    eprintln!(
+                        "[REMu][AMPR] read failed id={file_id:#x} offset={offset:#x} \
+remaining={:#x}: {error}",
+                        destination.len() - total
+                    );
+                    return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+                }
             };
             if read == 0 {
                 break;
@@ -10216,6 +10417,31 @@ fn ampr_submit_command_buffer(arguments: [u64; 6], state: &mut ProbeDispatchStat
     state.next_apr_submission_id = state.next_apr_submission_id.wrapping_add(1).max(1);
     let id = state.next_apr_submission_id;
     state.apr_submissions.insert(id);
+    // The buffer's transfers were performed as they were recorded, so its completions become
+    // observable now, in recorded order.
+    let completions = state
+        .ampr_command_buffers
+        .get_mut(&arguments[0])
+        .map(|command| std::mem::take(&mut command.pending_completions))
+        .unwrap_or_default();
+    let announced = !completions.is_empty();
+    for completion in completions {
+        queue_kernel_event(
+            state,
+            KernelQueuedEvent {
+                equeue: completion.equeue,
+                ident: completion.ident,
+                filter: KERNEL_EVENT_FILTER_AMPR,
+                flags: 0,
+                fflags: 1,
+                data: 0,
+                user_data: completion.user_data,
+            },
+        );
+    }
+    if announced {
+        notify_kernel_equeue_waiters();
+    }
     if arguments[2] != 0 {
         write_guest_u64(arguments[2], 0);
     }
@@ -18455,26 +18681,28 @@ mod platform_independent_tests {
         agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
         agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, ajm_finalize, ajm_initialize,
         ajm_instance_create, ajm_instance_destroy, ajm_module_register, ajm_module_unregister,
-        allocate_direct_memory, allocate_pthread_thread_object, civil_from_unix_seconds,
-        clone_guest_tls, create_pthread_attr, decode_agc_memory_acquire, destroy_pthread_attr,
-        dispatch_guest_numeric_parser, dispatch_probe_import, guest_clock_gettime, guest_free,
-        guest_global_locale, guest_kernel_convert_localtime_to_utc,
-        guest_kernel_convert_utc_to_localtime, guest_kernel_fstat, guest_kernel_ftruncate,
-        guest_kernel_gettimeofday, guest_kernel_lseek, guest_kernel_read, guest_posix_file_result,
-        guest_pthread_once, guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr,
-        guest_wmemcmp, guest_wmemcpy, guest_wmemmove, kernel_batch_map,
-        kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
-        pthread_attr_get_affinity, pthread_attr_get_stack, pthread_attr_set_affinity,
-        pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
-        pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
-        resolve_guest_path, rtc_get_current_clock_local_time, sanitize_save_segment,
-        save_data_commit, save_data_create_transaction_resource, save_data_dir_name_search,
-        save_data_mount3, save_data_pattern_matches, save_data_prepare, save_data_save_icon,
-        save_data_set_param, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
+        allocate_direct_memory, allocate_pthread_thread_object,
+        ampr_command_buffer_write_kernel_event_queue, ampr_submit_command_buffer,
+        civil_from_unix_seconds, clone_guest_tls, create_pthread_attr, decode_agc_memory_acquire,
+        destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
+        guest_clock_gettime, guest_free, guest_global_locale,
+        guest_kernel_convert_localtime_to_utc, guest_kernel_convert_utc_to_localtime,
+        guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_gettimeofday, guest_kernel_lseek,
+        guest_kernel_read, guest_posix_file_result, guest_pthread_once, guest_qsort,
+        guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy,
+        guest_wmemmove, kernel_add_ampr_event, kernel_batch_map, kernel_release_direct_memory,
+        kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pthread_attr_get_affinity,
+        pthread_attr_get_stack, pthread_attr_set_affinity, pthread_attr_set_detach_state,
+        pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16,
+        read_guest_u32, read_guest_u64, resolve_guest_path, rtc_get_current_clock_local_time,
+        rtc_get_current_tick, rtc_get_tick, rtc_set_tick, sanitize_save_segment, save_data_commit,
+        save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
+        save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
+        save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
         system_service_param_get_int, take_exit_callbacks, tls_dtv_entry_offset,
         unix_days_from_civil, video_out_open, write_guest_u32, write_guest_u64, write_import_stub,
     };
-    use super::{DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, KernelDirectory};
+    use super::{AmprCommandBufferState, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, KernelDirectory};
 
     #[repr(C, align(256))]
     struct AlignedComputeProgram([u32; 4]);
@@ -20381,6 +20609,56 @@ mod platform_independent_tests {
         );
     }
 
+    /// Registering interest must not announce a completion: the guest's listener resolves the
+    /// event against state the submission creates, so an early wake dereferences a context that
+    /// does not exist.
+    #[test]
+    fn ampr_completions_are_announced_by_submission_not_registration() {
+        let mut state = ProbeDispatchState::default();
+        let equeue = 0x4000;
+        state.kernel_equeues.insert(equeue);
+        assert_eq!(
+            kernel_add_ampr_event([equeue, 0x7502, 0xabc, 0, 0, 0], &mut state),
+            0
+        );
+        assert!(
+            state.pending_events.is_empty(),
+            "registration announced a completion"
+        );
+
+        let mut buffer = [0_u8; 0x100];
+        let command_buffer = 0x5000_u64;
+        state.ampr_command_buffers.insert(
+            command_buffer,
+            AmprCommandBufferState {
+                buffer: buffer.as_mut_ptr().addr() as u64,
+                size: buffer.len() as u64,
+                ..AmprCommandBufferState::default()
+            },
+        );
+        assert_eq!(
+            ampr_command_buffer_write_kernel_event_queue(
+                [command_buffer, equeue, 0x7502, 0xabc, 0, 0],
+                &mut state,
+            ),
+            0
+        );
+        assert!(
+            state.pending_events.is_empty(),
+            "recording announced a completion before submission"
+        );
+
+        assert_eq!(
+            ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(state.pending_events.len(), 1);
+        let event = state.pending_events.front().unwrap();
+        assert_eq!(event.equeue, equeue);
+        assert_eq!(event.ident, 0x7502);
+        assert_eq!(event.user_data, 0xabc);
+    }
+
     #[test]
     fn directory_records_pack_console_dirents_without_crossing_blocks() {
         let entries: Vec<(String, bool)> = (0..40)
@@ -20420,6 +20698,64 @@ mod platform_independent_tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(next_file_number, 41);
+    }
+
+    /// Engines store timestamps as ticks and decompose them again for display. A tick that does
+    /// not survive the round trip produces an implausible date and fails their validation.
+    #[test]
+    fn rtc_tick_round_trips_through_a_date() {
+        let mut date = [0_u16; 8];
+        date[0] = 2026;
+        date[1] = 7;
+        date[2] = 25;
+        date[3] = 18;
+        date[4] = 43;
+        date[5] = 7;
+        let mut tick = 0_u64;
+        assert_eq!(
+            rtc_get_tick([
+                date.as_mut_ptr().addr() as u64,
+                (&raw mut tick).addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_ne!(tick, 0);
+
+        let mut recovered = [0_u16; 8];
+        assert_eq!(
+            rtc_set_tick([
+                recovered.as_mut_ptr().addr() as u64,
+                (&raw const tick).addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(recovered[..6], date[..6]);
+
+        // The current clock must also decompose to the same instant it reports as a tick.
+        let mut now_tick = 0_u64;
+        assert_eq!(rtc_get_current_tick((&raw mut now_tick).addr() as u64), 0);
+        let mut now_date = [0_u16; 8];
+        assert_eq!(
+            rtc_set_tick([
+                now_date.as_mut_ptr().addr() as u64,
+                (&raw const now_tick).addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert!(now_date[0] >= 2020, "year was {}", now_date[0]);
+        assert!((1..=12).contains(&now_date[1]));
     }
 
     #[test]
