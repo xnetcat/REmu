@@ -2335,6 +2335,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "WDszmSbWuDk" => "sceKernelAddUserEventEdge",
         "bBfz7kMF2Ho" => "sceKernelAddAmprEvent",
         "kwGyyjohI50" => "sceKernelGetEventData",
+        "F6e0kwo4cnk" => "sceKernelTriggerUserEvent",
+        "mJ7aghmgvfc" => "sceKernelGetEventId",
         "Xs9hdiD7sAA" => "pthread_setschedparam",
         "w2rJhmD+dsE" => "sceAgcDriverAddEqEvent",
         "BpFoboUJoZU" => "sceKernelCreateEventFlag",
@@ -4003,6 +4005,9 @@ struct GuestConditionState {
     /// Signals delivered to this condition. A stalled waiter on a condition that has never been
     /// signaled is a missing producer; one on a signaled condition is a lost wakeup.
     notifies: u64,
+    /// Timed waits that expired without being signaled. A large count with no signals is a poll
+    /// whose predicate never becomes true.
+    timeouts: u64,
 }
 
 impl GuestConditionState {
@@ -4722,6 +4727,8 @@ fn import_call_trace_limit() -> u64 {
 }
 
 static IMPORT_CALL_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Guards the one-time process-wide condition summary printed with the first stall report.
+static STALL_SNAPSHOT_EMITTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImportReturn {
     let limit = import_call_trace_limit();
@@ -6143,10 +6150,13 @@ where
         state = next_state;
         let interrupted =
             !state.condition_waiter_released(waiter) && guest_exception_is_pending(guest_thread);
-        (
-            wait_result.timed_out() && !state.condition_waiter_released(waiter) && !interrupted,
-            interrupted,
-        )
+        let expired =
+            wait_result.timed_out() && !state.condition_waiter_released(waiter) && !interrupted;
+        if expired {
+            let guest_condition = state.conditions.entry(condition).or_default();
+            guest_condition.timeouts = guest_condition.timeouts.saturating_add(1);
+        }
+        (expired, interrupted)
     } else if let Some(report_after) = stall_report_interval() {
         // An unbounded wait that never completes is the hardest stall class to attribute, because
         // the thread is parked with no record of what it wanted. Wake periodically to name the
@@ -6175,6 +6185,34 @@ where
                     report_after.as_secs(),
                     current_guest_thread_name()
                 );
+                if !STALL_SNAPSHOT_EMITTED.swap(true, Ordering::Relaxed) {
+                    // One process-wide view of every condition: which are being signaled, which
+                    // are only ever polled, and which have waiters nobody serves.
+                    let mut summary: Vec<_> = state
+                        .conditions
+                        .iter()
+                        .map(|(address, guest_condition)| {
+                            (
+                                *address,
+                                guest_condition.waiters.len(),
+                                guest_condition.notifies,
+                                guest_condition.timeouts,
+                            )
+                        })
+                        .collect();
+                    summary.sort_by_key(|(_, waiters, notifies, timeouts)| {
+                        (
+                            std::cmp::Reverse(*timeouts),
+                            std::cmp::Reverse(*waiters),
+                            *notifies,
+                        )
+                    });
+                    for (address, waiters, notifies, timeouts) in summary.iter().take(24) {
+                        eprintln!(
+                            "[REMu][STALL] condition={address:#x} waiters={waiters} notifies={notifies} timeouts={timeouts}"
+                        );
+                    }
+                }
             }
         }
         let interrupted =
@@ -7795,6 +7833,8 @@ fn dispatch_probe_import(
         "WDszmSbWuDk" => kernel_add_user_event_edge(arguments, state),
         "bBfz7kMF2Ho" => kernel_add_ampr_event(arguments, state),
         "kwGyyjohI50" => kernel_get_event_data(arguments[0]),
+        "F6e0kwo4cnk" => kernel_trigger_user_event(arguments, state),
+        "mJ7aghmgvfc" => kernel_get_event_id(arguments[0]),
         "Xs9hdiD7sAA" => pthread_set_schedule_parameters(arguments),
         // Direct unit-dispatch callers use the nonblocking poll. Live imports are routed through
         // `kernel_wait_equeue_blocking` before acquiring the process-wide dispatch lock.
@@ -7898,6 +7938,43 @@ fn kernel_add_user_event_edge(arguments: [u64; 6], state: &mut ProbeDispatchStat
         KERNEL_EVENT_FILTER_USER,
         0,
     )
+}
+
+/// Triggers a user event that a queue registered through `sceKernelAddUserEventEdge`.
+///
+/// The console delivers the registration's own user data, so a listener can resolve the event
+/// back to its context; the trigger's identifier selects which registration fires.
+fn kernel_trigger_user_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let (equeue, ident) = (arguments[0], arguments[1]);
+    let Some(&user_data) =
+        state
+            .kernel_event_registrations
+            .get(&(equeue, KERNEL_EVENT_FILTER_USER, ident))
+    else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    queue_kernel_event(
+        state,
+        KernelQueuedEvent {
+            equeue,
+            ident,
+            filter: KERNEL_EVENT_FILTER_USER,
+            flags: 0,
+            fflags: 1,
+            data: arguments[2],
+            user_data,
+        },
+    );
+    notify_kernel_equeue_waiters();
+    0
+}
+
+/// Reads the identifier of a delivered kernel event.
+fn kernel_get_event_id(event: u64) -> u64 {
+    if event == 0 {
+        return 0;
+    }
+    read_guest_u64(event)
 }
 
 /// Reads the `data` field of a delivered kernel event.
@@ -8107,8 +8184,9 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
         .and_then(|microseconds| Instant::now().checked_add(Duration::from_micros(microseconds)));
     let guest_thread = current_guest_thread_handle();
     if wait_sequence <= 64 || wait_sequence.is_power_of_two() {
+        let thread_name = current_guest_thread_name();
         eprintln!(
-            "[REMu][KERNEL][EQUEUE] wait sequence={wait_sequence} equeue={:#x} events={:#x} capacity={} out_count={:#x} timeout_ptr={timeout_pointer:#x} timeout_us={timeout_microseconds:?} thread={guest_thread:#x}",
+            "[REMu][KERNEL][EQUEUE] wait sequence={wait_sequence} equeue={:#x} events={:#x} capacity={} out_count={:#x} timeout_ptr={timeout_pointer:#x} timeout_us={timeout_microseconds:?} thread={thread_name:?}/{guest_thread:#x}",
             arguments[0],
             arguments[1],
             low_u32(arguments[2]),
@@ -10561,7 +10639,11 @@ fn ampr_submit_command_buffer(arguments: [u64; 6], state: &mut ProbeDispatchStat
 
 fn ampr_wait_command_buffer(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let id = low_u32(arguments[0]);
-    if state.apr_submissions.remove(&id) {
+    let known = state.apr_submissions.remove(&id);
+    if trace_ampr_reads() {
+        eprintln!("[REMu][AMPR] wait id={id} known={known}");
+    }
+    if known {
         0
     } else {
         sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
