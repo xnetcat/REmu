@@ -13,15 +13,15 @@ use thiserror::Error;
 #[cfg(target_os = "macos")]
 mod write_watch;
 #[cfg(target_os = "macos")]
-pub use write_watch::CpuWriteWatch;
+pub use write_watch::{CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement};
 
 #[cfg(target_os = "macos")]
 mod address_space;
 #[cfg(target_os = "macos")]
 pub use address_space::{
     AddressSpaceError, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
-    GuestPhysicalBacking, GuestProtection, GuestSharedMapOptions, GuestVmaInfo, GuestVmaState,
-    RequestedAddress,
+    GuestPhysicalBacking, GuestProtection, GuestSharedMapOptions, GuestSharedMappingIdentity,
+    GuestVmaInfo, GuestVmaState, RequestedAddress, guest_shared_mapping_identity,
 };
 
 pub const PS5_MAIN_IMAGE_BASE: GuestAddress = GuestAddress::new(0x0000_0008_0000_0000);

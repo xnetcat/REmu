@@ -14,16 +14,137 @@ use std::fmt;
 use std::io;
 use std::ops::BitOr;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use remu_core::GuestAddress;
 use thiserror::Error;
+
+use super::write_watch::CpuWriteWatch;
 
 pub const GUEST_PAGE_SIZE: u64 = 16 * 1024;
 
 static NEXT_BACKING_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SharedMappingRecord {
+    end: u64,
+    backing_id: u64,
+    backing_offset: u64,
+}
+
+/// Stable physical-backing identity for a byte range in a shared guest mapping.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GuestSharedMappingIdentity {
+    pub backing_id: u64,
+    pub backing_offset: u64,
+}
+
+static SHARED_MAPPINGS: OnceLock<Mutex<BTreeMap<u64, SharedMappingRecord>>> = OnceLock::new();
+
+fn shared_mappings() -> &'static Mutex<BTreeMap<u64, SharedMappingRecord>> {
+    SHARED_MAPPINGS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Resolves a live shared guest range to its backing object and byte offset.
+///
+/// Adjacent virtual mappings are accepted when they name contiguous slices of the same backing.
+/// Anonymous and guard mappings intentionally return `None` because they cannot alias another VA.
+#[must_use]
+pub fn guest_shared_mapping_identity(
+    address: u64,
+    byte_count: u64,
+) -> Option<GuestSharedMappingIdentity> {
+    if byte_count == 0 {
+        return None;
+    }
+    let end = address.checked_add(byte_count)?;
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (&start, first) = mappings.range(..=address).next_back()?;
+    if address >= first.end {
+        return None;
+    }
+    let identity = GuestSharedMappingIdentity {
+        backing_id: first.backing_id,
+        backing_offset: first.backing_offset.checked_add(address - start)?,
+    };
+    let mut cursor = first.end.min(end);
+    let mut expected_backing_offset = first
+        .backing_offset
+        .checked_add(first.end.checked_sub(start)?)?;
+    while cursor < end {
+        let next = mappings.get(&cursor)?;
+        if next.backing_id != identity.backing_id || next.backing_offset != expected_backing_offset
+        {
+            return None;
+        }
+        expected_backing_offset = expected_backing_offset.checked_add(next.end - cursor)?;
+        cursor = next.end.min(end);
+    }
+    Some(identity)
+}
+
+fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
+    let Some(end) = address.checked_add(byte_count) else {
+        return;
+    };
+    let mut mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let overlaps = mappings
+        .range(..end)
+        .filter(|(start, record)| record.end > address && **start < end)
+        .map(|(&start, &record)| (start, record))
+        .collect::<Vec<_>>();
+    for (start, record) in overlaps {
+        mappings.remove(&start);
+        if start < address {
+            mappings.insert(
+                start,
+                SharedMappingRecord {
+                    end: address,
+                    ..record
+                },
+            );
+        }
+        if record.end > end {
+            mappings.insert(
+                end,
+                SharedMappingRecord {
+                    end: record.end,
+                    backing_id: record.backing_id,
+                    backing_offset: record.backing_offset + (end - start),
+                },
+            );
+        }
+    }
+}
+
+fn register_shared_mapping_range(
+    address: u64,
+    byte_count: u64,
+    backing_id: u64,
+    backing_offset: u64,
+) {
+    let Some(end) = address.checked_add(byte_count) else {
+        return;
+    };
+    unregister_shared_mapping_range(address, byte_count);
+    shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            address,
+            SharedMappingRecord {
+                end,
+                backing_id,
+                backing_offset,
+            },
+        );
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GuestProtection(u8);
@@ -555,6 +676,8 @@ impl HostReservation {
 
 impl Drop for HostReservation {
     fn drop(&mut self) {
+        CpuWriteWatch::retire_overlapping(self.address(), self.size as u64);
+        unregister_shared_mapping_range(self.address(), self.size as u64);
         match self.kind {
             ReservationKind::Mmap => {
                 // SAFETY: This object owns the complete reservation, including replacement maps.
@@ -769,11 +892,13 @@ impl GuestAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let (start, end) = self.validate_page_range(address, size)?;
         self.ensure_covered(start, end, true, None)?;
+        let reprotection = CpuWriteWatch::begin_reprotect_overlapping(start, size);
         let address_pointer = host_pointer(start)?;
         // SAFETY: Validation proves the complete range belongs to mapped pages in our reservation.
-        if unsafe { libc::mprotect(address_pointer, host_size(size)?, protection.host_flags()) }
-            != 0
-        {
+        let result =
+            unsafe { libc::mprotect(address_pointer, host_size(size)?, protection.host_flags()) };
+        drop(reprotection);
+        if result != 0 {
             return Err(host_error("protection change", start, end));
         }
         self.split_at(start);
@@ -1096,6 +1221,7 @@ impl GuestAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         debug_assert!(start >= self.base().get());
         debug_assert!(start.saturating_add(size) <= self.end);
+        CpuWriteWatch::retire_overlapping(start, size);
         let pointer = host_pointer(start)?;
         // SAFETY: Placement validation proves this fixed range lies entirely inside our host
         // reservation and does not cover another mapped VMA.
@@ -1117,6 +1243,7 @@ impl GuestAddressSpace {
             ));
         }
         debug_assert_eq!(result, pointer);
+        unregister_shared_mapping_range(start, size);
         Ok(())
     }
 
@@ -1130,6 +1257,7 @@ impl GuestAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         debug_assert!(start >= self.base().get());
         debug_assert!(start.saturating_add(size) <= self.end);
+        CpuWriteWatch::retire_overlapping(start, size);
         let pointer = host_pointer(start)?;
         let offset = libc::off_t::try_from(backing_offset).map_err(|_| {
             AddressSpaceError::HostSizeOverflow {
@@ -1155,6 +1283,7 @@ impl GuestAddressSpace {
             ));
         }
         debug_assert_eq!(result, pointer);
+        register_shared_mapping_range(start, size, backing.id(), backing_offset);
         Ok(())
     }
 
@@ -1517,6 +1646,44 @@ mod tests {
         memory.read(page(second, 1), &mut bytes).unwrap();
         assert_eq!(&bytes, b"alias");
         assert_eq!(memory.query(second).unwrap().backing_id, Some(backing_id));
+        assert_eq!(
+            guest_shared_mapping_identity(first.get(), 2 * GUEST_PAGE_SIZE),
+            Some(GuestSharedMappingIdentity {
+                backing_id,
+                backing_offset: 0,
+            })
+        );
+        assert_eq!(
+            guest_shared_mapping_identity(page(second, 1).get(), GUEST_PAGE_SIZE),
+            Some(GuestSharedMappingIdentity {
+                backing_id,
+                backing_offset: GUEST_PAGE_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn replacing_shared_pages_removes_their_backing_identity() {
+        let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+        let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+        let mapped = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .unwrap();
+        assert!(guest_shared_mapping_identity(mapped.get(), GUEST_PAGE_SIZE).is_some());
+
+        memory.unmap(mapped, 2 * GUEST_PAGE_SIZE).unwrap();
+
+        assert_eq!(
+            guest_shared_mapping_identity(mapped.get(), GUEST_PAGE_SIZE),
+            None
+        );
     }
 
     #[test]

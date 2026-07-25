@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::io;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug)]
@@ -27,7 +27,46 @@ struct WatchedRange {
     byte_count: u64,
     generation: AtomicU64,
     dirty: AtomicBool,
+    retirement: AtomicU8,
     pages: Box<[WatchedPage]>,
+}
+
+const WATCH_ACTIVE: u8 = 0;
+const WATCH_REPROTECTING: u8 = 1;
+const WATCH_REPROTECTED: u8 = 2;
+const WATCH_REPLACED: u8 = 3;
+
+/// Why a CPU write watch stopped observing its original mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuWriteWatchRetirement {
+    /// A guest `mprotect` is currently changing the watched pages.
+    Reprotecting,
+    /// The original mapping remains live after a guest protection change.
+    Reprotected,
+    /// The original mapping was unmapped or replaced with different storage.
+    Replaced,
+}
+
+/// Keeps a reprotection distinguishable from a mapping replacement until `mprotect` finishes.
+///
+/// Dropping the guard publishes completion. This makes early-return error paths safe while letting
+/// resource owners preserve GPU-only contents across permission-only changes.
+#[must_use]
+pub struct CpuWriteWatchReprotection {
+    ranges: Vec<Arc<WatchedRange>>,
+}
+
+impl Drop for CpuWriteWatchReprotection {
+    fn drop(&mut self) {
+        for range in &self.ranges {
+            let _ = range.retirement.compare_exchange(
+                WATCH_REPROTECTING,
+                WATCH_REPROTECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +132,7 @@ static WATCH_STATE: OnceLock<Mutex<WatchState>> = OnceLock::new();
 static WATCH_SNAPSHOT: AtomicPtr<WatchSnapshot> = AtomicPtr::new(std::ptr::null_mut());
 static ACTIVE_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 static HOST_PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+static RECOVERED_DISARMED_FAULTS: AtomicU64 = AtomicU64::new(0);
 static HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
 struct PreviousAction(std::cell::UnsafeCell<MaybeUninit<libc::sigaction>>);
@@ -203,6 +243,7 @@ impl CpuWriteWatch {
             byte_count,
             generation: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
+            retirement: AtomicU8::new(WATCH_ACTIVE),
             pages: pages.into_boxed_slice(),
         });
         state.ranges.insert(range.id, Arc::clone(&range));
@@ -266,10 +307,59 @@ impl CpuWriteWatch {
     /// Dirty-page detail is cleared immediately before each page is rearmed. A write after this
     /// method returns is guaranteed to fault and become visible to this watch.
     pub fn rearm(&self) -> io::Result<()> {
+        if self.is_retired() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "CPU write watch was retired by a guest mapping change",
+            ));
+        }
         let state = state()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_retired() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "CPU write watch was retired by a guest mapping change",
+            ));
+        }
         arm_range(&self.range, &state)
+    }
+
+    /// Returns whether the guest mapping underneath this watch was replaced or reprotected.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retirement().is_some()
+    }
+
+    /// Returns why this watch no longer observes its original mapping.
+    #[must_use]
+    pub fn retirement(&self) -> Option<CpuWriteWatchRetirement> {
+        match self.range.retirement.load(Ordering::Acquire) {
+            WATCH_ACTIVE => None,
+            WATCH_REPROTECTING => Some(CpuWriteWatchRetirement::Reprotecting),
+            WATCH_REPROTECTED => Some(CpuWriteWatchRetirement::Reprotected),
+            WATCH_REPLACED => Some(CpuWriteWatchRetirement::Replaced),
+            _ => unreachable!("CPU write-watch retirement has an invalid state"),
+        }
+    }
+
+    /// Retires every write watch intersecting a guest mapping operation.
+    ///
+    /// Guest address-space mutation calls this before `mmap`/`mprotect`. A watch must never
+    /// restore read/write access to a replacement mapping when its handle is eventually dropped,
+    /// nor may its signal handler treat that replacement as the allocation it originally watched.
+    pub fn retire_overlapping(address: u64, byte_count: u64) {
+        let _ = retire_overlapping(address, byte_count, WATCH_REPLACED);
+    }
+
+    /// Temporarily retires watches while permissions change without replacing their mappings.
+    ///
+    /// The caller must hold the returned guard until its `mprotect` attempt has finished. Resource
+    /// owners may then install a fresh watch while retaining GPU-private contents.
+    pub fn begin_reprotect_overlapping(address: u64, byte_count: u64) -> CpuWriteWatchReprotection {
+        CpuWriteWatchReprotection {
+            ranges: retire_overlapping(address, byte_count, WATCH_REPROTECTING),
+        }
     }
 
     /// Returns the exact requested guest range rather than its page-aligned protection span.
@@ -277,6 +367,41 @@ impl CpuWriteWatch {
     pub fn range(&self) -> (u64, u64) {
         (self.range.address, self.range.byte_count)
     }
+}
+
+fn retire_overlapping(address: u64, byte_count: u64, retirement: u8) -> Vec<Arc<WatchedRange>> {
+    let Some(end) = address.checked_add(byte_count) else {
+        return Vec::new();
+    };
+    let mut state = state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let retired_ids = state
+        .ranges
+        .iter()
+        .filter_map(|(&id, range)| {
+            let range_end = range.address.saturating_add(range.byte_count);
+            (range.address < end && address < range_end).then_some(id)
+        })
+        .collect::<Vec<_>>();
+    if retired_ids.is_empty() {
+        return Vec::new();
+    }
+    let retired = retired_ids
+        .into_iter()
+        .filter_map(|id| state.ranges.remove(&id))
+        .collect::<Vec<_>>();
+    for range in &retired {
+        range.retirement.store(retirement, Ordering::Release);
+        for page in &range.pages {
+            page.armed.store(false, Ordering::Release);
+        }
+    }
+    publish_snapshot(&state);
+    for range in &retired {
+        restore_unowned_pages(range, &state);
+    }
+    retired
 }
 
 impl Drop for CpuWriteWatch {
@@ -287,6 +412,10 @@ impl Drop for CpuWriteWatch {
         if state.ranges.remove(&self.range.id).is_none() {
             return;
         }
+
+        self.range
+            .retirement
+            .store(WATCH_REPLACED, Ordering::Release);
 
         // Publish first. Once all pre-publication handlers leave, no handler can dereference this
         // range, and the remaining snapshot completely describes who still owns each page.
@@ -494,10 +623,12 @@ extern "C" fn write_fault_signal_handler(
 
 fn try_handle_write_fault(fault_address: u64) -> bool {
     if fault_address == 0 {
+        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: null address\n");
         return false;
     }
     let snapshot_pointer = WATCH_SNAPSHOT.load(Ordering::SeqCst);
     if snapshot_pointer.is_null() {
+        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: no watch snapshot\n");
         return false;
     }
     // SAFETY: ACTIVE_HANDLERS pins the immutable snapshot until this handler leaves.
@@ -505,20 +636,21 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
     let page_size = host_page_size_infallible();
     let page_address = align_down(fault_address, page_size);
     let Some(page) = snapshot.page(page_address) else {
+        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: page is not watched\n");
         return false;
     };
-    if !page.owners.iter().any(|owner| {
+    let has_armed_owner = page.owners.iter().any(|owner| {
         // SAFETY: the snapshot pins all range allocations referenced by its owners.
         let range = unsafe { &*owner.range };
         range.pages[owner.page_index].armed.load(Ordering::Acquire)
-    }) {
-        return false;
-    }
+    });
 
     let Ok(address) = usize::try_from(page_address) else {
+        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: address conversion failed\n");
         return false;
     };
     let Ok(length) = usize::try_from(page_size) else {
+        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: length conversion failed\n");
         return false;
     };
     // SAFETY: all page owners registered this live mapping. This is the exact protected host page.
@@ -530,7 +662,22 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         )
     } != 0
     {
+        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: mprotect failed\n");
         return false;
+    }
+
+    // A watched page with no armed owner is required to be read/write: a previous handled store
+    // disarmed it. Guest process-image protection and overlapping resource lifetimes can race that
+    // invariant under Rosetta. Because the immutable snapshot still proves this is a live unified-
+    // memory resource, recover its expected write access and mark every owner dirty instead of
+    // forwarding a fatal SIGBUS. Legitimate guest protection changes retire the watches before
+    // reaching mprotect, so they do not enter this path.
+    if !has_armed_owner {
+        // Multiple Unity writers can already be trapped on the same page when the first handler
+        // disarms it. The later handlers are expected recovery, not actionable diagnostics;
+        // writing one line per collision from signal context caused severe stderr and audio
+        // stalls in update-heavy scenes.
+        RECOVERED_DISARMED_FAULTS.fetch_add(1, Ordering::Relaxed);
     }
 
     for owner in &page.owners {
@@ -544,6 +691,18 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         range.dirty.store(true, Ordering::Release);
     }
     true
+}
+
+fn write_signal_diagnostic(message: &'static [u8]) {
+    // SAFETY: `write` is async-signal-safe, and the static byte slice remains live throughout the
+    // call. Ignore short writes because this is a last-chance crash diagnostic.
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            message.as_ptr().cast::<c_void>(),
+            message.len(),
+        );
+    }
 }
 
 unsafe fn chain_previous_action(
@@ -585,7 +744,7 @@ unsafe fn chain_previous_action(
 mod tests {
     use std::io;
 
-    use super::CpuWriteWatch;
+    use super::{CpuWriteWatch, CpuWriteWatchRetirement};
 
     struct TestMapping {
         pointer: *mut u8,
@@ -797,6 +956,88 @@ mod tests {
         unsafe { mapping.write(0, 0x7f) };
         // SAFETY: the byte remains in the live test mapping.
         assert_eq!(unsafe { mapping.pointer.read_volatile() }, 0x7f);
+    }
+
+    #[test]
+    fn mapping_changes_retire_overlapping_watches_without_late_permission_restore() {
+        let mapping = TestMapping::new(2);
+        // SAFETY: both watched pages remain mapped for the duration of the test.
+        let first = unsafe { CpuWriteWatch::new(mapping.address(), 128).unwrap() };
+        // SAFETY: the second page is likewise a live read/write mapping.
+        let second =
+            unsafe { CpuWriteWatch::new(mapping.address() + page_size() as u64, 128).unwrap() };
+
+        CpuWriteWatch::retire_overlapping(mapping.address(), page_size() as u64);
+        assert!(first.is_retired());
+        assert_eq!(first.retirement(), Some(CpuWriteWatchRetirement::Replaced));
+        assert!(!second.is_retired());
+        assert_eq!(first.rearm().unwrap_err().kind(), io::ErrorKind::NotFound);
+
+        // SAFETY: retirement restored the first page, while the active second-page watch still
+        // catches its own write independently.
+        unsafe {
+            mapping.write(0, 0x41);
+            mapping.write(page_size(), 0x42);
+        }
+        assert!(second.is_dirty());
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn reprotection_is_distinct_from_mapping_replacement() {
+        let mapping = TestMapping::new(1);
+        // SAFETY: the complete host page remains mapped throughout reprotection and rewatching.
+        let first = unsafe { CpuWriteWatch::new(mapping.address(), 128).unwrap() };
+        let reprotection =
+            CpuWriteWatch::begin_reprotect_overlapping(mapping.address(), page_size() as u64);
+        assert_eq!(
+            first.retirement(),
+            Some(CpuWriteWatchRetirement::Reprotecting)
+        );
+        // SAFETY: emulate the caller's permission-only operation before publishing completion.
+        assert_eq!(
+            unsafe {
+                libc::mprotect(
+                    mapping.pointer.cast(),
+                    page_size(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            },
+            0
+        );
+        drop(reprotection);
+        assert_eq!(
+            first.retirement(),
+            Some(CpuWriteWatchRetirement::Reprotected)
+        );
+
+        // SAFETY: the same live read/write mapping can be watched again without replacing it.
+        let second = unsafe { CpuWriteWatch::new(mapping.address(), 128).unwrap() };
+        // SAFETY: the renewed watch covers this byte.
+        unsafe { mapping.write(0, 0x52) };
+        assert!(second.is_dirty());
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn recovers_disarmed_page_if_external_protection_becomes_read_only() {
+        let mapping = TestMapping::new(1);
+        // SAFETY: the complete host page remains a live read/write mapping through the watch.
+        let watch = unsafe { CpuWriteWatch::new(mapping.address(), 128).unwrap() };
+        // SAFETY: the first store is handled normally and leaves the watched page disarmed/RW.
+        unsafe { mapping.write(0, 0x31) };
+        assert!(watch.is_dirty());
+        // SAFETY: emulate a racing process-image protection update on this exact live host page.
+        assert_eq!(
+            unsafe { libc::mprotect(mapping.pointer.cast(), page_size(), libc::PROT_READ,) },
+            0
+        );
+        // SAFETY: the signal handler recognizes the page's live watch, restores RW and dirties it.
+        unsafe { mapping.write(1, 0x32) };
+        assert!(watch.is_dirty());
+        drop(watch);
     }
 
     #[test]
