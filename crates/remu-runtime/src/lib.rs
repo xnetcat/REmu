@@ -2318,6 +2318,18 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "NcaWUxfMNIQ" => "sceKernelMapNamedDirectMemory",
         "mL8NDH86iQI" => "sceKernelMapNamedFlexibleMemory",
         "gEpBkcwxUjw" => "sceKernelAprResolveFilepathsToIdsAndFileSizes",
+        "WT-5NKy42fw" => "sceKernelAprResolveFilepathsToIds",
+        "eYAh2vlCY-U" => "sceKernelAprResolveFilepathsToIdsForEach",
+        "QzB4O+bJQyA" => "sceKernelAprResolveFilepathsToIdsAndFileSizesForEach",
+        "i3HWvW35jao" => "sceKernelAprResolveFilepathsWithPrefixToIds",
+        "w5fcCG+t31g" => "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes",
+        "VB-BtuIW8Xc" => "sceKernelAprResolveFilepathsWithPrefixToIdsForEach",
+        "C+Khtbbx2g8" => "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach",
+        "WvEu7yl3Ivg" => "sceKernelAprGetFileSize",
+        "ApkYaHb8Sek" => "sceKernelAprGetFileStat",
+        "eE4Szl8sil8" => "sceKernelAprSubmitCommandBuffer",
+        "qvMUCyyaCSI" => "sceKernelAprSubmitCommandBufferAndGetId",
+        "Z4QosVuAsA0" => "pthread_once",
         "ASoW5WE-UPo" => "sceKernelAprSubmitCommandBufferAndGetResult",
         "rqwFKI4PAiM" => "sceKernelAprWaitCommandBuffer",
         "BQQniolj9tQ" => "sceKernelMapDirectMemory2",
@@ -5660,6 +5672,7 @@ fn dispatch_guest_sync_import_at_import(
         "JGgj7Uvrl+A" => guest_condition_notify(arguments[0], true),
         "mkx2fVhNMsg" => posix_pthread_result(guest_condition_notify(arguments[0], true)),
         "14bOACANTBo" => guest_pthread_once(arguments[0], arguments[1]),
+        "Z4QosVuAsA0" => posix_pthread_result(guest_pthread_once(arguments[0], arguments[1])),
         "188x57JYp0g" => guest_semaphore_create(arguments),
         "R1Jvn8bSCW8" => guest_semaphore_delete(arguments[0]),
         "Zxa0VhQVTsk" => guest_semaphore_wait(arguments),
@@ -7582,6 +7595,91 @@ fn dispatch_probe_import(
         "ODJK2sn9w4A" | "k-q+xOxdc3E" => av_player_validate_handle(arguments[0], state),
         "hdTyRzCXQeQ" => av_player_stream_count(arguments[0], state),
         "gEpBkcwxUjw" => ampr_resolve_file_paths(arguments, state),
+        // One resolver reached through eight names: the variants differ only in whether the
+        // caller wants sizes, supplies a prefix, or collects a per-entry result.
+        "WT-5NKy42fw" => ampr_resolve_paths_core(
+            arguments[0],
+            arguments[1],
+            None,
+            AprResolveOutputs {
+                ids: arguments[2],
+                error_index: arguments[3],
+                ..AprResolveOutputs::default()
+            },
+            state,
+        ),
+        "eYAh2vlCY-U" => ampr_resolve_paths_core(
+            arguments[0],
+            arguments[1],
+            None,
+            AprResolveOutputs {
+                ids: arguments[2],
+                results: arguments[3],
+                ..AprResolveOutputs::default()
+            },
+            state,
+        ),
+        "QzB4O+bJQyA" => ampr_resolve_paths_core(
+            arguments[0],
+            arguments[1],
+            None,
+            AprResolveOutputs {
+                ids: arguments[2],
+                sizes: arguments[3],
+                results: arguments[4],
+                ..AprResolveOutputs::default()
+            },
+            state,
+        ),
+        "i3HWvW35jao" => ampr_resolve_paths_core(
+            arguments[1],
+            arguments[2],
+            read_guest_cstring(arguments[0]),
+            AprResolveOutputs {
+                ids: arguments[3],
+                error_index: arguments[4],
+                ..AprResolveOutputs::default()
+            },
+            state,
+        ),
+        "w5fcCG+t31g" => ampr_resolve_paths_core(
+            arguments[1],
+            arguments[2],
+            read_guest_cstring(arguments[0]),
+            AprResolveOutputs {
+                ids: arguments[3],
+                sizes: arguments[4],
+                error_index: arguments[5],
+                ..AprResolveOutputs::default()
+            },
+            state,
+        ),
+        "VB-BtuIW8Xc" => ampr_resolve_paths_core(
+            arguments[1],
+            arguments[2],
+            read_guest_cstring(arguments[0]),
+            AprResolveOutputs {
+                ids: arguments[3],
+                results: arguments[4],
+                ..AprResolveOutputs::default()
+            },
+            state,
+        ),
+        "C+Khtbbx2g8" => ampr_resolve_paths_core(
+            arguments[1],
+            arguments[2],
+            read_guest_cstring(arguments[0]),
+            AprResolveOutputs {
+                ids: arguments[3],
+                sizes: arguments[4],
+                results: arguments[5],
+                ..AprResolveOutputs::default()
+            },
+            state,
+        ),
+        "WvEu7yl3Ivg" => ampr_get_file_size(arguments, state),
+        "ApkYaHb8Sek" => ampr_get_file_stat(arguments, state),
+        "eE4Szl8sil8" | "qvMUCyyaCSI" => ampr_submit_command_buffer(arguments, state),
         "ASoW5WE-UPo" => ampr_submit_command_buffer(arguments, state),
         "rqwFKI4PAiM" => ampr_wait_command_buffer(arguments, state),
         // sceKernelMapDirectMemory2 inserts memory type and passes alignment as argument seven.
@@ -10502,26 +10600,65 @@ fn ampr_file_id(path: &str) -> u32 {
         })
 }
 
+/// Optional outputs and inputs shared by every APR path-resolution entry point.
+///
+/// The console exposes one resolver through eight names differing only in whether the caller
+/// wants sizes, supplies a path prefix, or collects a per-entry result instead of stopping at the
+/// first rejection.
+#[derive(Clone, Copy, Debug, Default)]
+struct AprResolveOutputs {
+    ids: u64,
+    sizes: u64,
+    error_index: u64,
+    results: u64,
+}
+
 fn ampr_resolve_file_paths(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let (path_list, count, ids, sizes, error_index) = (
+    ampr_resolve_paths_core(
         arguments[0],
         arguments[1],
-        arguments[2],
-        arguments[3],
-        arguments[4],
-    );
-    if path_list == 0 || count == 0 || count > 1024 || sizes == 0 {
+        None,
+        AprResolveOutputs {
+            ids: arguments[2],
+            sizes: arguments[3],
+            error_index: arguments[4],
+            ..AprResolveOutputs::default()
+        },
+        state,
+    )
+}
+
+/// Resolves a batch of guest paths to APR file identifiers.
+///
+/// Every entry is attempted when the caller supplies a per-entry result array; otherwise the
+/// batch stops at the first rejection, as the console does. Rejected entries always receive the
+/// invalid identifier and a zero size so a caller cannot mistake stale memory for a usable id.
+fn ampr_resolve_paths_core(
+    path_list: u64,
+    count: u64,
+    prefix: Option<String>,
+    outputs: AprResolveOutputs,
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let AprResolveOutputs {
+        ids,
+        sizes,
+        error_index,
+        results,
+    } = outputs;
+    if path_list == 0 || count == 0 || count > 1024 || (ids == 0 && sizes == 0 && results == 0) {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    // Mark every entry invalid before resolving. A rejected path must leave a recognizable
-    // sentinel rather than whatever the caller's buffer already held: an uninitialized word looks
-    // like a usable identifier, and the guest then reads a file it never successfully resolved.
     for index in 0..count {
         if ids != 0 {
             write_guest_u32(ids + index * 4, AMPR_INVALID_FILE_ID);
         }
-        write_guest_u64(sizes + index * 8, 0);
+        if sizes != 0 {
+            write_guest_u64(sizes + index * 8, 0);
+        }
     }
+    let mut first_error = 0;
+    let mut resolved = 0_u32;
     for index in 0..count {
         let candidate = read_guest_u64(path_list + index * 8);
         let path = read_guest_cstring(candidate).or_else(|| {
@@ -10529,40 +10666,118 @@ fn ampr_resolve_file_paths(arguments: [u64; 6], state: &mut ProbeDispatchState) 
                 .then(|| read_guest_cstring(path_list))
                 .flatten()
         });
-        let Some(guest_path) = path else {
-            return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
-        };
-        let Some((host_path, _)) = resolve_probe_guest_path(state, &guest_path) else {
-            eprintln!(
-                "[REMu][AMPR] resolve rejected guest={guest_path:?} index={index} of {count}"
-            );
-            if error_index != 0 {
-                write_guest_u32(error_index, low_u32(index));
+        let entry_error = match path {
+            None => sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT),
+            Some(guest_path) => {
+                let guest_path = match prefix.as_deref() {
+                    Some(prefix) => join_guest_path(prefix, &guest_path),
+                    None => guest_path,
+                };
+                ampr_resolve_one_path(&guest_path, index, count, ids, sizes, state)
             }
-            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
         };
-        let Ok(metadata) = host_path.metadata() else {
-            eprintln!(
-                "[REMu][AMPR] resolve missing guest={guest_path:?} host={:?} index={index} of {count}",
-                host_path.display()
-            );
-            if error_index != 0 {
-                write_guest_u32(error_index, low_u32(index));
-            }
-            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-        };
-        let file_id = ampr_file_id(&guest_path);
-        state.ampr_files.insert(file_id, host_path.clone());
-        state.ampr_file_handles.remove(&file_id);
-        if ids != 0 {
-            write_guest_u32(ids + index * 4, file_id);
+        if results != 0 {
+            write_guest_u32(results + index * 4, low_u32(entry_error));
         }
-        write_guest_u64(sizes + index * 8, metadata.len());
+        if entry_error == 0 {
+            resolved = resolved.saturating_add(1);
+            continue;
+        }
+        if first_error == 0 {
+            first_error = entry_error;
+            if error_index != 0 {
+                write_guest_u32(error_index, low_u32(index));
+            }
+        }
+        if results == 0 {
+            return entry_error;
+        }
+    }
+    if results != 0 {
+        return u64::from(resolved);
+    }
+    first_error
+}
+
+/// Joins a resolver prefix with one entry, keeping exactly one separator between them.
+fn join_guest_path(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        return path.to_owned();
+    }
+    let prefix = prefix.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    format!("{prefix}/{path}")
+}
+
+/// Resolves one path, recording its identifier and size on success.
+fn ampr_resolve_one_path(
+    guest_path: &str,
+    index: u64,
+    count: u64,
+    ids: u64,
+    sizes: u64,
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let Some((host_path, _)) = resolve_probe_guest_path(state, guest_path) else {
+        eprintln!("[REMu][AMPR] resolve rejected guest={guest_path:?} index={index} of {count}");
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let Ok(metadata) = host_path.metadata() else {
         eprintln!(
-            "[REMu][AMPR] resolved guest={guest_path:?} host={:?} id={file_id:#x} size={:#x}",
-            host_path.display(),
-            metadata.len()
+            "[REMu][AMPR] resolve missing guest={guest_path:?} host={:?} index={index} of {count}",
+            host_path.display()
         );
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let file_id = ampr_file_id(guest_path);
+    state.ampr_files.insert(file_id, host_path.clone());
+    state.ampr_file_handles.remove(&file_id);
+    if ids != 0 {
+        write_guest_u32(ids + index * 4, file_id);
+    }
+    if sizes != 0 {
+        write_guest_u64(sizes + index * 8, metadata.len());
+    }
+    eprintln!(
+        "[REMu][AMPR] resolved guest={guest_path:?} host={:?} id={file_id:#x} size={:#x}",
+        host_path.display(),
+        metadata.len()
+    );
+    0
+}
+
+/// Reports the size of an already resolved APR file.
+fn ampr_get_file_size(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let (file_id, output) = (low_u32(arguments[0]), arguments[1]);
+    if output == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(host_path) = state.ampr_files.get(&file_id) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let Ok(metadata) = host_path.metadata() else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    write_guest_u64(output, metadata.len());
+    0
+}
+
+/// Fills a kernel stat structure for an already resolved APR file.
+fn ampr_get_file_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let (file_id, output) = (low_u32(arguments[0]), arguments[1]);
+    if output == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(host_path) = state.ampr_files.get(&file_id).cloned() else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let Ok(metadata) = host_path.metadata() else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let payload = kernel_stat_payload_from_metadata(&metadata, &file_id.to_le_bytes());
+    // SAFETY: the caller supplies a writable Gen5 stat object in live guest memory.
+    unsafe {
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), output as *mut u8, payload.len());
     }
     0
 }
@@ -17881,16 +18096,24 @@ fn resolve_probe_guest_path(
 }
 
 fn resolve_path_beneath(root: &Path, relative: &str) -> Option<PathBuf> {
-    let mut host = root.to_owned();
     // Console paths routinely contain duplicate separators (for example
-    // `/app0//shaders/presenter.vert`). Treat them like POSIX does while keeping parent traversal
-    // outside the read-only game root impossible.
+    // `/app0//shaders/presenter.vert`) and parent components: engines address their content
+    // relative to a binaries directory, so `../../../game/config.ini` is an ordinary request, not
+    // an attack. Resolve `..` by popping the component it cancels, and refuse only a path that
+    // would leave the game root entirely.
+    let mut components: Vec<&str> = Vec::new();
     for component in relative.split('/') {
         match component {
             "" | "." => {}
-            ".." => return None,
-            component => host.push(component),
+            ".." => {
+                components.pop()?;
+            }
+            component => components.push(component),
         }
+    }
+    let mut host = root.to_owned();
+    for component in components {
+        host.push(component);
     }
     Some(host)
 }
@@ -18938,6 +19161,7 @@ mod platform_independent_tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::AprResolveOutputs;
     use super::{
         AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_INDEX_BASE,
         AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
@@ -18977,7 +19201,7 @@ mod platform_independent_tests {
     };
     use super::{
         AMPR_INVALID_FILE_ID, AmprCommandBufferState, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE,
-        KernelDirectory, ampr_resolve_file_paths,
+        KernelDirectory, ampr_resolve_file_paths, ampr_resolve_paths_core, join_guest_path,
     };
 
     #[repr(C, align(256))]
@@ -19970,6 +20194,23 @@ mod platform_independent_tests {
         );
     }
 
+    /// Engines address content relative to their binaries directory, so parent components inside
+    /// the game root must resolve rather than be refused.
+    #[test]
+    fn resolves_parent_components_inside_the_game_root() {
+        assert_eq!(
+            resolve_guest_path(
+                Path::new("/games/title"),
+                "/app0/engine/binaries/ps5/../../../shpc/config/binaryconfig.ini",
+            ),
+            Some(Path::new("/games/title/shpc/config/binaryconfig.ini").to_owned())
+        );
+        assert_eq!(
+            resolve_guest_path(Path::new("/games/title"), "/app0/shpc/./content/paks"),
+            Some(Path::new("/games/title/shpc/content/paks").to_owned())
+        );
+    }
+
     #[test]
     fn rejects_game_root_parent_traversal() {
         assert_eq!(
@@ -20883,6 +21124,46 @@ mod platform_independent_tests {
                 .len(),
             4
         );
+    }
+
+    /// The per-entry form attempts every path and reports how many resolved, instead of stopping
+    /// at the first rejection the way the error-index form does.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn per_entry_apr_resolution_continues_past_a_rejected_path() {
+        let mut state = ProbeDispatchState::default();
+        let missing = b"/app0/missing-one.bin\0";
+        let also_missing = b"/app0/missing-two.bin\0";
+        let list = [
+            missing.as_ptr().addr() as u64,
+            also_missing.as_ptr().addr() as u64,
+        ];
+        let mut ids = [0x1234_5678_u32; 2];
+        let mut results = [0_u32; 2];
+        // Every entry is attempted, so the reported count is the number that resolved: none.
+        assert_eq!(
+            ampr_resolve_paths_core(
+                list.as_ptr().addr() as u64,
+                2,
+                None,
+                AprResolveOutputs {
+                    ids: ids.as_mut_ptr().addr() as u64,
+                    results: results.as_mut_ptr().addr() as u64,
+                    ..AprResolveOutputs::default()
+                },
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(ids, [AMPR_INVALID_FILE_ID; 2]);
+        assert!(results.iter().all(|result| *result != 0));
+    }
+
+    #[test]
+    fn resolver_prefix_keeps_one_separator() {
+        assert_eq!(join_guest_path("/app0", "config.ini"), "/app0/config.ini");
+        assert_eq!(join_guest_path("/app0/", "/config.ini"), "/app0/config.ini");
+        assert_eq!(join_guest_path("", "/config.ini"), "/config.ini");
     }
 
     /// A rejected path must leave an identifier the guest recognizes as invalid. Leaving the

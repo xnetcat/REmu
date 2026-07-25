@@ -209,6 +209,7 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
             (
                 "hle",
                 quoted_nids(probe_dispatch)
+                | quoted_nids(function_slice(source, "dispatch_stateless_import"))
                 | quoted_nids(function_slice(source, "dispatch_kernel_file_import"))
                 | quoted_nids(function_slice(source, "is_guest_sync_import"))
                 | quoted_nids(function_slice(source, "dispatch_guest_sync_import")),
