@@ -8,6 +8,22 @@ Current overall state: the first small test title boots through resource loading
 draw streams, compiles observed RDNA2 shaders to Metal, and flips its display buffers. Early
 splash frames render correctly; full scene rendering and playability are still open.
 
+## Import coverage
+
+A PS5 import identifies its function only by an 11-character NID, so measuring coverage means
+first recovering names. `scripts/generate-nid-names.py` hashes every symbol exported by a
+directory of PS5 modules and keeps the matches; `scripts/audit-import-coverage.py` then reports,
+per title, how each imported NID is served.
+
+For the larger of the two test titles, of 2028 callable imports: 1140 resolve inside modules the
+game itself ships, 436 are implemented here, and 443 remain unserved. All but 12 have a recovered
+name, which is what makes the remaining gap a work list rather than a list of hashes. The unserved
+majority is concentrated in the graphics and asynchronous-file command-buffer builders.
+
+Naming a NID is not implementing it. The audit deliberately separates the two, and a handler that
+claimed a NID while returning a fabricated success would be worse than no handler at all: it turns
+a loud gap into a silent one. Unimplemented imports are expected to stay visible in the log.
+
 | Subsystem | Implemented | Next concrete gap |
 | --- | --- | --- |
 | CPU, loader, linker | x86-64 guest execution behind a native CPU backend under Rosetta; SELF/ELF mapping, observed relocations, AMD64 DTV slots, per-thread `__tls_get_addr`, TLS clone rebasing, and import trampolines with synthetic coverage. | Continue source-backed HLE import closure. The AArch64 translator stays deferred until a milestone requires it. |
