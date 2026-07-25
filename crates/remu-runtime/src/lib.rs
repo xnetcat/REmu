@@ -2634,6 +2634,10 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "aII9h5nli9U" => "sceAudioOut2ContextPush",
         "cd+Rtw+D1x8" => "sceAudioOut2PortDestroy",
         "g2tViFIohHE" => "sceAudioOut2Initialize",
+        "R7d0F1g2qsU" => "sceAudioOut2ContextGetQueueLevel",
+        "gatEUKG+Ea4" => "sceAudioOut2PortGetState",
+        "DImz2Ft9E2g" => "sceAudioOut2GetSpeakerInfo",
+        "mPpPxv5CZt4" => "sceSystemServiceGetHdrToneMapLuminance",
         "on6ZH7Abo10" => "sceAudioOut2ContextDestroy",
         "pDmme7Bgm6E" => "sceAudioOut2ContextQueryMemory",
         "t5YrizufpQc" => "sceAudioOut2ContextResetParam",
@@ -3917,6 +3921,10 @@ struct AudioOut2PortState {
 }
 
 const AUDIO_OUT2_MIX_QUANTUM_FRAMES: u64 = 0x100;
+/// Blocks a port accepts before the guest must wait. REmu drains each push immediately.
+const AUDIO_OUT2_QUEUE_DEPTH: u32 = 8;
+const AUDIO_OUT2_PORT_STATE_SIZE: u64 = 0x20;
+const AUDIO_OUT2_SPEAKER_INFO_SIZE: u64 = 0x10;
 const AUDIO_OUT2_FLOAT_SURROUND_FORMAT: u64 = 5;
 
 impl AudioOut2State {
@@ -4988,6 +4996,9 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             | "QOQtbeDqsT4"
             | "GrQ9s4IrNaQ"
             | "g2tViFIohHE"
+            | "R7d0F1g2qsU"
+            | "gatEUKG+Ea4"
+            | "DImz2Ft9E2g"
             | "t5YrizufpQc"
             | "pDmme7Bgm6E"
             | "0x6o1VVAYSY"
@@ -5211,6 +5222,9 @@ fn dispatch_audio_out_import(nid: &str, arguments: [u64; 6]) -> u64 {
     if matches!(
         nid,
         "g2tViFIohHE"
+            | "R7d0F1g2qsU"
+            | "gatEUKG+Ea4"
+            | "DImz2Ft9E2g"
             | "t5YrizufpQc"
             | "pDmme7Bgm6E"
             | "0x6o1VVAYSY"
@@ -5277,6 +5291,37 @@ fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
     match nid {
         "g2tViFIohHE" => {
             eprintln!("[REMu][AUDIO2] initialized parameter={:#x}", arguments[0]);
+            0
+        }
+        // The mixer drains every pushed block before returning, so no audio is ever queued behind
+        // the port. Reporting an empty queue keeps the guest supplying the next block instead of
+        // waiting for space that is already free.
+        "R7d0F1g2qsU" => {
+            if arguments[1] != 0 {
+                write_guest_u32(arguments[1], 0);
+            }
+            if arguments[2] != 0 {
+                write_guest_u32(arguments[2], AUDIO_OUT2_QUEUE_DEPTH);
+            }
+            0
+        }
+        "gatEUKG+Ea4" => {
+            if arguments[1] == 0 {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            }
+            // SceAudioOut2PortState: the queue counters lead the structure and the remaining
+            // fields describe volume and reroute state REmu does not alter.
+            guest_memset(arguments[1], 0, AUDIO_OUT2_PORT_STATE_SIZE);
+            write_guest_u32(arguments[1] + 4, AUDIO_OUT2_QUEUE_DEPTH);
+            0
+        }
+        "DImz2Ft9E2g" => {
+            if arguments[1] == 0 {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            }
+            // REmu mixes to a stereo host device, so one speaker pair is reported.
+            guest_memset(arguments[1], 0, AUDIO_OUT2_SPEAKER_INFO_SIZE);
+            write_guest_u32(arguments[1], 2);
             0
         }
         "t5YrizufpQc" => {
@@ -7263,7 +7308,10 @@ fn guest_zeroed_constructor(address: u64, size: u64) -> u64 {
 fn ajm_initialize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let reserved = arguments[0];
     let output = arguments[1];
-    if reserved != 0 || output == 0 {
+    // Gen5 titles tag this argument with the library revision in its high dword and leave the low
+    // dword reserved. Rejecting the whole value as "must be zero" fails initialization for every
+    // revision-tagged caller, which makes an audio engine tear its threads down during startup.
+    if low_u32(reserved) != 0 || output == 0 {
         return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
     }
 
@@ -7942,6 +7990,18 @@ fn dispatch_probe_import(
         "RpQJJVKTiFM" | "4fU5yvOkVG4" => kernel_module_info_for_unwind(arguments, state),
         "crb5j7mkk1c" | "OMDRKKAZ8I4" => 0,
         "Vo5V8KAwCmk" => system_service_hide_splash(state),
+        // REmu presents in standard dynamic range, so tone mapping reports the SDR reference
+        // luminance rather than an HDR display's peak.
+        "mPpPxv5CZt4" => {
+            if arguments[0] == 0 {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            }
+            guest_memset(arguments[0], 0, 12);
+            write_guest_u32(arguments[0], 100);
+            write_guest_u32(arguments[0] + 4, 100);
+            write_guest_u32(arguments[0] + 8, 100);
+            0
+        }
         // libSceSaveData uses durable host-side transactions while preserving the guest ABI.
         "TywrFKCoLGY" => save_data_initialize(state),
         "dyIhnXq-0SM" => save_data_dir_name_search(arguments, state),
@@ -18212,6 +18272,30 @@ fn resolve_probe_guest_path(
     resolve_guest_path(&state.game_root, &normalized).map(|path| (path, false))
 }
 
+/// Finds a sibling of `path` whose name differs only by case.
+///
+/// Returns `None` when the parent cannot be listed or nothing matches, leaving the caller's
+/// original path so a genuine miss still reports the name the guest asked for.
+fn case_insensitive_child(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent()?;
+    let mut matched = None;
+    for entry in std::fs::read_dir(parent).ok()? {
+        let entry = entry.ok()?;
+        let candidate = entry.file_name();
+        let candidate = candidate.to_str()?;
+        if candidate.eq_ignore_ascii_case(name) {
+            // An exact match always wins; otherwise keep the first case-insensitive hit so the
+            // result stays stable regardless of directory order.
+            if candidate == name {
+                return Some(entry.path());
+            }
+            matched.get_or_insert_with(|| entry.path());
+        }
+    }
+    matched
+}
+
 fn resolve_path_beneath(root: &Path, relative: &str) -> Option<PathBuf> {
     // Console paths routinely contain duplicate separators (for example
     // `/app0//shaders/presenter.vert`) and parent components: engines address their content
@@ -18231,6 +18315,14 @@ fn resolve_path_beneath(root: &Path, relative: &str) -> Option<PathBuf> {
     let mut host = root.to_owned();
     for component in components {
         host.push(component);
+        if !host.exists() {
+            // Console lookups do not distinguish case, and dumps are frequently stored with
+            // normalized names. Fall back to a case-insensitive match within the parent so a
+            // title that asks for `AkRoomVerb.prx` still finds `akroomverb.prx`.
+            if let Some(matched) = case_insensitive_child(&host) {
+                host = matched;
+            }
+        }
     }
     Some(host)
 }
@@ -20313,6 +20405,25 @@ mod platform_independent_tests {
 
     /// Engines address content relative to their binaries directory, so parent components inside
     /// the game root must resolve rather than be refused.
+    /// Dumps are frequently stored with normalized names while titles request the original
+    /// casing, and console lookups do not distinguish case.
+    #[test]
+    fn resolves_guest_paths_that_differ_only_by_case() {
+        let root = std::env::temp_dir().join(format!("remu-case-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("prx")).unwrap();
+        std::fs::write(root.join("prx/akroomverb.prx"), b"module").unwrap();
+        // The resolved path must name a file that exists. On a case-insensitive host the request
+        // already resolves; on a case-sensitive one only the fallback finds the stored name.
+        let resolved = resolve_guest_path(&root, "/app0/prx/AkRoomVerb.prx").unwrap();
+        assert!(resolved.is_file(), "unresolved: {}", resolved.display());
+        // A genuine miss still reports the name the guest asked for.
+        assert_eq!(
+            resolve_guest_path(&root, "/app0/prx/Missing.prx"),
+            Some(root.join("prx/Missing.prx"))
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn resolves_parent_components_inside_the_game_root() {
         assert_eq!(
@@ -20492,6 +20603,29 @@ mod platform_independent_tests {
     }
 
     #[test]
+    /// Gen5 tags the reserved argument with a library revision; only the low dword must be zero.
+    #[test]
+    fn ajm_initialize_accepts_a_revision_tagged_reserved_argument() {
+        let mut state = ProbeDispatchState::default();
+        let mut context = 0_u32;
+        assert_eq!(
+            ajm_initialize(
+                [0x3_0000_0000, (&raw mut context).addr() as u64, 0, 0, 0, 0],
+                &mut state,
+            ),
+            0
+        );
+        assert_ne!(context, 0);
+        // A non-zero low dword is still a malformed reserved value.
+        assert_ne!(
+            ajm_initialize(
+                [0x3_0000_0001, (&raw mut context).addr() as u64, 0, 0, 0, 0],
+                &mut state,
+            ),
+            0
+        );
+    }
+
     fn ajm_initialize_allocates_stable_nonzero_context_ids() {
         let mut state = ProbeDispatchState::default();
         let mut first = 0_u32;
