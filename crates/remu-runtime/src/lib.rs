@@ -6,6 +6,13 @@ mod agc_register_defaults;
 mod audio;
 #[cfg(target_os = "macos")]
 mod kernel_memory;
+mod agc_dcb;
+mod agc_acb;
+mod agc_state;
+mod agc_driver;
+mod ampr;
+mod kernel_api;
+mod av;
 mod nid_names;
 mod np;
 
@@ -8215,9 +8222,13 @@ fn dispatch_probe_import(
         // general first-hit log also includes known imports whose implementation lives above this
         // dispatcher, so it cannot distinguish a missing ABI from an incomplete name table.
         _ => {
+            if let Some(result) = dispatch_extended_import(nid, arguments, state) {
+                return result;
+            }
             if state.unimplemented_nids.insert(nid.to_owned()) {
                 eprintln!(
-                    "[REMu][IMPORT] unimplemented nid={nid} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    "[REMu][IMPORT] unimplemented nid={nid} name={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    nid_display_name(nid).unwrap_or("unknown"),
                     arguments[0],
                     arguments[1],
                     arguments[2],
@@ -8229,6 +8240,40 @@ fn dispatch_probe_import(
             sce_kernel_error(SCE_KERNEL_ERROR_NOT_IMPLEMENTED)
         }
     }
+}
+
+/// Offers a NID to each per-area module in turn, returning the first result produced.
+///
+/// The main dispatcher consults this only after its own table misses, so a module here can add
+/// an ABI without touching the dispatcher, and a NID no module owns still reaches the
+/// unimplemented report unchanged.
+fn dispatch_extended_import(
+    nid: &str,
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> Option<u64> {
+    if let Some(result) = agc_dcb::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    if let Some(result) = agc_acb::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    if let Some(result) = agc_state::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    if let Some(result) = agc_driver::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    if let Some(result) = ampr::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    if let Some(result) = kernel_api::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    if let Some(result) = av::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    None
 }
 
 /// Destroys an event queue and discards the registrations and undelivered events it owned.
