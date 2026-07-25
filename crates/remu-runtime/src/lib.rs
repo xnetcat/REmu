@@ -2466,6 +2466,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "9vA2aW+CHuA" => "sceNetInetNtop",
         "C4UgDHHPvdw" => "sceNetResolverCreate",
         "obuxdTiwkF8" => "sceNetCtlGetInfo",
+        "UJ+Z7Q+4ck0" => "sceNetCtlRegisterCallback",
+        "iQw3iQPhvUQ" => "sceNetCtlCheckCallback",
         "A9cVMUtEp4Y" => "sceHttpInit",
         "0gYjPTR-6cY" => "sceHttpCreateTemplate",
         "nBDD66kiFW8" => "sceShareInitialize",
@@ -7309,6 +7311,10 @@ fn dispatch_stateless_import(
         // network status must fail explicitly so online features disable themselves instead of
         // waiting on a link that never appears.
         "C4UgDHHPvdw" | "obuxdTiwkF8" => guest_net_unavailable(50),
+        // Network-state callbacks are accepted and never fire: an offline link never changes
+        // state, so there is no notification to deliver and nothing pending to check.
+        "UJ+Z7Q+4ck0" => net_ctl_register_callback(arguments),
+        "iQw3iQPhvUQ" => 0,
         "nBDD66kiFW8" => 0,
         "zE-wXIZjLoM" => kernel_debug_raise_exception_on_release_mode(arguments),
         "j2AIqSqJP0w" | "2G6i6hMIUUY" => guest_kernel_getdents(arguments, false),
@@ -8777,6 +8783,19 @@ fn system_service_get_display_safe_area_info(output: u64) -> u64 {
     0
 }
 
+/// Records a network-state callback and reports its identifier.
+fn net_ctl_register_callback(arguments: [u64; 6]) -> u64 {
+    static NEXT_CALLBACK: AtomicU32 = AtomicU32::new(1);
+    if arguments[0] == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let id = NEXT_CALLBACK.fetch_add(1, Ordering::Relaxed);
+    if arguments[2] != 0 {
+        write_guest_u32(arguments[2], id);
+    }
+    0
+}
+
 /// Converts a binary network address into its textual form.
 fn net_inet_ntop(arguments: [u64; 6]) -> u64 {
     const AF_INET: i32 = 2;
@@ -10115,6 +10134,9 @@ fn ampr_command_buffer_set_buffer(arguments: [u64; 6], state: &mut ProbeDispatch
     0
 }
 
+/// Identifier reported for a path the kernel could not resolve.
+const AMPR_INVALID_FILE_ID: u32 = 0xffff_ffff;
+
 /// Byte size of one recorded APR command record.
 const AMPR_COMMAND_RECORD_SIZE: u64 = 0x30;
 /// Record tag for an equeue completion signal.
@@ -10264,6 +10286,15 @@ fn ampr_resolve_file_paths(arguments: [u64; 6], state: &mut ProbeDispatchState) 
     if path_list == 0 || count == 0 || count > 1024 || sizes == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    // Mark every entry invalid before resolving. A rejected path must leave a recognizable
+    // sentinel rather than whatever the caller's buffer already held: an uninitialized word looks
+    // like a usable identifier, and the guest then reads a file it never successfully resolved.
+    for index in 0..count {
+        if ids != 0 {
+            write_guest_u32(ids + index * 4, AMPR_INVALID_FILE_ID);
+        }
+        write_guest_u64(sizes + index * 8, 0);
+    }
     for index in 0..count {
         let candidate = read_guest_u64(path_list + index * 8);
         let path = read_guest_cstring(candidate).or_else(|| {
@@ -10275,12 +10306,19 @@ fn ampr_resolve_file_paths(arguments: [u64; 6], state: &mut ProbeDispatchState) 
             return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
         };
         let Some((host_path, _)) = resolve_probe_guest_path(state, &guest_path) else {
+            eprintln!(
+                "[REMu][AMPR] resolve rejected guest={guest_path:?} index={index} of {count}"
+            );
             if error_index != 0 {
                 write_guest_u32(error_index, low_u32(index));
             }
             return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
         };
         let Ok(metadata) = host_path.metadata() else {
+            eprintln!(
+                "[REMu][AMPR] resolve missing guest={guest_path:?} host={:?} index={index} of {count}",
+                host_path.display()
+            );
             if error_index != 0 {
                 write_guest_u32(error_index, low_u32(index));
             }
@@ -18702,7 +18740,10 @@ mod platform_independent_tests {
         system_service_param_get_int, take_exit_callbacks, tls_dtv_entry_offset,
         unix_days_from_civil, video_out_open, write_guest_u32, write_guest_u64, write_import_stub,
     };
-    use super::{AmprCommandBufferState, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, KernelDirectory};
+    use super::{
+        AMPR_INVALID_FILE_ID, AmprCommandBufferState, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE,
+        KernelDirectory, ampr_resolve_file_paths,
+    };
 
     #[repr(C, align(256))]
     struct AlignedComputeProgram([u32; 4]);
@@ -20607,6 +20648,38 @@ mod platform_independent_tests {
                 .len(),
             4
         );
+    }
+
+    /// A rejected path must leave an identifier the guest recognizes as invalid. Leaving the
+    /// caller's buffer untouched lets uninitialized stack data pass as a usable file id, and the
+    /// guest then issues a read for a file it never resolved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unresolved_apr_paths_report_an_invalid_identifier() {
+        let mut state = ProbeDispatchState::default();
+        let path = b"/app0/does-not-exist.res\0";
+        let path_list = [path.as_ptr().addr() as u64];
+        // Pre-fill with values that would look like plausible identifiers if left untouched.
+        let mut ids = [0x006e_0069_u32; 1];
+        let mut sizes = [0xdead_beef_u64; 1];
+        let mut error_index = 0_u32;
+        assert_ne!(
+            ampr_resolve_file_paths(
+                [
+                    path_list.as_ptr().addr() as u64,
+                    1,
+                    ids.as_mut_ptr().addr() as u64,
+                    sizes.as_mut_ptr().addr() as u64,
+                    (&raw mut error_index).addr() as u64,
+                    0,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(ids[0], AMPR_INVALID_FILE_ID);
+        assert_eq!(sizes[0], 0);
+        assert_eq!(error_index, 0);
     }
 
     /// Registering interest must not announce a completion: the guest's listener resolves the
