@@ -10937,8 +10937,9 @@ remaining={:#x}: {error}",
     command.command_count += 1;
     if trace_ampr_reads() {
         eprintln!(
-            "[REMu][AMPR] read id={file_id:#x} offset={file_offset:#x} requested={size:#x} read={:#x} destination={destination:#x}",
-            bytes_read
+            "[REMu][AMPR] read id={file_id:#x} offset={file_offset:#x} requested={size:#x} read={:#x} destination={destination:#x} thread={:?}",
+            bytes_read,
+            current_guest_thread_name()
         );
     }
     0
