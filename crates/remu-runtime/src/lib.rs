@@ -6099,6 +6099,15 @@ fn guest_condition_destroy(address: u64) -> u64 {
     }
 }
 
+/// Whether a stalled wait is released as a spurious wakeup once it is reported.
+///
+/// This is a diagnostic: it cannot make an incorrect guest correct, but it separates a lost
+/// wakeup from a predicate no producer ever satisfies.
+fn stall_break_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REMU_STALL_BREAK").is_some_and(|value| value == "1"))
+}
+
 /// Lists every event registration the guest is waiting on.
 ///
 /// A queue with waiters but no registration, or a registration REmu never posts to, identifies
@@ -6186,6 +6195,8 @@ where
     drop(mutex);
     let guest_thread = current_guest_thread_handle();
 
+    // Set when a diagnostic spurious wake retires an otherwise unbounded wait.
+    let mut released_spuriously = false;
     let (timed_out, interrupted) = if let Some(timeout) = timeout_usec {
         let duration = Duration::from_micros(timeout);
         let (next_state, wait_result) = sync
@@ -6220,6 +6231,17 @@ where
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next_state;
             if !wait_result.timed_out() {
+                break;
+            }
+            if stall_break_enabled() {
+                // POSIX permits spurious wakeups, so releasing a stalled waiter cannot corrupt a
+                // correct guest: it re-tests its predicate and waits again. Whether it proceeds
+                // distinguishes a lost wakeup from a predicate that was never satisfied.
+                eprintln!(
+                    "[REMu][STALL] releasing stalled wait thread={:?} condition={condition:#x} ticket={waiter}",
+                    current_guest_thread_name()
+                );
+                released_spuriously = true;
                 break;
             }
             if !reported {
@@ -6279,7 +6301,11 @@ where
             !state.condition_waiter_released(waiter) && guest_exception_is_pending(guest_thread);
         (false, interrupted)
     };
-    state.finish_condition_wait(condition, waiter, timed_out || interrupted);
+    state.finish_condition_wait(
+        condition,
+        waiter,
+        timed_out || interrupted || released_spuriously,
+    );
     drop(state);
 
     if interrupted {
