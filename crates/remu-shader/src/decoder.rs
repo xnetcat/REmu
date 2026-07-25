@@ -91,7 +91,9 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
         let ended = instruction.opcode == Opcode::END_PROGRAM;
         instructions.push(instruction);
         if ended && furthest_forward_branch_target.is_none_or(|target| pc >= target) {
-            return Ok(Program::new(address, instructions));
+            let program = Program::new(address, instructions);
+            crate::coverage::record_program(&program);
+            return Ok(program);
         }
     }
     Err(DecodeError::Unterminated)

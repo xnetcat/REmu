@@ -19436,7 +19436,19 @@ extern "C" fn guest_exit(code: i32) {
     terminate_probe(code);
 }
 
+/// Prints the shader opcode histogram accumulated by this run, one `[REMu][SHADER-OPCODES]` line
+/// per opcode.
+///
+/// The report is empty unless `REMU_TRACE_SHADER_OPCODES=1` was set for the process, so every path
+/// that ends a run can call this unconditionally.
+pub fn report_shader_opcode_coverage() {
+    for line in remu_shader::opcode_coverage_report() {
+        eprintln!("[REMu][SHADER-OPCODES] {line}");
+    }
+}
+
 fn terminate_probe(code: i32) -> ! {
+    report_shader_opcode_coverage();
     #[cfg(unix)]
     // SAFETY: `_exit` terminates the isolated CLI probe without unwinding across guest frames.
     unsafe {
