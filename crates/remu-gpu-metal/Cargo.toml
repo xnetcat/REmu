@@ -16,6 +16,7 @@ libc.workspace = true
 metal.workspace = true
 objc.workspace = true
 remu-memory = { path = "../remu-memory" }
+sha1.workspace = true
 winit.workspace = true
 
 [lints]
