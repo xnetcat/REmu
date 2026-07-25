@@ -2331,6 +2331,9 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "D0OdFMjp46I" => "sceKernelCreateEqueue",
         "fzyMKs9kim0" => "sceKernelWaitEqueue",
         "WDszmSbWuDk" => "sceKernelAddUserEventEdge",
+        "bBfz7kMF2Ho" => "sceKernelAddAmprEvent",
+        "kwGyyjohI50" => "sceKernelGetEventData",
+        "Xs9hdiD7sAA" => "pthread_setschedparam",
         "w2rJhmD+dsE" => "sceAgcDriverAddEqEvent",
         "BpFoboUJoZU" => "sceKernelCreateEventFlag",
         "8mql9OcQnd4" => "sceKernelDeleteEventFlag",
@@ -2453,7 +2456,41 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "-4GCfYdNF1s" => "sceImeUpdate",
         "18B2NS1y9UU" => "sceRtcGetCurrentTick",
         "ZPD1YOKI+Kw" => "sceRtcGetCurrentClockLocalTime",
+        "8w-H19ip48I" => "sceRtcGetTick",
         "8zLSfEfW5AU" => "sceCoredumpRegisterCoredumpHandler",
+        "j2AIqSqJP0w" => "sceKernelGetdents",
+        "2G6i6hMIUUY" => "posix_getdents",
+        "taRWhTJFTgE" => "sceKernelGetdirentries",
+        "sfKygSjIbI8" => "getdirentries",
+        "ts6GlZOKRrE" => "scePlayGoInitialize",
+        "MPe0EeBGM-E" => "scePlayGoTerminate",
+        "M1Gma1ocrGE" => "scePlayGoOpen",
+        "Uco1I0dlDi8" => "scePlayGoClose",
+        "uWIYLFkkwqk" => "scePlayGoGetLocus",
+        "-RJWNMK3fC8" => "scePlayGoGetProgress",
+        "v6EZ-YWRdMs" => "scePlayGoGetEta",
+        "rvBSfTimejE" => "scePlayGoGetInstallSpeed",
+        "4AAcTU9R3XM" => "scePlayGoSetInstallSpeed",
+        "73fF1MFU8hA" => "scePlayGoGetChunkId",
+        "3OMbYZBaa50" => "scePlayGoGetLanguageMask",
+        "LosLlHOpNqQ" => "scePlayGoSetLanguageMask",
+        "Nn7zKwnA5q0" => "scePlayGoGetToDoList",
+        "gUPGiOQ1tmQ" => "scePlayGoSetToDoList",
+        "-Q1-u1a7p0g" => "scePlayGoPrefetch",
+        "lDqxaY1UbEo" => "sceMsgDialogInitialize",
+        "ePw-kqZmelo" => "sceMsgDialogTerminate",
+        "b06Hh0DPEaE" => "sceMsgDialogOpen",
+        "HTrcDKlFKuM" => "sceMsgDialogClose",
+        "CWVW78Qc3fI" => "sceMsgDialogGetStatus",
+        "6fIC3XKt2k0" => "sceMsgDialogUpdateStatus",
+        "Lr8ovHH9l6A" => "sceMsgDialogGetResult",
+        "nu4a0-arQis" => "sceKernelAioInitializeParam",
+        "vYU8P9Td2Zo" => "sceKernelAioInitializeImpl",
+        "geDaqgH9lTg" => "posix_pthread_key_create",
+        "EI-5-jlq2dE" => "posix_pthread_getthreadid_np",
+        "eR2bZFAAU0Q" => "sceSysmoduleUnloadModule",
+        "buYbeLOGWmA" => "sceAppContentTemporaryDataMount2",
+        "zE-wXIZjLoM" => "sceKernelDebugRaiseExceptionOnReleaseMode",
         "dKadqZFgKKQ" => "sceImeKeyboardGetResourceId",
         "VkqLPArfFdc" => "sceImeKeyboardGetInfo",
         "rnEhHqG-4xo" => "sceUserServiceGetAccessibilityChatTranscription",
@@ -2633,6 +2670,15 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "a8uLzYY--tM" => "sceAmprAprCommandBufferConstructor",
         "N-FSPA4S3nI" => "sceAmprCommandBufferSetBuffer",
         "baQO9ez2gL4" => "sceAmprCommandBufferReset",
+        "ULvXMDz56po" => "sceAmprCommandBufferClearBuffer",
+        "tZDDEo2tE5k" => "sceAmprCommandBufferGetSize",
+        "GnxKOHEawhk" => "sceAmprCommandBufferGetCurrentOffset",
+        "H896Pt-yB4I" => "sceAmprCommandBufferWriteKernelEventQueue_04_00",
+        "sSAUCCU1dv4" => "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00",
+        "vWU-odnS+fU" => "sceAmprMeasureCommandSizeReadFile",
+        "GuchCTefuZw" => "sceAmprCommandBufferDestructor",
+        "Qs1xtplKo0U" => "sceAmprAprCommandBufferDestructor",
+        "Jmi+9w9u0E4" => "pthread_create_name_np",
         "mQ16-QdKv7k" => "sceAmprAprCommandBufferReadFile",
         "PjS5uASwcV8" => "sceVideoOutSetBufferAttribute2",
         "rKBUtgRrtbk" => "sceVideoOutRegisterBuffers2",
@@ -3086,6 +3132,10 @@ struct RuntimeServiceState {
     user_login_event_delivered: bool,
     pad: InitializationState,
     common_dialog: InitializationState,
+    /// Lifecycle state of the system message dialog, using the common-dialog status values.
+    message_dialog_status: u32,
+    play_go_initialized: bool,
+    play_go_open: bool,
     save_data_dialog_status: i32,
     agc_states: BTreeMap<u64, u32>,
     game_update: InitializationState,
@@ -3686,6 +3736,9 @@ struct KernelQueuedEvent {
 
 const KERNEL_EVENT_FILTER_GRAPHICS: i16 = -14;
 const KERNEL_EVENT_FILTER_USER: i16 = -11;
+/// Gen5 AP/AMPR command-buffer completion. The Gen4 filter set ends at the high-resolution timer,
+/// so the console assigns this newer source the next identifier below it.
+const KERNEL_EVENT_FILTER_AMPR: i16 = -16;
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
 static KERNEL_EQUEUE_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
@@ -3716,6 +3769,8 @@ struct AudioOut2State {
 struct KernelFileState {
     next_fd: i32,
     files: BTreeMap<i32, std::fs::File>,
+    directories: BTreeMap<i32, KernelDirectory>,
+    next_file_number: u32,
 }
 
 impl Default for KernelFileState {
@@ -3723,7 +3778,90 @@ impl Default for KernelFileState {
         Self {
             next_fd: 3,
             files: BTreeMap::new(),
+            directories: BTreeMap::new(),
+            next_file_number: 1,
         }
+    }
+}
+
+/// A directory opened by the guest, holding its entries already packed as console dirent records.
+///
+/// The listing is captured when the directory is opened so repeated reads see one stable
+/// enumeration, matching a guest that walks a directory while writing files elsewhere.
+#[derive(Debug, Default)]
+struct KernelDirectory {
+    records: Vec<u8>,
+    offset: usize,
+}
+
+/// Bytes of fixed dirent header before the name: `d_fileno`, `d_reclen`, `d_type`, `d_namlen`.
+const DIRENT_HEADER_SIZE: usize = 8;
+/// Console dirent records never straddle this boundary, so a reader can consume whole blocks.
+const DIRENT_BLOCK_SIZE: usize = 512;
+const DIRENT_TYPE_DIRECTORY: u8 = 4;
+const DIRENT_TYPE_FILE: u8 = 8;
+
+impl KernelDirectory {
+    /// Packs one directory listing into console dirent records.
+    ///
+    /// Each record is four-byte aligned, and a record that would cross a 512-byte block is pushed
+    /// to the next block by extending the previous record's length. Readers rely on that
+    /// invariant to consume a block at a time without partially decoding a trailing record.
+    fn new(entries: &[(String, bool)], next_file_number: &mut u32) -> Self {
+        let mut records: Vec<u8> = Vec::new();
+        let mut last_record_start: Option<usize> = None;
+        for (name, is_directory) in entries {
+            let name_bytes = name.as_bytes();
+            let Ok(name_length) = u8::try_from(name_bytes.len()) else {
+                // The console's dirent name length is a single byte; longer names cannot be
+                // represented and are skipped rather than truncated into a different name.
+                continue;
+            };
+            let record_length = (DIRENT_HEADER_SIZE + name_bytes.len() + 1).next_multiple_of(4);
+            let block_remaining = DIRENT_BLOCK_SIZE - records.len() % DIRENT_BLOCK_SIZE;
+            if record_length > block_remaining {
+                // Extend the previous record over the padding so the block stays fully described.
+                if let Some(start) = last_record_start {
+                    let previous = u16::from_le_bytes([records[start + 4], records[start + 5]]);
+                    let extended =
+                        previous.saturating_add(u16::try_from(block_remaining).unwrap_or(u16::MAX));
+                    records[start + 4..start + 6].copy_from_slice(&extended.to_le_bytes());
+                }
+                records.resize(records.len() + block_remaining, 0);
+            }
+            let file_number = *next_file_number;
+            *next_file_number = next_file_number.wrapping_add(1).max(1);
+            last_record_start = Some(records.len());
+            records.extend_from_slice(&file_number.to_le_bytes());
+            records.extend_from_slice(
+                &u16::try_from(record_length)
+                    .unwrap_or(u16::MAX)
+                    .to_le_bytes(),
+            );
+            records.push(if *is_directory {
+                DIRENT_TYPE_DIRECTORY
+            } else {
+                DIRENT_TYPE_FILE
+            });
+            records.push(name_length);
+            records.extend_from_slice(name_bytes);
+            records.resize(last_record_start.unwrap_or(0) + record_length, 0);
+        }
+        if !records.is_empty() {
+            // Pad the final block so every returned read is a whole number of blocks.
+            let tail = records.len() % DIRENT_BLOCK_SIZE;
+            if tail != 0 {
+                let padding = DIRENT_BLOCK_SIZE - tail;
+                if let Some(start) = last_record_start {
+                    let previous = u16::from_le_bytes([records[start + 4], records[start + 5]]);
+                    let extended =
+                        previous.saturating_add(u16::try_from(padding).unwrap_or(u16::MAX));
+                    records[start + 4..start + 6].copy_from_slice(&extended.to_le_bytes());
+                }
+                records.resize(records.len() + padding, 0);
+            }
+        }
+        Self { records, offset: 0 }
     }
 }
 
@@ -4463,7 +4601,7 @@ unsafe extern "C" fn import_dispatch_trampoline() {
         "add rsp, 0xd0",
         "add rsp, 8",
         "ret",
-        dispatch = sym import_dispatch,
+        dispatch = sym import_dispatch_entry,
     );
 }
 
@@ -4511,7 +4649,7 @@ unsafe extern "C" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
 #[cfg(not(target_arch = "x86_64"))]
 extern "C" fn import_dispatch_trampoline() {
     std::hint::black_box(
-        import_dispatch as extern "C" fn(*const ImportCallFrame) -> ProbeImportReturn,
+        import_dispatch_entry as extern "C" fn(*const ImportCallFrame) -> ProbeImportReturn,
     );
     unreachable!("x86-64 guest import stubs cannot execute on this host architecture");
 }
@@ -4541,14 +4679,14 @@ fn import_call_trace_limit() -> u64 {
 
 static IMPORT_CALL_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportReturn {
+extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImportReturn {
     let limit = import_call_trace_limit();
     if limit == 0 {
-        return import_dispatch_traced(frame);
+        return import_dispatch(frame);
     }
     let sequence = IMPORT_CALL_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     if sequence > limit || frame.is_null() {
-        return import_dispatch_traced(frame);
+        return import_dispatch(frame);
     }
     // SAFETY: the caller supplies one aligned, fully initialized frame that stays live for the
     // complete call, and the null case returned above.
@@ -4576,7 +4714,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         arguments[4],
         arguments[5],
     );
-    let result = import_dispatch_traced(frame);
+    let result = import_dispatch(frame);
     eprintln!(
         "[REMu][CALL] seq={sequence} nid={nid} name={name} result={:#x}",
         result.integer
@@ -4584,7 +4722,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     result
 }
 
-extern "C" fn import_dispatch_traced(frame: *const ImportCallFrame) -> ProbeImportReturn {
+extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportReturn {
     if frame.is_null() {
         eprintln!("[REMu][IMPORT] null captured register frame");
         terminate_probe(87);
@@ -4845,7 +4983,7 @@ extern "C" fn import_dispatch_traced(frame: *const ImportCallFrame) -> ProbeImpo
         invoke_guest_exit_callbacks(callbacks);
         return ProbeImportReturn::integer(0);
     }
-    if matches!(nid, "6UgtwV+0zb4" | "OxhIB8LB-PQ") {
+    if matches!(nid, "6UgtwV+0zb4" | "OxhIB8LB-PQ" | "Jmi+9w9u0E4") {
         if call_args[0] == 0 || call_args[2] == 0 {
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
         }
@@ -4853,7 +4991,8 @@ extern "C" fn import_dispatch_traced(frame: *const ImportCallFrame) -> ProbeImpo
         let entry = call_args[2];
         let thread_argument = call_args[3];
         let guest_tls = clone_guest_tls(&state.tls_template);
-        let thread_name = (nid == "6UgtwV+0zb4")
+        // The plain POSIX entry point has no name argument; both named forms pass it fifth.
+        let thread_name = matches!(nid, "6UgtwV+0zb4" | "Jmi+9w9u0E4")
             .then(|| read_guest_cstring(call_args[4]))
             .flatten()
             .filter(|name| !name.is_empty());
@@ -7064,6 +7203,14 @@ fn dispatch_stateless_import(
         "eaFXjfJv3xs" | "-4GCfYdNF1s" => 0,
         "18B2NS1y9UU" => rtc_get_current_tick(arguments[0]),
         "ZPD1YOKI+Kw" => rtc_get_current_clock_local_time(arguments[0]),
+        "8w-H19ip48I" => rtc_get_tick(arguments),
+        "zE-wXIZjLoM" => kernel_debug_raise_exception_on_release_mode(arguments),
+        "j2AIqSqJP0w" | "2G6i6hMIUUY" => guest_kernel_getdents(arguments, false),
+        "taRWhTJFTgE" | "sfKygSjIbI8" => guest_kernel_getdents(arguments, true),
+        // Async I/O is initialized with tuning parameters only; REmu services the requests
+        // synchronously through the same file paths, so there is no queue to size here.
+        "nu4a0-arQis" | "vYU8P9Td2Zo" => 0,
+        "EI-5-jlq2dE" => current_guest_thread_handle(),
         "dKadqZFgKKQ" => ime_keyboard_get_resource_ids(arguments),
         "VkqLPArfFdc" => ime_keyboard_get_info(arguments[1]),
         "x8qnXqh-tiM" => 0,
@@ -7298,7 +7445,7 @@ fn dispatch_probe_import(
         "dQHWEsJtoE4" => posix_pthread_result(create_pthread_mutex_attr(arguments[0], state)),
         "HF7lK46xzjY" => posix_pthread_result(destroy_pthread_mutex_attr(arguments[0], state)),
         "mDmgMOGVUqg" => posix_pthread_result(pthread_mutex_attr_set_type(arguments, state)),
-        "mqULNdimTn0" => pthread_key_create(arguments, state),
+        "mqULNdimTn0" | "geDaqgH9lTg" => pthread_key_create(arguments, state),
         "WrOLvHU0yQM" | "+BzXYkqYeLE" => pthread_set_specific(arguments, state),
         "PrdHuuDekhY" => pthread_key_delete(low_u32(arguments[0]), state),
         "6BpEZuDT7YI" => pthread_key_delete(low_u32(arguments[0]), state),
@@ -7337,6 +7484,12 @@ fn dispatch_probe_import(
         "a8uLzYY--tM" => ampr_apr_command_buffer_constructor(arguments, state),
         "N-FSPA4S3nI" => ampr_command_buffer_set_buffer(arguments, state),
         "baQO9ez2gL4" => ampr_command_buffer_reset(arguments, state),
+        "ULvXMDz56po" => ampr_command_buffer_clear_buffer(arguments, state),
+        "tZDDEo2tE5k" => ampr_command_buffer_get_size(arguments, state),
+        "GnxKOHEawhk" => ampr_command_buffer_get_current_offset(arguments, state),
+        "H896Pt-yB4I" => ampr_command_buffer_write_kernel_event_queue(arguments, state),
+        "sSAUCCU1dv4" | "vWU-odnS+fU" => ampr_measure_command_size(),
+        "GuchCTefuZw" | "Qs1xtplKo0U" => ampr_command_buffer_destructor(arguments, state),
         "mQ16-QdKv7k" => ampr_command_buffer_read_file(arguments, stack_arguments, state),
         // AGC shader construction and VideoOut mutate caller-owned descriptors. Games consume the
         // resulting pointers and command data immediately, so successful no-ops are insufficient.
@@ -7419,7 +7572,31 @@ fn dispatch_probe_import(
         // Runtime services retain initialization and loaded-module state instead of accepting
         // unrelated calls through the unknown-import fallback.
         "g8cM39EUZ6o" => sysmodule_load(arguments[0], state),
+        "eR2bZFAAU0Q" => sysmodule_unload(arguments[0], state),
         "fMP5NHUOaMk" => sysmodule_is_loaded(arguments[0], state),
+        // PlayGo describes an installed package. REmu runs a fully local image, so every chunk is
+        // resident; the calls still validate handles and pointers exactly.
+        "ts6GlZOKRrE" => play_go_initialize(state),
+        "MPe0EeBGM-E" => play_go_terminate(state),
+        "M1Gma1ocrGE" => play_go_open(arguments, state),
+        "Uco1I0dlDi8" => play_go_close(arguments[0], state),
+        "uWIYLFkkwqk" => play_go_get_locus(arguments, state),
+        "-RJWNMK3fC8" => play_go_get_progress(arguments, state),
+        "v6EZ-YWRdMs" => play_go_get_eta(arguments, state),
+        "rvBSfTimejE" => play_go_get_install_speed(arguments, state),
+        "73fF1MFU8hA" => play_go_get_chunk_id(arguments, state),
+        "3OMbYZBaa50" => play_go_get_language_mask(arguments, state),
+        "4AAcTU9R3XM" | "LosLlHOpNqQ" | "gUPGiOQ1tmQ" | "Nn7zKwnA5q0" | "-Q1-u1a7p0g" => {
+            play_go_accept_request(arguments[0], state)
+        }
+        "lDqxaY1UbEo" => message_dialog_initialize(state),
+        "ePw-kqZmelo" => message_dialog_terminate(state),
+        "b06Hh0DPEaE" => message_dialog_open(arguments[0], state),
+        "HTrcDKlFKuM" => message_dialog_close(state),
+        "CWVW78Qc3fI" => message_dialog_get_status(state),
+        "6fIC3XKt2k0" => message_dialog_update_status(state),
+        "Lr8ovHH9l6A" => message_dialog_get_result(arguments[0], state),
+        "buYbeLOGWmA" => app_content_temporary_data_mount(arguments, state),
         "YJtKLttI9fM" => game_update_initialize(state),
         "jO8DM8oyego" => np_entitlement_access_initialize(arguments, state),
         "ysmw6J-P8Ak" => np_session_signaling_initialize(arguments, state),
@@ -7434,6 +7611,9 @@ fn dispatch_probe_import(
             .into(),
         "D0OdFMjp46I" => kernel_create_equeue(arguments[0], state),
         "WDszmSbWuDk" => kernel_add_user_event_edge(arguments, state),
+        "bBfz7kMF2Ho" => kernel_add_ampr_event(arguments, state),
+        "kwGyyjohI50" => kernel_get_event_data(arguments[0]),
+        "Xs9hdiD7sAA" => pthread_set_schedule_parameters(arguments),
         // Direct unit-dispatch callers use the nonblocking poll. Live imports are routed through
         // `kernel_wait_equeue_blocking` before acquiring the process-wide dispatch lock.
         "fzyMKs9kim0" => kernel_wait_equeue(arguments, state),
@@ -7536,6 +7716,58 @@ fn kernel_add_user_event_edge(arguments: [u64; 6], state: &mut ProbeDispatchStat
         KERNEL_EVENT_FILTER_USER,
         0,
     )
+}
+
+/// Reads the `data` field of a delivered kernel event.
+///
+/// The accessor exists because the event layout is opaque to the title; the field sits after the
+/// identifier, filter, flags, and filter flags.
+fn kernel_get_event_data(event: u64) -> u64 {
+    if event == 0 {
+        return 0;
+    }
+    read_guest_u64(event + 0x10)
+}
+
+/// Applies a scheduling policy and priority to a running guest thread.
+///
+/// REmu runs guest threads on host threads whose priorities the host scheduler owns, so the
+/// request is validated and accepted without changing host scheduling. Rejecting it would fail
+/// engine worker setup for a property the guest cannot observe directly.
+fn pthread_set_schedule_parameters(arguments: [u64; 6]) -> u64 {
+    let (thread, parameters) = (arguments[0], arguments[2]);
+    if thread == 0 || parameters == 0 {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    0
+}
+
+/// Registers an equeue event for APR/AMPR command-buffer completion.
+///
+/// REmu services APR command buffers synchronously: by the time the guest registers interest, the
+/// transfers that event describes have already finished. The completion is therefore queued
+/// immediately, because a title that registers the event and then waits would otherwise block on
+/// work that can never complete again.
+fn kernel_add_ampr_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let (equeue, ident, user_data) = (arguments[0], arguments[1], arguments[3]);
+    let result = kernel_register_event(state, equeue, ident, KERNEL_EVENT_FILTER_AMPR, user_data);
+    if result != 0 {
+        return result;
+    }
+    queue_kernel_event(
+        state,
+        KernelQueuedEvent {
+            equeue,
+            ident,
+            filter: KERNEL_EVENT_FILTER_AMPR,
+            flags: 0,
+            fflags: 1,
+            data: ident,
+            user_data,
+        },
+    );
+    notify_kernel_equeue_waiters();
+    0
 }
 
 fn agc_driver_add_eq_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -7869,6 +8101,19 @@ fn sysmodule_load(module: u64, state: &mut ProbeDispatchState) -> u64 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     state.services.loaded_sysmodules.insert(module);
+    0
+}
+
+fn sysmodule_unload(module: u64, state: &mut ProbeDispatchState) -> u64 {
+    const SYSMODULE_INVALID_ID: u32 = 0x805a_1000;
+    const SYSMODULE_NOT_LOADED: u32 = 0x805a_1001;
+    let module = low_i32(module);
+    if module <= 0 {
+        return sce_kernel_error(SYSMODULE_INVALID_ID);
+    }
+    if !state.services.loaded_sysmodules.remove(&module) {
+        return sce_kernel_error(SYSMODULE_NOT_LOADED);
+    }
     0
 }
 
@@ -8395,6 +8640,83 @@ fn app_content_app_param_get_int(arguments: [u64; 6]) -> u64 {
     0
 }
 
+/// Converts an `SceRtcDateTime` into a tick count.
+///
+/// Ticks are microseconds since the start of year one, which is the same origin
+/// `sceRtcGetCurrentTick` reports, so values from both calls are directly comparable.
+fn rtc_get_tick(arguments: [u64; 6]) -> u64 {
+    let (input, output) = (arguments[0], arguments[1]);
+    if input == 0 || output == 0 {
+        return sce_kernel_error(RTC_ERROR_INVALID_POINTER);
+    }
+    let year = i64::from(read_guest_u16(input));
+    let month = i64::from(read_guest_u16(input + 2));
+    let day = i64::from(read_guest_u16(input + 4));
+    let hour = i64::from(read_guest_u16(input + 6));
+    let minute = i64::from(read_guest_u16(input + 8));
+    let second = i64::from(read_guest_u16(input + 10));
+    let microsecond = i64::from(read_guest_u32(input + 12));
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return sce_kernel_error(RTC_ERROR_INVALID_ARGUMENT);
+    }
+    let days = unix_days_from_civil(year, month, day);
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let ticks = i64::try_from(RTC_UNIX_EPOCH_TICK_MICROSECONDS).unwrap_or(i64::MAX)
+        + seconds.saturating_mul(1_000_000)
+        + microsecond;
+    write_guest_u64(output, u64::from_ne_bytes(ticks.to_ne_bytes()));
+    0
+}
+
+/// Days from the Unix epoch to a proleptic Gregorian date; the inverse of [`civil_from_unix_seconds`].
+fn unix_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Registers the writable per-title temporary data directory.
+fn app_content_temporary_data_mount(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let output = arguments[1];
+    if output == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let mount = state.save_root.join("temp0");
+    if let Err(error) = std::fs::create_dir_all(&mount) {
+        eprintln!(
+            "[REMu][VFS] temporary data mount failed {:?}: {error}",
+            mount.display()
+        );
+        return sce_kernel_io_error(&error);
+    }
+    // The console reports the guest-visible mount point, not a host path.
+    write_guest_bytes(output, b"/temp0\0");
+    0
+}
+
+/// Terminates the process for a guest-raised release-mode exception.
+///
+/// The title calls this after its own fatal-error handling has already run; continuing would let
+/// the guest execute past an error it declared unrecoverable.
+fn kernel_debug_raise_exception_on_release_mode(arguments: [u64; 6]) -> u64 {
+    eprintln!(
+        "[REMu][GUEST] fatal guest exception error={:#x} argument={:#x}",
+        low_u32(arguments[0]),
+        arguments[1]
+    );
+    terminate_probe(70)
+}
+
 fn rtc_get_current_tick(output: u64) -> u64 {
     if output == 0 {
         return sce_kernel_error(RTC_ERROR_INVALID_POINTER);
@@ -8411,6 +8733,274 @@ fn rtc_get_current_tick(output: u64) -> u64 {
         output,
         RTC_UNIX_EPOCH_TICK_MICROSECONDS.saturating_add(unix_microseconds),
     );
+    0
+}
+
+const PLAYGO_ERROR_NOT_INITIALIZED: u32 = 0x80b2_0002;
+const PLAYGO_ERROR_ALREADY_INITIALIZED: u32 = 0x80b2_0004;
+const PLAYGO_ERROR_BAD_HANDLE: u32 = 0x80b2_0006;
+const PLAYGO_ERROR_BAD_POINTER: u32 = 0x80b2_0008;
+const PLAYGO_ERROR_BAD_SIZE: u32 = 0x80b2_0009;
+/// The only handle the console hands out for the running application's PlayGo package.
+const PLAYGO_HANDLE: u32 = 1;
+/// Chunk is resident on local storage with fast access. REmu runs from a fully installed local
+/// image, so every chunk the title asks about is already present.
+const PLAYGO_LOCUS_LOCAL_FAST: u32 = 3;
+const PLAYGO_INSTALL_SPEED_FULL: u32 = 1;
+
+/// Reports whether PlayGo is initialized, rejecting the double-initialize the ABI forbids.
+fn play_go_initialize(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.play_go_initialized {
+        return sce_kernel_error(PLAYGO_ERROR_ALREADY_INITIALIZED);
+    }
+    state.services.play_go_initialized = true;
+    0
+}
+
+fn play_go_terminate(state: &mut ProbeDispatchState) -> u64 {
+    if !state.services.play_go_initialized {
+        return sce_kernel_error(PLAYGO_ERROR_NOT_INITIALIZED);
+    }
+    state.services.play_go_initialized = false;
+    state.services.play_go_open = false;
+    0
+}
+
+fn play_go_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let output = arguments[0];
+    if !state.services.play_go_initialized {
+        return sce_kernel_error(PLAYGO_ERROR_NOT_INITIALIZED);
+    }
+    if output == 0 {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_POINTER);
+    }
+    state.services.play_go_open = true;
+    write_guest_u32(output, PLAYGO_HANDLE);
+    0
+}
+
+fn play_go_close(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    if low_u32(handle) != PLAYGO_HANDLE || !state.services.play_go_open {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_HANDLE);
+    }
+    state.services.play_go_open = false;
+    0
+}
+
+/// Validates the handle and entry count shared by every per-chunk PlayGo query.
+fn play_go_entry_query(
+    handle: u64,
+    chunk_ids: u64,
+    entries: u64,
+    output: u64,
+    state: &ProbeDispatchState,
+) -> Result<u32, u64> {
+    if !state.services.play_go_initialized {
+        return Err(sce_kernel_error(PLAYGO_ERROR_NOT_INITIALIZED));
+    }
+    if low_u32(handle) != PLAYGO_HANDLE {
+        return Err(sce_kernel_error(PLAYGO_ERROR_BAD_HANDLE));
+    }
+    if chunk_ids == 0 || output == 0 {
+        return Err(sce_kernel_error(PLAYGO_ERROR_BAD_POINTER));
+    }
+    let entries = low_u32(entries);
+    if entries == 0 {
+        return Err(sce_kernel_error(PLAYGO_ERROR_BAD_SIZE));
+    }
+    Ok(entries)
+}
+
+fn play_go_get_locus(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let entries = match play_go_entry_query(
+        arguments[0],
+        arguments[1],
+        arguments[2],
+        arguments[3],
+        state,
+    ) {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    for entry in 0..u64::from(entries) {
+        write_guest_u32(arguments[3] + entry * 4, PLAYGO_LOCUS_LOCAL_FAST);
+    }
+    0
+}
+
+/// Reports installation progress. A locally installed image is always fully downloaded, so the
+/// progressed and total sizes are equal and non-zero; a zero total reads as "nothing installed".
+fn play_go_get_progress(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let entries = match play_go_entry_query(
+        arguments[0],
+        arguments[1],
+        arguments[2],
+        arguments[3],
+        state,
+    ) {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    // The console reports byte counts per requested chunk; the exact size is unobservable to the
+    // title beyond progressed == total, which is what "installed" means.
+    let total = u64::from(entries) * GUEST_PAGE_SIZE;
+    write_guest_u64(arguments[3], total);
+    write_guest_u64(arguments[3] + 8, total);
+    0
+}
+
+fn play_go_get_eta(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let _ = match play_go_entry_query(
+        arguments[0],
+        arguments[1],
+        arguments[2],
+        arguments[3],
+        state,
+    ) {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    // Nothing remains to be downloaded.
+    write_guest_u64(arguments[3], 0);
+    0
+}
+
+fn play_go_get_install_speed(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if !state.services.play_go_initialized {
+        return sce_kernel_error(PLAYGO_ERROR_NOT_INITIALIZED);
+    }
+    if low_u32(arguments[0]) != PLAYGO_HANDLE {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_HANDLE);
+    }
+    if arguments[1] == 0 {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_POINTER);
+    }
+    write_guest_u32(arguments[1], PLAYGO_INSTALL_SPEED_FULL);
+    0
+}
+
+/// Reports the chunk identifiers belonging to the installed image.
+///
+/// A locally installed title is delivered as one chunk, so the list contains only chunk zero.
+fn play_go_get_chunk_id(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let (output, entries, count_output) = (arguments[1], low_u32(arguments[2]), arguments[3]);
+    if !state.services.play_go_initialized {
+        return sce_kernel_error(PLAYGO_ERROR_NOT_INITIALIZED);
+    }
+    if low_u32(arguments[0]) != PLAYGO_HANDLE {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_HANDLE);
+    }
+    if output == 0 || count_output == 0 {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_POINTER);
+    }
+    if entries == 0 {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_SIZE);
+    }
+    write_guest_u32(output, 0);
+    write_guest_u32(count_output, 1);
+    0
+}
+
+/// Reports the language mask selected for the package. Zero means no language filtering.
+fn play_go_get_language_mask(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if !state.services.play_go_initialized {
+        return sce_kernel_error(PLAYGO_ERROR_NOT_INITIALIZED);
+    }
+    if low_u32(arguments[0]) != PLAYGO_HANDLE {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_HANDLE);
+    }
+    if arguments[1] == 0 {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_POINTER);
+    }
+    write_guest_u64(arguments[1], 0);
+    0
+}
+
+/// Accepts a download-ordering or speed request against an already complete installation.
+fn play_go_accept_request(handle: u64, state: &ProbeDispatchState) -> u64 {
+    if !state.services.play_go_initialized {
+        return sce_kernel_error(PLAYGO_ERROR_NOT_INITIALIZED);
+    }
+    if low_u32(handle) != PLAYGO_HANDLE {
+        return sce_kernel_error(PLAYGO_ERROR_BAD_HANDLE);
+    }
+    0
+}
+
+const COMMON_DIALOG_STATUS_NONE: u32 = 0;
+const COMMON_DIALOG_STATUS_INITIALIZED: u32 = 1;
+const COMMON_DIALOG_STATUS_RUNNING: u32 = 2;
+const COMMON_DIALOG_STATUS_FINISHED: u32 = 3;
+const COMMON_DIALOG_ERROR_NOT_INITIALIZED: u32 = 0x8002_0001;
+const COMMON_DIALOG_ERROR_ALREADY_INITIALIZED: u32 = 0x8002_0011;
+const COMMON_DIALOG_ERROR_ARG_NULL: u32 = 0x8002_000e;
+/// The dialog closed without the user choosing a button.
+const MESSAGE_DIALOG_BUTTON_INVALID: u32 = 0;
+const MESSAGE_DIALOG_RESULT_USER_CANCELED: u32 = 1;
+
+fn message_dialog_initialize(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.message_dialog_status != COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_ALREADY_INITIALIZED);
+    }
+    state.services.message_dialog_status = COMMON_DIALOG_STATUS_INITIALIZED;
+    0
+}
+
+fn message_dialog_terminate(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.message_dialog_status == COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    state.services.message_dialog_status = COMMON_DIALOG_STATUS_NONE;
+    0
+}
+
+/// Opens a system message dialog.
+///
+/// REmu presents no system dialog surface, so the dialog is immediately dismissed rather than
+/// left running: a title that polls `sceMsgDialogUpdateStatus` until the dialog finishes would
+/// otherwise never make progress. The recorded result reports that the user canceled without
+/// choosing a button, which is the outcome a dismissed dialog produces on the console.
+fn message_dialog_open(parameters: u64, state: &mut ProbeDispatchState) -> u64 {
+    if state.services.message_dialog_status == COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    if parameters == 0 {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_ARG_NULL);
+    }
+    state.services.message_dialog_status = COMMON_DIALOG_STATUS_RUNNING;
+    0
+}
+
+fn message_dialog_update_status(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.message_dialog_status == COMMON_DIALOG_STATUS_RUNNING {
+        state.services.message_dialog_status = COMMON_DIALOG_STATUS_FINISHED;
+    }
+    u64::from(state.services.message_dialog_status)
+}
+
+fn message_dialog_get_status(state: &ProbeDispatchState) -> u64 {
+    u64::from(state.services.message_dialog_status)
+}
+
+fn message_dialog_close(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.message_dialog_status == COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    state.services.message_dialog_status = COMMON_DIALOG_STATUS_FINISHED;
+    0
+}
+
+/// Fills `SceMsgDialogResult`: mode, result code, selected button, then reserved bytes.
+fn message_dialog_get_result(output: u64, state: &ProbeDispatchState) -> u64 {
+    if state.services.message_dialog_status == COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    if output == 0 {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_ARG_NULL);
+    }
+    write_guest_u32(output, 0);
+    write_guest_u32(output + 4, MESSAGE_DIALOG_RESULT_USER_CANCELED);
+    write_guest_u32(output + 8, MESSAGE_DIALOG_BUTTON_INVALID);
     0
 }
 
@@ -8435,6 +9025,7 @@ fn coredump_register_handler(arguments: [u64; 6], state: &mut ProbeDispatchState
 /// Number of microseconds in the RTC tick epoch before the Unix epoch.
 const RTC_UNIX_EPOCH_TICK_MICROSECONDS: u64 = 62_135_596_800_000_000;
 const RTC_ERROR_INVALID_POINTER: u32 = 0x80b5_0002;
+const RTC_ERROR_INVALID_ARGUMENT: u32 = 0x80b5_0001;
 
 /// Fills an `SceRtcDateTime` with the current wall-clock time in the host's local zone.
 ///
@@ -9346,6 +9937,125 @@ fn ampr_command_buffer_set_buffer(arguments: [u64; 6], state: &mut ProbeDispatch
         },
     );
     0
+}
+
+/// Byte size of one recorded APR command record.
+const AMPR_COMMAND_RECORD_SIZE: u64 = 0x30;
+/// Record tag for an equeue completion signal.
+const AMPR_COMMAND_WRITE_EVENT_QUEUE: u32 = 2;
+
+/// Reports the capacity of the memory attached to a command buffer.
+fn ampr_command_buffer_get_size(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let command_buffer = arguments[0];
+    if command_buffer == 0 {
+        return 0;
+    }
+    state
+        .ampr_command_buffers
+        .get(&command_buffer)
+        .map_or_else(|| read_guest_u64(command_buffer + 0x10), |entry| entry.size)
+}
+
+/// Reports how many bytes of the attached memory already hold recorded commands.
+fn ampr_command_buffer_get_current_offset(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let command_buffer = arguments[0];
+    if command_buffer == 0 {
+        return 0;
+    }
+    state
+        .ampr_command_buffers
+        .get(&command_buffer)
+        .map_or(0, |entry| entry.write_offset)
+}
+
+/// Reports the bytes one command occupies, so the guest can size its buffer before recording.
+const fn ampr_measure_command_size() -> u64 {
+    AMPR_COMMAND_RECORD_SIZE
+}
+
+/// Records a command that signals a kernel event queue when the buffer's work completes.
+///
+/// REmu executes APR transfers as they are recorded, so the queued completion is delivered when
+/// the buffer is submitted rather than by a hardware pipeline.
+fn ampr_command_buffer_write_kernel_event_queue(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let command_buffer = arguments[0];
+    let equeue = arguments[1];
+    let ident = arguments[2];
+    let user_data = arguments[3];
+    if command_buffer == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(command) = state.ampr_command_buffers.get_mut(&command_buffer) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if command.write_offset > command.size
+        || AMPR_COMMAND_RECORD_SIZE > command.size - command.write_offset
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NO_SPACE);
+    }
+    let record = command.buffer + command.write_offset;
+    guest_memset(record, 0, AMPR_COMMAND_RECORD_SIZE);
+    write_guest_u32(record, AMPR_COMMAND_WRITE_EVENT_QUEUE);
+    write_guest_u64(record + 8, equeue);
+    write_guest_u64(record + 0x10, ident);
+    write_guest_u64(record + 0x18, user_data);
+    command.write_offset += AMPR_COMMAND_RECORD_SIZE;
+    command.command_count += 1;
+    // The transfers this completion describes have already been performed, so deliver it now.
+    queue_kernel_event(
+        state,
+        KernelQueuedEvent {
+            equeue,
+            ident,
+            filter: KERNEL_EVENT_FILTER_AMPR,
+            flags: 0,
+            fflags: 1,
+            data: ident,
+            user_data,
+        },
+    );
+    notify_kernel_equeue_waiters();
+    0
+}
+
+/// Releases a command buffer's recorded state without freeing the guest's memory.
+fn ampr_command_buffer_destructor(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let command_buffer = arguments[0];
+    if command_buffer == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    state.ampr_command_buffers.remove(&command_buffer);
+    0
+}
+
+/// Detaches a command buffer's backing memory and returns it to the caller.
+///
+/// This returns the buffer *pointer*, not a status code: the caller owns that allocation again
+/// and typically frees it. Returning an error code here makes the guest allocator free a
+/// non-pointer and abort.
+fn ampr_command_buffer_clear_buffer(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let command_buffer = arguments[0];
+    if command_buffer == 0 {
+        return 0;
+    }
+    let buffer = state
+        .ampr_command_buffers
+        .get(&command_buffer)
+        .map_or_else(|| read_guest_u64(command_buffer + 8), |entry| entry.buffer);
+    let size = state
+        .ampr_command_buffers
+        .get(&command_buffer)
+        .map_or_else(|| read_guest_u64(command_buffer + 0x10), |entry| entry.size);
+    if buffer == 0 || size == 0 {
+        return 0;
+    }
+    write_guest_u64(command_buffer + 8, 0);
+    write_guest_u64(command_buffer + 0x10, 0);
+    state.ampr_command_buffers.remove(&command_buffer);
+    buffer
 }
 
 fn ampr_command_buffer_reset(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -13610,7 +14320,6 @@ fn read_guest_u8(address: u64) -> u8 {
     unsafe { std::ptr::read_unaligned(address as *const u8) }
 }
 
-#[cfg(test)]
 fn read_guest_u16(address: u64) -> u16 {
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u16) }
@@ -16892,12 +17601,45 @@ fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         );
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_DIRECTORY);
     }
+    let is_directory = file.metadata().is_ok_and(|metadata| metadata.is_dir());
     let mut files = KERNEL_FILES
         .get_or_init(|| Mutex::new(KernelFileState::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fd = files.next_fd.max(3);
     files.next_fd = fd.saturating_add(1);
+    if is_directory {
+        let mut entries: Vec<(String, bool)> = match std::fs::read_dir(&host_path) {
+            Ok(listing) => listing
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    Some((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.file_type().is_ok_and(|kind| kind.is_dir()),
+                    ))
+                })
+                .collect(),
+            Err(error) => {
+                eprintln!(
+                    "[REMu][VFS] sceKernelOpen could not list guest={guest_path:?} host={:?}: {error}",
+                    host_path.display()
+                );
+                return sce_kernel_io_error(&error);
+            }
+        };
+        // A stable order keeps repeated enumerations reproducible across runs and hosts.
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut next_file_number = files.next_file_number;
+        let directory = KernelDirectory::new(&entries, &mut next_file_number);
+        files.next_file_number = next_file_number;
+        files.directories.insert(fd, directory);
+        if trace_guest_vfs() {
+            eprintln!(
+                "[REMu][VFS] sceKernelOpen directory guest={guest_path:?} entries={} fd={fd}",
+                entries.len()
+            );
+        }
+    }
     files.files.insert(fd, file);
     if trace_guest_vfs() {
         eprintln!(
@@ -16906,6 +17648,46 @@ fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         );
     }
     signed_i32_return(fd)
+}
+
+/// Reads packed directory entries into the guest buffer.
+///
+/// Returns the number of bytes written and zero once the enumeration is exhausted. `basep`, when
+/// supplied, receives the enumeration position before the read so the guest can resume there.
+fn guest_kernel_getdents(arguments: [u64; 6], report_position: bool) -> u64 {
+    let (fd, buffer, capacity) = (low_i32(arguments[0]), arguments[1], arguments[2]);
+    if buffer == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    }
+    if capacity < DIRENT_BLOCK_SIZE as u64 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let mut files = KERNEL_FILES
+        .get_or_init(|| Mutex::new(KernelFileState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !files.files.contains_key(&fd) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR);
+    }
+    let Some(directory) = files.directories.get_mut(&fd) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if report_position && arguments[3] != 0 {
+        write_guest_u64(arguments[3], directory.offset as u64);
+    }
+    let remaining = directory.records.len().saturating_sub(directory.offset);
+    if remaining == 0 {
+        return 0;
+    }
+    // Only whole blocks are transferred, so a record is never split across two reads.
+    let transfer = remaining.min((capacity as usize / DIRENT_BLOCK_SIZE) * DIRENT_BLOCK_SIZE);
+    if transfer == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let end = directory.offset + transfer;
+    write_guest_bytes(buffer, &directory.records[directory.offset..end]);
+    directory.offset = end;
+    transfer as u64
 }
 
 fn guest_kernel_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
@@ -17015,16 +17797,15 @@ fn guest_kernel_write(arguments: [u64; 6]) -> u64 {
 
 fn guest_kernel_close(arguments: [u64; 6]) -> u64 {
     let fd = low_i32(arguments[0]);
-    if KERNEL_FILES
+    let mut files = KERNEL_FILES
         .get_or_init(|| Mutex::new(KernelFileState::default()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .files
-        .remove(&fd)
-        .is_none()
-    {
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    files.directories.remove(&fd);
+    if files.files.remove(&fd).is_none() {
         return sce_kernel_error(SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR);
     }
+    drop(files);
     if trace_guest_vfs() {
         eprintln!("[REMu][VFS] sceKernelClose fd={fd}");
     }
@@ -17690,9 +18471,10 @@ mod platform_independent_tests {
         save_data_commit, save_data_create_transaction_resource, save_data_dir_name_search,
         save_data_mount3, save_data_pattern_matches, save_data_prepare, save_data_save_icon,
         save_data_set_param, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
-        system_service_param_get_int, take_exit_callbacks, tls_dtv_entry_offset, video_out_open,
-        write_guest_u32, write_guest_u64, write_import_stub,
+        system_service_param_get_int, take_exit_callbacks, tls_dtv_entry_offset,
+        unix_days_from_civil, video_out_open, write_guest_u32, write_guest_u64, write_import_stub,
     };
+    use super::{DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, KernelDirectory};
 
     #[repr(C, align(256))]
     struct AlignedComputeProgram([u32; 4]);
@@ -19597,6 +20379,66 @@ mod platform_independent_tests {
                 .len(),
             4
         );
+    }
+
+    #[test]
+    fn directory_records_pack_console_dirents_without_crossing_blocks() {
+        let entries: Vec<(String, bool)> = (0..40)
+            .map(|index| (format!("pakchunk{index}-ps5.pak"), index % 7 == 0))
+            .collect();
+        let mut next_file_number = 1;
+        let directory = KernelDirectory::new(&entries, &mut next_file_number);
+        assert_eq!(directory.records.len() % DIRENT_BLOCK_SIZE, 0);
+
+        // Walk the records exactly as the guest does and recover every name in order.
+        let mut names = Vec::new();
+        let mut offset = 0;
+        while offset < directory.records.len() {
+            let record = &directory.records[offset..];
+            let reclen = usize::from(u16::from_le_bytes([record[4], record[5]]));
+            let namlen = usize::from(record[7]);
+            if namlen == 0 {
+                offset += DIRENT_BLOCK_SIZE - offset % DIRENT_BLOCK_SIZE;
+                continue;
+            }
+            assert!(reclen >= DIRENT_HEADER_SIZE + namlen + 1);
+            // A record must lie entirely inside one 512-byte block.
+            assert_eq!(
+                offset / DIRENT_BLOCK_SIZE,
+                (offset + DIRENT_HEADER_SIZE + namlen) / DIRENT_BLOCK_SIZE,
+                "record at {offset} crossed a block boundary"
+            );
+            names.push(String::from_utf8_lossy(&record[8..8 + namlen]).into_owned());
+            assert_eq!(record[6], if names.len() % 7 == 1 { 4 } else { 8 });
+            offset += reclen;
+        }
+        assert_eq!(
+            names,
+            entries
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(next_file_number, 41);
+    }
+
+    #[test]
+    fn civil_days_round_trip_through_civil_decomposition() {
+        for seconds in [
+            0_i64,
+            1_709_164_800,
+            951_782_400,
+            -2_203_891_201,
+            1_800_000_000,
+        ] {
+            let (year, month, day, hour, minute, second) = civil_from_unix_seconds(seconds);
+            let days = unix_days_from_civil(i64::from(year), i64::from(month), i64::from(day));
+            let rebuilt = days * 86_400
+                + i64::from(hour) * 3_600
+                + i64::from(minute) * 60
+                + i64::from(second);
+            assert_eq!(rebuilt, seconds, "round trip failed for {seconds}");
+        }
     }
 
     #[test]
