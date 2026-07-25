@@ -2,3 +2,6 @@
 /.DS_Store
 /research/upstreams/
 /.remu/
+
+# Isolated worktrees created for parallel agent runs.
+.claude/worktrees/

@@ -154,6 +154,31 @@ def parse_flat_stub_arms(dispatch_source: str, return_expression: str) -> set[st
     return result
 
 
+def area_module_nids(runtime_path: Path) -> set[str]:
+    """Returns the NIDs served by the per-area dispatch modules beside the main dispatcher.
+
+    Each area module owns one service family and exposes a `dispatch` the main dispatcher consults
+    after its own table misses, so a NID handled there is implemented just as fully as one handled
+    inline.  Modules are discovered by reading the dispatch chain rather than from a hard-coded
+    list, so adding an area to the runtime does not silently understate coverage here.
+    """
+    source = runtime_path.read_text(encoding="utf-8")
+    try:
+        chain = function_slice(source, "dispatch_extended_import")
+    except ValueError:
+        return set()
+    served: set[str] = set()
+    for module in re.findall(r"(\w+)::dispatch\(", chain):
+        module_path = runtime_path.with_name(f"{module}.rs")
+        if not module_path.is_file():
+            continue
+        module_source = module_path.read_text(encoding="utf-8")
+        # Everything outside the test module, so a NID named only by a test is not counted.
+        tests = re.search(r"(?m)^#\[cfg\(test\)\]", module_source)
+        served |= quoted_nids(module_source[: tests.start()] if tests else module_source)
+    return served
+
+
 def inspect_runtime_source(path: Path) -> RuntimeCoverage:
     source = path.read_text(encoding="utf-8")
     names = parse_known_names(source)
@@ -191,6 +216,7 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
             | quoted_nids(function_slice(source, "synthetic_data_import_target")),
         ),
         ("hle-native-agc", native_agc_nids),
+        ("hle-area-module", area_module_nids(path)),
     ]
 
     probe_dispatch = function_slice(source, "dispatch_probe_import")
