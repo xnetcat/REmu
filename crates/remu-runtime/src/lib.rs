@@ -10967,7 +10967,19 @@ fn ampr_submit_command_buffer(arguments: [u64; 6], state: &mut ProbeDispatchStat
             completions.len()
         );
     }
+    // The value recorded with the queue-write command is the event's `data`, which the guest
+    // reads back through `sceKernelGetEventData` to identify which request completed. `udata`
+    // belongs to the registration, not to the individual command.
     for completion in completions {
+        let user_data = state
+            .kernel_event_registrations
+            .get(&(
+                completion.equeue,
+                KERNEL_EVENT_FILTER_AMPR,
+                completion.ident,
+            ))
+            .copied()
+            .unwrap_or(0);
         queue_kernel_event(
             state,
             KernelQueuedEvent {
@@ -10976,8 +10988,8 @@ fn ampr_submit_command_buffer(arguments: [u64; 6], state: &mut ProbeDispatchStat
                 filter: KERNEL_EVENT_FILTER_AMPR,
                 flags: 0,
                 fflags: 1,
-                data: 0,
-                user_data: completion.user_data,
+                data: completion.user_data,
+                user_data,
             },
         );
     }
