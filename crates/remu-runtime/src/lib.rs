@@ -1,18 +1,18 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+mod agc_acb;
 mod agc_command_abi;
+mod agc_dcb;
+mod agc_driver;
 mod agc_register_defaults;
+mod agc_state;
+mod ampr;
 mod audio;
+mod av;
+mod kernel_api;
 #[cfg(target_os = "macos")]
 mod kernel_memory;
-mod agc_dcb;
-mod agc_acb;
-mod agc_state;
-mod agc_driver;
-mod ampr;
-mod kernel_api;
-mod av;
 mod nid_names;
 mod np;
 

@@ -196,9 +196,7 @@ fn set_uc_registers_direct(arguments: [u64; 6]) -> u64 {
             write_u32(
                 command + 8 + index * 4,
                 read_u32(
-                    registers
-                        + (u64::from(run_start) + index) * REGISTER_ARRAY_ENTRY_BYTES
-                        + 4,
+                    registers + (u64::from(run_start) + index) * REGISTER_ARRAY_ENTRY_BYTES + 4,
                 ),
             );
         }
@@ -495,9 +493,15 @@ mod tests {
             call("MDLD5Ly94Xk", args(&[buffer, 0x1_0000, address, 1])),
             0
         );
-        assert_eq!(call("MDLD5Ly94Xk", args(&[buffer, 0x100, address + 1, 1])), 0);
+        assert_eq!(
+            call("MDLD5Ly94Xk", args(&[buffer, 0x100, address + 1, 1])),
+            0
+        );
         assert_eq!(call("MDLD5Ly94Xk", args(&[0, 0x100, address, 1])), 0);
-        assert_eq!(call("MDLD5Ly94Xk", args(&[buffer + 4, 0x100, address, 1])), 0);
+        assert_eq!(
+            call("MDLD5Ly94Xk", args(&[buffer + 4, 0x100, address, 1])),
+            0
+        );
         assert_eq!(fixture.cursor(), fixture.start());
     }
 

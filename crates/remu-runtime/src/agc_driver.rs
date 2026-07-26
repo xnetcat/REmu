@@ -713,7 +713,10 @@ mod tests {
         let address = stream.as_ptr().addr() as u64;
         let mut state = ProbeDispatchState::default();
 
-        assert_eq!(call_with("AhGvpITrf4M", args(&[0, address, 4]), &mut state), 0);
+        assert_eq!(
+            call_with("AhGvpITrf4M", args(&[0, address, 4]), &mut state),
+            0
+        );
         assert_eq!(state.agc_submission_count, 1);
         assert_eq!(state.pending_agc_completions.len(), 1);
     }
@@ -818,7 +821,10 @@ mod tests {
         let sizes = [4_u32];
 
         assert_eq!(
-            call("+T8Xo6LtFJI", args(&[0, 1, 0, sizes.as_ptr().addr() as u64])),
+            call(
+                "+T8Xo6LtFJI",
+                args(&[0, 1, 0, sizes.as_ptr().addr() as u64])
+            ),
             AGC_ERROR_PARAMETER_NULL
         );
         assert_eq!(
@@ -849,7 +855,11 @@ mod tests {
         // The event type is a four-byte value in a register whose upper half the caller never
         // sets, so a stale upper half must not hide the registration.
         assert_eq!(
-            call_with("DL2RXaXOy88", args(&[equeue, 0xdead_0000_0000_0002]), &mut state),
+            call_with(
+                "DL2RXaXOy88",
+                args(&[equeue, 0xdead_0000_0000_0002]),
+                &mut state
+            ),
             0
         );
         assert!(state.kernel_event_registrations.is_empty());
@@ -939,19 +949,15 @@ mod tests {
         let buffer = fixture.address();
 
         assert_eq!(
-            call("cwbxjPSJ7WQ", args(&[buffer, 1, 2, 3, 0x1122_3344_5566_7788])),
+            call(
+                "cwbxjPSJ7WQ",
+                args(&[buffer, 1, 2, 3, 0x1122_3344_5566_7788])
+            ),
             fixture.start()
         );
         assert_eq!(
             &fixture.words[..6],
-            &[
-                pm4(6, IT_NOP, R_FLIP),
-                1,
-                2,
-                3,
-                0x5566_7788,
-                0x1122_3344
-            ]
+            &[pm4(6, IT_NOP, R_FLIP), 1, 2, 3, 0x5566_7788, 0x1122_3344]
         );
 
         assert_eq!(
@@ -975,20 +981,17 @@ mod tests {
         let text = c"shadow";
 
         assert_eq!(
-            call("+b34-CLWc0s", args(&[buffer, text.as_ptr().addr() as u64, 0xff])),
+            call(
+                "+b34-CLWc0s",
+                args(&[buffer, text.as_ptr().addr() as u64, 0xff])
+            ),
             fixture.start()
         );
         assert_eq!(fixture.words[0], pm4(3, IT_NOP, R_PUSH_MARKER));
         assert_eq!(&fixture.words[1..3], &[0x6461_6873, 0x0000_776f]);
 
-        assert_eq!(
-            call("LEnn-4ARRJM", args(&[buffer])),
-            fixture.start() + 12
-        );
-        assert_eq!(
-            &fixture.words[3..5],
-            &[pm4(2, IT_NOP, R_POP_MARKER), 0]
-        );
+        assert_eq!(call("LEnn-4ARRJM", args(&[buffer])), fixture.start() + 12);
+        assert_eq!(&fixture.words[3..5], &[pm4(2, IT_NOP, R_POP_MARKER), 0]);
         assert_eq!(fixture.cursor(), fixture.start() + 20);
     }
 
@@ -1072,7 +1075,12 @@ mod tests {
     fn an_unowned_nid_is_left_for_the_next_module() {
         let mut state = ProbeDispatchState::default();
 
-        for nid in ["zmw2uVSEj94", "UM9b9NunSrE", "i6bfTi13ApA", "not-an-agc-nid"] {
+        for nid in [
+            "zmw2uVSEj94",
+            "UM9b9NunSrE",
+            "i6bfTi13ApA",
+            "not-an-agc-nid",
+        ] {
             assert_eq!(dispatch(nid, [0; 6], &mut state), None, "{nid}");
         }
     }

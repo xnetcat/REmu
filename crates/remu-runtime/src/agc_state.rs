@@ -202,9 +202,7 @@ fn write_data_patch_dst(arguments: [u64; 6]) -> u64 {
     }
     write_u32(
         packet + WRITE_DATA_CONTROL_OFFSET,
-        (control & !WRITE_DATA_DST_MASK)
-            | ((destination & 1) << 30)
-            | ((destination & 0x1e) << 7),
+        (control & !WRITE_DATA_DST_MASK) | ((destination & 1) << 30) | ((destination & 0x1e) << 7),
     );
     0
 }
@@ -557,7 +555,10 @@ mod tests {
             call("W0WEyog0f74", args(&[packet, 2])),
             AGC_ERROR_PACKET_MISMATCH
         );
-        assert_eq!(call("W0WEyog0f74", args(&[0, 1])), AGC_ERROR_PACKET_MISMATCH);
+        assert_eq!(
+            call("W0WEyog0f74", args(&[0, 1])),
+            AGC_ERROR_PACKET_MISMATCH
+        );
     }
 
     #[test]
@@ -566,7 +567,10 @@ mod tests {
         words[0] = pm4(ACQUIRE_MEM_PACKET_DWORDS, IT_NOP, 0x18);
         let packet = address_of(&mut words);
 
-        assert_eq!(call("W0WEyog0f74", args(&[packet, 1])), AGC_ERROR_PACKET_MISMATCH);
+        assert_eq!(
+            call("W0WEyog0f74", args(&[packet, 1])),
+            AGC_ERROR_PACKET_MISMATCH
+        );
         assert_eq!(words[1], 0);
     }
 
@@ -635,11 +639,17 @@ mod tests {
         let packet = address_of(&mut words);
 
         assert_eq!(
-            call("xb8VgcXQhvI", args(&[packet, 2, 0x1122_3344_5566_7780, 0x1234])),
+            call(
+                "xb8VgcXQhvI",
+                args(&[packet, 2, 0x1122_3344_5566_7780, 0x1234])
+            ),
             0
         );
         assert_eq!(
-            call("QmfvaYpsOcI", args(&[packet, 1, 0x00aa_bbcc_ddee_ff00, 0x5678])),
+            call(
+                "QmfvaYpsOcI",
+                args(&[packet, 1, 0x00aa_bbcc_ddee_ff00, 0x5678])
+            ),
             0
         );
         assert_eq!(
@@ -648,7 +658,10 @@ mod tests {
         );
 
         assert_eq!(&words[2..4], &[0x0000_1230, 0x0000_7fff]);
-        assert_eq!(&words[8..11], &[0x5566_7780, 0x1122_3344, 0x1234 | (2 << 28)]);
+        assert_eq!(
+            &words[8..11],
+            &[0x5566_7780, 0x1122_3344, 0x1234 | (2 << 28)]
+        );
         assert_eq!(
             &words[11..14],
             &[0xddee_ff00, 0x00aa_bbcc, 0x5678 | (1 << 28)]

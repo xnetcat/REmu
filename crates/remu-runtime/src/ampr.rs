@@ -19,8 +19,8 @@
 use crate::{
     AMPR_COMMAND_RECORD_SIZE, ProbeDispatchState, SCE_KERNEL_ERROR_BUSY,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED,
-    ampr_command_buffer_write_kernel_event_queue, ampr_measure_command_size, guest_memset,
-    low_u32, process_guest_range_is_readable, read_guest_bytes, read_guest_u32, read_guest_u64,
+    ampr_command_buffer_write_kernel_event_queue, ampr_measure_command_size, guest_memset, low_u32,
+    process_guest_range_is_readable, read_guest_bytes, read_guest_u32, read_guest_u64,
     sce_kernel_error, write_guest_bytes, write_guest_u32,
 };
 
@@ -75,11 +75,7 @@ pub(crate) fn dispatch(
 }
 
 /// Handles the entry points that append a command to a buffer or report a buffer's state.
-fn dispatch_builder(
-    nid: &str,
-    arguments: [u64; 6],
-    state: &mut ProbeDispatchState,
-) -> Option<u64> {
+fn dispatch_builder(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchState) -> Option<u64> {
     Some(match nid {
         "YPxkUDhgoNI" => reset_gather_scatter_state(arguments[0], state),
         "tNn5WBkta60" => nop(arguments, state),
@@ -285,7 +281,10 @@ fn append_marker(
     let mut cursor = record;
     for (index, chunk) in chunks.iter().enumerate() {
         if index == 0 {
-            write_guest_u32(cursor, record_header(AMPR_COMMAND_MARKER, chunk.dwords(), kind));
+            write_guest_u32(
+                cursor,
+                record_header(AMPR_COMMAND_MARKER, chunk.dwords(), kind),
+            );
             write_guest_u32(cursor + 4, color.unwrap_or(0));
         } else {
             write_guest_u32(
@@ -393,7 +392,10 @@ fn marker_chunks(payload: usize) -> Vec<MarkerChunk> {
         let (header_bytes, capacity) = if chunks.is_empty() {
             (MARKER_HEADER_BYTES, MARKER_FIRST_TEXT_BYTES)
         } else {
-            (MARKER_CONTINUATION_HEADER_BYTES, MARKER_CONTINUATION_TEXT_BYTES)
+            (
+                MARKER_CONTINUATION_HEADER_BYTES,
+                MARKER_CONTINUATION_TEXT_BYTES,
+            )
         };
         let length = (payload - written).min(capacity);
         chunks.push(MarkerChunk {
@@ -766,8 +768,14 @@ mod tests {
         let object = fixture.object();
         let text = message("frame");
 
-        assert_eq!(fixture.call("4quckD2y7Pg", args(&[object, address(&text)])), 0);
-        assert_eq!(fixture.call("dXPaz65HNmk", args(&[object, address(&text)])), 0);
+        assert_eq!(
+            fixture.call("4quckD2y7Pg", args(&[object, address(&text)])),
+            0
+        );
+        assert_eq!(
+            fixture.call("dXPaz65HNmk", args(&[object, address(&text)])),
+            0
+        );
         assert_eq!(fixture.call("mv0O8Zg0woU", args(&[object])), 0);
 
         assert_eq!(fixture.word(0), 0x0000_0412);
@@ -799,7 +807,10 @@ mod tests {
         let object = fixture.object();
         let text = message(&"a".repeat(60));
 
-        assert_eq!(fixture.call("4quckD2y7Pg", args(&[object, address(&text)])), 0);
+        assert_eq!(
+            fixture.call("4quckD2y7Pg", args(&[object, address(&text)])),
+            0
+        );
 
         assert_eq!(fixture.word(0), 0x0000_1012);
         assert_eq!(fixture.text(8, 56), vec![b'a'; 56]);
@@ -816,7 +827,10 @@ mod tests {
         let object = fixture.object();
         let text = vec![b'z'; MARKER_TEXT_LIMIT * 2];
 
-        assert_eq!(fixture.call("4quckD2y7Pg", args(&[object, address(&text)])), 0);
+        assert_eq!(
+            fixture.call("4quckD2y7Pg", args(&[object, address(&text)])),
+            0
+        );
 
         assert_eq!(
             fixture.write_offset(),
@@ -840,7 +854,10 @@ mod tests {
         ] {
             let expected = fixture.call(query, args(&[address(text), 0x40]));
             let before = fixture.write_offset();
-            assert_eq!(fixture.call(builder, args(&[object, address(text), 0x40])), 0);
+            assert_eq!(
+                fixture.call(builder, args(&[object, address(text), 0x40])),
+                0
+            );
             assert_eq!(fixture.write_offset() - before, expected);
         }
 
@@ -918,7 +935,10 @@ mod tests {
 
         assert_eq!(fixture.call("YPxkUDhgoNI", args(&[object])), EBUSY);
         assert_eq!(fixture.call("tNn5WBkta60", args(&[object, 1])), EBUSY);
-        assert_eq!(fixture.call("4quckD2y7Pg", args(&[object, address(&text)])), EBUSY);
+        assert_eq!(
+            fixture.call("4quckD2y7Pg", args(&[object, address(&text)])),
+            EBUSY
+        );
         assert_eq!(fixture.call("mv0O8Zg0woU", args(&[object])), EBUSY);
 
         assert_eq!(fixture.write_offset(), 0x30);
@@ -933,7 +953,10 @@ mod tests {
         assert_eq!(fixture.call("YPxkUDhgoNI", [0; 6]), EINVAL);
         assert_eq!(fixture.call("tNn5WBkta60", args(&[0, 4])), EINVAL);
         assert_eq!(fixture.call("pFQ9UHpO52s", args(&[0, 0, 0])), EINVAL);
-        assert_eq!(fixture.call("4quckD2y7Pg", args(&[0, address(&text)])), EINVAL);
+        assert_eq!(
+            fixture.call("4quckD2y7Pg", args(&[0, address(&text)])),
+            EINVAL
+        );
         assert_eq!(fixture.call("mv0O8Zg0woU", [0; 6]), EINVAL);
         assert_eq!(fixture.call("GmOguNIsuKk", args(&[0, 0, 0, 0, 0])), EINVAL);
     }
@@ -985,7 +1008,10 @@ mod tests {
         assert_eq!(dispatch("RPCAhx-aabE", [0; 6], &mut state), Some(0));
         assert_eq!(dispatch("gzndltBEzWc", [0; 6], &mut state), Some(0));
         assert_eq!(dispatch("RPCAhx-aabE", args(&[8]), &mut state), Some(0));
-        assert_eq!(dispatch("gzndltBEzWc", args(&[0x4000]), &mut state), Some(0));
+        assert_eq!(
+            dispatch("gzndltBEzWc", args(&[0x4000]), &mut state),
+            Some(0)
+        );
     }
 
     #[test]

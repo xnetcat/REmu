@@ -80,7 +80,10 @@ mod tests {
 
     #[test]
     fn the_table_parses_and_carries_names() {
-        assert!(header().is_some(), "generated table is missing or malformed");
+        assert!(
+            header().is_some(),
+            "generated table is missing or malformed"
+        );
         assert!(
             generated_nid_name_count() > 1000,
             "recovered only {} names",
@@ -113,7 +116,11 @@ mod tests {
         for index in 0..count {
             let nid = record_nid(index).expect("record carries a NID");
             let name = record_name(index, names_offset).expect("record carries a name");
-            assert_eq!(sce_symbol_nid(name), nid, "name {name:?} does not hash to {nid:?}");
+            assert_eq!(
+                sce_symbol_nid(name),
+                nid,
+                "name {name:?} does not hash to {nid:?}"
+            );
         }
     }
 

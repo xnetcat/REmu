@@ -516,7 +516,10 @@ mod tests {
         let buffer = fixture.address();
         let start = fixture.start();
 
-        assert_eq!(call("e1DFTg+Sd8U", args(&[buffer, 0, start + 64, 4])), start);
+        assert_eq!(
+            call("e1DFTg+Sd8U", args(&[buffer, 0, start + 64, 4])),
+            start
+        );
         assert_eq!(fixture.cursor() - start, call("b-oySn+G2tE", [0; 6]));
 
         let before = fixture.cursor();
@@ -606,14 +609,7 @@ mod tests {
         assert_eq!(flip, fixture.start());
         assert_eq!(
             &fixture.words[..6],
-            &[
-                pm4(6, IT_NOP, R_FLIP),
-                1,
-                2,
-                3,
-                0x5566_7788,
-                0x1122_3344,
-            ]
+            &[pm4(6, IT_NOP, R_FLIP), 1, 2, 3, 0x5566_7788, 0x1122_3344,]
         );
 
         let fence = call("GPbUp9jXQa8", args(&[buffer, 1, 2]));
