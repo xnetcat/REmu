@@ -8247,11 +8247,30 @@ fn dispatch_probe_import(
 /// The main dispatcher consults this only after its own table misses, so a module here can add
 /// an ABI without touching the dispatcher, and a NID no module owns still reaches the
 /// unimplemented report unchanged.
+/// Reports whether the per-area modules take part in import dispatch.
+///
+/// They are off by default because their command-buffer builders were written from an interface
+/// description rather than from an observed packet stream. Sony's headers document parameters and
+/// structs but never the wire format, so several packet layouts here are reconstructions, and a
+/// builder that returns success while emitting a packet the GPU layer reads differently is worse
+/// than one that returns "not implemented": the guest carries on and loses work silently.
+///
+/// Set `REMU_EXTENDED_IMPORTS=1` to dispatch through them while validating an area against a
+/// title. An area belongs in the default path once its packets are checked against a real stream.
+fn extended_imports_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("REMU_EXTENDED_IMPORTS").is_some_and(|value| value == "1"))
+}
+
 fn dispatch_extended_import(
     nid: &str,
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
 ) -> Option<u64> {
+    if !extended_imports_enabled() {
+        return None;
+    }
     if let Some(result) = agc_dcb::dispatch(nid, arguments, state) {
         return Some(result);
     }
