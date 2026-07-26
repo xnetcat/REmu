@@ -18553,11 +18553,31 @@ fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<PathBuf> {
     resolve_path_beneath(game_root, relative)
 }
 
+/// Returns a host file that stands in for a guest path, if an overlay directory supplies one.
+///
+/// A dump is read-only and stays that way, so replacing one file in it -- a command line, a
+/// configuration file -- otherwise means editing the dump itself. An overlay directory mirrors
+/// the guest tree and is consulted first, which keeps experiments out of the dump entirely.
+///
+/// Set `REMU_OVERLAY_DIR` to a directory whose layout mirrors the guest filesystem, so
+/// `/app0/ue4commandline.txt` is served from `$REMU_OVERLAY_DIR/app0/ue4commandline.txt`.
+fn overlay_guest_path(normalized: &str) -> Option<PathBuf> {
+    static OVERLAY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let root = OVERLAY
+        .get_or_init(|| std::env::var_os("REMU_OVERLAY_DIR").map(PathBuf::from))
+        .as_ref()?;
+    let candidate = resolve_path_beneath(root, normalized.trim_start_matches('/'))?;
+    candidate.is_file().then_some(candidate)
+}
+
 fn resolve_probe_guest_path(
     state: &ProbeDispatchState,
     guest_path: &str,
 ) -> Option<(PathBuf, bool)> {
     let normalized = guest_path.replace('\\', "/");
+    if let Some(overlaid) = overlay_guest_path(&normalized) {
+        return Some((overlaid, false));
+    }
     for (mount_point, mounted) in &state.save_mounts {
         if normalized == *mount_point {
             return Some((mounted.path.clone(), !mounted.read_only));
