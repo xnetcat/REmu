@@ -6151,6 +6151,7 @@ fn create_sampled_guest_texture(
         10 => MTLTextureType::D3,
         11 if layer_count == 6 => MTLTextureType::Cube,
         11 => MTLTextureType::CubeArray,
+        13 => MTLTextureType::D2Array,
         _ => {
             return Err(format!(
                 "unsupported sampled Metal texture type {texture_type}"
@@ -6173,6 +6174,9 @@ fn create_sampled_guest_texture(
         descriptor.set_depth(u64::from(layer_count));
     }
     descriptor.set_mipmap_level_count(u64::from(mip_level_count));
+    if texture_type == 13 {
+        descriptor.set_array_length(u64::from(layer_count));
+    }
     if texture_type == 11 {
         descriptor.set_array_length(u64::from(layer_count / 6));
     }
@@ -6203,7 +6207,7 @@ fn create_sampled_guest_texture(
             bytes_per_row,
             u64::try_from(face_bytes).expect("validated image byte count fits u64"),
         );
-    } else if texture_type == 11 {
+    } else if matches!(texture_type, 11 | 13) {
         for layer in 0..layer_count {
             let offset = usize::try_from(layer)
                 .expect("validated layer fits usize")
@@ -6816,7 +6820,7 @@ fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescriptor, Stri
             "invalid image range address={address:#x} extent={width}x{height} pitch={pitch}"
         ));
     }
-    if !matches!(texture_type, 9..=11) {
+    if !matches!(texture_type, 9..=11 | 13) {
         return Err(format!(
             "Metal image upload does not yet implement texture type {texture_type}"
         ));
@@ -6840,6 +6844,16 @@ fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescriptor, Stri
             ));
         }
         layers
+    } else if texture_type == 13 {
+        let slices = words.get(4).copied().unwrap_or_default();
+        let last_array_slice = slices & 0x1fff;
+        let base_array_slice = (slices >> 16) & 0x1fff;
+        if base_array_slice > last_array_slice {
+            return Err(format!(
+                "invalid array slice range {base_array_slice}..={last_array_slice}"
+            ));
+        }
+        last_array_slice - base_array_slice + 1
     } else {
         1
     };

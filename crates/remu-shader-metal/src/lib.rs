@@ -1727,6 +1727,19 @@ impl<'a> Compiler<'a> {
             self.store_scalar(destination, &selected);
             return Ok(());
         }
+        if name == "VReadfirstlaneB32" {
+            let destination = destination_scalar(instruction)?;
+            let value = self.raw_source(instruction, 0)?;
+            // The lane read is the lowest one EXEC has enabled, which is not necessarily lane
+            // zero and is not the same as the SIMD group's own notion of an active thread. A
+            // wave with nothing enabled still has to produce a value, and the hardware reads
+            // lane zero in that case, which is what the mask of zero falls through to here.
+            let active = self.temp("uint", "(uint)(uint64_t)simd_ballot(exec)");
+            let lane = self.temp("uint", &format!("{active} == 0u ? 0u : ctz({active})"));
+            let selected = self.temp("uint", &format!("simd_shuffle({value}, (ushort){lane})"));
+            self.store_scalar(destination, &selected);
+            return Ok(());
+        }
         if name == "VWritelaneB32" {
             let destination = destination_vector(instruction)?;
             let value = self.raw_source(instruction, 0)?;
@@ -2058,6 +2071,16 @@ impl<'a> Compiler<'a> {
             ),
             "VMulLoU32" => format!(
                 "({} * {})",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VMulHiU32" => format!(
+                "(uint)(((ulong){} * (ulong){}) >> 32)",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
+            "VMulHiI32" => format!(
+                "(uint)(int)(((long)(int){} * (long)(int){}) >> 32)",
                 self.raw_source(instruction, 0)?,
                 self.raw_source(instruction, 1)?
             ),
@@ -7285,7 +7308,7 @@ mod tests {
 
     #[test]
     fn lowers_dpp_and_dpp8_for_every_otherwise_supported_vector_alu() {
-        const ALU: [(&str, usize); 60] = [
+        const ALU: [(&str, usize); 62] = [
             ("VCndmaskB32", 2),
             ("VMovB32", 1),
             ("VAddF32", 2),
@@ -7332,6 +7355,8 @@ mod tests {
             ("VMinU32", 2),
             ("VMaxU32", 2),
             ("VMulLoU32", 2),
+            ("VMulHiU32", 2),
+            ("VMulHiI32", 2),
             ("VCvtU32F32", 1),
             ("VCvtI32F32", 1),
             ("VCvtOffF32I4", 1),
