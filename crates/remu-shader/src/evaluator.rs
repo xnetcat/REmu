@@ -66,16 +66,29 @@ pub enum EvaluationError {
     UnsupportedScalarOpcode { pc: u32, opcode: Opcode },
     #[error("branch at pc 0x{pc:X} targets invalid pc 0x{target:X}")]
     InvalidBranchTarget { pc: u32, target: u32 },
-    #[error("shader control flow exceeded {MAX_PATH_STEPS} evaluated instructions")]
-    ControlFlowLimit,
+    #[error(
+        "shader control flow exceeded {MAX_PATH_STEPS} evaluated instructions at pc 0x{pc:X} \
+         with {pending_paths} pending paths"
+    )]
+    ControlFlowLimit { pc: u32, pending_paths: usize },
     #[error("guest memory read failed at pc 0x{pc:X}: address {address:#x}, {length} bytes")]
     MemoryFault {
         pc: u32,
         address: u64,
         length: usize,
     },
-    #[error("buffer descriptor in s{register} is invalid at pc 0x{pc:X}")]
-    InvalidBufferDescriptor { pc: u32, register: u32 },
+    #[error(
+        "buffer descriptor in s{register} is invalid at pc 0x{pc:X}: \
+         [{words0:08X}, {words1:08X}, {words2:08X}, {words3:08X}]"
+    )]
+    InvalidBufferDescriptor {
+        pc: u32,
+        register: u32,
+        words0: u32,
+        words1: u32,
+        words2: u32,
+        words3: u32,
+    },
     #[error("global address in s{register} is null at pc 0x{pc:X}")]
     NullGlobalAddress { pc: u32, register: u32 },
     #[error("image descriptors at pc 0x{pc:X} vary across scalar control-flow paths")]
@@ -101,7 +114,6 @@ struct BindingRequest {
     base_address: u64,
     requested_bytes: u64,
     writable: bool,
-    supplemental: bool,
     allow_shorter: bool,
 }
 
@@ -253,6 +265,7 @@ pub fn evaluate_shader(
     while let Some(path) = evaluator.pending_paths.pop() {
         evaluator.execute_path(path)?;
     }
+    evaluator.bind_statically_inactive_resources()?;
     let scalar_register_count = state
         .program
         .runtime_scalar_registers()
@@ -274,6 +287,92 @@ pub fn evaluate_shader(
 }
 
 impl<M: GuestMemoryReader> Evaluator<'_, M> {
+    fn bind_statically_inactive_resources(&mut self) -> Result<(), EvaluationError> {
+        let mut instruction_pcs = SmallVec::<[u32; 8]>::new();
+        let mut scalar_address = 0;
+        let mut writable = false;
+        for instruction in &self.state.program.instructions {
+            let candidate_scalar_address = match instruction.control.as_ref() {
+                Some(InstructionControl::ScalarMemory(_)) => instruction
+                    .sources
+                    .first()
+                    .filter(|source| source.kind == OperandKind::ScalarRegister)
+                    .map(|source| source.value),
+                Some(InstructionControl::BufferMemory(control)) => Some(control.scalar_resource),
+                Some(InstructionControl::GlobalMemory(control)) => control.scalar_address,
+                _ => None,
+            };
+            let Some(candidate_scalar_address) = candidate_scalar_address else {
+                continue;
+            };
+            if self
+                .global_bindings
+                .iter()
+                .any(|binding| binding.instruction_pcs.contains(&instruction.pc))
+            {
+                continue;
+            }
+            if instruction_pcs.is_empty() {
+                scalar_address = candidate_scalar_address;
+            }
+            instruction_pcs.push(instruction.pc);
+            writable |=
+                instruction.opcode.contains("Store") || instruction.opcode.contains("Atomic");
+        }
+        if instruction_pcs.is_empty() {
+            self.bind_statically_inactive_images()?;
+            return Ok(());
+        }
+        // Scalar control flow is evaluated exactly for the current descriptor and dependency
+        // snapshot, but Metal must still type-check every basic block in the shader. Give memory
+        // instructions on statically inactive scalar paths one bounds-checked zero buffer. If a
+        // dependency changes and activates the path, evaluation creates a new real binding and a
+        // different pipeline key before that dispatch is encoded.
+        self.global_bindings.push(GlobalMemoryBinding {
+            scalar_address,
+            base_address: 0,
+            instruction_pcs,
+            byte_count: 4,
+            data: vec![0; 4],
+            writable,
+            write_back_to_guest: false,
+        });
+        self.bind_statically_inactive_images()?;
+        Ok(())
+    }
+
+    fn bind_statically_inactive_images(&mut self) -> Result<(), EvaluationError> {
+        let missing = self
+            .state
+            .program
+            .instructions
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    instruction.control.as_ref(),
+                    Some(InstructionControl::Image(_))
+                ) && !self
+                    .image_bindings
+                    .iter()
+                    .any(|binding| binding.pc == instruction.pc)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let initial_registers = self.initial_registers;
+        for instruction in missing {
+            let Some(InstructionControl::Image(control)) = instruction.control.clone() else {
+                continue;
+            };
+            // Metal type-checks every scalar-control-flow block even when exact evaluation proves
+            // one inactive for this draw. Resource descriptors are shader inputs, so preserve the
+            // initial descriptor for those blocks instead of omitting the texture parameter and
+            // making otherwise valid MSL fail to lower. A later scalar-path activation still
+            // replaces this snapshot with the dynamically evaluated descriptor.
+            self.resolve_image(&instruction, &control, &initial_registers, true)?;
+        }
+        Ok(())
+    }
+
     fn queue_path(&mut self, mut path: ScalarPath) {
         let Some(instruction_index) = self
             .state
@@ -310,7 +409,10 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             let instruction = &self.state.program.instructions[instruction_index];
             self.evaluated_steps = self.evaluated_steps.saturating_add(1);
             if self.evaluated_steps > MAX_PATH_STEPS {
-                return Err(EvaluationError::ControlFlowLimit);
+                return Err(EvaluationError::ControlFlowLimit {
+                    pc: instruction.pc,
+                    pending_paths: self.pending_paths.len(),
+                });
             }
             if instruction.opcode == Opcode::END_PROGRAM {
                 break;
@@ -339,7 +441,14 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     .find(|(pc, _)| *pc == instruction.pc)
                     .map(|(_, visits)| *visits)
                     .unwrap_or_default();
-                if self.options.discover_static_control_flow && (!backward || backward_visits == 0)
+                // SCC is produced entirely by scalar instructions that this evaluator executes,
+                // so its branch direction is exact. Exploring the opposite SCC edge on every
+                // scalar-loop iteration creates thousands of impossible paths and can exhaust the
+                // global path budget. EXEC and VCC may be changed by skipped vector instructions;
+                // retain alternate-edge discovery only for those runtime-vector conditions.
+                if self.options.discover_static_control_flow
+                    && branch_condition_depends_on_vector_state(instruction.opcode)
+                    && (!backward || backward_visits == 0)
                 {
                     let alternate_index = if taken {
                         path.instruction_index.saturating_add(1)
@@ -415,12 +524,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     &mut path.scalar_condition,
                 )?;
             } else if let Some(InstructionControl::ScalarMemory(control)) = &instruction.control {
-                self.execute_scalar_load(
-                    instruction,
-                    *control,
-                    &mut path.registers,
-                    path.supplemental,
-                )?;
+                self.execute_scalar_load(instruction, *control, &mut path.registers)?;
             } else if let Some(InstructionControl::GlobalMemory(control)) = &instruction.control {
                 self.resolve_global_memory(
                     instruction,
@@ -453,7 +557,6 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         instruction: &Instruction,
         control: ScalarMemoryControl,
         registers: &mut [u32; SCALAR_REGISTER_COUNT],
-        supplemental: bool,
     ) -> Result<(), EvaluationError> {
         let scalar_base = match instruction.sources.first() {
             Some(Operand {
@@ -463,14 +566,19 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             _ => return Err(invalid(instruction, "scalar-memory base register pair")),
         };
         let is_buffer = instruction.opcode.starts_with("SBufferLoad");
-        let descriptor = is_buffer.then(|| decode_buffer_descriptor(registers, scalar_base, false));
-        let descriptor =
-            descriptor
-                .transpose()
-                .map_err(|()| EvaluationError::InvalidBufferDescriptor {
-                    pc: instruction.pc,
-                    register: scalar_base,
-                })?;
+        let descriptor = is_buffer.then(|| decode_buffer_descriptor(registers, scalar_base));
+        let descriptor = descriptor.transpose().map_err(|()| {
+            let [words0, words1, words2, words3] =
+                buffer_descriptor_words(registers, scalar_base).unwrap_or_default();
+            EvaluationError::InvalidBufferDescriptor {
+                pc: instruction.pc,
+                register: scalar_base,
+                words0,
+                words1,
+                words2,
+                words3,
+            }
+        })?;
         let base_address = descriptor.map_or_else(
             || read_scalar_pair(registers, scalar_base).unwrap_or_default(),
             |descriptor| descriptor.base_address,
@@ -483,16 +591,12 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         let byte_offset = u64::from(dynamic_offset)
             .wrapping_add(i64::from(control.immediate_offset_bytes).cast_unsigned());
         let address = base_address.wrapping_add(byte_offset) & !3;
-        let unbound =
+        let mut unbound =
             base_address == 0 || descriptor.is_some_and(|descriptor| descriptor.size_bytes == 0);
-        if unbound && !supplemental {
-            return Err(EvaluationError::NullGlobalAddress {
-                pc: instruction.pc,
-                register: scalar_base,
-            });
-        }
 
-        let binding_size = if let Some(descriptor) = descriptor {
+        let binding_size = if unbound {
+            4
+        } else if let Some(descriptor) = descriptor {
             descriptor.size_bytes
         } else {
             byte_offset
@@ -502,17 +606,40 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 )
                 .ok_or(EvaluationError::BindingSizeOverflow { pc: instruction.pc })?
         };
-        self.record_global_binding(
+        let binding_result = self.record_global_binding(
             instruction,
             BindingRequest {
                 scalar_address: scalar_base,
                 base_address,
                 requested_bytes: binding_size,
                 writable: false,
-                supplemental,
-                allow_shorter: !is_buffer,
+                // A buffer descriptor's extent is the hardware OOB limit, not a promise that
+                // every page in that virtual range is resident. The scalar load below validates
+                // the exact components it touches; retain the readable prefix needed by Metal
+                // instead of rejecting a valid sparsely backed descriptor up front.
+                allow_shorter: true,
             },
-        )?;
+        );
+        if let Err(error) = binding_result {
+            if !matches!(error, EvaluationError::MemoryFault { .. }) {
+                return Err(error);
+            }
+            // Resource-table pointers can transiently contain stale sentinels for a material
+            // branch that the vector shader will not execute. Match the permissive console
+            // resource behavior used by SharpEmu: keep translating, feed zero to the scalar
+            // destinations, and bind a bounded zero buffer for Metal.
+            unbound = true;
+            self.record_global_binding(
+                instruction,
+                BindingRequest {
+                    scalar_address: scalar_base,
+                    base_address: 0,
+                    requested_bytes: 4,
+                    writable: false,
+                    allow_shorter: false,
+                },
+            )?;
+        }
 
         for destination in &instruction.destinations {
             if destination.kind != OperandKind::ScalarRegister
@@ -544,11 +671,14 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 .memory
                 .read(address, &mut bytes[..component_byte_count])
             {
-                return Err(EvaluationError::MemoryFault {
-                    pc: instruction.pc,
-                    address,
-                    length: component_byte_count,
-                });
+                // Scalar resource tables can name allocations that are not resident for the
+                // active material permutation. Console drivers return zero for these speculative
+                // loads. SharpEmu applies the same compatibility rule; rejecting the complete
+                // compute submission here turns a harmless unused resource into a guest fatal.
+                for destination in &instruction.destinations {
+                    registers[destination.value as usize] = 0;
+                }
+                return Ok(());
             }
             for (index, destination) in instruction.destinations.iter().enumerate() {
                 let component_address = address.wrapping_add((index as u64) * 4);
@@ -571,20 +701,14 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     .checked_add(4)
                     .is_none_or(|end| end > descriptor.size_bytes)
             }) {
-                if supplemental {
-                    registers[destination.value as usize] = 0;
-                    continue;
-                }
-                return Err(invalid(instruction, "scalar buffer load bounds"));
+                registers[destination.value as usize] = 0;
+                continue;
             }
             let component_address = address.wrapping_add((index as u64) * 4);
             let mut bytes = [0_u8; 4];
             if !self.memory.read(component_address, &mut bytes) {
-                return Err(EvaluationError::MemoryFault {
-                    pc: instruction.pc,
-                    address: component_address,
-                    length: 4,
-                });
+                registers[destination.value as usize] = 0;
+                continue;
             }
             let value = u32::from_le_bytes(bytes);
             self.scalar_memory_reads.insert(component_address, value);
@@ -598,7 +722,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         instruction: &Instruction,
         control: GlobalMemoryControl,
         registers: &[u32; SCALAR_REGISTER_COUNT],
-        supplemental: bool,
+        _supplemental: bool,
     ) -> Result<(), EvaluationError> {
         let Some(scalar_address) = control.scalar_address else {
             // With SADDR=NULL the complete 64-bit address is supplied per lane by VGPRs.
@@ -609,11 +733,21 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         let Some(base_address) = read_scalar_pair(registers, scalar_address) else {
             return Err(invalid(instruction, "global-memory scalar address pair"));
         };
-        if base_address == 0 && !supplemental {
-            return Err(EvaluationError::NullGlobalAddress {
-                pc: instruction.pc,
-                register: scalar_address,
-            });
+        if base_address == 0 {
+            // Null resources are legal placeholders in shaders shared across material variants.
+            // The vector control flow that guards their use is not available to this scalar
+            // evaluator. Preserve the pass with a bounded zero resource instead of rejecting the
+            // complete shader during resource discovery.
+            return self.record_global_binding(
+                instruction,
+                BindingRequest {
+                    scalar_address,
+                    base_address: 0,
+                    requested_bytes: 4,
+                    writable: false,
+                    allow_shorter: false,
+                },
+            );
         }
         let minimum_address = if control.offset_bytes.is_negative() {
             base_address.wrapping_sub(u64::from(control.offset_bytes.unsigned_abs()))
@@ -632,7 +766,6 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 requested_bytes: (self.options.maximum_binding_bytes as u64)
                     .saturating_add(prefix_bytes),
                 writable,
-                supplemental,
                 allow_shorter: true,
             },
         )
@@ -643,30 +776,32 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         instruction: &Instruction,
         control: BufferMemoryControl,
         registers: &[u32; SCALAR_REGISTER_COUNT],
-        supplemental: bool,
+        _supplemental: bool,
     ) -> Result<(), EvaluationError> {
-        let descriptor = decode_buffer_descriptor(registers, control.scalar_resource, true)
-            .map_err(|()| EvaluationError::InvalidBufferDescriptor {
-                pc: instruction.pc,
-                register: control.scalar_resource,
+        let descriptor =
+            decode_buffer_descriptor(registers, control.scalar_resource).map_err(|()| {
+                let [words0, words1, words2, words3] =
+                    buffer_descriptor_words(registers, control.scalar_resource).unwrap_or_default();
+                EvaluationError::InvalidBufferDescriptor {
+                    pc: instruction.pc,
+                    register: control.scalar_resource,
+                    words0,
+                    words1,
+                    words2,
+                    words3,
+                }
             })?;
         let writable =
             instruction.opcode.contains("Store") || instruction.opcode.contains("Atomic");
         if descriptor.base_address == 0 {
-            if !supplemental {
-                return Err(EvaluationError::NullGlobalAddress {
-                    pc: instruction.pc,
-                    register: control.scalar_resource,
-                });
-            }
             return self.record_global_binding(
                 instruction,
                 BindingRequest {
                     scalar_address: control.scalar_resource,
                     base_address: 0,
                     requested_bytes: 4,
-                    writable,
-                    supplemental: true,
+                    // Never attempt to write a placeholder back through address zero.
+                    writable: false,
                     allow_shorter: false,
                 },
             );
@@ -716,7 +851,6 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                         base_address: binding_base,
                         requested_bytes: desired_size.saturating_add(prefix_bytes),
                         writable,
-                        supplemental,
                         allow_shorter: false,
                     },
                 )?;
@@ -732,7 +866,6 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 base_address: binding_base,
                 requested_bytes: descriptor.size_bytes.saturating_add(prefix_bytes),
                 writable,
-                supplemental,
                 allow_shorter: false,
             },
         )
@@ -840,7 +973,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         pc: u32,
         request: BindingRequest,
     ) -> Result<(usize, Vec<u8>), EvaluationError> {
-        let data = if request.base_address == 0 && request.supplemental {
+        let data = if request.base_address == 0 {
             vec![0; usize::try_from(request.requested_bytes.clamp(4, 4096)).unwrap_or(4)]
         } else if !self.options.capture_global_binding_data {
             let maximum_length = usize::try_from(
@@ -1016,6 +1149,13 @@ fn is_scalar_branch(opcode: Opcode) -> bool {
     )
 }
 
+fn branch_condition_depends_on_vector_state(opcode: Opcode) -> bool {
+    matches!(
+        opcode.known_name(),
+        Some("SCbranchVccz" | "SCbranchVccnz" | "SCbranchExecz" | "SCbranchExecnz")
+    )
+}
+
 fn invalid(instruction: &Instruction, detail: &'static str) -> EvaluationError {
     EvaluationError::InvalidInstruction {
         pc: instruction.pc,
@@ -1072,6 +1212,22 @@ fn execute_scalar_alu(
         return Ok(());
     }
     if execute_save_exec(instruction, registers, exec_mask, scalar_condition)? {
+        return Ok(());
+    }
+
+    if instruction.opcode.is("SBcnt1I32B64") {
+        let source = evaluate_operand64(
+            instruction
+                .sources
+                .first()
+                .ok_or_else(|| invalid(instruction, "64-bit source"))?,
+            registers,
+            *exec_mask,
+        )
+        .ok_or_else(|| invalid(instruction, "64-bit source"))?;
+        let result = source.count_ones();
+        registers[destination as usize] = result;
+        *scalar_condition = result != 0;
         return Ok(());
     }
 
@@ -1456,8 +1612,18 @@ fn execute_scalar_binary(
             value
         }
         Some("SAbsdiffI32") => {
-            u32::try_from(i64::from(left.cast_signed()).abs_diff(i64::from(right.cast_signed())))
-                .expect("i32 absolute difference fits u32")
+            // The ISA performs both the subtraction and conditional negation at
+            // i32 width. This intentionally leaves INT_MIN negative and makes
+            // INT_MIN - 1 wrap to INT_MAX.
+            let difference = left.cast_signed().wrapping_sub(right.cast_signed());
+            let value = if difference < 0 {
+                difference.wrapping_neg()
+            } else {
+                difference
+            }
+            .cast_unsigned();
+            *scalar_condition = value != 0;
+            value
         }
         Some("SLshl1AddU32" | "SLshl2AddU32" | "SLshl3AddU32" | "SLshl4AddU32") => {
             let shift = match instruction.opcode.known_name() {
@@ -1672,6 +1838,20 @@ fn execute_scalar_compare(
     let [left_operand, right_operand] = instruction.sources.as_slice() else {
         return Err(invalid(instruction, "scalar compare operands"));
     };
+    if matches!(
+        instruction.opcode.known_name(),
+        Some("SCmpEqU64" | "SCmpLgU64")
+    ) {
+        let left = evaluate_operand64(left_operand, registers, exec_mask)
+            .ok_or_else(|| invalid(instruction, "64-bit scalar compare source 0"))?;
+        let right = evaluate_operand64(right_operand, registers, exec_mask)
+            .ok_or_else(|| invalid(instruction, "64-bit scalar compare source 1"))?;
+        return Ok(if instruction.opcode.is("SCmpEqU64") {
+            left == right
+        } else {
+            left != right
+        });
+    }
     let left = evaluate_operand(left_operand, registers)
         .ok_or_else(|| invalid(instruction, "scalar compare source 0"))?;
     let right = evaluate_operand(right_operand, registers)
@@ -1765,18 +1945,19 @@ fn read_scalar_pair(registers: &[u32; SCALAR_REGISTER_COUNT], scalar_base: u32) 
     )
 }
 
+fn buffer_descriptor_words(
+    registers: &[u32; SCALAR_REGISTER_COUNT],
+    scalar_base: u32,
+) -> Option<[u32; 4]> {
+    let index = usize::try_from(scalar_base).ok()?;
+    registers.get(index..index.checked_add(4)?)?.try_into().ok()
+}
+
 fn decode_buffer_descriptor(
     registers: &[u32; SCALAR_REGISTER_COUNT],
     scalar_base: u32,
-    strict_type: bool,
 ) -> Result<BufferDescriptor, ()> {
-    let index = usize::try_from(scalar_base).map_err(|_| ())?;
-    let descriptor_words = registers
-        .get(index..index.checked_add(4).ok_or(())?)
-        .ok_or(())?;
-    let [word0, word1, word2, word3] = *descriptor_words else {
-        return Err(());
-    };
+    let [word0, word1, word2, word3] = buffer_descriptor_words(registers, scalar_base).ok_or(())?;
     if word0 == 0 && word1 == 0 && word2 == 0 && word3 == 0 {
         return Ok(BufferDescriptor {
             base_address: 0,
@@ -1788,20 +1969,10 @@ fn decode_buffer_descriptor(
             data_format: 0,
         });
     }
-    if word3 >> 30 != 0 {
-        if strict_type {
-            return Err(());
-        }
-        return Ok(BufferDescriptor {
-            base_address: 0,
-            stride: 0,
-            swizzle_enabled: false,
-            record_count: 0,
-            size_bytes: 0,
-            number_format: 0,
-            data_format: 0,
-        });
-    }
+    // GFX10 repurposes the legacy TYPE field at the top of word 3. Bit 31 is
+    // RESOURCE_LEVEL and is set on valid RDNA2 buffer descriptors. Interpreting those two bits as
+    // the pre-GFX10 resource type rejects real Gen5 descriptors before their base address can be
+    // evaluated.
     let base_address = u64::from(word0) | (u64::from(word1 & 0xffff) << 32);
     let stride = (word1 >> 16) & 0x3fff;
     let swizzle_enabled = word1 >> 31 != 0;
@@ -2014,11 +2185,82 @@ mod tests {
     }
 
     #[test]
+    fn s_bcnt1_i32_b64_counts_the_source_pair_and_updates_scc() {
+        let instruction = instruction(
+            0,
+            ShaderEncoding::Sop1,
+            "SBcnt1I32B64",
+            vec![Operand::scalar(0)],
+            vec![Operand::scalar(10)],
+            None,
+        );
+        let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+        let mut exec_mask = u64::MAX;
+        let mut scalar_condition = false;
+
+        registers[0] = 0xf0f0_0001;
+        registers[1] = 0x8000_ffff;
+        execute_scalar_alu(
+            &instruction,
+            0x1000,
+            &mut registers,
+            &mut exec_mask,
+            &mut scalar_condition,
+        )
+        .expect("64-bit bit count");
+        let source = u64::from(registers[0]) | (u64::from(registers[1]) << 32);
+        assert_eq!(registers[10], source.count_ones());
+        assert!(scalar_condition);
+
+        registers[0] = 0;
+        registers[1] = 0;
+        scalar_condition = true;
+        execute_scalar_alu(
+            &instruction,
+            0x1000,
+            &mut registers,
+            &mut exec_mask,
+            &mut scalar_condition,
+        )
+        .expect("zero 64-bit bit count");
+        assert_eq!(registers[10], 0);
+        assert!(!scalar_condition);
+    }
+
+    #[test]
+    fn s_bitcmp1_b32_uses_the_low_five_index_bits() {
+        let instruction = instruction(
+            0,
+            ShaderEncoding::Sopc,
+            "SBitcmp1B32",
+            vec![Operand::scalar(0), Operand::scalar(1)],
+            Vec::new(),
+            None,
+        );
+        let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+        registers[0] = 1 << 7;
+
+        for index in [7_u32, 39_u32] {
+            registers[1] = index;
+            assert!(
+                execute_scalar_compare(&instruction, &registers, u64::MAX)
+                    .expect("S_BITCMP1_B32 scalar evaluation"),
+                "bit index {index} must select source bit 7"
+            );
+        }
+        registers[1] = 6;
+        assert!(
+            !execute_scalar_compare(&instruction, &registers, u64::MAX)
+                .expect("clear S_BITCMP1_B32 scalar evaluation")
+        );
+    }
+
+    #[test]
     fn sizes_structured_buffer_descriptors_in_records() {
         let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
         registers[..4].copy_from_slice(&[0x2000, 16 << 16, 32, 0]);
 
-        let descriptor = decode_buffer_descriptor(&registers, 0, true).expect("descriptor");
+        let descriptor = decode_buffer_descriptor(&registers, 0).expect("descriptor");
 
         assert_eq!(descriptor.base_address, 0x2000);
         assert_eq!(descriptor.stride, 16);
@@ -2031,7 +2273,7 @@ mod tests {
         let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
         registers[..4].copy_from_slice(&[0x2000, 16 << 16, 512, 3 << 28]);
 
-        let descriptor = decode_buffer_descriptor(&registers, 0, true).expect("descriptor");
+        let descriptor = decode_buffer_descriptor(&registers, 0).expect("descriptor");
 
         assert_eq!(descriptor.stride, 16);
         assert_eq!(descriptor.record_count, 512);
@@ -2043,10 +2285,114 @@ mod tests {
         let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
         registers[..4].copy_from_slice(&[0x2000, (16 << 16) | (1 << 31), 32, 3 << 28]);
 
-        let descriptor = decode_buffer_descriptor(&registers, 0, true).expect("descriptor");
+        let descriptor = decode_buffer_descriptor(&registers, 0).expect("descriptor");
 
         assert!(descriptor.swizzle_enabled);
         assert_eq!(descriptor.size_bytes, 512);
+    }
+
+    #[test]
+    fn accepts_gfx10_buffer_descriptors_with_resource_level() {
+        let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+        registers[..4].copy_from_slice(&[0x8065_a700, 0xcb60_0000, 0x0046_c19b, 0x9050_0fac]);
+
+        let descriptor = decode_buffer_descriptor(&registers, 0)
+            .expect("RESOURCE_LEVEL is valid in an RDNA2 buffer descriptor");
+
+        assert_eq!(descriptor.base_address, 0x8065_a700);
+        assert_eq!(descriptor.stride, 0xb60);
+        assert!(descriptor.swizzle_enabled);
+        assert_eq!(descriptor.record_count, 0x0046_c19b);
+        assert_ne!(descriptor.size_bytes, 0);
+    }
+
+    #[test]
+    fn keeps_null_global_resources_as_bounded_zero_bindings() {
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Flat,
+                    "GlobalLoadDword",
+                    Vec::new(),
+                    vec![Operand::vector(0)],
+                    Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        vector_destination: 0,
+                        scalar_address: Some(12),
+                        offset_bytes: 0,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                    })),
+                ),
+                end(8),
+            ],
+            vec![0; 14],
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("null global resource must not discard the shader");
+
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].scalar_address, 12);
+        assert_eq!(evaluation.global_memory_bindings[0].base_address, 0);
+        assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
+        assert!(!evaluation.global_memory_bindings[0].writable);
+        assert!(!evaluation.global_memory_bindings[0].write_back_to_guest);
+    }
+
+    #[test]
+    fn keeps_null_buffer_resources_as_bounded_zero_bindings() {
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Mubuf,
+                    "BufferLoadDword",
+                    Vec::new(),
+                    vec![Operand::vector(0)],
+                    Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        scalar_resource: 8,
+                        instruction_format: None,
+                        offset_bytes: 0,
+                        index_enabled: false,
+                        offset_enabled: false,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                        tfe: false,
+                    })),
+                ),
+                end(8),
+            ],
+            vec![0; 12],
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("null buffer resource must not discard the shader");
+
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].scalar_address, 8);
+        assert_eq!(evaluation.global_memory_bindings[0].base_address, 0);
+        assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
+        assert!(!evaluation.global_memory_bindings[0].writable);
+        assert!(!evaluation.global_memory_bindings[0].write_back_to_guest);
     }
 
     #[test]
@@ -2189,6 +2535,211 @@ mod tests {
     }
 
     #[test]
+    fn scalar_absdiff_wraps_at_i32_width_and_sets_scc_from_the_result() {
+        let operation = instruction(
+            0,
+            ShaderEncoding::Sop2,
+            "SAbsdiffI32",
+            vec![Operand::scalar(0), Operand::scalar(1)],
+            vec![Operand::scalar(2)],
+            None,
+        );
+        for (left, right, expected, expected_scc) in [
+            (0x0000_0002, 0x0000_0005, 0x0000_0003, true),
+            (0xffff_ffff, 0x0000_0000, 0x0000_0001, true),
+            (0x8000_0000, 0x0000_0000, 0x8000_0000, true),
+            (0x8000_0000, 0x0000_0001, 0x7fff_ffff, true),
+            (0x8000_0000, 0xffff_ffff, 0x7fff_ffff, true),
+            (0x8000_0000, 0xffff_fffe, 0x7fff_fffe, true),
+            (0x1234_5678, 0x1234_5678, 0x0000_0000, false),
+        ] {
+            let mut scc = !expected_scc;
+            assert_eq!(
+                execute_scalar_binary(&operation, left, right, &mut scc)
+                    .expect("S_ABSDIFF_I32 evaluates"),
+                expected,
+                "left=0x{left:08X}, right=0x{right:08X}"
+            );
+            assert_eq!(scc, expected_scc, "left=0x{left:08X}, right=0x{right:08X}");
+        }
+    }
+
+    #[test]
+    fn evaluates_unsigned_64_bit_scalar_comparisons_as_register_pairs() {
+        let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+        registers[10] = 0x89ab_cdef;
+        registers[11] = 0x0123_4567;
+        registers[20] = 0x89ab_cdef;
+        registers[21] = 0x0123_4567;
+        let compare = instruction(
+            0,
+            ShaderEncoding::Sopc,
+            "SCmpEqU64",
+            vec![Operand::scalar(10), Operand::scalar(20)],
+            Vec::new(),
+            None,
+        );
+        assert!(
+            execute_scalar_compare(&compare, &registers, u64::MAX)
+                .expect("equal register pairs compare")
+        );
+
+        registers[21] ^= 1;
+        let not_equal = Instruction {
+            opcode: Opcode::from_static("SCmpLgU64"),
+            ..compare
+        };
+        assert!(
+            execute_scalar_compare(&not_equal, &registers, u64::MAX)
+                .expect("different register pairs compare")
+        );
+    }
+
+    #[test]
+    fn gives_unreachable_scalar_memory_a_zero_binding_without_reading_it() {
+        let mut memory = TestMemory::default();
+        memory.write(0x2000, &0x1122_3344_u32.to_le_bytes());
+        memory.write(0x3000, &0xaabb_ccdd_u32.to_le_bytes());
+        let scalar_load = |pc, scalar_base, destination| {
+            instruction(
+                pc,
+                ShaderEncoding::Smem,
+                "SLoadDword",
+                vec![Operand::scalar(scalar_base)],
+                vec![Operand::scalar(destination)],
+                Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                    destination_count: 1,
+                    immediate_offset_bytes: 0,
+                    dynamic_offset_register: None,
+                })),
+            )
+        };
+        let mut branch = instruction(
+            4,
+            ShaderEncoding::Sopp,
+            "SCbranchScc1",
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        branch.words[0] = 2;
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Sopk,
+                    "SCmpkEqI32",
+                    vec![Operand {
+                        kind: OperandKind::EncodedConstant,
+                        value: 1,
+                    }],
+                    vec![Operand::scalar(4)],
+                    None,
+                ),
+                branch,
+                scalar_load(8, 0, 6),
+                scalar_load(16, 2, 7),
+                end(24),
+            ],
+            vec![0x2000, 0, 0x3000, 0, 1],
+        );
+
+        let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
+            .expect("the exact scalar branch should skip its unreachable load");
+
+        assert_eq!(evaluation.scalar_registers[7], 0xaabb_ccdd);
+        assert_eq!(evaluation.scalar_memory_reads, vec![(0x3000, 0xaabb_ccdd)]);
+        assert_eq!(evaluation.global_memory_bindings.len(), 2);
+        assert_eq!(
+            evaluation.global_memory_bindings[0]
+                .instruction_pcs
+                .as_slice(),
+            [16]
+        );
+        assert_eq!(evaluation.global_memory_bindings[1].base_address, 0);
+        assert_eq!(
+            evaluation.global_memory_bindings[1]
+                .instruction_pcs
+                .as_slice(),
+            [8]
+        );
+    }
+
+    #[test]
+    fn preserves_initial_image_descriptors_for_statically_inactive_blocks() {
+        let image = ImageControl {
+            dmask: 0xf,
+            vector_address: 0,
+            address_registers: vec![0, 1],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 8,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+        };
+        let mut branch = instruction(
+            4,
+            ShaderEncoding::Sopp,
+            "SCbranchScc1",
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        branch.words[0] = 2;
+        let mut registers = (1..=12).collect::<Vec<_>>();
+        registers.resize(21, 0);
+        registers[20] = 1;
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Sopk,
+                    "SCmpkEqI32",
+                    vec![Operand {
+                        kind: OperandKind::EncodedConstant,
+                        value: 1,
+                    }],
+                    vec![Operand::scalar(20)],
+                    None,
+                ),
+                branch,
+                instruction(
+                    8,
+                    ShaderEncoding::Mimg,
+                    "ImageSampleLz",
+                    Vec::new(),
+                    Vec::new(),
+                    Some(InstructionControl::Image(image)),
+                ),
+                end(16),
+            ],
+            registers,
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("inactive image descriptor should remain available to Metal lowering");
+
+        assert_eq!(evaluation.image_bindings.len(), 1);
+        assert_eq!(evaluation.image_bindings[0].pc, 8);
+        assert_eq!(
+            evaluation.image_bindings[0].resource_descriptor.as_slice(),
+            (1..=8).collect::<Vec<_>>().as_slice()
+        );
+        assert_eq!(
+            evaluation.image_bindings[0].sampler_descriptor.as_slice(),
+            (9..=12).collect::<Vec<_>>().as_slice()
+        );
+    }
+
+    #[test]
     fn bounds_vector_controlled_backward_loops_during_scalar_discovery() {
         let mut branch = instruction(
             4,
@@ -2222,6 +2773,53 @@ mod tests {
         )
         .expect("vector-controlled runtime loop must not exhaust static discovery");
         assert!(evaluation.global_memory_bindings.is_empty());
+    }
+
+    #[test]
+    fn conversion_only_vector_alu_is_skipped_by_scalar_resource_evaluation() {
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Vop1,
+                    "VCvtFlrI32F32",
+                    vec![Operand::vector(1)],
+                    vec![Operand::vector(8)],
+                    None,
+                ),
+                instruction(
+                    4,
+                    ShaderEncoding::Vop3,
+                    "VCvtPknormU16F32",
+                    vec![
+                        Operand::vector(2),
+                        Operand::vector(3),
+                        Operand::source(128, None),
+                    ],
+                    vec![Operand::vector(9)],
+                    Some(InstructionControl::Vop3(crate::Vop3Control {
+                        absolute_mask: 0,
+                        negate_mask: 0,
+                        output_modifier: 0,
+                        clamp: false,
+                        operand_select: 0,
+                        scalar_destination: None,
+                    })),
+                ),
+                end(12),
+            ],
+            Vec::new(),
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("vector conversions must not enter scalar resource evaluation");
+        assert!(evaluation.scalar_memory_reads.is_empty());
+        assert!(evaluation.global_memory_bindings.is_empty());
+        assert!(evaluation.image_bindings.is_empty());
     }
 
     #[test]
@@ -2310,6 +2908,165 @@ mod tests {
         );
         assert_eq!(evaluation.global_memory_bindings.len(), 1);
         assert_eq!(evaluation.global_memory_bindings[0].data.len(), 8);
+    }
+
+    #[test]
+    fn null_scalar_loads_return_zero_and_keep_a_zero_binding() {
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Smem,
+                    "SLoadDwordx2",
+                    vec![Operand::scalar(0)],
+                    vec![Operand::scalar(4), Operand::scalar(5)],
+                    Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                        destination_count: 2,
+                        immediate_offset_bytes: 0,
+                        dynamic_offset_register: None,
+                    })),
+                ),
+                end(8),
+            ],
+            vec![0, 0],
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("null scalar resource must not discard the shader");
+
+        assert_eq!(evaluation.scalar_registers[4], 0);
+        assert_eq!(evaluation.scalar_registers[5], 0);
+        assert!(evaluation.scalar_memory_reads.is_empty());
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].base_address, 0);
+        assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
+    }
+
+    #[test]
+    fn unreadable_scalar_resource_sentinels_fall_back_to_zero() {
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Smem,
+                    "SLoadDword",
+                    vec![Operand::scalar(0)],
+                    vec![Operand::scalar(4)],
+                    Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                        destination_count: 1,
+                        immediate_offset_bytes: 0,
+                        dynamic_offset_register: None,
+                    })),
+                ),
+                end(8),
+            ],
+            vec![0x3f, 0],
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("unreadable resource sentinel must not discard the shader");
+
+        assert_eq!(evaluation.scalar_registers[4], 0);
+        assert!(evaluation.scalar_memory_reads.is_empty());
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].base_address, 0);
+        assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
+    }
+
+    #[test]
+    fn unreadable_scalar_components_after_binding_discovery_return_zero() {
+        struct ResidentRangeWithUnavailableContents;
+
+        impl GuestMemoryReader for ResidentRangeWithUnavailableContents {
+            fn read(&self, _address: u64, _output: &mut [u8]) -> bool {
+                false
+            }
+
+            fn readable_prefix_length(
+                &self,
+                _address: u64,
+                maximum_length: usize,
+            ) -> Option<usize> {
+                Some(maximum_length)
+            }
+        }
+
+        let shader = state(
+            vec![
+                instruction(
+                    0x0c,
+                    ShaderEncoding::Smem,
+                    "SLoadDword",
+                    vec![Operand::scalar(0)],
+                    vec![Operand::scalar(4)],
+                    Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                        destination_count: 1,
+                        immediate_offset_bytes: 0,
+                        dynamic_offset_register: None,
+                    })),
+                ),
+                end(0x14),
+            ],
+            vec![0x8037_3300, 0],
+        );
+        let evaluation = evaluate_shader(
+            &ResidentRangeWithUnavailableContents,
+            &shader,
+            EvaluationOptions {
+                capture_global_binding_data: false,
+                ..EvaluationOptions::default()
+            },
+        )
+        .expect("an unavailable scalar component must behave like a zero-filled resource");
+
+        assert_eq!(evaluation.scalar_registers[4], 0);
+        assert!(evaluation.scalar_memory_reads.is_empty());
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(
+            evaluation.global_memory_bindings[0].base_address,
+            0x8037_3300
+        );
+    }
+
+    #[test]
+    fn scalar_buffer_loads_do_not_require_the_complete_descriptor_range_to_be_mapped() {
+        let mut memory = TestMemory::default();
+        memory.write(0x2000, &0x1122_3344_u32.to_le_bytes());
+        memory.write(0x2004, &0xaabb_ccdd_u32.to_le_bytes());
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Smem,
+                    "SBufferLoadDwordx2",
+                    vec![Operand::scalar(0)],
+                    vec![Operand::scalar(4), Operand::scalar(5)],
+                    Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                        destination_count: 2,
+                        immediate_offset_bytes: 0,
+                        dynamic_offset_register: None,
+                    })),
+                ),
+                end(8),
+            ],
+            vec![0x2000, 16 << 16, 4096, (1 << 31) | (1 << 28)],
+        );
+
+        let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
+            .expect("only the scalar components that execute need resident backing");
+
+        assert_eq!(evaluation.scalar_registers[4], 0x1122_3344);
+        assert_eq!(evaluation.scalar_registers[5], 0xaabb_ccdd);
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].byte_count, 8);
     }
 
     #[test]

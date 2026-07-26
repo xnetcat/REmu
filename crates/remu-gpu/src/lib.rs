@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -61,6 +62,7 @@ static HOST_PAD_AXES: AtomicU32 = AtomicU32::new(0x8080_8080);
 static HOST_PAD_TRIGGERS: AtomicU32 = AtomicU32::new(0);
 static GPU_EVENTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static GPU_COMPLETED_SUBMISSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static GPU_COMPLETED_SUBMISSIONS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
 static AUDIO_OUTPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
 static AUDIO_UNDERRUN_FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -265,6 +267,12 @@ impl ComputeLaunch {
             * self.threads_per_group[1] as u64
             * self.threads_per_group[2] as u64
     }
+
+    /// A dispatch with a zero extent on any axis launches no workgroups.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.group_count[0] == 0 || self.group_count[1] == 0 || self.group_count[2] == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -360,7 +368,7 @@ pub fn decode_compute_launch(
                 .checked_mul(u64::from(threads_per_group[axis]))
                 .ok_or(ComputeDispatchDecodeError::ThreadCountOverflow { axis: axes[axis] })?;
             let end_thread = u64::from(dimensions[axis]);
-            if end_thread <= start_thread {
+            if end_thread < start_thread {
                 return Err(ComputeDispatchDecodeError::EndNotAfterBase {
                     axis: axes[axis],
                     end: end_thread,
@@ -376,7 +384,7 @@ pub fn decode_compute_launch(
         ComputeGrid::Threads(threads)
     } else {
         for axis in 0..3 {
-            if dimensions[axis] <= base_group[axis] {
+            if dimensions[axis] < base_group[axis] {
                 return Err(ComputeDispatchDecodeError::EndNotAfterBase {
                     axis: axes[axis],
                     end: u64::from(dimensions[axis]),
@@ -385,7 +393,7 @@ pub fn decode_compute_launch(
             }
             group_count[axis] = dimensions[axis] - base_group[axis];
         }
-        if initiator & DISPATCH_PARTIAL_THREADGROUP == 0 {
+        if initiator & DISPATCH_PARTIAL_THREADGROUP == 0 || group_count.contains(&0) {
             ComputeGrid::Threadgroups(group_count)
         } else {
             let mut threads = [0_u64; 3];
@@ -546,6 +554,15 @@ pub trait GpuProbe {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GpuEvent {
+    /// One complete guest command-buffer submission and the hardware queue that owns it.
+    ///
+    /// Events inside a submission are strictly ordered. A backend may interleave work from
+    /// different queue IDs, but it must never execute a later event from this submission while
+    /// its front event is blocked. `QueueSubmission` must not be nested.
+    QueueSubmission {
+        queue_id: u64,
+        events: Vec<GpuEvent>,
+    },
     DisplayRegistered {
         width: u32,
         height: u32,
@@ -569,7 +586,18 @@ pub enum GpuEvent {
     MemoryCopy(GpuMemoryCopy),
     MemoryWrite(GpuMemoryWrite),
     MemoryRelease(GpuMemoryRelease),
+    /// A decoded wait which has not yet crossed the installed guest GPU event sink.
+    ///
+    /// [`emit_event`] upgrades waits inside a `QueueSubmission` to
+    /// [`GpuEvent::RegisteredMemoryWait`] before the bounded channel send. Keeping this variant
+    /// separate lets command decoding and backend unit tests use the pure packet condition without
+    /// fabricating a process-global ticket.
     MemoryWait(GpuMemoryWait),
+    /// A wait registered synchronously when its owning queue submission was published.
+    RegisteredMemoryWait {
+        id: GpuWaitId,
+        wait: GpuMemoryWait,
+    },
     ComputeDispatch(Box<ComputeDispatch>),
     IndexedDraw(Box<IndexedDraw>),
     /// An ordered CPU-visible end-of-pipe boundary for one guest graphics submission.
@@ -658,6 +686,14 @@ pub struct GpuMemoryWait {
     pub is_64_bit: bool,
 }
 
+/// Process-unique identity for one submitted guest-memory wait.
+///
+/// A label address can be returned to the guest allocator and reused for another frame. The ID
+/// keeps those logical generations distinct: a producer may latch only wait IDs which were
+/// registered before that producer retired.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GpuWaitId(u64);
+
 impl GpuMemoryWait {
     #[must_use]
     pub const fn is_satisfied_by(self, value: u64) -> bool {
@@ -730,7 +766,206 @@ impl GpuMemoryAcquire {
     }
 }
 
+const GPU_WAIT_CAPACITY: usize = 65_536;
+
+#[derive(Clone, Copy, Debug)]
+struct RegisteredGpuWait {
+    condition: GpuMemoryWait,
+    latched_value: Option<u64>,
+}
+
+#[derive(Default)]
+struct GpuWaitRegistry {
+    next_id: u64,
+    waits: HashMap<GpuWaitId, RegisteredGpuWait>,
+    by_label: HashMap<(u64, bool), Vec<GpuWaitId>>,
+}
+
+impl GpuWaitRegistry {
+    fn register_many(&mut self, conditions: &[GpuMemoryWait]) -> Result<Vec<GpuWaitId>, ()> {
+        if self
+            .waits
+            .len()
+            .checked_add(conditions.len())
+            .is_none_or(|count| count > GPU_WAIT_CAPACITY)
+        {
+            return Err(());
+        }
+        let condition_count = u64::try_from(conditions.len()).map_err(|_| ())?;
+        let next_id = self.next_id.checked_add(condition_count).ok_or(())?;
+
+        let mut ids = Vec::with_capacity(conditions.len());
+        for (index, &condition) in conditions.iter().enumerate() {
+            let id = GpuWaitId(
+                self.next_id
+                    + u64::try_from(index)
+                        .expect("a registered wait index fits u64 after length validation")
+                    + 1,
+            );
+            self.waits.insert(
+                id,
+                RegisteredGpuWait {
+                    condition,
+                    latched_value: None,
+                },
+            );
+            self.by_label
+                .entry((condition.address, condition.is_64_bit))
+                .or_default()
+                .push(id);
+            ids.push(id);
+        }
+        self.next_id = next_id;
+        Ok(ids)
+    }
+
+    fn retire(&mut self, id: GpuWaitId) {
+        let Some(registered) = self.waits.remove(&id) else {
+            return;
+        };
+        let key = (registered.condition.address, registered.condition.is_64_bit);
+        let remove_key = self.by_label.get_mut(&key).is_some_and(|ids| {
+            ids.retain(|candidate| *candidate != id);
+            ids.is_empty()
+        });
+        if remove_key {
+            self.by_label.remove(&key);
+        }
+    }
+
+    fn cancel(&mut self, ids: &[GpuWaitId]) {
+        for &id in ids {
+            self.retire(id);
+        }
+    }
+
+    fn take_latched(&mut self, id: GpuWaitId) -> Option<u64> {
+        let value = self.waits.get(&id)?.latched_value?;
+        self.retire(id);
+        Some(value)
+    }
+
+    fn record_producer(&mut self, address: u64, is_64_bit: bool, value: u64) {
+        let Some(ids) = self.by_label.get(&(address, is_64_bit)).cloned() else {
+            return;
+        };
+        for id in ids {
+            let Some(wait) = self.waits.get_mut(&id) else {
+                continue;
+            };
+            if wait.latched_value.is_none() && wait.condition.is_satisfied_by(value) {
+                wait.latched_value = Some(value);
+            }
+        }
+    }
+
+    fn pending_overlapping(&self, start: u64, byte_count: u64) -> Vec<(GpuWaitId, GpuMemoryWait)> {
+        if byte_count == 0 {
+            return Vec::new();
+        }
+        let end = start.saturating_add(byte_count);
+        self.waits
+            .iter()
+            .filter_map(|(&id, registered)| {
+                if registered.latched_value.is_some() {
+                    return None;
+                }
+                let width = if registered.condition.is_64_bit { 8 } else { 4 };
+                let wait_end = registered.condition.address.saturating_add(width);
+                (start < wait_end && registered.condition.address < end)
+                    .then_some((id, registered.condition))
+            })
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.waits.clear();
+        self.by_label.clear();
+    }
+}
+
 static GPU_EVENT_SINK: OnceLock<Mutex<Option<SyncSender<GpuEvent>>>> = OnceLock::new();
+static GPU_WAITS: OnceLock<Mutex<GpuWaitRegistry>> = OnceLock::new();
+
+fn gpu_wait_registry() -> &'static Mutex<GpuWaitRegistry> {
+    GPU_WAITS.get_or_init(|| Mutex::new(GpuWaitRegistry::default()))
+}
+
+fn register_queue_submission_waits(event: &mut GpuEvent) -> Result<Vec<GpuWaitId>, ()> {
+    let GpuEvent::QueueSubmission { events, .. } = event else {
+        return Ok(Vec::new());
+    };
+    let waits = events
+        .iter()
+        .filter_map(|event| match event {
+            GpuEvent::MemoryWait(wait) => Some(*wait),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let registered_ids = gpu_wait_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .register_many(&waits)?;
+    let mut ids = registered_ids.iter().copied();
+    for event in events.iter_mut() {
+        if let GpuEvent::MemoryWait(wait) = event {
+            let wait = *wait;
+            *event = GpuEvent::RegisteredMemoryWait {
+                id: ids
+                    .next()
+                    .expect("every submitted memory wait received a ticket"),
+                wait,
+            };
+        }
+    }
+    debug_assert!(ids.next().is_none());
+    Ok(registered_ids)
+}
+
+/// Takes a satisfying producer value latched for one submitted wait.
+///
+/// A successful take retires the ticket. A pending, cancelled, or already-consumed ticket returns
+/// `None`.
+pub fn take_gpu_wait_latch(id: GpuWaitId) -> Option<u64> {
+    gpu_wait_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take_latched(id)
+}
+
+/// Retires one satisfied, rejected, or otherwise consumed wait ticket.
+pub fn retire_gpu_wait(id: GpuWaitId) {
+    gpu_wait_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retire(id);
+}
+
+/// Latches a concrete ordered producer value into matching waits already submitted for this label.
+///
+/// The registry intentionally retains no historical producer value. A later reuse of the same
+/// guest address therefore cannot inherit satisfaction from an older label generation.
+pub fn record_gpu_wait_producer(address: u64, is_64_bit: bool, value: u64) {
+    gpu_wait_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_producer(address, is_64_bit, value);
+}
+
+/// Returns pending submitted waits whose watched bytes overlap an ordered producer range.
+///
+/// Backends use this for DMA fills/copies and proven shader writebacks: after applying the complete
+/// producer packet, they read only these 4- or 8-byte values and pass them to
+/// [`record_gpu_wait_producer`].
+pub fn pending_gpu_waits_overlapping(
+    start: u64,
+    byte_count: u64,
+) -> Vec<(GpuWaitId, GpuMemoryWait)> {
+    gpu_wait_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending_overlapping(start, byte_count)
+}
 
 /// Creates the bounded, ordered event channel used by the guest GPU command processor.
 #[must_use]
@@ -741,26 +976,53 @@ pub fn gpu_event_channel() -> (SyncSender<GpuEvent>, Receiver<GpuEvent>) {
 pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
     GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
     GPU_COMPLETED_SUBMISSION_SEQUENCE.store(0, Ordering::Release);
+    GPU_COMPLETED_SUBMISSIONS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    let sink = GPU_EVENT_SINK.get_or_init(|| Mutex::new(None));
+    let mut sink = sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gpu_wait_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     AUDIO_OUTPUT_FRAMES.store(0, Ordering::Relaxed);
     AUDIO_UNDERRUN_FRAMES.store(0, Ordering::Relaxed);
-    let sink = GPU_EVENT_SINK.get_or_init(|| Mutex::new(None));
-    *sink
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+    *sink = Some(sender);
 }
 
 pub fn clear_event_sink() {
     GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
     GPU_COMPLETED_SUBMISSION_SEQUENCE.store(0, Ordering::Release);
-    let Some(sink) = GPU_EVENT_SINK.get() else {
-        return;
-    };
-    *sink
+    GPU_COMPLETED_SUBMISSIONS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    if let Some(sink) = GPU_EVENT_SINK.get() {
+        let mut sink = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *sink = None;
+        gpu_wait_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    } else {
+        gpu_wait_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
-/// Returns the newest guest submission whose ordered backend work is fully complete.
+/// Returns the numerically newest guest submission observed complete by the backend.
+///
+/// This is telemetry only: hardware queues retire independently, so callers that deliver guest
+/// completion notifications must use [`take_gpu_completed_submission_ids`] instead.
 #[must_use]
 pub fn gpu_completed_submission_sequence() -> u64 {
     GPU_COMPLETED_SUBMISSION_SEQUENCE.load(Ordering::Acquire)
@@ -768,25 +1030,64 @@ pub fn gpu_completed_submission_sequence() -> u64 {
 
 /// Publishes completion of an ordered guest submission.
 ///
-/// Backends may retire more than one boundary between guest polls, so completion is monotonic
-/// even if callbacks are observed out of order on a future multi-queue implementation.
+/// Backends may retire different hardware queues out of submission order. Exact IDs are retained
+/// for the runtime while the scalar maximum remains available for telemetry.
 pub fn record_gpu_submission_completed(sequence: u64) {
+    GPU_COMPLETED_SUBMISSIONS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(sequence);
     let _ = GPU_COMPLETED_SUBMISSION_SEQUENCE.fetch_max(sequence, Ordering::AcqRel);
 }
 
-pub fn emit_event(event: GpuEvent) {
-    let Some(sink) = GPU_EVENT_SINK.get() else {
-        return;
-    };
-    let sender = sink
+/// Drains the exact set of guest submission IDs completed since the previous runtime refresh.
+///
+/// Returning IDs rather than a global prefix prevents a blocked graphics queue from withholding
+/// an independent async-compute interrupt, and prevents a newer completion from falsely
+/// completing an older queue.
+pub fn take_gpu_completed_submission_ids() -> Vec<u64> {
+    let mut completed = GPU_COMPLETED_SUBMISSIONS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    if let Some(sender) = sender {
-        GPU_EVENTS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-        if sender.send(event).is_err() {
-            record_gpu_event_consumed();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *completed).into_iter().collect()
+}
+
+/// Publishes one decoded GPU event to the installed bounded presenter channel.
+///
+/// Queue-submission waits are registered before the potentially blocking channel send. Returning
+/// `false` means no backend can complete the event; any wait tickets allocated for a failed send
+/// have already been cancelled.
+pub fn emit_event(mut event: GpuEvent) -> bool {
+    let Some(sink) = GPU_EVENT_SINK.get() else {
+        return false;
+    };
+    let sink = sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(sender) = sink.as_ref() else {
+        return false;
+    };
+    let registered_waits = match register_queue_submission_waits(&mut event) {
+        Ok(ids) => ids,
+        Err(()) => {
+            eprintln!(
+                "[REMu][GPU] rejected queue submission: more than {GPU_WAIT_CAPACITY} memory waits are pending"
+            );
+            return false;
         }
+    };
+    GPU_EVENTS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    if sender.send(event).is_err() {
+        record_gpu_event_consumed();
+        gpu_wait_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel(&registered_waits);
+        false
+    } else {
+        true
     }
 }
 
@@ -814,8 +1115,12 @@ mod tests {
         decode_compute_launch, decode_compute_system_registers, emit_event,
         gpu_completed_submission_sequence, gpu_event_channel, gpu_events_in_flight, host_pad_state,
         install_event_sink, record_gpu_event_consumed, record_gpu_submission_completed,
-        report_audio_frames, set_host_pad_state,
+        record_gpu_wait_producer, report_audio_frames, set_host_pad_state,
+        take_gpu_completed_submission_ids, take_gpu_wait_latch,
     };
+    use std::sync::Mutex;
+
+    static EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
 
     #[test]
     fn gpu_event_channel_applies_bounded_backpressure() {
@@ -837,21 +1142,124 @@ mod tests {
 
     #[test]
     fn runtime_telemetry_tracks_gpu_queue_and_audio_callback_progress() {
+        let _event_guard = EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (sender, receiver) = gpu_event_channel();
         install_event_sink(sender);
-        emit_event(GpuEvent::Shutdown);
+        assert!(emit_event(GpuEvent::Shutdown));
         assert_eq!(gpu_events_in_flight(), 1);
         assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
         record_gpu_event_consumed();
         assert_eq!(gpu_events_in_flight(), 0);
 
-        record_gpu_submission_completed(7);
-        record_gpu_submission_completed(3);
-        assert_eq!(gpu_completed_submission_sequence(), 7);
+        record_gpu_submission_completed(2);
+        record_gpu_submission_completed(1);
+        assert_eq!(gpu_completed_submission_sequence(), 2);
+        assert_eq!(take_gpu_completed_submission_ids(), [1, 2]);
 
         report_audio_frames(480, 12);
         assert_eq!(audio_output_frames(), 480);
         assert_eq!(audio_underrun_frames(), 12);
+        clear_event_sink();
+    }
+
+    #[test]
+    fn queue_submission_registers_wait_before_presenter_ingress() {
+        let _event_guard = EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait = GpuMemoryWait {
+            address: 0x7000_2000,
+            reference: 1,
+            mask: u64::from(u32::MAX),
+            compare_function: 3,
+            is_64_bit: false,
+        };
+        let (sender, receiver) = gpu_event_channel();
+        install_event_sink(sender);
+
+        assert!(emit_event(GpuEvent::QueueSubmission {
+            queue_id: 7,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        }));
+        record_gpu_wait_producer(wait.address, false, 1);
+
+        let GpuEvent::QueueSubmission { queue_id, events } =
+            receiver.recv().expect("registered queue submission")
+        else {
+            panic!("queue submission wrapper was lost");
+        };
+        let [GpuEvent::RegisteredMemoryWait { id, wait: actual }] = events.as_slice() else {
+            panic!("submitted wait was not assigned an identity");
+        };
+        assert_eq!(queue_id, 7);
+        assert_eq!(*actual, wait);
+        assert_eq!(take_gpu_wait_latch(*id), Some(1));
+        assert_eq!(take_gpu_wait_latch(*id), None);
+        clear_event_sink();
+    }
+
+    #[test]
+    fn old_producer_does_not_satisfy_a_later_label_generation() {
+        let _event_guard = EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait = GpuMemoryWait {
+            address: 0x7000_2020,
+            reference: 1,
+            mask: u64::from(u32::MAX),
+            compare_function: 3,
+            is_64_bit: false,
+        };
+        let (sender, receiver) = gpu_event_channel();
+        install_event_sink(sender);
+        record_gpu_wait_producer(wait.address, false, 1);
+
+        assert!(emit_event(GpuEvent::QueueSubmission {
+            queue_id: 8,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        }));
+        let GpuEvent::QueueSubmission { events, .. } =
+            receiver.recv().expect("registered queue submission")
+        else {
+            panic!("queue submission wrapper was lost");
+        };
+        let [GpuEvent::RegisteredMemoryWait { id, .. }] = events.as_slice() else {
+            panic!("submitted wait was not assigned an identity");
+        };
+        assert_eq!(take_gpu_wait_latch(*id), None);
+        super::retire_gpu_wait(*id);
+        clear_event_sink();
+    }
+
+    #[test]
+    fn failed_queue_send_cancels_all_registered_waits() {
+        let _event_guard = EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wait = GpuMemoryWait {
+            address: 0x7000_2040,
+            reference: 1,
+            mask: u64::from(u32::MAX),
+            compare_function: 3,
+            is_64_bit: false,
+        };
+        let (sender, receiver) = gpu_event_channel();
+        drop(receiver);
+        install_event_sink(sender);
+
+        assert!(!emit_event(GpuEvent::QueueSubmission {
+            queue_id: 9,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        }));
+        assert!(
+            super::gpu_wait_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .waits
+                .is_empty()
+        );
         clear_event_sink();
     }
 
@@ -952,6 +1360,20 @@ mod tests {
             .expect("valid thread-dimension dispatch");
         assert_eq!(launch.grid, ComputeGrid::Threads([130, 3, 1]));
         assert_eq!(launch.group_count, [3, 3, 1]);
+    }
+
+    #[test]
+    fn decodes_zero_extent_dispatches_as_empty_work() {
+        let registers = compute_registers([64, 1, 1], [0; 3]);
+        let groups = decode_compute_launch([0, 8, 1], 0x8005, &registers)
+            .expect("zero group extent is an empty dispatch");
+        assert_eq!(groups.grid, ComputeGrid::Threadgroups([0, 8, 1]));
+        assert!(groups.is_empty());
+
+        let threads = decode_compute_launch([0, 8, 1], 0x8025, &registers)
+            .expect("zero thread extent is an empty dispatch");
+        assert_eq!(threads.grid, ComputeGrid::Threads([0, 8, 1]));
+        assert!(threads.is_empty());
     }
 
     #[test]

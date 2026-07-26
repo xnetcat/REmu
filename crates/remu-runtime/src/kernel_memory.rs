@@ -303,25 +303,30 @@ impl KernelMemory {
     ///
     /// GPU command decoding uses this snapshot to validate process-local copies without issuing a
     /// Mach VM read syscall for every small shader resource. Callers must refresh their snapshot
-    /// after changing a mapping or its protection.
+    /// after changing a mapping or its protection. Adjacent readable VMAs are one continuous host
+    /// virtual range for that purpose even when their guest query metadata or physical backing
+    /// offsets differ.
     pub fn readable_ranges(&self) -> Vec<(u64, u64)> {
-        self.virtual_memory
-            .vmas()
-            .into_iter()
-            .filter(|mapping| {
-                matches!(
-                    mapping.state,
-                    GuestVmaState::Anonymous | GuestVmaState::Shared
-                ) && mapping.protection.contains(GuestProtection::READ)
-            })
-            .filter_map(|mapping| {
-                mapping
-                    .start
-                    .get()
-                    .checked_add(mapping.size)
-                    .map(|end| (mapping.start.get(), end))
-            })
-            .collect()
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for mapping in self.virtual_memory.vmas().into_iter().filter(|mapping| {
+            matches!(
+                mapping.state,
+                GuestVmaState::Anonymous | GuestVmaState::Shared
+            ) && mapping.protection.contains(GuestProtection::READ)
+        }) {
+            let Some(end) = mapping.start.get().checked_add(mapping.size) else {
+                continue;
+            };
+            let start = mapping.start.get();
+            if let Some((_, previous_end)) = ranges.last_mut()
+                && *previous_end == start
+            {
+                *previous_end = end;
+            } else {
+                ranges.push((start, end));
+            }
+        }
+        ranges
     }
 
     pub fn allocate_direct(
@@ -683,6 +688,41 @@ mod tests {
         assert_eq!(mapping.kind, KernelVirtualMappingKind::Reserved);
     }
 
+    #[test]
+    fn protecting_a_reserved_virtual_range_commits_read_write_pages() {
+        let mut memory = KernelMemory::new().unwrap();
+        let reserved = memory
+            .reserve_virtual(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+            )
+            .unwrap();
+
+        memory.protect(reserved, GUEST_PAGE_SIZE, 0xf2).unwrap();
+        // SAFETY: protection 0xf2 includes the guest CPU read/write mode.
+        unsafe {
+            (reserved.get() as *mut u8).write_volatile(0x5a);
+            assert_eq!((reserved.get() as *const u8).read_volatile(), 0x5a);
+        }
+
+        assert_eq!(
+            memory.query(reserved, false),
+            Some(KernelVirtualMapping {
+                address: reserved,
+                size: GUEST_PAGE_SIZE,
+                direct_start: 0,
+                protection: 0xf2,
+                memory_type: 0,
+                kind: KernelVirtualMappingKind::Reserved,
+            })
+        );
+        assert_eq!(
+            memory.readable_ranges(),
+            vec![(reserved.get(), reserved.get() + GUEST_PAGE_SIZE)]
+        );
+    }
+
     /// A reservation exists so the guest can choose where a later mapping lands. Unreal's PS5
     /// allocator reserves one arena up front and then commits direct memory into it with
     /// `MAP_FIXED`; committing the reservation eagerly turns that second call into an overlap
@@ -864,6 +904,10 @@ mod tests {
         assert_eq!(second_query.address, second);
         assert_eq!(second_query.size, GUEST_PAGE_SIZE);
         assert_eq!(second_query.direct_start, GUEST_PAGE_SIZE);
+        assert_eq!(
+            memory.readable_ranges(),
+            vec![(first.get(), second.get() + GUEST_PAGE_SIZE)]
+        );
     }
 
     #[test]

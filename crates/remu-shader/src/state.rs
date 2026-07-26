@@ -62,6 +62,21 @@ pub fn build_shader_state(
     {
         count |= 0x20;
     }
+    // Recent Gen5 merged export blocks can leave the legacy USER_SGPR field at zero while still
+    // programming the GS user-data registers consumed by the shader. Preserve every explicitly
+    // programmed user scalar that the decoded program reads; otherwise valid table pointers such
+    // as s[14:15] are truncated before evaluation.
+    let programmed_input_count = program
+        .input_scalar_registers()
+        .iter()
+        .copied()
+        .filter_map(|register| register.checked_sub(user_data_scalar_register_base))
+        .filter(|offset| *offset < MAXIMUM_HARDWARE_USER_SGPRS)
+        .filter(|offset| register_value(user_data_base_register + *offset).is_some())
+        .max()
+        .and_then(|offset| offset.checked_add(1))
+        .unwrap_or_default();
+    count = count.max(programmed_input_count);
     if count > MAXIMUM_HARDWARE_USER_SGPRS {
         return Err(ShaderStateError::InvalidUserSgprCount { count });
     }
@@ -79,7 +94,7 @@ pub fn build_shader_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Instruction;
+    use crate::{Instruction, Opcode, Operand, ShaderEncoding};
 
     #[test]
     fn decodes_stage_specific_user_sgpr_count_bits() {
@@ -109,5 +124,38 @@ mod tests {
         })
         .expect("export user data");
         assert_eq!(state.user_data.len(), 7);
+    }
+
+    #[test]
+    fn retains_programmed_merged_export_inputs_when_resource_count_is_zero() {
+        let program = Arc::new(Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::from_static("SMovB64"),
+                words: vec![0],
+                sources: vec![Operand::scalar(14)],
+                destinations: vec![Operand::scalar(20)],
+                control: None,
+            }],
+        ));
+        let state =
+            build_shader_state(
+                program,
+                GS_USER_DATA_REGISTER,
+                8,
+                None,
+                |register| match register {
+                    0x08b => Some(0x008b_0000),
+                    0x092 => Some(0xa0e1_0c90),
+                    0x093 => Some(0x0000_0072),
+                    _ => None,
+                },
+            )
+            .expect("merged export user data");
+
+        assert_eq!(state.user_data.len(), 8);
+        assert_eq!(&state.user_data[6..], &[0xa0e1_0c90, 0x72]);
     }
 }

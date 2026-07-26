@@ -25,6 +25,7 @@ struct WatchedRange {
     id: u64,
     address: u64,
     byte_count: u64,
+    precise_tracking: bool,
     generation: AtomicU64,
     dirty: AtomicBool,
     retirement: AtomicU8,
@@ -82,12 +83,13 @@ struct SnapshotPage {
 
 struct WatchSnapshot {
     pages: Box<[SnapshotPage]>,
+    writable_ranges: Box<[(u64, u64)]>,
 }
 
 impl WatchSnapshot {
-    fn from_ranges(ranges: impl Iterator<Item = Arc<WatchedRange>>) -> Self {
+    fn from_state(state: &WatchState) -> Self {
         let mut pages = BTreeMap::<u64, Vec<PageOwner>>::new();
-        for range in ranges {
+        for range in state.ranges.values().filter(|range| range.precise_tracking) {
             let range_pointer = Arc::as_ptr(&range);
             for (page_index, page) in range.pages.iter().enumerate() {
                 pages.entry(page.address).or_default().push(PageOwner {
@@ -103,6 +105,11 @@ impl WatchSnapshot {
                     address,
                     owners: owners.into_boxed_slice(),
                 })
+                .collect(),
+            writable_ranges: state
+                .writable_ranges
+                .iter()
+                .map(|(&start, &end)| (start, end))
                 .collect(),
         }
     }
@@ -120,12 +127,26 @@ impl WatchSnapshot {
         }
         None
     }
+
+    fn contains_writable_page(&self, address: u64) -> bool {
+        let index = self
+            .writable_ranges
+            .partition_point(|&(start, _)| start <= address);
+        index != 0 && address < self.writable_ranges[index - 1].1
+    }
 }
 
 #[derive(Default)]
 struct WatchState {
     next_id: u64,
     ranges: BTreeMap<u64, Arc<WatchedRange>>,
+    /// Page-aligned live mappings whose last active watch was disarmed and removed.
+    ///
+    /// A protection fault can already be committed on another CPU when `mprotect(PROT_WRITE)`
+    /// returns. Retaining the mapping interval lets its delayed signal recover after the active
+    /// owner leaves the immutable snapshot. Guest mapping operations remove these intervals before
+    /// replacing or reprotecting the corresponding pages.
+    writable_ranges: BTreeMap<u64, u64>,
 }
 
 static WATCH_STATE: OnceLock<Mutex<WatchState>> = OnceLock::new();
@@ -214,6 +235,8 @@ impl CpuWriteWatch {
                 "CPU write watch page count does not fit this host",
             )
         })?;
+        let precise_tracking =
+            std::env::var_os("REMU_DISABLE_CPU_WRITE_WATCH").is_none_or(|value| value != "1");
         let mut pages = Vec::new();
         pages.try_reserve_exact(page_count).map_err(|error| {
             io::Error::new(
@@ -229,7 +252,9 @@ impl CpuWriteWatch {
             });
         }
 
-        install_fault_handlers()?;
+        if precise_tracking {
+            install_fault_handlers()?;
+        }
         let mut state = state()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -241,6 +266,7 @@ impl CpuWriteWatch {
             id: state.next_id,
             address,
             byte_count,
+            precise_tracking,
             generation: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             retirement: AtomicU8::new(WATCH_ACTIVE),
@@ -250,8 +276,9 @@ impl CpuWriteWatch {
         publish_snapshot(&state);
         if let Err(error) = arm_range(&range, &state) {
             state.ranges.remove(&range.id);
-            publish_snapshot(&state);
             restore_unowned_pages(&range, &state);
+            remember_writable_range(&mut state, &range);
+            publish_snapshot(&state);
             return Err(error);
         }
         Ok(Self { range })
@@ -270,6 +297,16 @@ impl CpuWriteWatch {
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.range.dirty.load(Ordering::Acquire)
+    }
+
+    /// Returns whether this watch uses page protection to observe exact CPU writes.
+    ///
+    /// `REMU_DISABLE_CPU_WRITE_WATCH=1` keeps mapping-lifetime validation active but assumes CPU
+    /// texture contents remain unchanged. This intentionally imprecise mode is only for debuggers
+    /// that intercept deliberate protection faults before the process handler can service them.
+    #[must_use]
+    pub fn precise_tracking(&self) -> bool {
+        self.range.precise_tracking
     }
 
     /// Returns the number of protected host pages faulted since this watch was created.
@@ -325,6 +362,24 @@ impl CpuWriteWatch {
         arm_range(&self.range, &state)
     }
 
+    /// Runs an operation while the watched guest mapping is pinned against replacement.
+    ///
+    /// Mapping mutation retires overlapping watches under the same registry lock before changing
+    /// host VM state. Holding that lock from the final retirement check through a GPU-to-CPU
+    /// writeback therefore prevents an unmap from opening a use-after-unmap window.
+    pub fn with_live_mapping<T>(&self, operation: impl FnOnce() -> T) -> io::Result<T> {
+        let state = state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_retired() || !state.ranges.contains_key(&self.range.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "CPU write-watch mapping is no longer live",
+            ));
+        }
+        Ok(operation())
+    }
+
     /// Returns whether the guest mapping underneath this watch was replaced or reprotected.
     #[must_use]
     pub fn is_retired(&self) -> bool {
@@ -376,6 +431,16 @@ fn retire_overlapping(address: u64, byte_count: u64, retirement: u8) -> Vec<Arc<
     let mut state = state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let page_size = HOST_PAGE_SIZE.load(Ordering::Acquire);
+    let (page_start, page_end) = if page_size == 0 {
+        (address, end)
+    } else {
+        (
+            align_down(address, page_size),
+            align_up(end, page_size).unwrap_or(u64::MAX),
+        )
+    };
+    let forgot_writable_range = forget_writable_range(&mut state, page_start, page_end);
     let retired_ids = state
         .ranges
         .iter()
@@ -385,6 +450,9 @@ fn retire_overlapping(address: u64, byte_count: u64, retirement: u8) -> Vec<Arc<
         })
         .collect::<Vec<_>>();
     if retired_ids.is_empty() {
+        if forgot_writable_range {
+            publish_snapshot(&state);
+        }
         return Vec::new();
     }
     let retired = retired_ids
@@ -397,10 +465,13 @@ fn retire_overlapping(address: u64, byte_count: u64, retirement: u8) -> Vec<Arc<
             page.armed.store(false, Ordering::Release);
         }
     }
-    publish_snapshot(&state);
+    // Keep the old snapshot published until every page is either writable or remains protected
+    // by an owner represented in the replacement snapshot. A guest store racing retirement can
+    // then be handled through the old snapshot instead of becoming an unowned protection fault.
     for range in &retired {
         restore_unowned_pages(range, &state);
     }
+    publish_snapshot(&state);
     retired
 }
 
@@ -417,13 +488,15 @@ impl Drop for CpuWriteWatch {
             .retirement
             .store(WATCH_REPLACED, Ordering::Release);
 
-        // Publish first. Once all pre-publication handlers leave, no handler can dereference this
-        // range, and the remaining snapshot completely describes who still owns each page.
-        publish_snapshot(&state);
         for page in &self.range.pages {
             page.armed.store(false, Ordering::Release);
         }
+        // Restore access while the old snapshot still pins this range. A racing guest store either
+        // observes a writable page or faults through a snapshot that proves the mapping is live.
+        // Pages owned by another armed watch stay protected and remain in the new snapshot.
         restore_unowned_pages(&self.range, &state);
+        remember_writable_range(&mut state, &self.range);
+        publish_snapshot(&state);
     }
 }
 
@@ -432,7 +505,7 @@ fn state() -> &'static Mutex<WatchState> {
 }
 
 fn publish_snapshot(state: &WatchState) {
-    let snapshot = Box::new(WatchSnapshot::from_ranges(state.ranges.values().cloned()));
+    let snapshot = Box::new(WatchSnapshot::from_state(state));
     let previous = WATCH_SNAPSHOT.swap(Box::into_raw(snapshot), Ordering::SeqCst);
 
     // A handler increments before loading the pointer. With sequential consistency, it therefore
@@ -447,7 +520,63 @@ fn publish_snapshot(state: &WatchState) {
     }
 }
 
+fn remember_writable_range(state: &mut WatchState, range: &WatchedRange) {
+    if !range.precise_tracking {
+        return;
+    }
+    let Some(first) = range.pages.first() else {
+        return;
+    };
+    let Some(last) = range.pages.last() else {
+        return;
+    };
+    let start = first.address;
+    let end = last.address.saturating_add(host_page_size_infallible());
+    let mut merged_start = start;
+    let mut merged_end = end;
+    let overlapping = state
+        .writable_ranges
+        .range(..=end)
+        .filter_map(|(&candidate_start, &candidate_end)| {
+            (candidate_end >= start).then_some((candidate_start, candidate_end))
+        })
+        .collect::<Vec<_>>();
+    for (candidate_start, candidate_end) in overlapping {
+        state.writable_ranges.remove(&candidate_start);
+        merged_start = merged_start.min(candidate_start);
+        merged_end = merged_end.max(candidate_end);
+    }
+    state.writable_ranges.insert(merged_start, merged_end);
+}
+
+fn forget_writable_range(state: &mut WatchState, start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    let overlapping = state
+        .writable_ranges
+        .range(..end)
+        .filter_map(|(&candidate_start, &candidate_end)| {
+            (candidate_end > start).then_some((candidate_start, candidate_end))
+        })
+        .collect::<Vec<_>>();
+    let changed = !overlapping.is_empty();
+    for (candidate_start, candidate_end) in overlapping {
+        state.writable_ranges.remove(&candidate_start);
+        if candidate_start < start {
+            state.writable_ranges.insert(candidate_start, start);
+        }
+        if end < candidate_end {
+            state.writable_ranges.insert(end, candidate_end);
+        }
+    }
+    changed
+}
+
 fn arm_range(range: &WatchedRange, state: &WatchState) -> io::Result<()> {
+    if !range.precise_tracking {
+        return Ok(());
+    }
     let mut changed = Vec::with_capacity(range.pages.len());
     for (index, page) in range.pages.iter().enumerate() {
         let was_dirty = page.dirty.swap(false, Ordering::AcqRel);
@@ -488,6 +617,9 @@ fn rollback_arm(range: &WatchedRange, state: &WatchState, changed: &[(usize, boo
 }
 
 fn restore_unowned_pages(range: &WatchedRange, state: &WatchState) {
+    if !range.precise_tracking {
+        return;
+    }
     for page in &range.pages {
         restore_page_if_unowned(page.address, state);
     }
@@ -635,14 +767,17 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
     let snapshot = unsafe { &*snapshot_pointer };
     let page_size = host_page_size_infallible();
     let page_address = align_down(fault_address, page_size);
-    let Some(page) = snapshot.page(page_address) else {
+    let page = snapshot.page(page_address);
+    if page.is_none() && !snapshot.contains_writable_page(page_address) {
         write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: page is not watched\n");
         return false;
-    };
-    let has_armed_owner = page.owners.iter().any(|owner| {
-        // SAFETY: the snapshot pins all range allocations referenced by its owners.
-        let range = unsafe { &*owner.range };
-        range.pages[owner.page_index].armed.load(Ordering::Acquire)
+    }
+    let has_armed_owner = page.is_some_and(|page| {
+        page.owners.iter().any(|owner| {
+            // SAFETY: the snapshot pins all range allocations referenced by its owners.
+            let range = unsafe { &*owner.range };
+            range.pages[owner.page_index].armed.load(Ordering::Acquire)
+        })
     });
 
     let Ok(address) = usize::try_from(page_address) else {
@@ -680,15 +815,18 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         RECOVERED_DISARMED_FAULTS.fetch_add(1, Ordering::Relaxed);
     }
 
-    for owner in &page.owners {
-        // SAFETY: the active snapshot pins the range, and page_index was produced from that range.
-        let range = unsafe { &*owner.range };
-        let watched_page = &range.pages[owner.page_index];
-        if watched_page.armed.swap(false, Ordering::AcqRel) {
-            range.generation.fetch_add(1, Ordering::AcqRel);
+    if let Some(page) = page {
+        for owner in &page.owners {
+            // SAFETY: the active snapshot pins the range, and page_index was produced from that
+            // range.
+            let range = unsafe { &*owner.range };
+            let watched_page = &range.pages[owner.page_index];
+            if watched_page.armed.swap(false, Ordering::AcqRel) {
+                range.generation.fetch_add(1, Ordering::AcqRel);
+            }
+            watched_page.dirty.store(true, Ordering::Release);
+            range.dirty.store(true, Ordering::Release);
         }
-        watched_page.dirty.store(true, Ordering::Release);
-        range.dirty.store(true, Ordering::Release);
     }
     true
 }
@@ -785,6 +923,7 @@ mod tests {
 
     impl Drop for TestMapping {
         fn drop(&mut self) {
+            CpuWriteWatch::retire_overlapping(self.address(), self.length as u64);
             // SAFETY: self owns this still-live mapping and all watches are dropped first by each
             // test's declaration/drop order.
             unsafe { libc::munmap(self.pointer.cast(), self.length) };
@@ -956,6 +1095,118 @@ mod tests {
         unsafe { mapping.write(0, 0x7f) };
         // SAFETY: the byte remains in the live test mapping.
         assert_eq!(unsafe { mapping.pointer.read_volatile() }, 0x7f);
+    }
+
+    #[test]
+    fn concurrent_writes_cannot_observe_an_unpublished_protected_page() {
+        let mapping = TestMapping::new(1);
+        let address = mapping.address() as usize;
+        let (write_sender, write_receiver) = std::sync::mpsc::sync_channel::<u8>(0);
+        let (done_sender, done_receiver) = std::sync::mpsc::sync_channel::<()>(0);
+        let writer = std::thread::spawn(move || {
+            while let Ok(value) = write_receiver.recv() {
+                // SAFETY: the owning test retains the mapping until this thread is joined. The
+                // write deliberately races watch destruction and must either fault through the
+                // still-published snapshot or observe restored write permission.
+                unsafe { (address as *mut u8).write_volatile(value) };
+                done_sender.send(()).unwrap();
+            }
+        });
+
+        for value in 0..=u8::MAX {
+            // SAFETY: the mapping remains live and writable throughout every watch lifecycle.
+            let watch = unsafe { CpuWriteWatch::new(mapping.address(), 128).unwrap() };
+            write_sender.send(value).unwrap();
+            drop(watch);
+            done_receiver.recv().unwrap();
+        }
+
+        drop(write_sender);
+        writer.join().unwrap();
+        let state = super::state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state
+                .writable_ranges
+                .range(..=mapping.address())
+                .next_back()
+                .is_some_and(|(_, &end)| mapping.address() < end)
+        );
+    }
+
+    #[test]
+    fn live_mapping_access_excludes_concurrent_retirement() {
+        let mapping = TestMapping::new(1);
+        // SAFETY: the complete page remains mapped until both scoped operations finish.
+        let watch = unsafe { CpuWriteWatch::new(mapping.address(), page_size() as u64).unwrap() };
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (retired_sender, retired_receiver) = std::sync::mpsc::channel();
+        let mapping_address = mapping.address();
+        let mapping_length = page_size() as u64;
+
+        std::thread::scope(|scope| {
+            let watch = &watch;
+            let access = scope.spawn(move || {
+                watch
+                    .with_live_mapping(|| {
+                        entered_sender.send(()).unwrap();
+                        release_receiver.recv().unwrap();
+                    })
+                    .unwrap();
+            });
+            entered_receiver.recv().unwrap();
+            let retirement = scope.spawn(move || {
+                CpuWriteWatch::retire_overlapping(mapping_address, mapping_length);
+                retired_sender.send(()).unwrap();
+            });
+
+            assert!(
+                retired_receiver
+                    .recv_timeout(std::time::Duration::from_millis(20))
+                    .is_err()
+            );
+            release_sender.send(()).unwrap();
+            retired_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            access.join().unwrap();
+            retirement.join().unwrap();
+        });
+        assert!(watch.is_retired());
+    }
+
+    #[test]
+    fn mapping_retirement_forgets_dormant_writable_pages() {
+        let mapping = TestMapping::new(1);
+        // SAFETY: the mapping remains live and writable through watch destruction.
+        let watch = unsafe { CpuWriteWatch::new(mapping.address(), 128).unwrap() };
+        drop(watch);
+        {
+            let state = super::state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                state
+                    .writable_ranges
+                    .range(..=mapping.address())
+                    .next_back()
+                    .is_some_and(|(_, &end)| mapping.address() < end)
+            );
+        }
+
+        CpuWriteWatch::retire_overlapping(mapping.address() + 1, 1);
+        let state = super::state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !state
+                .writable_ranges
+                .range(..=mapping.address())
+                .next_back()
+                .is_some_and(|(_, &end)| mapping.address() < end)
+        );
     }
 
     #[test]

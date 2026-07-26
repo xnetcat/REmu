@@ -5,6 +5,8 @@ mod agc_acb;
 mod agc_command_abi;
 mod agc_dcb;
 mod agc_driver;
+#[allow(dead_code)]
+mod agc_frontend;
 mod agc_register_defaults;
 mod agc_state;
 mod ampr;
@@ -35,6 +37,9 @@ use remu_loader::{
     DynamicInfo, Elf64Rela, Elf64Symbol, ImportedSymbol, InspectError, LoadedExecutable,
     ModuleDependencyGraphError, UnresolvedModuleDependency, resolve_module_dependency_graph,
 };
+
+#[cfg(test)]
+static GPU_EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
 #[cfg(target_os = "macos")]
 use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapCoalescing, GuestMapPlacement};
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage, MappingError};
@@ -266,11 +271,17 @@ pub enum LinkError {
 }
 
 fn discover_runtime_module_paths(app_root: &Path) -> Result<Vec<PathBuf>, LinkError> {
-    let root = app_root.join("decrypted/Media/Plugins");
-    if !root.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut pending = vec![root];
+    // Unreal plug-ins are commonly unpacked under Media/Plugins, while Wwise titles such as
+    // Silent Hill keep load-on-demand effect modules directly in /app0/prx. Both sets must be
+    // mapped up front because the process image is finalized before sceKernelLoadStartModule can
+    // ask to start one of them.
+    let mut pending = [
+        app_root.join("decrypted/Media/Plugins"),
+        app_root.join("prx"),
+    ]
+    .into_iter()
+    .filter(|root| root.is_dir())
+    .collect::<Vec<_>>();
     let mut modules = Vec::new();
     while let Some(directory) = pending.pop() {
         let entries = std::fs::read_dir(&directory)
@@ -2604,6 +2615,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "hdTyRzCXQeQ" => "sceAvPlayerStreamCount",
         "rPo6tV8D9bM" => "sceSystemServiceGetStatus",
         "fZo48un7LK4" => "sceSystemServiceParamGetInt",
+        "3RQ5aQfnstU" => "sceSystemServiceGetNoticeScreenSkipFlag",
         "Vo5V8KAwCmk" => "sceSystemServiceHideSplashScreen",
         "uoUpLGNkygk" => "sceCommonDialogInitialize",
         "ERKzksauAJA" => "sceSaveDataDialogGetStatus",
@@ -2640,6 +2652,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "JK2wamZPzwM" => "sceAudioOut2PortCreate",
         "PE2zHMqLSHs" => "sceAudioOut2ContextAdvance",
         "aII9h5nli9U" => "sceAudioOut2ContextPush",
+        "XHl38ZNknbs" => "sceAudioOut2MasteringInit",
+        "v8iOE+j8a5o" => "sceAudioOut2MasteringSetParam",
         "cd+Rtw+D1x8" => "sceAudioOut2PortDestroy",
         "g2tViFIohHE" => "sceAudioOut2Initialize",
         "R7d0F1g2qsU" => "sceAudioOut2ContextGetQueueLevel",
@@ -2811,7 +2825,6 @@ struct ProbeDispatchState {
     pthread_attributes: BTreeMap<u64, PthreadAttrObject>,
     pthread_mutex_attributes: BTreeMap<u64, PthreadMutexAttrObject>,
     pthread_condition_attributes: BTreeSet<u64>,
-    next_pthread_key: u32,
     pthread_keys: BTreeMap<u32, u64>,
     ampr_files: BTreeMap<u32, PathBuf>,
     ampr_file_handles: BTreeMap<u32, std::fs::File>,
@@ -2863,6 +2876,7 @@ struct ProbeDispatchState {
     kernel_event_registrations: BTreeMap<(u64, i16, u64), u64>,
     pending_events: VecDeque<KernelQueuedEvent>,
     pending_agc_completions: VecDeque<u64>,
+    pending_agc_user_interrupts: VecDeque<u64>,
     save_root: PathBuf,
     save_data_initialized: bool,
     save_mounts: BTreeMap<String, SaveDataMount>,
@@ -3747,6 +3761,7 @@ struct AgcGraphicsState {
     context_registers: BTreeMap<u32, u32>,
     shader_registers: BTreeMap<u32, u32>,
     user_config_registers: BTreeMap<u32, u32>,
+    predicate_skip: bool,
     index_buffer_address: u64,
     index_resource_address: u64,
     index_buffer_count: u32,
@@ -3771,6 +3786,7 @@ struct AgcGraphicsState {
 #[derive(Debug, Default)]
 struct AgcShaderRegistry {
     headers: BTreeMap<u64, u64>,
+    code_sizes: BTreeMap<u64, u32>,
     snapshots: BTreeMap<u64, remu_gpu::ShaderSnapshot>,
     decode_failures: BTreeSet<u64>,
 }
@@ -3780,6 +3796,7 @@ impl AgcGraphicsState {
         self.context_registers.clear();
         self.shader_registers.clear();
         self.user_config_registers.clear();
+        self.predicate_skip = false;
         self.index_buffer_address = 0;
         self.index_resource_address = 0;
         self.index_buffer_count = 0;
@@ -3828,10 +3845,32 @@ static GUEST_EXCEPTION_DELIVERY: OnceLock<Mutex<GuestExceptionDeliveryState>> = 
 #[derive(Debug, Default)]
 struct AudioOut2State {
     next_handle: u64,
-    contexts: BTreeSet<u64>,
+    contexts: BTreeMap<u64, AudioOut2ContextState>,
     users: BTreeSet<u64>,
-    ports: BTreeMap<u64, AudioOut2PortState>,
+    ports: BTreeMap<u64, AudioOut2PortRuntimeState>,
+    mastering_parameters: u64,
+    user_creates: u64,
+    user_destroys: u64,
+    port_creates: u64,
+    port_destroys: u64,
+    queue_level_queries: u64,
+    speaker_queries: u64,
     attribute_updates: u64,
+    port_state_queries: u64,
+    context_advances: u64,
+    context_pushes: u64,
+    #[cfg(test)]
+    submitted_pcm: Vec<(u64, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AudioOut2ContextState {
+    queue_depth: u32,
+    grain_frames: u32,
+    queued: u32,
+    last_queue_update: Instant,
+    memory_address: u64,
+    memory_size: u64,
 }
 
 #[derive(Debug)]
@@ -3935,18 +3974,422 @@ impl KernelDirectory {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct AudioOut2PortState {
+struct AudioOut2PortRuntimeState {
     context: u64,
-    backend_handle: u64,
+    backend_handle: Option<u64>,
     buffer_address: u64,
+    channel_count: u8,
+    gains: [f32; 8],
+    parameter: SceAudioOut2PortParam,
 }
 
-const AUDIO_OUT2_MIX_QUANTUM_FRAMES: u64 = 0x100;
-/// Blocks a port accepts before the guest must wait. REmu drains each push immediately.
-const AUDIO_OUT2_QUEUE_DEPTH: u32 = 8;
-const AUDIO_OUT2_PORT_STATE_SIZE: u64 = 0x20;
-const AUDIO_OUT2_SPEAKER_INFO_SIZE: u64 = 0x10;
-const AUDIO_OUT2_FLOAT_SURROUND_FORMAT: u64 = 5;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SceAudioOut2ContextParam {
+    max_ports: u32,
+    max_object_ports: u32,
+    guarantee_object_ports: u32,
+    queue_depth: u32,
+    num_grains: u32,
+    flags: u32,
+    reserved: [u32; 10],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SceAudioOut2PortParam {
+    port_type: u16,
+    pad: u16,
+    data_format: u32,
+    sampling_frequency: u32,
+    flags: u32,
+    user_handle: u64,
+    reserved: [u32; 10],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SceAudioOut2Attribute {
+    attribute_id: u32,
+    reserved: i32,
+    value: u64,
+    value_size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SceAudioOut2Pcm {
+    data: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SceAudioOut2PortState {
+    output: u16,
+    num_channels: u8,
+    pad1: u8,
+    volume: i16,
+    reroute_counter: u16,
+    flags: u32,
+    pad2: u32,
+    reserved: [u64; 6],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<SceAudioOut2ContextParam>() == 0x40);
+    assert!(std::mem::offset_of!(SceAudioOut2ContextParam, max_ports) == 0x00);
+    assert!(std::mem::offset_of!(SceAudioOut2ContextParam, max_object_ports) == 0x04);
+    assert!(std::mem::offset_of!(SceAudioOut2ContextParam, guarantee_object_ports) == 0x08);
+    assert!(std::mem::offset_of!(SceAudioOut2ContextParam, queue_depth) == 0x0c);
+    assert!(std::mem::offset_of!(SceAudioOut2ContextParam, num_grains) == 0x10);
+    assert!(std::mem::offset_of!(SceAudioOut2ContextParam, flags) == 0x14);
+
+    assert!(std::mem::size_of::<SceAudioOut2PortParam>() == 0x40);
+    assert!(std::mem::offset_of!(SceAudioOut2PortParam, port_type) == 0x00);
+    assert!(std::mem::offset_of!(SceAudioOut2PortParam, data_format) == 0x04);
+    assert!(std::mem::offset_of!(SceAudioOut2PortParam, sampling_frequency) == 0x08);
+    assert!(std::mem::offset_of!(SceAudioOut2PortParam, flags) == 0x0c);
+    assert!(std::mem::offset_of!(SceAudioOut2PortParam, user_handle) == 0x10);
+
+    assert!(std::mem::size_of::<SceAudioOut2Attribute>() == 0x18);
+    assert!(std::mem::offset_of!(SceAudioOut2Attribute, attribute_id) == 0x00);
+    assert!(std::mem::offset_of!(SceAudioOut2Attribute, reserved) == 0x04);
+    assert!(std::mem::offset_of!(SceAudioOut2Attribute, value) == 0x08);
+    assert!(std::mem::offset_of!(SceAudioOut2Attribute, value_size) == 0x10);
+
+    assert!(std::mem::size_of::<SceAudioOut2Pcm>() == 0x08);
+    assert!(std::mem::offset_of!(SceAudioOut2Pcm, data) == 0x00);
+
+    assert!(std::mem::size_of::<SceAudioOut2PortState>() == 0x40);
+    assert!(std::mem::offset_of!(SceAudioOut2PortState, output) == 0x00);
+    assert!(std::mem::offset_of!(SceAudioOut2PortState, num_channels) == 0x02);
+    assert!(std::mem::offset_of!(SceAudioOut2PortState, volume) == 0x04);
+    assert!(std::mem::offset_of!(SceAudioOut2PortState, reroute_counter) == 0x06);
+    assert!(std::mem::offset_of!(SceAudioOut2PortState, flags) == 0x08);
+    assert!(std::mem::offset_of!(SceAudioOut2PortState, reserved) == 0x10);
+};
+
+const AUDIO_OUT2_CONTEXT_PARAM_SIZE: u64 = std::mem::size_of::<SceAudioOut2ContextParam>() as u64;
+// `sceAudioOut2ContextQueryMemory` writes one `size_t`. Silent Hill's Wwise wrapper places that
+// qword immediately before its 0x40-byte context parameter and reads it back as the allocation
+// size after the call. SharpEmu currently writes a larger private memory-info guess here, but doing
+// that overwrites the live parameter in this shipped caller.
+const AUDIO_OUT2_CONTEXT_MEMORY_BASE_SIZE: u64 = 0x1_0000;
+const AUDIO_OUT2_CONTEXT_MEMORY_QUEUE_STRIDE: u64 = 0x590;
+const AUDIO_OUT2_DEFAULT_QUEUE_DEPTH: u32 = 4;
+const AUDIO_OUT2_DEFAULT_GRAIN_FRAMES: u32 = 0x200;
+const AUDIO_OUT2_MAX_QUEUE_DEPTH: u32 = 64;
+/// Bytes one `SceAudioOut2PortState` occupies.
+///
+/// Silent Hill has two call sites that reserve and consume the full 0x40 bytes. One copies the
+/// result into a long-lived Wwise object with two 32-byte vector loads, so leaving the upper half
+/// untouched launders stale stack data into live device state.
+const AUDIO_OUT2_PORT_STATE_SIZE: u64 = std::mem::size_of::<SceAudioOut2PortState>() as u64;
+/// Bytes one `SceAudioOut2SpeakerInfo` occupies.
+///
+/// The Wwise caller reserves exactly 0x40 bytes at `rbp - 0x80`. Clearing the previous 0x50-byte
+/// guess overwrote the next sixteen bytes of its stack frame.
+const AUDIO_OUT2_SPEAKER_INFO_SIZE: u64 = 0x40;
+const AUDIO_OUT2_PORT_TYPE_VIBRATION: u16 = 6;
+const SCE_AUDIO_OUT2_ERROR_NOT_READY: u32 = 0x8026_8008;
+
+const fn decode_audio_out2_channel_format(format: u32) -> Option<(u8, u64)> {
+    match format {
+        // AudioOut2's create descriptor encodes the channel count in this format word. Map it to
+        // the corresponding floating-point ordinary AudioOut format used by the host mixer.
+        0x100 => Some((1, 3)),
+        0x200 => Some((2, 4)),
+        0x880 => Some((8, 5)),
+        _ => None,
+    }
+}
+
+fn read_audio_out2_context_param(address: u64) -> SceAudioOut2ContextParam {
+    // SAFETY: callers validate a complete readable 0x40-byte parameter object first.
+    unsafe { std::ptr::read_unaligned(address as *const SceAudioOut2ContextParam) }
+}
+
+fn read_audio_out2_port_param(address: u64) -> SceAudioOut2PortParam {
+    // SAFETY: callers validate a complete readable 0x40-byte parameter object first.
+    unsafe { std::ptr::read_unaligned(address as *const SceAudioOut2PortParam) }
+}
+
+fn decode_audio_out2_attribute(address: u64) -> SceAudioOut2Attribute {
+    // SAFETY: callers validate the complete attribute array before decoding an entry.
+    unsafe { std::ptr::read_unaligned(address as *const SceAudioOut2Attribute) }
+}
+
+fn write_audio_out2_context_param(address: u64, parameter: SceAudioOut2ContextParam) {
+    // SAFETY: callers validate one complete writable context-parameter object first.
+    unsafe {
+        std::ptr::write_unaligned(address as *mut SceAudioOut2ContextParam, parameter);
+    }
+}
+
+fn write_audio_out2_port_state(address: u64, port_state: SceAudioOut2PortState) {
+    // SAFETY: callers validate one complete writable port-state object first.
+    unsafe {
+        std::ptr::write_unaligned(address as *mut SceAudioOut2PortState, port_state);
+    }
+}
+
+fn audio_out2_grain_duration(grain_frames: u32) -> Duration {
+    Duration::from_nanos(u64::from(grain_frames) * 1_000_000_000 / 48_000)
+}
+
+fn audio_out2_update_context_queue(context: &mut AudioOut2ContextState, now: Instant) {
+    if context.queued == 0 {
+        context.last_queue_update = now;
+        return;
+    }
+    let grain_duration = audio_out2_grain_duration(context.grain_frames);
+    let elapsed = now.saturating_duration_since(context.last_queue_update);
+    let drained = u32::try_from(
+        (elapsed.as_nanos() / grain_duration.as_nanos()).min(u128::from(context.queued)),
+    )
+    .expect("the drained AudioOut2 queue count is bounded by u32");
+    if drained == 0 {
+        return;
+    }
+    context.queued -= drained;
+    context.last_queue_update += grain_duration
+        .checked_mul(drained)
+        .expect("a bounded AudioOut2 queue duration cannot overflow");
+    if context.queued == 0 {
+        context.last_queue_update = now;
+    }
+}
+
+fn audio_out2_queue_wait_duration(context: &AudioOut2ContextState, now: Instant) -> Duration {
+    let grain_duration = audio_out2_grain_duration(context.grain_frames);
+    grain_duration.saturating_sub(now.saturating_duration_since(context.last_queue_update))
+}
+
+fn trace_audio_out2_memory() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_AUDIO2_MEMORY").is_some_and(|value| value == "1")
+    })
+}
+
+fn trace_audio_out2_context_memory(context: AudioOut2ContextState, push: u64, channels: &[u8]) {
+    const PAGE_SIZE: u64 = 0x1000;
+    const MAX_POINTERS: usize = 24;
+    let Ok(memory_size) = usize::try_from(context.memory_size) else {
+        return;
+    };
+    if memory_size == 0
+        || memory_size > 0x20_0000
+        || !process_guest_range_is_readable(context.memory_address, memory_size)
+    {
+        eprintln!(
+            "[REMu][AUDIO2-MEM] push={push} unreadable context={:#x}+{:#x}",
+            context.memory_address, context.memory_size
+        );
+        return;
+    }
+
+    let mut pages = Vec::new();
+    let mut pointers = Vec::new();
+    let mut page_offset = 0;
+    while page_offset < context.memory_size {
+        let page_bytes = (context.memory_size - page_offset).min(PAGE_SIZE);
+        let qwords = page_bytes / 8;
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        let mut nonzero = 0_u64;
+        let mut float_samples = 0_u64;
+        let mut live_float_samples = 0_u64;
+        for index in 0..qwords {
+            let offset = page_offset + index * 8;
+            let value = read_guest_u64(context.memory_address + offset);
+            hash ^= value;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+            nonzero += u64::from(value != 0);
+            for bits in [value as u32, (value >> 32) as u32] {
+                let sample = f32::from_bits(bits);
+                if sample.is_finite() && sample.abs() <= 2.0 {
+                    float_samples += 1;
+                    live_float_samples += u64::from(sample.abs() >= f32::MIN_POSITIVE);
+                }
+            }
+            if pointers.len() < MAX_POINTERS
+                && value & 3 == 0
+                && value != context.memory_address
+                && process_guest_range_is_readable(value, 128)
+                && !pointers
+                    .iter()
+                    .any(|(_, candidate): &(u64, u64)| *candidate == value)
+            {
+                pointers.push((offset, value));
+            }
+        }
+        if nonzero != 0 {
+            pages.push(format!(
+                "{page_offset:#x}:nz={nonzero}/{qwords},f={live_float_samples}/{float_samples},h={hash:016x}"
+            ));
+        }
+        page_offset += page_bytes;
+    }
+
+    let pointers = pointers
+        .into_iter()
+        .map(|(offset, address)| {
+            let mut live_float_samples = 0_u32;
+            let mut peak = 0.0_f32;
+            for index in 0..16_u64 {
+                let value = read_guest_u64(address + index * 8);
+                for bits in [value as u32, (value >> 32) as u32] {
+                    let sample = f32::from_bits(bits);
+                    if sample.is_finite() && sample.abs() <= 2.0 {
+                        live_float_samples += u32::from(sample.abs() >= f32::MIN_POSITIVE);
+                        peak = peak.max(sample.abs());
+                    }
+                }
+            }
+            format!("{offset:#x}->{address:#x}(live-f32={live_float_samples}/32,peak={peak:.3})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[REMu][AUDIO2-MEM] push={push} context={:#x}+{:#x} channels={channels:?} pages=[{}] pointers=[{pointers}]",
+        context.memory_address,
+        context.memory_size,
+        pages.join(","),
+    );
+}
+
+fn trace_audio_out2_mastering_memory(parameters: u64, push: u64) {
+    const MASTERING_OBJECT_PREFIX: u64 = 0x5b8;
+    const MASTERING_OBJECT_SIZE: usize = 0x800;
+    const TARGET_SAMPLE_SIZES: [usize; 3] = [0x4000, 0x2000, 0x1000];
+    const MAX_TARGETS: usize = 48;
+    const SECOND_LEVEL_SCAN_SIZES: [usize; 3] = [0x1_0000, 0x8000, 0x4000];
+    const MAX_SECOND_LEVEL_TARGETS: usize = 64;
+
+    let Some(object) = parameters.checked_sub(MASTERING_OBJECT_PREFIX) else {
+        return;
+    };
+    if parameters == 0 || !process_guest_range_is_readable(object, MASTERING_OBJECT_SIZE) {
+        eprintln!(
+            "[REMu][AUDIO2-MASTER] push={push} unreadable parameters={parameters:#x} object={object:#x}"
+        );
+        return;
+    }
+
+    let mut targets = Vec::new();
+    for offset in (0..MASTERING_OBJECT_SIZE).step_by(size_of::<u64>()) {
+        let address = read_guest_u64(object + offset as u64);
+        let sample_bytes = TARGET_SAMPLE_SIZES
+            .into_iter()
+            .find(|sample_bytes| process_guest_range_is_readable(address, *sample_bytes));
+        if address & 3 != 0
+            || sample_bytes.is_none()
+            || targets
+                .iter()
+                .any(|(_, candidate, _, _, _, _)| *candidate == address)
+        {
+            continue;
+        }
+        let sample_bytes = sample_bytes.unwrap();
+        let mut live_samples = 0_u32;
+        let mut peak = 0.0_f32;
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for index in 0..sample_bytes / size_of::<u32>() {
+            let bits = read_guest_u32(address + (index * size_of::<u32>()) as u64);
+            hash ^= u64::from(bits);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+            let sample = f32::from_bits(bits);
+            if sample.is_finite() && (1.0e-8..=8.0).contains(&sample.abs()) {
+                live_samples = live_samples.saturating_add(1);
+                peak = peak.max(sample.abs());
+            }
+        }
+        targets.push((offset, address, sample_bytes, live_samples, peak, hash));
+        if targets.len() == MAX_TARGETS {
+            break;
+        }
+    }
+    let formatted_targets = targets
+        .iter()
+        .map(|(offset, address, sample_bytes, live_samples, peak, hash)| {
+            format!(
+                "{offset:#x}->{address:#x}(bytes={sample_bytes:#x},live-f32={live_samples}/{},peak={peak:.3},h={hash:016x})",
+                sample_bytes / size_of::<u32>(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[REMu][AUDIO2-MASTER] push={push} parameters={parameters:#x} object={object:#x} targets=[{formatted_targets}]"
+    );
+
+    let mut second_level_targets = Vec::new();
+    for (parent_offset, parent, _, _, _, _) in &targets {
+        let Some(scan_bytes) = SECOND_LEVEL_SCAN_SIZES
+            .into_iter()
+            .find(|scan_bytes| process_guest_range_is_readable(*parent, *scan_bytes))
+        else {
+            continue;
+        };
+        for child_offset in (0..scan_bytes).step_by(size_of::<u64>()) {
+            let address = read_guest_u64(*parent + child_offset as u64);
+            let sample_bytes = TARGET_SAMPLE_SIZES
+                .into_iter()
+                .find(|sample_bytes| process_guest_range_is_readable(address, *sample_bytes));
+            if address & 3 != 0
+                || address == object
+                || address == *parent
+                || sample_bytes.is_none()
+                || second_level_targets
+                    .iter()
+                    .any(|(_, _, candidate, _, _, _, _)| *candidate == address)
+            {
+                continue;
+            }
+            let sample_bytes = sample_bytes.unwrap();
+            let mut live_samples = 0_u32;
+            let mut peak = 0.0_f32;
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            for index in 0..sample_bytes / size_of::<u32>() {
+                let bits = read_guest_u32(address + (index * size_of::<u32>()) as u64);
+                hash ^= u64::from(bits);
+                hash = hash.wrapping_mul(0x1000_0000_01b3);
+                let sample = f32::from_bits(bits);
+                if sample.is_finite() && (1.0e-8..=8.0).contains(&sample.abs()) {
+                    live_samples = live_samples.saturating_add(1);
+                    peak = peak.max(sample.abs());
+                }
+            }
+            second_level_targets.push((
+                *parent_offset,
+                child_offset,
+                address,
+                sample_bytes,
+                live_samples,
+                peak,
+                hash,
+            ));
+        }
+    }
+    second_level_targets
+        .sort_unstable_by_key(|(_, _, _, _, live_samples, _, _)| std::cmp::Reverse(*live_samples));
+    second_level_targets.truncate(MAX_SECOND_LEVEL_TARGETS);
+    let second_level_targets = second_level_targets
+        .into_iter()
+        .map(
+            |(parent_offset, child_offset, address, sample_bytes, live_samples, peak, hash)| {
+                format!(
+                    "{parent_offset:#x}+{child_offset:#x}->{address:#x}(bytes={sample_bytes:#x},live-f32={live_samples}/{},peak={peak:.3},h={hash:016x})",
+                    sample_bytes / size_of::<u32>(),
+                )
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[REMu][AUDIO2-MASTER2] push={push} parameters={parameters:#x} object={object:#x} targets=[{second_level_targets}]"
+    );
+}
 
 impl AudioOut2State {
     fn allocate_handle(&mut self) -> u64 {
@@ -4157,6 +4600,7 @@ impl GuestSyncState {
 #[derive(Debug)]
 struct GuestMutexState {
     owner: Option<ThreadId>,
+    owner_guest_thread: u64,
     recursion: u32,
     mutex_type: i32,
     waiters: u32,
@@ -4181,6 +4625,7 @@ impl Default for GuestMutexState {
         let attributes = PthreadMutexAttrState::default();
         Self {
             owner: None,
+            owner_guest_thread: 0,
             recursion: 0,
             mutex_type: attributes.mutex_type,
             waiters: 0,
@@ -4204,6 +4649,9 @@ struct GuestEventFlagState {
 }
 
 static GUEST_SYNC: OnceLock<(Mutex<GuestSyncState>, Condvar)> = OnceLock::new();
+static EVENT_FLAG_WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static EVENT_FLAG_SET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static MUTEX_CONTENTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const GUEST_MUTEX_SHARD_COUNT: usize = 64;
 static GUEST_MUTEX_SHARDS: OnceLock<
     [Mutex<HashMap<u64, Arc<GuestMutexEntry>>>; GUEST_MUTEX_SHARD_COUNT],
@@ -4488,6 +4936,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         guest_free(object.handle);
     }
     state.pthread_condition_attributes.clear();
+    state.pthread_keys.clear();
+    GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
     state.exit_callbacks.clear();
     state.process_param_address = image.process_param.map_or(0, GuestAddress::get);
     state.thread_atexit_count_callback = 0;
@@ -4555,6 +5005,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.kernel_event_registrations.clear();
     state.pending_events.clear();
     state.pending_agc_completions.clear();
+    state.pending_agc_user_interrupts.clear();
     *KERNEL_FILES
         .get_or_init(|| Mutex::new(KernelFileState::default()))
         .lock()
@@ -5076,6 +5527,8 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             | "8XTArSPyWHk"
             | "PE2zHMqLSHs"
             | "aII9h5nli9U"
+            | "XHl38ZNknbs"
+            | "v8iOE+j8a5o"
     ) {
         return ProbeImportReturn::integer(dispatch_audio_out_import(nid, call_args));
     }
@@ -5186,6 +5639,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             set_current_guest_thread_name(trace_name.clone());
             set_current_guest_thread_pointer(guest_tls.thread_pointer);
             let result = run_guest_thread(entry, thread_argument);
+            run_guest_thread_destructors();
             set_current_guest_thread_pointer(0);
             set_current_guest_thread_handle(0);
             drop(guest_tls);
@@ -5302,6 +5756,8 @@ fn dispatch_audio_out_import(nid: &str, arguments: [u64; 6]) -> u64 {
             | "8XTArSPyWHk"
             | "PE2zHMqLSHs"
             | "aII9h5nli9U"
+            | "XHl38ZNknbs"
+            | "v8iOE+j8a5o"
     ) {
         if nid == "g2tViFIohHE" {
             AUDIO_OUT
@@ -5364,8 +5820,16 @@ fn guest_output_pointer(address: u64, size: usize) -> Option<u64> {
 /// selector rather than the output buffer. Writing through a small integer corrupts whatever the
 /// host has mapped there, so a value that cannot be a guest address is refused and reported once
 /// with the whole argument list, which is what identifies the real signature.
-fn audio_out2_output_pointer(nid: &str, arguments: [u64; 6], candidate: u64) -> Option<u64> {
-    if process_guest_range_is_readable(candidate, 32) {
+fn audio_out2_output_pointer(
+    nid: &str,
+    arguments: [u64; 6],
+    candidate: u64,
+    size: u64,
+) -> Option<u64> {
+    let Ok(size) = usize::try_from(size) else {
+        return None;
+    };
+    if process_guest_range_is_readable(candidate, size) {
         return Some(candidate);
     }
     static REPORTED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
@@ -5393,54 +5857,203 @@ fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
             eprintln!("[REMu][AUDIO2] initialized parameter={:#x}", arguments[0]);
             0
         }
-        // The mixer drains every pushed block before returning, so no audio is ever queued behind
-        // the port. Reporting an empty queue keeps the guest supplying the next block instead of
-        // waiting for space that is already free.
-        // The queue level is reported through the third argument; the first two select the
-        // context and port.
-        "R7d0F1g2qsU" => {
-            let Some(level) = audio_out2_output_pointer(nid, arguments, arguments[2]) else {
-                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-            };
-            write_guest_u32(level, 0);
+        // Audio middleware treats mastering as a required second initialization stage. The
+        // mastering graph itself does not change the interleaved blocks REmu sends to the host,
+        // but rejecting this call makes the middleware tear down and recreate every user and
+        // port without ever pushing a block.
+        "XHl38ZNknbs" => {
+            eprintln!(
+                "[REMu][AUDIO2] initialized mastering config={:#x} state={:#x}",
+                arguments[2], arguments[5]
+            );
             0
+        }
+        // The host mixer consumes the already-mastered interleaved result. Accept graph parameter
+        // updates so middleware can finish constructing that graph instead of entering its
+        // teardown-and-retry path.
+        "v8iOE+j8a5o" => {
+            // Wwise embeds this parameter block 0x5b8 bytes into its mastering device object.
+            // Retaining its address lets the opt-in memory diagnostic follow the large float
+            // buffers owned by that object at the same instants ContextPush submits a grain.
+            if arguments[0] != 0 && process_guest_range_is_readable(arguments[0], size_of::<u64>())
+            {
+                state.mastering_parameters = arguments[0];
+            }
+            0
+        }
+        // The ABI has two optional u32 outputs. Initial setup supplies both, while Wwise's live
+        // device poll supplies only the second argument and deliberately leaves the third null.
+        // Treating that valid poll as an error makes Wwise report a lost output device and rebuild
+        // its entire graph on every watchdog interval.
+        "R7d0F1g2qsU" => {
+            let (queued, available, queue_depth, poll_backoff) = {
+                let now = Instant::now();
+                let Some(context) = state.contexts.get_mut(&arguments[0]) else {
+                    return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                };
+                audio_out2_update_context_queue(context, now);
+                let available = context.queue_depth.saturating_sub(context.queued);
+                // Wwise polls only the available-slot output in a tight loop while the hardware
+                // queue is full. A real syscall and device query naturally yield enough CPU for
+                // the mixer thread to submit the next grain; an in-process HLE call can otherwise
+                // execute tens of millions of polls per second and contend on this state mutex.
+                // A bounded host scheduling backoff preserves the reported zero level while
+                // releasing the mutex and keeps the polling thread from starving the producer.
+                let poll_backoff =
+                    (arguments[1] == 0 && arguments[2] != 0 && available == 0).then(|| {
+                        audio_out2_queue_wait_duration(context, now).min(Duration::from_millis(1))
+                    });
+                (context.queued, available, context.queue_depth, poll_backoff)
+            };
+            let mut result = 0;
+            for (level, value) in [(arguments[1], queued), (arguments[2], available)] {
+                if level == 0 {
+                    continue;
+                }
+                let Some(level) = guest_output_pointer(level, size_of::<u32>()) else {
+                    result = sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                    break;
+                };
+                write_guest_u32(level, value);
+            }
+            state.queue_level_queries = state.queue_level_queries.saturating_add(1);
+            let query = state.queue_level_queries;
+            if query <= 64 || query.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] queue level query={query} context={} queued={queued}/{}, available={available} outputs={:#x},{:#x} result={result:#x} args={:#x},{:#x},{:#x}",
+                    arguments[0],
+                    queue_depth,
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
+                    arguments[5],
+                );
+            }
+            drop(state);
+            if let Some(backoff) = poll_backoff
+                && !backoff.is_zero()
+            {
+                std::thread::sleep(backoff);
+            }
+            result
         }
         "gatEUKG+Ea4" => {
-            let Some(state) = audio_out2_output_pointer(nid, arguments, arguments[1]) else {
+            let Some(output) =
+                audio_out2_output_pointer(nid, arguments, arguments[1], AUDIO_OUT2_PORT_STATE_SIZE)
+            else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
             };
-            // SceAudioOut2PortState: the queue counters lead the structure and the remaining
-            // fields describe volume and reroute state REmu does not alter.
-            guest_memset(state, 0, AUDIO_OUT2_PORT_STATE_SIZE);
-            write_guest_u32(state + 4, AUDIO_OUT2_QUEUE_DEPTH);
+            let port_exists = state.ports.contains_key(&arguments[0]);
+            let port = state.ports.get(&arguments[0]).copied();
+            let parameter = port.map(|port| port.parameter);
+            let channel_count = port.map_or(2, |port| port.channel_count);
+            state.port_state_queries = state.port_state_queries.saturating_add(1);
+            let query = state.port_state_queries;
+            // AudioOut2 exposes the same leading live-device state as the ordinary AudioOut
+            // path. Byte 2 is the physical channel count, bytes 4..6 are the signed volume, and
+            // bytes 6..8 are the reroute counter. Writing a volume byte at offset 7 fabricates a
+            // large reroute count and makes middleware destroy and recreate every port.
+            // Route 1 is the connected primary device, matching ordinary AudioOut. Route 0 means
+            // disconnected: Wwise's device poll treats it as a removal and immediately rebuilds
+            // every user and port, even though PortCreate and mastering both succeeded.
+            write_audio_out2_port_state(
+                output,
+                SceAudioOut2PortState {
+                    output: 1,
+                    num_channels: channel_count,
+                    volume: 127,
+                    ..SceAudioOut2PortState::default()
+                },
+            );
+            if query <= 8 || query.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] port state query={query} handle={} exists={port_exists} output={output:#x} parameter={parameter:?} args={:#x},{:#x},{:#x},{:#x}",
+                    arguments[0], arguments[2], arguments[3], arguments[4], arguments[5]
+                );
+            }
             0
         }
-        // The speaker description is written through the first argument; the rest select the
-        // user and output type.
+        // The speaker description is written through the first argument; the second is a flags
+        // selector. Report one stable stereo device with its complete AudioOut2 topology.
         "DImz2Ft9E2g" => {
-            let Some(info) = audio_out2_output_pointer(nid, arguments, arguments[0]) else {
+            let Some(info) = audio_out2_output_pointer(
+                nid,
+                arguments,
+                arguments[0],
+                AUDIO_OUT2_SPEAKER_INFO_SIZE,
+            ) else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
             };
-            // REmu mixes to a stereo host device, so one speaker pair is reported.
+            // Layout: u8 type, three reserved bytes, u32 available-speaker mask, u32 flags,
+            // one reserved u32, then twelve i16 azimuth/elevation pairs. Flags at offset 8 are
+            // output state, not a connected bit. The stereo mask and conventional ±30-degree
+            // positions describe the two available speakers.
             guest_memset(info, 0, AUDIO_OUT2_SPEAKER_INFO_SIZE);
-            write_guest_u32(info, 2);
+            write_guest_u32(info + 4, 0x3);
+            write_guest_u16(info + 0x10, (-30_i16).cast_unsigned());
+            write_guest_u16(info + 0x14, 30);
+            state.speaker_queries = state.speaker_queries.saturating_add(1);
+            let query = state.speaker_queries;
+            if query <= 8 || query.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] speaker query={query} output={info:#x} args={:#x},{:#x},{:#x},{:#x},{:#x}",
+                    arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
+                );
+            }
             0
         }
         "t5YrizufpQc" => {
-            if arguments[0] == 0 {
+            let Some(parameter) = guest_output_pointer(
+                arguments[0],
+                usize::try_from(AUDIO_OUT2_CONTEXT_PARAM_SIZE)
+                    .expect("AudioOut2 parameter size fits usize"),
+            ) else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-            }
+            };
+            // SceAudioOut2ContextParam is a fixed 0x40-byte object. Reset supplies the hardware
+            // defaults middleware retains unless it needs a different port count or grain size.
+            write_audio_out2_context_param(
+                parameter,
+                SceAudioOut2ContextParam {
+                    max_ports: 256,
+                    max_object_ports: 256,
+                    queue_depth: AUDIO_OUT2_DEFAULT_QUEUE_DEPTH,
+                    num_grains: AUDIO_OUT2_DEFAULT_GRAIN_FRAMES,
+                    flags: 1,
+                    ..SceAudioOut2ContextParam::default()
+                },
+            );
             0
         }
         "pDmme7Bgm6E" => {
             if arguments[0] == 0 || arguments[1] == 0 {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
             }
-            const CONTEXT_MEMORY_SIZE: u64 = 0x1_0000;
-            write_guest_u64(arguments[1], CONTEXT_MEMORY_SIZE);
+            let Some(parameter) = guest_output_pointer(
+                arguments[0],
+                usize::try_from(AUDIO_OUT2_CONTEXT_PARAM_SIZE)
+                    .expect("AudioOut2 parameter size fits usize"),
+            ) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            let Some(memory_size) = guest_output_pointer(arguments[1], size_of::<u64>()) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            // KytyPS5 derives this from the hardware queue depth. This reproduces the 0x11640
+            // Wwise request with the default four queues without hard-coding that one setup.
+            let parameter = read_audio_out2_context_param(parameter);
+            let queue_depth = match parameter.queue_depth {
+                0 => AUDIO_OUT2_DEFAULT_QUEUE_DEPTH,
+                value => value,
+            };
+            let context_memory_size = AUDIO_OUT2_CONTEXT_MEMORY_BASE_SIZE.saturating_add(
+                u64::from(queue_depth).saturating_mul(AUDIO_OUT2_CONTEXT_MEMORY_QUEUE_STRIDE),
+            );
+            write_guest_u64(memory_size, context_memory_size);
             eprintln!(
-                "[REMu][AUDIO2] context memory query parameter={:#x} size={CONTEXT_MEMORY_SIZE:#x}",
-                arguments[0]
+                "[REMu][AUDIO2] context memory query parameter={:#x} queue_depth={queue_depth} size={context_memory_size:#x}",
+                arguments[0],
             );
             0
         }
@@ -5448,12 +6061,59 @@ fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
             if arguments[0] == 0 || arguments[1] == 0 || arguments[2] == 0 || arguments[3] == 0 {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
             }
+            let Some(parameter) = guest_output_pointer(
+                arguments[0],
+                usize::try_from(AUDIO_OUT2_CONTEXT_PARAM_SIZE)
+                    .expect("AudioOut2 parameter size fits usize"),
+            ) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            let parameter = read_audio_out2_context_param(parameter);
+            let queue_depth = if parameter.queue_depth == 0 {
+                AUDIO_OUT2_DEFAULT_QUEUE_DEPTH
+            } else {
+                parameter.queue_depth
+            };
+            let grain_frames = if parameter.num_grains == 0 {
+                AUDIO_OUT2_DEFAULT_GRAIN_FRAMES
+            } else {
+                parameter.num_grains
+            };
+            if queue_depth > AUDIO_OUT2_MAX_QUEUE_DEPTH
+                || !(64..=8192).contains(&grain_frames)
+                || !grain_frames.is_power_of_two()
+            {
+                eprintln!(
+                    "[REMu][AUDIO2] rejected context parameter={parameter:?} queue_depth={queue_depth} grain={grain_frames}"
+                );
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            }
+            let Ok(memory_size) = usize::try_from(arguments[2]) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            if !process_guest_range_is_readable(arguments[1], memory_size) {
+                eprintln!(
+                    "[REMu][AUDIO2] rejected context memory={:#x}+{:#x}",
+                    arguments[1], arguments[2]
+                );
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            }
             let handle = state.allocate_handle();
-            state.contexts.insert(handle);
+            state.contexts.insert(
+                handle,
+                AudioOut2ContextState {
+                    queue_depth,
+                    grain_frames,
+                    queued: 0,
+                    last_queue_update: Instant::now(),
+                    memory_address: arguments[1],
+                    memory_size: arguments[2],
+                },
+            );
             write_guest_u64(arguments[3], handle);
             eprintln!(
-                "[REMu][AUDIO2] created context={handle} memory={:#x} size={:#x}",
-                arguments[1], arguments[2]
+                "[REMu][AUDIO2] created context={handle} memory={:#x} size={:#x} queue_depth={queue_depth} grain={grain_frames} parameter={parameter:?}",
+                arguments[1], arguments[2],
             );
             0
         }
@@ -5463,63 +6123,121 @@ fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
             }
             let handle = state.allocate_handle();
             state.users.insert(handle);
+            state.user_creates = state.user_creates.saturating_add(1);
+            let create = state.user_creates;
             write_guest_u64(arguments[1], handle);
-            eprintln!(
-                "[REMu][AUDIO2] created user={handle} user_id={:#x}",
-                arguments[0]
-            );
+            if create <= 8 || create.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] user create={create} handle={handle} user_id={:#x}",
+                    arguments[0]
+                );
+            }
             0
         }
         "JK2wamZPzwM" => {
-            if !state.contexts.contains(&arguments[0]) || arguments[1] == 0 || arguments[2] == 0 {
+            let Some(context) = state.contexts.get(&arguments[0]).copied() else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            if arguments[1] == 0 || arguments[2] == 0 {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
             }
-            let frequency = u64::from(read_guest_u32(arguments[1] + 8));
-            let backend_handle = {
-                let mut audio = AUDIO_OUT
-                    .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                audio.initialize();
-                match audio.open([
-                    0,
-                    0,
-                    0,
-                    AUDIO_OUT2_MIX_QUANTUM_FRAMES,
-                    frequency,
-                    AUDIO_OUT2_FLOAT_SURROUND_FORMAT,
-                ]) {
-                    Ok(handle) => handle,
-                    Err(error) => return audio_out_error(error),
-                }
+            if !process_guest_range_is_readable(
+                arguments[1],
+                std::mem::size_of::<SceAudioOut2PortParam>(),
+            ) {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            }
+            let parameter = read_audio_out2_port_param(arguments[1]);
+            let frequency = u64::from(parameter.sampling_frequency);
+            let channel_format = parameter.data_format;
+            let Some((channel_count, raw_format)) =
+                decode_audio_out2_channel_format(channel_format)
+            else {
+                eprintln!(
+                    "[REMu][AUDIO2] unsupported port channel format={channel_format:#x} parameter={parameter:?}"
+                );
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            // Port type 6 carries controller-vibration samples. Sending those floats to the
+            // ordinary speaker mixer produces loud garbage and is observably the wrong route.
+            // Pad/personal/aux routing remains on the existing fallback until a distinct host
+            // endpoint is implemented; only the known non-audible route is suppressed here.
+            let backend_handle =
+                (parameter.port_type != AUDIO_OUT2_PORT_TYPE_VIBRATION).then(|| {
+                    let mut audio = AUDIO_OUT
+                        .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    audio.initialize();
+                    match audio.open([
+                        0,
+                        0,
+                        0,
+                        u64::from(context.grain_frames),
+                        frequency,
+                        raw_format,
+                    ]) {
+                        Ok(handle) => Ok(handle),
+                        Err(error) => Err(audio_out_error(error)),
+                    }
+                });
+            let backend_handle = match backend_handle.transpose() {
+                Ok(handle) => handle,
+                Err(error) => return error,
             };
             let handle = state.allocate_handle();
             state.ports.insert(
                 handle,
-                AudioOut2PortState {
+                AudioOut2PortRuntimeState {
                     context: arguments[0],
                     backend_handle,
                     buffer_address: 0,
+                    channel_count,
+                    gains: [1.0; 8],
+                    parameter,
                 },
             );
+            state.port_creates = state.port_creates.saturating_add(1);
+            let create = state.port_creates;
             write_guest_u64(arguments[2], handle);
-            eprintln!(
-                "[REMu][AUDIO2] created port={handle} context={} parameter={:#x} backend={backend_handle} rate={frequency}",
-                arguments[0], arguments[1],
-            );
+            if create <= 8 || create.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] port create={create} handle={handle} context={} parameter_address={:#x} parameter={parameter:?} channels={channel_count} backend={backend_handle:?} rate={frequency}",
+                    arguments[0], arguments[1],
+                );
+            }
             0
         }
         "IaZXJ9M79uo" => {
-            state.users.remove(&arguments[0]);
+            let existed = state.users.remove(&arguments[0]);
+            state.user_destroys = state.user_destroys.saturating_add(1);
+            let destroy = state.user_destroys;
+            if destroy <= 8 || destroy.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] user destroy={destroy} handle={} existed={existed}",
+                    arguments[0]
+                );
+            }
             0
         }
         "cd+Rtw+D1x8" => {
-            if let Some(port) = state.ports.remove(&arguments[0]) {
+            let removed = state.ports.remove(&arguments[0]);
+            state.port_destroys = state.port_destroys.saturating_add(1);
+            let destroy = state.port_destroys;
+            if destroy <= 8 || destroy.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] port destroy={destroy} handle={} existed={} parameter={:?}",
+                    arguments[0],
+                    removed.is_some(),
+                    removed.map(|port| port.parameter),
+                );
+            }
+            if let Some(backend_handle) = removed.and_then(|port| port.backend_handle) {
                 let _ = AUDIO_OUT
                     .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .close(port.backend_handle);
+                    .close(backend_handle);
             }
             0
         }
@@ -5528,7 +6246,7 @@ fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
             let backend_handles = state
                 .ports
                 .extract_if(.., |_, port| port.context == arguments[0])
-                .map(|(_, port)| port.backend_handle)
+                .filter_map(|(_, port)| port.backend_handle)
                 .collect::<Vec<_>>();
             let mut audio = AUDIO_OUT
                 .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
@@ -5545,32 +6263,113 @@ fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
             }
             state.attribute_updates = state.attribute_updates.saturating_add(1);
             let count = arguments[2].min(16);
+            let Some(attribute_bytes) = usize::try_from(count)
+                .ok()
+                .and_then(|count| count.checked_mul(std::mem::size_of::<SceAudioOut2Attribute>()))
+            else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            if !process_guest_range_is_readable(arguments[1], attribute_bytes) {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            }
+            let mut backend_gain_update = None;
             for index in 0..count {
-                let base = arguments[1] + index * 24;
-                let attribute = read_guest_u64(base);
-                let data = read_guest_u64(base + 8);
-                let size = read_guest_u64(base + 16);
-                if attribute == 0
-                    && data != 0
-                    && size >= 8
-                    && let Some(port) = state.ports.get_mut(&arguments[0])
-                {
-                    port.buffer_address = read_guest_u64(data);
+                let base =
+                    arguments[1] + index * std::mem::size_of::<SceAudioOut2Attribute>() as u64;
+                // SceAudioOut2Attribute begins with a u32 ID and a separate reserved i32. Reading
+                // both as one u64 makes a nonzero reserved word part of the ID and prevents PCM
+                // attribute zero from attaching its buffer.
+                let attribute = decode_audio_out2_attribute(base);
+                match attribute.attribute_id {
+                    0 => {
+                        if attribute.value == 0
+                            || attribute.value_size < std::mem::size_of::<SceAudioOut2Pcm>() as u64
+                            || !process_guest_range_is_readable(
+                                attribute.value,
+                                std::mem::size_of::<SceAudioOut2Pcm>(),
+                            )
+                        {
+                            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                        }
+                        let pcm = SceAudioOut2Pcm {
+                            data: read_guest_u64(attribute.value),
+                        };
+                        if let Some(port) = state.ports.get_mut(&arguments[0]) {
+                            port.buffer_address = pcm.data;
+                        }
+                    }
+                    1 => {
+                        if attribute.value == 0
+                            || attribute.value_size < std::mem::size_of::<f32>() as u64
+                            || attribute.value_size % std::mem::size_of::<f32>() as u64 != 0
+                        {
+                            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                        }
+                        let gain_bytes = usize::try_from(
+                            attribute
+                                .value_size
+                                .min((8 * std::mem::size_of::<f32>()) as u64),
+                        )
+                        .expect("at most eight f32 gains fit usize");
+                        if !process_guest_range_is_readable(attribute.value, gain_bytes) {
+                            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                        }
+                        let Some(port) = state.ports.get_mut(&arguments[0]) else {
+                            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                        };
+                        let mut gains = port.gains;
+                        for (channel, gain) in gains
+                            .iter_mut()
+                            .enumerate()
+                            .take(gain_bytes / std::mem::size_of::<f32>())
+                        {
+                            let bits = read_guest_u32(
+                                attribute.value + (channel * std::mem::size_of::<f32>()) as u64,
+                            );
+                            let value = f32::from_bits(bits);
+                            if !value.is_finite() {
+                                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                            }
+                            *gain = value;
+                        }
+                        port.gains = gains;
+                        if let Some(backend_handle) = port.backend_handle {
+                            backend_gain_update = Some((backend_handle, gains));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((backend_handle, gains)) = backend_gain_update {
+                let mut audio = AUDIO_OUT
+                    .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Err(error) = audio.set_channel_gains(backend_handle, gains) {
+                    return audio_out_error(error);
                 }
             }
             if state.attribute_updates <= 8 || state.attribute_updates.is_power_of_two() {
                 let attributes = (0..count)
                     .map(|index| {
-                        let base = arguments[1] + index * 24;
-                        let attribute = read_guest_u64(base);
-                        let data = read_guest_u64(base + 8);
-                        let size = read_guest_u64(base + 16);
-                        let value = if data != 0 && size >= 8 {
-                            read_guest_u64(data)
+                        let base = arguments[1]
+                            + index * std::mem::size_of::<SceAudioOut2Attribute>() as u64;
+                        let attribute = decode_audio_out2_attribute(base);
+                        let value = if attribute.value != 0
+                            && attribute.value_size >= 8
+                            && process_guest_range_is_readable(attribute.value, 8)
+                        {
+                            read_guest_u64(attribute.value)
                         } else {
                             0
                         };
-                        format!("id={attribute:#x}/data={data:#x}/size={size:#x}/value={value:#x}")
+                        format!(
+                            "id={:#x}/reserved={:#x}/data={:#x}/size={:#x}/value={value:#x}",
+                            attribute.attribute_id,
+                            attribute.reserved,
+                            attribute.value,
+                            attribute.value_size,
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(",");
@@ -5582,38 +6381,140 @@ fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
             0
         }
         "PE2zHMqLSHs" => {
-            if !state.contexts.contains(&arguments[0]) {
+            let Some(context) = state.contexts.get_mut(&arguments[0]) else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            audio_out2_update_context_queue(context, Instant::now());
+            state.context_advances = state.context_advances.saturating_add(1);
+            let advance = state.context_advances;
+            if advance <= 8 || advance.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] context advance={advance} handle={} args={:#x},{:#x},{:#x},{:#x},{:#x}",
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
+                    arguments[5],
+                );
             }
             0
         }
         "aII9h5nli9U" => {
-            if !state.contexts.contains(&arguments[0]) {
-                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            state.context_pushes = state.context_pushes.saturating_add(1);
+            let push = state.context_pushes;
+            // Reserve one hardware queue slot. Nonblocking pushes report NOT_READY when the queue
+            // is full; blocking pushes wait only until the 48 kHz device clock drains a slot.
+            loop {
+                let now = Instant::now();
+                let Some(context) = state.contexts.get_mut(&arguments[0]) else {
+                    return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                };
+                audio_out2_update_context_queue(context, now);
+                if context.queued < context.queue_depth {
+                    if context.queued == 0 {
+                        context.last_queue_update = now;
+                    }
+                    context.queued += 1;
+                    break;
+                }
+                if arguments[1] == 0 {
+                    return sce_kernel_error(SCE_AUDIO_OUT2_ERROR_NOT_READY);
+                }
+                let wait_duration = audio_out2_queue_wait_duration(context, now);
+                drop(state);
+                if !wait_duration.is_zero() {
+                    std::thread::sleep(wait_duration);
+                } else {
+                    std::thread::yield_now();
+                }
+                state = AUDIO_OUT2
+                    .get_or_init(|| Mutex::new(AudioOut2State::default()))
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            let buffers = state
-                .ports
-                .values()
-                .filter(|port| port.context == arguments[0] && port.buffer_address != 0)
-                .map(|port| (port.backend_handle, port.buffer_address))
-                .collect::<Vec<_>>();
+            let grain_frames = state
+                .contexts
+                .get(&arguments[0])
+                .expect("the context was validated while reserving its queue slot")
+                .grain_frames;
+            // Attribute zero is the only PCM source. Snapshot exactly one configured grain now,
+            // while the guest's pointer is attached to this push, so later Wwise pointer updates
+            // cannot mutate an already-submitted block. In particular, context/mastering memory
+            // is never searched for plausible sample pointers.
+            let mut buffers = Vec::new();
+            for (port_handle, port) in state.ports.iter().filter(|(_, port)| {
+                port.context == arguments[0]
+                    && port.buffer_address != 0
+                    && port.backend_handle.is_some()
+            }) {
+                let Some(byte_length) = usize::try_from(grain_frames)
+                    .ok()
+                    .and_then(|frames| frames.checked_mul(usize::from(port.channel_count)))
+                    .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+                else {
+                    return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                };
+                if !process_guest_range_has_read_access(port.buffer_address, byte_length) {
+                    return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                }
+                let mut snapshot = vec![0_u8; byte_length];
+                read_guest_bytes(port.buffer_address, &mut snapshot);
+                buffers.push((
+                    *port_handle,
+                    port.backend_handle
+                        .expect("the buffer filter selects only audible backend ports"),
+                    snapshot,
+                ));
+            }
+            #[cfg(test)]
+            state.submitted_pcm.extend(
+                buffers
+                    .iter()
+                    .map(|(port, _, snapshot)| (*port, snapshot.clone())),
+            );
+            let context_memory_trace = (trace_audio_out2_memory()
+                && trace_logarithmic_sequence(push, 8))
+            .then(|| {
+                let context = state.contexts.get(&arguments[0]).copied()?;
+                let channels = state
+                    .ports
+                    .values()
+                    .filter(|port| port.context == arguments[0])
+                    .map(|port| port.channel_count)
+                    .collect::<Vec<_>>();
+                (!channels.is_empty()).then_some((context, channels, state.mastering_parameters))
+            })
+            .flatten();
+            if push <= 8 || push.is_power_of_two() {
+                eprintln!(
+                    "[REMu][AUDIO2] context push={push} handle={} buffers={} args={:#x},{:#x},{:#x},{:#x},{:#x}",
+                    arguments[0],
+                    buffers.len(),
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
+                    arguments[5],
+                );
+            }
             drop(state);
+            if let Some((context, channels, mastering_parameters)) = context_memory_trace {
+                trace_audio_out2_context_memory(context, push, &channels);
+                trace_audio_out2_mastering_memory(mastering_parameters, push);
+            }
 
-            let mut maximum_delay = Duration::ZERO;
             let mut audio = AUDIO_OUT
                 .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (handle, buffer) in buffers {
-                match audio.output([handle, buffer, 0, 0, 0, 0]) {
-                    Ok(delay) => maximum_delay = maximum_delay.max(delay),
+            for (_, handle, buffer) in buffers {
+                match audio.output([handle, buffer.as_ptr() as u64, 0, 0, 0, 0]) {
+                    Ok(_) => {}
                     Err(error) => return audio_out_error(error),
                 }
             }
             drop(audio);
-            if !maximum_delay.is_zero() {
-                std::thread::sleep(maximum_delay);
-            }
             0
         }
         _ => unreachable!("caller filters AudioOut2 imports"),
@@ -6014,31 +6915,71 @@ fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guest_thread = current_guest_thread_handle();
+    let mut reported_stall = false;
     loop {
         match mutex.owner.as_ref() {
             None => {
                 mutex.owner = Some(current);
+                mutex.owner_guest_thread = guest_thread;
                 mutex.recursion = 1;
                 return 0;
             }
-            Some(owner) if *owner == current => {
-                return match mutex.mutex_type {
-                    2 | 3 => {
-                        mutex.recursion = mutex.recursion.saturating_add(1);
-                        0
-                    }
-                    4 if !try_only => 0,
-                    _ if try_only => u64::from(libc::EBUSY.cast_unsigned()),
-                    _ => u64::from(libc::EDEADLK.cast_unsigned()),
-                };
+            Some(owner) if *owner == current && mutex.mutex_type == 2 => {
+                mutex.recursion = mutex.recursion.saturating_add(1);
+                return 0;
+            }
+            Some(owner) if *owner == current && try_only => {
+                return u64::from(libc::EBUSY.cast_unsigned());
+            }
+            // Error-checking and adaptive mutexes diagnose a same-thread relock. A normal mutex
+            // deliberately falls through to the blocking path below and deadlocks, matching the
+            // Gen5 pthread contract.
+            Some(owner) if *owner == current && matches!(mutex.mutex_type, 1 | 4) => {
+                return u64::from(libc::EDEADLK.cast_unsigned());
             }
             Some(_) if try_only => return u64::from(libc::EBUSY as u32),
             Some(_) => {
                 mutex.waiters = mutex.waiters.saturating_add(1);
-                mutex = entry
-                    .wake
-                    .wait(mutex)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let contention_sequence =
+                    MUTEX_CONTENTION_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+                if trace_guest_sync() && trace_logarithmic_sequence(contention_sequence, 8) {
+                    eprintln!(
+                        "[REMu][MUTEX] contention sequence={contention_sequence} thread={:?} \
+                         handle={guest_thread:#x} mutex={address:#x} type={} owner={:#x} \
+                         recursion={} waiters={}",
+                        current_guest_thread_name(),
+                        mutex.mutex_type,
+                        mutex.owner_guest_thread,
+                        mutex.recursion,
+                        mutex.waiters,
+                    );
+                }
+                if let Some(report_after) = stall_report_interval() {
+                    let (next_mutex, wait_result) = entry
+                        .wake
+                        .wait_timeout(mutex, report_after)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    mutex = next_mutex;
+                    if wait_result.timed_out() && !reported_stall {
+                        reported_stall = true;
+                        eprintln!(
+                            "[REMu][STALL] mutex lock exceeded {}s thread={:?} \
+                             handle={guest_thread:#x} mutex={address:#x} \
+                             owner={:#x} recursion={} waiters={}",
+                            report_after.as_secs(),
+                            current_guest_thread_name(),
+                            mutex.owner_guest_thread,
+                            mutex.recursion,
+                            mutex.waiters,
+                        );
+                    }
+                } else {
+                    mutex = entry
+                        .wake
+                        .wait(mutex)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
                 mutex.waiters = mutex.waiters.saturating_sub(1);
             }
         }
@@ -6059,6 +7000,7 @@ fn guest_mutex_unlock(address: u64) -> u64 {
             mutex.recursion -= 1;
         } else {
             mutex.owner = None;
+            mutex.owner_guest_thread = 0;
             mutex.recursion = 0;
             entry.wake.notify_one();
         }
@@ -6343,6 +7285,7 @@ where
         );
     }
     mutex.owner = None;
+    mutex.owner_guest_thread = 0;
     mutex.recursion = 0;
     mutex_entry.wake.notify_one();
     drop(mutex);
@@ -6477,6 +7420,7 @@ where
     loop {
         if mutex.owner.is_none() {
             mutex.owner = Some(current);
+            mutex.owner_guest_thread = guest_thread;
             mutex.recursion = released_recursion;
             return if timed_out {
                 sce_kernel_error(SCE_KERNEL_ERROR_TIMED_OUT)
@@ -6731,8 +7675,10 @@ fn guest_event_flag_create(arguments: [u64; 6]) -> u64 {
     write_guest_u64(output, handle);
     if trace_guest_sync() {
         eprintln!(
-            "[REMu][EVENT_FLAG] create handle={handle} name={name:?} attr={attributes:#x} bits={:#x}",
-            arguments[3]
+            "[REMu][EVENT_FLAG] create handle={handle} name={name:?} attr={attributes:#x} bits={:#x} thread={:?}/{:#x}",
+            arguments[3],
+            current_guest_thread_name(),
+            current_guest_thread_handle(),
         );
     }
     0
@@ -6749,8 +7695,12 @@ fn guest_event_flag_delete(handle: u64) -> u64 {
     };
     if trace_guest_sync() {
         eprintln!(
-            "[REMu][EVENT_FLAG] delete handle={handle} name={:?} attr={:#x} waiters={}",
-            flag.name, flag.attributes, flag.waiters
+            "[REMu][EVENT_FLAG] delete handle={handle} name={:?} attr={:#x} waiters={} thread={:?}/{:#x}",
+            flag.name,
+            flag.attributes,
+            flag.waiters,
+            current_guest_thread_name(),
+            current_guest_thread_handle(),
         );
     }
     sync.1.notify_all();
@@ -6767,6 +7717,21 @@ fn guest_event_flag_set(handle: u64, pattern: u64) -> u64 {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     flag.bits |= pattern;
+    let bits = flag.bits;
+    let name = flag.name.clone();
+    let waiters = flag.waiters;
+    if trace_guest_sync() {
+        let sequence = EVENT_FLAG_SET_SEQUENCE
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if sequence <= 32 || sequence.is_power_of_two() {
+            eprintln!(
+                "[REMu][EVENT_FLAG] set sequence={sequence} handle={handle} name={name:?} pattern={pattern:#x} bits={bits:#x} waiters={waiters} thread={:?}/{:#x}",
+                current_guest_thread_name(),
+                current_guest_thread_handle(),
+            );
+        }
+    }
     sync.1.notify_all();
     0
 }
@@ -6827,12 +7792,30 @@ fn guest_event_flag_wait(arguments: [u64; 6]) -> u64 {
     let Some(flag) = state.event_flags.get_mut(&handle) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
+    let wait_sequence = EVENT_FLAG_WAIT_SEQUENCE
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let trace_wait = trace_guest_sync() && (wait_sequence <= 32 || wait_sequence.is_power_of_two());
+    if trace_wait {
+        eprintln!(
+            "[REMu][EVENT_FLAG] wait sequence={wait_sequence} handle={handle} name={:?} pattern={pattern:#x} mode={wait_mode:#x} bits={:#x} timeout_us={timeout:?} thread={:?}/{guest_thread:#x}",
+            flag.name,
+            flag.bits,
+            current_guest_thread_name(),
+        );
+    }
     let cancellation_generation = flag.cancellation_generation;
     if event_flag_satisfied(flag.bits, pattern, wait_mode) {
         if arguments[3] != 0 {
             write_guest_u64(arguments[3], flag.bits);
         }
         event_flag_apply_clear(&mut flag.bits, pattern, wait_mode);
+        if trace_wait {
+            eprintln!(
+                "[REMu][EVENT_FLAG] wait satisfied sequence={wait_sequence} handle={handle} immediately=true remaining={:#x}",
+                flag.bits
+            );
+        }
         return 0;
     }
     flag.waiters = flag.waiters.saturating_add(1);
@@ -6857,6 +7840,12 @@ fn guest_event_flag_wait(arguments: [u64; 6]) -> u64 {
             }
             event_flag_apply_clear(&mut flag.bits, pattern, wait_mode);
             flag.waiters = flag.waiters.saturating_sub(1);
+            if trace_wait {
+                eprintln!(
+                    "[REMu][EVENT_FLAG] wait satisfied sequence={wait_sequence} handle={handle} immediately=false remaining={:#x}",
+                    flag.bits
+                );
+            }
             return 0;
         }
         if let Some(deadline) = deadline {
@@ -7390,13 +8379,54 @@ const SCE_AJM_ERROR_INVALID_INSTANCE: u32 = 0x8093_0003;
 const SCE_AJM_ERROR_CODEC_ALREADY_REGISTERED: u32 = 0x8093_0009;
 const SCE_AJM_ERROR_CODEC_NOT_REGISTERED: u32 = 0x8093_000a;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SceAjmBatchInfo {
+    buffer: u64,
+    offset: u64,
+    size: u64,
+    last_good_job: u64,
+    last_good_job_return_address: u64,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<SceAjmBatchInfo>() == 0x28);
+    assert!(std::mem::offset_of!(SceAjmBatchInfo, buffer) == 0x00);
+    assert!(std::mem::offset_of!(SceAjmBatchInfo, offset) == 0x08);
+    assert!(std::mem::offset_of!(SceAjmBatchInfo, size) == 0x10);
+    assert!(std::mem::offset_of!(SceAjmBatchInfo, last_good_job) == 0x18);
+    assert!(std::mem::offset_of!(SceAjmBatchInfo, last_good_job_return_address) == 0x20);
+};
+
 fn ajm_batch_initialize(arguments: [u64; 6]) -> u64 {
     let batch = arguments[0];
     let size = arguments[1];
-    if batch == 0 || !(0x40..=0x10_000).contains(&size) {
+    let info = arguments[2];
+    let Ok(batch_size) = usize::try_from(size) else {
+        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+    };
+    if batch == 0
+        || info == 0
+        || !(0x40..=0x10_000).contains(&size)
+        || !process_guest_range_has_read_access(batch, batch_size)
+        || guest_output_pointer(info, std::mem::size_of::<SceAjmBatchInfo>()).is_none()
+    {
         return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
     }
-    guest_memset(batch, 0, size);
+    // The arena belongs to the caller and may already contain allocator/debug state. The PS5 ABI
+    // initializes only this five-qword cursor; job builders subsequently append into `buffer`
+    // using `offset` and update the two last-good fields.
+    let batch_info = SceAjmBatchInfo {
+        buffer: batch,
+        offset: 0,
+        size,
+        last_good_job: 0,
+        last_good_job_return_address: 0,
+    };
+    // SAFETY: the complete 0x28-byte output object was validated above.
+    unsafe {
+        std::ptr::write_unaligned(info as *mut SceAjmBatchInfo, batch_info);
+    }
     0
 }
 
@@ -7628,6 +8658,7 @@ fn dispatch_stateless_import(
         "YUeqkyT7mEQ" => agc_dcb_set_flip(arguments),
         "rPo6tV8D9bM" => system_service_get_status(arguments),
         "fZo48un7LK4" => system_service_param_get_int(arguments),
+        "3RQ5aQfnstU" => system_service_get_notice_screen_skip_flag(arguments[0]),
         "Xjoosiw+XPI" => guest_uuid_create(arguments[0]),
         "yDBwVAolDgg" => guest_kernel_is_stack(arguments),
         "Qs0wWulgl7U" => 0,
@@ -7985,10 +9016,12 @@ fn dispatch_probe_import(
         "dQHWEsJtoE4" => posix_pthread_result(create_pthread_mutex_attr(arguments[0], state)),
         "HF7lK46xzjY" => posix_pthread_result(destroy_pthread_mutex_attr(arguments[0], state)),
         "mDmgMOGVUqg" => posix_pthread_result(pthread_mutex_attr_set_type(arguments, state)),
-        "mqULNdimTn0" | "geDaqgH9lTg" => pthread_key_create(arguments, state),
-        "WrOLvHU0yQM" | "+BzXYkqYeLE" => pthread_set_specific(arguments, state),
+        "mqULNdimTn0" => posix_pthread_result(pthread_key_create(arguments, state)),
+        "geDaqgH9lTg" => pthread_key_create(arguments, state),
+        "WrOLvHU0yQM" => posix_pthread_result(pthread_set_specific(arguments, state)),
+        "+BzXYkqYeLE" => pthread_set_specific(arguments, state),
         "PrdHuuDekhY" => pthread_key_delete(low_u32(arguments[0]), state),
-        "6BpEZuDT7YI" => pthread_key_delete(low_u32(arguments[0]), state),
+        "6BpEZuDT7YI" => posix_pthread_result(pthread_key_delete(low_u32(arguments[0]), state)),
         "nsYoNRywwNg" | "wtkt-teR1so" => {
             create_pthread_attr(arguments[0], PthreadAttrState::default(), state)
         }
@@ -8467,17 +9500,34 @@ fn queue_kernel_event(state: &mut ProbeDispatchState, mut event: KernelQueuedEve
 }
 
 fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
-    let completed = remu_gpu::gpu_completed_submission_sequence();
+    const AGC_USER_INTERRUPT_EVENT: u64 = 0x1800;
+    let completed = remu_gpu::take_gpu_completed_submission_ids()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if completed.is_empty() {
+        return;
+    }
+    let newest_completed = completed.iter().next_back().copied().unwrap_or_default();
+    let mut completed_graphics = Vec::new();
+    state.pending_agc_completions.retain(|sequence| {
+        if completed.contains(sequence) {
+            completed_graphics.push(*sequence);
+            false
+        } else {
+            true
+        }
+    });
+    let mut completed_compute = Vec::new();
+    state.pending_agc_user_interrupts.retain(|sequence| {
+        if completed.contains(sequence) {
+            completed_compute.push(*sequence);
+            false
+        } else {
+            true
+        }
+    });
     let mut queued = false;
-    while state
-        .pending_agc_completions
-        .front()
-        .is_some_and(|sequence| *sequence <= completed)
-    {
-        let sequence = state
-            .pending_agc_completions
-            .pop_front()
-            .expect("the completed AGC sequence was just inspected");
+    for sequence in completed_graphics {
         // The AGC driver completion is not a packet-provided hardware event ID. Titles may use
         // an arbitrary ID when registering their completion queue, so announce end-of-pipe to
         // every graphics registration while preserving that ID in both `ident` and `data`.
@@ -8506,11 +9556,52 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         }
         if trace_logarithmic_sequence(sequence, 8) {
             eprintln!(
-                "[REMu][AGC] completed submission={sequence} backend={completed} equeues={}",
+                "[REMu][AGC] completed submission={sequence} newest_backend={newest_completed} equeues={}",
                 state
                     .kernel_event_registrations
                     .keys()
                     .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
+                    .count()
+            );
+        }
+    }
+    for sequence in completed_compute {
+        // Compute submissions use the driver-wide AGC user interrupt rather than the graphics
+        // end-of-pipe registrations. This is the signal the guest's AgcSubmissionThread waits on
+        // before it can recycle the ACB and submit the next frame.
+        let timestamp = kernel_process_time(true);
+        let registrations = state
+            .kernel_event_registrations
+            .iter()
+            .filter_map(|(&(equeue, filter, ident), &user_data)| {
+                (filter == KERNEL_EVENT_FILTER_USER && ident == AGC_USER_INTERRUPT_EVENT)
+                    .then_some((equeue, ident, filter, user_data))
+            })
+            .collect::<Vec<_>>();
+        for (equeue, ident, filter, user_data) in registrations {
+            queue_kernel_event(
+                state,
+                KernelQueuedEvent {
+                    equeue,
+                    ident,
+                    filter,
+                    flags: 0,
+                    fflags: 1,
+                    data: timestamp,
+                    user_data,
+                },
+            );
+            queued = true;
+        }
+        if trace_logarithmic_sequence(sequence, 8) {
+            eprintln!(
+                "[REMu][AGC] completed compute submission={sequence} newest_backend={newest_completed} user_interrupts={}",
+                state
+                    .kernel_event_registrations
+                    .keys()
+                    .filter(|(_, filter, ident)| {
+                        *filter == KERNEL_EVENT_FILTER_USER && *ident == AGC_USER_INTERRUPT_EVENT
+                    })
                     .count()
             );
         }
@@ -9190,6 +10281,19 @@ fn system_service_param_get_int(arguments: [u64; 6]) -> u64 {
     0
 }
 
+/// Reports that the platform notice screen has not already been acknowledged by the system.
+///
+/// Titles use this one-byte flag to decide whether to show their legal/health notice during
+/// first-run startup. Returning an error without initializing it leaves the guest's stack byte
+/// stale and can make a fresh install skip the notice nondeterministically.
+fn system_service_get_notice_screen_skip_flag(output: u64) -> u64 {
+    let Some(output) = guest_output_pointer(output, 1) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    write_guest_u8(output, 0);
+    0
+}
+
 fn guest_uuid_create(output: u64) -> u64 {
     static NEXT_UUID: AtomicU32 = AtomicU32::new(1);
     if output == 0 {
@@ -9493,7 +10597,7 @@ const PLAYGO_ERROR_BAD_SIZE: u32 = 0x80b2_0009;
 const PLAYGO_HANDLE: u32 = 1;
 /// Chunk is resident on local storage with fast access. REmu runs from a fully installed local
 /// image, so every chunk the title asks about is already present.
-const PLAYGO_LOCUS_LOCAL_FAST: u32 = 3;
+const PLAYGO_LOCUS_LOCAL_FAST: u8 = 3;
 const PLAYGO_INSTALL_SPEED_FULL: u32 = 1;
 
 /// Reports whether PlayGo is initialized, rejecting the double-initialize the ABI forbids.
@@ -9571,7 +10675,10 @@ fn play_go_get_locus(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
         Err(error) => return error,
     };
     for entry in 0..u64::from(entries) {
-        write_guest_u32(arguments[3] + entry * 4, PLAYGO_LOCUS_LOCAL_FAST);
+        // ScePlayGoLocus is an int8_t enum and `out_loci` is a tightly packed byte array.
+        // Writing dwords here corrupts the caller's adjacent stack fields; Silent Hill keeps
+        // this single-byte result immediately beside other PlayGo temporaries.
+        write_guest_u8(arguments[3] + entry, PLAYGO_LOCUS_LOCAL_FAST);
     }
     0
 }
@@ -9914,6 +11021,7 @@ const AGC_SHADER_SH_REGISTERS_OFFSET: u64 = 0x20;
 const AGC_SHADER_SPECIALS_OFFSET: u64 = 0x28;
 const AGC_SHADER_INPUT_SEMANTICS_OFFSET: u64 = 0x30;
 const AGC_SHADER_OUTPUT_SEMANTICS_OFFSET: u64 = 0x38;
+const AGC_SHADER_SIZE_OFFSET: u64 = 0x44;
 const AGC_SHADER_TYPE_OFFSET: u64 = 0x5a;
 const AGC_SHADER_SH_REGISTER_COUNT_OFFSET: u64 = 0x5c;
 const AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET: u64 = 0x50;
@@ -9969,6 +11077,7 @@ const AGC_CB_SET_SH_REGISTER_RANGE_MARKER: u32 = 0x6875_000d;
 const AGC_SPI_PS_INPUT_CNTL_0: u32 = 0x191;
 const AGC_VGT_PRIMITIVE_TYPE: u32 = 0x242;
 const AGC_VGT_INDEX_TYPE: u32 = 0x243;
+const AGC_VGT_GS_OUT_PRIM_TYPE: u32 = 0x29b;
 const AGC_SPI_SHADER_PGM_LO_PS: u32 = 0x008;
 const AGC_SPI_SHADER_PGM_HI_PS: u32 = 0x009;
 const AGC_SPI_SHADER_PGM_LO_ES: u32 = 0x0c8;
@@ -10039,7 +11148,19 @@ fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
     if !patch_agc_shader_program_registers(header, code) {
         return u64::MAX;
     }
+    if trace_agc_programs() {
+        eprintln!(
+            "[REMu][AGC][SHADER] registered code={code:#x} header={header:#x} type={} user_data={:#x} specials={:#x}",
+            read_guest_u8(header + AGC_SHADER_TYPE_OFFSET),
+            read_guest_u64(header + AGC_SHADER_USER_DATA_OFFSET),
+            read_guest_u64(header + AGC_SHADER_SPECIALS_OFFSET),
+        );
+    }
     state.agc_shader_registry.headers.insert(code, header);
+    state
+        .agc_shader_registry
+        .code_sizes
+        .insert(code, read_guest_u32(header + AGC_SHADER_SIZE_OFFSET));
     state.agc_shader_registry.snapshots.remove(&code);
     state.agc_shader_registry.decode_failures.remove(&code);
     if destination != 0 {
@@ -10079,6 +11200,7 @@ fn agc_allocate_command_dwords(command_buffer: u64, size_dwords: u32) -> Option<
         command_buffer + AGC_COMMAND_BUFFER_CURSOR_UP_OFFSET,
         next_cursor,
     );
+    agc_command_abi::track_graphics_allocation(cursor_up, size_dwords);
     Some(cursor_up)
 }
 
@@ -10136,68 +11258,213 @@ fn agc_copy_shader_register(source: u64, destination: u64) {
     write_guest_u32(destination + 4, read_guest_u32(source + 4));
 }
 
+fn agc_primitive_type_to_gs_output(primitive_type: u32) -> u32 {
+    match primitive_type {
+        1 => 0,                    // point list -> points
+        2 | 3 | 10 | 11 | 18 => 1, // line primitives -> lines
+        7 => 3,                    // rectangle list -> 2D rectangle
+        17 => 4,                   // legacy rectangle list
+        _ => 2,                    // triangles
+    }
+}
+
 fn agc_create_primitive_state(arguments: [u64; 6]) -> u64 {
     let cx_registers = arguments[0];
     let uc_registers = arguments[1];
     let hull_shader = arguments[2];
     let geometry_shader = arguments[3];
     let primitive_type = low_u32(arguments[4]);
-    if cx_registers == 0 || uc_registers == 0 || hull_shader != 0 || geometry_shader == 0 {
+    if cx_registers == 0 && uc_registers == 0 {
+        return 0;
+    }
+    if geometry_shader == 0
+        || read_guest_u8(geometry_shader + AGC_SHADER_TYPE_OFFSET) != SHADER_BINARY_TYPE_GS
+        || (hull_shader != 0
+            && read_guest_u8(hull_shader + AGC_SHADER_TYPE_OFFSET) != SHADER_BINARY_TYPE_HS)
+    {
         return u64::MAX;
     }
-    let shader_type = read_guest_u8(geometry_shader + AGC_SHADER_TYPE_OFFSET);
-    if !matches!(shader_type, 2 | 6) {
+    let geometry_specials = read_guest_u64(geometry_shader + AGC_SHADER_SPECIALS_OFFSET);
+    let hull_specials = if hull_shader == 0 {
+        0
+    } else {
+        read_guest_u64(hull_shader + AGC_SHADER_SPECIALS_OFFSET)
+    };
+    if geometry_specials == 0 || (hull_shader != 0 && hull_specials == 0) {
         return u64::MAX;
     }
-    let specials = read_guest_u64(geometry_shader + AGC_SHADER_SPECIALS_OFFSET);
-    if specials == 0 {
-        return u64::MAX;
+
+    if cx_registers != 0 {
+        agc_copy_shader_register(
+            geometry_specials + AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET,
+            cx_registers,
+        );
+        if read_guest_u32(cx_registers + 4) & 0x20 != 0 {
+            agc_copy_shader_register(
+                geometry_specials + AGC_SHADER_SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET,
+                cx_registers + 8,
+            );
+        } else {
+            write_guest_u32(cx_registers + 8, AGC_VGT_GS_OUT_PRIM_TYPE);
+            write_guest_u32(
+                cx_registers + 12,
+                agc_primitive_type_to_gs_output(primitive_type),
+            );
+        }
+        if hull_specials != 0 {
+            let combined_stages = read_guest_u32(cx_registers + 4)
+                | read_guest_u32(
+                    hull_specials + AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET + 4,
+                );
+            write_guest_u32(cx_registers + 4, combined_stages);
+            if combined_stages & 0x20 == 0 {
+                agc_copy_shader_register(
+                    hull_specials + AGC_SHADER_SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET,
+                    cx_registers + 8,
+                );
+            }
+        }
     }
-    agc_copy_shader_register(
-        specials + AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET,
-        cx_registers,
-    );
-    agc_copy_shader_register(
-        specials + AGC_SHADER_SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET,
-        cx_registers + 8,
-    );
-    agc_copy_shader_register(specials + AGC_SHADER_SPECIAL_GE_CNTL_OFFSET, uc_registers);
-    agc_copy_shader_register(
-        specials + AGC_SHADER_SPECIAL_GE_USER_VGPR_EN_OFFSET,
-        uc_registers + 8,
-    );
-    write_guest_u32(uc_registers + 16, AGC_VGT_PRIMITIVE_TYPE);
-    write_guest_u32(uc_registers + 20, primitive_type);
+
+    if uc_registers != 0 {
+        agc_copy_shader_register(
+            geometry_specials + AGC_SHADER_SPECIAL_GE_CNTL_OFFSET,
+            uc_registers,
+        );
+        agc_copy_shader_register(
+            if hull_specials == 0 {
+                geometry_specials + AGC_SHADER_SPECIAL_GE_USER_VGPR_EN_OFFSET
+            } else {
+                hull_specials + AGC_SHADER_SPECIAL_GE_USER_VGPR_EN_OFFSET
+            },
+            uc_registers + 8,
+        );
+        write_guest_u32(uc_registers + 16, AGC_VGT_PRIMITIVE_TYPE);
+        write_guest_u32(uc_registers + 20, primitive_type);
+    }
     0
+}
+
+fn agc_apply_interpolant_default_value(mut value: u32, pixel_semantic: u32) -> u32 {
+    value &= !0x0000_0300;
+    value |= ((pixel_semantic >> 28) & 0x3) << 8;
+    value
+}
+
+fn agc_apply_interpolant_default_value_hi(mut value: u32, pixel_semantic: u32) -> u32 {
+    value &= !0x0060_0000;
+    value |= ((pixel_semantic >> 30) & 0x3) << 21;
+    value
+}
+
+fn agc_interpolant_mapping_value(
+    mut value: u32,
+    pixel_semantic: u32,
+    geometry_semantic: u32,
+) -> u32 {
+    let flat_shade = if pixel_semantic & 0x0140_0000 != 0 {
+        0x0000_0400
+    } else {
+        0
+    };
+    value &= !0x1f;
+    value |= (geometry_semantic >> 8) & 0x1f;
+    value &= !0x0000_0400;
+    value |= flat_shade;
+    agc_apply_interpolant_default_value(value, pixel_semantic)
+}
+
+fn agc_interpolant_default_value(mut value: u32, pixel_semantic: u32) -> u32 {
+    value &= !0x1f;
+    value &= !0x0000_0400;
+    agc_apply_interpolant_default_value(value, pixel_semantic)
+}
+
+fn agc_interpolant_f16_value(pixel_semantic: u32, geometry_semantic: Option<u32>) -> u32 {
+    let mut value = (pixel_semantic << 4) & 0x0300_0000;
+    if let Some(geometry_semantic) = geometry_semantic {
+        let common = pixel_semantic & geometry_semantic;
+        value &= 0xfff7_ffdf;
+        value |= (common >> 15) & 0x20;
+        value ^= 0x0008_0020;
+        value &= !0x0010_0000;
+        value |= (!common >> 1) & 0x0010_0000;
+    } else {
+        value |= 0x0018_0020;
+    }
+    agc_apply_interpolant_default_value_hi(value, pixel_semantic)
+}
+
+fn agc_interpolant_non_f16_value(pixel_semantic: u32, geometry_semantic: Option<u32>) -> u32 {
+    if pixel_semantic & 0x0100_0000 != 0 || geometry_semantic.is_none() {
+        0x20
+    } else {
+        0
+    }
+}
+
+fn agc_write_interpolant_register(registers: u64, index: u32, value: u32) {
+    let destination = registers + u64::from(index) * 8;
+    write_guest_u32(destination, AGC_SPI_PS_INPUT_CNTL_0 + index);
+    write_guest_u32(destination + 4, value);
 }
 
 fn agc_create_interpolant_mapping(arguments: [u64; 6]) -> u64 {
     let registers = arguments[0];
     let geometry_shader = arguments[1];
     let pixel_shader = arguments[2];
-    if registers == 0 || geometry_shader == 0 {
+    if registers == 0 {
+        return u64::MAX;
+    }
+
+    let input_count = if pixel_shader == 0 {
+        0
+    } else {
+        read_guest_u32(pixel_shader + AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET)
+    };
+    if input_count > 32 {
+        return u64::MAX;
+    }
+    if input_count == 0 {
+        for index in 0..32 {
+            agc_write_interpolant_register(registers, index, index);
+        }
+        return 0;
+    }
+    let input_semantics = read_guest_u64(pixel_shader + AGC_SHADER_INPUT_SEMANTICS_OFFSET);
+    if input_semantics == 0 || geometry_shader == 0 {
         return u64::MAX;
     }
     let output_semantics = read_guest_u64(geometry_shader + AGC_SHADER_OUTPUT_SEMANTICS_OFFSET);
-    let output_count = read_guest_u32(geometry_shader + AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET);
-    let input_semantics = if pixel_shader == 0 {
-        0
-    } else {
-        // Reading the count matches the API's descriptor validation even though only the pointer
-        // is needed to construct the fixed 32-register mapping.
-        let _ = read_guest_u32(pixel_shader + AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET);
-        read_guest_u64(pixel_shader + AGC_SHADER_INPUT_SEMANTICS_OFFSET)
-    };
-    for index in 0_u32..32 {
-        let mut value = 0;
-        if index < output_count && output_semantics != 0 {
-            let flat = input_semantics != 0
-                && (read_guest_u32(input_semantics + u64::from(index) * 4) >> 22) & 1 != 0;
-            value = index | if flat { 0x400 } else { 0 };
-        }
-        let destination = registers + u64::from(index) * 8;
-        write_guest_u32(destination, AGC_SPI_PS_INPUT_CNTL_0 + index);
-        write_guest_u32(destination + 4, value);
+    let output_count = u32::from(read_guest_u16(
+        geometry_shader + AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET,
+    ));
+    if output_count != 0 && output_semantics == 0 {
+        return u64::MAX;
+    }
+
+    for index in 0..input_count {
+        let pixel_semantic = read_guest_u32(input_semantics + u64::from(index) * 4);
+        let semantic = pixel_semantic & 0xff;
+        let geometry_semantic = (0..output_count).find_map(|output_index| {
+            let candidate = read_guest_u32(output_semantics + u64::from(output_index) * 4);
+            (candidate & 0xff == semantic).then_some(candidate)
+        });
+        let value = if pixel_semantic & 0x0030_0000 != 0 {
+            agc_interpolant_f16_value(pixel_semantic, geometry_semantic)
+        } else {
+            agc_interpolant_non_f16_value(pixel_semantic, geometry_semantic)
+        };
+        let value = geometry_semantic.map_or_else(
+            || agc_interpolant_default_value(value, pixel_semantic),
+            |geometry_semantic| {
+                agc_interpolant_mapping_value(value, pixel_semantic, geometry_semantic)
+            },
+        );
+        agc_write_interpolant_register(registers, index, value);
+    }
+    for index in input_count..32 {
+        agc_write_interpolant_register(registers, index, index);
     }
     0
 }
@@ -10403,11 +11670,13 @@ fn agc_fuse_shader_halves(arguments: [u64; 6]) -> u64 {
         if let Some(entry) =
             find_shader_register(fused_registers, register_count, address_register + 1, 0)
         {
-            write_guest_u32(entry + 4, low_u32(code >> 40));
+            let previous = read_guest_u32(entry + 4);
+            write_guest_u32(
+                entry + 4,
+                (previous & 0xffff_ff00) | (low_u32(code >> 40) & 0xff),
+            );
         }
     }
-    // The fused description owns no user data of its own.
-    write_guest_u64(fused + 8, 0);
     0
 }
 
@@ -10510,7 +11779,7 @@ fn agc_dcb_wait_reg_mem(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
     let packet_dwords = if standard_wait {
         7
     } else if size == 0 {
-        6
+        7
     } else {
         9
     };
@@ -10540,14 +11809,27 @@ fn agc_dcb_wait_reg_mem(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
         write_guest_u32(command + 8, (address >> 32) as u32);
         write_guest_u32(command + 12, low_u32(mask));
         if size == 0 {
-            write_guest_u32(command + 16, compare_function | (operation << 8));
-            write_guest_u32(command + 20, low_u32(reference));
+            write_guest_u32(command + 16, low_u32(reference));
+            write_guest_u32(
+                command + 20,
+                0x10 | compare_function
+                    | ((operation & 0x3) << 8)
+                    | ((operation & 0xc) << 4)
+                    | (cache_policy << 25),
+            );
+            write_guest_u32(command + 24, (poll_cycles >> 4).min(u32::from(u16::MAX)));
         } else {
             write_guest_u32(command + 16, (mask >> 32) as u32);
             write_guest_u32(command + 20, low_u32(reference));
             write_guest_u32(command + 24, (reference >> 32) as u32);
-            write_guest_u32(command + 28, compare_function | (operation << 8));
-            write_guest_u32(command + 32, poll_cycles / 40);
+            write_guest_u32(
+                command + 28,
+                0x10 | compare_function
+                    | ((operation & 0x1) << 8)
+                    | ((operation & 0x6) << 5)
+                    | (cache_policy << 25),
+            );
+            write_guest_u32(command + 32, (poll_cycles >> 4).min(u32::from(u16::MAX)));
         }
     }
     command
@@ -10739,6 +12021,43 @@ thread_local! {
     /// display through either the video-out call or an AGC flip packet, so the count is kept
     /// where both paths converge.
     static QUEUED_FLIPS: Cell<u32> = const { Cell::new(0) };
+    /// Order-visible events emitted while one AGC command buffer is decoded. Capturing a complete
+    /// submission before publishing it preserves its resumable PM4 cursor and queue identity at
+    /// the backend instead of irreversibly flattening graphics and async-compute work.
+    static AGC_GPU_EVENT_CAPTURE: RefCell<Option<Vec<remu_gpu::GpuEvent>>> =
+        const { RefCell::new(None) };
+}
+
+fn capture_agc_gpu_events<R>(operation: impl FnOnce() -> R) -> (R, Vec<remu_gpu::GpuEvent>) {
+    AGC_GPU_EVENT_CAPTURE.with_borrow_mut(|capture| {
+        assert!(
+            capture.is_none(),
+            "nested AGC GPU event capture would lose submission ownership"
+        );
+        *capture = Some(Vec::new());
+    });
+    let result = operation();
+    let events = AGC_GPU_EVENT_CAPTURE.with_borrow_mut(|capture| {
+        capture
+            .take()
+            .expect("AGC GPU event capture exists after decoding")
+    });
+    (result, events)
+}
+
+fn emit_agc_gpu_event(event: remu_gpu::GpuEvent) {
+    let mut event = Some(event);
+    let captured = AGC_GPU_EVENT_CAPTURE.with_borrow_mut(|capture| {
+        if let Some(events) = capture.as_mut() {
+            events.push(event.take().expect("uncaptured AGC event exists"));
+            true
+        } else {
+            false
+        }
+    });
+    if !captured {
+        remu_gpu::emit_event(event.expect("AGC event was not captured"));
+    }
 }
 
 /// Interval the display holds each flip, in microseconds. Zero disables pacing entirely.
@@ -11280,22 +12599,35 @@ fn ampr_command_buffer_read_file(
     let bytes_read = if capacity == 0 {
         0
     } else {
-        // SAFETY: AMPR receives a live guest mapping sized for the requested transfer. Reading
-        // directly into it avoids an allocation and a second full copy for every asset chunk.
-        let destination =
-            unsafe { std::slice::from_raw_parts_mut(destination as *mut u8, capacity) };
+        if !process_guest_range_has_read_access(destination, capacity) {
+            eprintln!(
+                "[REMu][AMPR] read rejected unmapped destination={destination:#x} size={size:#x}"
+            );
+            return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+        }
+        // A watched guest page is host read-only. macOS pread(2) returns EFAULT instead of
+        // delivering the write-fault signal, and a concurrent resource upload can rearm the page
+        // between an eager mprotect and the syscall. Read into ordinary host storage, then copy
+        // with CPU stores so the write-watch handler dirties each page synchronously.
+        let mut staging = Vec::new();
+        if let Err(error) = staging.try_reserve_exact(capacity) {
+            eprintln!("[REMu][AMPR] could not stage read id={file_id:#x} size={size:#x}: {error}");
+            return sce_kernel_error(SCE_KERNEL_ERROR_OUT_OF_MEMORY);
+        }
+        staging.resize(capacity, 0_u8);
         let mut total = 0_usize;
-        while total < destination.len() {
+        while total < staging.len() {
             let Some(offset) = file_offset.checked_add(total as u64) else {
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
             };
-            let read = match file.read_at(&mut destination[total..], offset) {
+            let read = match file.read_at(&mut staging[total..], offset) {
                 Ok(read) => read,
                 Err(error) => {
                     eprintln!(
                         "[REMu][AMPR] read failed id={file_id:#x} offset={offset:#x} \
-remaining={:#x}: {error}",
-                        destination.len() - total
+remaining={:#x} destination={:#x}: {error}",
+                        staging.len() - total,
+                        destination + total as u64
                     );
                     return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
                 }
@@ -11304,6 +12636,11 @@ remaining={:#x}: {error}",
                 break;
             }
             total += read;
+        }
+        // SAFETY: the complete guest destination range was validated above. Ordinary CPU stores
+        // enter CpuWriteWatch's signal handler on protected pages before changing their bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(staging.as_ptr(), destination as *mut u8, total);
         }
         total
     };
@@ -11325,7 +12662,7 @@ remaining={:#x}: {error}",
     command.command_count += 1;
     if trace_ampr_reads() {
         eprintln!(
-            "[REMu][AMPR] read id={file_id:#x} offset={file_offset:#x} requested={size:#x} read={:#x} destination={destination:#x} thread={:?}",
+            "[REMu][AMPR] read id={file_id:#x} offset={file_offset:#x} requested={size:#x} read={:#x} destination={destination:#x} staged=true thread={:?}",
             bytes_read,
             current_guest_thread_name()
         );
@@ -11634,10 +12971,28 @@ fn queue_agc_event_write(state: &mut ProbeDispatchState, event_type: u32) {
     notify_kernel_equeue_waiters();
 }
 
-fn request_agc_submission_completion(state: &mut ProbeDispatchState) {
+fn request_agc_submission_completion(
+    state: &mut ProbeDispatchState,
+    queue_id: u64,
+    mut events: Vec<remu_gpu::GpuEvent>,
+) {
     let sequence = state.agc_submission_count;
-    state.pending_agc_completions.push_back(sequence);
-    remu_gpu::emit_event(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
+    events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
+    if remu_gpu::emit_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
+        state.pending_agc_completions.push_back(sequence);
+    }
+}
+
+fn request_agc_compute_submission_completion(
+    state: &mut ProbeDispatchState,
+    queue_id: u64,
+    mut events: Vec<remu_gpu::GpuEvent>,
+) {
+    let sequence = state.agc_submission_count;
+    events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
+    if remu_gpu::emit_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
+        state.pending_agc_user_interrupts.push_back(sequence);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11707,7 +13062,7 @@ fn agc_submit_ordered_video_out_flip(
         eprintln!("[REMu][VIDEO] ignored flip without attributes for buffer index {buffer_index}");
         return false;
     };
-    remu_gpu::emit_event(remu_gpu::GpuEvent::Flip {
+    emit_agc_gpu_event(remu_gpu::GpuEvent::Flip {
         address: target.address,
         buffer_index,
         flip_argument,
@@ -11771,7 +13126,45 @@ fn agc_apply_submission_registers(
             }
             destination.insert(register, value);
         }
-        if trace_agc_registers()
+        if (trace_agc_registers() || trace_agc_programs())
+            && opcode == AGC_IT_SET_SH_REG
+            && [
+                AGC_SPI_SHADER_PGM_LO_PS,
+                AGC_SPI_SHADER_PGM_HI_PS,
+                AGC_SPI_SHADER_PGM_LO_ES,
+                AGC_SPI_SHADER_PGM_HI_ES,
+            ]
+            .into_iter()
+            .any(|register| {
+                register >= first_register && register < first_register.saturating_add(length - 2)
+            })
+        {
+            eprintln!(
+                "[REMu][AGC][REG] shader programs direct packet={packet_address:#x} first={first_register:#x} count={} ps={:#x}/{:#x} es={:#x}/{:#x}",
+                length - 2,
+                graphics
+                    .shader_registers
+                    .get(&AGC_SPI_SHADER_PGM_LO_PS)
+                    .copied()
+                    .unwrap_or_default(),
+                graphics
+                    .shader_registers
+                    .get(&AGC_SPI_SHADER_PGM_HI_PS)
+                    .copied()
+                    .unwrap_or_default(),
+                graphics
+                    .shader_registers
+                    .get(&AGC_SPI_SHADER_PGM_LO_ES)
+                    .copied()
+                    .unwrap_or_default(),
+                graphics
+                    .shader_registers
+                    .get(&AGC_SPI_SHADER_PGM_HI_ES)
+                    .copied()
+                    .unwrap_or_default(),
+            );
+        }
+        if (trace_agc_registers() || trace_agc_programs())
             && opcode == AGC_IT_SET_SH_REG
             && first_register <= 0x013
             && first_register.saturating_add(length - 2) > 0x00c
@@ -11873,6 +13266,8 @@ fn agc_apply_indirect_register_table(
             registers_address,
         ));
     }
+    let mut traced_shader_registers = Vec::new();
+    let mut traced_raw_registers = Vec::new();
     for pair in bytes.chunks_exact(8) {
         let raw_offset = u32::from_le_bytes(pair[..4].try_into().expect("register offset dword"));
         if raw_offset == u32::MAX {
@@ -11889,7 +13284,32 @@ fn agc_apply_indirect_register_table(
                 "[REMu][AGC][REG] primitive={value:#x} source=indirect opcode={opcode:#x} table={registers_address:#x}"
             );
         }
+        if (trace_agc_registers() || trace_agc_programs())
+            && opcode == AGC_IT_SET_SH_REG_INDIRECT
+            && matches!(
+                offset,
+                AGC_SPI_SHADER_PGM_LO_PS
+                    | AGC_SPI_SHADER_PGM_HI_PS
+                    | AGC_SPI_SHADER_PGM_LO_ES
+                    | AGC_SPI_SHADER_PGM_HI_ES
+            )
+        {
+            traced_shader_registers.push((offset, value));
+        }
+        if trace_agc_programs() && opcode == AGC_IT_SET_SH_REG_INDIRECT && register_count <= 32 {
+            traced_raw_registers.push((raw_offset, offset, value));
+        }
         destination.insert(offset, value);
+    }
+    if !traced_shader_registers.is_empty() {
+        eprintln!(
+            "[REMu][AGC][REG] shader indirect table={registers_address:#x} count={register_count} entries={traced_shader_registers:x?}"
+        );
+    }
+    if !traced_raw_registers.is_empty() {
+        eprintln!(
+            "[REMu][AGC][REG] shader indirect raw table={registers_address:#x} count={register_count} entries={traced_raw_registers:x?}"
+        );
     }
     Ok(())
 }
@@ -12128,6 +13548,13 @@ pub(crate) fn process_guest_range_is_readable(address: u64, length: usize) -> bo
     ProcessGuestMemory.read(address, &mut bytes)
 }
 
+pub(crate) fn process_guest_range_has_read_access(address: u64, length: usize) -> bool {
+    match ProcessGuestMemory.readable_prefix_length(address, length) {
+        Some(prefix) => prefix == length,
+        None => process_guest_range_is_readable(address, length),
+    }
+}
+
 fn agc_shader_snapshot(
     shaders: &mut AgcShaderRegistry,
     address: u64,
@@ -12139,7 +13566,13 @@ fn agc_shader_snapshot(
         return Some(snapshot.clone());
     }
     let memory = ProcessGuestMemory;
-    let program = match remu_shader::read_program(&memory, address) {
+    let program = match shaders.code_sizes.get(&address).copied() {
+        Some(code_size) => usize::try_from(code_size)
+            .map_err(|_| remu_shader::DecodeError::InvalidCodeSize { bytes: usize::MAX })
+            .and_then(|code_size| remu_shader::read_program_bounded(&memory, address, code_size)),
+        None => remu_shader::read_program(&memory, address),
+    };
+    let program = match program {
         Ok(program) => Arc::new(program),
         Err(error) => {
             shaders.decode_failures.insert(address);
@@ -12157,6 +13590,35 @@ fn agc_shader_snapshot(
         .ok()
         .flatten()
         .map(Arc::new);
+    if trace_agc_programs() {
+        let specials = (header_address != 0)
+            .then(|| agc_read_mapped_u64(header_address + AGC_SHADER_SPECIALS_OFFSET))
+            .flatten()
+            .unwrap_or_default();
+        let user_data_range = (specials != 0)
+            .then(|| {
+                try_read_process_guest_u32(specials + 0x14)
+                    .map(|packed| (packed & u32::from(u16::MAX), packed >> u16::BITS))
+            })
+            .flatten();
+        let prefix = program
+            .instructions
+            .iter()
+            .take(12)
+            .map(|instruction| {
+                (
+                    instruction.pc,
+                    instruction.opcode,
+                    instruction.words.clone(),
+                    instruction.sources.clone(),
+                    instruction.destinations.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[REMu][AGC][SHADER] decoded code={address:#x} header={header_address:#x} user_data_range={user_data_range:x?} metadata={metadata:x?} prefix={prefix:x?}"
+        );
+    }
     let snapshot = remu_gpu::ShaderSnapshot {
         header_address,
         program,
@@ -12200,6 +13662,39 @@ enum AgcSubmissionError {
         length: u32,
         remaining: u32,
     },
+    #[error("indirect command-buffer nesting exceeds {maximum} levels")]
+    IndirectBufferNesting { maximum: u32 },
+    #[error("INDIRECT_BUFFER packet has {actual} dwords, expected 4 or 14")]
+    IndirectBufferPacketLength { actual: u32 },
+    #[error(
+        "INDIRECT_BUFFER names unreadable command range 0x{address:016X} with {dword_count} dwords"
+    )]
+    InvalidIndirectBuffer { address: u64, dword_count: u32 },
+    #[error("SET_PREDICATION packet has {actual} dwords, expected at least 3")]
+    PredicationPacketLength { actual: u32 },
+    #[error("SET_PREDICATION operation {0} is not implemented")]
+    UnsupportedPredicationOperation(u32),
+    #[error("SET_PREDICATION names unreadable value at 0x{0:016X}")]
+    UnreadablePredicationValue(u64),
+    #[error("COND_EXEC packet has {actual} dwords, expected 5")]
+    CondExecPacketLength { actual: u32 },
+    #[error("COND_EXEC control has unsupported value 0x{0:08X}")]
+    UnsupportedCondExecControl(u32),
+    #[error("COND_EXEC names unreadable value at 0x{0:016X}")]
+    UnreadableCondExecValue(u64),
+    #[error(
+        "COND_EXEC at 0x{packet_address:016X} skips {skip_dwords} dwords beyond the command stream"
+    )]
+    InvalidCondExecRange {
+        packet_address: u64,
+        skip_dwords: u32,
+    },
+    #[error("Gen5 branch uses unsupported mode {0}")]
+    UnsupportedBranchMode(u32),
+    #[error("Gen5 branch uses unsupported comparison function {0}")]
+    UnsupportedBranchComparison(u32),
+    #[error("Gen5 branch names unreadable comparison value at 0x{0:016X}")]
+    UnreadableBranchValue(u64),
     #[error("SET_BASE packet has {actual} dwords, expected 4")]
     SetBasePacketLength { actual: u32 },
     #[error("SET_BASE selects unsupported base index {0}")]
@@ -12210,7 +13705,7 @@ enum AgcSubmissionError {
     ClearStatePacketLength { actual: u32 },
     #[error("CLEAR_STATE control has unsupported bits 0x{0:08X}")]
     UnsupportedClearStateControl(u32),
-    #[error("partial-flush EVENT_WRITE packet has {actual} dwords, expected 2")]
+    #[error("EVENT_WRITE packet has {actual} dwords, expected at least 2")]
     EventWritePacketLength { actual: u32 },
     #[error("partial-flush EVENT_WRITE control has unsupported bits 0x{0:08X}")]
     UnsupportedEventWriteControl(u32),
@@ -12226,6 +13721,8 @@ enum AgcSubmissionError {
         event_index: u32,
         length: u32,
     },
+    #[error("PIXEL_PIPE_STAT_DUMP names invalid qword address 0x{0:016X}")]
+    InvalidPixelPipeStatAddress(u64),
     #[error("native indirect-register opcode 0x{opcode:02X} has {actual} dwords, expected 5")]
     NativeIndirectRegisterPacketLength { opcode: u32, actual: u32 },
     #[error("indexed SET_UCONFIG_REG packet has {actual} dwords, expected 3")]
@@ -12356,7 +13853,7 @@ fn agc_decode_compute_dispatch(
     )
     .map_err(|reason| AgcComputeDispatchError::ShaderEvaluation {
         address: shader_address,
-        reason,
+        reason: format!("{reason}; {}", shader_control_flow_summary(&shader.program)),
     })?;
     graphics.emitted_compute_dispatches = graphics.emitted_compute_dispatches.saturating_add(1);
     Ok(remu_gpu::ComputeDispatch {
@@ -12407,6 +13904,19 @@ fn agc_draw_writes_image(draw: &remu_gpu::IndexedDraw) -> bool {
     })
 }
 
+fn agc_draw_reads_image(draw: &remu_gpu::IndexedDraw) -> bool {
+    [
+        draw.export_shader_evaluation.as_deref(),
+        draw.pixel_shader_evaluation.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|evaluation| &evaluation.image_bindings)
+    .any(|binding| {
+        !binding.opcode.starts_with("ImageStore") && !binding.opcode.starts_with("ImageAtomic")
+    })
+}
+
 fn agc_shader_has_memory_side_effects(shader: Option<&remu_gpu::ShaderSnapshot>) -> bool {
     shader.is_some_and(|shader| {
         shader.program.instructions.iter().any(|instruction| {
@@ -12453,6 +13963,7 @@ fn agc_resolve_targetless_scanout(
     if !color_target_absent
         || agc_has_active_depth_state(&graphics.context_registers)
         || !agc_draw_resources_evaluated(draw)
+        || !agc_draw_reads_image(draw)
         || agc_draw_writes_image(draw)
     {
         return;
@@ -12512,6 +14023,17 @@ fn agc_resolve_targetless_scanout(
 
 fn agc_trace_draw_summary(draw: &remu_gpu::IndexedDraw) {
     if trace_agc_draws() || trace_logarithmic_sequence(draw.sequence, 8) {
+        let export_user_data_base = export_user_data_register(draw);
+        let export_user_data = std::array::from_fn::<_, 8, _>(|index| {
+            draw.shader_registers
+                .iter()
+                .find(|register| {
+                    register.offset
+                        == export_user_data_base
+                            + u32::try_from(index).expect("export scalar index fits")
+                })
+                .map(|register| register.value)
+        });
         let pixel_user_data = std::array::from_fn::<_, 8, _>(|index| {
             draw.shader_registers
                 .iter()
@@ -12528,7 +14050,7 @@ fn agc_trace_draw_summary(draw: &remu_gpu::IndexedDraw) {
                 .map(|register| register.value)
         });
         eprintln!(
-            "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x} scanout={:#x} target_mask={:#x} viewport={viewport:x?} ps_user={pixel_user_data:x?}",
+            "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x} scanout={:#x} target_mask={:#x} viewport={viewport:x?} es_user_base={export_user_data_base:#x} es_user={export_user_data:x?} ps_user={pixel_user_data:x?}",
             draw.sequence,
             draw.indexed,
             draw.index_count,
@@ -12552,6 +14074,7 @@ fn agc_trace_draw_summary(draw: &remu_gpu::IndexedDraw) {
 }
 
 fn agc_emit_draw(
+    packet_address: u64,
     graphics: &mut AgcGraphicsState,
     shaders: &mut AgcShaderRegistry,
     video_out: &VideoOutState,
@@ -12577,6 +14100,19 @@ fn agc_emit_draw(
         AGC_SPI_SHADER_PGM_LO_PS,
         AGC_SPI_SHADER_PGM_HI_PS,
     );
+    if trace_agc_programs() {
+        let pixel_user_data = std::array::from_fn::<_, 8, _>(|index| {
+            graphics
+                .shader_registers
+                .get(&(0x00c + u32::try_from(index).expect("pixel scalar index fits")))
+                .copied()
+                .unwrap_or_default()
+        });
+        eprintln!(
+            "[REMu][AGC][PROGRAM] draw={} packet={packet_address:#x} indexed={indexed} count={element_count} es={export_shader_address:#x} ps={pixel_shader_address:#x} ps_user={pixel_user_data:x?}",
+            graphics.emitted_draws,
+        );
+    }
     let (color_targets, color_target_absent) = agc_prepare_draw_color_targets(graphics);
     let color_target_address = color_targets.first().map_or(0, |target| target.address);
     let primitive_type = graphics
@@ -12682,9 +14218,27 @@ fn agc_emit_draw(
                     .failed_shader_evaluations
                     .insert((0, draw.export_shader_address))
                 {
+                    let resource2_register = export_user_data_base.saturating_sub(1);
+                    let resource2 = graphics.shader_registers.get(&resource2_register).copied();
+                    let user_sgpr_count =
+                        resource2.map(|value| ((value >> 1) & 0x1f) | (((value >> 27) & 1) << 5));
+                    let required_inputs = draw
+                        .export_shader
+                        .as_ref()
+                        .map(|snapshot| {
+                            snapshot
+                                .program
+                                .input_scalar_registers()
+                                .iter()
+                                .copied()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     eprintln!(
-                        "[REMu][AGC][SHADER] export evaluation failed at {:#x}: {error}",
-                        draw.export_shader_address
+                        "[REMu][AGC][SHADER] export evaluation failed at {:#x}: {error}; \
+                         user_base={export_user_data_base:#x} resource2={resource2:#x?} \
+                         user_sgprs={user_sgpr_count:?} required_inputs={required_inputs:x?}",
+                        draw.export_shader_address,
                     );
                 }
             })
@@ -12856,7 +14410,7 @@ fn agc_emit_draw(
         }
     }
     agc_trace_draw_summary(&draw);
-    remu_gpu::emit_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
+    emit_agc_gpu_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
 }
 
 fn shader_control_flow_summary(program: &remu_shader::Program) -> String {
@@ -13177,6 +14731,10 @@ fn trace_msl_pair(draw: &remu_gpu::IndexedDraw, export_user_data_base: u32) -> S
     let Some(pixel_snapshot) = draw.pixel_shader.as_ref() else {
         return "missing-ps".to_owned();
     };
+    // Preserve the decoded IR even when resource discovery fails before either stage can reach
+    // Metal translation. These failures are precisely where the instruction operands and raw
+    // descriptor controls are needed to distinguish an invalid resource from a decoder bug.
+    dump_shader_trace(draw, export_snapshot, pixel_snapshot, None, None);
     let export_evaluation = match evaluate_shader_snapshot(
         draw,
         export_snapshot,
@@ -13370,6 +14928,7 @@ fn agc_emit_indexed_draw(
     future_scanout_target: Option<AgcVideoOutTarget>,
 ) {
     agc_emit_draw(
+        packet_address,
         graphics,
         shaders,
         video_out,
@@ -13422,6 +14981,9 @@ fn decode_agc_pipeline_barrier(
     packet_address: u64,
     length: u32,
 ) -> Result<remu_gpu::GpuPipelineBarrier, AgcSubmissionError> {
+    if length < 2 {
+        return Err(AgcSubmissionError::EventWritePacketLength { actual: length });
+    }
     let control = read_guest_u32(packet_address + 4);
     let event_type = control & 0x3f;
     let event_index = (control >> 8) & 0x7;
@@ -13437,9 +14999,6 @@ fn decode_agc_pipeline_barrier(
             });
         }
     };
-    if length != 2 {
-        return Err(AgcSubmissionError::EventWritePacketLength { actual: length });
-    }
     if control & !0x0000_073f != 0 {
         return Err(AgcSubmissionError::UnsupportedEventWriteControl(control));
     }
@@ -13456,21 +15015,46 @@ fn decode_agc_event_write(
     packet_address: u64,
     length: u32,
 ) -> Result<Option<remu_gpu::GpuPipelineBarrier>, AgcSubmissionError> {
+    if length < 2 {
+        return Err(AgcSubmissionError::EventWritePacketLength { actual: length });
+    }
     let control = read_guest_u32(packet_address + 4);
     let event_type = control & 0x3f;
+    let event_index = (control >> 8) & 0xf;
     if matches!(event_type, 0x07 | 0x0f | 0x10) {
         return decode_agc_pipeline_barrier(packet_address, length).map(Some);
     }
-    if length != 2 {
-        return Err(AgcSubmissionError::EventWritePacketLength { actual: length });
+    // EVENT_TYPE=0x39 is PIXEL_PIPE_STAT_DUMP. AMD assigns it EVENT_INDEX=1 (the
+    // ZPASS_DONE/PIXEL_PIPE_STAT group), and the two remaining packet dwords name the qword-aligned
+    // occlusion-counter destination. The attached RDNA2 ISA manual covers shader instructions,
+    // not PM4, but AMD's packet documentation and Linux's GFX10 `nvd.h` agree on this four-dword
+    // form. KytyPS5 deliberately accepts this event without synthesizing counters; do the same
+    // until Metal visibility-result buffers are wired into guest query memory. Rejecting it is
+    // worse than the documented no-result fallback because Unreal treats a refused DCB as fatal.
+    if event_type == 0x39 {
+        if event_index != 1 || length != 4 || control & !0x0000_0f3f != 0 {
+            return Err(AgcSubmissionError::UnsupportedEventWrite {
+                event_type,
+                event_index,
+                length,
+            });
+        }
+        let destination = read_guest_u64(packet_address + 8);
+        if destination == 0 || !destination.is_multiple_of(8) {
+            return Err(AgcSubmissionError::InvalidPixelPipeStatAddress(destination));
+        }
+        return Ok(None);
     }
-    // Non-addressed Gen5 events use only EVENT_TYPE. They signal registered graphics queues in
-    // submission order; EVENT_INDEX is reserved for the three partial-flush forms above.
+    // Non-addressed Gen5 events use only EVENT_TYPE. EVENT_INDEX is reserved for the three
+    // partial-flush forms above and the addressed pixel-pipe dump handled above; these packets
+    // perform GPU cache actions and do not themselves signal a kernel graphics queue. The packet
+    // processor consumes the header-declared length: some native command streams pad these events
+    // to four dwords, and the unused payload does not change the event semantics.
     if control & !0x3f != 0 {
-        return if (control >> 8) & 0x7 != 0 {
+        return if event_index != 0 {
             Err(AgcSubmissionError::UnsupportedEventWrite {
                 event_type,
-                event_index: (control >> 8) & 0x7,
+                event_index,
                 length,
             })
         } else {
@@ -13538,8 +15122,8 @@ fn decode_agc_dma_data(
                 read_guest_u64(packet_address + 8),
                 read_guest_u64(packet_address + 16),
                 u64::from(command & 0x03ff_ffff),
-                (control >> 29) & 0x3,
-                (control >> 20) & 0x3,
+                ((control >> 29) & 0x3) | ((command >> 24) & 0x4) | ((command >> 25) & 0x8),
+                ((control >> 20) & 0x3) | ((command >> 25) & 0x4) | ((command >> 26) & 0x8),
             )
         } else {
             if length < 8 {
@@ -13554,7 +15138,10 @@ fn decode_agc_dma_data(
                 control & 0xff,
             )
         };
-    if source_address < 0x10_000
+    let source_is_memory = matches!(source_selection, 0 | 3);
+    let source_is_immediate = source_selection == 2;
+    if (!source_is_memory && !source_is_immediate)
+        || (source_is_memory && source_address < 0x10_000)
         || destination_address < 0x10_000
         || byte_count == 0
         || byte_count > 512 * 1024 * 1024
@@ -13640,16 +15227,18 @@ fn agc_handle_submission_packet(
     }
     if opcode == AGC_IT_EVENT_WRITE {
         if let Some(barrier) = decode_agc_event_write(packet_address, length)? {
-            remu_gpu::pipeline_barrier(barrier);
-        } else {
-            event_writes.push(read_guest_u32(packet_address + 4) & 0x3f);
+            emit_agc_gpu_event(remu_gpu::GpuEvent::PipelineBarrier(barrier));
         }
+        // EVENT_WRITE performs a cache or pipeline action. It is not an end-of-pipe interrupt;
+        // completion notifications come from RELEASE_MEM interrupt selectors or the driver's
+        // submit-on-done fallback.
+        let _ = event_writes;
     }
     if ((opcode == AGC_IT_WRITE_DATA) || (opcode == AGC_IT_NOP && register == AGC_R_WRITE_DATA))
         && let Some(write) =
             decode_agc_memory_write(packet_address, length, opcode == AGC_IT_WRITE_DATA)
     {
-        remu_gpu::emit_event(remu_gpu::GpuEvent::MemoryWrite(write));
+        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryWrite(write));
     }
     if (opcode == AGC_IT_DMA_DATA || (opcode == AGC_IT_NOP && register == AGC_R_DMA_DATA))
         && let Some(mut copy) =
@@ -13662,7 +15251,8 @@ fn agc_handle_submission_packet(
         copy.cpu_applied = mirror_agc_cpu_memory_copy(&copy);
         static DMA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
         let sequence = DMA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if sequence <= 32
+        if trace_agc_programs()
+            || sequence <= 32
             || sequence.is_power_of_two()
             || graphics
                 .sampled_texture_addresses
@@ -13678,36 +15268,38 @@ fn agc_handle_submission_packet(
                 copy.byte_count,
             );
         }
-        remu_gpu::emit_event(remu_gpu::GpuEvent::MemoryCopy(copy));
+        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryCopy(copy));
     }
     if opcode == AGC_IT_NOP && register == AGC_R_ACQUIRE_MEM && length >= 8 {
-        remu_gpu::acquire_memory(decode_agc_memory_acquire(packet_address));
+        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryAcquire(
+            decode_agc_memory_acquire(packet_address),
+        ));
     }
     if opcode == AGC_IT_NOP
         && register == AGC_R_RELEASE_MEM
         && length >= 7
         && let Some(release) = decode_agc_memory_release(packet_address, false)
     {
-        remu_gpu::emit_event(remu_gpu::GpuEvent::MemoryRelease(release));
+        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(release));
     }
     if opcode == AGC_IT_RELEASE_MEM
         && length >= 8
         && let Some(release) = decode_agc_memory_release(packet_address, true)
     {
-        remu_gpu::emit_event(remu_gpu::GpuEvent::MemoryRelease(release));
+        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(release));
     }
     if opcode == AGC_IT_NOP
         && matches!(register, AGC_R_WAIT_MEM_32 | AGC_R_WAIT_MEM_64)
         && length >= if register == AGC_R_WAIT_MEM_64 { 9 } else { 6 }
         && let Some(wait) = decode_agc_memory_wait(packet_address, register, false)
     {
-        remu_gpu::emit_event(remu_gpu::GpuEvent::MemoryWait(wait));
+        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryWait(wait));
     }
     if opcode == AGC_IT_WAIT_REG_MEM
         && length >= 7
         && let Some(wait) = decode_agc_memory_wait(packet_address, register, true)
     {
-        remu_gpu::emit_event(remu_gpu::GpuEvent::MemoryWait(wait));
+        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryWait(wait));
     }
     if opcode == AGC_IT_INDEX_BASE && length >= 3 {
         graphics.index_buffer_address = u64::from(read_guest_u32(packet_address + 4))
@@ -13734,6 +15326,7 @@ fn agc_handle_submission_packet(
             .copied()
             .unwrap_or_default();
         agc_emit_draw(
+            packet_address,
             graphics,
             shaders,
             video_out,
@@ -13755,6 +15348,7 @@ fn agc_handle_submission_packet(
     }
     if opcode == AGC_IT_DRAW_INDEX_AUTO && length >= 3 {
         agc_emit_draw(
+            packet_address,
             graphics,
             shaders,
             video_out,
@@ -13767,6 +15361,7 @@ fn agc_handle_submission_packet(
     }
     if opcode == AGC_IT_NOP && register == AGC_R_DRAW_INDEX_AUTO && length >= 2 {
         agc_emit_draw(
+            packet_address,
             graphics,
             shaders,
             video_out,
@@ -13844,7 +15439,18 @@ fn agc_handle_submission_packet(
                 dispatch.sequence, dispatch.shader_address,
             );
         }
-        remu_gpu::emit_event(remu_gpu::GpuEvent::ComputeDispatch(Box::new(dispatch)));
+        if dispatch.launch.is_empty() {
+            eprintln!(
+                "[REMu][AGC] skipped empty compute dispatch={} source={:?} grid={:?} base={:?} cs={:#x}",
+                dispatch.sequence,
+                dispatch.source,
+                dispatch.launch.grid,
+                dispatch.launch.base_group,
+                dispatch.shader_address,
+            );
+        } else {
+            emit_agc_gpu_event(remu_gpu::GpuEvent::ComputeDispatch(Box::new(dispatch)));
+        }
     }
     if opcode == AGC_IT_NOP && register == AGC_R_FLIP && length >= 6 {
         let handle = read_guest_u32(packet_address + 4);
@@ -13933,18 +15539,14 @@ fn decode_agc_memory_wait(
     } else {
         (
             read_guest_u64(packet_address + 4),
-            u64::from(read_guest_u32(packet_address + 20)),
+            u64::from(read_guest_u32(packet_address + 16)),
             u64::from(read_guest_u32(packet_address + 12)),
-            read_guest_u32(packet_address + 16),
+            read_guest_u32(packet_address + 20),
         )
     };
     let compare_function = control & 0x7;
     let alignment = if is_64_bit { 8 } else { 4 };
-    let decoded = if address == 0
-        || mask == 0
-        || !address.is_multiple_of(alignment)
-        || matches!(compare_function, 0 | 7)
-    {
+    let decoded = if address == 0 || !address.is_multiple_of(alignment) || compare_function == 7 {
         None
     } else {
         Some(remu_gpu::GpuMemoryWait {
@@ -13973,6 +15575,190 @@ fn decode_agc_memory_wait(
         );
     }
     decoded
+}
+
+fn agc_read_mapped_u32(address: u64) -> Option<u32> {
+    let mut bytes = [0_u8; 4];
+    ProcessGuestMemory
+        .read(address, &mut bytes)
+        .then(|| u32::from_le_bytes(bytes))
+}
+
+fn agc_read_mapped_u64(address: u64) -> Option<u64> {
+    let mut bytes = [0_u8; 8];
+    ProcessGuestMemory
+        .read(address, &mut bytes)
+        .then(|| u64::from_le_bytes(bytes))
+}
+
+fn agc_apply_predication(
+    packet: AgcSubmissionPacket,
+    graphics: &mut AgcGraphicsState,
+) -> Result<(), AgcSubmissionError> {
+    if packet.length < 3 {
+        return Err(AgcSubmissionError::PredicationPacketLength {
+            actual: packet.length,
+        });
+    }
+    let payload_dwords = packet.length - 1;
+    let first = read_guest_u32(packet.address + 4);
+    let second = read_guest_u32(packet.address + 8);
+    let third = (payload_dwords >= 3).then(|| read_guest_u32(packet.address + 12));
+    const PREDICATION_FLAGS_MASK: u32 = 0x0007_1100;
+    let (flags, value_address) =
+        if third.is_some_and(|third| first & !PREDICATION_FLAGS_MASK == 0 && third <= 0xffff) {
+            (
+                first,
+                u64::from(second & 0xffff_fff0) | (u64::from(third.unwrap_or_default()) << 32),
+            )
+        } else {
+            (
+                second,
+                u64::from(first & 0xffff_fff0) | (u64::from(second & 0xff) << 32),
+            )
+        };
+    let condition = (flags >> 8) & 1;
+    let operation = (flags >> 16) & 7;
+    match operation {
+        0 => graphics.predicate_skip = false,
+        3 => {
+            let value = agc_read_mapped_u64(value_address).ok_or(
+                AgcSubmissionError::UnreadablePredicationValue(value_address),
+            )?;
+            graphics.predicate_skip = match condition {
+                0 => value != 0,
+                _ => value == 0,
+            };
+            if trace_agc_registers() || trace_agc_programs() {
+                eprintln!(
+                    "[REMu][AGC][PRED] address={value_address:#x} value={value:#x} condition={condition} skip={}",
+                    graphics.predicate_skip
+                );
+            }
+        }
+        _ => {
+            return Err(AgcSubmissionError::UnsupportedPredicationOperation(
+                operation,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn agc_cond_exec_skip_end(
+    packet: AgcSubmissionPacket,
+    command_end: u64,
+) -> Result<Option<u64>, AgcSubmissionError> {
+    if packet.length != 5 {
+        return Err(AgcSubmissionError::CondExecPacketLength {
+            actual: packet.length,
+        });
+    }
+    let low = read_guest_u32(packet.address + 4);
+    let high = read_guest_u32(packet.address + 8);
+    let reserved = read_guest_u32(packet.address + 12);
+    let control = low & 3;
+    if control != 0 || reserved != 0 {
+        return Err(AgcSubmissionError::UnsupportedCondExecControl(
+            control | reserved,
+        ));
+    }
+    let value_address = u64::from(low & !3) | (u64::from(high) << 32);
+    let value = agc_read_mapped_u32(value_address)
+        .ok_or(AgcSubmissionError::UnreadableCondExecValue(value_address))?;
+    if value != 0 {
+        return Ok(None);
+    }
+    let skip_dwords = read_guest_u32(packet.address + 16) & 0x3fff;
+    let packet_end = packet.address + u64::from(packet.length) * 4;
+    let Some(skip_end) = packet_end.checked_add(u64::from(skip_dwords) * 4) else {
+        return Err(AgcSubmissionError::InvalidCondExecRange {
+            packet_address: packet.address,
+            skip_dwords,
+        });
+    };
+    if skip_end > command_end {
+        return Err(AgcSubmissionError::InvalidCondExecRange {
+            packet_address: packet.address,
+            skip_dwords,
+        });
+    }
+    if trace_agc_registers() || trace_agc_programs() {
+        eprintln!(
+            "[REMu][AGC][COND] address={value_address:#x} value=0 skip_dwords={skip_dwords} end={skip_end:#x}"
+        );
+    }
+    Ok(Some(skip_end))
+}
+
+fn agc_branch_is_satisfied(value: u64, reference: u64, mask: u64, comparison: u32) -> bool {
+    match comparison {
+        0 => true,
+        1 => value & mask < reference,
+        2 => value & mask <= reference,
+        3 => value & mask == reference,
+        4 => value & mask != reference,
+        5 => value & mask >= reference,
+        6 => value & mask > reference,
+        _ => false,
+    }
+}
+
+fn agc_branch_target(
+    packet: AgcSubmissionPacket,
+) -> Result<Option<(u64, u32)>, AgcSubmissionError> {
+    let control = read_guest_u32(packet.address + 4);
+    let mode = control & 3;
+    let comparison = (control >> 8) & 7;
+    if !matches!(mode, 1 | 2) {
+        return Err(AgcSubmissionError::UnsupportedBranchMode(mode));
+    }
+    if comparison > 6 {
+        return Err(AgcSubmissionError::UnsupportedBranchComparison(comparison));
+    }
+    let compare_address = u64::from(read_guest_u32(packet.address + 8) & !7)
+        | (u64::from(read_guest_u32(packet.address + 12)) << 32);
+    // Comparison zero is the native unconditional form. The address still acts as a queue label
+    // for command-buffer stitching, but the command processor does not need its contents to pick
+    // a target.
+    let value = if comparison == 0 {
+        0
+    } else {
+        agc_read_mapped_u64(compare_address)
+            .ok_or(AgcSubmissionError::UnreadableBranchValue(compare_address))?
+    };
+    let mask = read_guest_u64(packet.address + 16);
+    let reference = read_guest_u64(packet.address + 24);
+    let take_then = agc_branch_is_satisfied(value, reference, mask, comparison);
+    let (address_offset, count_offset) = if take_then {
+        (32, 40)
+    } else if mode == 2 {
+        (44, 52)
+    } else {
+        return Ok(None);
+    };
+    let address = u64::from(read_guest_u32(packet.address + address_offset) & !3)
+        | (u64::from(read_guest_u32(packet.address + address_offset + 4)) << 32);
+    let dword_count = read_guest_u32(packet.address + count_offset) & 0x000f_ffff;
+    if trace_agc_registers() || trace_agc_programs() {
+        eprintln!(
+            "[REMu][AGC][BRANCH] compare={compare_address:#x} value={value:#x} reference={reference:#x} mask={mask:#x} function={comparison} then={take_then} target={address:#x}/{dword_count}"
+        );
+    }
+    (address != 0 && dword_count != 0)
+        .then_some((address, dword_count))
+        .map_or(Ok(None), |(address, dword_count)| {
+            let byte_count = usize::try_from(u64::from(dword_count) * 4)
+                .expect("the 20-bit branch dword count fits usize");
+            if process_guest_range_is_readable(address, byte_count) {
+                Ok(Some((address, dword_count)))
+            } else {
+                Err(AgcSubmissionError::InvalidIndirectBuffer {
+                    address,
+                    dword_count,
+                })
+            }
+        })
 }
 
 struct AgcSubmissionContext<'a> {
@@ -14033,6 +15819,75 @@ fn agc_parse_submission(
     dword_count: u32,
     context: &mut AgcSubmissionContext<'_>,
 ) -> Result<(), AgcSubmissionError> {
+    let (offset, packet_counts) =
+        agc_parse_command_stream(command_address, dword_count, context, 0)?;
+
+    *context.submission_count = context.submission_count.saturating_add(1);
+    if trace_agc_programs() || trace_logarithmic_sequence(*context.submission_count, 8) {
+        let packet_summary = packet_counts
+            .iter()
+            .map(|(&(opcode, register), &count)| {
+                format!("op={opcode:#04x}/reg={register:#04x}:{count}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "[REMu][AGC] submit={} address={command_address:#x} dwords={dword_count} parsed={offset} packets=[{packet_summary}] flips={}",
+            context.submission_count,
+            context.flips.len()
+        );
+    }
+    Ok(())
+}
+
+fn agc_parse_graphics_submission(
+    command_address: u64,
+    dword_count: u32,
+    context: &mut AgcSubmissionContext<'_>,
+) -> Result<(), AgcSubmissionError> {
+    let continuation_packets = agc_command_abi::take_graphics_continuations_before(command_address);
+    let has_explicit_continuation = !continuation_packets.is_empty();
+    for packet_address in continuation_packets {
+        let packet = AgcSubmissionPacket {
+            address: packet_address,
+            length: 14,
+            opcode: AGC_IT_INDIRECT_BUFFER,
+            register: 0,
+            predicated: false,
+        };
+        if let Some((target_address, target_dword_count)) = agc_branch_target(packet)? {
+            eprintln!(
+                "[REMu][AGC] applying graphics continuation packet={packet_address:#x} target={target_address:#x}/{target_dword_count} before={command_address:#x}"
+            );
+            agc_parse_command_stream(target_address, target_dword_count, context, 1)?;
+            agc_command_abi::consume_recorded_graphics_range(target_address, target_dword_count);
+        }
+    }
+    if !has_explicit_continuation {
+        if let Some((prefix_address, prefix_dword_count)) =
+            agc_command_abi::take_recorded_graphics_prefix(command_address)
+        {
+            eprintln!(
+                "[REMu][AGC] applying recorded graphics prefix address={prefix_address:#x} dwords={prefix_dword_count} before={command_address:#x}"
+            );
+            agc_parse_command_stream(prefix_address, prefix_dword_count, context, 1)?;
+        }
+    }
+    agc_parse_submission(command_address, dword_count, context)
+}
+
+fn agc_parse_command_stream(
+    command_address: u64,
+    dword_count: u32,
+    context: &mut AgcSubmissionContext<'_>,
+    nesting: u32,
+) -> Result<(u32, BTreeMap<(u32, u32), u32>), AgcSubmissionError> {
+    const MAX_INDIRECT_BUFFER_NESTING: u32 = 32;
+    if nesting > MAX_INDIRECT_BUFFER_NESTING {
+        return Err(AgcSubmissionError::IndirectBufferNesting {
+            maximum: MAX_INDIRECT_BUFFER_NESTING,
+        });
+    }
     let mut offset = 0_u32;
     let mut packet_counts = BTreeMap::<(u32, u32), u32>::new();
     let mut packets = Vec::new();
@@ -14079,14 +15934,109 @@ fn agc_parse_submission(
         if packet.opcode == AGC_IT_EVENT_WRITE {
             decode_agc_event_write(packet.address, packet.length)?;
         }
+        if packet.opcode == AGC_IT_INDIRECT_BUFFER && !matches!(packet.length, 4 | 14) {
+            return Err(AgcSubmissionError::IndirectBufferPacketLength {
+                actual: packet.length,
+            });
+        }
     }
 
     let future_scanout_targets = agc_future_scanout_targets(&packets, context.video_out);
+    let command_end = command_address + u64::from(dword_count) * 4;
+    let mut conditional_skip_end = None;
     for (packet, future_scanout_target) in packets
         .iter()
         .copied()
         .zip(future_scanout_targets.into_iter())
     {
+        if conditional_skip_end.is_some_and(|skip_end| packet.address < skip_end) {
+            let packet_end = packet.address + u64::from(packet.length) * 4;
+            if packet_end > conditional_skip_end.unwrap_or_default() {
+                return Err(AgcSubmissionError::InvalidCondExecRange {
+                    packet_address: packet.address,
+                    skip_dwords: packet.length,
+                });
+            }
+            continue;
+        }
+        conditional_skip_end = None;
+        if packet.predicated && context.graphics.predicate_skip {
+            if trace_agc_registers() {
+                eprintln!(
+                    "[REMu][AGC][PRED] skipped packet={:#x} opcode={:#x} register={:#x} dwords={}",
+                    packet.address, packet.opcode, packet.register, packet.length
+                );
+            }
+            continue;
+        }
+        if packet.opcode == AGC_IT_SET_PREDICATION {
+            agc_apply_predication(packet, context.graphics)?;
+            continue;
+        }
+        if packet.opcode == AGC_IT_COND_EXEC {
+            conditional_skip_end = agc_cond_exec_skip_end(packet, command_end)?;
+            continue;
+        }
+        if packet.opcode == AGC_IT_INDIRECT_BUFFER {
+            if packet.length == 14 {
+                if agc_command_abi::graphics_continuation_was_consumed(packet.address) {
+                    if trace_agc_registers() || trace_agc_programs() {
+                        eprintln!(
+                            "[REMu][AGC][BRANCH] skipped already-applied continuation packet={:#x}",
+                            packet.address
+                        );
+                    }
+                    continue;
+                }
+                if let Some((branch_address, branch_dword_count)) = agc_branch_target(packet)? {
+                    agc_parse_command_stream(
+                        branch_address,
+                        branch_dword_count,
+                        context,
+                        nesting + 1,
+                    )?;
+                    // This target has now executed as part of the native branch. Its constructor
+                    // records exist only so a target separated from its submitted tail can be
+                    // recovered when the branch packet itself is unavailable. Leaving them live
+                    // lets the adjacent tail reconstruct and execute this prefix a second time,
+                    // after completion labels in it may already have been returned to the guest
+                    // allocator. That stale replay creates producerless WAIT_REG_MEM deadlocks.
+                    agc_command_abi::consume_recorded_graphics_range(
+                        branch_address,
+                        branch_dword_count,
+                    );
+                }
+                agc_command_abi::retire_pending_graphics_continuation(packet.address);
+                continue;
+            }
+            let indirect_address = u64::from(read_guest_u32(packet.address + 4) & !3)
+                | (u64::from(read_guest_u32(packet.address + 8)) << 32);
+            let indirect_dword_count = read_guest_u32(packet.address + 12) & 0x000f_ffff;
+            if indirect_dword_count == 0 {
+                continue;
+            }
+            let byte_count = usize::try_from(u64::from(indirect_dword_count) * 4)
+                .expect("the 20-bit indirect dword count fits usize");
+            if indirect_address == 0
+                || !process_guest_range_is_readable(indirect_address, byte_count)
+            {
+                return Err(AgcSubmissionError::InvalidIndirectBuffer {
+                    address: indirect_address,
+                    dword_count: indirect_dword_count,
+                });
+            }
+            static INDIRECT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+            let sequence = INDIRECT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if trace_agc_programs() || (nesting < 8 && trace_logarithmic_sequence(sequence, 32)) {
+                eprintln!(
+                    "[REMu][AGC] indirect sequence={sequence} depth={} packet={:#x} address={indirect_address:#x} dwords={indirect_dword_count}",
+                    nesting + 1,
+                    packet.address,
+                );
+            }
+            agc_parse_command_stream(indirect_address, indirect_dword_count, context, nesting + 1)?;
+            continue;
+        }
         agc_handle_submission_packet(
             packet,
             context.graphics,
@@ -14099,22 +16049,7 @@ fn agc_parse_submission(
         )?;
     }
 
-    *context.submission_count = context.submission_count.saturating_add(1);
-    if trace_logarithmic_sequence(*context.submission_count, 8) {
-        let packet_summary = packet_counts
-            .iter()
-            .map(|(&(opcode, register), &count)| {
-                format!("op={opcode:#04x}/reg={register:#04x}:{count}")
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        eprintln!(
-            "[REMu][AGC] submit={} address={command_address:#x} dwords={dword_count} parsed={offset} packets=[{packet_summary}] flips={}",
-            context.submission_count,
-            context.flips.len()
-        );
-    }
-    Ok(())
+    Ok((offset, packet_counts))
 }
 
 fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -14133,21 +16068,29 @@ fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
         );
         return u64::MAX;
     }
+    let next_submission = state.agc_submission_count.saturating_add(1);
+    if trace_agc_programs() || trace_logarithmic_sequence(next_submission, 8) {
+        eprintln!(
+            "[REMu][AGC] queue=graphics submit={next_submission} address={command_address:#x} dwords={dword_count}"
+        );
+    }
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
-    let result = agc_parse_submission(
-        command_address,
-        dword_count,
-        &mut AgcSubmissionContext {
-            graphics: &mut state.agc_graphics,
-            shaders: &mut state.agc_shader_registry,
-            index_resources: &state.agc_index_resources,
-            video_out: &state.video_out,
-            submission_count: &mut state.agc_submission_count,
-            flips: &mut flips,
-            event_writes: &mut event_writes,
-        },
-    );
+    let (result, gpu_events) = capture_agc_gpu_events(|| {
+        agc_parse_graphics_submission(
+            command_address,
+            dword_count,
+            &mut AgcSubmissionContext {
+                graphics: &mut state.agc_graphics,
+                shaders: &mut state.agc_shader_registry,
+                index_resources: &state.agc_index_resources,
+                video_out: &state.video_out,
+                submission_count: &mut state.agc_submission_count,
+                flips: &mut flips,
+                event_writes: &mut event_writes,
+            },
+        )
+    });
     for (handle, buffer_index, flip_argument) in flips {
         queue_video_out_flip(state, handle, buffer_index, flip_argument);
     }
@@ -14156,7 +16099,8 @@ fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
     }
     match result {
         Ok(()) => {
-            request_agc_submission_completion(state);
+            agc_command_abi::track_graphics_submission(command_address, dword_count);
+            request_agc_submission_completion(state, 0, gpu_events);
             0
         }
         Err(error) => {
@@ -14179,19 +16123,21 @@ fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
         if command_address != 0 && dword_count != 0 && dword_count <= 1_000_000 {
             let mut flips = Vec::new();
             let mut event_writes = Vec::new();
-            let result = agc_parse_submission(
-                command_address,
-                dword_count,
-                &mut AgcSubmissionContext {
-                    graphics: &mut state.agc_graphics,
-                    shaders: &mut state.agc_shader_registry,
-                    index_resources: &state.agc_index_resources,
-                    video_out: &state.video_out,
-                    submission_count: &mut state.agc_submission_count,
-                    flips: &mut flips,
-                    event_writes: &mut event_writes,
-                },
-            );
+            let (result, gpu_events) = capture_agc_gpu_events(|| {
+                agc_parse_graphics_submission(
+                    command_address,
+                    dword_count,
+                    &mut AgcSubmissionContext {
+                        graphics: &mut state.agc_graphics,
+                        shaders: &mut state.agc_shader_registry,
+                        index_resources: &state.agc_index_resources,
+                        video_out: &state.video_out,
+                        submission_count: &mut state.agc_submission_count,
+                        flips: &mut flips,
+                        event_writes: &mut event_writes,
+                    },
+                )
+            });
             for (handle, buffer_index, flip_argument) in flips {
                 queue_video_out_flip(state, handle, buffer_index, flip_argument);
             }
@@ -14199,7 +16145,10 @@ fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
                 queue_agc_event_write(state, event_type);
             }
             match result {
-                Ok(()) => request_agc_submission_completion(state),
+                Ok(()) => {
+                    agc_command_abi::track_graphics_submission(command_address, dword_count);
+                    request_agc_submission_completion(state, 0, gpu_events);
+                }
                 Err(error) => {
                     eprintln!("[REMu][AGC] rejected DCB {index} in multi-submission: {error}");
                     return u64::MAX;
@@ -14276,16 +16225,24 @@ fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
         );
         return u64::MAX;
     }
+    let next_submission = state.agc_submission_count.saturating_add(1);
+    if trace_agc_programs() || trace_logarithmic_sequence(next_submission, 8) {
+        eprintln!(
+            "[REMu][AGC] queue=async-compute owner={owner} submit={next_submission} address={command_address:#x} dwords={dword_count}"
+        );
+    }
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
-    let result = agc_submit_compute_commands(
-        owner,
-        command_address,
-        dword_count,
-        state,
-        &mut flips,
-        &mut event_writes,
-    );
+    let (result, gpu_events) = capture_agc_gpu_events(|| {
+        agc_submit_compute_commands(
+            owner,
+            command_address,
+            dword_count,
+            state,
+            &mut flips,
+            &mut event_writes,
+        )
+    });
     for (handle, buffer_index, flip_argument) in flips {
         queue_video_out_flip(state, handle, buffer_index, flip_argument);
     }
@@ -14293,7 +16250,15 @@ fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
         queue_agc_event_write(state, event_type);
     }
     match result {
-        Ok(()) => 0,
+        Ok(()) => {
+            // The native driver asks the compute backend to trigger an interrupt when the
+            // command buffer does not already contain one. SubmissionBoundary is our backend
+            // flush/completion point, so every accepted ACB needs one just like a DCB does.
+            // Without it, the last compute batch remains open and the guest waits forever for
+            // the queue completion before it can submit the next frame.
+            request_agc_compute_submission_completion(state, u64::from(owner) + 1, gpu_events);
+            0
+        }
         Err(error) => {
             eprintln!("[REMu][AGC] rejected ACB submission for owner {owner}: {error}");
             u64::MAX
@@ -14317,14 +16282,16 @@ fn agc_driver_submit_multi_acbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
         }
         let mut flips = Vec::new();
         let mut event_writes = Vec::new();
-        let result = agc_submit_compute_commands(
-            owner,
-            command_address,
-            dword_count,
-            state,
-            &mut flips,
-            &mut event_writes,
-        );
+        let (result, gpu_events) = capture_agc_gpu_events(|| {
+            agc_submit_compute_commands(
+                owner,
+                command_address,
+                dword_count,
+                state,
+                &mut flips,
+                &mut event_writes,
+            )
+        });
         for (handle, buffer_index, flip_argument) in flips {
             queue_video_out_flip(state, handle, buffer_index, flip_argument);
         }
@@ -14332,7 +16299,9 @@ fn agc_driver_submit_multi_acbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
             queue_agc_event_write(state, event_type);
         }
         match result {
-            Ok(()) => {}
+            Ok(()) => {
+                request_agc_compute_submission_completion(state, u64::from(owner) + 1, gpu_events)
+            }
             Err(error) => {
                 eprintln!(
                     "[REMu][AGC] rejected ACB {index} for owner {owner} in multi-submission: {error}"
@@ -14900,14 +16869,11 @@ fn pthread_mutex_attr_set_protocol(arguments: [u64; 6], state: &mut ProbeDispatc
 
 fn pthread_key_create(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     if arguments[0] == 0 {
-        return u64::from(libc::EINVAL.cast_unsigned());
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(key) = state.next_pthread_key.checked_add(1).map(|next| {
-        let key = state.next_pthread_key;
-        state.next_pthread_key = next;
-        key
-    }) else {
-        return u64::from(libc::EAGAIN.cast_unsigned());
+    const MAX_KEYS: u32 = 256;
+    let Some(key) = (0..MAX_KEYS).find(|key| !state.pthread_keys.contains_key(key)) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
     };
     state.pthread_keys.insert(key, arguments[1]);
     write_guest_u32(arguments[0], key);
@@ -14916,7 +16882,7 @@ fn pthread_key_create(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u6
 
 fn pthread_key_delete(key: u32, state: &mut ProbeDispatchState) -> u64 {
     if state.pthread_keys.remove(&key).is_none() {
-        return u64::from(libc::ENOENT.cast_unsigned());
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
         values.remove(&key);
@@ -14927,7 +16893,7 @@ fn pthread_key_delete(key: u32, state: &mut ProbeDispatchState) -> u64 {
 fn pthread_set_specific(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     let key = low_u32(arguments[0]);
     if !state.pthread_keys.contains_key(&key) {
-        return u64::from(libc::ENOENT.cast_unsigned());
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
         values.insert(key, arguments[1]);
@@ -14937,6 +16903,65 @@ fn pthread_set_specific(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 
 
 fn pthread_get_specific(key: u32) -> u64 {
     GUEST_PTHREAD_SPECIFIC.with_borrow(|values| values.get(&key).copied().unwrap_or(0))
+}
+
+fn take_current_thread_specific_destructors(state: &ProbeDispatchState) -> Vec<(u64, u64)> {
+    GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
+        state
+            .pthread_keys
+            .iter()
+            .filter_map(|(&key, &destructor)| {
+                let value = values.get_mut(&key)?;
+                if destructor == 0 || *value == 0 {
+                    return None;
+                }
+                let argument = *value;
+                *value = 0;
+                Some((destructor, argument))
+            })
+            .collect()
+    })
+}
+
+fn run_guest_thread_destructors() {
+    let Some(dispatch) = PROBE_DISPATCH.get() else {
+        return;
+    };
+    let thread_dtors = dispatch
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .thread_dtors_callback;
+    if thread_dtors != 0 {
+        type Callback = unsafe extern "C" fn();
+        // SAFETY: `_sceKernelSetThreadDtors` registers a live no-argument guest callback. The
+        // process dispatch lock is not held, so the callback may freely re-enter guest imports.
+        let callback: Callback = unsafe { std::mem::transmute(thread_dtors) };
+        // SAFETY: The registration defines the callback ABI above.
+        unsafe { callback() };
+    }
+
+    const DESTRUCTOR_ITERATIONS: usize = 4;
+    for _ in 0..DESTRUCTOR_ITERATIONS {
+        let destructors = {
+            let state = dispatch
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            take_current_thread_specific_destructors(&state)
+        };
+        if destructors.is_empty() {
+            break;
+        }
+        for (function, argument) in destructors {
+            type Destructor = unsafe extern "C" fn(u64);
+            // SAFETY: pthread-key creation registers a live guest SysV destructor and the value is
+            // the opaque pointer installed by this same thread. It was cleared before this call so
+            // a destructor may install a replacement for the next iteration.
+            let destructor: Destructor = unsafe { std::mem::transmute(function) };
+            // SAFETY: The key registration defines the destructor ABI above.
+            unsafe { destructor(argument) };
+        }
+    }
+    GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
 }
 
 fn pthread_condition_attr_init(address: u64, state: &mut ProbeDispatchState) -> u64 {
@@ -16226,7 +18251,7 @@ fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 
         arguments[2],
         arguments[3],
     );
-    if output == 0 || output_size < VIRTUAL_QUERY_INFO_SIZE {
+    if output == 0 || output_size != VIRTUAL_QUERY_INFO_SIZE || !matches!(flags, 0 | 1) {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let Some(memory) = state.kernel_memory.as_ref() else {
@@ -16249,7 +18274,10 @@ fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 
     };
     write_guest_u8(output + 0x20, mapping_flags);
     for (index, byte) in name.iter().copied().enumerate() {
-        write_guest_u8(output + 0x21 + u64::try_from(index).unwrap_or(0), byte);
+        // `VirtualQueryInfo` stores all mapping booleans in the complete dword at 0x20. The
+        // 32-byte name begins at 0x24; starting it at 0x21 corrupts the remaining bitfield bytes
+        // and shifts the name three bytes ahead of the ABI consumed by Unreal.
+        write_guest_u8(output + 0x24 + u64::try_from(index).unwrap_or(0), byte);
     }
     if trace_guest_vm() {
         eprintln!(
@@ -16369,6 +18397,12 @@ fn trace_guest_vfs() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_VFS").is_some_and(|value| value == "1"))
 }
 
+fn trace_guest_vfs_miss() -> Option<u64> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    (trace_guest_vfs() || trace_logarithmic_sequence(sequence, 32)).then_some(sequence)
+}
+
 fn trace_agc_shaders() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -16398,6 +18432,13 @@ fn trace_agc_registers() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("REMU_TRACE_AGC_REGISTERS").is_some_and(|value| value == "1")
+    })
+}
+
+fn trace_agc_programs() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_AGC_PROGRAMS").is_some_and(|value| value == "1")
     })
 }
 
@@ -16760,12 +18801,51 @@ fn av_player_probe_video(path: &Path) -> Option<(u32, u32, f64, Duration)> {
         .then_some((width, height, frames_per_second, duration))
 }
 
+fn av_player_remove_unreal_leading_dot_segments(path: &str) -> Option<&str> {
+    let mut normalized = path;
+    let mut removed_parent = false;
+    loop {
+        if let Some(rest) = normalized.strip_prefix("../") {
+            normalized = rest;
+            removed_parent = true;
+        } else if let Some(rest) = normalized.strip_prefix("./") {
+            normalized = rest;
+        } else {
+            break;
+        }
+    }
+    // A bare filename after one or more parent segments has no project directory to anchor it.
+    // Refuse it instead of silently turning an attempted escape into an app0-root lookup.
+    (!removed_parent || normalized.contains('/')).then_some(normalized)
+}
+
 fn av_player_resolve_source(game_root: &Path, source: &str) -> Option<PathBuf> {
     let mut normalized = source.trim().trim_end_matches('\0').replace('\\', "/");
-    if let Some(file) = normalized.strip_prefix("file://") {
-        normalized = file.to_owned();
-    } else if let Some(file) = normalized.strip_prefix("file:") {
-        normalized = file.to_owned();
+    let mut unreal_project_relative = normalized.starts_with("../") || normalized.starts_with("./");
+    let scheme_length = if normalized
+        .get(.."file://".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+    {
+        Some("file://".len())
+    } else if normalized
+        .get(.."file:".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        Some("file:".len())
+    } else {
+        None
+    };
+    if let Some(scheme_length) = scheme_length {
+        normalized = normalized[scheme_length..].to_owned();
+        // Unreal emits project-relative movies as `file://../../../Project/Content/...`.
+        // The leading dot segments describe its virtual binaries directory, which REmu does not
+        // expose as the AVPlayer base. Remove only that leading virtual prefix, then let the
+        // ordinary app0 resolver enforce containment and perform case-insensitive component
+        // lookup.
+        unreal_project_relative = true;
+    }
+    if unreal_project_relative {
+        normalized = av_player_remove_unreal_leading_dot_segments(&normalized)?.to_owned();
     }
     resolve_guest_path(game_root, &normalized).or_else(|| {
         let media = normalized.find("Media/")?;
@@ -18132,6 +20212,7 @@ fn enumerate_save_data_entries(
             continue;
         };
         if name.to_ascii_lowercase().starts_with("sce_")
+            || name.eq_ignore_ascii_case("temp0")
             || (!pattern.is_empty() && !save_data_pattern_matches(&name, pattern))
         {
             continue;
@@ -18506,11 +20587,15 @@ fn guest_fopen(path_address: u64, mode_address: u64, state: &ProbeDispatchState)
         return 0;
     };
     let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
-        eprintln!("[REMu][VFS] rejected path {guest_path:?}");
+        if let Some(miss) = trace_guest_vfs_miss() {
+            eprintln!("[REMu][VFS] miss={miss} rejected path {guest_path:?}");
+        }
         return 0;
     };
     if !mode.starts_with('r') && !writable {
-        eprintln!("[REMu][VFS] rejected write mode {mode:?} for {guest_path:?}");
+        if let Some(miss) = trace_guest_vfs_miss() {
+            eprintln!("[REMu][VFS] miss={miss} rejected write mode {mode:?} for {guest_path:?}");
+        }
         return 0;
     }
     if writable
@@ -18807,13 +20892,17 @@ fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
-        eprintln!("[REMu][VFS] sceKernelOpen rejected guest={guest_path:?}");
+        if let Some(miss) = trace_guest_vfs_miss() {
+            eprintln!("[REMu][VFS] miss={miss} sceKernelOpen rejected guest={guest_path:?}");
+        }
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     if access != 0 && !writable {
-        eprintln!(
-            "[REMu][VFS] sceKernelOpen rejected write access guest={guest_path:?} flags={flags:#x}"
-        );
+        if let Some(miss) = trace_guest_vfs_miss() {
+            eprintln!(
+                "[REMu][VFS] miss={miss} sceKernelOpen rejected write access guest={guest_path:?} flags={flags:#x}"
+            );
+        }
         return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
     }
     let create = writable && flags & 0x200 != 0;
@@ -18833,18 +20922,23 @@ fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
     let file = match options.open(&host_path) {
         Ok(file) => file,
         Err(error) => {
-            eprintln!(
-                "[REMu][VFS] sceKernelOpen failed guest={guest_path:?} host={:?}: {error}",
-                host_path.display()
-            );
+            let miss = trace_guest_vfs_miss();
+            if error.kind() != std::io::ErrorKind::NotFound || miss.is_some() {
+                eprintln!(
+                    "[REMu][VFS] miss={miss:?} sceKernelOpen failed guest={guest_path:?} host={:?}: {error}",
+                    host_path.display()
+                );
+            }
             return sce_kernel_io_error(&error);
         }
     };
     if flags & 0x0002_0000 != 0 && file.metadata().is_ok_and(|metadata| !metadata.is_dir()) {
-        eprintln!(
-            "[REMu][VFS] sceKernelOpen expected directory guest={guest_path:?} host={:?}",
-            host_path.display()
-        );
+        if let Some(miss) = trace_guest_vfs_miss() {
+            eprintln!(
+                "[REMu][VFS] miss={miss} sceKernelOpen expected directory guest={guest_path:?} host={:?}",
+                host_path.display()
+            );
+        }
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_DIRECTORY);
     }
     let is_directory = file.metadata().is_ok_and(|metadata| metadata.is_dir());
@@ -18866,10 +20960,13 @@ fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
                 })
                 .collect(),
             Err(error) => {
-                eprintln!(
-                    "[REMu][VFS] sceKernelOpen could not list guest={guest_path:?} host={:?}: {error}",
-                    host_path.display()
-                );
+                let miss = trace_guest_vfs_miss();
+                if error.kind() != std::io::ErrorKind::NotFound || miss.is_some() {
+                    eprintln!(
+                        "[REMu][VFS] miss={miss:?} sceKernelOpen could not list guest={guest_path:?} host={:?}: {error}",
+                        host_path.display()
+                    );
+                }
                 return sce_kernel_io_error(&error);
             }
         };
@@ -18944,16 +21041,21 @@ fn guest_kernel_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
     let Some((host_path, _)) = resolve_probe_guest_path(state, &guest_path) else {
-        eprintln!("[REMu][VFS] sceKernelStat rejected guest={guest_path:?}");
+        if let Some(miss) = trace_guest_vfs_miss() {
+            eprintln!("[REMu][VFS] miss={miss} sceKernelStat rejected guest={guest_path:?}");
+        }
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     let metadata = match std::fs::metadata(&host_path) {
         Ok(metadata) => metadata,
         Err(error) => {
-            eprintln!(
-                "[REMu][VFS] sceKernelStat failed guest={guest_path:?} host={:?}: {error}",
-                host_path.display()
-            );
+            let miss = trace_guest_vfs_miss();
+            if error.kind() != std::io::ErrorKind::NotFound || miss.is_some() {
+                eprintln!(
+                    "[REMu][VFS] miss={miss:?} sceKernelStat failed guest={guest_path:?} host={:?}: {error}",
+                    host_path.display()
+                );
+            }
             return sce_kernel_io_error(&error);
         }
     };
@@ -19630,6 +21732,7 @@ fn probe_entry(
         (&raw const parameters).addr() as u64,
         guest_exit as *const () as usize as u64,
     ) as i32;
+    run_guest_thread_destructors();
     set_current_guest_thread_pointer(0);
     DIAGNOSTIC_TIMEOUT_CANCELLED.store(true, Ordering::Release);
     let import_hits = IMPORT_TELEMETRY.get().map_or(0, |telemetry| {
@@ -19731,20 +21834,28 @@ mod platform_independent_tests {
         AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
         AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG_INDEX,
         AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO,
-        AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
-        BATCH_MAP_OPERATION_MAP_DIRECT, DEFAULT_FLIP_INTERVAL_MICROSECONDS, GuestExitCallback,
-        KERNEL_FILES, KernelFileState, ProbeDispatchState, PthreadAttrState,
+        AUDIO_OUT2_CONTEXT_MEMORY_BASE_SIZE, AUDIO_OUT2_CONTEXT_MEMORY_QUEUE_STRIDE,
+        AUDIO_OUT2_CONTEXT_PARAM_SIZE, AUDIO_OUT2_DEFAULT_GRAIN_FRAMES,
+        AUDIO_OUT2_DEFAULT_QUEUE_DEPTH, AUDIO_OUT2_PORT_TYPE_VIBRATION, AgcColorTargetState,
+        AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
+        BATCH_MAP_OPERATION_MAP_DIRECT, DEFAULT_FLIP_INTERVAL_MICROSECONDS, GPU_EVENT_SINK_TEST,
+        GuestExitCallback, KERNEL_FILES, KernelFileState, ProbeDispatchState, PthreadAttrState,
         SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
+        SCE_AJM_ERROR_INVALID_PARAMETER, SCE_AUDIO_OUT2_ERROR_NOT_READY,
         SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND,
-        SCE_KERNEL_ERROR_NOT_IMPLEMENTED, VIDEO_OUT_FLIP_INTERVAL, VideoOutBufferAttributes,
-        VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_color_target_state,
-        agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
-        agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, ajm_finalize, ajm_initialize,
+        SCE_KERNEL_ERROR_NOT_IMPLEMENTED, SceAjmBatchInfo, SceAudioOut2Attribute,
+        SceAudioOut2ContextParam, SceAudioOut2Pcm, SceAudioOut2PortParam, SceAudioOut2PortState,
+        VIDEO_OUT_FLIP_INTERVAL, VideoOutBufferAttributes, VideoOutState, agc_apply_set_base,
+        agc_apply_submission_registers, agc_color_target_state, agc_dcb_draw_index_auto,
+        agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_decode_compute_dispatch,
+        agc_driver_submit_acb, agc_pm4, ajm_batch_initialize, ajm_finalize, ajm_initialize,
         ajm_instance_create, ajm_instance_destroy, ajm_module_register, ajm_module_unregister,
         allocate_direct_memory, allocate_pthread_thread_object,
         ampr_command_buffer_write_kernel_event_queue, ampr_submit_command_buffer,
-        civil_from_unix_seconds, clone_guest_tls, create_pthread_attr, decode_agc_memory_acquire,
-        destroy_pthread_attr, dispatch_guest_numeric_parser, dispatch_probe_import,
+        civil_from_unix_seconds, clone_guest_tls, create_pthread_attr, decode_agc_dma_data,
+        decode_agc_memory_acquire, decode_agc_memory_wait, decode_audio_out2_attribute,
+        decode_audio_out2_channel_format, destroy_pthread_attr, discover_runtime_module_paths,
+        dispatch_audio_out2_import, dispatch_guest_numeric_parser, dispatch_probe_import,
         flip_interval_microseconds, guest_clock_gettime, guest_free, guest_global_locale,
         guest_kernel_convert_localtime_to_utc, guest_kernel_convert_utc_to_localtime,
         guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_gettimeofday, guest_kernel_lseek,
@@ -19761,13 +21872,554 @@ mod platform_independent_tests {
         save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
         save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
         system_service_param_get_int, take_exit_callbacks, tls_dtv_entry_offset,
-        unix_days_from_civil, video_out_open, write_guest_u32, write_guest_u64, write_import_stub,
+        unix_days_from_civil, video_out_open, write_guest_u8, write_guest_u16, write_guest_u32,
+        write_guest_u64, write_import_stub,
     };
     use super::{
-        AMPR_INVALID_FILE_ID, AmprCommandBufferState, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE,
-        KernelDirectory, agc_get_fused_shader_size, ampr_resolve_file_paths,
-        ampr_resolve_paths_core, join_guest_path,
+        AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET, AGC_SHADER_INPUT_SEMANTICS_OFFSET,
+        AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET, AGC_SHADER_OUTPUT_SEMANTICS_OFFSET,
+        AGC_SPI_PS_INPUT_CNTL_0, AMPR_INVALID_FILE_ID, AmprCommandBufferState, DIRENT_BLOCK_SIZE,
+        DIRENT_HEADER_SIZE, KernelDirectory, SHADER_BINARY_TYPE_GS_BACK,
+        SHADER_BINARY_TYPE_GS_FRONT, SHADER_HEADER_CODE_OFFSET,
+        SHADER_HEADER_NUM_SH_REGISTERS_OFFSET, SHADER_HEADER_SH_REGISTERS_OFFSET,
+        SHADER_HEADER_SIZE, SHADER_HEADER_TYPE_OFFSET, SPI_SHADER_PGM_LO_ES,
+        agc_create_interpolant_mapping, agc_fuse_shader_halves, agc_get_fused_shader_size,
+        ampr_resolve_file_paths, ampr_resolve_paths_core, join_guest_path,
     };
+
+    fn reset_audio_out2_test_state() {
+        *super::AUDIO_OUT2
+            .get_or_init(|| Mutex::new(super::AudioOut2State::default()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = super::AudioOut2State::default();
+        let mut audio = super::AUDIO_OUT
+            .get_or_init(|| Mutex::new(super::audio::AudioOutState::default()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *audio = super::audio::AudioOutState::default();
+        audio.use_timed_sink_for_test();
+    }
+
+    fn create_audio_out2_test_context(grain_frames: u32) -> u64 {
+        let mut parameter = [0_u8; 0x40];
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "t5YrizufpQc",
+                [parameter.as_mut_ptr() as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        parameter[16..20].copy_from_slice(&grain_frames.to_le_bytes());
+        let mut memory_size = 0_u64;
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "pDmme7Bgm6E",
+                [
+                    parameter.as_ptr() as u64,
+                    std::ptr::from_mut(&mut memory_size) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        let mut memory = vec![
+            0_u8;
+            usize::try_from(memory_size)
+                .expect("the test AudioOut2 allocation fits usize")
+        ];
+        let mut context = 0_u64;
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "0x6o1VVAYSY",
+                [
+                    parameter.as_ptr() as u64,
+                    memory.as_mut_ptr() as u64,
+                    memory_size,
+                    std::ptr::from_mut(&mut context) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        context
+    }
+
+    fn create_audio_out2_test_port(context: u64, port_type: u16, data_format: u32) -> u64 {
+        let parameter = SceAudioOut2PortParam {
+            port_type,
+            data_format,
+            sampling_frequency: 48_000,
+            ..SceAudioOut2PortParam::default()
+        };
+        let mut port = 0_u64;
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "JK2wamZPzwM",
+                [
+                    context,
+                    std::ptr::addr_of!(parameter) as u64,
+                    std::ptr::from_mut(&mut port) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        port
+    }
+
+    #[test]
+    fn audio_out2_mastering_initialization_is_an_accepted_mixer_stage() {
+        assert_eq!(
+            dispatch_audio_out2_import("XHl38ZNknbs", [0, 0x1000, 0x2000, 0, 0x3000, 0x4000]),
+            0
+        );
+        assert_eq!(
+            dispatch_audio_out2_import("v8iOE+j8a5o", [0x5000, 0, 0, 0x6000, 2, 0xa]),
+            0
+        );
+    }
+
+    #[test]
+    fn audio_out2_channel_formats_map_to_matching_host_layouts() {
+        assert_eq!(decode_audio_out2_channel_format(0x100), Some((1, 3)));
+        assert_eq!(decode_audio_out2_channel_format(0x200), Some((2, 4)));
+        assert_eq!(decode_audio_out2_channel_format(0x880), Some((8, 5)));
+        assert_eq!(decode_audio_out2_channel_format(0), None);
+        assert_eq!(decode_audio_out2_channel_format(0x480), None);
+    }
+
+    #[test]
+    fn audio_out2_attribute_id_does_not_include_its_reserved_word() {
+        let attribute = SceAudioOut2Attribute {
+            attribute_id: 0,
+            reserved: 0x80,
+            value: 0x1122_3344_5566_7788,
+            value_size: 8,
+        };
+        let decoded = decode_audio_out2_attribute(std::ptr::addr_of!(attribute) as u64);
+        assert_eq!(decoded.attribute_id, 0);
+        assert_eq!(decoded.reserved, 0x80);
+        assert_eq!(decoded.value, 0x1122_3344_5566_7788);
+        assert_eq!(decoded.value_size, 8);
+    }
+
+    #[test]
+    fn audio_out2_abi_layouts_match_silent_hill_objects() {
+        assert_eq!(std::mem::size_of::<SceAudioOut2ContextParam>(), 0x40);
+        assert_eq!(std::mem::size_of::<SceAudioOut2PortParam>(), 0x40);
+        assert_eq!(std::mem::size_of::<SceAudioOut2Attribute>(), 0x18);
+        assert_eq!(std::mem::size_of::<SceAudioOut2Pcm>(), 0x08);
+        assert_eq!(std::mem::size_of::<SceAudioOut2PortState>(), 0x40);
+        assert_eq!(
+            std::mem::offset_of!(SceAudioOut2PortParam, user_handle),
+            0x10
+        );
+        assert_eq!(
+            std::mem::offset_of!(SceAudioOut2Attribute, value_size),
+            0x10
+        );
+        assert_eq!(std::mem::offset_of!(SceAudioOut2PortState, reserved), 0x10);
+    }
+
+    #[test]
+    fn audio_out2_gain_only_attribute_does_not_fabricate_pcm() {
+        let _serial = AUDIO_OUT2_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_audio_out2_test_state();
+        let context = create_audio_out2_test_context(AUDIO_OUT2_DEFAULT_GRAIN_FRAMES);
+        let port = create_audio_out2_test_port(context, 0, 0x880);
+        let gains = [0.125_f32, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0];
+        let attribute = SceAudioOut2Attribute {
+            attribute_id: 1,
+            value: gains.as_ptr() as u64,
+            value_size: std::mem::size_of_val(&gains) as u64,
+            ..SceAudioOut2Attribute::default()
+        };
+
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "8XTArSPyWHk",
+                [port, std::ptr::addr_of!(attribute) as u64, 1, 0, 0, 0,],
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_audio_out2_import("aII9h5nli9U", [context, 0, 0, 0, 0, 0]),
+            0
+        );
+
+        let state = super::AUDIO_OUT2
+            .get()
+            .expect("the AudioOut2 test state is initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.ports.get(&port).unwrap().gains, gains);
+        assert_eq!(state.ports.get(&port).unwrap().buffer_address, 0);
+        assert!(state.submitted_pcm.is_empty());
+    }
+
+    #[test]
+    fn audio_out2_pcm_attribute_snapshots_each_512_by_8_float_grain() {
+        let _serial = AUDIO_OUT2_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_audio_out2_test_state();
+        let context = create_audio_out2_test_context(512);
+        let port = create_audio_out2_test_port(context, 0, 0x880);
+        let first = (0..512 * 8)
+            .map(|sample| (sample as f32 - 2048.0) / 4096.0)
+            .collect::<Vec<_>>();
+        let second = (0..512 * 8)
+            .map(|sample| 0.75 - sample as f32 / 8192.0)
+            .collect::<Vec<_>>();
+        let pcm = SceAudioOut2Pcm {
+            data: first.as_ptr() as u64,
+        };
+        let attribute = SceAudioOut2Attribute {
+            attribute_id: 0,
+            value: std::ptr::addr_of!(pcm) as u64,
+            value_size: std::mem::size_of::<SceAudioOut2Pcm>() as u64,
+            ..SceAudioOut2Attribute::default()
+        };
+
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "8XTArSPyWHk",
+                [port, std::ptr::addr_of!(attribute) as u64, 1, 0, 0, 0,],
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_audio_out2_import("aII9h5nli9U", [context, 0, 0, 0, 0, 0]),
+            0
+        );
+
+        let second_pcm = SceAudioOut2Pcm {
+            data: second.as_ptr() as u64,
+        };
+        let second_attribute = SceAudioOut2Attribute {
+            attribute_id: 0,
+            value: std::ptr::addr_of!(second_pcm) as u64,
+            value_size: std::mem::size_of::<SceAudioOut2Pcm>() as u64,
+            ..SceAudioOut2Attribute::default()
+        };
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "8XTArSPyWHk",
+                [
+                    port,
+                    std::ptr::addr_of!(second_attribute) as u64,
+                    1,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_audio_out2_import("aII9h5nli9U", [context, 0, 0, 0, 0, 0]),
+            0
+        );
+
+        let expected_first = first
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        let expected_second = second
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        let state = super::AUDIO_OUT2
+            .get()
+            .expect("the AudioOut2 test state is initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.submitted_pcm.len(), 2);
+        assert_eq!(state.submitted_pcm[0], (port, expected_first));
+        assert_eq!(state.submitted_pcm[1], (port, expected_second));
+    }
+
+    #[test]
+    fn audio_out2_vibration_pcm_never_enters_the_speaker_backend() {
+        let _serial = AUDIO_OUT2_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_audio_out2_test_state();
+        let context = create_audio_out2_test_context(512);
+        let port = create_audio_out2_test_port(context, AUDIO_OUT2_PORT_TYPE_VIBRATION, 0x200);
+        let samples = vec![0.5_f32; 512 * 2];
+        let pcm = SceAudioOut2Pcm {
+            data: samples.as_ptr() as u64,
+        };
+        let attribute = SceAudioOut2Attribute {
+            attribute_id: 0,
+            value: std::ptr::addr_of!(pcm) as u64,
+            value_size: std::mem::size_of::<SceAudioOut2Pcm>() as u64,
+            ..SceAudioOut2Attribute::default()
+        };
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "8XTArSPyWHk",
+                [port, std::ptr::addr_of!(attribute) as u64, 1, 0, 0, 0,],
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_audio_out2_import("aII9h5nli9U", [context, 0, 0, 0, 0, 0]),
+            0
+        );
+
+        let state = super::AUDIO_OUT2
+            .get()
+            .expect("the AudioOut2 test state is initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.ports.get(&port).unwrap().backend_handle.is_none());
+        assert!(state.submitted_pcm.is_empty());
+    }
+
+    #[test]
+    fn audio_out2_queue_level_accepts_each_optional_output_independently() {
+        let _serial = AUDIO_OUT2_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_audio_out2_test_state();
+        let context = create_audio_out2_test_context(AUDIO_OUT2_DEFAULT_GRAIN_FRAMES);
+        let mut queued = u32::MAX;
+        let mut available = u32::MAX;
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "R7d0F1g2qsU",
+                [
+                    context,
+                    std::ptr::from_mut(&mut queued) as u64,
+                    std::ptr::from_mut(&mut available) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(queued, 0);
+        assert_eq!(available, AUDIO_OUT2_DEFAULT_QUEUE_DEPTH);
+
+        queued = u32::MAX;
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "R7d0F1g2qsU",
+                [context, std::ptr::from_mut(&mut queued) as u64, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(queued, 0);
+
+        available = u32::MAX;
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "R7d0F1g2qsU",
+                [
+                    context,
+                    0,
+                    std::ptr::from_mut(&mut available) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(available, AUDIO_OUT2_DEFAULT_QUEUE_DEPTH);
+        assert_eq!(
+            dispatch_audio_out2_import("R7d0F1g2qsU", [context, 0, 0, 0, 0, 0]),
+            0
+        );
+    }
+
+    #[test]
+    fn audio_out2_context_reset_writes_the_complete_hardware_defaults() {
+        let mut storage = [0xa5_u8; 0x60];
+        let parameter = &mut storage[0x10..0x50];
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "t5YrizufpQc",
+                [parameter.as_mut_ptr() as u64, 0, 0, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(u32::from_le_bytes(parameter[0..4].try_into().unwrap()), 256);
+        assert_eq!(u32::from_le_bytes(parameter[4..8].try_into().unwrap()), 256);
+        assert_eq!(u32::from_le_bytes(parameter[8..12].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(parameter[12..16].try_into().unwrap()),
+            AUDIO_OUT2_DEFAULT_QUEUE_DEPTH
+        );
+        assert_eq!(
+            u32::from_le_bytes(parameter[16..20].try_into().unwrap()),
+            AUDIO_OUT2_DEFAULT_GRAIN_FRAMES
+        );
+        assert_eq!(u32::from_le_bytes(parameter[20..24].try_into().unwrap()), 1);
+        assert!(parameter[24..].iter().all(|byte| *byte == 0));
+        assert_eq!(&storage[..0x10], &[0xa5; 0x10]);
+        assert_eq!(&storage[0x50..], &[0xa5; 0x10]);
+    }
+
+    #[test]
+    fn audio_out2_context_memory_query_writes_only_the_size_qword() {
+        let parameter = [0_u8; AUDIO_OUT2_CONTEXT_PARAM_SIZE as usize];
+        let mut storage = [0xa5_u8; 0x28];
+        let memory_size = &mut storage[0x10..0x18];
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "pDmme7Bgm6E",
+                [
+                    parameter.as_ptr() as u64,
+                    memory_size.as_mut_ptr() as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(memory_size.try_into().unwrap()),
+            AUDIO_OUT2_CONTEXT_MEMORY_BASE_SIZE
+                + u64::from(AUDIO_OUT2_DEFAULT_QUEUE_DEPTH)
+                    * AUDIO_OUT2_CONTEXT_MEMORY_QUEUE_STRIDE
+        );
+        assert_eq!(&storage[..0x10], &[0xa5; 0x10]);
+        assert_eq!(&storage[0x18..], &[0xa5; 0x10]);
+    }
+
+    #[test]
+    fn audio_out2_context_memory_query_scales_with_queue_depth() {
+        let mut parameter = [0_u8; AUDIO_OUT2_CONTEXT_PARAM_SIZE as usize];
+        parameter[12..16].copy_from_slice(&8_u32.to_le_bytes());
+        let mut memory_size = 0_u64;
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "pDmme7Bgm6E",
+                [
+                    parameter.as_ptr() as u64,
+                    std::ptr::from_mut(&mut memory_size) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            memory_size,
+            AUDIO_OUT2_CONTEXT_MEMORY_BASE_SIZE + 8 * AUDIO_OUT2_CONTEXT_MEMORY_QUEUE_STRIDE
+        );
+    }
+
+    #[test]
+    fn audio_out2_context_push_reserves_and_drains_hardware_queue_slots() {
+        let _serial = AUDIO_OUT2_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_audio_out2_test_state();
+        let context = create_audio_out2_test_context(8192);
+        for _ in 0..AUDIO_OUT2_DEFAULT_QUEUE_DEPTH {
+            assert_eq!(
+                dispatch_audio_out2_import("aII9h5nli9U", [context, 0, 0, 0, 0, 0]),
+                0
+            );
+        }
+        let mut queued = u32::MAX;
+        let mut available = u32::MAX;
+        assert_eq!(
+            dispatch_audio_out2_import(
+                "R7d0F1g2qsU",
+                [
+                    context,
+                    std::ptr::from_mut(&mut queued) as u64,
+                    std::ptr::from_mut(&mut available) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(queued, AUDIO_OUT2_DEFAULT_QUEUE_DEPTH);
+        assert_eq!(available, 0);
+        assert_eq!(
+            dispatch_audio_out2_import("aII9h5nli9U", [context, 0, 0, 0, 0, 0]),
+            sce_kernel_error(SCE_AUDIO_OUT2_ERROR_NOT_READY)
+        );
+
+        let mut state = super::AUDIO_OUT2
+            .get()
+            .expect("the AudioOut2 test state is initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let context_state = state
+            .contexts
+            .get_mut(&context)
+            .expect("the AudioOut2 test context remains live");
+        context_state.last_queue_update -=
+            super::audio_out2_grain_duration(context_state.grain_frames);
+        super::audio_out2_update_context_queue(context_state, Instant::now());
+        assert_eq!(context_state.queued, AUDIO_OUT2_DEFAULT_QUEUE_DEPTH - 1);
+    }
+
+    #[test]
+    fn audio_out2_port_state_reports_the_stable_default_route() {
+        let _serial = AUDIO_OUT2_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_audio_out2_test_state();
+        let mut storage = [0xa5_u8; 0x60];
+        let state = &mut storage[0x10..0x50];
+        assert_eq!(
+            dispatch_audio_out2_import("gatEUKG+Ea4", [3, state.as_mut_ptr() as u64, 0, 0, 0, 0],),
+            0
+        );
+        assert_eq!(u16::from_le_bytes([state[0], state[1]]), 1);
+        assert_eq!(state[2], 2);
+        assert_eq!(i16::from_le_bytes([state[4], state[5]]), 127);
+        assert_eq!(u16::from_le_bytes([state[6], state[7]]), 0);
+        assert!(state[8..].iter().all(|byte| *byte == 0));
+        assert_eq!(&storage[..0x10], &[0xa5; 0x10]);
+        assert_eq!(&storage[0x50..], &[0xa5; 0x10]);
+    }
+
+    #[test]
+    fn audio_out2_speaker_info_reports_the_complete_stereo_topology() {
+        let mut storage = [0xa5_u8; 0x60];
+        let info = &mut storage[0x10..0x50];
+        assert_eq!(
+            dispatch_audio_out2_import("DImz2Ft9E2g", [info.as_mut_ptr() as u64, 1, 0, 0, 0, 0],),
+            0
+        );
+        assert_eq!(info[0], 0);
+        assert_eq!(u32::from_le_bytes(info[4..8].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(info[8..12].try_into().unwrap()), 0);
+        assert_eq!(
+            i16::from_le_bytes(info[0x10..0x12].try_into().unwrap()),
+            -30
+        );
+        assert_eq!(i16::from_le_bytes(info[0x12..0x14].try_into().unwrap()), 0);
+        assert_eq!(i16::from_le_bytes(info[0x14..0x16].try_into().unwrap()), 30);
+        assert_eq!(i16::from_le_bytes(info[0x16..0x18].try_into().unwrap()), 0);
+        assert!(info[0x18..].iter().all(|byte| *byte == 0));
+        assert_eq!(&storage[..0x10], &[0xa5; 0x10]);
+        assert_eq!(&storage[0x50..], &[0xa5; 0x10]);
+    }
 
     #[repr(C, align(256))]
     struct AlignedComputeProgram([u32; 4]);
@@ -19782,11 +22434,66 @@ mod platform_independent_tests {
         flags: [u8; 4],
     }
 
-    static GPU_EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
+    static AUDIO_OUT2_TEST: Mutex<()> = Mutex::new(());
     static GUEST_CONDITION_TEST: Mutex<()> = Mutex::new(());
     static GUEST_EXCEPTION_TEST: Mutex<()> = Mutex::new(());
     static DELIVERED_EXCEPTION: AtomicU32 = AtomicU32::new(0);
     static ONCE_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn agc_completion_tracking_requires_a_published_queue_submission() {
+        let _event_guard = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remu_gpu::clear_event_sink();
+        let mut state = ProbeDispatchState {
+            agc_submission_count: 41,
+            ..ProbeDispatchState::default()
+        };
+
+        super::request_agc_submission_completion(&mut state, 0, Vec::new());
+        super::request_agc_compute_submission_completion(&mut state, 33, Vec::new());
+
+        assert!(state.pending_agc_completions.is_empty());
+        assert!(state.pending_agc_user_interrupts.is_empty());
+
+        let (sender, receiver) = remu_gpu::gpu_event_channel();
+        remu_gpu::install_event_sink(sender);
+        super::request_agc_submission_completion(&mut state, 0, Vec::new());
+        state.agc_submission_count = 42;
+        super::request_agc_compute_submission_completion(&mut state, 33, Vec::new());
+        assert_eq!(
+            state
+                .pending_agc_completions
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [41]
+        );
+        assert_eq!(
+            state
+                .pending_agc_user_interrupts
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [42]
+        );
+        assert!(matches!(
+            receiver.recv(),
+            Ok(remu_gpu::GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events,
+            }) if events == [remu_gpu::GpuEvent::SubmissionBoundary(41)]
+        ));
+        assert!(matches!(
+            receiver.recv(),
+            Ok(remu_gpu::GpuEvent::QueueSubmission {
+                queue_id: 33,
+                events,
+            }) if events == [remu_gpu::GpuEvent::SubmissionBoundary(42)]
+        ));
+        remu_gpu::clear_event_sink();
+    }
 
     unsafe extern "C" fn once_test_callback() {
         ONCE_CALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -19849,6 +22556,7 @@ mod platform_independent_tests {
         );
         state.pending_agc_completions.extend([first, second]);
         remu_gpu::record_gpu_submission_completed(second);
+        remu_gpu::record_gpu_submission_completed(first);
 
         let mut event = [0_u8; 0x40];
         let mut count = 0_u32;
@@ -19879,6 +22587,49 @@ mod platform_independent_tests {
             0xfeed_face
         );
         assert!(state.pending_agc_completions.is_empty());
+    }
+
+    #[test]
+    fn delivers_completed_compute_submissions_only_through_the_agc_user_interrupt() {
+        let _serial = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
+        let mut state = ProbeDispatchState::default();
+        state.kernel_equeues.extend([1, 2]);
+        assert_eq!(
+            super::kernel_register_event(
+                &mut state,
+                1,
+                0x1800,
+                super::KERNEL_EVENT_FILTER_USER,
+                0xfeed_face,
+            ),
+            0
+        );
+        assert_eq!(
+            super::kernel_register_event(
+                &mut state,
+                2,
+                0x20,
+                super::KERNEL_EVENT_FILTER_GRAPHICS,
+                0xcafe_babe,
+            ),
+            0
+        );
+        state.pending_agc_user_interrupts.push_back(sequence);
+        remu_gpu::record_gpu_submission_completed(sequence);
+
+        super::refresh_completed_agc_submissions(&mut state);
+
+        assert!(state.pending_agc_user_interrupts.is_empty());
+        assert_eq!(state.pending_events.len(), 1);
+        let event = state.pending_events.front().expect("AGC user interrupt");
+        assert_eq!(event.equeue, 1);
+        assert_eq!(event.ident, 0x1800);
+        assert_eq!(event.filter, super::KERNEL_EVENT_FILTER_USER);
+        assert_eq!(event.fflags, 1);
+        assert_eq!(event.user_data, 0xfeed_face);
     }
 
     fn compute_graphics_state(program_address: u64) -> (AgcGraphicsState, AgcShaderRegistry) {
@@ -20125,6 +22876,58 @@ mod platform_independent_tests {
         );
         assert_eq!(super::guest_rwlock_unlock(address), 0);
         assert_eq!(super::guest_rwlock_destroy(address), 0);
+    }
+
+    #[test]
+    fn mutex_types_apply_gen5_same_thread_relock_semantics() {
+        let _guard = GUEST_CONDITION_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cases = [
+            (0x7fff_0000_1100, 1, libc::EDEADLK),
+            (0x7fff_0000_1200, 3, libc::EBUSY),
+            (0x7fff_0000_1300, 4, libc::EDEADLK),
+        ];
+        for (address, mutex_type, expected) in cases {
+            assert_eq!(
+                super::guest_mutex_init(
+                    address,
+                    super::PthreadMutexAttrState {
+                        mutex_type,
+                        ..super::PthreadMutexAttrState::default()
+                    }
+                ),
+                0
+            );
+            assert_eq!(super::guest_mutex_lock(address, false), 0);
+            assert_eq!(
+                super::guest_mutex_lock(address, mutex_type == 3),
+                u64::from(expected.cast_unsigned())
+            );
+            assert_eq!(super::guest_mutex_unlock(address), 0);
+            assert_eq!(super::guest_mutex_destroy(address), 0);
+        }
+
+        let recursive = 0x7fff_0000_1400;
+        assert_eq!(
+            super::guest_mutex_init(
+                recursive,
+                super::PthreadMutexAttrState {
+                    mutex_type: 2,
+                    ..super::PthreadMutexAttrState::default()
+                }
+            ),
+            0
+        );
+        assert_eq!(super::guest_mutex_lock(recursive, false), 0);
+        assert_eq!(super::guest_mutex_lock(recursive, false), 0);
+        assert_eq!(super::guest_mutex_unlock(recursive), 0);
+        assert_eq!(
+            super::guest_mutex_destroy(recursive),
+            u64::from(libc::EBUSY.cast_unsigned())
+        );
+        assert_eq!(super::guest_mutex_unlock(recursive), 0);
+        assert_eq!(super::guest_mutex_destroy(recursive), 0);
     }
 
     #[test]
@@ -20802,6 +23605,164 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn create_shader_registers_the_authoritative_agc_code_extent() {
+        let mut header = [0_u8; 0x60];
+        let mut shader_registers = [0x20c_u32, 0, 0x20d, 0];
+        let code = [0xbf81_0000_u32; 0x1001];
+        let mut destination = 0_u64;
+        let header_address = header.as_mut_ptr().addr() as u64;
+        let registers_address = shader_registers.as_mut_ptr().addr() as u64;
+        let code_address = code.as_ptr().addr() as u64;
+        write_guest_u32(header_address, super::AGC_SHADER_FILE_HEADER);
+        write_guest_u32(header_address + 4, super::AGC_SHADER_VERSION);
+        write_guest_u64(
+            header_address + super::AGC_SHADER_SH_REGISTERS_OFFSET,
+            registers_address.wrapping_sub(header_address + super::AGC_SHADER_SH_REGISTERS_OFFSET),
+        );
+        write_guest_u32(
+            header_address + super::AGC_SHADER_SIZE_OFFSET,
+            u32::try_from(std::mem::size_of_val(&code)).expect("test shader size fits u32"),
+        );
+        write_guest_u8(header_address + super::AGC_SHADER_TYPE_OFFSET, 0);
+        write_guest_u8(
+            header_address + super::AGC_SHADER_SH_REGISTER_COUNT_OFFSET,
+            2,
+        );
+        let mut state = ProbeDispatchState::default();
+
+        assert_eq!(
+            super::agc_create_shader(
+                [
+                    (&raw mut destination).addr() as u64,
+                    header_address,
+                    code_address,
+                    0,
+                    0,
+                    0,
+                ],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(destination, header_address);
+        assert_eq!(
+            state.agc_shader_registry.code_sizes.get(&code_address),
+            Some(&u32::try_from(std::mem::size_of_val(&code)).expect("test shader size fits u32"))
+        );
+        assert_eq!(shader_registers[1], low_u32(code_address >> 8));
+        assert_eq!(shader_registers[3], low_u32(code_address >> 40));
+    }
+
+    #[test]
+    fn interpolant_mapping_matches_semantics_and_keeps_identity_tail() {
+        let mut geometry = [0_u8; 0x60];
+        let mut pixel = [0_u8; 0x60];
+        let geometry_semantics = [7 | (5 << 8)];
+        let pixel_semantics = [7 | (1 << 22) | (2 << 28)];
+        let mut registers = [0_u32; 64];
+        let geometry_address = geometry.as_mut_ptr().addr() as u64;
+        let pixel_address = pixel.as_mut_ptr().addr() as u64;
+        write_guest_u64(
+            geometry_address + AGC_SHADER_OUTPUT_SEMANTICS_OFFSET,
+            geometry_semantics.as_ptr().addr() as u64,
+        );
+        write_guest_u16(
+            geometry_address + AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET,
+            1,
+        );
+        // This adjacent packed field must not become part of the 16-bit output count.
+        write_guest_u16(
+            geometry_address + AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET + 2,
+            u16::MAX,
+        );
+        write_guest_u64(
+            pixel_address + AGC_SHADER_INPUT_SEMANTICS_OFFSET,
+            pixel_semantics.as_ptr().addr() as u64,
+        );
+        write_guest_u32(pixel_address + AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET, 1);
+
+        assert_eq!(
+            agc_create_interpolant_mapping([
+                registers.as_mut_ptr().addr() as u64,
+                geometry_address,
+                pixel_address,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+        assert_eq!(registers[0], AGC_SPI_PS_INPUT_CNTL_0);
+        assert_eq!(registers[1], 0x605);
+        assert_eq!(registers[2], AGC_SPI_PS_INPUT_CNTL_0 + 1);
+        assert_eq!(registers[3], 1);
+        assert_eq!(registers[62], AGC_SPI_PS_INPUT_CNTL_0 + 31);
+        assert_eq!(registers[63], 31);
+
+        registers.fill(u32::MAX);
+        assert_eq!(
+            agc_create_interpolant_mapping([registers.as_mut_ptr().addr() as u64, 0, 0, 0, 0, 0,]),
+            0
+        );
+        assert_eq!(registers[0], AGC_SPI_PS_INPUT_CNTL_0);
+        assert_eq!(registers[1], 0);
+        assert_eq!(registers[63], 31);
+    }
+
+    #[test]
+    fn fused_shader_preserves_header_data_and_high_register_flags() {
+        let mut front = [0_u8; SHADER_HEADER_SIZE as usize];
+        let mut back = [0_u8; SHADER_HEADER_SIZE as usize];
+        let mut fused = [0_u8; SHADER_HEADER_SIZE as usize];
+        let mut back_registers = [
+            SPI_SHADER_PGM_LO_ES,
+            0,
+            SPI_SHADER_PGM_LO_ES + 1,
+            0xa5a5_5a00,
+        ];
+        let mut scratch = [0_u32; 4];
+        let front_address = front.as_mut_ptr().addr() as u64;
+        let back_address = back.as_mut_ptr().addr() as u64;
+        let code = 0x00ab_cdef_1234_5600_u64;
+        let user_data = 0x1234_5678_9abc_def0_u64;
+        write_guest_u8(
+            front_address + SHADER_HEADER_TYPE_OFFSET,
+            SHADER_BINARY_TYPE_GS_FRONT,
+        );
+        write_guest_u8(
+            back_address + SHADER_HEADER_TYPE_OFFSET,
+            SHADER_BINARY_TYPE_GS_BACK,
+        );
+        write_guest_u8(back_address + SHADER_HEADER_NUM_SH_REGISTERS_OFFSET, 2);
+        write_guest_u64(front_address + SHADER_HEADER_CODE_OFFSET, code);
+        write_guest_u64(back_address + 8, user_data);
+        write_guest_u64(
+            back_address + SHADER_HEADER_SH_REGISTERS_OFFSET,
+            back_registers.as_mut_ptr().addr() as u64,
+        );
+
+        assert_eq!(
+            agc_fuse_shader_halves([
+                fused.as_mut_ptr().addr() as u64,
+                front_address,
+                back_address,
+                scratch.as_mut_ptr().addr() as u64,
+                0,
+                0,
+            ]),
+            0
+        );
+        let fused_address = fused.as_ptr().addr() as u64;
+        assert_eq!(read_guest_u64(fused_address + 8), user_data);
+        assert_eq!(
+            read_guest_u64(fused_address + SHADER_HEADER_SH_REGISTERS_OFFSET),
+            scratch.as_ptr().addr() as u64
+        );
+        assert_eq!(scratch[1], low_u32(code >> 8));
+        assert_eq!(scratch[3], 0xa5a5_5a00 | (low_u32(code >> 40) & 0xff));
+    }
+
+    #[test]
     fn resolves_guest_paths_that_differ_only_by_case() {
         let root = std::env::temp_dir().join(format!("remu-case-{}", std::process::id()));
         std::fs::create_dir_all(root.join("prx")).unwrap();
@@ -20815,6 +23776,70 @@ mod platform_independent_tests {
             resolve_guest_path(&root, "/app0/prx/Missing.prx"),
             Some(root.join("prx/Missing.prx"))
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn av_player_resolves_unreal_file_urls_inside_app0_case_insensitively() {
+        let root = std::env::temp_dir().join(format!("remu-avplayer-path-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let movie = root.join("shpc/content/movies/ui_titlemovie01.mp4");
+        std::fs::create_dir_all(movie.parent().unwrap()).unwrap();
+        std::fs::write(&movie, b"movie").unwrap();
+
+        let resolved = super::av_player_resolve_source(
+            &root,
+            "file://../../../shpc/Content/Movies/UI_TitleMovie01.mp4",
+        )
+        .unwrap();
+        assert!(resolved.is_file(), "unresolved: {}", resolved.display());
+        assert_eq!(std::fs::read(resolved).unwrap(), b"movie");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn av_player_unreal_file_urls_cannot_collapse_to_a_root_filename() {
+        let root =
+            std::env::temp_dir().join(format!("remu-avplayer-escape-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("outside.mp4"), b"inside decoy").unwrap();
+
+        assert_eq!(
+            super::av_player_resolve_source(&root, "file://../../../outside.mp4"),
+            None
+        );
+        assert_eq!(
+            super::av_player_resolve_source(&root, "../../../outside.mp4"),
+            None
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn discovers_runtime_modules_in_media_and_app0_prx_layouts() {
+        let root =
+            std::env::temp_dir().join(format!("remu-runtime-modules-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let media_plugins = root.join("decrypted/Media/Plugins/Runtime");
+        let app_prx = root.join("prx");
+        std::fs::create_dir_all(&media_plugins).unwrap();
+        std::fs::create_dir_all(&app_prx).unwrap();
+        std::fs::write(media_plugins.join("media_plugin.sprx"), b"module").unwrap();
+        std::fs::write(app_prx.join("akroomverb.prx"), b"module").unwrap();
+        std::fs::write(app_prx.join("akroomverb.prx.esbak"), b"backup").unwrap();
+
+        let modules = discover_runtime_module_paths(&root).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert!(
+            modules
+                .iter()
+                .any(|path| path.ends_with("media_plugin.sprx"))
+        );
+        assert!(modules.iter().any(|path| path.ends_with("akroomverb.prx")));
+
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -20987,6 +24012,24 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn fresh_boot_does_not_skip_the_platform_notice_screen() {
+        let mut skip = 0xff_u8;
+        let mut state = ProbeDispatchState::default();
+
+        assert_eq!(
+            dispatch_probe_import(
+                "3RQ5aQfnstU",
+                [(&raw mut skip).addr() as u64, 0, 0, 0, 0, 0],
+                [0; 6],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(skip, 0);
+        assert!(state.unimplemented_nids.is_empty());
+    }
+
+    #[test]
     fn unknown_imports_return_the_gen5_not_implemented_error() {
         let mut state = ProbeDispatchState::default();
         assert_eq!(
@@ -20997,6 +24040,54 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn ajm_batch_initialize_writes_only_the_five_qword_info_object() {
+        let batch = [0x5a_u8; 0x708];
+        let original_batch = batch;
+        let mut info_storage = [0xa5_u8; 0x48];
+        let info_address = info_storage[0x10..0x38].as_mut_ptr() as u64;
+
+        assert_eq!(
+            ajm_batch_initialize([
+                batch.as_ptr() as u64,
+                batch.len() as u64,
+                info_address,
+                0,
+                0,
+                0,
+            ]),
+            0
+        );
+
+        assert_eq!(
+            batch, original_batch,
+            "the caller-owned batch arena is preserved"
+        );
+        assert_eq!(&info_storage[..0x10], &[0xa5; 0x10]);
+        assert_eq!(&info_storage[0x38..], &[0xa5; 0x10]);
+        // SAFETY: info_address points at the initialized 0x28-byte subrange above.
+        let info = unsafe { std::ptr::read_unaligned(info_address as *const SceAjmBatchInfo) };
+        assert_eq!(
+            info,
+            SceAjmBatchInfo {
+                buffer: batch.as_ptr() as u64,
+                offset: 0,
+                size: batch.len() as u64,
+                last_good_job: 0,
+                last_good_job_return_address: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn ajm_batch_initialize_requires_the_ps5_info_output() {
+        let batch = [0x5a_u8; 0x708];
+        assert_eq!(
+            ajm_batch_initialize([batch.as_ptr() as u64, batch.len() as u64, 0, 0, 0, 0,]),
+            sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER)
+        );
+        assert!(batch.iter().all(|byte| *byte == 0x5a));
+    }
+
     /// Gen5 tags the reserved argument with a library revision; only the low dword must be zero.
     #[test]
     fn ajm_initialize_accepts_a_revision_tagged_reserved_argument() {
@@ -21020,6 +24111,7 @@ mod platform_independent_tests {
         );
     }
 
+    #[test]
     fn ajm_initialize_allocates_stable_nonzero_context_ids() {
         let mut state = ProbeDispatchState::default();
         let mut first = 0_u32;
@@ -21420,6 +24512,47 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn pthread_keys_reuse_deleted_slots_and_clear_values_before_destructors() {
+        let mut state = ProbeDispatchState::default();
+        let mut first_key = u32::MAX;
+        let first_key_address = (&raw mut first_key).addr() as u64;
+        assert_eq!(
+            super::pthread_key_create(
+                [first_key_address, 0x1234_5678_9abc_def0, 0, 0, 0, 0],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(first_key, 0);
+        assert_eq!(
+            super::pthread_set_specific([u64::from(first_key), 0xcafe_babe, 0, 0, 0, 0], &state),
+            0
+        );
+
+        assert_eq!(
+            super::take_current_thread_specific_destructors(&state),
+            [(0x1234_5678_9abc_def0, 0xcafe_babe)]
+        );
+        assert_eq!(super::pthread_get_specific(first_key), 0);
+        assert_eq!(super::pthread_key_delete(first_key, &mut state), 0);
+
+        let mut replacement_key = u32::MAX;
+        assert_eq!(
+            super::pthread_key_create(
+                [(&raw mut replacement_key).addr() as u64, 0, 0, 0, 0, 0],
+                &mut state,
+            ),
+            0
+        );
+        assert_eq!(replacement_key, first_key);
+        assert!(
+            super::take_current_thread_specific_destructors(&state).is_empty(),
+            "a reused key must not inherit the deleted key's thread-specific value"
+        );
+        super::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
+    }
+
+    #[test]
     fn finalization_selects_callbacks_in_reverse_registration_order() {
         let mut state = ProbeDispatchState {
             exit_callbacks: vec![
@@ -21521,6 +24654,31 @@ mod platform_independent_tests {
         assert!(save_data_pattern_matches("alpha-beta", "%ha_b%"));
         assert!(!save_data_pattern_matches("slot", "slot_"));
         assert!(!save_data_pattern_matches("other", "save%"));
+    }
+
+    #[test]
+    fn temporary_app_content_mount_is_not_a_save_data_slot() {
+        let temporary = TemporaryTestDirectory::new("savedata-temp-mount");
+        let state = ProbeDispatchState {
+            save_root: temporary.path.clone(),
+            ..ProbeDispatchState::default()
+        };
+        let mut mount_point = [0_u8; 16];
+
+        assert_eq!(
+            super::app_content_temporary_data_mount(
+                [0, mount_point.as_mut_ptr().addr() as u64, 0, 0, 0, 0],
+                &state,
+            ),
+            0
+        );
+        assert_eq!(&mount_point[..7], b"/temp0\0");
+        assert!(temporary.path.join("temp0").is_dir());
+        assert!(
+            super::enumerate_save_data_entries(&temporary.path, "")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -22219,8 +25377,8 @@ mod platform_independent_tests {
             0
         );
         assert_eq!(u32::from_le_bytes(output[24..28].try_into().unwrap()), 2);
-        assert_eq!(output[32], 0x11);
-        assert_eq!(&output[33..41], b"flexible");
+        assert_eq!(u32::from_le_bytes(output[32..36].try_into().unwrap()), 0x11);
+        assert_eq!(&output[36..44], b"flexible");
         assert_eq!(
             super::known_nid_name("mL8NDH86iQI"),
             Some("sceKernelMapNamedFlexibleMemory")
@@ -22591,8 +25749,9 @@ mod platform_independent_tests {
         );
         assert_eq!(u32::from_le_bytes(output[24..28].try_into().unwrap()), 0x33);
         assert_eq!(u32::from_le_bytes(output[28..32].try_into().unwrap()), 12);
-        assert_eq!(output[32], 0x12);
-        assert_eq!(&output[33..39], b"direct");
+        assert_eq!(u32::from_le_bytes(output[32..36].try_into().unwrap()), 0x12);
+        assert_eq!(&output[36..42], b"direct");
+        assert_eq!(&output[42..], &[0; 30]);
     }
 
     #[cfg(target_os = "macos")]
@@ -22886,6 +26045,64 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn decodes_native_32_bit_wait_reference_before_its_control_word() {
+        let mut label = 0_u32;
+        let label_address = (&raw mut label).addr() as u64;
+        let packet = [
+            agc_pm4(7, AGC_IT_NOP, super::AGC_R_WAIT_MEM_32),
+            low_u32(label_address),
+            low_u32(label_address >> 32),
+            u32::MAX,
+            1,
+            0x113,
+            0,
+        ];
+
+        assert_eq!(
+            decode_agc_memory_wait(
+                packet.as_ptr().addr() as u64,
+                super::AGC_R_WAIT_MEM_32,
+                false
+            ),
+            Some(remu_gpu::GpuMemoryWait {
+                address: label_address,
+                reference: 1,
+                mask: u64::from(u32::MAX),
+                compare_function: 3,
+                is_64_bit: false,
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_native_dma_immediate_fill_without_treating_the_value_as_an_address() {
+        let mut destination = [0_u32; 2];
+        let destination_address = destination.as_mut_ptr().addr() as u64;
+        let control = 1 | (3 << 13) | (3 << 20) | (3 << 25) | (2 << 29) | (1 << 31);
+        let packet = [
+            agc_pm4(7, super::AGC_IT_DMA_DATA, 0),
+            control,
+            1,
+            0,
+            low_u32(destination_address),
+            low_u32(destination_address >> 32),
+            8,
+        ];
+
+        assert_eq!(
+            decode_agc_dma_data(packet.as_ptr().addr() as u64, 7, true),
+            Some(remu_gpu::GpuMemoryCopy {
+                source_address: 1,
+                destination_address,
+                byte_count: 8,
+                source_selection: 2,
+                destination_selection: 3,
+                cpu_applied: false,
+            })
+        );
+    }
+
+    #[test]
     fn emits_ordered_gen5_release_and_wait_label_operations() {
         let _event_guard = GPU_EVENT_SINK_TEST
             .lock()
@@ -22947,6 +26164,79 @@ mod platform_independent_tests {
                 mask: u64::MAX,
                 compare_function: 3,
                 is_64_bit: true,
+            })
+        );
+        assert_eq!(submission_count, 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn executes_indirect_command_buffer_events_before_following_waits() {
+        let _event_guard = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut label = 0_u32;
+        let label_address = (&raw mut label).addr() as u64;
+        let indirect = [
+            agc_pm4(8, AGC_IT_NOP, super::AGC_R_RELEASE_MEM),
+            0,
+            1 << 16,
+            low_u32(label_address),
+            low_u32(label_address >> 32),
+            1,
+            0,
+            0,
+        ];
+        let indirect_address = indirect.as_ptr().addr() as u64;
+        let commands = [
+            agc_pm4(4, super::AGC_IT_INDIRECT_BUFFER, 0),
+            low_u32(indirect_address),
+            low_u32(indirect_address >> 32),
+            0x0f20_0000 | u32::try_from(indirect.len()).expect("indirect dword count"),
+            agc_pm4(7, AGC_IT_NOP, super::AGC_R_WAIT_MEM_32),
+            low_u32(label_address),
+            low_u32(label_address >> 32),
+            u32::MAX,
+            1,
+            0x13,
+            0,
+        ];
+        let (sender, receiver) = remu_gpu::gpu_event_channel();
+        remu_gpu::install_event_sink(sender);
+        let mut graphics = AgcGraphicsState::default();
+        let mut shaders = AgcShaderRegistry::default();
+        let mut submission_count = 0;
+        super::agc_parse_submission(
+            commands.as_ptr().addr() as u64,
+            u32::try_from(commands.len()).expect("command dword count"),
+            &mut super::AgcSubmissionContext {
+                graphics: &mut graphics,
+                shaders: &mut shaders,
+                index_resources: &BTreeMap::new(),
+                video_out: &VideoOutState::default(),
+                submission_count: &mut submission_count,
+                flips: &mut Vec::new(),
+                event_writes: &mut Vec::new(),
+            },
+        )
+        .expect("indirect release and direct wait submission");
+        remu_gpu::clear_event_sink();
+
+        assert_eq!(
+            receiver.recv().expect("indirect release event"),
+            remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease {
+                address: label_address,
+                value: remu_gpu::GpuMemoryReleaseValue::Immediate32(1),
+            })
+        );
+        assert_eq!(
+            receiver.recv().expect("following wait event"),
+            remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait {
+                address: label_address,
+                reference: 1,
+                mask: u64::from(u32::MAX),
+                compare_function: 3,
+                is_64_bit: false,
             })
         );
         assert_eq!(submission_count, 1);
@@ -23029,6 +26319,24 @@ mod platform_independent_tests {
             );
         }
 
+        // The hardware packet processor uses the Type-3 header length to advance over the
+        // packet, while EVENT_INDEX=4 consumes only EVENT_CONTROL. Native Gen5 streams may leave
+        // two padding dwords in that packet; they must not turn a valid partial flush into a
+        // fatal submission error.
+        let padded_partial_flush = [
+            agc_pm4(4, super::AGC_IT_EVENT_WRITE, 0),
+            0x410,
+            0xfeed_face,
+            0xcafe_babe,
+        ];
+        assert_eq!(
+            super::decode_agc_pipeline_barrier(padded_partial_flush.as_ptr().addr() as u64, 4)
+                .expect("padded partial flush"),
+            remu_gpu::GpuPipelineBarrier {
+                wait_for: remu_gpu::GpuPipelineStage::PixelShader,
+            }
+        );
+
         let wrong_index = [agc_pm4(2, super::AGC_IT_EVENT_WRITE, 0), 0x10];
         assert!(matches!(
             super::decode_agc_pipeline_barrier(wrong_index.as_ptr().addr() as u64, 2),
@@ -23052,6 +26360,81 @@ mod platform_independent_tests {
             Err(super::AgcSubmissionError::UnsupportedEventWriteControl(
                 0x8000_0410
             ))
+        ));
+
+        let ordinary_event = [agc_pm4(2, super::AGC_IT_EVENT_WRITE, 0), 0x02];
+        let mut graphics = AgcGraphicsState::default();
+        let mut notifications = Vec::new();
+        super::agc_handle_submission_packet(
+            super::AgcSubmissionPacket {
+                address: ordinary_event.as_ptr().addr() as u64,
+                length: 2,
+                opcode: super::AGC_IT_EVENT_WRITE,
+                register: 0,
+                predicated: false,
+            },
+            &mut graphics,
+            &mut AgcShaderRegistry::default(),
+            &BTreeMap::new(),
+            &VideoOutState::default(),
+            &mut Vec::new(),
+            &mut notifications,
+            None,
+        )
+        .expect("ordinary cache event");
+        assert!(
+            notifications.is_empty(),
+            "ordinary EVENT_WRITE must not fabricate a kernel interrupt"
+        );
+
+        let query_results = [0_u64; 16];
+        let query_address = query_results.as_ptr().addr() as u64;
+        let pixel_pipe_stat_dump = [
+            agc_pm4(4, super::AGC_IT_EVENT_WRITE, 0),
+            0x139,
+            low_u32(query_address),
+            (query_address >> 32) as u32,
+        ];
+        assert_eq!(
+            super::decode_agc_event_write(pixel_pipe_stat_dump.as_ptr().addr() as u64, 4)
+                .expect("addressed pixel-pipe statistic dump"),
+            None
+        );
+        super::agc_handle_submission_packet(
+            super::AgcSubmissionPacket {
+                address: pixel_pipe_stat_dump.as_ptr().addr() as u64,
+                length: 4,
+                opcode: super::AGC_IT_EVENT_WRITE,
+                register: 0,
+                predicated: false,
+            },
+            &mut graphics,
+            &mut AgcShaderRegistry::default(),
+            &BTreeMap::new(),
+            &VideoOutState::default(),
+            &mut Vec::new(),
+            &mut notifications,
+            None,
+        )
+        .expect("pixel-pipe statistic dump");
+        assert!(
+            notifications.is_empty(),
+            "occlusion query dumps are not kernel completion interrupts"
+        );
+
+        let malformed_query = [
+            agc_pm4(4, super::AGC_IT_EVENT_WRITE, 0),
+            0x239,
+            low_u32(query_address),
+            (query_address >> 32) as u32,
+        ];
+        assert!(matches!(
+            super::decode_agc_event_write(malformed_query.as_ptr().addr() as u64, 4),
+            Err(super::AgcSubmissionError::UnsupportedEventWrite {
+                event_type: 0x39,
+                event_index: 2,
+                length: 4,
+            })
         ));
     }
 
@@ -23111,6 +26494,181 @@ mod platform_independent_tests {
             Some(&0x44)
         );
         assert_eq!(graphics.user_config_registers.get(&0x242), Some(&4));
+    }
+
+    #[test]
+    fn skips_predicated_packets_when_boolean_predication_is_false() {
+        let predicate = 1_u64;
+        let predicate_address = std::ptr::from_ref(&predicate).addr() as u64;
+        let commands = [
+            agc_pm4(4, super::AGC_IT_SET_PREDICATION, 0),
+            3 << 16,
+            low_u32(predicate_address) & !0x0f,
+            low_u32(predicate_address >> 32),
+            agc_pm4(3, super::AGC_IT_SET_SH_REG, 0) | 1,
+            0x00c,
+            0xdead_beef,
+            agc_pm4(3, super::AGC_IT_SET_SH_REG, 0),
+            0x00d,
+            0x1234_5678,
+        ];
+        let mut graphics = AgcGraphicsState::default();
+        let mut shaders = AgcShaderRegistry::default();
+        let mut submission_count = 0;
+
+        super::agc_parse_submission(
+            commands.as_ptr().addr() as u64,
+            u32::try_from(commands.len()).expect("command dword count"),
+            &mut super::AgcSubmissionContext {
+                graphics: &mut graphics,
+                shaders: &mut shaders,
+                index_resources: &BTreeMap::new(),
+                video_out: &VideoOutState::default(),
+                submission_count: &mut submission_count,
+                flips: &mut Vec::new(),
+                event_writes: &mut Vec::new(),
+            },
+        )
+        .expect("predicated submission");
+
+        assert!(graphics.predicate_skip);
+        assert!(!graphics.shader_registers.contains_key(&0x00c));
+        assert_eq!(graphics.shader_registers.get(&0x00d), Some(&0x1234_5678));
+    }
+
+    #[test]
+    fn cond_exec_skips_exactly_its_zero_guarded_dword_range() {
+        let predicate = 0_u32;
+        let predicate_address = std::ptr::from_ref(&predicate).addr() as u64;
+        let commands = [
+            agc_pm4(5, super::AGC_IT_COND_EXEC, 0),
+            low_u32(predicate_address) & !3,
+            low_u32(predicate_address >> 32),
+            0,
+            3,
+            agc_pm4(3, super::AGC_IT_SET_SH_REG, 0),
+            0x00c,
+            0xdead_beef,
+            agc_pm4(3, super::AGC_IT_SET_SH_REG, 0),
+            0x00d,
+            0x1234_5678,
+        ];
+        let mut graphics = AgcGraphicsState::default();
+        let mut shaders = AgcShaderRegistry::default();
+        let mut submission_count = 0;
+
+        super::agc_parse_submission(
+            commands.as_ptr().addr() as u64,
+            u32::try_from(commands.len()).expect("command dword count"),
+            &mut super::AgcSubmissionContext {
+                graphics: &mut graphics,
+                shaders: &mut shaders,
+                index_resources: &BTreeMap::new(),
+                video_out: &VideoOutState::default(),
+                submission_count: &mut submission_count,
+                flips: &mut Vec::new(),
+                event_writes: &mut Vec::new(),
+            },
+        )
+        .expect("conditional submission");
+
+        assert!(!graphics.shader_registers.contains_key(&0x00c));
+        assert_eq!(graphics.shader_registers.get(&0x00d), Some(&0x1234_5678));
+    }
+
+    #[test]
+    fn native_gen5_branch_executes_only_the_selected_indirect_buffer() {
+        let comparison_value = 5_u64;
+        let comparison_address = std::ptr::from_ref(&comparison_value).addr() as u64;
+        let then_commands = [agc_pm4(3, super::AGC_IT_SET_SH_REG, 0), 0x00c, 0x1111_1111];
+        let else_commands = [agc_pm4(3, super::AGC_IT_SET_SH_REG, 0), 0x00d, 0x2222_2222];
+        let then_address = then_commands.as_ptr().addr() as u64;
+        let else_address = else_commands.as_ptr().addr() as u64;
+        super::agc_command_abi::track_graphics_allocation(then_address, 3);
+        let commands = [
+            agc_pm4(14, super::AGC_IT_INDIRECT_BUFFER, 0),
+            2 | (3 << 8),
+            low_u32(comparison_address) & !7,
+            low_u32(comparison_address >> 32),
+            u32::MAX,
+            u32::MAX,
+            5,
+            0,
+            low_u32(then_address) & !3,
+            low_u32(then_address >> 32),
+            3,
+            low_u32(else_address) & !3,
+            low_u32(else_address >> 32),
+            3,
+        ];
+        let mut graphics = AgcGraphicsState::default();
+        let mut shaders = AgcShaderRegistry::default();
+        let mut submission_count = 0;
+
+        super::agc_parse_submission(
+            commands.as_ptr().addr() as u64,
+            u32::try_from(commands.len()).expect("command dword count"),
+            &mut super::AgcSubmissionContext {
+                graphics: &mut graphics,
+                shaders: &mut shaders,
+                index_resources: &BTreeMap::new(),
+                video_out: &VideoOutState::default(),
+                submission_count: &mut submission_count,
+                flips: &mut Vec::new(),
+                event_writes: &mut Vec::new(),
+            },
+        )
+        .expect("branched submission");
+
+        assert_eq!(graphics.shader_registers.get(&0x00c), Some(&0x1111_1111));
+        assert!(!graphics.shader_registers.contains_key(&0x00d));
+        assert_eq!(
+            super::agc_command_abi::take_recorded_graphics_prefix(then_address + 12),
+            None,
+            "an already executed native branch target must not be reconstructed before an adjacent tail"
+        );
+    }
+
+    #[test]
+    fn unconditional_gen5_branch_does_not_read_its_queue_label() {
+        let then_commands = [agc_pm4(3, super::AGC_IT_SET_SH_REG, 0), 0x00c, 0x8765_4321];
+        let then_address = then_commands.as_ptr().addr() as u64;
+        let commands = [
+            agc_pm4(14, super::AGC_IT_INDIRECT_BUFFER, 0),
+            1,
+            0x0000_1000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            low_u32(then_address) & !3,
+            low_u32(then_address >> 32),
+            3,
+            0,
+            0,
+            0,
+        ];
+        let mut graphics = AgcGraphicsState::default();
+        let mut shaders = AgcShaderRegistry::default();
+        let mut submission_count = 0;
+
+        super::agc_parse_submission(
+            commands.as_ptr().addr() as u64,
+            u32::try_from(commands.len()).expect("command dword count"),
+            &mut super::AgcSubmissionContext {
+                graphics: &mut graphics,
+                shaders: &mut shaders,
+                index_resources: &BTreeMap::new(),
+                video_out: &VideoOutState::default(),
+                submission_count: &mut submission_count,
+                flips: &mut Vec::new(),
+                event_writes: &mut Vec::new(),
+            },
+        )
+        .expect("unconditional branch");
+
+        assert_eq!(graphics.shader_registers.get(&0x00c), Some(&0x8765_4321));
     }
 
     #[test]
@@ -23467,8 +27025,44 @@ mod platform_independent_tests {
         }));
         super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
         assert_eq!(
+            draw.scanout_target, None,
+            "a constant export with no sampled source is not a display composite"
+        );
+
+        draw.pixel_shader_evaluation = Some(Arc::new(remu_shader::ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: vec![remu_shader::ImageBinding {
+                pc: 0,
+                opcode: remu_shader::Opcode::Known("ImageSample"),
+                control: remu_shader::ImageControl {
+                    dmask: 0xf,
+                    vector_address: 0,
+                    address_registers: Vec::new(),
+                    vector_data: 0,
+                    scalar_resource: 0,
+                    scalar_sampler: 0,
+                    dimension: 2,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                },
+                resource_descriptor: vec![1, 0, 0, 0].into(),
+                sampler_descriptor: vec![0; 4].into(),
+                mip_level: None,
+            }],
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        }));
+        super::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
+        assert_eq!(
             draw.scanout_target.map(|scanout| scanout.address),
-            Some(target.address)
+            Some(target.address),
+            "a side-effect-free sampled draw may be the display composite"
         );
 
         draw.scanout_target = None;
@@ -23539,7 +27133,7 @@ mod platform_independent_tests {
     }
 
     #[test]
-    fn resolves_constant_targetless_draw_before_ordered_barrier_acquire_and_flip() {
+    fn constant_targetless_draw_does_not_overwrite_ordered_scanout() {
         let _event_guard = GPU_EVENT_SINK_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -23581,23 +27175,13 @@ mod platform_independent_tests {
         .expect("ordered targetless submission");
         remu_gpu::clear_event_sink();
 
-        let remu_gpu::GpuEvent::IndexedDraw(draw) = receiver.recv().expect("resolved draw event")
+        let remu_gpu::GpuEvent::IndexedDraw(draw) = receiver.recv().expect("constant draw event")
         else {
             panic!("draw must precede flip");
         };
         assert_eq!(
-            draw.scanout_target,
-            Some(remu_gpu::GpuScanoutTarget {
-                address,
-                width: 1_280,
-                height: 720,
-                pitch: 1_280,
-                pixel_format: 0x8000_0000_2200_0000,
-                tiling_mode: 0,
-                export_slot: 0,
-                write_mask: 0xf,
-                color_surface: Some(target),
-            })
+            draw.scanout_target, None,
+            "an evaluated constant export is not redirected into VideoOut"
         );
         assert_eq!(
             receiver.recv().expect("pixel partial flush"),
@@ -23685,13 +27269,22 @@ mod platform_independent_tests {
             [7, (&raw const packet).addr() as u64, 0, 0, 0, 0],
             &mut state,
         );
-        let event = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        let submission_event = receiver.recv_timeout(std::time::Duration::from_secs(1));
         remu_gpu::clear_event_sink();
 
         assert_eq!(result, 0);
-        let remu_gpu::GpuEvent::ComputeDispatch(dispatch) = event.expect("compute dispatch event")
+        let remu_gpu::GpuEvent::QueueSubmission { queue_id, events } =
+            submission_event.expect("compute queue submission")
         else {
-            panic!("ACB emitted a non-compute event");
+            panic!("ACB did not preserve its compute queue");
+        };
+        assert_eq!(queue_id, 8);
+        let [
+            remu_gpu::GpuEvent::ComputeDispatch(dispatch),
+            remu_gpu::GpuEvent::SubmissionBoundary(1),
+        ] = events.as_slice()
+        else {
+            panic!("ACB submission did not retain compute dispatch and completion order");
         };
         assert_eq!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct);
         assert_eq!(
@@ -23706,6 +27299,53 @@ mod platform_independent_tests {
                 .get(&remu_gpu::COMPUTE_PGM_LO_REGISTER)),
             Some(&low_u32(program_address >> 8))
         );
+        assert_eq!(
+            state
+                .pending_agc_user_interrupts
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(state.pending_agc_completions.is_empty());
+    }
+
+    #[test]
+    fn accepts_zero_extent_indirect_compute_without_emitting_gpu_work() {
+        let program = AlignedComputeProgram([0; 4]);
+        let program_address = program.0.as_ptr().addr() as u64;
+        let (mut graphics, mut shaders) = compute_graphics_state(program_address);
+        let dimensions = AlignedIndirectArguments([0, 8, 1, 0, 0, 0, 0, 0]);
+        graphics.compute_indirect_args_address = dimensions.0.as_ptr().addr() as u64;
+        let packet = [agc_pm4(3, AGC_IT_DISPATCH_INDIRECT, 0), 0, 0x8041];
+        let mut flips = Vec::new();
+        let mut event_writes = Vec::new();
+
+        let (result, gpu_events) = super::capture_agc_gpu_events(|| {
+            super::agc_handle_submission_packet(
+                super::AgcSubmissionPacket {
+                    address: packet.as_ptr().addr() as u64,
+                    length: 3,
+                    opcode: AGC_IT_DISPATCH_INDIRECT,
+                    register: 0,
+                    predicated: false,
+                },
+                &mut graphics,
+                &mut shaders,
+                &BTreeMap::new(),
+                &VideoOutState::default(),
+                &mut flips,
+                &mut event_writes,
+                None,
+            )
+        });
+
+        result.expect("zero-extent indirect dispatch is valid empty work");
+        assert!(
+            gpu_events.is_empty(),
+            "empty compute must not reach the backend"
+        );
+        assert_eq!(graphics.emitted_compute_dispatches, 1);
     }
 
     #[test]

@@ -29,10 +29,11 @@ use crate::{
     DEFAULT_THREAD_AFFINITY_MASK, DEFAULT_THREAD_PRIORITY, KERNEL_EVENT_FILTER_USER, KERNEL_FILES,
     KernelFileState, ProbeDispatchState, SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR,
     SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_IS_DIRECTORY,
-    SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_PERMISSION_DENIED,
-    current_guest_thread_handle, guest_errno_address, guest_kernel_rmdir, guest_posix_file_result,
-    guest_rwlock_destroy, guest_rwlock_init, guest_rwlock_lock, guest_rwlock_unlock, guest_sync,
-    kernel_process_time, kernel_register_event, low_i32, low_u32, posix_pthread_result,
+    SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
+    SCE_KERNEL_ERROR_PERMISSION_DENIED, current_guest_thread_handle, guest_errno_address,
+    guest_kernel_rmdir, guest_posix_file_result, guest_rwlock_destroy, guest_rwlock_init,
+    guest_rwlock_lock, guest_rwlock_unlock, guest_sync, kernel_process_time, kernel_register_event,
+    low_i32, low_u32, posix_pthread_result, process_guest_range_has_read_access,
     process_guest_range_is_readable, pthread_attr_set_inherit_schedule,
     pthread_attr_set_schedule_param, pthread_attr_state, pthread_get_schedule_param,
     pthread_rename, read_guest_bytes, read_guest_cstring, read_guest_u16, read_guest_u32,
@@ -508,10 +509,22 @@ fn kernel_positional_transfer(arguments: [u64; 6], write: bool) -> u64 {
         let source = unsafe { std::slice::from_raw_parts(buffer as *const u8, length) };
         file.write_at(source, offset.cast_unsigned())
     } else {
-        // SAFETY: the positional read ABI supplies a writable guest range of exactly `length`
-        // bytes, and the descriptor table lock serialises access to the file.
-        let destination = unsafe { std::slice::from_raw_parts_mut(buffer as *mut u8, length) };
-        file.read_at(destination, offset.cast_unsigned())
+        if !process_guest_range_has_read_access(buffer, length) {
+            return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+        }
+        let mut staging = Vec::new();
+        if staging.try_reserve_exact(length).is_err() {
+            return sce_kernel_error(SCE_KERNEL_ERROR_OUT_OF_MEMORY);
+        }
+        staging.resize(length, 0_u8);
+        file.read_at(&mut staging, offset.cast_unsigned())
+            .inspect(|&transferred| {
+                // SAFETY: the complete guest destination range was validated above. Copying with
+                // CPU stores lets CpuWriteWatch synchronously disarm and dirty protected pages.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(staging.as_ptr(), buffer as *mut u8, transferred);
+                }
+            })
     };
     match transferred {
         Ok(transferred) => u64::try_from(transferred).expect("transferred byte count fits u64"),
@@ -1317,6 +1330,51 @@ mod tests {
             .stream_position()
             .expect("the host reports the descriptor cursor");
         assert_eq!(position, 0);
+        release_descriptor(fd);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn positional_reads_copy_through_cpu_write_watches() {
+        let directory = TemporaryDirectory::new("positional-write-watch");
+        let path = directory.path.join("data.bin");
+        std::fs::write(&path, b"watched").expect("the test file can be written");
+        let file = std::fs::File::open(&path).expect("the test file can be opened");
+        let fd = register_descriptor(file);
+        let page_size =
+            usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("host page size");
+        // SAFETY: this test owns the anonymous mapping until after the watch is retired.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        let address = mapping.addr() as u64;
+        // SAFETY: the complete watched page is a live readable/writable anonymous mapping.
+        let watch = unsafe { remu_memory::CpuWriteWatch::new(address, page_size as u64).unwrap() };
+        let mut state = ProbeDispatchState::default();
+
+        let read = dispatch(
+            "+r3rMFwItV4",
+            args(&[u64::from(fd.cast_unsigned()), address + 7, 7, 0]),
+            &mut state,
+        );
+
+        assert_eq!(read, Some(7));
+        assert!(watch.is_dirty());
+        // SAFETY: the mapping remains live and the staged read made its first page readable.
+        let bytes = unsafe { std::slice::from_raw_parts((address + 7) as *const u8, 7) };
+        assert_eq!(bytes, b"watched");
+        drop(watch);
+        remu_memory::CpuWriteWatch::retire_overlapping(address, page_size as u64);
+        // SAFETY: no watch retains this mapping and the test owns the exact mmap span.
+        assert_eq!(unsafe { libc::munmap(mapping, page_size) }, 0);
         release_descriptor(fd);
     }
 

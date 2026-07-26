@@ -25,9 +25,9 @@ use std::sync::Mutex;
 
 use crate::{
     AgcSubmissionContext, KERNEL_EVENT_FILTER_GRAPHICS, ProbeDispatchState,
-    SCE_KERNEL_ERROR_NOT_FOUND, agc_parse_submission, process_guest_range_is_readable,
-    queue_agc_event_write, queue_video_out_flip, request_agc_submission_completion,
-    sce_kernel_error,
+    SCE_KERNEL_ERROR_NOT_FOUND, agc_command_abi, agc_parse_graphics_submission,
+    capture_agc_gpu_events, process_guest_range_is_readable, queue_agc_event_write,
+    queue_video_out_flip, request_agc_submission_completion, sce_kernel_error,
 };
 
 const AGC_ERROR_ALIGNMENT: u64 = 0x8a6c_0002;
@@ -199,7 +199,7 @@ fn agr_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     if dword_count == 0 {
         return 0;
     }
-    submit_graphics(command_address, dword_count, state)
+    submit_graphics(queue, command_address, dword_count, state)
 }
 
 /// Submits a batch of command buffers to a graphics ring in the order the guest listed them.
@@ -241,7 +241,7 @@ fn agr_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
         if dword_count == 0 {
             continue;
         }
-        let result = submit_graphics(command_address, dword_count, state);
+        let result = submit_graphics(queue, command_address, dword_count, state);
         if result != 0 {
             return result;
         }
@@ -273,22 +273,29 @@ fn check_submission(queue: u32, command_address: u64, dword_count: u32) -> Resul
 }
 
 /// Walks a validated packet stream and applies the flips and interrupts it carries.
-fn submit_graphics(command_address: u64, dword_count: u32, state: &mut ProbeDispatchState) -> u64 {
+fn submit_graphics(
+    queue: u32,
+    command_address: u64,
+    dword_count: u32,
+    state: &mut ProbeDispatchState,
+) -> u64 {
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
-    let result = agc_parse_submission(
-        command_address,
-        dword_count,
-        &mut AgcSubmissionContext {
-            graphics: &mut state.agc_graphics,
-            shaders: &mut state.agc_shader_registry,
-            index_resources: &state.agc_index_resources,
-            video_out: &state.video_out,
-            submission_count: &mut state.agc_submission_count,
-            flips: &mut flips,
-            event_writes: &mut event_writes,
-        },
-    );
+    let (result, gpu_events) = capture_agc_gpu_events(|| {
+        agc_parse_graphics_submission(
+            command_address,
+            dword_count,
+            &mut AgcSubmissionContext {
+                graphics: &mut state.agc_graphics,
+                shaders: &mut state.agc_shader_registry,
+                index_resources: &state.agc_index_resources,
+                video_out: &state.video_out,
+                submission_count: &mut state.agc_submission_count,
+                flips: &mut flips,
+                event_writes: &mut event_writes,
+            },
+        )
+    });
     for (handle, buffer_index, flip_argument) in flips {
         queue_video_out_flip(state, handle, buffer_index, flip_argument);
     }
@@ -297,7 +304,8 @@ fn submit_graphics(command_address: u64, dword_count: u32, state: &mut ProbeDisp
     }
     match result {
         Ok(()) => {
-            request_agc_submission_completion(state);
+            agc_command_abi::track_graphics_submission(command_address, dword_count);
+            request_agc_submission_completion(state, u64::from(queue), gpu_events);
             0
         }
         Err(error) => {
@@ -653,6 +661,7 @@ fn has_capacity(cursor_up: u64, cursor_down: u64, reserved: u32, needed: u32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GPU_EVENT_SINK_TEST;
 
     struct CommandFixture {
         descriptor: Box<[u64; 7]>,
@@ -709,6 +718,11 @@ mod tests {
 
     #[test]
     fn a_graphics_submission_parses_its_stream_and_requests_a_completion_event() {
+        let _event_guard = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (sender, receiver) = remu_gpu::gpu_event_channel();
+        remu_gpu::install_event_sink(sender);
         let stream = command_stream();
         let address = stream.as_ptr().addr() as u64;
         let mut state = ProbeDispatchState::default();
@@ -719,6 +733,17 @@ mod tests {
         );
         assert_eq!(state.agc_submission_count, 1);
         assert_eq!(state.pending_agc_completions.len(), 1);
+        assert!(matches!(
+            receiver.recv(),
+            Ok(remu_gpu::GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events,
+            }) if matches!(
+                events.last(),
+                Some(remu_gpu::GpuEvent::SubmissionBoundary(1))
+            )
+        ));
+        remu_gpu::clear_event_sink();
     }
 
     #[test]
@@ -768,6 +793,11 @@ mod tests {
 
     #[test]
     fn a_multi_buffer_submission_runs_every_listed_command_buffer() {
+        let _event_guard = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (sender, receiver) = remu_gpu::gpu_event_channel();
+        remu_gpu::install_event_sink(sender);
         let stream = command_stream();
         let address = stream.as_ptr().addr() as u64;
         let addresses = [address, address];
@@ -789,6 +819,19 @@ mod tests {
         );
         assert_eq!(state.agc_submission_count, 2);
         assert_eq!(state.pending_agc_completions.len(), 2);
+        for sequence in 1..=2 {
+            assert!(matches!(
+                receiver.recv(),
+                Ok(remu_gpu::GpuEvent::QueueSubmission {
+                    queue_id: 0,
+                    events,
+                }) if matches!(
+                    events.last(),
+                    Some(remu_gpu::GpuEvent::SubmissionBoundary(actual)) if *actual == sequence
+                )
+            ));
+        }
+        remu_gpu::clear_event_sink();
     }
 
     #[test]

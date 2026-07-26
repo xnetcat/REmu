@@ -882,8 +882,9 @@ impl GuestAddressSpace {
         Ok(())
     }
 
-    /// Changes protection on mapped pages. Partial ranges split VMAs and equal adjacent pieces are
-    /// merged again automatically.
+    /// Changes protection on claimed pages. Granting access to reserved pages commits anonymous
+    /// memory there; partial ranges split VMAs and equal adjacent pieces are merged again
+    /// automatically.
     pub fn protect(
         &mut self,
         address: GuestAddress,
@@ -891,10 +892,10 @@ impl GuestAddressSpace {
         protection: GuestProtection,
     ) -> Result<(), AddressSpaceError> {
         let (start, end) = self.validate_page_range(address, size)?;
-        self.ensure_covered(start, end, true, None)?;
+        self.ensure_covered(start, end, false, None)?;
         let reprotection = CpuWriteWatch::begin_reprotect_overlapping(start, size);
         let address_pointer = host_pointer(start)?;
-        // SAFETY: Validation proves the complete range belongs to mapped pages in our reservation.
+        // SAFETY: Validation proves the complete range is claimed inside our host reservation.
         let result =
             unsafe { libc::mprotect(address_pointer, host_size(size)?, protection.host_flags()) };
         drop(reprotection);
@@ -905,6 +906,9 @@ impl GuestAddressSpace {
         self.split_at(end);
         for (_, vma) in self.vmas.range_mut(start..end) {
             vma.protection = protection;
+            if protection != GuestProtection::NONE && matches!(vma.kind, VmaKind::Reserved) {
+                vma.kind = VmaKind::Anonymous;
+            }
         }
         self.normalize();
         Ok(())
@@ -1561,6 +1565,49 @@ mod tests {
             .protect(page(base, 1), GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
             .unwrap();
         assert_eq!(memory.vmas().len(), 1);
+    }
+
+    #[test]
+    fn protection_commits_only_the_selected_reserved_pages() {
+        let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+        let reserved = memory
+            .reserve(
+                GuestMapPlacement::Anywhere,
+                3 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+            )
+            .unwrap();
+
+        let committed = page(reserved, 1);
+        memory
+            .protect(committed, GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+            .unwrap();
+        memory.write(committed, b"committed").unwrap();
+
+        assert_eq!(
+            memory.query(reserved).unwrap().state,
+            GuestVmaState::Reserved
+        );
+        assert_eq!(
+            memory.query(committed).unwrap().state,
+            GuestVmaState::Anonymous
+        );
+        assert_eq!(
+            memory.query(page(reserved, 2)).unwrap().state,
+            GuestVmaState::Reserved
+        );
+        assert!(matches!(
+            memory.map_anonymous(
+                GuestMapPlacement::Fixed(committed),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+            ),
+            Err(AddressSpaceError::Overlap {
+                state: GuestVmaState::Anonymous,
+                ..
+            })
+        ));
     }
 
     #[test]

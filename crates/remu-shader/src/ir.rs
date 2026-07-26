@@ -202,6 +202,7 @@ pub enum RawOpcodeFamily {
     Vop3b,
     Vop3p,
     Mubuf,
+    Mimg,
 }
 
 /// A decoded opcode. Known operations retain their canonical name while architecturally framed

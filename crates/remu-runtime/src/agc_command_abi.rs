@@ -5,6 +5,8 @@
 //! place is important: patch functions validate the packet opcode they mutate,
 //! and every `GetSize` result is tied to the corresponding encoder.
 
+use std::{collections::BTreeSet, sync::Mutex};
+
 const GRAPHICS5_ERROR_INVALID_PACKET: u64 = 0x8a6c_000c;
 
 const COMMAND_BUFFER_CURSOR_UP_OFFSET: u64 = 0x10;
@@ -62,6 +64,28 @@ const VGT_INDEX_TYPE: u32 = 0x243;
 const MAX_PACKET_DWORDS: u32 = 0x4001;
 
 type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingGraphicsContinuation {
+    packet: u64,
+    then_start: u64,
+    then_end: u64,
+    else_start: u64,
+    else_end: u64,
+}
+
+static RECENT_COMMAND_ALLOCATIONS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static PENDING_GRAPHICS_CONTINUATIONS: Mutex<Vec<PendingGraphicsContinuation>> =
+    Mutex::new(Vec::new());
+static CONSUMED_GRAPHICS_CONTINUATIONS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Command-buffer descriptors most recently used through an ACB-only constructor.
+///
+/// The Gen5 common helpers accept both DCB and ACB descriptors, so the descriptor is the stable
+/// piece of information which tells `allocate_dwords` whether a neighboring allocation can extend
+/// a submitted graphics stream. Without this distinction, an ACB built immediately after a DCB in
+/// the same backing ring is reconstructed as a post-submit graphics tail and then executed again
+/// through the compute submission.
+static ASYNC_COMMAND_BUFFERS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 
 #[derive(Clone, Copy)]
 enum IndirectRegisterKind {
@@ -141,7 +165,12 @@ fn dispatch_common_command(
         "n2fD4A+pb+g" => cb_set_register_range(arguments, IT_SET_SH_REG),
         "bxGoVxpdSPQ" => low_u32(arguments[0]).wrapping_mul(4).wrapping_add(8).into(),
         "UZbQjYAwwXM" => cb_set_sh_registers(arguments),
-        "wr23dPKyWc0" => cb_release_mem(arguments, stack_arguments),
+        "wr23dPKyWc0" => trace_failed_sync_command(
+            "sceAgcCbReleaseMem",
+            arguments,
+            stack_arguments,
+            cb_release_mem(arguments, stack_arguments),
+        ),
         "hL7C0IRpWZI" => 32,
         _ => return None,
     })
@@ -160,6 +189,27 @@ fn dispatch_async_command(
     arguments: [u64; 6],
     stack_arguments: [u64; 6],
 ) -> Option<u64> {
+    if !matches!(
+        nid,
+        "JrtiDtKeS38"
+            | "cFazmnXpJOE"
+            | "KT-hTp-Ch14"
+            | "ewobAQeMo5k"
+            | "M0ttm8h7SKA"
+            | "qyM2bxYFPAk"
+            | "ozKzBP4aki4"
+            | "htn36gPnBk4"
+            | "-RnpfpxIhec"
+            | "qzMN2XKGA4k"
+            | "j3EtxFkSIhQ"
+            | "eZ4+17OQz4Q"
+            | "xAeBOa0A3kk"
+            | "cpCILPya5Zk"
+            | "6mFxkVqdmbQ"
+    ) {
+        return None;
+    }
+    mark_async_command_buffer(arguments[0]);
     Some(match nid {
         "JrtiDtKeS38" => acb_reset_queue(arguments),
         "cFazmnXpJOE" => event_write(arguments),
@@ -167,18 +217,74 @@ fn dispatch_async_command(
         "ewobAQeMo5k" | "M0ttm8h7SKA" => 32,
         "qyM2bxYFPAk" => cond_exec(arguments),
         "ozKzBP4aki4" => 20,
-        "htn36gPnBk4" => acb_wait_reg_mem(arguments, stack_arguments),
-        "-RnpfpxIhec" => dma_data(arguments, stack_arguments),
-        "qzMN2XKGA4k" => copy_data(arguments, stack_arguments, true),
+        "htn36gPnBk4" => trace_failed_sync_command(
+            "sceAgcAcbWaitRegMem",
+            arguments,
+            stack_arguments,
+            acb_wait_reg_mem(arguments, stack_arguments),
+        ),
+        "-RnpfpxIhec" => trace_failed_sync_command(
+            "sceAgcAcbDmaData",
+            arguments,
+            stack_arguments,
+            acb_dma_data(arguments, stack_arguments),
+        ),
+        "qzMN2XKGA4k" => trace_failed_sync_command(
+            "sceAgcAcbCopyData",
+            arguments,
+            stack_arguments,
+            copy_data(arguments, stack_arguments, true),
+        ),
         "j3EtxFkSIhQ" => acb_dispatch_indirect(arguments),
-        "eZ4+17OQz4Q" => write_data(arguments, stack_arguments),
+        "eZ4+17OQz4Q" => trace_failed_sync_command(
+            "sceAgcAcbWriteData",
+            arguments,
+            stack_arguments,
+            write_data(arguments, stack_arguments),
+        ),
         "xAeBOa0A3kk" | "cpCILPya5Zk" => push_marker(arguments),
         "6mFxkVqdmbQ" => pop_marker(arguments),
-        _ => return None,
+        _ => unreachable!("the ACB NID set was checked above"),
     })
 }
 
 fn dispatch_draw_command(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]) -> Option<u64> {
+    if !matches!(
+        nid,
+        "TRO721eVt4g"
+            | "MWiElSNE8j8"
+            | "pFLArOT53+w"
+            | "LHFXRrlTPD8"
+            | "w4-d0n60hdo"
+            | "ZvwO9euwYzc"
+            | "-HOOCn0JY48"
+            | "hvUfkUIQcOE"
+            | "GIIW2J37e70"
+            | "8N2tmT3jmC8"
+            | "mljzuGDZRQ4"
+            | "tSBxhAPyytQ"
+            | "q88lQ+GP5Yk"
+            | "6ee9Hd3EWXQ"
+            | "Rlx+bykm0r0"
+            | "mR9j7+SfM34"
+            | "Yw0jKSqop+E"
+            | "B+aG9DUnTKA"
+            | "RmaJwLtc8rY"
+            | "1q1titRBL6o"
+            | "t1vNu082-jM"
+            | "ypVBz4uPKcQ"
+            | "CtB+A9-VxO0"
+            | "1DeUNpRIDDA"
+            | "WrdP9Zxx3lQ"
+            | "w8HVkEeXPv8"
+            | "qMlfB1ZhMDc"
+            | "cxPZ4Wgvdj8"
+            | "mStuvI0zOtc"
+            | "6DFuRKT4C9w"
+    ) {
+        return None;
+    }
+    mark_graphics_command_buffer(arguments[0]);
     Some(match nid {
         "TRO721eVt4g" => dcb_reset_queue(arguments),
         "MWiElSNE8j8" => dcb_wait_until_safe(arguments),
@@ -208,7 +314,7 @@ fn dispatch_draw_command(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 
         "1DeUNpRIDDA" | "WrdP9Zxx3lQ" | "w8HVkEeXPv8" => 12,
         "qMlfB1ZhMDc" | "cxPZ4Wgvdj8" | "mStuvI0zOtc" => 20,
         "6DFuRKT4C9w" => 8,
-        _ => return None,
+        _ => unreachable!("the DCB NID set was checked above"),
     })
 }
 
@@ -217,19 +323,65 @@ fn dispatch_draw_sync_command(
     arguments: [u64; 6],
     stack_arguments: [u64; 6],
 ) -> Option<u64> {
+    if !matches!(
+        nid,
+        "aJf+j5yntiU"
+            | "57labkp+rSQ"
+            | "-vnlTPPXPrw"
+            | "2ccJz9LQI+w"
+            | "1rZSWUv1IRc"
+            | "WmAc2MEj6Io"
+            | "xSAR0LTcRKM"
+            | "VEGu4dixjUg"
+            | "zfcxg-ewMK8"
+            | "BIPexNBSGog"
+            | "bbFueFP+J4k"
+            | "u2T2DiA5hRI"
+            | "i1jyy49AjXU"
+            | "p9tI+yTvx68"
+            | "rUuVjyR+Rd4"
+            | "vuSXe69VILM"
+            | "VmW0Tdpy420"
+            | "43WJ08sSugE"
+            | "+kSrjIVxKFE"
+            | "QhCbS4X9Rl8"
+            | "H7uZqCoNuWk"
+            | "QIXCsbipds0"
+            | "+u6dKSLWM2o"
+            | "ou16V5hh5sg"
+            | "YUeqkyT7mEQ"
+    ) {
+        return None;
+    }
+    mark_graphics_command_buffer(arguments[0]);
     Some(match nid {
         "aJf+j5yntiU" => event_write(arguments),
         "57labkp+rSQ" => dcb_acquire_mem(arguments, stack_arguments),
         "-vnlTPPXPrw" | "2ccJz9LQI+w" => 32,
-        "1rZSWUv1IRc" => copy_data(arguments, stack_arguments, false),
-        "WmAc2MEj6Io" => dma_data(arguments, stack_arguments),
+        "1rZSWUv1IRc" => trace_failed_sync_command(
+            "sceAgcDcbCopyData",
+            arguments,
+            stack_arguments,
+            copy_data(arguments, stack_arguments, false),
+        ),
+        "WmAc2MEj6Io" => trace_failed_sync_command(
+            "sceAgcDcbDmaData",
+            arguments,
+            stack_arguments,
+            dma_data(arguments, stack_arguments),
+        ),
         "xSAR0LTcRKM" => dcb_jump(arguments),
         "VEGu4dixjUg" => 16,
         "zfcxg-ewMK8" => dcb_rewind(arguments),
         "BIPexNBSGog" => cond_exec(arguments),
         "bbFueFP+J4k" => set_predication(arguments),
         "u2T2DiA5hRI" => stall_command_buffer_parser(arguments),
-        "i1jyy49AjXU" => write_data(arguments, stack_arguments),
+        "i1jyy49AjXU" => trace_failed_sync_command(
+            "sceAgcDcbWriteData",
+            arguments,
+            stack_arguments,
+            write_data(arguments, stack_arguments),
+        ),
         "p9tI+yTvx68" | "rUuVjyR+Rd4" => low_u32(arguments[0])
             .wrapping_mul(4)
             .wrapping_add(16)
@@ -246,8 +398,47 @@ fn dispatch_draw_sync_command(
         "QIXCsbipds0" | "+u6dKSLWM2o" => 8,
         "ou16V5hh5sg" => 20,
         "YUeqkyT7mEQ" => set_flip(arguments),
-        _ => return None,
+        _ => unreachable!("the DCB synchronization NID set was checked above"),
     })
+}
+
+fn mark_async_command_buffer(command_buffer: u64) {
+    if command_buffer != 0 {
+        ASYNC_COMMAND_BUFFERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(command_buffer);
+    }
+}
+
+fn mark_graphics_command_buffer(command_buffer: u64) {
+    if command_buffer != 0 {
+        ASYNC_COMMAND_BUFFERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&command_buffer);
+    }
+}
+
+fn is_async_command_buffer(command_buffer: u64) -> bool {
+    ASYNC_COMMAND_BUFFERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&command_buffer)
+}
+
+fn trace_failed_sync_command(
+    name: &str,
+    arguments: [u64; 6],
+    stack_arguments: [u64; 6],
+    command: u64,
+) -> u64 {
+    if command == 0 {
+        eprintln!(
+            "[REMu][AGC][SYNC][BUILD] {name} rejected args={arguments:#x?} stack={stack_arguments:#x?}"
+        );
+    }
+    command
 }
 
 fn dispatch_packet_patch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
@@ -386,6 +577,8 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
     let mut cursor_down = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
     let reserved = read_u32(command_buffer + COMMAND_BUFFER_RESERVED_DWORDS_OFFSET);
     if !has_capacity(cursor_up, cursor_down, reserved, dword_count) {
+        let previous_cursor_up = cursor_up;
+        let previous_cursor_down = cursor_down;
         let callback = read_u64(command_buffer + COMMAND_BUFFER_CALLBACK_OFFSET);
         if callback == 0 {
             return None;
@@ -402,6 +595,9 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
         }
         cursor_up = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET);
         cursor_down = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
+        eprintln!(
+            "[REMu][AGC] command-buffer grow descriptor={command_buffer:#x} requested={dword_count} reserved={reserved} old={previous_cursor_up:#x}..{previous_cursor_down:#x} new={cursor_up:#x}..{cursor_down:#x}"
+        );
         if !has_capacity(cursor_up, cursor_down, reserved, dword_count) {
             return None;
         }
@@ -409,7 +605,289 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
     let byte_count = u64::from(dword_count).checked_mul(4)?;
     let next = cursor_up.checked_add(byte_count)?;
     write_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET, next);
+    if !is_async_command_buffer(command_buffer) {
+        track_graphics_allocation(cursor_up, dword_count);
+    }
     Some(cursor_up)
+}
+
+fn register_graphics_continuation(
+    packet: u64,
+    then_address: u64,
+    then_count: u32,
+    else_address: u64,
+    else_count: u32,
+) {
+    let target_end = |address: u64, count: u32| {
+        (address != 0 && count != 0)
+            .then(|| address.checked_add(u64::from(count) * 4))
+            .flatten()
+            .unwrap_or(0)
+    };
+    let then_end = target_end(then_address, then_count);
+    let else_end = target_end(else_address, else_count);
+    if packet == 0 || (then_end == 0 && else_end == 0) {
+        return;
+    }
+
+    CONSUMED_GRAPHICS_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|&consumed| consumed != packet);
+    let mut pending = PENDING_GRAPHICS_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.retain(|continuation| continuation.packet != packet);
+    pending.push(PendingGraphicsContinuation {
+        packet,
+        then_start: then_address,
+        then_end,
+        else_start: else_address,
+        else_end,
+    });
+    if pending.len() > 4_096 {
+        let drain_count = pending.len() - 2_048;
+        pending.drain(..drain_count);
+    }
+}
+
+/// Takes branch packets whose selected indirect-buffer range is immediately before a submitted
+/// DCB. Gen5 uses this form when a command buffer grows: the branch executes the prefix written
+/// into the replacement allocation, then execution continues with the explicitly submitted tail.
+pub(crate) fn take_graphics_continuations_before(command_address: u64) -> Vec<u64> {
+    let mut pending = PENDING_GRAPHICS_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut matched = Vec::new();
+    let mut matched_ranges = Vec::new();
+    pending.retain(|continuation| {
+        if continuation.then_end == command_address || continuation.else_end == command_address {
+            matched.push(continuation.packet);
+            matched_ranges.extend([
+                (continuation.then_start, continuation.then_end),
+                (continuation.else_start, continuation.else_end),
+            ]);
+            false
+        } else {
+            true
+        }
+    });
+    drop(pending);
+    for (start, end) in matched_ranges {
+        if let Ok(dword_count) = u32::try_from(end.saturating_sub(start) / 4)
+            && start != 0
+            && dword_count != 0
+        {
+            consume_recorded_graphics_range(start, dword_count);
+        }
+    }
+
+    if !matched.is_empty() {
+        let mut consumed = CONSUMED_GRAPHICS_CONTINUATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        consumed.extend(matched.iter().copied());
+        if consumed.len() > 4_096 {
+            let drain_count = consumed.len() - 2_048;
+            consumed.drain(..drain_count);
+        }
+    }
+    matched
+}
+
+pub(crate) fn graphics_continuation_was_consumed(packet: u64) -> bool {
+    CONSUMED_GRAPHICS_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&packet)
+}
+
+/// Retires constructor-side recovery metadata after the native branch packet itself executes.
+///
+/// The pending record exists only to recover a branch target which was separated from the
+/// explicitly submitted tail by command-buffer growth. If the packet is already present in a
+/// parsed DCB, normal branch execution has performed that work and the recovery record must not
+/// replay it before the next DCB. This deliberately does not mark the packet globally consumed:
+/// a native command stream may legally execute the same indirect branch more than once.
+pub(crate) fn retire_pending_graphics_continuation(packet: u64) {
+    let mut pending = PENDING_GRAPHICS_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut retired_ranges = Vec::new();
+    pending.retain(|continuation| {
+        if continuation.packet == packet {
+            retired_ranges.extend([
+                (continuation.then_start, continuation.then_end),
+                (continuation.else_start, continuation.else_end),
+            ]);
+            false
+        } else {
+            true
+        }
+    });
+    drop(pending);
+    // Once the native branch packet is present in a parsed DCB, both alternatives belong to that
+    // branch's control-flow graph. The selected one executes now and the unselected one does not;
+    // neither may later be guessed as a missing prefix for an adjacent submission.
+    for (start, end) in retired_ranges {
+        if let Ok(dword_count) = u32::try_from(end.saturating_sub(start) / 4)
+            && start != 0
+            && dword_count != 0
+        {
+            consume_recorded_graphics_range(start, dword_count);
+        }
+    }
+}
+
+/// Recovers command packets allocated before an explicitly submitted DCB tail.
+///
+/// A grow callback can move the DCB while another guest thread is preparing the stitching branch.
+/// The command constructors have still recorded the replacement buffer's prefix. Only a complete,
+/// readable PM4 stream ending exactly at the submitted address is accepted, so unrelated recent
+/// allocations cannot be replayed as graphics work.
+pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64, u32)> {
+    const MAX_PREFIX_DWORDS: u64 = 1_000_000;
+    let lower_bound = command_address.saturating_sub(MAX_PREFIX_DWORDS * 4);
+    let mut allocations = RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut candidates = allocations
+        .iter()
+        .filter_map(|&(start, end)| {
+            (start >= lower_bound && start < command_address && end <= command_address)
+                .then_some(start)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    // Some Gen5 command helpers reserve only an anchor packet; the guest writes neighboring PM4
+    // directly. Accept those guest-authored packets only inside a complete readable stream that
+    // begins at a constructor-recorded address and ends exactly at the submitted tail. Ranges
+    // parsed by an explicit branch or earlier submission are retired separately, preventing a
+    // valid-looking old stream from being selected a second time.
+    let prefix_start = candidates
+        .into_iter()
+        .find(|&start| scan_valid_command_stream_end(start, command_address) == command_address)?;
+    let dword_count = u32::try_from((command_address - prefix_start) / 4).ok()?;
+    if dword_count == 0 {
+        return None;
+    }
+    allocations.retain(|&(start, end)| !(start >= prefix_start && end <= command_address));
+    Some((prefix_start, dword_count))
+}
+
+/// Retires command-constructor records covered by work that has already been parsed.
+///
+/// A native branch target and the submitted DCB that follows it are distinct allocations. Both
+/// must be retired after use; otherwise a later tail at a higher address can reconstruct and
+/// execute the branch target for a second time.
+pub(crate) fn consume_recorded_graphics_range(command_address: u64, dword_count: u32) {
+    let Some(command_end) = command_address.checked_add(u64::from(dword_count) * 4) else {
+        return;
+    };
+    RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|&(allocation_start, allocation_end)| {
+            !(allocation_start >= command_address && allocation_end <= command_end)
+        });
+}
+
+pub(crate) fn track_graphics_allocation(command: u64, dword_count: u32) {
+    if command == 0 || dword_count == 0 {
+        return;
+    }
+    let Some(command_end) = command.checked_add(u64::from(dword_count) * 4) else {
+        return;
+    };
+    let mut allocations = RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    allocations.push((command, command_end));
+    if allocations.len() > 16_384 {
+        let drain_count = allocations.len() - 8_192;
+        allocations.drain(..drain_count);
+    }
+}
+
+pub(crate) fn track_graphics_submission(command_address: u64, dword_count: u32) {
+    let Some(submitted_end) = command_address.checked_add(u64::from(dword_count) * 4) else {
+        return;
+    };
+    {
+        let mut allocations = RECENT_COMMAND_ALLOCATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Command-buffer storage is a ring and may wrap to a numerically lower address. Retire only
+        // allocations covered by this submission; dropping every lower address loses a freshly
+        // built prefix in a recycled allocation. Allocations beyond `submitted_end` belong to a
+        // future DCB: the guest can build it before submitting an intervening ACB, but it must not
+        // execute until that future DCB is explicitly submitted.
+        allocations.retain(|&(allocation_start, allocation_end)| {
+            !(allocation_start >= command_address && allocation_end <= submitted_end)
+        });
+    }
+
+    // A grow/stitch branch can be constructed before its replacement allocation is submitted
+    // directly. Once every non-empty target of that branch has been covered by a successful
+    // explicit submission, retaining the branch would replay the same target when the adjacent
+    // tail arrives. Besides duplicating draws, release-memory packets can then write queue labels
+    // into storage which the guest has already returned to its allocator.
+    let target_was_submitted =
+        |start: u64, end: u64| end == 0 || (start >= command_address && end <= submitted_end);
+    let mut retired_packets = Vec::new();
+    {
+        let mut pending = PENDING_GRAPHICS_CONTINUATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.retain(|continuation| {
+            let retire = target_was_submitted(continuation.then_start, continuation.then_end)
+                && target_was_submitted(continuation.else_start, continuation.else_end);
+            if retire {
+                retired_packets.push(continuation.packet);
+            }
+            !retire
+        });
+    }
+    if !retired_packets.is_empty() {
+        let mut consumed = CONSUMED_GRAPHICS_CONTINUATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        consumed.extend(retired_packets);
+        if consumed.len() > 4_096 {
+            let drain_count = consumed.len() - 2_048;
+            consumed.drain(..drain_count);
+        }
+    }
+}
+
+fn scan_valid_command_stream_end(start: u64, recorded_end: u64) -> u64 {
+    if start == 0 || recorded_end <= start {
+        return start;
+    }
+    let Ok(byte_count) = usize::try_from(recorded_end - start) else {
+        return start;
+    };
+    if !super::process_guest_range_is_readable(start, byte_count) {
+        return start;
+    }
+    let mut command = start;
+    while command < recorded_end {
+        let header = read_u32(command);
+        let dword_count = match header >> 30 {
+            2 => 1,
+            3 => ((header >> 16) & 0x3fff) + 2,
+            _ => break,
+        };
+        let Some(next) = command.checked_add(u64::from(dword_count) * 4) else {
+            break;
+        };
+        if next > recorded_end {
+            break;
+        }
+        command = next;
+    }
+    command
 }
 
 fn has_capacity(cursor_up: u64, cursor_down: u64, reserved: u32, needed: u32) -> bool {
@@ -481,6 +959,14 @@ fn cb_branch(arguments: [u64; 6], stack: [u64; 6]) -> u64 {
     let Some(command) = allocate_dwords(arguments[0], 14) else {
         return 0;
     };
+    eprintln!(
+        "[REMu][AGC] build branch descriptor={:#x} command={command:#x} mode={mode} compare={compare} address={compare_address:#x} mask={:#x} reference={:#x} then={then_address:#x}/{then_count} cache={} else={else_address:#x}/{else_count} cache={}",
+        arguments[0],
+        arguments[4],
+        arguments[5],
+        low_u8(stack[0]),
+        low_u8(stack[3]),
+    );
     write_words(
         command,
         &[
@@ -500,6 +986,7 @@ fn cb_branch(arguments: [u64; 6], stack: [u64; 6]) -> u64 {
             else_count | (low_u8(stack[3]) << 28),
         ],
     );
+    register_graphics_continuation(command, then_address, then_count, else_address, else_count);
     command
 }
 
@@ -583,51 +1070,33 @@ fn cb_set_sh_registers(arguments: [u64; 6]) -> u64 {
 
 fn cb_release_mem(arguments: [u64; 6], stack: [u64; 6]) -> u64 {
     let action = low_u8(arguments[1]);
-    let mut gcr_control = low_u16(arguments[2]);
+    let gcr_control = low_u16(arguments[2]);
     let destination = low_u8(arguments[3]);
     let cache_policy = low_u8(arguments[4]);
-    let mut address = arguments[5];
+    let address = arguments[5];
     let data_selection = low_u8(stack[0]);
-    let mut data = stack[1];
+    let data = stack[1];
     let gds_offset = low_u16(stack[2]);
     let gds_size = low_u16(stack[3]);
     let interrupt = low_u8(stack[4]);
     let interrupt_context = low_u32(stack[5]);
-    if destination > 1
-        || cache_policy > 3
-        || !matches!(data_selection, 0 | 1 | 2 | 3 | 5)
-        || interrupt > 4
-        || address & 3 != 0
-    {
+    if destination > 1 || data_selection > 3 || gds_offset != 0 || gds_size > 2 || interrupt > 3 {
         return 0;
-    }
-    if gcr_control & 0x300 == 0x100 {
-        gcr_control |= 0x200;
-    }
-    if interrupt == 4 {
-        address = 0;
-        data = 0;
-    } else if data_selection == 5 {
-        data = u64::from(gds_offset & 0xffff) | (u64::from(gds_size & 0xffff) << 16);
     }
     let Some(command) = allocate_dwords(arguments[0], 8) else {
         return 0;
     };
-    let event_index = if action >= 0x2f { 6 } else { 5 };
     write_words(
         command,
         &[
             pm4(8, IT_NOP, R_RELEASE_MEM),
-            (action & 0x3f)
-                | (event_index << 8)
-                | ((gcr_control & 0xfff) << 12)
-                | (cache_policy << 25),
-            (destination << 16) | (interrupt << 24) | (data_selection << 29),
-            low_u32(address) & !3,
+            action | (cache_policy << 8),
+            gcr_control | (data_selection << 16) | (interrupt << 24),
+            low_u32(address),
             low_u32(address >> 32),
             low_u32(data),
             low_u32(data >> 32),
-            interrupt_context & 0x07ff_ffff,
+            interrupt_context,
         ],
     );
     command
@@ -722,6 +1191,23 @@ fn acb_wait_reg_mem(arguments: [u64; 6], stack: [u64; 6]) -> u64 {
         mask: stack[0],
         poll_cycles: low_u32(stack[1]),
     })
+}
+
+fn acb_dma_data(arguments: [u64; 6], stack: [u64; 6]) -> u64 {
+    // Current Gen5 ACB callers omit the engine and block-engine parameters because the queue
+    // selects the asynchronous engine itself. Shift the remaining ten arguments into the common
+    // DCB encoder instead of interpreting the destination selector as an invalid engine value.
+    dma_data(
+        [
+            arguments[0],
+            1,
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+        ],
+        [arguments[5], stack[0], stack[1], stack[2], stack[3], 1],
+    )
 }
 
 fn acb_dispatch_indirect(arguments: [u64; 6]) -> u64 {
@@ -1731,7 +2217,7 @@ fn patch_release_address(arguments: [u64; 6]) -> u64 {
     let Some(opcode) = release_packet_kind(command) else {
         return GRAPHICS5_ERROR_INVALID_PACKET;
     };
-    if address & 3 != 0 {
+    if opcode != IT_NOP && address & 3 != 0 {
         return GRAPHICS5_ERROR_INVALID_PACKET;
     }
     if opcode == IT_EVENT_WRITE_EOP {
@@ -1749,13 +2235,10 @@ fn patch_release_address(arguments: [u64; 6]) -> u64 {
 fn patch_release_gcr(arguments: [u64; 6]) -> u64 {
     let command = arguments[0];
     let gcr = low_u16(arguments[1]);
-    if gcr > 0xfff || !is_packet(command, IT_NOP, Some(R_RELEASE_MEM)) {
+    if !is_packet(command, IT_NOP, Some(R_RELEASE_MEM)) {
         return GRAPHICS5_ERROR_INVALID_PACKET;
     }
-    write_u32(
-        command + 4,
-        (read_u32(command + 4) & !0x00ff_f000) | (gcr << 12),
-    );
+    write_u32(command + 8, (read_u32(command + 8) & !0x0000_ffff) | gcr);
     0
 }
 
@@ -1782,12 +2265,12 @@ fn patch_release_data(arguments: [u64; 6]) -> u64 {
 fn patch_release_type(arguments: [u64; 6]) -> u64 {
     let command = arguments[0];
     let data_selection = low_u8(arguments[1]);
-    if data_selection > 7 || !is_packet(command, IT_NOP, Some(R_RELEASE_MEM)) {
+    if data_selection > 3 || !is_packet(command, IT_NOP, Some(R_RELEASE_MEM)) {
         return GRAPHICS5_ERROR_INVALID_PACKET;
     }
     write_u32(
         command + 8,
-        (read_u32(command + 8) & !(7 << 29)) | (data_selection << 29),
+        (read_u32(command + 8) & !0x00ff_0000) | (data_selection << 16),
     );
     0
 }
@@ -1859,6 +2342,194 @@ mod tests {
             dispatch_agc_command_abi("not-an-agc-nid", [0; 6], [0; 6]),
             None
         );
+    }
+
+    #[test]
+    fn records_a_branch_target_that_stitches_into_the_next_dcb() {
+        let mut fixture = CommandFixture::new(0);
+        let buffer = fixture.address();
+        let compare = 0_u64;
+        let compare_address = std::ptr::from_ref(&compare).addr() as u64;
+        let target = Box::new([pm4(3, IT_SET_SH_REG, 0), 0x0c, 0x1234_5678, 0]);
+        let target_address = target.as_ptr().addr() as u64;
+        let next_dcb = target_address + 12;
+
+        let command = call(
+            "w1KFAHVqpaU",
+            args(&[buffer, 1, 0, compare_address, 0, 0]),
+            args(&[0, target_address, 3, 0, 0, 0]),
+        );
+
+        assert_eq!(command, fixture.start());
+        assert_eq!(fixture.words[0], pm4(14, IT_INDIRECT_BUFFER, 0));
+        assert_eq!(take_graphics_continuations_before(next_dcb), vec![command]);
+        assert!(take_graphics_continuations_before(next_dcb).is_empty());
+        assert!(graphics_continuation_was_consumed(command));
+    }
+
+    #[test]
+    fn explicitly_submitted_branch_target_is_not_replayed_before_the_next_dcb() {
+        let mut fixture = CommandFixture::new(0);
+        let buffer = fixture.address();
+        let compare = 0_u64;
+        let compare_address = std::ptr::from_ref(&compare).addr() as u64;
+        let target = Box::new([pm4(3, IT_SET_SH_REG, 0), 0x0c, 0x1234_5678]);
+        let target_address = target.as_ptr().addr() as u64;
+        let next_dcb = target_address + 12;
+
+        let command = call(
+            "w1KFAHVqpaU",
+            args(&[buffer, 1, 0, compare_address, 0, 0]),
+            args(&[0, target_address, 3, 0, 0, 0]),
+        );
+        track_graphics_submission(target_address, 3);
+
+        assert!(take_graphics_continuations_before(next_dcb).is_empty());
+        assert!(graphics_continuation_was_consumed(command));
+    }
+
+    #[test]
+    fn directly_executed_branch_is_not_recovered_again_before_the_next_dcb() {
+        let mut fixture = CommandFixture::new(0);
+        let buffer = fixture.address();
+        let compare = 0_u64;
+        let compare_address = std::ptr::from_ref(&compare).addr() as u64;
+        let target = Box::new([pm4(3, IT_SET_SH_REG, 0), 0x0c, 0x1234_5678]);
+        let target_address = target.as_ptr().addr() as u64;
+        let next_dcb = target_address + 12;
+
+        let command = call(
+            "w1KFAHVqpaU",
+            args(&[buffer, 1, 0, compare_address, 0, 0]),
+            args(&[0, target_address, 3, 0, 0, 0]),
+        );
+        track_graphics_allocation(target_address, 3);
+        retire_pending_graphics_continuation(command);
+
+        assert!(take_graphics_continuations_before(next_dcb).is_empty());
+        assert!(!graphics_continuation_was_consumed(command));
+        assert_eq!(take_recorded_graphics_prefix(next_dcb), None);
+    }
+
+    #[test]
+    fn recovers_only_a_complete_recorded_pm4_prefix() {
+        let commands = Box::new([
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0c,
+            0x1111_1111,
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0d,
+            0x2222_2222,
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0e,
+            0x3333_3333,
+        ]);
+        let start = commands.as_ptr().addr() as u64;
+        track_graphics_allocation(start, 3);
+        track_graphics_allocation(start + 12, 3);
+
+        assert_eq!(take_recorded_graphics_prefix(start + 24), Some((start, 6)));
+        assert_eq!(take_recorded_graphics_prefix(start + 24), None);
+    }
+
+    #[test]
+    fn a_recorded_anchor_recovers_neighboring_guest_authored_pm4() {
+        let commands = Box::new([
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0c,
+            0x1111_1111,
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0d,
+            0x2222_2222,
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0e,
+            0x3333_3333,
+        ]);
+        let start = commands.as_ptr().addr() as u64;
+        track_graphics_allocation(start, 3);
+        track_graphics_allocation(start + 24, 3);
+
+        assert_eq!(take_recorded_graphics_prefix(start + 36), Some((start, 9)));
+    }
+
+    #[test]
+    fn consumed_continuation_target_cannot_be_replayed_as_a_prefix() {
+        let commands = Box::new([
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0c,
+            0x1111_1111,
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0d,
+            0x2222_2222,
+        ]);
+        let start = commands.as_ptr().addr() as u64;
+        track_graphics_allocation(start, 3);
+        track_graphics_allocation(start + 12, 3);
+
+        consume_recorded_graphics_range(start, 6);
+
+        assert_eq!(take_recorded_graphics_prefix(start + 24), None);
+    }
+
+    #[test]
+    fn submitted_commands_are_not_replayed_before_a_later_tail() {
+        let commands = Box::new([
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0c,
+            0x1111_1111,
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0d,
+            0x2222_2222,
+        ]);
+        let start = commands.as_ptr().addr() as u64;
+        track_graphics_allocation(start, 3);
+        track_graphics_allocation(start + 12, 3);
+
+        track_graphics_submission(start, 3);
+
+        assert_eq!(
+            take_recorded_graphics_prefix(start + 24),
+            Some((start + 12, 3))
+        );
+    }
+
+    #[test]
+    fn async_allocations_are_not_recorded_as_a_graphics_prefix() {
+        let mut fixture = CommandFixture::new(0);
+        let descriptor = fixture.address();
+        let graphics = call("TRO721eVt4g", args(&[descriptor, 0, 0]), [0; 6]);
+        assert_eq!(graphics, fixture.start());
+        track_graphics_submission(graphics, 2);
+
+        let compute = call("JrtiDtKeS38", args(&[descriptor, 0]), [0; 6]);
+
+        assert_eq!(compute, graphics + 8);
+        assert_eq!(take_recorded_graphics_prefix(compute + 8), None);
+    }
+
+    #[test]
+    fn a_higher_submission_does_not_discard_a_wrapped_lower_prefix() {
+        let commands = Box::new([
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0c,
+            0x1111_1111,
+            0,
+            0,
+            0,
+            pm4(3, IT_SET_SH_REG, 0),
+            0x0d,
+            0x2222_2222,
+            0,
+            0,
+            0,
+        ]);
+        let start = commands.as_ptr().addr() as u64;
+        let higher_submission = start + 24;
+        track_graphics_allocation(start, 3);
+
+        track_graphics_submission(higher_submission, 3);
+
+        assert_eq!(take_recorded_graphics_prefix(start + 12), Some((start, 3)));
     }
 
     #[test]
@@ -2022,6 +2693,30 @@ mod tests {
     }
 
     #[test]
+    fn builds_async_dma_data_with_the_queue_implied_engine() {
+        let mut fixture = CommandFixture::new(0);
+        let buffer = fixture.address();
+        let destination = 0x1234_5678_9abc_def0;
+        let command = call(
+            "-RnpfpxIhec",
+            args(&[buffer, 3, 3, destination, 2, 3]),
+            args(&[1, 4, 0, 0]),
+        );
+
+        assert_eq!(command, fixture.start());
+        assert_eq!(fixture.words[0], pm4(7, IT_DMA_DATA, 0));
+        assert_eq!(fixture.words[1] & 1, 1);
+        assert_eq!((fixture.words[1] >> 20) & 3, 3);
+        assert_eq!((fixture.words[1] >> 29) & 3, 2);
+        assert_eq!(&fixture.words[2..4], &[1, 0]);
+        assert_eq!(
+            &fixture.words[4..6],
+            &[low_u32(destination), low_u32(destination >> 32)]
+        );
+        assert_eq!(fixture.words[6] & 0x03ff_ffff, 4);
+    }
+
+    #[test]
     fn builds_and_patches_64_bit_wait_packet() {
         let mut fixture = CommandFixture::new(0);
         let buffer = fixture.address();
@@ -2069,23 +2764,28 @@ mod tests {
         let buffer = fixture.address();
         let command = call(
             "wr23dPKyWc0",
-            args(&[buffer, 0x2f, 0x100, 1, 2, 0x1000]),
+            args(&[buffer, 0x2f, 0x100, 1, 2, 0x70_0000_0001]),
             args(&[1, 0x1122_3344_5566_7788, 0, 0, 2, 0x123]),
         );
         assert_eq!(command, fixture.start());
         assert_eq!(fixture.words[0], pm4(8, IT_NOP, R_RELEASE_MEM));
-        assert_eq!(fixture.words[1] & 0x00ff_f000, 0x0030_0000);
+        assert_eq!(fixture.words[1], 0x22f);
+        assert_eq!(fixture.words[2], 0x0201_0100);
+        assert_eq!(&fixture.words[3..5], &[1, 0x70]);
 
         assert_eq!(call("J8YCgfKAMQs", args(&[command, 0x456]), [0; 6]), 0);
         assert_eq!(call("T9fjQIINoeE", args(&[command, 3]), [0; 6]), 0);
-        assert_eq!(call("0fWWK5uG9rQ", args(&[command, 0x2000]), [0; 6]), 0);
+        assert_eq!(
+            call("0fWWK5uG9rQ", args(&[command, 0x70_0000_0001]), [0; 6]),
+            0
+        );
         assert_eq!(
             call("MlEw1feXcjg", args(&[command, 2, 1, 0x00ab_cdef]), [0; 6]),
             0
         );
-        assert_eq!(fixture.words[1] & 0x00ff_f000, 0x0045_6000);
-        assert_eq!(fixture.words[2] >> 29, 3);
-        assert_eq!(&fixture.words[3..7], &[0x2000, 0, 0x00ab_cdef, 0]);
+        assert_eq!(fixture.words[2] & 0xffff, 0x456);
+        assert_eq!((fixture.words[2] >> 16) & 0xff, 3);
+        assert_eq!(&fixture.words[3..7], &[1, 0x70, 0x00ab_cdef, 0]);
     }
 
     #[test]

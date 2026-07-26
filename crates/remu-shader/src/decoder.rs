@@ -9,7 +9,7 @@ use crate::ir::{
 };
 use crate::metadata::GuestMemoryReader;
 
-const MAX_INSTRUCTIONS: usize = 4096;
+const FALLBACK_MAX_INSTRUCTIONS: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DecodeError {
@@ -34,8 +34,10 @@ pub enum DecodeError {
     },
     #[error("unsupported FLAT address segment 0x{segment:X} at pc 0x{pc:X}: opcode 0x{opcode:X}")]
     FlatSegment { pc: u32, segment: u32, opcode: u32 },
-    #[error("shader has no S_ENDPGM within {MAX_INSTRUCTIONS} instructions")]
-    Unterminated,
+    #[error("shader has no S_ENDPGM within {inspected_instructions} decoded instructions")]
+    Unterminated { inspected_instructions: usize },
+    #[error("shader code size {bytes} is not a non-zero number of dwords")]
+    InvalidCodeSize { bytes: usize },
     #[error("shader program counter exceeds the 32-bit Gen5 address space")]
     ProgramCounterOverflow,
     #[error("shader address arithmetic overflowed at pc 0x{pc:X}")]
@@ -61,16 +63,20 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
     let mut instructions = Vec::new();
     let mut word_index = 0usize;
     let mut furthest_forward_branch_target = None;
-    while instructions.len() < MAX_INSTRUCTIONS {
+    while word_index < words.len() {
         let pc = u32::try_from(
             word_index
                 .checked_mul(4)
                 .ok_or(DecodeError::ProgramCounterOverflow)?,
         )
         .map_err(|_| DecodeError::ProgramCounterOverflow)?;
-        let remaining = words.get(word_index..).ok_or(DecodeError::Unterminated)?;
+        let remaining = words.get(word_index..).ok_or(DecodeError::Unterminated {
+            inspected_instructions: instructions.len(),
+        })?;
         if remaining.is_empty() {
-            return Err(DecodeError::Unterminated);
+            return Err(DecodeError::Unterminated {
+                inspected_instructions: instructions.len(),
+            });
         }
         let frame = decode_frame(pc, remaining)?;
         if remaining.len() < frame.dwords {
@@ -96,16 +102,48 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
             return Ok(program);
         }
     }
-    Err(DecodeError::Unterminated)
+    Err(DecodeError::Unterminated {
+        inspected_instructions: instructions.len(),
+    })
 }
 
 /// Reads and decodes a program through a fault-reporting guest-memory interface. Only the words
 /// required by each decoded frame are touched, so an `S_ENDPGM` at the end of a mapping does not
 /// cause speculative reads into the following page.
 pub fn read_program(memory: &impl GuestMemoryReader, address: u64) -> Result<Program, DecodeError> {
+    read_program_with_limits(memory, address, FALLBACK_MAX_INSTRUCTIONS, usize::MAX)
+}
+
+/// Reads a shader whose exact AGC code extent is known from its registered binary header.
+///
+/// Modern game shaders can legitimately exceed the decoder's conservative fallback scan. The
+/// binary-provided size is the authoritative boundary: it permits every instruction in that
+/// allocation while still preventing the decoder from walking into the next guest object when a
+/// corrupt shader has no `S_ENDPGM`.
+pub fn read_program_bounded(
+    memory: &impl GuestMemoryReader,
+    address: u64,
+    code_size_bytes: usize,
+) -> Result<Program, DecodeError> {
+    if code_size_bytes == 0 || !code_size_bytes.is_multiple_of(4) {
+        return Err(DecodeError::InvalidCodeSize {
+            bytes: code_size_bytes,
+        });
+    }
+    let code_dwords = code_size_bytes / 4;
+    read_program_with_limits(memory, address, code_dwords, code_dwords)
+}
+
+fn read_program_with_limits(
+    memory: &impl GuestMemoryReader,
+    address: u64,
+    max_instructions: usize,
+    max_dwords: usize,
+) -> Result<Program, DecodeError> {
     let mut raw_words = Vec::new();
     let mut furthest_forward_branch_target = None;
-    for _ in 0..MAX_INSTRUCTIONS {
+    let mut decoded_instructions = 0usize;
+    while decoded_instructions < max_instructions && raw_words.len() < max_dwords {
         let pc = u32::try_from(
             raw_words
                 .len()
@@ -124,6 +162,13 @@ pub fn read_program(memory: &impl GuestMemoryReader, address: u64) -> Result<Pro
             }
             result => result?,
         };
+        if raw_words.len().saturating_add(frame.dwords) > max_dwords {
+            return Err(DecodeError::Truncated {
+                pc,
+                needed_dwords: frame.dwords,
+                available_dwords: max_dwords.saturating_sub(raw_words.len()),
+            });
+        }
         for index in prefix.len()..frame.dwords {
             prefix.push(read_memory_word(memory, address, pc, index)?);
         }
@@ -135,11 +180,14 @@ pub fn read_program(memory: &impl GuestMemoryReader, address: u64) -> Result<Pro
         }
         let ended = frame.opcode == Opcode::END_PROGRAM;
         raw_words.extend(prefix);
+        decoded_instructions += 1;
         if ended && furthest_forward_branch_target.is_none_or(|target| pc >= target) {
             return decode_program(address, &raw_words);
         }
     }
-    Err(DecodeError::Unterminated)
+    Err(DecodeError::Unterminated {
+        inspected_instructions: decoded_instructions,
+    })
 }
 
 fn forward_branch_target(instruction: &Instruction) -> Result<Option<u32>, DecodeError> {
@@ -246,7 +294,7 @@ fn decode_frame(pc: u32, words: &[u32]) -> Result<Frame, DecodeError> {
             let extra = required_word(pc, words, 1, 2)?;
             Ok(decode_mtbuf(word, extra))
         }
-        0x3c => decode_mimg(pc, word),
+        0x3c => Ok(decode_mimg(word)),
         0x3e => Ok(Frame {
             encoding: ShaderEncoding::Exp,
             opcode: Opcode::EXPORT,
@@ -305,6 +353,7 @@ fn decode_sop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x0a => Some("SWqmB64"),
         0x0b => Some("SBrevB32"),
         0x0f => Some("SBcnt1I32B32"),
+        0x10 => Some("SBcnt1I32B64"),
         0x13 => Some("SFF1I32B32"),
         0x1d => Some("SBitset1B32"),
         0x1f => Some("SGetpcB64"),
@@ -386,7 +435,7 @@ fn decode_sop2(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x28 => Some("SBfeI32"),
         0x29 => Some("SBfeU64"),
         0x2a => Some("SBfeI64"),
-        0x2d => Some("SAbsdiffI32"),
+        0x2c => Some("SAbsdiffI32"),
         0x2e => Some("SLshl1AddU32"),
         0x2f => Some("SLshl2AddU32"),
         0x30 => Some("SLshl3AddU32"),
@@ -428,6 +477,8 @@ fn decode_sopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x0d => Some("SBitcmp1B32"),
         0x0e => Some("SBitcmp0B64"),
         0x0f => Some("SBitcmp1B64"),
+        0x12 => Some("SCmpEqU64"),
+        0x13 => Some("SCmpLgU64"),
         _ => None,
     };
     let literal = word & 0xff == 0xff || (word >> 8) & 0xff == 0xff;
@@ -457,6 +508,15 @@ fn decode_sopp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x0c => Some("SWaitcnt"),
         0x10 => Some("SSendmsg"),
         0x16 => Some("STtraceData"),
+        // RDNA2 uses S_CODE_END to pad bytes beyond the executable shader. Treating it as the
+        // bounded stream terminator keeps the decoder from interpreting padding as instructions.
+        0x1f => {
+            return Ok(Frame {
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                dwords: 1,
+            });
+        }
         0x20 => Some("SInstPrefetch"),
         0x21 => Some("SClause"),
         0x23 => Some("SWaitcntDepctr"),
@@ -530,6 +590,8 @@ fn decode_vop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x42 => Some("VMovreldB32"),
         0x43 => Some("VMovrelsB32"),
         0x44 => Some("VMovrelsdB32"),
+        0x52 => Some("VCvtU16F16"),
+        0x56 => Some("VRsqF16"),
         _ => None,
     };
     known_frame(
@@ -587,6 +649,16 @@ fn decode_vop2(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x2f => Some("VCvtPkrtzF16F32"),
         0x30 => Some("VCvtPkU16U32"),
         0x31 => Some("VCvtPkI16I32"),
+        0x32 => Some("VAddF16"),
+        0x33 => Some("VSubF16"),
+        0x34 => Some("VSubrevF16"),
+        0x35 => Some("VMulF16"),
+        0x36 => Some("VFmacF16"),
+        0x37 => Some("VFmaMkF16"),
+        0x38 => Some("VFmaAkF16"),
+        0x39 => Some("VMaxF16"),
+        0x3a => Some("VMinF16"),
+        0x3b => Some("VLdexpF16"),
         _ => None,
     };
     let forced_literal = matches!(code, 0x20 | 0x21 | 0x2c | 0x2d);
@@ -660,6 +732,14 @@ fn decode_vopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0xc5 => Some("VCmpNeU32"),
         0xc6 => Some("VCmpGeU32"),
         0xc7 => Some("VCmpTU32"),
+        0xc8 => Some("VCmpFF16"),
+        0xc9 => Some("VCmpLtF16"),
+        0xca => Some("VCmpEqF16"),
+        0xcb => Some("VCmpLeF16"),
+        0xcc => Some("VCmpGtF16"),
+        0xcd => Some("VCmpLgF16"),
+        0xce => Some("VCmpGeF16"),
+        0xcf => Some("VCmpOF16"),
         0xd0 => Some("VCmpxFU32"),
         0xd1 => Some("VCmpxLtU32"),
         0xd2 => Some("VCmpxEqU32"),
@@ -668,6 +748,30 @@ fn decode_vopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0xd5 => Some("VCmpxNeU32"),
         0xd6 => Some("VCmpxGeU32"),
         0xd7 => Some("VCmpxTU32"),
+        0xd8 => Some("VCmpxFF16"),
+        0xd9 => Some("VCmpxLtF16"),
+        0xda => Some("VCmpxEqF16"),
+        0xdb => Some("VCmpxLeF16"),
+        0xdc => Some("VCmpxGtF16"),
+        0xdd => Some("VCmpxLgF16"),
+        0xde => Some("VCmpxGeF16"),
+        0xdf => Some("VCmpxOF16"),
+        0xe8 => Some("VCmpUF16"),
+        0xe9 => Some("VCmpNgeF16"),
+        0xea => Some("VCmpNlgF16"),
+        0xeb => Some("VCmpNgtF16"),
+        0xec => Some("VCmpNleF16"),
+        0xed => Some("VCmpNeqF16"),
+        0xee => Some("VCmpNltF16"),
+        0xef => Some("VCmpTruF16"),
+        0xf8 => Some("VCmpxUF16"),
+        0xf9 => Some("VCmpxNgeF16"),
+        0xfa => Some("VCmpxNlgF16"),
+        0xfb => Some("VCmpxNgtF16"),
+        0xfc => Some("VCmpxNleF16"),
+        0xfd => Some("VCmpxNeqF16"),
+        0xfe => Some("VCmpxNltF16"),
+        0xff => Some("VCmpxTruF16"),
         _ => None,
     };
     known_frame(
@@ -710,6 +814,7 @@ fn decode_vop3(word: u32, extra: u32) -> Frame {
             0x146 => Some("VCubetcF32"),
             0x147 => Some("VCubemaF32"),
             0x148 => Some("VBfeU32"),
+            0x149 => Some("VBfeI32"),
             0x14a => Some("VBfiB32"),
             0x14b => Some("VFmaF32"),
             0x151 => Some("VMin3F32"),
@@ -730,8 +835,13 @@ fn decode_vop3(word: u32, extra: u32) -> Frame {
             0x16a => Some("VMulHiU32"),
             0x16b => Some("VMulLoI32"),
             0x16c => Some("VMulHiI32"),
+            // VOP1 opcodes use their architectural opcode plus 0x180 in the VOP3/e64
+            // encoding. V_CVT_FLR_I32_F32 is opcode 0x0d, hence 0x18d here.
+            0x18d => Some("VCvtFlrI32F32"),
+            0x345 => Some("VXadU32"),
             0x346 => Some("VLshlAddU32"),
             0x347 => Some("VAddLshlU32"),
+            0x34b => Some("VFmaF16"),
             0x360 => Some("VReadlaneB32"),
             0x361 => Some("VWritelaneB32"),
             0x362 => Some("VLdexpF32"),
@@ -741,6 +851,7 @@ fn decode_vop3(word: u32, extra: u32) -> Frame {
             0x366 => Some("VMbcntHiU32B32"),
             0x368 => Some("VCvtPknormI16F32"),
             0x369 => Some("VCvtPknormU16F32"),
+            0x36a => Some("VCvtPkU16U32"),
             0x36d => Some("VAdd3U32"),
             0x36f => Some("VLshlOrU32"),
             0x371 => Some("VAndOrB32"),
@@ -840,6 +951,7 @@ fn decode_ds(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x37 => Some("DsRead2B32"),
         0x38 => Some("DsRead2St64B32"),
         0x4d => Some("DsWriteB64"),
+        0xb0 => Some("DsWriteAddtidB32"),
         0xde => Some("DsWriteB96"),
         0xdf => Some("DsWriteB128"),
         0xfe => Some("DsReadB96"),
@@ -1027,8 +1139,12 @@ const fn scalar_load_name(code: u32) -> Option<&'static str> {
     }
 }
 
-fn decode_mimg(pc: u32, word: u32) -> Result<Frame, DecodeError> {
-    let code = (word >> 18) & 0x7f;
+fn decode_mimg(word: u32) -> Frame {
+    // MIMG is the one RDNA2 encoding whose opcode is split: OP[6:0] lives in
+    // bits 24:18 while OP[7] lives in bit 0. Bit 0 must not be mistaken for
+    // part of NSA; dropping it aliases IMAGE_MSAA_LOAD and later operations to
+    // unrelated low-numbered image operations.
+    let code = ((word >> 18) & 0x7f) | ((word & 1) << 7);
     let name = match code {
         0x00 => Some("ImageLoad"),
         0x01 => Some("ImageLoadMip"),
@@ -1065,14 +1181,19 @@ fn decode_mimg(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x5f => Some("ImageGather4CLzO"),
         _ => None,
     };
-    known_frame(
-        pc,
-        word,
-        ShaderEncoding::Mimg,
-        code,
-        name,
-        2 + ((word >> 1) & 3) as usize,
-    )
+    Frame {
+        encoding: ShaderEncoding::Mimg,
+        opcode: name.map_or_else(
+            || {
+                Opcode::raw(
+                    RawOpcodeFamily::Mimg,
+                    u16::try_from(code).expect("eight-bit MIMG opcode fits u16"),
+                )
+            },
+            Opcode::from_static,
+        ),
+        dwords: 2 + ((word >> 1) & 3) as usize,
+    }
 }
 
 fn decode_vintrp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
@@ -1218,11 +1339,13 @@ fn create_instruction(
                 &mut control,
             );
             if !is_sdwa && !is_dpp && !is_dpp8 {
-                if (opcode.is("VMadMkF32") || opcode.is("VFmaMkF32"))
+                if (opcode.is("VMadMkF32") || opcode.is("VFmaMkF32") || opcode.is("VFmaMkF16"))
                     && let Some(literal) = literal
                 {
                     sources.insert(1, literal_operand(literal));
-                } else if (opcode.is("VMadAkF32") || opcode.is("VFmaAkF32"))
+                } else if (opcode.is("VMadAkF32")
+                    || opcode.is("VFmaAkF32")
+                    || opcode.is("VFmaAkF16"))
                     && let Some(literal) = literal
                 {
                     sources.push(literal_operand(literal));
@@ -1254,6 +1377,8 @@ fn create_instruction(
             ]);
             if opcode.is("VReadlaneB32") {
                 destinations.push(Operand::scalar(word & 0xff));
+            } else if opcode.is("VMadU64U32") {
+                push_vector_range(&mut destinations, word & 0xff, 2);
             } else {
                 destinations.push(Operand::vector(word & 0xff));
             }
@@ -1424,7 +1549,10 @@ fn decode_data_share(
     let vector_data1 = (extra >> 16) & 0xff;
     let vector_destination = (extra >> 24) & 0xff;
     sources.push(Operand::vector(vector_address));
-    if opcode.is("DsWriteB32") {
+    if opcode.is("DsWriteAddtidB32") {
+        sources.clear();
+        sources.push(Operand::vector(vector_data0));
+    } else if opcode.is("DsWriteB32") {
         sources.push(Operand::vector(vector_data0));
     } else if opcode.is("DsWriteB64") {
         push_vector_range(sources, vector_data0, 2);
@@ -1575,18 +1703,24 @@ fn decode_image(
         Operand::scalar(scalar_sampler),
     ]);
     let result_count = (word >> 8 & 0xf).count_ones().max(1);
+    let d16 = extra >> 31 & 1 != 0;
+    let data_register_count = if d16 {
+        result_count.div_ceil(2)
+    } else {
+        result_count
+    };
     if opcode.starts_with("ImageStore") || opcode.starts_with("ImageAtomic") {
         let data_count = if opcode.is("ImageAtomicCmpswap") {
             2
         } else {
-            result_count
+            data_register_count
         };
         push_vector_range(sources, vector_data, data_count);
         if opcode.starts_with("ImageAtomic") && word >> 13 & 1 != 0 {
             destinations.push(Operand::vector(vector_data));
         }
     } else {
-        push_vector_range(destinations, vector_data, result_count);
+        push_vector_range(destinations, vector_data, data_register_count);
     }
     let dimension = (word >> 3) & 7;
     InstructionControl::Image(ImageControl {
@@ -1601,7 +1735,7 @@ fn decode_image(
         glc: word >> 13 & 1 != 0,
         slc: word >> 25 & 1 != 0,
         a16: extra >> 30 & 1 != 0,
-        d16: extra >> 31 & 1 != 0,
+        d16,
     })
 }
 
@@ -1834,6 +1968,37 @@ mod tests {
     }
 
     #[test]
+    fn registered_code_extent_allows_a_shader_larger_than_the_fallback_scan() {
+        let mut words = vec![0xbf80_0000; FALLBACK_MAX_INSTRUCTIONS + 1];
+        words.push(0xbf81_0000);
+        let memory = SliceMemory {
+            base: 0x4000,
+            words,
+        };
+        assert!(matches!(
+            read_program(&memory, memory.base),
+            Err(DecodeError::Unterminated {
+                inspected_instructions: FALLBACK_MAX_INSTRUCTIONS
+            })
+        ));
+
+        let program = read_program_bounded(
+            &memory,
+            memory.base,
+            memory.words.len() * std::mem::size_of::<u32>(),
+        )
+        .expect("AGC's registered shader size is the authoritative decoder boundary");
+        assert_eq!(program.instructions.len(), FALLBACK_MAX_INSTRUCTIONS + 2);
+        assert_eq!(
+            program
+                .instructions
+                .last()
+                .map(|instruction| &instruction.opcode),
+            Some(&Opcode::END_PROGRAM)
+        );
+    }
+
+    #[test]
     fn rejects_a_missing_literal_extension_without_reading_past_the_slice() {
         let error = decode_program(0x1000, &[0x7e00_02ff]).expect_err("missing literal");
         assert_eq!(
@@ -1856,6 +2021,113 @@ mod tests {
             Opcode::raw(RawOpcodeFamily::Vop3, 0)
         );
         assert_eq!(program.instructions[1].pc, 8);
+    }
+
+    #[test]
+    fn decodes_silent_hill_xor_add_and_unsigned_pack_vop3_opcodes() {
+        let sources = 257_u32 | (258_u32 << 9) | (259_u32 << 18);
+        let program = decode_program(
+            0x1000,
+            &[0xd345_0008, sources, 0xd36a_0009, sources, 0xbf81_0000],
+        )
+        .expect("observed RDNA2 VOP3 stream");
+        assert!(program.instructions[0].opcode.is("VXadU32"));
+        assert_eq!(
+            program.instructions[0].sources,
+            [Operand::vector(1), Operand::vector(2), Operand::vector(3)]
+        );
+        assert_eq!(program.instructions[0].destinations, [Operand::vector(8)]);
+        assert!(program.instructions[1].opcode.is("VCvtPkU16U32"));
+        assert_eq!(
+            program.instructions[1].sources,
+            [Operand::vector(1), Operand::vector(2), Operand::vector(3)]
+        );
+        assert_eq!(program.instructions[1].destinations, [Operand::vector(9)]);
+    }
+
+    #[test]
+    fn decodes_silent_hill_half_to_u16_and_signed_bitfield_extract() {
+        let sources = 257_u32 | (258_u32 << 9) | (259_u32 << 18);
+        let program = decode_program(0x1000, &[0x7e06_a4f9, 0, 0xd149_0008, sources, 0xbf81_0000])
+            .expect("observed RDNA2 VOP1 SDWA and VOP3 stream");
+
+        assert!(program.instructions[0].opcode.is("VCvtU16F16"));
+        assert_eq!(program.instructions[0].sources, [Operand::vector(0)]);
+        assert_eq!(program.instructions[0].destinations, [Operand::vector(3)]);
+        assert!(matches!(
+            program.instructions[0].control,
+            Some(InstructionControl::Sdwa(_))
+        ));
+
+        assert!(program.instructions[1].opcode.is("VBfeI32"));
+        assert_eq!(
+            program.instructions[1].sources,
+            [Operand::vector(1), Operand::vector(2), Operand::vector(3)]
+        );
+        assert_eq!(program.instructions[1].destinations, [Operand::vector(8)]);
+    }
+
+    #[test]
+    fn decodes_rdna2_floor_and_packed_unorm_conversion_encodings() {
+        let unary_sources = 257_u32 | (128_u32 << 9) | (128_u32 << 18);
+        let packed_sources = 257_u32 | (258_u32 << 9) | (128_u32 << 18);
+        let program = decode_program(
+            0x1000,
+            &[
+                // v_cvt_flr_i32_f32_e32 v8, v1
+                0x7e10_1b01,
+                // v_cvt_flr_i32_f32_e64 v9, -|v1|
+                0xd18d_0109,
+                unary_sources | (1_u32 << 29),
+                // v_cvt_pknorm_u16_f32 v10, |v1|, -v2
+                0xd369_010a,
+                packed_sources | (2_u32 << 29),
+                0xbf81_0000,
+            ],
+        )
+        .expect("RDNA2 conversion stream");
+
+        let floor_e32 = &program.instructions[0];
+        assert_eq!(floor_e32.encoding, ShaderEncoding::Vop1);
+        assert!(floor_e32.opcode.is("VCvtFlrI32F32"));
+        assert_eq!(floor_e32.sources, [Operand::vector(1)]);
+        assert_eq!(floor_e32.destinations, [Operand::vector(8)]);
+
+        let floor_e64 = &program.instructions[1];
+        assert_eq!(floor_e64.encoding, ShaderEncoding::Vop3);
+        assert!(floor_e64.opcode.is("VCvtFlrI32F32"));
+        assert_eq!(floor_e64.destinations, [Operand::vector(9)]);
+        assert_eq!(
+            floor_e64.control,
+            Some(InstructionControl::Vop3(Vop3Control {
+                absolute_mask: 1,
+                negate_mask: 1,
+                output_modifier: 0,
+                clamp: false,
+                operand_select: 0,
+                scalar_destination: None,
+            }))
+        );
+
+        let packed = &program.instructions[2];
+        assert_eq!(packed.encoding, ShaderEncoding::Vop3);
+        assert!(packed.opcode.is("VCvtPknormU16F32"));
+        assert_eq!(
+            packed.sources[..2],
+            [Operand::vector(1), Operand::vector(2)]
+        );
+        assert_eq!(packed.destinations, [Operand::vector(10)]);
+        assert_eq!(
+            packed.control,
+            Some(InstructionControl::Vop3(Vop3Control {
+                absolute_mask: 1,
+                negate_mask: 2,
+                output_modifier: 0,
+                clamp: false,
+                operand_select: 0,
+                scalar_destination: None,
+            }))
+        );
     }
 
     #[test]
@@ -1922,7 +2194,7 @@ mod tests {
 
     #[test]
     fn decodes_every_supported_ds_opcode_and_every_control_bit_pattern() {
-        const OPCODES: [(u32, &str, usize, usize); 37] = [
+        const OPCODES: [(u32, &str, usize, usize); 38] = [
             (0x00, "DsAddU32", 2, 0),
             (0x01, "DsSubU32", 2, 0),
             (0x03, "DsIncU32", 2, 0),
@@ -1956,6 +2228,7 @@ mod tests {
             (0x37, "DsRead2B32", 1, 2),
             (0x38, "DsRead2St64B32", 1, 2),
             (0x4d, "DsWriteB64", 3, 0),
+            (0xb0, "DsWriteAddtidB32", 1, 0),
             (0xde, "DsWriteB96", 4, 0),
             (0xdf, "DsWriteB128", 5, 0),
             (0xfe, "DsReadB96", 1, 3),
@@ -1995,6 +2268,36 @@ mod tests {
                     gds: bits >> 16 != 0,
                 })),
                 "incorrect DS control for packed bits 0x{bits:05X}"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_silent_hill_ds_write_addtid_words_without_an_address_source() {
+        let extra = 1u32 | (2u32 << 8) | (3u32 << 16) | (4u32 << 24);
+        for (word, expected_offset1) in [
+            (0xdac0_0000, 0_u32),
+            (0xdac0_0100, 1_u32),
+            (0xdac0_0200, 2_u32),
+        ] {
+            let program = decode_program(0x1000, &[word, extra, 0xbf81_0000])
+                .expect("observed Silent Hill DS_WRITE_ADDTID_B32 stream");
+            let instruction = &program.instructions[0];
+
+            assert!(instruction.opcode.is("DsWriteAddtidB32"));
+            assert_eq!(
+                instruction.sources,
+                [Operand::vector(2)],
+                "ADDR and DATA1 are architecturally ignored"
+            );
+            assert!(instruction.destinations.is_empty());
+            assert_eq!(
+                instruction.control,
+                Some(InstructionControl::DataShare(DataShareControl {
+                    offset0: 0,
+                    offset1: expected_offset1,
+                    gds: false,
+                }))
             );
         }
     }
@@ -2140,6 +2443,17 @@ mod tests {
     }
 
     #[test]
+    fn decodes_s_bcnt1_i32_b64_from_the_silent_hill_word() {
+        let program =
+            decode_program(0x1000, &[0xbe8a_1000, 0xbf81_0000]).expect("well-formed SOP1 program");
+        let instruction = &program.instructions[0];
+
+        assert!(instruction.opcode.is("SBcnt1I32B64"));
+        assert_eq!(instruction.sources, [Operand::scalar(0)]);
+        assert_eq!(instruction.destinations, [Operand::scalar(10)]);
+    }
+
+    #[test]
     fn records_all_mimg_nsa_address_registers() {
         // IMAGE_LOAD with NSA=2 carries eight additional byte-packed VGPR indices.
         let word = 0xf000_0004;
@@ -2157,6 +2471,84 @@ mod tests {
     }
 
     #[test]
+    fn image_d16_liveness_uses_one_vgpr_for_each_packed_component_pair() {
+        let extra = 1 | (20 << 8) | (1 << 31);
+        for (opcode, name) in [(0_u32, "ImageLoad"), (8, "ImageStore")] {
+            let word = 0xf000_0000 | (opcode << 18) | (0xf << 8);
+            let instruction = create_instruction(
+                0,
+                ShaderEncoding::Mimg,
+                Opcode::Known(name),
+                vec![word, extra],
+            );
+            let Some(InstructionControl::Image(control)) = instruction.control else {
+                panic!("expected image control");
+            };
+            assert!(control.d16);
+            if name == "ImageLoad" {
+                assert_eq!(
+                    instruction.destinations,
+                    [Operand::vector(20), Operand::vector(21)]
+                );
+            } else {
+                assert_eq!(
+                    &instruction.sources[instruction.sources.len() - 2..],
+                    [Operand::vector(20), Operand::vector(21)]
+                );
+                assert!(!instruction.sources.contains(&Operand::vector(22)));
+            }
+        }
+    }
+
+    #[test]
+    fn retains_high_mimg_opcodes_without_aliasing_low_operations() {
+        for (opcode, nsa_dwords) in [(0x80_u32, 0_u32), (0xa2, 1), (0xe6, 3)] {
+            let word =
+                0xf000_0000 | ((opcode & 0x7f) << 18) | ((opcode >> 7) & 1) | (nsa_dwords << 1);
+            let mut words = vec![word, 0];
+            words.resize(2 + usize::try_from(nsa_dwords).expect("small NSA count"), 0);
+            words.push(0xbf81_0000);
+
+            let program = decode_program(0x1000, &words).expect("framed high MIMG opcode");
+            assert_eq!(
+                program.instructions[0].opcode,
+                Opcode::Raw {
+                    family: RawOpcodeFamily::Mimg,
+                    code: u16::try_from(opcode).expect("eight-bit MIMG opcode fits u16"),
+                }
+            );
+            assert_eq!(
+                program.instructions[0].words.len(),
+                2 + usize::try_from(nsa_dwords).expect("small NSA count")
+            );
+            assert_eq!(program.instructions[1].pc, (2 + nsa_dwords) * 4);
+            assert!(
+                !program.instructions[0].opcode.is("ImageLoad")
+                    && !program.instructions[0].opcode.is("ImageSampleD"),
+                "high opcode 0x{opcode:02X} aliased a low operation"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_absdiff_at_the_rdna2_sop2_opcode() {
+        let word = 0x8000_0000 | (44 << 23);
+        let frame = decode_frame(0, &[word]).expect("S_ABSDIFF_I32 opcode 44");
+        assert_eq!(frame.encoding, ShaderEncoding::Sop2);
+        assert!(frame.opcode.is("SAbsdiffI32"));
+
+        let reserved = 0x8000_0000 | (45 << 23);
+        assert!(matches!(
+            decode_frame(0, &[reserved]),
+            Err(DecodeError::UnknownOpcode {
+                encoding: ShaderEncoding::Sop2,
+                opcode: 45,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn memory_reader_stops_exactly_at_endpgm() {
         let memory = SliceMemory {
             base: 0x8000,
@@ -2165,5 +2557,153 @@ mod tests {
         let program = read_program(&memory, memory.base).expect("single-word program");
         assert_eq!(program.instructions.len(), 1);
         assert_eq!(program.instructions[0].opcode, Opcode::END_PROGRAM);
+    }
+
+    #[test]
+    fn rdna2_code_end_terminates_padding_and_half_float_vop2_opcodes_decode() {
+        let program = decode_program(
+            0x8000,
+            &[
+                0x6406_0601, // v_add_f16 v3, v1, v3
+                0x6600_00f9, // v_sub_f16 v0, src_sdwa, v0
+                0,
+                0x6812_0202, // v_subrev_f16 v9, v2, v1
+                0x6a12_0202, // v_mul_f16 v9, v2, v1
+                0x7404_04f9, // v_min_f16 v2, src_sdwa, v2
+                0,
+                0xd74b_600a, // v_fma_f16 v10, v240, v12, v10 op_sel:[0,0,1,1]
+                0x042a_18f0,
+                0xbf13_1e6a, // s_cmp_lg_u64 s106:s107, s30:s31
+                0x7e12_acf9, // v_rsq_f16 v9, src_dpp
+                0,
+                0x7d98_04f9, // v_cmp_gt_f16 src_dpp, v2
+                0,
+                0x7dfa_04f9, // v_cmpx_neq_f16 src_dpp, v2
+                0,
+                0x7dfc_62f9, // v_cmpx_nlt_f16 src_dpp, v49
+                0,
+                0xbf9f_0000, // s_code_end
+                0,
+            ],
+        )
+        .expect("observed RDNA2 shader subset");
+
+        assert!(program.instructions[0].opcode.is("VAddF16"));
+        assert!(program.instructions[1].opcode.is("VSubF16"));
+        assert!(program.instructions[2].opcode.is("VSubrevF16"));
+        assert!(program.instructions[3].opcode.is("VMulF16"));
+        assert!(program.instructions[4].opcode.is("VMinF16"));
+        assert!(program.instructions[5].opcode.is("VFmaF16"));
+        assert!(program.instructions[6].opcode.is("SCmpLgU64"));
+        assert!(program.instructions[7].opcode.is("VRsqF16"));
+        assert!(program.instructions[8].opcode.is("VCmpGtF16"));
+        assert!(program.instructions[9].opcode.is("VCmpxNeqF16"));
+        assert!(program.instructions[10].opcode.is("VCmpxNltF16"));
+        assert_eq!(program.instructions[11].opcode, Opcode::END_PROGRAM);
+        assert_eq!(program.instructions.len(), 12);
+    }
+
+    #[test]
+    fn decodes_silent_hill_lane_permute_bitcount_and_u64_mad_shapes() {
+        let v_bcnt = (0x22_u32 << 25) | (4_u32 << 17) | (3_u32 << 9) | (0x100_u32 + 2);
+        let v_permlane = (0x35_u32 << 26) | (0x377_u32 << 16) | (2_u32 << 11) | 8;
+        let v_permlanex = (0x35_u32 << 26) | (0x378_u32 << 16) | (1_u32 << 11) | 9;
+        let selectors = (0x100_u32 + 5) | (20_u32 << 9) | (21_u32 << 18);
+        let v_mad_u64 = (0x35_u32 << 26) | (0x176_u32 << 16) | (30_u32 << 8) | 40;
+        let mad_sources = (0x100_u32 + 6) | ((0x100_u32 + 7) << 9) | ((0x100_u32 + 50) << 18);
+        let program = decode_program(
+            0xa000,
+            &[
+                v_bcnt,
+                v_permlane,
+                selectors,
+                v_permlanex,
+                selectors,
+                v_mad_u64,
+                mad_sources,
+                0xbf81_0000,
+            ],
+        )
+        .expect("observed Silent Hill compute opcode subset");
+
+        let bcnt = &program.instructions[0];
+        assert!(bcnt.opcode.is("VBcntU32B32"));
+        assert_eq!(bcnt.sources, [Operand::vector(2), Operand::vector(3)]);
+        assert_eq!(bcnt.destinations, [Operand::vector(4)]);
+
+        for (index, opcode, operand_select, destination) in
+            [(1, "VPermlane16B32", 2, 8), (2, "VPermlanex16B32", 1, 9)]
+        {
+            let instruction = &program.instructions[index];
+            assert!(instruction.opcode.is(opcode));
+            assert_eq!(
+                instruction.sources,
+                [Operand::vector(5), Operand::scalar(20), Operand::scalar(21)]
+            );
+            assert_eq!(instruction.destinations, [Operand::vector(destination)]);
+            let Some(InstructionControl::Vop3(control)) = instruction.control else {
+                panic!("lane permutation must retain VOP3 control");
+            };
+            assert_eq!(control.operand_select, operand_select);
+        }
+
+        let mad = &program.instructions[3];
+        assert!(mad.opcode.is("VMadU64U32"));
+        assert_eq!(
+            mad.sources,
+            [Operand::vector(6), Operand::vector(7), Operand::vector(50)]
+        );
+        assert_eq!(mad.destinations, [Operand::vector(40), Operand::vector(41)]);
+        let Some(InstructionControl::Vop3(control)) = mad.control else {
+            panic!("64-bit MAD must retain VOP3B control");
+        };
+        assert_eq!(control.scalar_destination, Some(30));
+    }
+
+    #[test]
+    fn decodes_clean_room_ps5_extension_regression_envelopes() {
+        // These are synthetic raw envelopes from the clean-room Ps5IsaExtensions manifest, not
+        // retained guest captures. They are still valuable regressions for the PS5 opcode holes:
+        // the two constant MAD forms must consume their unconditional literal or every following
+        // instruction in the shader is decoded at the wrong address.
+        let vop2 = decode_program(
+            0x9000,
+            &[
+                0x3e00_0501, // v_mac_f32 v0, v1, v2
+                0x4000_0501, // v_madmk_f32 v0, v1, 1.0, v2
+                0x3f80_0000,
+                0x4200_0501, // v_madak_f32 v0, v1, v2, 1.0
+                0x3f80_0000,
+                0xbf81_0000,
+            ],
+        )
+        .expect("synthetic PS5 VOP2 extension envelopes");
+        assert!(vop2.instructions[0].opcode.is("VMacF32"));
+        assert_eq!(vop2.instructions[0].pc, 0);
+        assert_eq!(vop2.instructions[0].words.len(), 1);
+        assert!(vop2.instructions[1].opcode.is("VMadMkF32"));
+        assert_eq!(vop2.instructions[1].pc, 4);
+        assert_eq!(vop2.instructions[1].words, [0x4000_0501, 0x3f80_0000]);
+        assert_eq!(vop2.instructions[1].sources.len(), 3);
+        assert!(vop2.instructions[2].opcode.is("VMadAkF32"));
+        assert_eq!(vop2.instructions[2].pc, 12);
+        assert_eq!(vop2.instructions[2].words, [0x4200_0501, 0x3f80_0000]);
+        assert_eq!(vop2.instructions[2].sources.len(), 3);
+        assert_eq!(vop2.instructions[3].pc, 20);
+        assert_eq!(vop2.instructions[3].opcode, Opcode::END_PROGRAM);
+
+        let vop3 = decode_program(
+            0xa000,
+            &[
+                0xd541_0000, // PS5 VOP3A opcode 321: v_mad_f32 v0, v1, v2, v3
+                0x040e_0501,
+                0xbf81_0000,
+            ],
+        )
+        .expect("synthetic PS5 VOP3 extension envelope");
+        assert!(vop3.instructions[0].opcode.is("VMadF32"));
+        assert_eq!(vop3.instructions[0].words, [0xd541_0000, 0x040e_0501]);
+        assert_eq!(vop3.instructions[0].sources.len(), 3);
+        assert_eq!(vop3.instructions[1].pc, 8);
     }
 }

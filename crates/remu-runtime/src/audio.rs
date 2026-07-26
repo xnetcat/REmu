@@ -248,11 +248,19 @@ impl HostAudio {
 pub(crate) struct AudioOutState {
     initialized: bool,
     next_handle: i32,
+    successful_opens: u64,
+    successful_closes: u64,
     ports: BTreeMap<i32, AudioPort>,
     host: Option<HostAudio>,
 }
 
 impl AudioOutState {
+    #[cfg(test)]
+    pub(crate) fn use_timed_sink_for_test(&mut self) {
+        self.initialized = true;
+        self.host = None;
+    }
+
     pub(crate) fn initialize(&mut self) {
         if self.initialized {
             return;
@@ -322,10 +330,13 @@ impl AudioOutState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .add_port(handle);
         }
-        eprintln!(
-            "[REMu][AUDIO] opened port={handle} user={user_id:#x} type={port_type} frames={buffer_frames} rate={frequency} format={raw_format:#x} channels={} encoding={:?}",
-            format.channels, format.encoding
-        );
+        self.successful_opens = self.successful_opens.saturating_add(1);
+        if self.successful_opens <= 8 || self.successful_opens.is_power_of_two() {
+            eprintln!(
+                "[REMu][AUDIO] opened sequence={} port={handle} user={user_id:#x} type={port_type} frames={buffer_frames} rate={frequency} format={raw_format:#x} channels={} encoding={:?}",
+                self.successful_opens, format.channels, format.encoding
+            );
+        }
         Ok(handle.cast_unsigned().into())
     }
 
@@ -341,10 +352,13 @@ impl AudioOutState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove_port(handle);
         }
-        eprintln!(
-            "[REMu][AUDIO] closed port={handle} user={:#x} type={} format={:#x}",
-            port.user_id, port.port_type, port.raw_format
-        );
+        self.successful_closes = self.successful_closes.saturating_add(1);
+        if self.successful_closes <= 8 || self.successful_closes.is_power_of_two() {
+            eprintln!(
+                "[REMu][AUDIO] closed sequence={} port={handle} user={:#x} type={} format={:#x}",
+                self.successful_closes, port.user_id, port.port_type, port.raw_format
+            );
+        }
         Ok(())
     }
 
@@ -376,24 +390,42 @@ impl AudioOutState {
         Ok(())
     }
 
+    pub(crate) fn set_channel_gains(
+        &mut self,
+        handle: u64,
+        gains: [f32; 8],
+    ) -> Result<(), AudioOutError> {
+        if gains.iter().any(|gain| !gain.is_finite()) {
+            return Err(AudioOutError::InvalidVolume);
+        }
+        let handle = low_i32(handle);
+        let port = self
+            .ports
+            .get_mut(&handle)
+            .ok_or(AudioOutError::InvalidPort)?;
+        port.channel_volume = gains;
+        Ok(())
+    }
+
     pub(crate) fn get_port_state(&self, arguments: [u64; 6]) -> Result<(), AudioOutError> {
         let handle = low_i32(arguments[0]);
         let output = arguments[1];
-        let port = self.ports.get(&handle).ok_or(AudioOutError::InvalidPort)?;
+        if !self.ports.contains_key(&handle) {
+            return Err(AudioOutError::InvalidPort);
+        }
         if output == 0 {
             return Err(AudioOutError::InvalidPointer);
         }
-        // SceAudioOutPortState is 16 bytes: output count, channel count, reserved/reroute fields,
-        // volume, and flags. A live primary device reports one output and the port channel count.
-        // SAFETY: The ABI supplies a writable 16-byte port-state object.
+        // SceAudioOutPortState begins with a u16 output route, u8 physical channel count,
+        // reserved byte, i16 volume, u16 reroute counter, and u64 flags. The emulated host is a
+        // stereo primary route; volume is invalid for primary outputs and the reroute counter
+        // remains zero until the host device actually changes.
+        // SAFETY: The ABI supplies one writable 16-byte SceAudioOutPortState object.
         unsafe {
             std::ptr::write_bytes(output as *mut u8, 0, 16);
             std::ptr::write_unaligned(output as *mut u16, 1);
-            std::ptr::write_unaligned(
-                (output + 2) as *mut u16,
-                u16::try_from(port.format.channels).expect("Gen5 audio has at most eight channels"),
-            );
-            std::ptr::write_unaligned((output + 7) as *mut u8, 127);
+            std::ptr::write_unaligned((output + 2) as *mut u8, 2);
+            std::ptr::write_unaligned((output + 4) as *mut i16, -1);
         }
         Ok(())
     }
@@ -559,8 +591,27 @@ const fn low_i32(value: u64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioFormat, AudioPort, SampleEncoding, StreamingStereoResampler, decode_stereo_frames,
+        AudioFormat, AudioOutState, AudioPort, SampleEncoding, StreamingStereoResampler,
+        decode_stereo_frames,
     };
+    use std::collections::BTreeMap;
+
+    fn stereo_audio_port() -> AudioPort {
+        AudioPort {
+            user_id: 0,
+            port_type: 0,
+            buffer_frames: 256,
+            frequency: 48_000,
+            raw_format: 1,
+            format: AudioFormat {
+                channels: 2,
+                encoding: SampleEncoding::Signed16,
+            },
+            channel_volume: [1.0; 8],
+            next_deadline: None,
+            resampler: None,
+        }
+    }
 
     #[test]
     fn decodes_and_downmixes_float_surround_audio() {
@@ -604,5 +655,51 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(actual.len(), 470);
         assert!(actual.windows(2).all(|pair| pair[1][0] > pair[0][0]));
+    }
+
+    #[test]
+    fn port_state_writes_exactly_one_sixteen_byte_abi_object() {
+        let mut ports = BTreeMap::new();
+        ports.insert(1, stereo_audio_port());
+        let state = AudioOutState {
+            initialized: true,
+            next_handle: 1,
+            successful_opens: 1,
+            successful_closes: 0,
+            ports,
+            host: None,
+        };
+        let mut output = [0xa5_u8; 32];
+
+        state
+            .get_port_state([1, output.as_mut_ptr() as u64, 0, 0, 0, 0])
+            .expect("an open port has a queryable state");
+
+        assert_eq!(u16::from_le_bytes(output[0..2].try_into().unwrap()), 1);
+        assert_eq!(output[2], 2);
+        assert_eq!(i16::from_le_bytes(output[4..6].try_into().unwrap()), -1);
+        assert_eq!(&output[6..16], &[0; 10]);
+        assert_eq!(&output[16..], &[0xa5; 16]);
+    }
+
+    #[test]
+    fn audio_out2_float_gains_replace_the_backend_channel_gains() {
+        let mut ports = BTreeMap::new();
+        ports.insert(1, stereo_audio_port());
+        let mut state = AudioOutState {
+            initialized: true,
+            next_handle: 1,
+            successful_opens: 1,
+            successful_closes: 0,
+            ports,
+            host: None,
+        };
+        let gains = [0.125_f32, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0];
+
+        state
+            .set_channel_gains(1, gains)
+            .expect("the AudioOut2 port owns a live backend port");
+
+        assert_eq!(state.ports.get(&1).unwrap().channel_volume, gains);
     }
 }
