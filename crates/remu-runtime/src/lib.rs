@@ -2881,7 +2881,9 @@ struct ProbeDispatchState {
     kernel_equeues: BTreeSet<u64>,
     kernel_event_registrations: BTreeMap<(u64, i16, u64), u64>,
     pending_events: VecDeque<KernelQueuedEvent>,
-    pending_agc_completions: VecDeque<u64>,
+    /// Backend completion sequence paired with the AGC queue identifier registered through
+    /// `sceAgcDriverAddEqEvent` (graphics is 0, ACB queues use their owner ID).
+    pending_agc_completions: VecDeque<(u64, u64)>,
     pending_agc_user_interrupts: VecDeque<u64>,
     save_root: PathBuf,
     save_data_initialized: bool,
@@ -2936,6 +2938,7 @@ struct AvPlayerInstance {
     height: u32,
     frames_per_second: f64,
     duration: Duration,
+    has_audio: bool,
     paused: bool,
     end_of_stream: bool,
     playing_since: Option<Instant>,
@@ -2986,6 +2989,17 @@ impl AvPlayerInstance {
     fn playback_elapsed(&self) -> Duration {
         self.playing_since
             .map_or(self.elapsed, |started| self.elapsed + started.elapsed())
+    }
+
+    fn decoded_playback_elapsed(&self) -> Duration {
+        if self.source.is_none() {
+            return self.playback_elapsed();
+        }
+        let video = (self.frames_per_second.is_finite() && self.frames_per_second > 0.0)
+            .then(|| Duration::from_secs_f64(self.next_video_frame as f64 / self.frames_per_second))
+            .unwrap_or_default();
+        let audio = Duration::from_secs_f64(self.next_audio_frame as f64 * 1_024.0 / 48_000.0);
+        video.max(audio)
     }
 }
 
@@ -7092,22 +7106,34 @@ fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
 
 fn guest_mutex_unlock(address: u64) -> u64 {
     let Some(entry) = guest_mutex_entry(address, false) else {
-        return 0;
+        eprintln!(
+            "[REMu][MUTEX] rejected unlock of unknown mutex thread={:?} handle={:#x} mutex={address:#x}",
+            current_guest_thread_name(),
+            current_guest_thread_handle(),
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);
     };
     let current = std::thread::current().id();
     let mut mutex = entry
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if mutex.owner.as_ref().is_some_and(|owner| *owner == current) {
-        if mutex.recursion > 1 {
-            mutex.recursion -= 1;
-        } else {
-            mutex.owner = None;
-            mutex.owner_guest_thread = 0;
-            mutex.recursion = 0;
-            entry.wake.notify_one();
-        }
+    if !mutex.owner.as_ref().is_some_and(|owner| *owner == current) {
+        eprintln!(
+            "[REMu][MUTEX] rejected non-owner unlock thread={:?} handle={:#x} mutex={address:#x} owner={:#x}",
+            current_guest_thread_name(),
+            current_guest_thread_handle(),
+            mutex.owner_guest_thread,
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);
+    }
+    if mutex.recursion > 1 {
+        mutex.recursion -= 1;
+    } else {
+        mutex.owner = None;
+        mutex.owner_guest_thread = 0;
+        mutex.recursion = 0;
+        entry.wake.notify_one();
     }
     0
 }
@@ -9621,10 +9647,10 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         return;
     }
     let newest_completed = completed.iter().next_back().copied().unwrap_or_default();
-    let mut completed_graphics = Vec::new();
-    state.pending_agc_completions.retain(|sequence| {
-        if completed.contains(sequence) {
-            completed_graphics.push(*sequence);
+    let mut completed_queues = Vec::new();
+    state.pending_agc_completions.retain(|&(sequence, ident)| {
+        if completed.contains(&sequence) {
+            completed_queues.push((sequence, ident));
             false
         } else {
             true
@@ -9640,15 +9666,16 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         }
     });
     let mut queued = false;
-    for sequence in completed_graphics {
-        // The AGC driver completion is not a packet-provided hardware event ID. Titles may use
-        // an arbitrary ID when registering their completion queue, so announce end-of-pipe to
-        // every graphics registration while preserving that ID in both `ident` and `data`.
+    for (sequence, completed_ident) in completed_queues {
+        // `sceAgcDriverAddEqEvent` registers one hardware queue by ID. Queue zero is graphics and
+        // an ACB queue uses its owner ID (Silent Hill uses 0x20). Broadcasting one queue's
+        // completion to every registration wakes unrelated interrupt work before its command
+        // buffer has retired, allowing the guest to recycle live RHI task nodes.
         let registrations = state
             .kernel_event_registrations
             .iter()
             .filter_map(|(&(equeue, filter, ident), &user_data)| {
-                (filter == KERNEL_EVENT_FILTER_GRAPHICS)
+                (filter == KERNEL_EVENT_FILTER_GRAPHICS && ident == completed_ident)
                     .then_some((equeue, ident, filter, user_data))
             })
             .collect::<Vec<_>>();
@@ -13209,18 +13236,24 @@ fn request_agc_submission_completion(
     let sequence = state.agc_submission_count;
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
     if remu_gpu::emit_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
-        state.pending_agc_completions.push_back(sequence);
+        state
+            .pending_agc_completions
+            .push_back((sequence, queue_id));
     }
 }
 
 fn request_agc_compute_submission_completion(
     state: &mut ProbeDispatchState,
-    queue_id: u64,
+    owner: u64,
     mut events: Vec<remu_gpu::GpuEvent>,
 ) {
     let sequence = state.agc_submission_count;
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
+    // Backend queue zero is reserved for graphics, while the guest-visible AGC queue identity is
+    // the owner itself. Offset only the backend identity and retain the owner for equeue routing.
+    let queue_id = owner.saturating_add(1);
     if remu_gpu::emit_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
+        state.pending_agc_completions.push_back((sequence, owner));
         state.pending_agc_user_interrupts.push_back(sequence);
     }
 }
@@ -16486,7 +16519,7 @@ fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
             // flush/completion point, so every accepted ACB needs one just like a DCB does.
             // Without it, the last compute batch remains open and the guest waits forever for
             // the queue completion before it can submit the next frame.
-            request_agc_compute_submission_completion(state, u64::from(owner) + 1, gpu_events);
+            request_agc_compute_submission_completion(state, u64::from(owner), gpu_events);
             0
         }
         Err(error) => {
@@ -16530,7 +16563,7 @@ fn agc_driver_submit_multi_acbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
         }
         match result {
             Ok(()) => {
-                request_agc_compute_submission_completion(state, u64::from(owner) + 1, gpu_events)
+                request_agc_compute_submission_completion(state, u64::from(owner), gpu_events)
             }
             Err(error) => {
                 eprintln!(
@@ -19031,6 +19064,26 @@ fn av_player_probe_video(path: &Path) -> Option<(u32, u32, f64, Duration)> {
         .then_some((width, height, frames_per_second, duration))
 }
 
+fn av_player_probe_has_audio(path: &Path) -> bool {
+    let Some(ffprobe) = av_player_tool("ffprobe", "REMU_FFPROBE") else {
+        return false;
+    };
+    Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
 fn av_player_remove_unreal_leading_dot_segments(path: &str) -> Option<&str> {
     let mut normalized = path;
     let mut removed_parent = false;
@@ -19130,11 +19183,15 @@ fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
             event_object: read_guest_u64(parameter + 88),
             event_callback: read_guest_u64(parameter + 96),
             source: None,
-            auto_start: read_guest_u8(parameter + 164) != 0,
+            // Gen5 retains the PS4 InitDataEx prefix: the signed framebuffer count is at
+            // 0xa4 and the following byte is autoStart. Reading 0xa4 treated the count itself as
+            // a boolean and could make an explicitly-controlled player start a second time.
+            auto_start: read_guest_u8(parameter + 168) != 0,
             width: 0,
             height: 0,
             frames_per_second: 30.0,
             duration: Duration::ZERO,
+            has_audio: false,
             paused: false,
             end_of_stream: false,
             playing_since: None,
@@ -19202,13 +19259,13 @@ fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallback>) {
             );
             continue;
         }
-        type Callback = unsafe extern "C" fn(u64, u64, u64, u64, u64);
+        type Callback = unsafe extern "C" fn(u64, u64, u64, u64);
         // SAFETY: InitEx supplies a live guest SysV event callback and opaque event object. The
         // process-wide dispatch lock has already been released, so this callback may re-enter any
         // AVPlayer export exactly as the native library permits.
         let function: Callback = unsafe { std::mem::transmute(callback.function) };
-        // SAFETY: The callback ABI is `(object, event, source_id, event_data, event_data_size)`.
-        unsafe { function(callback.object, callback.event, 0, 0, 0) };
+        // SAFETY: The callback ABI is `(object, event, source_id, event_data)`.
+        unsafe { function(callback.object, callback.event, 0, 0) };
         eprintln!(
             "[REMu][AVPLAYER] delivered event={} callback={:#x}",
             callback.event, callback.function
@@ -19250,23 +19307,18 @@ fn prepare_av_player_video_buffers(handle: u64) {
         );
         return;
     }
-    type AllocateTexture = unsafe extern "C" fn(u64, u64, u64, u64, u64) -> u64;
+    type AllocateTexture = unsafe extern "C" fn(u64, u32, u32) -> u64;
     // SAFETY: InitEx supplies the live guest texture-allocation callback and opaque allocator
     // object. This runs before the process dispatch lock is acquired, so the allocator may call
     // kernel memory exports while it obtains GPU-visible storage.
     let allocate: AllocateTexture = unsafe { std::mem::transmute(request.0) };
     let mut buffers = [0_u64; 3];
     for (index, buffer) in buffers.iter_mut().enumerate() {
-        // SAFETY: The callback ABI is `(object, alignment, size, memory_type, reserved)`.
-        *buffer = unsafe {
-            allocate(
-                request.1,
-                0x100,
-                u64::try_from(request.2).unwrap_or(u64::MAX),
-                0,
-                0,
-            )
+        let Ok(size) = u32::try_from(request.2) else {
+            return;
         };
+        // SAFETY: The callback ABI is `(object, alignment, size)`.
+        *buffer = unsafe { allocate(request.1, 0x100, size) };
         if *buffer == 0 {
             eprintln!("[REMu][AVPLAYER] texture allocator returned null for buffer {index}");
             return;
@@ -19313,6 +19365,7 @@ fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatchState) -> 
     player.height = height;
     player.frames_per_second = frames_per_second;
     player.duration = duration;
+    player.has_audio = av_player_probe_has_audio(&host_path);
     player.paused = false;
     if player.auto_start {
         player.playing_since = Some(Instant::now());
@@ -19323,12 +19376,13 @@ fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatchState) -> 
         player.auto_start,
     );
     eprintln!(
-        "[REMu][AVPLAYER] source handle={:#x} guest={source:?} host={} {}x{} fps={frames_per_second:.3} duration_ms={} auto_start={}",
+        "[REMu][AVPLAYER] source handle={:#x} guest={source:?} host={} {}x{} fps={frames_per_second:.3} duration_ms={} audio={} auto_start={}",
         arguments[0],
         host_path.display(),
         width,
         height,
         duration.as_millis(),
+        player.has_audio,
         player.auto_start,
     );
     av_player_queue_event(callback.0, callback.1, 2, state);
@@ -19445,9 +19499,12 @@ fn av_player_finish_stream(player: &mut AvPlayerInstance) {
 fn av_player_nv12_layout(width: u32, height: u32) -> Option<(usize, usize)> {
     let width = usize::try_from(width).ok()?;
     let height = usize::try_from(height).ok()?;
-    let row_pitch = width.checked_add(255)? & !255;
-    let chroma_rows = height.checked_add(1)?.checked_div(2)?;
-    let frame_bytes = row_pitch.checked_mul(height.checked_add(chroma_rows)?)?;
+    let row_pitch = width.checked_add(63)? & !63;
+    let aligned_height = height.checked_add(15)? & !15;
+    let frame_bytes = row_pitch
+        .checked_mul(aligned_height)?
+        .checked_mul(3)?
+        .checked_div(2)?;
     Some((row_pitch, frame_bytes))
 }
 
@@ -19507,6 +19564,8 @@ fn av_player_write_video_frame(
     }
     let width = usize::try_from(player.width).unwrap_or(0);
     let height = usize::try_from(player.height).unwrap_or(0);
+    let aligned_width = width.saturating_add(15) & !15;
+    let aligned_height = height.saturating_add(15) & !15;
     let frame = if row_pitch == width {
         &player.raw_video_frame
     } else {
@@ -19519,8 +19578,8 @@ fn av_player_write_video_frame(
                 .copy_from_slice(&player.raw_video_frame[source..source + width]);
         }
         let source_chroma = width * height;
-        let destination_chroma = row_pitch * height;
-        for row in 0..height / 2 {
+        let destination_chroma = row_pitch * aligned_height;
+        for row in 0..height.div_ceil(2) {
             let source = source_chroma + row * width;
             let destination = destination_chroma + row * row_pitch;
             player.padded_video_frame[destination..destination + width]
@@ -19537,13 +19596,12 @@ fn av_player_write_video_frame(
     write_guest_u64(output + 16, timestamp_milliseconds);
     write_guest_u32(
         output + 24,
-        if extended {
-            player.width
-        } else {
-            u32::try_from(row_pitch).unwrap_or(player.width)
-        },
+        u32::try_from(aligned_width).unwrap_or(player.width),
     );
-    write_guest_u32(output + 28, player.height);
+    write_guest_u32(
+        output + 28,
+        u32::try_from(aligned_height).unwrap_or(player.height),
+    );
     write_guest_u32(output + 32, 1.0_f32.to_bits());
     if extended {
         write_guest_u32(
@@ -19552,6 +19610,14 @@ fn av_player_write_video_frame(
         );
         write_guest_u8(output + 64, 8);
         write_guest_u8(output + 65, 8);
+        write_guest_u32(
+            output + 44,
+            u32::try_from(row_pitch.saturating_sub(width)).unwrap_or(0),
+        );
+        write_guest_u32(
+            output + 52,
+            u32::try_from(aligned_height.saturating_sub(height)).unwrap_or(0),
+        );
     }
     true
 }
@@ -19568,16 +19634,15 @@ fn av_player_current_time(handle: u64, state: &ProbeDispatchState) -> u64 {
     let Some(player) = state.av_player.players.get(&handle) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
-    u64::try_from(player.playback_elapsed().as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(player.decoded_playback_elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn av_player_is_active(handle: u64, state: &ProbeDispatchState) -> u64 {
     state.av_player.players.get(&handle).map_or(0, |player| {
-        u64::from(
-            player.playing_since.is_some()
-                && !player.end_of_stream
-                && (player.duration.is_zero() || player.playback_elapsed() < player.duration),
-        )
+        // Host wall time can advance by many seconds while an emulated frame is translated.
+        // AVPlayer stays active until its decoder actually reaches EOF so a short intro cannot
+        // disappear before the guest has received its first frame.
+        u64::from(player.playing_since.is_some() && !player.end_of_stream)
     })
 }
 
@@ -19662,16 +19727,9 @@ fn av_player_get_video_data(
     {
         return 0;
     }
-    let expected_frame = (player.playback_elapsed().as_secs_f64()
-        * player.frames_per_second.max(1.0))
-    .floor() as u64;
-    while player.next_video_frame < expected_frame {
-        if !av_player_read_video_frame(player) {
-            av_player_finish_stream(player);
-            return 0;
-        }
-        player.next_video_frame = player.next_video_frame.saturating_add(1);
-    }
+    // Delivery is intentionally frame-sequential. Using host wall time here made a slow first
+    // emulated frame discard an entire short movie while catching up, so the game received EOF
+    // without ever seeing its intro or splash frame.
     if !av_player_read_video_frame(player) {
         av_player_finish_stream(player);
         return 0;
@@ -19701,6 +19759,7 @@ fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDispatchState)
         return 0;
     };
     if arguments[1] == 0
+        || !player.has_audio
         || player.playing_since.is_none()
         || player.paused
         || player.end_of_stream
@@ -19746,11 +19805,10 @@ fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDispatchState)
 }
 
 fn av_player_stream_count(handle: u64, state: &ProbeDispatchState) -> u64 {
-    if state.av_player.players.contains_key(&handle) {
-        2
-    } else {
-        sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS)
-    }
+    state.av_player.players.get(&handle).map_or_else(
+        || sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS),
+        |player| 1 + u64::from(player.has_audio),
+    )
 }
 
 fn av_player_validate_handle(handle: u64, state: &ProbeDispatchState) -> u64 {
@@ -19765,14 +19823,22 @@ fn av_player_get_stream_info(arguments: [u64; 6], state: &ProbeDispatchState) ->
     let Some(player) = state.av_player.players.get(&arguments[0]) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
-    if arguments[1] > 1 || arguments[2] == 0 || player.width == 0 || player.height == 0 {
+    if arguments[1] > u64::from(player.has_audio)
+        || arguments[2] == 0
+        || player.width == 0
+        || player.height == 0
+    {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     }
+    // Gen5's non-Ex stream-info structure is 32 bytes and omits the PS4 start-time tail.
+    // Silent Hill places exactly 32 bytes before its stack canary.
     guest_memset(arguments[2], 0, 32);
-    write_guest_u32(arguments[2], low_u32(arguments[1]));
+    // Gen5 stream kinds are one-based (video=1, audio=2, timed text=3). The PS4 ABI is
+    // zero-based; returning that layout made Unreal discard the only video stream as unknown.
+    write_guest_u32(arguments[2], low_u32(arguments[1]).saturating_add(1));
     if arguments[1] == 0 {
-        write_guest_u32(arguments[2] + 8, player.width);
-        write_guest_u32(arguments[2] + 12, player.height);
+        write_guest_u32(arguments[2] + 8, player.width.saturating_add(15) & !15);
+        write_guest_u32(arguments[2] + 12, player.height.saturating_add(15) & !15);
         write_guest_u32(
             arguments[2] + 16,
             ((player.width as f32) / (player.height as f32)).to_bits(),
@@ -22682,7 +22748,7 @@ mod platform_independent_tests {
         };
 
         super::request_agc_submission_completion(&mut state, 0, Vec::new());
-        super::request_agc_compute_submission_completion(&mut state, 33, Vec::new());
+        super::request_agc_compute_submission_completion(&mut state, 32, Vec::new());
 
         assert!(state.pending_agc_completions.is_empty());
         assert!(state.pending_agc_user_interrupts.is_empty());
@@ -22691,14 +22757,14 @@ mod platform_independent_tests {
         remu_gpu::install_event_sink(sender);
         super::request_agc_submission_completion(&mut state, 0, Vec::new());
         state.agc_submission_count = 42;
-        super::request_agc_compute_submission_completion(&mut state, 33, Vec::new());
+        super::request_agc_compute_submission_completion(&mut state, 32, Vec::new());
         assert_eq!(
             state
                 .pending_agc_completions
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            [41]
+            [(41, 0), (42, 32)]
         );
         assert_eq!(
             state
@@ -22784,7 +22850,13 @@ mod platform_independent_tests {
             super::agc_driver_add_eq_event([equeue, 0x1234, 0xfeed_face, 0, 0, 0], &mut state),
             0
         );
-        state.pending_agc_completions.extend([first, second]);
+        assert_eq!(
+            super::agc_driver_add_eq_event([equeue, 0x20, 0xcafe_babe, 0, 0, 0], &mut state),
+            0
+        );
+        state
+            .pending_agc_completions
+            .extend([(first, 0x1234), (second, 0x1234)]);
         remu_gpu::record_gpu_submission_completed(second);
         remu_gpu::record_gpu_submission_completed(first);
 
@@ -22816,11 +22888,18 @@ mod platform_independent_tests {
             read_guest_u64(event.as_ptr().addr() as u64 + 0x18),
             0xfeed_face
         );
+        assert!(
+            state
+                .pending_events
+                .iter()
+                .all(|pending| pending.ident != 0x20),
+            "graphics completion must not wake an unrelated compute queue"
+        );
         assert!(state.pending_agc_completions.is_empty());
     }
 
     #[test]
-    fn delivers_completed_compute_submissions_only_through_the_agc_user_interrupt() {
+    fn routes_completed_compute_submissions_to_the_owner_and_user_interrupt() {
         let _serial = GPU_EVENT_SINK_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -22847,19 +22926,33 @@ mod platform_independent_tests {
             ),
             0
         );
+        state.pending_agc_completions.push_back((sequence, 0x20));
         state.pending_agc_user_interrupts.push_back(sequence);
         remu_gpu::record_gpu_submission_completed(sequence);
 
         super::refresh_completed_agc_submissions(&mut state);
 
+        assert!(state.pending_agc_completions.is_empty());
         assert!(state.pending_agc_user_interrupts.is_empty());
-        assert_eq!(state.pending_events.len(), 1);
-        let event = state.pending_events.front().expect("AGC user interrupt");
-        assert_eq!(event.equeue, 1);
-        assert_eq!(event.ident, 0x1800);
-        assert_eq!(event.filter, super::KERNEL_EVENT_FILTER_USER);
-        assert_eq!(event.fflags, 1);
-        assert_eq!(event.user_data, 0xfeed_face);
+        assert_eq!(state.pending_events.len(), 2);
+        let queue_event = state
+            .pending_events
+            .iter()
+            .find(|event| event.filter == super::KERNEL_EVENT_FILTER_GRAPHICS)
+            .expect("compute owner completion");
+        assert_eq!(queue_event.equeue, 2);
+        assert_eq!(queue_event.ident, 0x20);
+        assert_eq!(queue_event.fflags, 1);
+        assert_eq!(queue_event.user_data, 0xcafe_babe);
+        let user_event = state
+            .pending_events
+            .iter()
+            .find(|event| event.filter == super::KERNEL_EVENT_FILTER_USER)
+            .expect("AGC user interrupt");
+        assert_eq!(user_event.equeue, 1);
+        assert_eq!(user_event.ident, 0x1800);
+        assert_eq!(user_event.fflags, 1);
+        assert_eq!(user_event.user_data, 0xfeed_face);
     }
 
     fn compute_graphics_state(program_address: u64) -> (AgcGraphicsState, AgcShaderRegistry) {
@@ -23158,6 +23251,33 @@ mod platform_independent_tests {
         );
         assert_eq!(super::guest_mutex_unlock(recursive), 0);
         assert_eq!(super::guest_mutex_destroy(recursive), 0);
+    }
+
+    #[test]
+    fn mutex_unlock_rejects_missing_and_non_owner_mutexes() {
+        let _guard = GUEST_CONDITION_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let missing = 0x7fff_0000_1500;
+        assert_eq!(
+            super::guest_mutex_unlock(missing),
+            sce_kernel_error(super::SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED)
+        );
+
+        let mutex = 0x7fff_0000_1600;
+        assert_eq!(
+            super::guest_mutex_init(mutex, super::PthreadMutexAttrState::default()),
+            0
+        );
+        assert_eq!(super::guest_mutex_lock(mutex, false), 0);
+        assert_eq!(
+            std::thread::spawn(move || super::guest_mutex_unlock(mutex))
+                .join()
+                .expect("non-owner unlock thread"),
+            sce_kernel_error(super::SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED)
+        );
+        assert_eq!(super::guest_mutex_unlock(mutex), 0);
+        assert_eq!(super::guest_mutex_destroy(mutex), 0);
     }
 
     #[test]
@@ -27783,13 +27903,20 @@ mod platform_independent_tests {
         );
         assert_eq!(
             state
+                .pending_agc_completions
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(1, 7)]
+        );
+        assert_eq!(
+            state
                 .pending_agc_user_interrupts
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
             vec![1]
         );
-        assert!(state.pending_agc_completions.is_empty());
     }
 
     #[test]

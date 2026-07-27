@@ -192,7 +192,10 @@ fragment float4 remu_presentation_fragment(
     REmuPresentationVertex input [[stage_in]],
     texture2d<float> source [[texture(0)]],
     sampler source_sampler [[sampler(0)]]) {
-    return source.sample(source_sampler, input.texture_coordinate);
+    // VideoOut treats scanout alpha as padding; games are free to leave it at zero. Passing that
+    // value into CAMetalLayer makes AppKit composite an otherwise valid frame as transparent
+    // black, so host presentation must always be opaque.
+    return float4(source.sample(source_sampler, input.texture_coordinate).rgb, 1.0);
 }
 ";
 
@@ -1248,7 +1251,15 @@ struct MetalTextureSwizzleChannels {
     alpha: u8,
 }
 
-fn new_red_blue_swizzled_texture_view(texture: &Texture) -> Option<Texture> {
+fn new_red_blue_swizzled_texture_view(
+    texture: &Texture,
+    base_mip_level: u32,
+    mip_level_count: u32,
+) -> Option<Texture> {
+    let underlying_mip_count = base_mip_level.checked_add(mip_level_count)?;
+    if mip_level_count == 0 || underlying_mip_count > texture.mipmap_level_count() as u32 {
+        return None;
+    }
     const RED: u8 = 2;
     const GREEN: u8 = 3;
     const BLUE: u8 = 4;
@@ -1268,7 +1279,7 @@ fn new_red_blue_swizzled_texture_view(texture: &Texture) -> Option<Texture> {
             texture.as_ref(),
             newTextureViewWithPixelFormat: texture.pixel_format()
             textureType: texture.texture_type()
-            levels: NSRange::new(0, texture.mipmap_level_count())
+            levels: NSRange::new(u64::from(base_mip_level), u64::from(mip_level_count))
             slices: NSRange::new(0, texture.array_length())
             swizzle: swizzle
         ]
@@ -1313,8 +1324,15 @@ fn resident_texture_for_sample(
     ) {
         return None;
     }
-    if resident.component_reorder_view.is_none() {
-        let view = new_red_blue_swizzled_texture_view(&resident.texture)?;
+    let sampled_mip_level_count = sampled.mip_level_count.max(1);
+    let uses_complete_hierarchy =
+        sampled.base_mip_level == 0 && sampled_mip_level_count == resident.mip_level_count;
+    if uses_complete_hierarchy && resident.component_reorder_view.is_none() {
+        let view = new_red_blue_swizzled_texture_view(
+            &resident.texture,
+            sampled.base_mip_level,
+            sampled_mip_level_count,
+        )?;
         view.set_label(&format!(
             "REMu component-reordered guest image {:#x}",
             resident.descriptor.address
@@ -1336,7 +1354,22 @@ fn resident_texture_for_sample(
             }
         }
     }
-    resident.component_reorder_view.clone()
+    if uses_complete_hierarchy {
+        resident.component_reorder_view.clone()
+    } else {
+        let view = new_red_blue_swizzled_texture_view(
+            &resident.texture,
+            sampled.base_mip_level,
+            sampled_mip_level_count,
+        )?;
+        view.set_label(&format!(
+            "REMu component-reordered guest image {:#x} mips {}..{}",
+            resident.descriptor.address,
+            sampled.base_mip_level,
+            sampled.base_mip_level + sampled_mip_level_count,
+        ));
+        Some(view)
+    }
 }
 
 fn resident_component_reordered_sample_is_eligible(
@@ -1344,15 +1377,16 @@ fn resident_component_reordered_sample_is_eligible(
     sampled: DecodedImageDescriptor,
     comparison: bool,
 ) -> bool {
+    let underlying_mip_count = sampled
+        .base_mip_level
+        .checked_add(sampled.mip_level_count.max(1));
     !comparison
         && resident.gpu_written
         && resident.texture_type == 9
         && resident.layer_count == 1
-        && resident.mip_level_count == 1
         && sampled.texture_type == 9
         && sampled.layer_count == 1
-        && sampled.base_mip_level == 0
-        && sampled.mip_level_count == 1
+        && underlying_mip_count.is_some_and(|count| resident.mip_level_count >= count)
         && guest_texture_descriptors_share_component_reordered_storage(
             resident.descriptor,
             sampled.guest,
@@ -1992,6 +2026,7 @@ struct MetalPresenter {
     frame_texture_size: (u32, u32),
     display: Option<DisplayConfiguration>,
     pending_flip: Option<PendingFlip>,
+    pending_flip_queue: Option<u64>,
     next_flip_sequence: u64,
     uploaded_flip_sequence: u64,
     startup_error: Option<String>,
@@ -2114,6 +2149,7 @@ impl MetalPresenter {
             frame_texture_size: (0, 0),
             display: None,
             pending_flip: None,
+            pending_flip_queue: None,
             next_flip_sequence: 0,
             uploaded_flip_sequence: 0,
             startup_error: None,
@@ -2218,6 +2254,26 @@ impl MetalPresenter {
         Ok(())
     }
 
+    fn finalize_pending_flip(&mut self) {
+        let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
+            return;
+        };
+        match self.activate_translated_scanout(flip.address, display.width, display.height) {
+            Ok(true) => {
+                self.uploaded_flip_sequence = flip.sequence;
+            }
+            Ok(false) => {
+                if let Err(error) = self.synchronize_flip_target(flip.address) {
+                    eprintln!("[REMu][METAL] flip synchronization failed: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("[REMu][METAL] translated scanout synchronization failed: {error}");
+            }
+        }
+        self.redraw_pending = true;
+    }
+
     #[allow(clippy::too_many_lines)]
     fn receive_events(&mut self) -> PresenterFlow {
         self.receive_shader_compilations();
@@ -2299,26 +2355,17 @@ impl MetalPresenter {
                         tiling_mode,
                     });
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
-                    match self.activate_translated_scanout(address, width, height) {
-                        Ok(true) => {
-                            self.uploaded_flip_sequence = self.next_flip_sequence;
-                        }
-                        Ok(false) => {
-                            if let Err(error) = self.synchronize_flip_target(address) {
-                                eprintln!("[REMu][METAL] flip synchronization failed: {error}");
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[REMu][METAL] translated scanout synchronization failed: {error}"
-                            );
-                        }
-                    }
                     self.pending_flip = Some(PendingFlip {
                         address,
                         sequence: self.next_flip_sequence,
                     });
-                    self.redraw_pending = true;
+                    self.pending_flip_queue = match source {
+                        OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
+                        OrderedEventSource::Host { .. } => {
+                            self.finalize_pending_flip();
+                            None
+                        }
+                    };
                 }
                 GpuEvent::PipelineBarrier(barrier) => self.end_guest_pipeline_barrier(barrier),
                 GpuEvent::MemoryAcquire(acquire) => {
@@ -2470,6 +2517,14 @@ impl MetalPresenter {
                         // No open or committed work remains, so this submission is genuinely
                         // empty and can complete immediately.
                         remu_gpu::record_gpu_submission_completed(sequence);
+                    }
+                    if matches!(
+                        (source, self.pending_flip_queue),
+                        (OrderedEventSource::GuestQueue(queue_id), Some(pending_queue))
+                            if queue_id == pending_queue
+                    ) {
+                        self.pending_flip_queue = None;
+                        self.finalize_pending_flip();
                     }
                 }
                 GpuEvent::Shutdown => {
@@ -2845,6 +2900,33 @@ impl MetalPresenter {
                 }
             }
             retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
+        }
+        // GFX10 image descriptors may expose only the mip selected by one shader even though
+        // later passes reinterpret the same mode-27 allocation as a larger hierarchy. Metal
+        // cannot grow a texture after a compute/render pass has written it, so create the complete
+        // hierarchy at first residency whenever the guest allocation covers it. This keeps the
+        // first GPU-written level live and lets later single-level and mip-tail views share the
+        // same backing instead of dropping the later compute pass.
+        if descriptor.tile_mode == 27 {
+            let mip_level_count = complete_2d_mip_level_count(descriptor);
+            if mip_level_count > 1
+                && let Ok(layout) = mode27_mip_chain_layout(descriptor, mip_level_count)
+                && let Ok(byte_count) = u64::try_from(layout.byte_count)
+                && guest_shared_backing_alias_segments(descriptor.address, byte_count).is_some()
+            {
+                return ensure_mipmapped_resident_texture_in_map(
+                    device,
+                    DecodedImageDescriptor {
+                        guest: descriptor,
+                        destination_select: 0xfac,
+                        base_mip_level: 0,
+                        mip_level_count,
+                        texture_type: 9,
+                        layer_count: 1,
+                    },
+                    &mut self.resident_guest_textures,
+                );
+            }
         }
         ensure_resident_texture_in_map(device, descriptor, &mut self.resident_guest_textures)
     }
@@ -3381,17 +3463,45 @@ impl MetalPresenter {
         }
     }
 
-    fn request_pending_flip_redraw_for_texture(&mut self, descriptor: GuestTextureDescriptor) {
+    fn refresh_pending_flip_after_target_write(&mut self, target: DecodedRenderTarget) {
         let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
             return;
         };
-        if flip.sequence != self.uploaded_flip_sequence
-            && flip.address == descriptor.address
-            && display.width == descriptor.width
-            && display.height == descriptor.height
+        if flip.address != target.texture.address
+            || display.width != target.texture.width
+            || display.height != target.texture.height
         {
-            self.redraw_pending = true;
+            return;
         }
+
+        // A guest may announce a flip before its final compositor pass, and reinterpreting an
+        // overlapping allocation can replace the Metal texture object after that announcement.
+        // Refresh the presented object after every matching target write instead of treating an
+        // already-uploaded flip sequence as immutable. Otherwise the window keeps sampling the
+        // stale solid texture while later passes render the real menu into its replacement.
+        let refreshed = if target.direct_scanout {
+            self.direct_scanout_textures
+                .get(&target.texture.address)
+                .filter(|scanout| scanout.initialized && scanout.descriptor == target.texture)
+                .map(|scanout| scanout.texture.clone())
+        } else {
+            self.resident_guest_textures
+                .values()
+                .filter(|resident| {
+                    resident.gpu_written
+                        && resident.descriptor.address == target.texture.address
+                        && resident.descriptor.width == target.texture.width
+                        && resident.descriptor.height == target.texture.height
+                })
+                .max_by_key(|resident| resident.content_version)
+                .map(|resident| resident.texture.clone())
+        };
+        if let Some(texture) = refreshed {
+            self.frame_texture = Some(texture);
+            self.frame_texture_size = (target.texture.width, target.texture.height);
+            self.uploaded_flip_sequence = flip.sequence;
+        }
+        self.redraw_pending = true;
     }
 
     fn synchronize_cpu_written_guest_resources(
@@ -3538,7 +3648,7 @@ impl MetalPresenter {
                 layer_count: key.layer_count,
             };
             let raw = snapshot_watched_sampled_texture_raw(descriptor, &cached.write_watch)?;
-            let texture = if key.base_mip_level != 0 || key.mip_level_count != 1 {
+            let texture = if sampled_texture_uses_exact_mode27_mips(descriptor) {
                 create_exact_mode27_sampled_mip_view(&device, descriptor, &raw, key.comparison)?
             } else {
                 let linear = decode_sampled_texture_linear_from_raw(descriptor, &raw)?;
@@ -4581,12 +4691,10 @@ impl MetalPresenter {
         let Some((descriptor, source_texture, source)) = direct.or(resident) else {
             return Ok(false);
         };
-        // Preserve the texture exactly at the flip boundary. The event loop may translate draws
-        // for later guest frames before it next requests an AppKit drawable; sampling the mutable
-        // render target directly would therefore display those later writes instead of this flip.
-        // A queue-ordered GPU copy retains the boundary without a CPU wait or guest-memory round
-        // trip. The two VideoOut addresses naturally form a reusable snapshot pair, and an older
-        // presentation using one snapshot is ahead of the next copy to it on this serial queue.
+        // Keep the scanout resident on the GPU and let the serial Metal queue order presentation
+        // after the guest work that produced it. AGC's embedded flip marker can precede Silent
+        // Hill's final composition work, so copying at that marker preserves a stale solid buffer.
+        // Presenting the live resident also avoids a 32 MiB 4K blit on every frame.
         self.flush_guest_command_batch(false, GuestBatchFlushReason::FlipSnapshot)?;
         let device = self
             .device
@@ -4598,24 +4706,6 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal command queue is unavailable")?
             .clone();
-        let snapshot = self.ensure_scanout_snapshot_texture(&device, descriptor);
-        let command_buffer = queue.new_command_buffer().to_owned();
-        command_buffer.set_label("REMu scanout snapshot");
-        let encoder = command_buffer.new_blit_command_encoder();
-        encoder.set_label("REMu flip-boundary texture copy");
-        encoder.copy_from_texture(
-            &source_texture,
-            0,
-            0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-            MTLSize::new(u64::from(descriptor.width), u64::from(descriptor.height), 1),
-            &snapshot,
-            0,
-            0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-        );
-        encoder.end_encoding();
-        command_buffer.commit();
         let capture_due = self.capture_directory.is_some()
             && self
                 .last_guest_capture
@@ -4630,10 +4720,10 @@ impl MetalPresenter {
                     | MTLPixelFormat::RGBA16Float
             )
         {
-            let rendered = read_texture_linear(&device, &queue, &snapshot, descriptor)?;
+            let rendered = read_texture_linear(&device, &queue, &source_texture, descriptor)?;
             self.capture_translated_frame_if_changed(descriptor, &rendered);
         }
-        self.frame_texture = Some(snapshot);
+        self.frame_texture = Some(source_texture);
         self.frame_texture_size = (descriptor.width, descriptor.height);
         static LOGGED_TRANSLATED_SCANOUTS: OnceLock<Mutex<HashSet<(u64, &'static str)>>> =
             OnceLock::new();
@@ -5347,10 +5437,10 @@ impl MetalPresenter {
                 .get(key)
                 .ok_or("shader pair has no compiled Metal pipeline")?;
             if let Some(directory) = std::env::var_os("REMU_DUMP_SCANOUT_MSL_DIR")
-                && targets.iter().any(|target| {
+                && (targets.iter().any(|target| {
                     self.scanout_snapshot_textures
                         .contains_key(&target.texture.address)
-                })
+                }) || diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address))
             {
                 static DUMPED_SCANOUT_PAIRS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
                 let pair = (draw.export_shader_address, draw.pixel_shader_address);
@@ -5891,9 +5981,9 @@ impl MetalPresenter {
                 }
             }
             // A flip can arrive before the presenter has translated the render target that
-            // backs it. Once that exact texture is written, wake the presentation path so it
-            // can snapshot the already-requested flip without decoding tiled guest memory.
-            self.request_pending_flip_redraw_for_texture(target.texture);
+            // backs it, and the translated texture can later be replaced by an overlapping
+            // reinterpretation. Always refresh the live scanout after a matching target write.
+            self.refresh_pending_flip_after_target_write(*target);
         }
         let dump_target_before_pixel_shader =
             diagnostic_dump_target_before_pixel_shader().is_some();
@@ -7705,12 +7795,9 @@ fn watch_guest_texture(
 }
 
 fn sampled_texture_raw_range(descriptor: DecodedImageDescriptor) -> Result<(usize, usize), String> {
-    let exact_mip_chain = descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1;
+    let exact_mip_chain = sampled_texture_uses_exact_mode27_mips(descriptor);
     let byte_count = if exact_mip_chain {
-        if descriptor.texture_type != 9
-            || descriptor.layer_count != 1
-            || descriptor.guest.tile_mode != 27
-        {
+        if descriptor.texture_type != 9 || descriptor.layer_count != 1 {
             return Err(format!(
                 "exact sampled mip-chain upload requires a 2D single-layer mode-27 resource, got type={} layers={} tile={} base={} count={}",
                 descriptor.texture_type,
@@ -7743,6 +7830,11 @@ fn sampled_texture_raw_range(descriptor: DecodedImageDescriptor) -> Result<(usiz
             .map_err(|_| "sampled texture address does not fit usize")?,
         usize::try_from(byte_count).map_err(|_| "sampled texture byte count does not fit usize")?,
     ))
+}
+
+fn sampled_texture_uses_exact_mode27_mips(descriptor: DecodedImageDescriptor) -> bool {
+    descriptor.guest.tile_mode == 27
+        && (descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1)
 }
 
 fn watch_sampled_texture(
@@ -8921,6 +9013,11 @@ fn ensure_resident_texture_in_map(
         },
     );
     Ok(texture)
+}
+
+fn complete_2d_mip_level_count(descriptor: GuestTextureDescriptor) -> u32 {
+    let maximum_extent = descriptor.width.max(descriptor.height).max(1);
+    (u32::BITS - maximum_extent.leading_zeros()).min(16)
 }
 
 fn ensure_mipmapped_resident_texture_in_map(
@@ -10604,7 +10701,7 @@ fn upload_image_textures(
                     let raw = snapshot_watched_sampled_texture_raw(descriptor, &write_watch)
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
                     let texture =
-                        if descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1 {
+                        if sampled_texture_uses_exact_mode27_mips(descriptor) {
                             create_exact_mode27_sampled_mip_view(
                                 device,
                                 descriptor,
@@ -15179,14 +15276,35 @@ kernel void remu_sampler_cache_test(
         presenter.redraw_pending = false;
 
         presenter.mark_direct_scanout_initialized(descriptor.address);
-        presenter.request_pending_flip_redraw_for_texture(descriptor);
+        let target = DecodedRenderTarget {
+            guest_slot: 0,
+            texture: descriptor,
+            output_kind: PixelOutputKind::Float,
+            write_mask: 0xf,
+            direct_scanout: true,
+            sample_count: 1,
+            texture_type: 9,
+            layer_count: 1,
+            base_layer: 0,
+            mip_level: 0,
+            mip_level_count: 1,
+            dcc_enabled: false,
+            fast_clear_enabled: false,
+        };
+        presenter.refresh_pending_flip_after_target_write(target);
 
         assert!(presenter.redraw_pending);
-        assert_eq!(presenter.uploaded_flip_sequence, 0);
+        assert_eq!(presenter.uploaded_flip_sequence, 1);
         presenter.upload_pending_frame();
         assert_eq!(presenter.uploaded_flip_sequence, 1);
         assert_eq!(presenter.frame_texture_size, (640, 360));
         assert!(presenter.frame_texture.is_some());
+
+        // The same guest flip remains live while later compositor passes update its target.
+        // An uploaded sequence must not suppress the redraw for those newer contents.
+        presenter.redraw_pending = false;
+        presenter.refresh_pending_flip_after_target_write(target);
+        assert!(presenter.redraw_pending);
     }
 
     #[test]
@@ -15246,7 +15364,7 @@ kernel void remu_sampler_cache_test(
         attachment.set_texture(Some(&texture));
         attachment.set_load_action(MTLLoadAction::Clear);
         attachment.set_store_action(MTLStoreAction::Store);
-        attachment.set_clear_color(MTLClearColor::new(0.25, 0.5, 1.0, 1.0));
+        attachment.set_clear_color(MTLClearColor::new(0.25, 0.5, 1.0, 0.0));
         let paint = queue.new_command_buffer().to_owned();
         let encoder = paint.new_render_command_encoder(pass);
         encoder.end_encoding();
@@ -15279,7 +15397,7 @@ kernel void remu_sampler_cache_test(
         assert!(
             output
                 .chunks_exact(4)
-                .all(|pixel| pixel == [64, 128, 255, 255])
+                .all(|pixel| pixel == [64, 128, 255, 0])
         );
 
         let output_descriptor = GuestTextureDescriptor {
@@ -15322,7 +15440,8 @@ kernel void remu_sampler_cache_test(
         assert!(
             presented
                 .chunks_exact(4)
-                .all(|pixel| pixel == [255, 188, 137, 255])
+                .all(|pixel| pixel == [255, 188, 137, 255]),
+            "VideoOut scanout alpha must not make the host drawable transparent"
         );
     }
 
@@ -16294,10 +16413,16 @@ fragment int4 remu_format_sint() { return int4(-3); }
         assert_eq!(descriptor.mip_level_count, 5);
         assert_eq!(descriptor.guest.width, width);
         assert_eq!(descriptor.guest.height, height);
-        assert!(
-            super::sampled_texture_raw_range(descriptor)
-                .expect_err("initial mip chains require exact guest detiling")
-                .contains("requires a 2D single-layer mode-27")
+        assert_eq!(
+            super::sampled_texture_raw_range(descriptor),
+            Ok((
+                usize::try_from(descriptor.guest.address).expect("test address fits usize"),
+                usize::try_from(
+                    guest_texture_byte_count(descriptor.guest)
+                        .expect("base texture byte count fits")
+                )
+                .expect("base texture byte count fits usize")
+            ))
         );
     }
 
@@ -16375,18 +16500,18 @@ fragment int4 remu_format_sint() { return int4(-3); }
             texture_type: 9,
             layer_count: 1,
         };
-        let original = super::ensure_mipmapped_resident_texture_in_map(
+        let original = presenter
+            .ensure_resident_texture(&device, guest)
+            .expect("first single-level use reserves the complete mapped hierarchy");
+        assert_eq!(original.mipmap_level_count(), 6);
+
+        let complete_view = super::ensure_mipmapped_resident_texture_in_map(
             &device,
             complete,
             &mut presenter.resident_guest_textures,
         )
-        .expect("complete mip hierarchy becomes resident");
-        assert_eq!(original.mipmap_level_count(), 6);
-
-        let preflight = presenter
-            .ensure_resident_texture(&device, guest)
-            .expect("single-level storage preflight reuses the hierarchy");
-        assert!(std::ptr::eq(original.as_ref(), preflight.as_ref()));
+        .expect("later complete mip view reuses first residency");
+        assert!(std::ptr::eq(original.as_ref(), complete_view.as_ref()));
         assert_eq!(
             presenter
                 .resident_guest_textures
@@ -17035,8 +17160,8 @@ fragment int4 remu_format_sint() { return int4(-3); }
         descriptor.set_storage_mode(MTLStorageMode::Private);
         descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
         let texture = device.new_texture(&descriptor);
-        let view =
-            new_red_blue_swizzled_texture_view(&texture).expect("swizzled Metal texture view");
+        let view = new_red_blue_swizzled_texture_view(&texture, 0, 1)
+            .expect("swizzled Metal texture view");
         assert_eq!(view.pixel_format(), MTLPixelFormat::BGRA8Unorm);
         assert!(view.parent_texture().is_some());
 

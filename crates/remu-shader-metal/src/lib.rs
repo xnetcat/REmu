@@ -513,6 +513,13 @@ impl<'a> Compiler<'a> {
         self.options.stage == MetalShaderStage::Compute && self.options.wave_lane_count == 64
     }
 
+    fn uses_lds_memory(&self) -> bool {
+        self.program
+            .instructions
+            .iter()
+            .any(is_lds_memory_instruction)
+    }
+
     fn architectural_lane(&self) -> &'static str {
         if self.split_wave64() {
             "remu_wave_lane"
@@ -3622,6 +3629,21 @@ impl<'a> Compiler<'a> {
         };
         let result = self.temp("ulong", &value);
         self.store_scalar_pair(destination, &result);
+        if self.split_wave64()
+            && self.uses_lds_memory()
+            && name == "SMovB64"
+            && destination == EXEC_LO
+            && instruction.sources.first().is_some_and(|source| {
+                source.kind == OperandKind::EncodedConstant && source.value == 193
+            })
+        {
+            // One guest wave64 executes in lockstep, but Metal realizes it as two independent
+            // SIMD32 groups. Guest shaders can use an EXEC=-1 restore as their wave reconvergence
+            // point and immediately consume LDS values produced on either side of the preceding
+            // branch without an S_BARRIER. Synchronize the host halves here so the high half
+            // cannot read the low half's shared tile (or vice versa) before its stores complete.
+            self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
+        }
         if sets_scc {
             self.line(3, &format!("scc = {result} != 0ul;"));
         }
@@ -7734,6 +7756,49 @@ mod tests {
             "a zero-extended -1 disables the high 32 lanes"
         );
         assert!(shader.source.contains("remu_s_127 = (uint)("));
+    }
+
+    #[test]
+    fn synchronizes_split_wave64_lds_at_full_exec_reconvergence() {
+        let program = Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0x100,
+                    encoding: ShaderEncoding::Ds,
+                    opcode: Opcode::Known("DsWriteB32"),
+                    words: vec![0, 0],
+                    sources: vec![Operand::vector(0), Operand::vector(1)],
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::DataShare(DataShareControl {
+                        offset0: 0,
+                        offset1: 0,
+                        gds: false,
+                    })),
+                },
+                Instruction {
+                    pc: 0x108,
+                    encoding: ShaderEncoding::Sop1,
+                    opcode: Opcode::Known("SMovB64"),
+                    words: vec![0],
+                    sources: vec![Operand::source(193, None)],
+                    destinations: vec![Operand::scalar(EXEC_LO)],
+                    control: None,
+                },
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute_wave(2_048, 64),
+        )
+        .expect("split wave64 LDS reconvergence should lower");
+
+        assert!(
+            shader
+                .source
+                .contains("threadgroup_barrier(mem_flags::mem_threadgroup)")
+        );
     }
 
     #[test]

@@ -78,34 +78,57 @@ struct PageOwner {
 
 struct SnapshotPage {
     address: u64,
-    owners: Box<[PageOwner]>,
+    owner_start: usize,
+    owner_count: usize,
 }
 
 struct WatchSnapshot {
     pages: Box<[SnapshotPage]>,
+    owners: Box<[PageOwner]>,
     writable_ranges: Box<[(u64, u64)]>,
 }
 
 impl WatchSnapshot {
     fn from_state(state: &WatchState) -> Self {
-        let mut pages = BTreeMap::<u64, Vec<PageOwner>>::new();
+        let owner_count = state
+            .ranges
+            .values()
+            .filter(|range| range.precise_tracking)
+            .map(|range| range.pages.len())
+            .sum();
+        let mut entries = Vec::with_capacity(owner_count);
         for range in state.ranges.values().filter(|range| range.precise_tracking) {
             let range_pointer = Arc::as_ptr(&range);
             for (page_index, page) in range.pages.iter().enumerate() {
-                pages.entry(page.address).or_default().push(PageOwner {
-                    range: range_pointer,
-                    page_index,
-                });
+                entries.push((
+                    page.address,
+                    PageOwner {
+                        range: range_pointer,
+                        page_index,
+                    },
+                ));
             }
         }
-        Self {
-            pages: pages
-                .into_iter()
-                .map(|(address, owners)| SnapshotPage {
+        entries.sort_unstable_by_key(|(address, _)| *address);
+        let mut pages = Vec::<SnapshotPage>::with_capacity(entries.len());
+        let mut owners = Vec::<PageOwner>::with_capacity(entries.len());
+        for (address, owner) in entries {
+            if pages.last().is_none_or(|page| page.address != address) {
+                pages.push(SnapshotPage {
                     address,
-                    owners: owners.into_boxed_slice(),
-                })
-                .collect(),
+                    owner_start: owners.len(),
+                    owner_count: 0,
+                });
+            }
+            owners.push(owner);
+            pages
+                .last_mut()
+                .expect("snapshot page was inserted")
+                .owner_count += 1;
+        }
+        Self {
+            pages: pages.into_boxed_slice(),
+            owners: owners.into_boxed_slice(),
             writable_ranges: state
                 .writable_ranges
                 .iter()
@@ -126,6 +149,10 @@ impl WatchSnapshot {
             }
         }
         None
+    }
+
+    fn owners(&self, page: &SnapshotPage) -> &[PageOwner] {
+        &self.owners[page.owner_start..page.owner_start + page.owner_count]
     }
 
     fn contains_writable_page(&self, address: u64) -> bool {
@@ -773,7 +800,7 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         return false;
     }
     let has_armed_owner = page.is_some_and(|page| {
-        page.owners.iter().any(|owner| {
+        snapshot.owners(page).iter().any(|owner| {
             // SAFETY: the snapshot pins all range allocations referenced by its owners.
             let range = unsafe { &*owner.range };
             range.pages[owner.page_index].armed.load(Ordering::Acquire)
@@ -816,7 +843,7 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
     }
 
     if let Some(page) = page {
-        for owner in &page.owners {
+        for owner in snapshot.owners(page) {
             // SAFETY: the active snapshot pins the range, and page_index was produced from that
             // range.
             let range = unsafe { &*owner.range };
