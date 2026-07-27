@@ -5,3 +5,4 @@
 
 # Isolated worktrees created for parallel agent runs.
 .claude/worktrees/
+/tmp
