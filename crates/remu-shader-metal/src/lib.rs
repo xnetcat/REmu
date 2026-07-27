@@ -11,14 +11,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use remu_shader::{
-    DataShareControl, Dpp8Control, DppControl, ExportControl, ImageBinding, ImageControl,
-    Instruction, InstructionControl, Opcode, Operand, OperandKind, PixelOutputBinding,
-    PixelOutputKind, Program, SdwaControl, ShaderEncoding, ShaderEvaluation, VertexInputBinding,
-    Vop3pControl, decode_inline_constant, decode_unified_format, decode_v2f16_inline_constant,
+    DataShareControl, Dpp8Control, DppControl, ExportControl, ImageBinding, ImageBindingSlotMap,
+    ImageControl, Instruction, InstructionControl, Opcode, Operand, OperandKind,
+    PixelOutputBinding, PixelOutputKind, Program, SdwaControl, ShaderEncoding, ShaderEvaluation,
+    VertexInputBinding, Vop3pControl, decode_inline_constant, decode_unified_format,
+    decode_v2f16_inline_constant, image_is_comparison,
 };
 
 const SCALAR_REGISTER_COUNT: u32 = 128;
 const VECTOR_REGISTER_COUNT: u32 = 256;
+const METAL_DIRECT_TEXTURE_LIMIT: u32 = 128;
 const VCC_LO: u32 = 106;
 const VCC_HI: u32 = 107;
 const EXEC_LO: u32 = 126;
@@ -372,6 +374,7 @@ struct Compiler<'a> {
     pixel_attributes: BTreeSet<u32>,
     pixel_interpolations: BTreeMap<u32, PixelInterpolation>,
     image_kinds: Vec<ImageKind>,
+    image_slots: ImageBindingSlotMap,
     control_flow: ControlFlowLowering,
 }
 
@@ -501,7 +504,6 @@ struct ImageKind {
     storage: bool,
     writable: bool,
     comparison: bool,
-    sampler_slot: Option<u32>,
     dimension: u32,
     texture_type: u32,
 }
@@ -669,33 +671,42 @@ impl<'a> Compiler<'a> {
             vertex_outputs.extend(0..options.required_vertex_output_count);
         }
 
-        let mut sampler_count = 0_u32;
-        let image_kinds = evaluation
-            .image_bindings
-            .iter()
-            .map(|binding| {
+        let image_slots = evaluation.image_binding_slots();
+        if image_slots.texture_count > METAL_DIRECT_TEXTURE_LIMIT {
+            return Err(MetalCompileError::InvalidInterface(format!(
+                "{} distinct image descriptors/types/access modes exceed Metal's {} direct \
+                 texture slots",
+                image_slots.texture_count, METAL_DIRECT_TEXTURE_LIMIT
+            )));
+        }
+        let mut image_kinds = Vec::with_capacity(
+            usize::try_from(image_slots.texture_count)
+                .map_err(|_| MetalCompileError::InvalidInterface("too many textures".into()))?,
+        );
+        for (binding_index, binding) in evaluation.image_bindings.iter().enumerate() {
+            let texture_slot = usize::try_from(image_slots.texture_slots[binding_index])
+                .map_err(|_| MetalCompileError::InvalidInterface("texture slot overflow".into()))?;
+            if texture_slot == image_kinds.len() {
                 let storage = is_storage_image(binding.opcode);
                 let writable = is_writable_image(binding.opcode);
-                let comparison = binding.opcode.contains("SampleC");
-                let sampler_slot = (!storage).then(|| {
-                    let slot = sampler_count;
-                    sampler_count += 1;
-                    slot
-                });
-                ImageKind {
+                let comparison = image_is_comparison(binding.opcode);
+                image_kinds.push(ImageKind {
                     component: image_component_type(binding),
                     storage,
                     writable,
                     comparison,
-                    sampler_slot,
                     dimension: binding.control.dimension,
                     texture_type: binding
                         .resource_descriptor
                         .get(3)
                         .map_or(0, |word| (word >> 28) & 0xf),
-                }
-            })
-            .collect();
+                });
+            } else if texture_slot > image_kinds.len() {
+                return Err(MetalCompileError::InvalidInterface(
+                    "non-dense canonical texture slots".into(),
+                ));
+            }
+        }
         let control_flow = analyze_control_flow(program)?;
 
         Ok(Self {
@@ -708,6 +719,7 @@ impl<'a> Compiler<'a> {
             pixel_attributes,
             pixel_interpolations,
             image_kinds,
+            image_slots,
             control_flow,
         })
     }
@@ -771,13 +783,7 @@ impl<'a> Compiler<'a> {
         let (source, register_references) = self.emit_module()?;
         let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
             .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
-        let sampler_count = self
-            .image_kinds
-            .iter()
-            .filter(|kind| kind.sampler_slot.is_some())
-            .count();
-        let sampler_count = u32::try_from(sampler_count)
-            .map_err(|_| MetalCompileError::InvalidInterface("too many samplers".into()))?;
+        let sampler_count = self.image_slots.sampler_count;
         let initial_scalar_buffer_index = global_buffer_count;
         let threadgroup_memory_bytes = if self
             .program
@@ -798,8 +804,7 @@ impl<'a> Compiler<'a> {
                 initial_scalar_buffer_index,
                 sampler_argument_buffer_index: (sampler_count != 0)
                     .then_some(initial_scalar_buffer_index + 1),
-                texture_count: u32::try_from(self.image_kinds.len())
-                    .map_err(|_| MetalCompileError::InvalidInterface("too many textures".into()))?,
+                texture_count: self.image_slots.texture_count,
                 sampler_count,
                 threadgroup_memory_bytes,
             },
@@ -941,11 +946,8 @@ impl<'a> Compiler<'a> {
     fn emit_module(&self) -> Result<(String, RegisterReferences), MetalCompileError> {
         let global_count = self.evaluation.global_memory_bindings.len();
         let initial_index = global_count;
-        let sampler_count = self
-            .image_kinds
-            .iter()
-            .filter(|kind| kind.sampler_slot.is_some())
-            .count();
+        let sampler_count = usize::try_from(self.image_slots.sampler_count)
+            .map_err(|_| MetalCompileError::InvalidInterface("too many samplers".into()))?;
         let mut source = String::from(
             "#include <metal_stdlib>\nusing namespace metal;\n\n\
              inline bool remu_range_valid(uint offset, uint size, uint length) {\n\
@@ -4685,12 +4687,14 @@ impl<'a> Compiler<'a> {
         let Some(InstructionControl::Image(image)) = instruction.control.as_ref() else {
             return Err("missing image control".to_owned());
         };
-        let binding_index = self
+        let evaluation_index = self
             .evaluation
             .image_bindings
             .iter()
             .position(|binding| binding.pc == instruction.pc)
             .ok_or_else(|| "image instruction has no evaluated image binding".to_owned())?;
+        let binding_index = usize::try_from(self.image_slots.texture_slots[evaluation_index])
+            .map_err(|_| "canonical image texture slot does not fit usize".to_owned())?;
         let kind = self.image_kinds[binding_index];
         let name = instruction
             .opcode
@@ -4715,10 +4719,10 @@ impl<'a> Compiler<'a> {
                 image.dimension, image.is_array
             ));
         }
-        let sampler_slot = kind
-            .sampler_slot
+        let sampler_slot = self.image_slots.sampler_slots[evaluation_index]
             .ok_or_else(|| "sampled image has no sampler slot".to_owned())?;
-        let sampled = self.emit_image_sample(image, name, binding_index, sampler_slot)?;
+        let sampled =
+            self.emit_image_sample(image, instruction.opcode, name, binding_index, sampler_slot)?;
         if gather {
             for component in 0..4 {
                 let raw = if kind.component == "uint" {
@@ -4958,6 +4962,7 @@ impl<'a> Compiler<'a> {
     fn emit_image_sample(
         &mut self,
         image: &ImageControl,
+        opcode: Opcode,
         name: &str,
         binding_index: usize,
         sampler_slot: u32,
@@ -4976,7 +4981,7 @@ impl<'a> Compiler<'a> {
             ));
         }
         let has_offset = name.ends_with('O');
-        let has_compare = name.contains("SampleC");
+        let has_compare = image_is_comparison(opcode);
         let has_gradients = name.contains("SampleD");
         let has_zero_lod = name.contains("Lz");
         let has_lod = !has_zero_lod && name.contains("SampleL");
@@ -5148,7 +5153,14 @@ impl<'a> Compiler<'a> {
         };
         let kind = self.image_kinds[binding_index];
         let vector_kind = format!("vec<{}, 4>", kind.component);
-        let physical = if is_gather {
+        let physical = if is_gather && has_compare {
+            self.temp(
+                &vector_kind,
+                &format!(
+                    "tex{binding_index}.gather_compare(remu_samplers.s{sampler_slot}, {coordinates}, {compare}, int2(0))"
+                ),
+            )
+        } else if is_gather {
             let destination_select = self.image_destination_select(image);
             let logical_component = image.dmask.trailing_zeros();
             let selector = self.temp(
@@ -8656,6 +8668,160 @@ mod tests {
         assert!(shader.source.contains("remu_s_3 & 0xFFFu"));
         assert!(shader.source.contains("remu_v_4 = "));
         assert!(shader.source.contains("remu_v_7 = "));
+    }
+
+    #[test]
+    fn canonicalizes_silent_hill_scale_image_uses_below_the_direct_texture_limit() {
+        const IMAGE_INSTRUCTION_COUNT: usize = 147;
+        let control = ImageControl {
+            dmask: 0xf,
+            vector_address: 0,
+            address_registers: vec![0, 1],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 8,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+        };
+        let mut instructions = Vec::with_capacity(IMAGE_INSTRUCTION_COUNT);
+        let mut evaluation = empty_evaluation();
+        let mut resource_descriptor = vec![0; 8];
+        resource_descriptor[3] = 0xfac | (9 << 28);
+
+        for index in 0..IMAGE_INSTRUCTION_COUNT {
+            let pc = u32::try_from(index * 8).expect("test PC fits u32");
+            instructions.push(Instruction {
+                pc,
+                encoding: ShaderEncoding::Mimg,
+                opcode: Opcode::Known("ImageSampleLz"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(0), Operand::vector(1), Operand::scalar(0)],
+                destinations: (4..8).map(Operand::vector).collect(),
+                control: Some(InstructionControl::Image(control.clone())),
+            });
+            evaluation.image_bindings.push(ImageBinding {
+                pc,
+                opcode: Opcode::Known("ImageSampleLz"),
+                control: control.clone(),
+                resource_descriptor: resource_descriptor.clone().into(),
+                sampler_descriptor: vec![0; 4].into(),
+                mip_level: Some(0),
+            });
+        }
+
+        let program = Program::new(0x800c_1100_00, instructions);
+        let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+            .expect("repeated descriptor uses must share one Metal binding");
+
+        assert_eq!(evaluation.image_bindings.len(), IMAGE_INSTRUCTION_COUNT);
+        assert_eq!(shader.bindings.texture_count, 1);
+        assert_eq!(shader.bindings.sampler_count, 1);
+        assert_eq!(shader.source.matches("[[texture(").count(), 1);
+        assert!(shader.source.contains("tex0 [[texture(0)]]"));
+        assert!(!shader.source.contains("[[texture(128)]]"));
+        assert!(!shader.source.contains("tex128"));
+
+        let mut genuinely_distinct = evaluation.clone();
+        for (index, binding) in genuinely_distinct.image_bindings.iter_mut().enumerate() {
+            binding.resource_descriptor[0] =
+                u32::try_from(index).expect("test descriptor index fits u32");
+        }
+        let error = compile_msl(
+            &program,
+            &genuinely_distinct,
+            &MetalCompileOptions::compute(0),
+        )
+        .expect_err("129+ genuinely distinct textures must be rejected, not dropped");
+        assert!(error.to_string().contains("distinct image descriptors"));
+    }
+
+    #[test]
+    fn comparison_gather_uses_distinct_depth_resources_and_gather_compare_codegen() {
+        let ordinary_control = ImageControl {
+            dmask: 1,
+            vector_address: 0,
+            address_registers: vec![0, 1],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 8,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+        };
+        let comparison_control = ImageControl {
+            address_registers: vec![0, 1, 2],
+            vector_data: 8,
+            ..ordinary_control.clone()
+        };
+        let ordinary = Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Mimg,
+            opcode: Opcode::Known("ImageGather4"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(0), Operand::vector(1), Operand::scalar(0)],
+            destinations: (4..8).map(Operand::vector).collect(),
+            control: Some(InstructionControl::Image(ordinary_control.clone())),
+        };
+        let comparison = Instruction {
+            pc: 8,
+            encoding: ShaderEncoding::Mimg,
+            opcode: Opcode::Known("ImageGather4C"),
+            words: vec![0, 0],
+            sources: vec![
+                Operand::vector(0),
+                Operand::vector(1),
+                Operand::vector(2),
+                Operand::scalar(0),
+                Operand::scalar(8),
+            ],
+            destinations: (8..12).map(Operand::vector).collect(),
+            control: Some(InstructionControl::Image(comparison_control.clone())),
+        };
+        let mut evaluation = empty_evaluation();
+        let mut resource_descriptor = vec![0; 8];
+        resource_descriptor[3] = 0x204 | (9 << 28);
+        for (instruction, control) in [
+            (&ordinary, ordinary_control),
+            (&comparison, comparison_control),
+        ] {
+            evaluation.image_bindings.push(ImageBinding {
+                pc: instruction.pc,
+                opcode: instruction.opcode,
+                control,
+                resource_descriptor: resource_descriptor.clone().into(),
+                sampler_descriptor: vec![3 << 12, 0, 0, 0].into(),
+                mip_level: None,
+            });
+        }
+
+        let shader = compile_msl(
+            &Program::new(0x1000, vec![ordinary, comparison]),
+            &evaluation,
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("ordinary and comparison gathers should lower");
+
+        assert_eq!(shader.bindings.texture_count, 2);
+        assert_eq!(shader.bindings.sampler_count, 2);
+        assert!(
+            shader
+                .source
+                .contains("texture2d<float> tex0 [[texture(0)]]")
+        );
+        assert!(shader.source.contains("depth2d<float> tex1 [[texture(1)]]"));
+        assert!(shader.source.contains("tex0.gather(remu_samplers.s0"));
+        assert!(
+            shader
+                .source
+                .contains("tex1.gather_compare(remu_samplers.s1")
+        );
     }
 
     #[test]

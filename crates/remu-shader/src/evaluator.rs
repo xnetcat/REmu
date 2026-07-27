@@ -3165,4 +3165,76 @@ mod tests {
             (9..=12).collect::<Vec<_>>().as_slice()
         );
     }
+
+    #[test]
+    fn canonicalizes_repeated_image_descriptors_without_merging_type_or_access() {
+        let image_instruction = |pc, opcode, scalar_resource, scalar_sampler, dimension| {
+            instruction(
+                pc,
+                ShaderEncoding::Mimg,
+                opcode,
+                Vec::new(),
+                Vec::new(),
+                Some(InstructionControl::Image(ImageControl {
+                    dmask: 0xf,
+                    vector_address: 0,
+                    address_registers: vec![0, 1, 2],
+                    vector_data: 4,
+                    scalar_resource,
+                    scalar_sampler,
+                    dimension,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                })),
+            )
+        };
+        let mut registers = (1..=12).collect::<Vec<_>>();
+        registers.resize(16, 0);
+        registers.extend(101..=108);
+        let shader = state(
+            vec![
+                image_instruction(0, "ImageSample", 0, 8, 1),
+                image_instruction(8, "ImageSampleLz", 0, 8, 1),
+                image_instruction(16, "ImageLoad", 0, 0, 1),
+                image_instruction(24, "ImageSampleCLz", 0, 8, 1),
+                image_instruction(32, "ImageSample", 0, 8, 2),
+                image_instruction(40, "ImageSample", 16, 8, 1),
+                image_instruction(48, "ImageStore", 0, 0, 1),
+                image_instruction(56, "ImageGather4", 0, 8, 1),
+                image_instruction(64, "ImageGather4C", 0, 8, 1),
+                end(72),
+            ],
+            registers,
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("image resource discovery");
+        let slots = evaluation.image_binding_slots();
+
+        assert_eq!(evaluation.image_bindings.len(), 9);
+        assert_eq!(slots.texture_slots, [0, 0, 1, 2, 3, 4, 5, 0, 2]);
+        assert_eq!(
+            slots.sampler_slots,
+            [
+                Some(0),
+                Some(0),
+                None,
+                Some(1),
+                Some(0),
+                Some(0),
+                None,
+                Some(0),
+                Some(1)
+            ]
+        );
+        assert_eq!(slots.texture_count, 6);
+        assert_eq!(slots.sampler_count, 2);
+    }
 }

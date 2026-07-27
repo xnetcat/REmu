@@ -2508,6 +2508,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "A9cVMUtEp4Y" => "sceHttpInit",
         "0gYjPTR-6cY" => "sceHttpCreateTemplate",
         "nBDD66kiFW8" => "sceShareInitialize",
+        "jh+8XiK4LeE" => "sceKernelIsAddressSanitizerEnabled",
         "8zLSfEfW5AU" => "sceCoredumpRegisterCoredumpHandler",
         "j2AIqSqJP0w" => "sceKernelGetdents",
         "2G6i6hMIUUY" => "posix_getdents",
@@ -2560,6 +2561,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "ysmw6J-P8Ak" => "sceNpSessionSignalingInitialize",
         "sk54bi6FtYM" => "sceNpWebApi2CreateUserContext",
         "3Zl8BePTh9Y" => "sceNpCheckCallback",
+        "Ec63y59l9tw" => "sceNpSetNpTitleId",
         "s6W4Zl4Slgk" => "sceNpUniversalDataSystemCreateEventPropertyObject",
         "hZIg1EWGsHM" => "sceUltInitialize",
         "CdWp0oHWGr0" => "sceUserServiceGetInitialUser",
@@ -2567,6 +2569,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "j3YMu1MVNNo" => "sceUserServiceInitialize",
         "hv1luiJrqQM" => "scePadInit",
         "xk0AcarP3V4" => "scePadOpen",
+        "u1GRHp+oWoY" => "scePadGetHandle",
         "6ncge5+l5Qs" => "scePadClose",
         "AcslpN1jHR8" => "scePadDeviceClassGetExtendedInformation",
         "clVvL4ZDntw" => "scePadSetMotionSensorState",
@@ -2617,8 +2620,11 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "fZo48un7LK4" => "sceSystemServiceParamGetInt",
         "3RQ5aQfnstU" => "sceSystemServiceGetNoticeScreenSkipFlag",
         "Vo5V8KAwCmk" => "sceSystemServiceHideSplashScreen",
+        "YBiIdcDPrxs" => "sceShareFeaturePermit",
+        "7QZtURYnXG4" => "sceShareSetContentParam",
         "uoUpLGNkygk" => "sceCommonDialogInitialize",
         "ERKzksauAJA" => "sceSaveDataDialogGetStatus",
+        "s9e3+YpRnzw" => "sceSaveDataDialogInitialize",
         "sjaobBgqeB4" => "sceNpUniversalDataSystemInitialize",
         "47UAEuQl+iI" => "sceNpUniversalDataSystemTerminate",
         "5zBnau1uIEo" => "sceNpUniversalDataSystemCreateContext",
@@ -3212,7 +3218,10 @@ struct RuntimeServiceState {
     user_service: InitializationState,
     user_login_event_delivered: bool,
     pad: InitializationState,
+    pad_handle: Option<i32>,
+    next_pad_handle: i32,
     common_dialog: InitializationState,
+    common_dialog_owner: Option<CommonDialogOwner>,
     /// Lifecycle state of the system message dialog, using the common-dialog status values.
     message_dialog_status: u32,
     play_go_initialized: bool,
@@ -3225,6 +3234,9 @@ struct RuntimeServiceState {
     next_np_web_api2_user_context: i32,
     np_web_api2_user_contexts: BTreeMap<i32, (i32, i32)>,
     np_callback_polls: u64,
+    np_title_id: Option<[u8; 16]>,
+    share_feature_permitted: bool,
+    share_content_parameter: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3232,6 +3244,12 @@ enum InitializationState {
     #[default]
     Uninitialized,
     Initialized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommonDialogOwner {
+    Message,
+    SaveData,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4610,6 +4628,13 @@ struct GuestMutexState {
 struct GuestMutexEntry {
     state: Mutex<GuestMutexState>,
     wake: Condvar,
+    storage_address: u64,
+    /// Opaque object installed in the guest's `ScePthreadMutex` storage by the init ABI.
+    ///
+    /// The bundled libc writes bookkeeping fields in this object immediately after
+    /// `scePthreadMutexInit` succeeds, even though lock ownership itself is modeled by REmu.
+    /// Synthetic unit-test addresses are deliberately allowed to leave this zero.
+    guest_object: u64,
 }
 
 #[derive(Debug, Default)]
@@ -6795,6 +6820,27 @@ fn guest_mutex_shard(address: u64) -> usize {
 }
 
 fn guest_mutex_entry(address: u64, create: bool) -> Option<Arc<GuestMutexEntry>> {
+    let shard = guest_mutex_shards()[guest_mutex_shard(address)]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = shard.get(&address) {
+        return Some(entry.clone());
+    }
+    drop(shard);
+    for candidate in guest_mutex_shards() {
+        let candidate = candidate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = candidate
+            .values()
+            .find(|entry| entry.guest_object != 0 && entry.guest_object == address)
+        {
+            return Some(entry.clone());
+        }
+    }
+    if !create {
+        return None;
+    }
     let mut shard = guest_mutex_shards()[guest_mutex_shard(address)]
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6805,6 +6851,8 @@ fn guest_mutex_entry(address: u64, create: bool) -> Option<Arc<GuestMutexEntry>>
         let entry = Arc::new(GuestMutexEntry {
             state: Mutex::new(GuestMutexState::default()),
             wake: Condvar::new(),
+            storage_address: address,
+            guest_object: 0,
         });
         shard.insert(address, entry.clone());
         entry
@@ -6862,10 +6910,17 @@ fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) -> u64 {
     if address == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    let guest_object = match allocate_guest_mutex_object(address, attributes) {
+        Ok(object) => object,
+        Err(error) => return error,
+    };
     let mut shard = guest_mutex_shards()[guest_mutex_shard(address)]
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if shard.contains_key(&address) {
+        if guest_object != 0 {
+            guest_free(guest_object);
+        }
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     shard.insert(
@@ -6876,22 +6931,63 @@ fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) -> u64 {
                 ..GuestMutexState::default()
             }),
             wake: Condvar::new(),
+            storage_address: address,
+            guest_object,
         }),
     );
+    if guest_object != 0 {
+        write_guest_u64(address, guest_object);
+    }
     0
+}
+
+fn allocate_guest_mutex_object(
+    storage: u64,
+    attributes: PthreadMutexAttrState,
+) -> Result<u64, u64> {
+    let mut existing = [0_u8; 8];
+    if !ProcessGuestMemory.read(storage, &mut existing) {
+        // Synchronization unit tests also exercise deliberately synthetic, non-dereferenceable
+        // addresses. They only require the host-side ownership model; a real mapped guest mutex
+        // must always take the object-backed path above.
+        return Ok(0);
+    }
+    const GUEST_MUTEX_OBJECT_SIZE: u64 = 0x100;
+    const GUEST_MUTEX_TYPE_OFFSET: u64 = 0x20;
+    const GUEST_MUTEX_PROTOCOL_OFFSET: u64 = 0x3c;
+    let object = guest_calloc(1, GUEST_MUTEX_OBJECT_SIZE);
+    if object == 0 {
+        return Err(sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN));
+    }
+    write_guest_u32(
+        object + GUEST_MUTEX_TYPE_OFFSET,
+        attributes.mutex_type.cast_unsigned(),
+    );
+    write_guest_u32(
+        object + GUEST_MUTEX_PROTOCOL_OFFSET,
+        attributes.protocol.cast_unsigned(),
+    );
+    Ok(object)
 }
 
 fn guest_mutex_destroy(address: u64) -> u64 {
     if address == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let mut shard = guest_mutex_shards()[guest_mutex_shard(address)]
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(entry) = shard.get(&address).cloned() else {
+    let Some(entry) = guest_mutex_entry(address, false) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
-    let mutex = entry
+    let storage_address = entry.storage_address;
+    let mut shard = guest_mutex_shards()[guest_mutex_shard(storage_address)]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(stored_entry) = shard.get(&storage_address).cloned() else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    if !Arc::ptr_eq(&entry, &stored_entry) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    }
+    let mutex = stored_entry
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6899,7 +6995,15 @@ fn guest_mutex_destroy(address: u64) -> u64 {
         return u64::from(libc::EBUSY.cast_unsigned());
     }
     drop(mutex);
-    shard.remove(&address);
+    let entry = shard
+        .remove(&storage_address)
+        .expect("the mutex entry checked above remains in its shard");
+    let guest_object = entry.guest_object;
+    drop(shard);
+    if guest_object != 0 {
+        write_guest_u64(storage_address, 0);
+        guest_free(guest_object);
+    }
     0
 }
 
@@ -8964,6 +9068,10 @@ fn dispatch_probe_import(
         "Y7aJ1uydPMo" => guest_realloc(arguments[0], arguments[1]),
         "Ujf3KzMvRmI" | "2Btkg8k24Zg" => guest_aligned_alloc(arguments[0], arguments[1]),
         "cVSk9y8URbc" => guest_posix_memalign(arguments[0], arguments[1], arguments[2]),
+        // REmu does not instrument the guest address space with AddressSanitizer. Returning a
+        // successful false result is ABI-observable: treating the missing import error as a
+        // boolean true makes Unreal select ASan-only allocation and fault handling paths.
+        "jh+8XiK4LeE" => 0,
         // libc strlen
         "j4ViWNHEgww" => guest_strlen(arguments[0]),
         "Ovb2dSJOAuE" => guest_strcmp(arguments[0], arguments[1]),
@@ -9048,6 +9156,7 @@ fn dispatch_probe_import(
         "waPcxYiR3WA" => pthread_condition_attr_destroy(arguments[0], state),
         // Initial single-device handles for input, video, and audio.
         "xk0AcarP3V4" => pad_open(arguments, state),
+        "u1GRHp+oWoY" => pad_get_handle(arguments, state),
         "Up36PTk687E" => video_out_open(arguments, state),
         "utPrVdxio-8" => video_out_get_output_status(arguments, state),
         "CBiu4mCE1DA" => video_out_set_flip_rate(arguments, state),
@@ -9187,8 +9296,12 @@ fn dispatch_probe_import(
         "ysmw6J-P8Ak" => np_session_signaling_initialize(arguments, state),
         "sk54bi6FtYM" => np_web_api2_create_user_context(arguments, state),
         "3Zl8BePTh9Y" => np_check_callback(state),
+        "Ec63y59l9tw" => np_set_np_title_id(arguments, state),
+        "YBiIdcDPrxs" => share_feature_permit(state),
+        "7QZtURYnXG4" => share_set_content_parameter(arguments[0], state),
         "hZIg1EWGsHM" => ult_initialize(arguments[0], state),
         "uoUpLGNkygk" => common_dialog_initialize(state),
+        "s9e3+YpRnzw" => save_data_dialog_initialize(state),
         "ERKzksauAJA" => state
             .services
             .save_data_dialog_status
@@ -9941,6 +10054,68 @@ fn np_check_callback(state: &mut ProbeDispatchState) -> u64 {
     0
 }
 
+const SCE_NP_ERROR_INVALID_ARGUMENT: u32 = 0x8055_0003;
+
+fn np_set_np_title_id(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    const NP_TITLE_ID_SIZE: usize = 16;
+    const NP_TITLE_SECRET_SIZE: usize = 128;
+    if arguments[0] == 0 || arguments[1] == 0 {
+        return sce_kernel_error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    }
+
+    let mut title_id = [0_u8; NP_TITLE_ID_SIZE];
+    let mut title_secret = [0_u8; NP_TITLE_SECRET_SIZE];
+    if !ProcessGuestMemory.read(arguments[0], &mut title_id)
+        || !ProcessGuestMemory.read(arguments[1], &mut title_secret)
+    {
+        return sce_kernel_error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    }
+    state.services.np_title_id = Some(title_id);
+    // The secret is caller-owned authentication material. Validate the complete fixed-width ABI
+    // record without retaining or logging it.
+    std::hint::black_box(title_secret);
+    0
+}
+
+fn share_feature_permit(state: &mut ProbeDispatchState) -> u64 {
+    state.services.share_feature_permitted = true;
+    0
+}
+
+fn share_set_content_parameter(address: u64, state: &mut ProbeDispatchState) -> u64 {
+    const MAXIMUM_CONTENT_PARAMETER_BYTES: usize = 4_096;
+    if address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+
+    let mut bytes = Vec::with_capacity(128);
+    while bytes.len() < MAXIMUM_CONTENT_PARAMETER_BYTES {
+        let Some(chunk_address) = address.checked_add(bytes.len() as u64) else {
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        };
+        // Reading only to the next 4 KiB boundary lets a valid short string end immediately before
+        // an unmapped page. `ProcessGuestMemory` validates every chunk without dereferencing an
+        // untrusted guest pointer in the host process.
+        let page_bytes = 4_096 - usize::try_from(chunk_address & 0xfff).unwrap_or_default();
+        let chunk_length =
+            page_bytes.min(MAXIMUM_CONTENT_PARAMETER_BYTES.saturating_sub(bytes.len()));
+        let mut chunk = vec![0_u8; chunk_length];
+        if !ProcessGuestMemory.read(chunk_address, &mut chunk) {
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        }
+        if let Some(end) = chunk.iter().position(|byte| *byte == 0) {
+            bytes.extend_from_slice(&chunk[..end]);
+            let Ok(parameter) = String::from_utf8(bytes) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            state.services.share_content_parameter = Some(parameter);
+            return 0;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+}
+
 fn ult_initialize(runtime: u64, state: &mut ProbeDispatchState) -> u64 {
     if runtime == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
@@ -9987,6 +10162,21 @@ fn common_dialog_initialize(state: &mut ProbeDispatchState) -> u64 {
     0
 }
 
+fn save_data_dialog_initialize(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.common_dialog != InitializationState::Initialized {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_SYSTEM_INITIALIZED);
+    }
+    if state.services.save_data_dialog_status != COMMON_DIALOG_STATUS_NONE.cast_signed() {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_DIALOG_ALREADY_INITIALIZED);
+    }
+    if state.services.common_dialog_owner.is_some() {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_BUSY);
+    }
+    state.services.save_data_dialog_status = COMMON_DIALOG_STATUS_INITIALIZED.cast_signed();
+    state.services.common_dialog_owner = Some(CommonDialogOwner::SaveData);
+    0
+}
+
 fn agc_initialize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let agc_state = arguments[0];
     let version = low_u32(arguments[1]);
@@ -10021,15 +10211,17 @@ fn np_get_account_country(output: u64) -> u64 {
 }
 
 const SCE_PAD_ERROR_INVALID_HANDLE: u32 = 0x8092_0003;
+const SCE_PAD_ERROR_ALREADY_OPENED: u32 = 0x8092_0004;
 const SCE_PAD_ERROR_NOT_INITIALIZED: u32 = 0x8092_0005;
 const SCE_PAD_ERROR_DEVICE_NOT_CONNECTED: u32 = 0x8092_0007;
+const SCE_PAD_ERROR_DEVICE_NO_HANDLE: u32 = 0x8092_0008;
 
 fn pad_initialize(state: &mut ProbeDispatchState) -> u64 {
     state.services.pad = InitializationState::Initialized;
     0
 }
 
-fn pad_open(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+fn pad_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     if state.services.pad != InitializationState::Initialized {
         return sce_kernel_error(SCE_PAD_ERROR_NOT_INITIALIZED);
     }
@@ -10039,21 +10231,47 @@ fn pad_open(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     if user != 0x1000_0000 || port_type != 0 || index != 0 {
         return sce_kernel_error(SCE_PAD_ERROR_DEVICE_NOT_CONNECTED);
     }
-    1
+    if state.services.pad_handle.is_some() {
+        return sce_kernel_error(SCE_PAD_ERROR_ALREADY_OPENED);
+    }
+    let handle = state.services.next_pad_handle.max(1);
+    state.services.next_pad_handle = handle.saturating_add(1);
+    state.services.pad_handle = Some(handle);
+    u64::from(handle.cast_unsigned())
+}
+
+fn pad_get_handle(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if state.services.pad != InitializationState::Initialized {
+        return sce_kernel_error(SCE_PAD_ERROR_NOT_INITIALIZED);
+    }
+    let user = low_i32(arguments[0]);
+    let port_type = low_i32(arguments[1]);
+    let index = low_i32(arguments[2]);
+    if user != 0x1000_0000 || port_type != 0 || index != 0 {
+        return sce_kernel_error(SCE_PAD_ERROR_DEVICE_NO_HANDLE);
+    }
+    state.services.pad_handle.map_or_else(
+        || sce_kernel_error(SCE_PAD_ERROR_DEVICE_NO_HANDLE),
+        |handle| u64::from(handle.cast_unsigned()),
+    )
 }
 
 fn validate_pad_handle(handle: u64, state: &ProbeDispatchState) -> Result<(), u64> {
     if state.services.pad != InitializationState::Initialized {
         return Err(sce_kernel_error(SCE_PAD_ERROR_NOT_INITIALIZED));
     }
-    if !matches!(low_i32(handle), 0 | 1) {
+    if state.services.pad_handle != Some(low_i32(handle)) {
         return Err(sce_kernel_error(SCE_PAD_ERROR_INVALID_HANDLE));
     }
     Ok(())
 }
 
-fn pad_close(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    validate_pad_handle(arguments[0], state).map_or_else(|error| error, |()| 0)
+fn pad_close(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0], state) {
+        return error;
+    }
+    state.services.pad_handle = None;
+    0
 }
 
 fn pad_get_extended_information(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
@@ -10786,18 +11004,27 @@ const COMMON_DIALOG_STATUS_NONE: u32 = 0;
 const COMMON_DIALOG_STATUS_INITIALIZED: u32 = 1;
 const COMMON_DIALOG_STATUS_RUNNING: u32 = 2;
 const COMMON_DIALOG_STATUS_FINISHED: u32 = 3;
+const COMMON_DIALOG_ERROR_NOT_SYSTEM_INITIALIZED: u32 = 0x80b8_0001;
+const COMMON_DIALOG_ERROR_DIALOG_ALREADY_INITIALIZED: u32 = 0x80b8_0004;
 const COMMON_DIALOG_ERROR_NOT_INITIALIZED: u32 = 0x8002_0001;
-const COMMON_DIALOG_ERROR_ALREADY_INITIALIZED: u32 = 0x8002_0011;
 const COMMON_DIALOG_ERROR_ARG_NULL: u32 = 0x8002_000e;
+const COMMON_DIALOG_ERROR_BUSY: u32 = 0x80b8_0008;
 /// The dialog closed without the user choosing a button.
 const MESSAGE_DIALOG_BUTTON_INVALID: u32 = 0;
 const MESSAGE_DIALOG_RESULT_USER_CANCELED: u32 = 1;
 
 fn message_dialog_initialize(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.common_dialog != InitializationState::Initialized {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_SYSTEM_INITIALIZED);
+    }
     if state.services.message_dialog_status != COMMON_DIALOG_STATUS_NONE {
-        return sce_kernel_error(COMMON_DIALOG_ERROR_ALREADY_INITIALIZED);
+        return sce_kernel_error(COMMON_DIALOG_ERROR_DIALOG_ALREADY_INITIALIZED);
+    }
+    if state.services.common_dialog_owner.is_some() {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_BUSY);
     }
     state.services.message_dialog_status = COMMON_DIALOG_STATUS_INITIALIZED;
+    state.services.common_dialog_owner = Some(CommonDialogOwner::Message);
     0
 }
 
@@ -10806,6 +11033,9 @@ fn message_dialog_terminate(state: &mut ProbeDispatchState) -> u64 {
         return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
     }
     state.services.message_dialog_status = COMMON_DIALOG_STATUS_NONE;
+    if state.services.common_dialog_owner == Some(CommonDialogOwner::Message) {
+        state.services.common_dialog_owner = None;
+    }
     0
 }
 
@@ -22931,6 +23161,46 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn mutex_init_installs_the_guest_visible_object_libc_updates() {
+        let _guard = GUEST_CONDITION_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut storage = 0_u64;
+        let address = (&raw mut storage).addr() as u64;
+        assert_eq!(
+            super::guest_mutex_init(address, super::PthreadMutexAttrState::default()),
+            0
+        );
+        assert_ne!(storage, 0);
+        let handle = storage;
+        assert_eq!(
+            super::read_guest_u32(handle + 0x20) & 0xff,
+            super::PthreadMutexAttrState::default()
+                .mutex_type
+                .cast_unsigned()
+        );
+        assert_eq!(
+            super::read_guest_u32(handle + 0x3c),
+            super::PthreadMutexAttrState::default()
+                .protocol
+                .cast_unsigned()
+        );
+
+        // PS5 libc performs this exact update after scePthreadMutexInit succeeds. The returned
+        // opaque object therefore has to be real writable guest-visible storage.
+        let flags = super::read_guest_u32(handle + 0x20);
+        super::write_guest_u32(handle + 0x20, flags | 0x100);
+        assert_eq!(super::read_guest_u32(handle + 0x20) & 0x100, 0x100);
+
+        // Both the public storage address and libc's resolved opaque pointer identify the same
+        // mutex in different generations of the SDK.
+        assert_eq!(super::guest_mutex_lock(handle, false), 0);
+        assert_eq!(super::guest_mutex_unlock(address), 0);
+        assert_eq!(super::guest_mutex_destroy(handle), 0);
+        assert_eq!(storage, 0);
+    }
+
+    #[test]
     fn module_unwind_query_writes_the_gen5_metadata_layout() {
         let mut state = ProbeDispatchState::default();
         state.unwind_modules.push(super::GuestUnwindModule {
@@ -24026,6 +24296,218 @@ mod platform_independent_tests {
             0
         );
         assert_eq!(skip, 0);
+        assert!(state.unimplemented_nids.is_empty());
+    }
+
+    #[test]
+    fn pad_get_handle_observes_the_primary_controller_lifecycle() {
+        let mut state = ProbeDispatchState::default();
+        let primary = [0x1000_0000, 0, 0, 0, 0, 0];
+
+        assert_eq!(
+            dispatch_probe_import("u1GRHp+oWoY", primary, [0; 6], &mut state),
+            sce_kernel_error(super::SCE_PAD_ERROR_NOT_INITIALIZED)
+        );
+        assert_eq!(
+            dispatch_probe_import("hv1luiJrqQM", [0; 6], [0; 6], &mut state),
+            0
+        );
+        assert_eq!(
+            dispatch_probe_import("u1GRHp+oWoY", primary, [0; 6], &mut state),
+            sce_kernel_error(super::SCE_PAD_ERROR_DEVICE_NO_HANDLE)
+        );
+        assert_eq!(
+            dispatch_probe_import("xk0AcarP3V4", primary, [0; 6], &mut state),
+            1
+        );
+        assert_eq!(
+            dispatch_probe_import("u1GRHp+oWoY", primary, [0; 6], &mut state),
+            1
+        );
+        assert_eq!(
+            dispatch_probe_import("xk0AcarP3V4", primary, [0; 6], &mut state),
+            sce_kernel_error(super::SCE_PAD_ERROR_ALREADY_OPENED)
+        );
+        assert_eq!(
+            dispatch_probe_import("6ncge5+l5Qs", [1, 0, 0, 0, 0, 0], [0; 6], &mut state),
+            0
+        );
+        assert_eq!(
+            dispatch_probe_import("u1GRHp+oWoY", primary, [0; 6], &mut state),
+            sce_kernel_error(super::SCE_PAD_ERROR_DEVICE_NO_HANDLE)
+        );
+        assert_eq!(
+            dispatch_probe_import("xk0AcarP3V4", primary, [0; 6], &mut state),
+            2
+        );
+        assert_eq!(
+            dispatch_probe_import("u1GRHp+oWoY", primary, [0; 6], &mut state),
+            2
+        );
+        assert_eq!(
+            dispatch_probe_import("6ncge5+l5Qs", [1, 0, 0, 0, 0, 0], [0; 6], &mut state),
+            sce_kernel_error(super::SCE_PAD_ERROR_INVALID_HANDLE)
+        );
+        assert_eq!(
+            dispatch_probe_import("u1GRHp+oWoY", primary, [0; 6], &mut state),
+            2,
+            "rejecting a stale handle must not close the new controller"
+        );
+        assert_eq!(
+            super::known_nid_name("u1GRHp+oWoY"),
+            Some("scePadGetHandle")
+        );
+        assert!(state.unimplemented_nids.is_empty());
+    }
+
+    #[test]
+    fn save_data_dialog_initialization_requires_and_owns_common_dialog_state() {
+        let mut state = ProbeDispatchState::default();
+        assert_eq!(
+            dispatch_probe_import("s9e3+YpRnzw", [0; 6], [0; 6], &mut state),
+            sce_kernel_error(super::COMMON_DIALOG_ERROR_NOT_SYSTEM_INITIALIZED)
+        );
+        assert_eq!(
+            dispatch_probe_import("uoUpLGNkygk", [0; 6], [0; 6], &mut state),
+            0
+        );
+        assert_eq!(
+            dispatch_probe_import("s9e3+YpRnzw", [0; 6], [0; 6], &mut state),
+            0
+        );
+        assert_eq!(
+            dispatch_probe_import("ERKzksauAJA", [0; 6], [0; 6], &mut state),
+            u64::from(super::COMMON_DIALOG_STATUS_INITIALIZED)
+        );
+        assert_eq!(
+            dispatch_probe_import("s9e3+YpRnzw", [0; 6], [0; 6], &mut state),
+            sce_kernel_error(super::COMMON_DIALOG_ERROR_DIALOG_ALREADY_INITIALIZED)
+        );
+        assert_eq!(
+            dispatch_probe_import("lDqxaY1UbEo", [0; 6], [0; 6], &mut state),
+            sce_kernel_error(super::COMMON_DIALOG_ERROR_BUSY),
+            "save-data dialog must own the shared common-dialog service"
+        );
+        assert_eq!(
+            super::known_nid_name("s9e3+YpRnzw"),
+            Some("sceSaveDataDialogInitialize")
+        );
+        assert!(state.unimplemented_nids.is_empty());
+
+        let mut busy = ProbeDispatchState::default();
+        assert_eq!(
+            dispatch_probe_import("uoUpLGNkygk", [0; 6], [0; 6], &mut busy),
+            0
+        );
+        assert_eq!(
+            dispatch_probe_import("lDqxaY1UbEo", [0; 6], [0; 6], &mut busy),
+            0
+        );
+        assert_eq!(
+            dispatch_probe_import("s9e3+YpRnzw", [0; 6], [0; 6], &mut busy),
+            sce_kernel_error(super::COMMON_DIALOG_ERROR_BUSY)
+        );
+        assert_eq!(
+            dispatch_probe_import("ePw-kqZmelo", [0; 6], [0; 6], &mut busy),
+            0
+        );
+        assert_eq!(
+            dispatch_probe_import("s9e3+YpRnzw", [0; 6], [0; 6], &mut busy),
+            0,
+            "terminating the message dialog must release common-dialog ownership"
+        );
+    }
+
+    #[test]
+    fn share_and_np_title_services_validate_and_retain_caller_data() {
+        let mut state = ProbeDispatchState::default();
+        assert_eq!(
+            dispatch_probe_import("7QZtURYnXG4", [0; 6], [0; 6], &mut state),
+            sce_kernel_error(super::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            dispatch_probe_import("Ec63y59l9tw", [0; 6], [0; 6], &mut state),
+            sce_kernel_error(super::SCE_NP_ERROR_INVALID_ARGUMENT)
+        );
+
+        let content = std::ffi::CString::new("silent-hill-capture").expect("valid C string");
+        assert_eq!(
+            dispatch_probe_import(
+                "7QZtURYnXG4",
+                [content.as_ptr() as u64, 0, 0, 0, 0, 0],
+                [0; 6],
+                &mut state
+            ),
+            0
+        );
+        assert_eq!(
+            state.services.share_content_parameter.as_deref(),
+            Some("silent-hill-capture")
+        );
+        assert_eq!(
+            dispatch_probe_import("YBiIdcDPrxs", [0; 6], [0; 6], &mut state),
+            0
+        );
+        assert!(state.services.share_feature_permitted);
+
+        let mut title_id = *b"PPSA10112_00\0\0\0\0";
+        let title_secret = [0x5a_u8; 128];
+        assert_eq!(
+            dispatch_probe_import("7QZtURYnXG4", [1, 0, 0, 0, 0, 0], [0; 6], &mut state),
+            sce_kernel_error(super::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            dispatch_probe_import(
+                "Ec63y59l9tw",
+                [1, title_secret.as_ptr() as u64, 0, 0, 0, 0],
+                [0; 6],
+                &mut state
+            ),
+            sce_kernel_error(super::SCE_NP_ERROR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            dispatch_probe_import(
+                "Ec63y59l9tw",
+                [
+                    title_id.as_mut_ptr() as u64,
+                    title_secret.as_ptr() as u64,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+                [0; 6],
+                &mut state
+            ),
+            0
+        );
+        assert_eq!(state.services.np_title_id, Some(title_id));
+        assert_eq!(
+            super::known_nid_name("YBiIdcDPrxs"),
+            Some("sceShareFeaturePermit")
+        );
+        assert_eq!(
+            super::known_nid_name("7QZtURYnXG4"),
+            Some("sceShareSetContentParam")
+        );
+        assert_eq!(
+            super::known_nid_name("Ec63y59l9tw"),
+            Some("sceNpSetNpTitleId")
+        );
+        assert!(state.unimplemented_nids.is_empty());
+    }
+
+    #[test]
+    fn address_sanitizer_query_reports_the_uninstrumented_guest_runtime() {
+        let mut state = ProbeDispatchState::default();
+        assert_eq!(
+            dispatch_probe_import("jh+8XiK4LeE", [0; 6], [0; 6], &mut state),
+            0
+        );
+        assert_eq!(
+            super::known_nid_name("jh+8XiK4LeE"),
+            Some("sceKernelIsAddressSanitizerEnabled")
+        );
         assert!(state.unimplemented_nids.is_empty());
     }
 

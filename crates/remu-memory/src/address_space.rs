@@ -27,10 +27,10 @@ pub const GUEST_PAGE_SIZE: u64 = 16 * 1024;
 static NEXT_BACKING_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct SharedMappingRecord {
     end: u64,
-    backing_id: u64,
+    backing: GuestPhysicalBacking,
     backing_offset: u64,
 }
 
@@ -41,10 +41,56 @@ pub struct GuestSharedMappingIdentity {
     pub backing_offset: u64,
 }
 
+/// One live CPU mapping that covers a contiguous portion of a GPU-physical backing range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestSharedBackingSegment {
+    pub address: u64,
+    pub byte_count: u64,
+}
+
 static SHARED_MAPPINGS: OnceLock<Mutex<BTreeMap<u64, SharedMappingRecord>>> = OnceLock::new();
 
 fn shared_mappings() -> &'static Mutex<BTreeMap<u64, SharedMappingRecord>> {
     SHARED_MAPPINGS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn resolve_shared_backing_range(
+    mappings: &BTreeMap<u64, SharedMappingRecord>,
+    address: u64,
+    byte_count: u64,
+) -> Option<(GuestPhysicalBacking, u64, u64)> {
+    if byte_count == 0 {
+        return None;
+    }
+    let (&first_start, first) = mappings.range(..=address).next_back()?;
+    if address >= first.end {
+        return None;
+    }
+    let backing_id = first.backing.id();
+    let physical_start = first.backing_offset.checked_add(address - first_start)?;
+    let physical_end = physical_start.checked_add(byte_count)?;
+    if physical_end > first.backing.size() {
+        return None;
+    }
+    let mut physical_cursor = physical_start;
+    while physical_cursor < physical_end {
+        let covered_end = mappings
+            .iter()
+            .filter(|(_, record)| record.backing.id() == backing_id)
+            .filter_map(|(&start, record)| {
+                let mapping_length = record.end.checked_sub(start)?;
+                let backing_end = record.backing_offset.checked_add(mapping_length)?;
+                (record.backing_offset <= physical_cursor && physical_cursor < backing_end)
+                    .then_some(backing_end)
+            })
+            .max()?
+            .min(physical_end);
+        if covered_end == physical_cursor {
+            return None;
+        }
+        physical_cursor = covered_end;
+    }
+    Some((first.backing.clone(), physical_start, physical_end))
 }
 
 /// Resolves a live shared guest range to its backing object and byte offset.
@@ -68,7 +114,7 @@ pub fn guest_shared_mapping_identity(
         return None;
     }
     let identity = GuestSharedMappingIdentity {
-        backing_id: first.backing_id,
+        backing_id: first.backing.id(),
         backing_offset: first.backing_offset.checked_add(address - start)?,
     };
     let mut cursor = first.end.min(end);
@@ -77,7 +123,8 @@ pub fn guest_shared_mapping_identity(
         .checked_add(first.end.checked_sub(start)?)?;
     while cursor < end {
         let next = mappings.get(&cursor)?;
-        if next.backing_id != identity.backing_id || next.backing_offset != expected_backing_offset
+        if next.backing.id() != identity.backing_id
+            || next.backing_offset != expected_backing_offset
         {
             return None;
         }
@@ -85,6 +132,127 @@ pub fn guest_shared_mapping_identity(
         cursor = next.end.min(end);
     }
     Some(identity)
+}
+
+/// Resolves a GPU resource range through the shared physical backing behind its first VA.
+///
+/// Prospero can map adjacent direct-memory pages at unrelated CPU virtual addresses while the GPU
+/// resource remains physically contiguous. This returns live CPU aliases which, together, cover
+/// that exact physical byte interval. Every byte must still have a live mapping; holes in physical
+/// backing coverage are rejected.
+#[must_use]
+pub fn guest_shared_backing_segments(
+    address: u64,
+    byte_count: u64,
+) -> Option<Vec<GuestSharedBackingSegment>> {
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backing, physical_start, physical_end) =
+        resolve_shared_backing_range(&mappings, address, byte_count)?;
+    let backing_id = backing.id();
+
+    let mut physical_cursor = physical_start;
+    let mut segments = Vec::new();
+    while physical_cursor < physical_end {
+        let candidate = mappings
+            .iter()
+            .filter(|(_, record)| record.backing.id() == backing_id)
+            .filter_map(|(&start, record)| {
+                let length = record.end.checked_sub(start)?;
+                let backing_end = record.backing_offset.checked_add(length)?;
+                (record.backing_offset <= physical_cursor && physical_cursor < backing_end)
+                    .then_some((start, record, backing_end))
+            })
+            // Prefer the alias that covers the most remaining bytes. This avoids needlessly
+            // splitting a range when several coherent aliases name the same physical pages.
+            .max_by_key(|(_, _, backing_end)| *backing_end)?;
+        let (mapping_start, record, mapping_backing_end) = candidate;
+        let covered_end = mapping_backing_end.min(physical_end);
+        let guest_address = mapping_start.checked_add(physical_cursor - record.backing_offset)?;
+        let covered_bytes = covered_end.checked_sub(physical_cursor)?;
+        if covered_bytes == 0 {
+            return None;
+        }
+        segments.push(GuestSharedBackingSegment {
+            address: guest_address,
+            byte_count: covered_bytes,
+        });
+        physical_cursor = covered_end;
+    }
+    Some(segments)
+}
+
+/// Returns every live CPU alias intersecting a GPU-physical backing range.
+///
+/// This is intentionally broader than [`guest_shared_backing_segments`]: write watching must
+/// observe stores through every coherent alias, not just one representative that covers each
+/// physical byte.
+#[must_use]
+pub fn guest_shared_backing_alias_segments(
+    address: u64,
+    byte_count: u64,
+) -> Option<Vec<GuestSharedBackingSegment>> {
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backing, physical_start, physical_end) =
+        resolve_shared_backing_range(&mappings, address, byte_count)?;
+    let backing_id = backing.id();
+    let mut aliases = mappings
+        .iter()
+        .filter(|(_, record)| record.backing.id() == backing_id)
+        .filter_map(|(&mapping_start, record)| {
+            let mapping_length = record.end.checked_sub(mapping_start)?;
+            let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
+            let intersection_start = record.backing_offset.max(physical_start);
+            let intersection_end = mapping_backing_end.min(physical_end);
+            (intersection_start < intersection_end).then(|| GuestSharedBackingSegment {
+                address: mapping_start + (intersection_start - record.backing_offset),
+                byte_count: intersection_end - intersection_start,
+            })
+        })
+        .collect::<Vec<_>>();
+    aliases.sort_unstable_by_key(|segment| (segment.address, segment.byte_count));
+    aliases.dedup();
+    (!aliases.is_empty()).then_some(aliases)
+}
+
+/// Copies a GPU-physical resource range out of its shared direct-memory backing.
+///
+/// Unlike dereferencing the resource VA, this remains valid when consecutive backing pages are
+/// exposed through disjoint CPU aliases. Live-mapping coverage is validated before the transfer.
+pub fn read_guest_shared_backing(address: u64, destination: &mut [u8]) -> bool {
+    let Ok(byte_count) = u64::try_from(destination.len()) else {
+        return false;
+    };
+    let Some((backing, offset, _)) = ({
+        let mappings = shared_mappings()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolve_shared_backing_range(&mappings, address, byte_count)
+    }) else {
+        return false;
+    };
+    backing.read_exact_at(offset, destination)
+}
+
+/// Copies bytes into a GPU-physical resource range in shared direct-memory backing.
+///
+/// CPU aliases observe the write coherently because they map this same shared backing object.
+pub fn write_guest_shared_backing(address: u64, source: &[u8]) -> bool {
+    let Ok(byte_count) = u64::try_from(source.len()) else {
+        return false;
+    };
+    let Some((backing, offset, _)) = ({
+        let mappings = shared_mappings()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolve_shared_backing_range(&mappings, address, byte_count)
+    }) else {
+        return false;
+    };
+    backing.write_all_at(offset, source)
 }
 
 fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
@@ -97,7 +265,7 @@ fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
     let overlaps = mappings
         .range(..end)
         .filter(|(start, record)| record.end > address && **start < end)
-        .map(|(&start, &record)| (start, record))
+        .map(|(&start, record)| (start, record.clone()))
         .collect::<Vec<_>>();
     for (start, record) in overlaps {
         mappings.remove(&start);
@@ -106,7 +274,7 @@ fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
                 start,
                 SharedMappingRecord {
                     end: address,
-                    ..record
+                    ..record.clone()
                 },
             );
         }
@@ -115,7 +283,7 @@ fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
                 end,
                 SharedMappingRecord {
                     end: record.end,
-                    backing_id: record.backing_id,
+                    backing: record.backing,
                     backing_offset: record.backing_offset + (end - start),
                 },
             );
@@ -126,7 +294,7 @@ fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
 fn register_shared_mapping_range(
     address: u64,
     byte_count: u64,
-    backing_id: u64,
+    backing: &GuestPhysicalBacking,
     backing_offset: u64,
 ) {
     let Some(end) = address.checked_add(byte_count) else {
@@ -140,7 +308,7 @@ fn register_shared_mapping_range(
             address,
             SharedMappingRecord {
                 end,
-                backing_id,
+                backing: backing.clone(),
                 backing_offset,
             },
         );
@@ -453,6 +621,109 @@ impl GuestPhysicalBacking {
     #[must_use]
     pub fn size(&self) -> u64 {
         self.inner.size
+    }
+
+    fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> bool {
+        let Some(end) = offset.checked_add(u64::try_from(destination.len()).unwrap_or(u64::MAX))
+        else {
+            return false;
+        };
+        if end > self.size() {
+            return false;
+        }
+        let Ok(page_size) = host_page_size() else {
+            return false;
+        };
+        let aligned_offset = offset - offset % page_size;
+        let in_mapping_offset = offset - aligned_offset;
+        let Some(mapping_length) = in_mapping_offset
+            .checked_add(u64::try_from(destination.len()).unwrap_or(u64::MAX))
+            .and_then(|length| host_size(length).ok())
+        else {
+            return false;
+        };
+        let Ok(file_offset) = libc::off_t::try_from(aligned_offset) else {
+            return false;
+        };
+        // macOS POSIX shared-memory descriptors do not support pread/pwrite. Map only the
+        // requested physical span and copy from that stable direct-backing view instead.
+        // SAFETY: the aligned file range was validated against the live backing object.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapping_length,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                self.inner.descriptor,
+                file_offset,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return false;
+        }
+        // SAFETY: `mapping` covers the requested offset and destination length.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mapping.cast::<u8>().add(
+                    usize::try_from(in_mapping_offset)
+                        .expect("validated mapping offset fits usize"),
+                ),
+                destination.as_mut_ptr(),
+                destination.len(),
+            );
+            libc::munmap(mapping, mapping_length);
+        }
+        true
+    }
+
+    fn write_all_at(&self, offset: u64, source: &[u8]) -> bool {
+        let Some(end) = offset.checked_add(u64::try_from(source.len()).unwrap_or(u64::MAX)) else {
+            return false;
+        };
+        if end > self.size() {
+            return false;
+        }
+        let Ok(page_size) = host_page_size() else {
+            return false;
+        };
+        let aligned_offset = offset - offset % page_size;
+        let in_mapping_offset = offset - aligned_offset;
+        let Some(mapping_length) = in_mapping_offset
+            .checked_add(u64::try_from(source.len()).unwrap_or(u64::MAX))
+            .and_then(|length| host_size(length).ok())
+        else {
+            return false;
+        };
+        let Ok(file_offset) = libc::off_t::try_from(aligned_offset) else {
+            return false;
+        };
+        // SAFETY: the aligned file range was validated against the live backing object.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapping_length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                self.inner.descriptor,
+                file_offset,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return false;
+        }
+        // SAFETY: `mapping` covers the requested offset and source length.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source.as_ptr(),
+                mapping.cast::<u8>().add(
+                    usize::try_from(in_mapping_offset)
+                        .expect("validated mapping offset fits usize"),
+                ),
+                source.len(),
+            );
+            libc::munmap(mapping, mapping_length);
+        }
+        true
     }
 }
 
@@ -1287,7 +1558,7 @@ impl GuestAddressSpace {
             ));
         }
         debug_assert_eq!(result, pointer);
-        register_shared_mapping_range(start, size, backing.id(), backing_offset);
+        register_shared_mapping_range(start, size, backing, backing_offset);
         Ok(())
     }
 
@@ -1754,6 +2025,179 @@ mod tests {
         assert_eq!(vmas.len(), 2);
         assert_eq!(vmas[0].size, 2 * GUEST_PAGE_SIZE);
         assert_eq!(vmas[1].backing_offset, 3 * GUEST_PAGE_SIZE);
+    }
+
+    #[test]
+    fn gpu_backing_range_spans_disjoint_virtual_aliases() {
+        let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+        let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).unwrap();
+        let base = memory.base();
+        let first = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(page(base, 0)),
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .unwrap();
+        let second = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(page(base, 8)),
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                2 * GUEST_PAGE_SIZE,
+            )
+            .unwrap();
+        let source = (0..4 * usize::try_from(GUEST_PAGE_SIZE).unwrap())
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            guest_shared_mapping_identity(first.get(), 4 * GUEST_PAGE_SIZE),
+            None,
+            "the CPU virtual interval contains a guard hole"
+        );
+        assert_eq!(
+            guest_shared_backing_segments(first.get(), 4 * GUEST_PAGE_SIZE),
+            Some(vec![
+                GuestSharedBackingSegment {
+                    address: first.get(),
+                    byte_count: 2 * GUEST_PAGE_SIZE,
+                },
+                GuestSharedBackingSegment {
+                    address: second.get(),
+                    byte_count: 2 * GUEST_PAGE_SIZE,
+                },
+            ])
+        );
+        assert!(write_guest_shared_backing(first.get(), &source));
+        let mut second_half = vec![0; usize::try_from(2 * GUEST_PAGE_SIZE).unwrap()];
+        memory.read(second, &mut second_half).unwrap();
+        assert_eq!(
+            second_half,
+            source[usize::try_from(2 * GUEST_PAGE_SIZE).unwrap()..]
+        );
+        let mut round_trip = vec![0; source.len()];
+        assert!(read_guest_shared_backing(first.get(), &mut round_trip));
+        assert_eq!(round_trip, source);
+    }
+
+    #[test]
+    fn gpu_backing_range_rejects_unmapped_physical_holes() {
+        let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+        let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).unwrap();
+        let base = memory.base();
+        let first = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(page(base, 0)),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .unwrap();
+        memory
+            .map_shared(
+                GuestMapPlacement::Fixed(page(base, 8)),
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                2 * GUEST_PAGE_SIZE,
+            )
+            .unwrap();
+
+        assert_eq!(
+            guest_shared_backing_segments(first.get(), 4 * GUEST_PAGE_SIZE),
+            None
+        );
+        assert!(!read_guest_shared_backing(
+            first.get(),
+            &mut vec![0; usize::try_from(4 * GUEST_PAGE_SIZE).unwrap()]
+        ));
+    }
+
+    #[test]
+    fn gpu_backing_alias_enumeration_tracks_aliases_and_remaps() {
+        let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+        let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+        let replacement = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+        let base = memory.base();
+        let first = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(page(base, 0)),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .unwrap();
+        let continuation = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(page(base, 4)),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                GUEST_PAGE_SIZE,
+            )
+            .unwrap();
+        let alias = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(page(base, 8)),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            guest_shared_backing_alias_segments(first.get(), 2 * GUEST_PAGE_SIZE),
+            Some(vec![
+                GuestSharedBackingSegment {
+                    address: first.get(),
+                    byte_count: GUEST_PAGE_SIZE,
+                },
+                GuestSharedBackingSegment {
+                    address: continuation.get(),
+                    byte_count: GUEST_PAGE_SIZE,
+                },
+                GuestSharedBackingSegment {
+                    address: alias.get(),
+                    byte_count: GUEST_PAGE_SIZE,
+                },
+            ])
+        );
+
+        memory.unmap(continuation, GUEST_PAGE_SIZE).unwrap();
+        assert_eq!(
+            guest_shared_backing_alias_segments(first.get(), 2 * GUEST_PAGE_SIZE),
+            None,
+            "removing the only continuation invalidates complete backing coverage"
+        );
+        memory
+            .map_shared(
+                GuestMapPlacement::Fixed(continuation),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &replacement,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            guest_shared_backing_alias_segments(first.get(), 2 * GUEST_PAGE_SIZE),
+            None,
+            "a different physical backing cannot repair the resource span"
+        );
     }
 
     #[test]

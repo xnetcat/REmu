@@ -35,10 +35,13 @@ use remu_gpu::{
     PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2,
     PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
 };
-use remu_memory::{CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_mapping_identity};
+use remu_memory::{
+    CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_backing_alias_segments,
+    guest_shared_mapping_identity, read_guest_shared_backing, write_guest_shared_backing,
+};
 use remu_shader::{
     GlobalMemoryBinding, ImageBinding, InstructionControl, PixelOutputKind, Program,
-    ShaderEvaluation,
+    ShaderEvaluation, image_is_comparison,
 };
 use sha1::{Digest, Sha1};
 use winit::application::ApplicationHandler;
@@ -308,12 +311,26 @@ impl PendingTextureReadback {
         texture: &Texture,
         descriptor: GuestTextureDescriptor,
     ) -> Result<Self, String> {
+        Self::encode_mip(device, queue, texture, descriptor, 0)
+    }
+
+    fn encode_mip(
+        device: &Device,
+        queue: &metal::CommandQueue,
+        texture: &Texture,
+        descriptor: GuestTextureDescriptor,
+        mip_level: u32,
+    ) -> Result<Self, String> {
         validate_texture_readback_source(texture, descriptor)?;
-        let layout = TextureReadbackLayout::new(
-            descriptor.width,
-            descriptor.height,
-            descriptor.bytes_per_pixel,
-        )?;
+        if u64::from(mip_level) >= texture.mipmap_level_count() {
+            return Err(format!(
+                "Metal texture has {} mip levels, cannot read level {mip_level}",
+                texture.mipmap_level_count()
+            ));
+        }
+        let width = (descriptor.width >> mip_level).max(1);
+        let height = (descriptor.height >> mip_level).max(1);
+        let layout = TextureReadbackLayout::new(width, height, descriptor.bytes_per_pixel)?;
         let staging = device.new_buffer(
             layout.staging_length,
             MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeDefaultCache,
@@ -326,9 +343,9 @@ impl PendingTextureReadback {
         encoder.copy_from_texture_to_buffer(
             texture,
             0,
-            0,
+            u64::from(mip_level),
             MTLOrigin { x: 0, y: 0, z: 0 },
-            MTLSize::new(u64::from(descriptor.width), u64::from(descriptor.height), 1),
+            MTLSize::new(u64::from(width), u64::from(height), 1),
             &staging,
             0,
             layout.staging_bytes_per_row,
@@ -342,7 +359,7 @@ impl PendingTextureReadback {
             staging,
             _source: texture.clone(),
             layout,
-            height: descriptor.height,
+            height,
         })
     }
 
@@ -429,7 +446,7 @@ struct GraphicsPipelineKey {
 struct GraphicsShaderResourceKey {
     initial_scalar_count: usize,
     global_bindings: Vec<(Vec<u32>, u64, usize, bool)>,
-    image_bindings: Vec<(u32, u32, bool, bool, u32, u32)>,
+    image_bindings: Vec<(u32, u32, bool, bool, u32, u32, u32, Option<u32>)>,
     vertex_inputs: Vec<(u32, u32, u32, u32, u32, u32, u32)>,
 }
 
@@ -444,6 +461,8 @@ struct DecodedRenderTarget {
     texture_type: u32,
     layer_count: u32,
     base_layer: u32,
+    mip_level: u32,
+    mip_level_count: u32,
     dcc_enabled: bool,
     fast_clear_enabled: bool,
 }
@@ -555,7 +574,7 @@ struct ComputePipelineKey {
     compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
     initial_scalar_count: usize,
     global_bindings: Vec<(Vec<u32>, u64, usize, bool)>,
-    image_bindings: Vec<(u32, bool, bool, u32, u32)>,
+    image_bindings: Vec<(u32, bool, bool, u32, u32, u32, Option<u32>)>,
 }
 
 struct ShaderCompileResult {
@@ -1057,7 +1076,8 @@ struct ResidentGuestTexture {
     descriptor: GuestTextureDescriptor,
     texture_type: u32,
     layer_count: u32,
-    write_watch: CpuWriteWatch,
+    mip_level_count: u32,
+    write_watch: GuestTextureWriteWatch,
     gpu_written: bool,
     content_version: u64,
 }
@@ -1075,8 +1095,145 @@ struct SampledTextureKey {
 
 struct CachedSampledTexture {
     texture: Texture,
-    write_watch: CpuWriteWatch,
+    write_watch: Arc<GuestTextureWriteWatch>,
     admission_id: u64,
+}
+
+struct GuestTextureWriteWatch {
+    address: u64,
+    byte_count: u64,
+    ranges: Vec<CpuWriteWatch>,
+}
+
+impl GuestTextureWriteWatch {
+    fn new(address: u64, byte_count: u64) -> Result<Self, String> {
+        let segments = guest_shared_backing_alias_segments(address, byte_count).ok_or_else(|| {
+            format!(
+                "guest texture range {address:#x}+{byte_count:#x} has no complete live shared backing"
+            )
+        })?;
+        let ranges = segments
+            .into_iter()
+            .map(|segment| {
+                // SAFETY: the backing resolver returned live readable/writable CPU aliases that
+                // cover this exact GPU-physical resource span.
+                unsafe { CpuWriteWatch::new(segment.address, segment.byte_count) }.map_err(
+                    |error| {
+                        format!(
+                            "could not watch guest texture CPU writes at {:#x}+{:#x}: {error}",
+                            segment.address, segment.byte_count
+                        )
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            address,
+            byte_count,
+            ranges,
+        })
+    }
+
+    fn retirement(&self) -> Option<CpuWriteWatchRetirement> {
+        let mut retirement = None;
+        for watch in &self.ranges {
+            match watch.retirement() {
+                Some(CpuWriteWatchRetirement::Replaced) => {
+                    return Some(CpuWriteWatchRetirement::Replaced);
+                }
+                Some(CpuWriteWatchRetirement::Reprotecting) => {
+                    retirement = Some(CpuWriteWatchRetirement::Reprotecting);
+                }
+                Some(CpuWriteWatchRetirement::Reprotected)
+                    if retirement != Some(CpuWriteWatchRetirement::Reprotecting) =>
+                {
+                    retirement = Some(CpuWriteWatchRetirement::Reprotected);
+                }
+                None | Some(CpuWriteWatchRetirement::Reprotected) => {}
+            }
+        }
+        retirement
+    }
+
+    fn consume_dirty(&self) -> bool {
+        self.ranges
+            .iter()
+            .fold(false, |dirty, watch| watch.consume_dirty() || dirty)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.ranges.iter().any(CpuWriteWatch::is_dirty)
+    }
+
+    fn precise_tracking(&self) -> bool {
+        self.ranges.iter().all(CpuWriteWatch::precise_tracking)
+    }
+
+    fn generations(&self) -> Vec<u64> {
+        self.ranges.iter().map(CpuWriteWatch::generation).collect()
+    }
+
+    fn rearm(&self) -> Result<(), String> {
+        for watch in &self.ranges {
+            watch
+                .rearm()
+                .map_err(|error| format!("could not rearm guest texture CPU writes: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn range(&self) -> (u64, u64) {
+        (self.address, self.byte_count)
+    }
+
+    fn with_contiguous_mapping<T>(
+        &self,
+        address: u64,
+        byte_count: u64,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        if let Some(retirement) = self.retirement() {
+            return Err(format!(
+                "guest texture mapping {address:#x}+{byte_count:#x} is retired ({retirement:?})"
+            ));
+        }
+        let end = address
+            .checked_add(byte_count)
+            .ok_or("guest texture mapping range overflows")?;
+        let watch = self
+            .ranges
+            .iter()
+            .find(|watch| {
+                let (watch_address, watch_bytes) = watch.range();
+                watch_address <= address
+                    && watch_address
+                        .checked_add(watch_bytes)
+                        .is_some_and(|watch_end| end <= watch_end)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "guest texture mapping {address:#x}+{byte_count:#x} has no single covering write watch"
+                )
+            })?;
+        watch.with_live_mapping(operation).map_err(|error| {
+            format!(
+                "guest texture mapping {address:#x}+{byte_count:#x} was retired during access: {error}"
+            )
+        })
+    }
+
+    fn has_single_covering_mapping(&self, address: u64, byte_count: u64) -> bool {
+        let Some(end) = address.checked_add(byte_count) else {
+            return false;
+        };
+        self.ranges.iter().any(|watch| {
+            let (watch_address, watch_bytes) = watch.range();
+            watch_address <= address
+                && watch_address
+                    .checked_add(watch_bytes)
+                    .is_some_and(|watch_end| end <= watch_end)
+        })
+    }
 }
 
 /// Metal exposes this C structure by value in the swizzled texture-view Objective-C method.
@@ -1127,12 +1284,33 @@ fn new_red_blue_swizzled_texture_view(texture: &Texture) -> Option<Texture> {
 
 fn resident_texture_for_sample(
     resident: &mut ResidentGuestTexture,
-    sampled: GuestTextureDescriptor,
+    sampled: DecodedImageDescriptor,
 ) -> Option<Texture> {
-    if guest_texture_descriptors_share_storage(resident.descriptor, sampled) {
-        return Some(resident.texture.clone());
+    let underlying_mip_count = sampled
+        .base_mip_level
+        .checked_add(sampled.mip_level_count.max(1))?;
+    if resident.mip_level_count < underlying_mip_count {
+        return None;
     }
-    if !guest_texture_descriptors_share_component_reordered_storage(resident.descriptor, sampled) {
+    if guest_texture_descriptors_share_storage(resident.descriptor, sampled.guest) {
+        if sampled.base_mip_level == 0 && sampled.mip_level_count.max(1) == resident.mip_level_count
+        {
+            return Some(resident.texture.clone());
+        }
+        return Some(resident.texture.new_texture_view_from_slice(
+            resident.texture.pixel_format(),
+            MTLTextureType::D2,
+            NSRange::new(
+                u64::from(sampled.base_mip_level),
+                u64::from(sampled.mip_level_count.max(1)),
+            ),
+            NSRange::new(0, 1),
+        ));
+    }
+    if !guest_texture_descriptors_share_component_reordered_storage(
+        resident.descriptor,
+        sampled.guest,
+    ) {
         return None;
     }
     if resident.component_reorder_view.is_none() {
@@ -1150,10 +1328,10 @@ fn resident_texture_for_sample(
                     "[REMu][METAL][ALIAS-VIEW] sequence={sequence} address={:#x} rendered={:?} sampled={:?} extent={}x{} tile={}",
                     resident.descriptor.address,
                     resident.descriptor.pixel_format,
-                    sampled.pixel_format,
-                    sampled.width,
-                    sampled.height,
-                    sampled.tile_mode,
+                    sampled.guest.pixel_format,
+                    sampled.guest.width,
+                    sampled.guest.height,
+                    sampled.guest.tile_mode,
                 );
             }
         }
@@ -1170,6 +1348,7 @@ fn resident_component_reordered_sample_is_eligible(
         && resident.gpu_written
         && resident.texture_type == 9
         && resident.layer_count == 1
+        && resident.mip_level_count == 1
         && sampled.texture_type == 9
         && sampled.layer_count == 1
         && sampled.base_mip_level == 0
@@ -1200,6 +1379,7 @@ fn refresh_resident_texture_write_watch(
                 resident.descriptor,
                 resident.texture_type,
                 resident.layer_count,
+                resident.mip_level_count,
             )?;
             Ok(WriteWatchRefresh::Renewed { was_dirty })
         }
@@ -1211,10 +1391,25 @@ fn watch_resident_texture(
     descriptor: GuestTextureDescriptor,
     texture_type: u32,
     layer_count: u32,
-) -> Result<CpuWriteWatch, String> {
+    mip_level_count: u32,
+) -> Result<GuestTextureWriteWatch, String> {
     if texture_type == 9 && layer_count == 1 {
-        watch_guest_texture(descriptor)
+        if mip_level_count == 1 {
+            watch_guest_texture(descriptor)
+        } else {
+            let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
+            GuestTextureWriteWatch::new(
+                descriptor.address,
+                u64::try_from(layout.byte_count)
+                    .map_err(|_| "mip chain byte count does not fit u64")?,
+            )
+        }
     } else {
+        if mip_level_count != 1 {
+            return Err(format!(
+                "mipmapped resident texture type={texture_type} layers={layer_count} is unsupported"
+            ));
+        }
         watch_sampled_texture(DecodedImageDescriptor {
             guest: descriptor,
             destination_select: 0,
@@ -1229,24 +1424,52 @@ fn watch_resident_texture(
 fn refresh_sampled_texture_write_watch(
     key: SampledTextureKey,
     cached: &mut CachedSampledTexture,
+    write_watches: &mut HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
 ) -> Result<WriteWatchRefresh, String> {
     match cached.write_watch.retirement() {
         None => Ok(WriteWatchRefresh::Active),
         Some(CpuWriteWatchRetirement::Reprotecting) => Ok(WriteWatchRefresh::Reprotecting),
         Some(CpuWriteWatchRetirement::Reprotected) => {
             let was_dirty = cached.write_watch.is_dirty();
-            cached.write_watch = watch_sampled_texture(DecodedImageDescriptor {
+            let write_watch = Arc::new(watch_sampled_texture(DecodedImageDescriptor {
                 guest: key.descriptor,
                 destination_select: key.destination_select,
                 base_mip_level: key.base_mip_level,
                 mip_level_count: key.mip_level_count,
                 texture_type: key.texture_type,
                 layer_count: key.layer_count,
-            })?;
+            })?);
+            cached.write_watch = Arc::clone(&write_watch);
+            write_watches.insert(key, write_watch);
             Ok(WriteWatchRefresh::Renewed { was_dirty })
         }
         Some(CpuWriteWatchRetirement::Replaced) => Ok(WriteWatchRefresh::Replaced),
     }
+}
+
+fn persistent_sampled_texture_write_watch(
+    key: SampledTextureKey,
+    descriptor: DecodedImageDescriptor,
+    write_watches: &mut HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
+) -> Result<Arc<GuestTextureWriteWatch>, String> {
+    if let Some(write_watch) = write_watches.get(&key)
+        && !matches!(
+            write_watch.retirement(),
+            Some(CpuWriteWatchRetirement::Reprotected | CpuWriteWatchRetirement::Replaced)
+        )
+    {
+        return Ok(Arc::clone(write_watch));
+    }
+    write_watches.remove(&key);
+    let write_watch = Arc::new(watch_sampled_texture(descriptor)?);
+    // The texture cache has the same capacity. Keeping one coherent watch per admitted key lets
+    // render-target invalidation discard stale Metal pixels without repeatedly rebuilding the
+    // process-wide signal-handler registry. Rare overflow keys retain their watch only as long as
+    // their sampled texture entry.
+    if write_watches.len() < SAMPLED_TEXTURE_CACHE_CAPACITY {
+        write_watches.insert(key, Arc::clone(&write_watch));
+    }
+    Ok(write_watch)
 }
 
 fn retire_sampled_texture(texture: CachedSampledTexture) {
@@ -1268,6 +1491,36 @@ fn retire_sampled_texture(texture: CachedSampledTexture) {
     if let Err(error) = sender.send(texture) {
         drop(error.0);
     }
+}
+
+fn retire_sampled_textures_matching(
+    cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
+    mut should_retire: impl FnMut(SampledTextureKey) -> bool,
+) {
+    // Dropping a write watch republishes the signal-handler's immutable page-owner snapshot.
+    // Invalidating a render graph can evict hundreds of sampled aliases at once, so doing those
+    // drops inside HashMap::retain stalls the presenter for an entire guest frame. Remove the
+    // entries immediately for correctness, then let the existing reclaimer perform their costly
+    // destruction away from the event-loop thread.
+    let retired = cache
+        .keys()
+        .copied()
+        .filter(|key| should_retire(*key))
+        .collect::<Vec<_>>();
+    for key in retired {
+        if let Some(texture) = cache.remove(&key) {
+            retire_sampled_texture(texture);
+        }
+    }
+}
+
+fn retire_overlapping_sampled_textures(
+    cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
+    descriptor: GuestTextureDescriptor,
+) {
+    retire_sampled_textures_matching(cache, |key| {
+        guest_texture_descriptors_overlap(key.descriptor, descriptor)
+    });
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1397,6 +1650,7 @@ fn compute_pipeline_key(
     evaluation: &ShaderEvaluation,
     program: &std::sync::Arc<remu_shader::Program>,
 ) -> ComputePipelineKey {
+    let image_slots = evaluation.image_binding_slots();
     ComputePipelineKey {
         // Retaining the Arc makes pointer identity stable for the lifetime of both successful and
         // negative cache entries; an allocator cannot recycle a dropped Program into this key.
@@ -1413,9 +1667,10 @@ fn compute_pipeline_key(
         image_bindings: evaluation
             .image_bindings
             .iter()
-            .map(|binding| {
+            .enumerate()
+            .map(|(index, binding)| {
                 let storage = is_storage_image_opcode(binding.opcode);
-                let comparison = binding.opcode.contains("SampleC");
+                let comparison = image_is_comparison(binding.opcode);
                 let texture_type = binding
                     .resource_descriptor
                     .get(3)
@@ -1426,6 +1681,8 @@ fn compute_pipeline_key(
                     comparison,
                     binding.control.dimension,
                     texture_type,
+                    image_slots.texture_slots[index],
+                    image_slots.sampler_slots[index],
                 )
             })
             .collect(),
@@ -1645,7 +1902,7 @@ impl PendingGuestMemoryWrite {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GuestRenderPassKey {
-    targets: Vec<(GuestTextureDescriptor, u32, bool, u32, u32, u32)>,
+    targets: Vec<(GuestTextureDescriptor, u32, bool, u32, u32, u32, u32, u32)>,
     depth: Option<(GuestTextureDescriptor, u32)>,
     resolve_multisample_targets: bool,
 }
@@ -1754,6 +2011,7 @@ struct MetalPresenter {
     scanout_snapshot_textures: HashMap<u64, ScanoutSnapshotTexture>,
     multisample_textures: HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
+    sampled_texture_write_watches: HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
     fallback_texture_cache: HashMap<SampledTextureKey, Texture>,
     sampled_texture_admission_order: VecDeque<(SampledTextureKey, u64)>,
     next_sampled_texture_admission_id: u64,
@@ -1875,6 +2133,7 @@ impl MetalPresenter {
             scanout_snapshot_textures: HashMap::new(),
             multisample_textures: HashMap::new(),
             sampled_texture_cache: HashMap::new(),
+            sampled_texture_write_watches: HashMap::new(),
             fallback_texture_cache: HashMap::new(),
             sampled_texture_admission_order: VecDeque::new(),
             next_sampled_texture_admission_id: 0,
@@ -2223,6 +2482,13 @@ impl MetalPresenter {
                 }
             }
             self.receiver.finish_event(source);
+            // Do not let a large guest GPU backlog delay an already-requested presentation.
+            // In particular, the first flip can precede creation of its translated scanout
+            // texture; once a later draw produces that texture, return to Winit immediately so
+            // `about_to_wait` can request the redraw instead of processing hundreds more events.
+            if self.redraw_pending {
+                return PresenterFlow::Continue;
+            }
         }
         PresenterFlow::Continue
     }
@@ -2501,10 +2767,14 @@ impl MetalPresenter {
         device: &Device,
         descriptor: GuestTextureDescriptor,
     ) -> Result<Texture, String> {
-        if let Some(resident) = self
-            .resident_guest_textures
-            .get_mut(&descriptor)
-            .filter(|resident| resident.texture_type == 9 && resident.layer_count == 1)
+        if let Some(resident) =
+            self.resident_guest_textures
+                .get_mut(&descriptor)
+                .filter(|resident| {
+                    resident.texture_type == 9
+                        && resident.layer_count == 1
+                        && resident.mip_level_count >= 1
+                })
         {
             match refresh_resident_texture_write_watch(resident)? {
                 WriteWatchRefresh::Active
@@ -2520,6 +2790,7 @@ impl MetalPresenter {
             .find(|resident| {
                 resident.texture_type == 9
                     && resident.layer_count == 1
+                    && resident.mip_level_count >= 1
                     && guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
             })
             .map(|resident| resident.descriptor);
@@ -2570,23 +2841,96 @@ impl MetalPresenter {
                     .remove(&alias)
                     .expect("collected resident alias exists");
                 if refresh != WriteWatchRefresh::Replaced && resident.gpu_written {
-                    let linear = read_texture_linear(
-                        device,
-                        &queue,
-                        &resident.texture,
-                        resident.descriptor,
-                    )?;
-                    write_watched_guest_texture_linear(
-                        resident.descriptor,
-                        &linear,
-                        &resident.write_watch,
-                    )?;
+                    write_resident_texture_contents_to_guest(device, &queue, &resident)?;
                 }
             }
-            self.sampled_texture_cache
-                .retain(|key, _| !guest_texture_descriptors_overlap(key.descriptor, descriptor));
+            retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
         }
         ensure_resident_texture_in_map(device, descriptor, &mut self.resident_guest_textures)
+    }
+
+    fn ensure_mipmapped_render_target_texture(
+        &mut self,
+        device: &Device,
+        target: DecodedRenderTarget,
+    ) -> Result<Texture, String> {
+        if target.texture_type != 9
+            || target.layer_count != 1
+            || target.mip_level_count <= 1
+            || target.sample_count != 1
+        {
+            return Err(format!(
+                "mipmapped render target requires a single-sample 2D resource, got type={} layers={} levels={} samples={}",
+                target.texture_type,
+                target.layer_count,
+                target.mip_level_count,
+                target.sample_count
+            ));
+        }
+        if let Some(resident) = self
+            .resident_guest_textures
+            .get_mut(&target.texture)
+            .filter(|resident| {
+                resident.texture_type == 9
+                    && resident.layer_count == 1
+                    && resident.mip_level_count >= target.mip_level_count
+            })
+        {
+            match refresh_resident_texture_write_watch(resident)? {
+                WriteWatchRefresh::Active
+                | WriteWatchRefresh::Reprotecting
+                | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
+                WriteWatchRefresh::Replaced => {}
+            }
+        }
+        if self
+            .resident_guest_textures
+            .get(&target.texture)
+            .is_some_and(|resident| resident.gpu_written)
+        {
+            return Err(format!(
+                "cannot reinterpret GPU-written target {:#x} as a {}-level hierarchy",
+                target.texture.address, target.mip_level_count
+            ));
+        }
+        self.resident_guest_textures.remove(&target.texture);
+        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
+        let layout = mode27_mip_chain_layout(target.texture, target.mip_level_count)?;
+        let write_watch = watch_resident_texture(
+            target.texture,
+            target.texture_type,
+            target.layer_count,
+            target.mip_level_count,
+        )?;
+        let raw =
+            snapshot_watched_guest_range(target.texture.address, layout.byte_count, &write_watch)?;
+        let (_, linear_levels) =
+            decode_mode27_mip_chain_from_raw(target.texture, target.mip_level_count, &raw)?;
+        let texture = create_mipmapped_guest_texture(
+            device,
+            target.texture,
+            target.mip_level_count,
+            &linear_levels,
+        )?;
+        texture.set_label(&format!(
+            "REMu {}-level guest image {:#x}",
+            target.mip_level_count, target.texture.address
+        ));
+        self.resident_guest_textures.insert(
+            target.texture,
+            ResidentGuestTexture {
+                texture: texture.clone(),
+                component_reorder_view: None,
+                descriptor: target.texture,
+                texture_type: target.texture_type,
+                layer_count: target.layer_count,
+                mip_level_count: target.mip_level_count,
+                write_watch,
+                gpu_written: false,
+                content_version: 0,
+            },
+        );
+        Ok(texture)
     }
 
     fn ensure_layered_render_target_texture(
@@ -2595,7 +2939,11 @@ impl MetalPresenter {
         target: DecodedRenderTarget,
     ) -> Result<Texture, String> {
         if target.texture_type == 9 && target.layer_count == 1 {
-            return self.ensure_resident_texture(device, target.texture);
+            return if target.mip_level_count == 1 {
+                self.ensure_resident_texture(device, target.texture)
+            } else {
+                self.ensure_mipmapped_render_target_texture(device, target)
+            };
         }
         if target.texture_type != 10 || target.layer_count <= 1 {
             return Err(format!(
@@ -2606,12 +2954,20 @@ impl MetalPresenter {
         if target.sample_count != 1 {
             return Err("multisampled 3D color targets are not implemented".to_owned());
         }
+        if target.mip_level_count != 1 || target.mip_level != 0 {
+            return Err(format!(
+                "mipmapped 3D color targets are not implemented (mip={}/{})",
+                target.mip_level,
+                target.mip_level_count - 1
+            ));
+        }
         if let Some(resident) = self
             .resident_guest_textures
             .get_mut(&target.texture)
             .filter(|resident| {
                 resident.texture_type == target.texture_type
                     && resident.layer_count == target.layer_count
+                    && resident.mip_level_count == 1
             })
         {
             match refresh_resident_texture_write_watch(resident)? {
@@ -2632,8 +2988,7 @@ impl MetalPresenter {
             ));
         }
         self.resident_guest_textures.remove(&target.texture);
-        self.sampled_texture_cache
-            .retain(|key, _| !guest_texture_descriptors_overlap(key.descriptor, target.texture));
+        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
         let descriptor = DecodedImageDescriptor {
             guest: target.texture,
             destination_select: 0,
@@ -2658,6 +3013,7 @@ impl MetalPresenter {
                 descriptor: target.texture,
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
+                mip_level_count: 1,
                 write_watch,
                 gpu_written: false,
                 content_version: 0,
@@ -2789,7 +3145,8 @@ impl MetalPresenter {
         buffer_index: Option<u32>,
         evaluation: &ShaderEvaluation,
     ) -> Result<(Option<Buffer>, Vec<SamplerState>), String> {
-        let sampled_descriptors = sampled_image_bindings(evaluation)
+        let sampled_descriptors = canonical_sampler_bindings(evaluation)
+            .into_iter()
             .map(|binding| binding.sampler_descriptor.clone())
             .collect::<Vec<_>>();
         let key = buffer_index.map(|buffer_index| SamplerArgumentCacheKey {
@@ -3024,6 +3381,19 @@ impl MetalPresenter {
         }
     }
 
+    fn request_pending_flip_redraw_for_texture(&mut self, descriptor: GuestTextureDescriptor) {
+        let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
+            return;
+        };
+        if flip.sequence != self.uploaded_flip_sequence
+            && flip.address == descriptor.address
+            && display.width == descriptor.width
+            && display.height == descriptor.height
+        {
+            self.redraw_pending = true;
+        }
+    }
+
     fn synchronize_cpu_written_guest_resources(
         &mut self,
         acquire: GpuMemoryAcquire,
@@ -3079,6 +3449,7 @@ impl MetalPresenter {
                 self.sampled_texture_cache
                     .get_mut(&key)
                     .expect("collected sampled texture exists"),
+                &mut self.sampled_texture_write_watches,
             )?;
             match refresh {
                 WriteWatchRefresh::Renewed { was_dirty: true } => {
@@ -3102,17 +3473,38 @@ impl MetalPresenter {
             {
                 continue;
             }
-            let raw =
-                snapshot_watched_guest_texture_raw(resident.descriptor, &resident.write_watch)?;
-            let linear = decode_guest_texture_linear_from_raw(resident.descriptor, &raw)?;
-            let texture = create_guest_texture(
-                &device,
-                resident.descriptor,
-                MTLTextureUsage::RenderTarget
-                    | MTLTextureUsage::ShaderRead
-                    | MTLTextureUsage::ShaderWrite,
-                &linear,
-            )?;
+            let texture = if resident.mip_level_count == 1 {
+                let raw =
+                    snapshot_watched_guest_texture_raw(resident.descriptor, &resident.write_watch)?;
+                let linear = decode_guest_texture_linear_from_raw(resident.descriptor, &raw)?;
+                create_guest_texture(
+                    &device,
+                    resident.descriptor,
+                    MTLTextureUsage::RenderTarget
+                        | MTLTextureUsage::ShaderRead
+                        | MTLTextureUsage::ShaderWrite,
+                    &linear,
+                )?
+            } else {
+                let layout =
+                    mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
+                let raw = snapshot_watched_guest_range(
+                    resident.descriptor.address,
+                    layout.byte_count,
+                    &resident.write_watch,
+                )?;
+                let (_, linear_levels) = decode_mode27_mip_chain_from_raw(
+                    resident.descriptor,
+                    resident.mip_level_count,
+                    &raw,
+                )?;
+                create_mipmapped_guest_texture(
+                    &device,
+                    resident.descriptor,
+                    resident.mip_level_count,
+                    &linear_levels,
+                )?
+            };
             texture.set_label(&format!(
                 "REMu guest image {:#x}",
                 resident.descriptor.address
@@ -3146,18 +3538,22 @@ impl MetalPresenter {
                 layer_count: key.layer_count,
             };
             let raw = snapshot_watched_sampled_texture_raw(descriptor, &cached.write_watch)?;
-            let linear = decode_sampled_texture_linear_from_raw(descriptor, &raw)?;
-            let texture = create_sampled_guest_texture(
-                &device,
-                &queue,
-                key.descriptor,
-                &linear,
-                key.base_mip_level,
-                key.mip_level_count,
-                key.texture_type,
-                key.layer_count,
-                key.comparison,
-            )?;
+            let texture = if key.base_mip_level != 0 || key.mip_level_count != 1 {
+                create_exact_mode27_sampled_mip_view(&device, descriptor, &raw, key.comparison)?
+            } else {
+                let linear = decode_sampled_texture_linear_from_raw(descriptor, &raw)?;
+                create_sampled_guest_texture(
+                    &device,
+                    &queue,
+                    key.descriptor,
+                    &linear,
+                    key.base_mip_level,
+                    key.mip_level_count,
+                    key.texture_type,
+                    key.layer_count,
+                    key.comparison,
+                )?
+            };
             texture.set_label(&format!(
                 "REMu sampled guest image {:#x}",
                 key.descriptor.address
@@ -3196,8 +3592,7 @@ impl MetalPresenter {
             resident.gpu_written = true;
             resident.content_version = self.resident_content_version;
         }
-        self.sampled_texture_cache
-            .retain(|key, _| !guest_texture_descriptors_overlap(key.descriptor, descriptor));
+        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
     }
 
     fn synchronize_sampled_aliases(
@@ -3214,7 +3609,7 @@ impl MetalPresenter {
             {
                 let sampled = decode_image_descriptor(&binding.resource_descriptor)
                     .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                let comparison = binding.opcode.contains("SampleC");
+                let comparison = image_is_comparison(binding.opcode);
                 // A Gen5 MSAA allocation can expose its shader-readable resolved image through
                 // an overlapping SRD whose base follows the allocation's mask metadata. Keep the
                 // Metal resolve GPU-current so `upload_image_textures` can bind it directly. A
@@ -3284,8 +3679,7 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .get_mut(&descriptor)
                 .expect("collected sampled alias exists");
-            let linear = read_texture_linear(&device, &queue, &resident.texture, descriptor)?;
-            write_watched_guest_texture_linear(descriptor, &linear, &resident.write_watch)?;
+            write_resident_texture_contents_to_guest(&device, &queue, resident)?;
             rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
             resident.gpu_written = false;
         }
@@ -3743,9 +4137,7 @@ impl MetalPresenter {
                         .resident_guest_textures
                         .get_mut(&descriptor)
                         .expect("collected DMA source texture exists");
-                    let linear =
-                        read_texture_linear(&device, &queue, &resident.texture, descriptor)?;
-                    write_watched_guest_texture_linear(descriptor, &linear, &resident.write_watch)?;
+                    write_resident_texture_contents_to_guest(&device, &queue, resident)?;
                     rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
                     resident.gpu_written = false;
                 }
@@ -3795,9 +4187,9 @@ impl MetalPresenter {
                 )
             })
         });
-        self.sampled_texture_cache.retain(|key, _| {
-            guest_texture_byte_count(key.descriptor).is_none_or(|length| {
-                !guest_ranges_overlap(
+        retire_sampled_textures_matching(&mut self.sampled_texture_cache, |key| {
+            guest_texture_byte_count(key.descriptor).is_some_and(|length| {
+                guest_ranges_overlap(
                     key.descriptor.address,
                     length,
                     copy.destination_address,
@@ -4154,8 +4546,7 @@ impl MetalPresenter {
             .resident_guest_textures
             .get_mut(&descriptor)
             .expect("refreshed resident texture exists");
-        let linear = read_texture_linear(&device, &queue, &resident.texture, descriptor)?;
-        write_watched_guest_texture_linear(descriptor, &linear, &resident.write_watch)?;
+        write_resident_texture_contents_to_guest(&device, &queue, resident)?;
         rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
         resident.gpu_written = false;
         Ok(())
@@ -4244,10 +4635,21 @@ impl MetalPresenter {
         }
         self.frame_texture = Some(snapshot);
         self.frame_texture_size = (descriptor.width, descriptor.height);
-        if self.next_flip_sequence == 1 {
+        static LOGGED_TRANSLATED_SCANOUTS: OnceLock<Mutex<HashSet<(u64, &'static str)>>> =
+            OnceLock::new();
+        let first_for_source = LOGGED_TRANSLATED_SCANOUTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((address, source));
+        if first_for_source {
             eprintln!(
-                "[REMu][METAL] presenting translated {source} scanout at {address:#x} {}x{}",
-                descriptor.width, descriptor.height
+                "[REMu][METAL] presenting translated {source} scanout sequence={} at {address:#x} {}x{} format={:?} tile={}",
+                self.next_flip_sequence,
+                descriptor.width,
+                descriptor.height,
+                descriptor.pixel_format,
+                descriptor.tile_mode,
             );
         }
         Ok(true)
@@ -4395,6 +4797,7 @@ impl MetalPresenter {
             &mut self.resident_guest_textures,
             &self.multisample_textures,
             &mut self.sampled_texture_cache,
+            &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
             &mut self.sampled_texture_admission_order,
             &mut self.next_sampled_texture_admission_id,
@@ -4913,6 +5316,7 @@ impl MetalPresenter {
             &mut self.resident_guest_textures,
             &self.multisample_textures,
             &mut self.sampled_texture_cache,
+            &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
             &mut self.sampled_texture_admission_order,
             &mut self.next_sampled_texture_admission_id,
@@ -4924,6 +5328,7 @@ impl MetalPresenter {
             &mut self.resident_guest_textures,
             &self.multisample_textures,
             &mut self.sampled_texture_cache,
+            &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
             &mut self.sampled_texture_admission_order,
             &mut self.next_sampled_texture_admission_id,
@@ -5022,13 +5427,13 @@ impl MetalPresenter {
         // target. Metal exposes the same explicit render-target extent on the pass descriptor.
         let render_width = targets
             .iter()
-            .map(|target| target.texture.width)
+            .map(|target| (target.texture.width >> target.mip_level).max(1))
             .chain(depth.map(|depth| depth.texture.width))
             .min()
             .unwrap_or(primary_target.width);
         let render_height = targets
             .iter()
-            .map(|target| target.texture.height)
+            .map(|target| (target.texture.height >> target.mip_level).max(1))
             .chain(depth.map(|depth| depth.texture.height))
             .min()
             .unwrap_or(primary_target.height);
@@ -5263,6 +5668,8 @@ impl MetalPresenter {
                         target.texture_type,
                         target.layer_count,
                         target.base_layer,
+                        target.mip_level,
+                        target.mip_level_count,
                     )
                 })
                 .collect(),
@@ -5292,6 +5699,7 @@ impl MetalPresenter {
                         format!("Metal render pass has no color attachment {location}")
                     })?;
                 attachment.set_texture(Some(texture));
+                attachment.set_level(u64::from(targets[location].mip_level));
                 if targets[location].texture_type == 10 {
                     attachment.set_depth_plane(u64::from(targets[location].base_layer));
                 } else {
@@ -5482,6 +5890,10 @@ impl MetalPresenter {
                     self.mark_resident_texture_written(target.texture);
                 }
             }
+            // A flip can arrive before the presenter has translated the render target that
+            // backs it. Once that exact texture is written, wake the presentation path so it
+            // can snapshot the already-requested flip without decoding tiled guest memory.
+            self.request_pending_flip_redraw_for_texture(target.texture);
         }
         let dump_target_before_pixel_shader =
             diagnostic_dump_target_before_pixel_shader().is_some();
@@ -6319,13 +6731,21 @@ impl MetalPresenter {
     }
 
     fn upload_pending_frame(&mut self) {
-        let (Some(display), Some(flip), Some(device)) =
-            (self.display, self.pending_flip, self.device.as_ref())
-        else {
+        let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
             return;
         };
         if flip.sequence == self.uploaded_flip_sequence {
             return;
+        }
+        match self.activate_translated_scanout(flip.address, display.width, display.height) {
+            Ok(true) => {
+                self.uploaded_flip_sequence = flip.sequence;
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("[REMu][METAL] translated scanout retry failed: {error}");
+            }
         }
         // The VideoOut ABI uses zero for the console's tiled scanout and one for a linear
         // allocation. Raw guest-memory upload is valid only for the latter; translated render
@@ -6340,6 +6760,9 @@ impl MetalPresenter {
             }
             return;
         }
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
         let Some(row_bytes) = u64::from(display.pitch).checked_mul(4) else {
             return;
         };
@@ -7251,28 +7674,64 @@ fn guest_texture_raw_range(descriptor: GuestTextureDescriptor) -> Result<(usize,
 }
 
 fn snapshot_guest_texture_raw(descriptor: GuestTextureDescriptor) -> Result<Vec<u8>, String> {
-    let (source_address, source_length) = guest_texture_raw_range(descriptor)?;
-    // SAFETY: The decoded resource descriptor names a live guest direct-memory mapping. The
-    // runtime owns that mapping while GPU events referencing it may be processed.
-    Ok(unsafe { std::slice::from_raw_parts(source_address as *const u8, source_length) }.to_vec())
+    let (_source_address, source_length) = guest_texture_raw_range(descriptor)?;
+    let mut raw = vec![0; source_length];
+    if read_guest_shared_backing(descriptor.address, &mut raw) {
+        return Ok(raw);
+    }
+    #[cfg(test)]
+    {
+        // Tests also exercise the tiler with ordinary process-local allocations.
+        // SAFETY: those test descriptors retain their complete source allocation.
+        return Ok(unsafe {
+            std::slice::from_raw_parts(_source_address as *const u8, source_length)
+        }
+        .to_vec());
+    }
+    #[cfg(not(test))]
+    Err(format!(
+        "guest texture range {:#x}+{source_length:#x} has no complete live shared backing",
+        descriptor.address
+    ))
 }
 
-fn watch_guest_texture(descriptor: GuestTextureDescriptor) -> Result<CpuWriteWatch, String> {
+fn watch_guest_texture(
+    descriptor: GuestTextureDescriptor,
+) -> Result<GuestTextureWriteWatch, String> {
     let (_, byte_count) = guest_texture_raw_range(descriptor)?;
     let byte_count =
         u64::try_from(byte_count).map_err(|_| "guest texture byte count does not fit u64")?;
-    // SAFETY: the validated descriptor identifies a live guest direct-memory allocation. The
-    // runtime retains guest mappings while GPU events and their resident resources are alive.
-    unsafe { CpuWriteWatch::new(descriptor.address, byte_count) }
-        .map_err(|error| format!("could not watch guest texture CPU writes: {error}"))
+    GuestTextureWriteWatch::new(descriptor.address, byte_count)
 }
 
 fn sampled_texture_raw_range(descriptor: DecodedImageDescriptor) -> Result<(usize, usize), String> {
-    let face_bytes = guest_texture_byte_count(descriptor.guest)
-        .ok_or("sampled texture face byte count overflows")?;
-    let byte_count = face_bytes
-        .checked_mul(u64::from(descriptor.layer_count))
-        .ok_or("sampled texture byte count overflows")?;
+    let exact_mip_chain = descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1;
+    let byte_count = if exact_mip_chain {
+        if descriptor.texture_type != 9
+            || descriptor.layer_count != 1
+            || descriptor.guest.tile_mode != 27
+        {
+            return Err(format!(
+                "exact sampled mip-chain upload requires a 2D single-layer mode-27 resource, got type={} layers={} tile={} base={} count={}",
+                descriptor.texture_type,
+                descriptor.layer_count,
+                descriptor.guest.tile_mode,
+                descriptor.base_mip_level,
+                descriptor.mip_level_count
+            ));
+        }
+        let underlying_mip_count = descriptor
+            .base_mip_level
+            .checked_add(descriptor.mip_level_count)
+            .ok_or("sampled mip range overflows")?;
+        u64::try_from(mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?.byte_count)
+            .map_err(|_| "sampled mip-chain byte count does not fit u64")?
+    } else {
+        guest_texture_byte_count(descriptor.guest)
+            .ok_or("sampled texture face byte count overflows")?
+            .checked_mul(u64::from(descriptor.layer_count))
+            .ok_or("sampled texture byte count overflows")?
+    };
     if descriptor.guest.address < 0x10_000 || byte_count > 512 * 1024 * 1024 {
         return Err(format!(
             "invalid sampled texture range address={:#x} bytes={byte_count}",
@@ -7286,43 +7745,22 @@ fn sampled_texture_raw_range(descriptor: DecodedImageDescriptor) -> Result<(usiz
     ))
 }
 
-fn watch_sampled_texture(descriptor: DecodedImageDescriptor) -> Result<CpuWriteWatch, String> {
+fn watch_sampled_texture(
+    descriptor: DecodedImageDescriptor,
+) -> Result<GuestTextureWriteWatch, String> {
     let (_, byte_count) = sampled_texture_raw_range(descriptor)?;
-    // SAFETY: the decoded descriptor names a live guest allocation retained while GPU events
-    // referencing this sampled view are processed.
-    unsafe {
-        CpuWriteWatch::new(
-            descriptor.guest.address,
-            u64::try_from(byte_count).map_err(|_| "sampled byte count does not fit u64")?,
-        )
-    }
-    .map_err(|error| format!("could not watch sampled guest texture CPU writes: {error}"))
+    GuestTextureWriteWatch::new(
+        descriptor.guest.address,
+        u64::try_from(byte_count).map_err(|_| "sampled byte count does not fit u64")?,
+    )
 }
 
 fn snapshot_watched_sampled_texture_raw(
     descriptor: DecodedImageDescriptor,
-    write_watch: &CpuWriteWatch,
+    write_watch: &GuestTextureWriteWatch,
 ) -> Result<Vec<u8>, String> {
-    if !write_watch.precise_tracking() {
-        let (address, byte_count) = sampled_texture_raw_range(descriptor)?;
-        // SAFETY: the lifetime-only watch pins the mapping while the resident resource owns it.
-        return Ok(
-            unsafe { std::slice::from_raw_parts(address as *const u8, byte_count) }.to_vec(),
-        );
-    }
-    loop {
-        let _ = write_watch.consume_dirty();
-        write_watch
-            .rearm()
-            .map_err(|error| format!("could not rearm sampled texture CPU writes: {error}"))?;
-        let generation = write_watch.generation();
-        let (address, byte_count) = sampled_texture_raw_range(descriptor)?;
-        // SAFETY: sampled_texture_raw_range validates the complete live resource view.
-        let raw = unsafe { std::slice::from_raw_parts(address as *const u8, byte_count) }.to_vec();
-        if write_watch.generation() == generation && !write_watch.is_dirty() {
-            return Ok(raw);
-        }
-    }
+    let (_, source_length) = sampled_texture_raw_range(descriptor)?;
+    snapshot_watched_guest_range(descriptor.guest.address, source_length, write_watch)
 }
 
 fn decode_sampled_texture_linear_from_raw(
@@ -7357,37 +7795,100 @@ fn decode_sampled_texture_linear_from_raw(
     Ok(linear)
 }
 
-fn snapshot_watched_guest_texture_raw(
-    descriptor: GuestTextureDescriptor,
-    write_watch: &CpuWriteWatch,
+fn snapshot_watched_guest_range(
+    address: u64,
+    byte_count: usize,
+    write_watch: &GuestTextureWriteWatch,
 ) -> Result<Vec<u8>, String> {
+    let byte_count_u64 =
+        u64::try_from(byte_count).map_err(|_| "guest range length does not fit u64")?;
+    let source_address =
+        usize::try_from(address).map_err(|_| "guest range address does not fit usize")?;
+    let direct_snapshot = || {
+        // SAFETY: with_contiguous_mapping pins the complete live mapping around this copy.
+        unsafe { std::slice::from_raw_parts(source_address as *const u8, byte_count) }.to_vec()
+    };
+    let snapshot = || {
+        if guest_shared_mapping_identity(address, byte_count_u64).is_some()
+            && write_watch.has_single_covering_mapping(address, byte_count_u64)
+        {
+            write_watch.with_contiguous_mapping(address, byte_count_u64, direct_snapshot)
+        } else {
+            let mut raw = vec![0; byte_count];
+            if read_guest_shared_backing(address, &mut raw) {
+                Ok(raw)
+            } else {
+                Err(format!(
+                    "guest range {address:#x}+{byte_count:#x} has no complete live shared backing"
+                ))
+            }
+        }
+    };
     if !write_watch.precise_tracking() {
-        return snapshot_guest_texture_raw(descriptor);
+        return snapshot();
     }
     loop {
         let _ = write_watch.consume_dirty();
-        write_watch
-            .rearm()
-            .map_err(|error| format!("could not rearm guest texture CPU writes: {error}"))?;
-        let generation = write_watch.generation();
-        let raw = snapshot_guest_texture_raw(descriptor)?;
-        if write_watch.generation() == generation && !write_watch.is_dirty() {
+        write_watch.rearm()?;
+        let generations = write_watch.generations();
+        let raw = snapshot()?;
+        if write_watch.generations() == generations && !write_watch.is_dirty() {
             return Ok(raw);
         }
     }
 }
 
-fn rearm_guest_texture_after_gpu_writeback(write_watch: &CpuWriteWatch) -> Result<(), String> {
+fn snapshot_watched_guest_texture_raw(
+    descriptor: GuestTextureDescriptor,
+    write_watch: &GuestTextureWriteWatch,
+) -> Result<Vec<u8>, String> {
+    let (_, source_length) = guest_texture_raw_range(descriptor)?;
+    snapshot_watched_guest_range(descriptor.address, source_length, write_watch)
+}
+
+fn write_watched_guest_range(
+    address: u64,
+    raw: &[u8],
+    write_watch: &GuestTextureWriteWatch,
+) -> Result<(), String> {
+    if write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced) {
+        return Err(format!(
+            "guest range mapping {address:#x} was retired before writeback"
+        ));
+    }
+    let byte_count = u64::try_from(raw.len()).map_err(|_| "guest range length does not fit u64")?;
+    if guest_shared_mapping_identity(address, byte_count).is_some()
+        && write_watch.has_single_covering_mapping(address, byte_count)
+    {
+        let destination =
+            usize::try_from(address).map_err(|_| "guest range address does not fit usize")?;
+        return write_watch.with_contiguous_mapping(address, byte_count, || {
+            // SAFETY: with_contiguous_mapping pins the complete writable mapping for this copy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), destination as *mut u8, raw.len());
+            }
+        });
+    }
+    if write_guest_shared_backing(address, raw) {
+        Ok(())
+    } else {
+        Err(format!(
+            "guest range {address:#x}+{byte_count:#x} lost shared backing during writeback"
+        ))
+    }
+}
+
+fn rearm_guest_texture_after_gpu_writeback(
+    write_watch: &GuestTextureWriteWatch,
+) -> Result<(), String> {
     if !write_watch.precise_tracking() {
         return Ok(());
     }
     loop {
-        let generation = write_watch.generation();
+        let generations = write_watch.generations();
         let _ = write_watch.consume_dirty();
-        write_watch
-            .rearm()
-            .map_err(|error| format!("could not rearm guest texture CPU writes: {error}"))?;
-        if write_watch.generation() == generation && !write_watch.is_dirty() {
+        write_watch.rearm()?;
+        if write_watch.generations() == generations && !write_watch.is_dirty() {
             return Ok(());
         }
     }
@@ -7480,17 +7981,7 @@ fn write_guest_texture_linear(
             descriptor.address
         ));
     }
-    // Kyty routes image readback through its guest backing registry. Do the equivalent
-    // validation before forming a raw slice: an SRD can outlive a released or partially
-    // remapped direct-memory allocation, and writing through that stale VA crashes the host.
-    #[cfg(not(test))]
-    if guest_shared_mapping_identity(descriptor.address, byte_count).is_none() {
-        return Err(format!(
-            "guest texture range {:#x}+{byte_count:#x} has no live contiguous shared backing",
-            descriptor.address
-        ));
-    }
-    let (width, height, pitch, bytes_per_element) = texture_element_layout(descriptor)?;
+    let (width, height, _pitch, bytes_per_element) = texture_element_layout(descriptor)?;
     let required = width
         .checked_mul(height)
         .and_then(|elements| elements.checked_mul(bytes_per_element))
@@ -7501,15 +7992,69 @@ fn write_guest_texture_linear(
             linear.len()
         ));
     }
-    let destination_address = usize::try_from(descriptor.address)
-        .map_err(|_| "guest texture address does not fit usize")?;
     let destination_length =
         usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
-    // SAFETY: The resource descriptor points into a live writable guest direct-memory mapping.
-    // The decoded dimensions, pitch, and tiling mode bound this mutable view to 128 MiB.
-    let destination = unsafe {
-        std::slice::from_raw_parts_mut(destination_address as *mut u8, destination_length)
-    };
+    if guest_shared_mapping_identity(descriptor.address, byte_count).is_some() {
+        let destination_address = usize::try_from(descriptor.address)
+            .map_err(|_| "guest texture address does not fit usize")?;
+        // SAFETY: the registry proved the full writable texture range is one live contiguous
+        // mapping, and the caller's write watch has not been retired.
+        let destination = unsafe {
+            std::slice::from_raw_parts_mut(destination_address as *mut u8, destination_length)
+        };
+        write_guest_texture_linear_into_raw(descriptor, linear, destination)?;
+        return Ok(());
+    }
+    let mut destination = vec![0; destination_length];
+    let has_shared_backing = read_guest_shared_backing(descriptor.address, &mut destination);
+    #[cfg(test)]
+    if !has_shared_backing {
+        let destination_address = usize::try_from(descriptor.address)
+            .map_err(|_| "guest texture address does not fit usize")?;
+        // SAFETY: process-local unit-test descriptors retain the full destination allocation.
+        destination.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(destination_address as *const u8, destination_length)
+        });
+    }
+    #[cfg(not(test))]
+    if !has_shared_backing {
+        return Err(format!(
+            "guest texture range {:#x}+{byte_count:#x} has no complete live shared backing",
+            descriptor.address
+        ));
+    }
+    write_guest_texture_linear_into_raw(descriptor, linear, &mut destination)?;
+    if has_shared_backing {
+        if !write_guest_shared_backing(descriptor.address, &destination) {
+            return Err(format!(
+                "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
+                descriptor.address
+            ));
+        }
+    } else {
+        #[cfg(test)]
+        {
+            let destination_address = usize::try_from(descriptor.address)
+                .map_err(|_| "guest texture address does not fit usize")?;
+            // SAFETY: process-local unit-test descriptors retain the full destination allocation.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    destination.as_ptr(),
+                    destination_address as *mut u8,
+                    destination.len(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_guest_texture_linear_into_raw(
+    descriptor: GuestTextureDescriptor,
+    linear: &[u8],
+    destination: &mut [u8],
+) -> Result<(), String> {
+    let (width, height, pitch, bytes_per_element) = texture_element_layout(descriptor)?;
     if descriptor.tile_mode == 0 {
         let destination_row_bytes = pitch
             .checked_mul(bytes_per_element)
@@ -7538,16 +8083,40 @@ fn write_guest_texture_linear(
 fn write_watched_guest_texture_linear(
     descriptor: GuestTextureDescriptor,
     linear: &[u8],
-    write_watch: &CpuWriteWatch,
+    write_watch: &GuestTextureWriteWatch,
 ) -> Result<(), String> {
-    write_watch
-        .with_live_mapping(|| write_guest_texture_linear(descriptor, linear))
-        .map_err(|error| {
-            format!(
-                "guest texture mapping {:#x} was retired before writeback: {error}",
-                descriptor.address
-            )
-        })?
+    if write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced) {
+        return Err(format!(
+            "guest texture mapping {:#x} was retired before writeback",
+            descriptor.address
+        ));
+    }
+    let byte_count = guest_texture_byte_count(descriptor)
+        .ok_or("guest texture byte count overflows the host address space")?;
+    if guest_shared_mapping_identity(descriptor.address, byte_count).is_some()
+        && write_watch.has_single_covering_mapping(descriptor.address, byte_count)
+    {
+        return write_watch.with_contiguous_mapping(descriptor.address, byte_count, || {
+            write_guest_texture_linear(descriptor, linear)
+        })?;
+    }
+    let destination_length =
+        usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
+    let mut destination = vec![0; destination_length];
+    if !read_guest_shared_backing(descriptor.address, &mut destination) {
+        return Err(format!(
+            "guest texture range {:#x}+{byte_count:#x} has no complete live shared backing",
+            descriptor.address
+        ));
+    }
+    write_guest_texture_linear_into_raw(descriptor, linear, &mut destination)?;
+    if !write_guest_shared_backing(descriptor.address, &destination) {
+        return Err(format!(
+            "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
+            descriptor.address
+        ));
+    }
+    Ok(())
 }
 
 fn create_guest_texture(
@@ -7589,6 +8158,114 @@ fn create_guest_texture(
                 .expect("validated texture element byte count fits u64"),
     );
     Ok(texture)
+}
+
+fn create_mipmapped_guest_texture(
+    device: &Device,
+    guest: GuestTextureDescriptor,
+    mip_level_count: u32,
+    linear_levels: &[Vec<u8>],
+) -> Result<Texture, String> {
+    let layout = mode27_mip_chain_layout(guest, mip_level_count)?;
+    if linear_levels.len() != layout.levels.len() {
+        return Err(format!(
+            "Metal mip upload has {} levels, expected {}",
+            linear_levels.len(),
+            layout.levels.len()
+        ));
+    }
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(guest.pixel_format);
+    descriptor.set_width(u64::from(guest.width));
+    descriptor.set_height(u64::from(guest.height));
+    descriptor.set_mipmap_level_count(u64::from(mip_level_count));
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(
+        MTLTextureUsage::RenderTarget
+            | MTLTextureUsage::ShaderRead
+            | MTLTextureUsage::ShaderWrite
+            | MTLTextureUsage::PixelFormatView,
+    );
+    let texture = device.new_texture(&descriptor);
+    for (level_index, (&level, linear)) in layout.levels.iter().zip(linear_levels).enumerate() {
+        let expected = level
+            .width
+            .checked_mul(level.height)
+            .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
+            .ok_or("Metal mip upload size overflows")?;
+        if linear.len() != expected {
+            return Err(format!(
+                "Metal mip {level_index} upload has {} bytes, expected {expected}",
+                linear.len()
+            ));
+        }
+        texture.replace_region(
+            MTLRegion::new_2d(
+                0,
+                0,
+                u64::try_from(level.width).expect("validated mip width fits u64"),
+                u64::try_from(level.height).expect("validated mip height fits u64"),
+            ),
+            u64::try_from(level_index).expect("validated mip index fits u64"),
+            linear.as_ptr().cast::<c_void>(),
+            u64::try_from(level.width * layout.bytes_per_element)
+                .expect("validated mip row size fits u64"),
+        );
+    }
+    Ok(texture)
+}
+
+fn create_exact_mode27_sampled_mip_view(
+    device: &Device,
+    descriptor: DecodedImageDescriptor,
+    raw: &[u8],
+    comparison: bool,
+) -> Result<Texture, String> {
+    if comparison {
+        return Err(format!(
+            "exact comparison-sampled mip view base={} count={} is not implemented",
+            descriptor.base_mip_level, descriptor.mip_level_count
+        ));
+    }
+    if descriptor.texture_type != 9
+        || descriptor.layer_count != 1
+        || descriptor.guest.tile_mode != 27
+        || descriptor.mip_level_count == 0
+    {
+        return Err(format!(
+            "exact sampled mip view requires a nonempty 2D single-layer mode-27 resource, got type={} layers={} tile={} base={} count={}",
+            descriptor.texture_type,
+            descriptor.layer_count,
+            descriptor.guest.tile_mode,
+            descriptor.base_mip_level,
+            descriptor.mip_level_count
+        ));
+    }
+    let underlying_mip_count = descriptor
+        .base_mip_level
+        .checked_add(descriptor.mip_level_count)
+        .ok_or("sampled mip range overflows")?;
+    let (_, linear_levels) =
+        decode_mode27_mip_chain_from_raw(descriptor.guest, underlying_mip_count, raw)?;
+    let texture = create_mipmapped_guest_texture(
+        device,
+        descriptor.guest,
+        underlying_mip_count,
+        &linear_levels,
+    )?;
+    if descriptor.base_mip_level == 0 && descriptor.mip_level_count == underlying_mip_count {
+        return Ok(texture);
+    }
+    Ok(texture.new_texture_view_from_slice(
+        descriptor.guest.pixel_format,
+        MTLTextureType::D2,
+        NSRange::new(
+            u64::from(descriptor.base_mip_level),
+            u64::from(descriptor.mip_level_count),
+        ),
+        NSRange::new(0, 1),
+    ))
 }
 
 fn create_layered_render_target_texture(
@@ -8027,6 +8704,55 @@ fn read_texture_linear(
     PendingTextureReadback::encode(device, queue, texture, descriptor)?.finish()
 }
 
+fn read_texture_mip_linear(
+    device: &Device,
+    queue: &metal::CommandQueue,
+    texture: &Texture,
+    descriptor: GuestTextureDescriptor,
+    mip_level: u32,
+) -> Result<Vec<u8>, String> {
+    PendingTextureReadback::encode_mip(device, queue, texture, descriptor, mip_level)?.finish()
+}
+
+fn write_resident_texture_contents_to_guest(
+    device: &Device,
+    queue: &metal::CommandQueue,
+    resident: &ResidentGuestTexture,
+) -> Result<(), String> {
+    if resident.mip_level_count == 1 {
+        let linear = read_texture_linear(device, queue, &resident.texture, resident.descriptor)?;
+        return write_watched_guest_texture_linear(
+            resident.descriptor,
+            &linear,
+            &resident.write_watch,
+        );
+    }
+    if resident.texture_type != 9 || resident.layer_count != 1 {
+        return Err(format!(
+            "mip writeback requires a 2D single-layer resident, got type={} layers={}",
+            resident.texture_type, resident.layer_count
+        ));
+    }
+    let layout = mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
+    let mut raw = snapshot_watched_guest_range(
+        resident.descriptor.address,
+        layout.byte_count,
+        &resident.write_watch,
+    )?;
+    let mut levels = Vec::with_capacity(layout.levels.len());
+    for mip_level in 0..resident.mip_level_count {
+        levels.push(read_texture_mip_linear(
+            device,
+            queue,
+            &resident.texture,
+            resident.descriptor,
+            mip_level,
+        )?);
+    }
+    encode_mode27_mip_chain_into_raw(&layout, &levels, &mut raw)?;
+    write_watched_guest_range(resident.descriptor.address, &raw, &resident.write_watch)
+}
+
 fn read_texture_volume_linear(
     device: &Device,
     queue: &metal::CommandQueue,
@@ -8158,7 +8884,9 @@ fn ensure_resident_texture_in_map(
 ) -> Result<Texture, String> {
     if let Some(resident) = resident_guest_textures
         .get_mut(&descriptor)
-        .filter(|resident| resident.texture_type == 9 && resident.layer_count == 1)
+        .filter(|resident| {
+            resident.texture_type == 9 && resident.layer_count == 1 && resident.mip_level_count >= 1
+        })
     {
         match refresh_resident_texture_write_watch(resident)? {
             WriteWatchRefresh::Active
@@ -8186,12 +8914,109 @@ fn ensure_resident_texture_in_map(
             descriptor,
             texture_type: 9,
             layer_count: 1,
+            mip_level_count: 1,
             write_watch,
             gpu_written: false,
             content_version: 0,
         },
     );
     Ok(texture)
+}
+
+fn ensure_mipmapped_resident_texture_in_map(
+    device: &Device,
+    descriptor: DecodedImageDescriptor,
+    resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+) -> Result<Texture, String> {
+    if descriptor.texture_type != 9
+        || descriptor.layer_count != 1
+        || descriptor.guest.tile_mode != 27
+        || descriptor.mip_level_count == 0
+    {
+        return Err(format!(
+            "mipmapped storage image requires a nonempty 2D single-layer mode-27 resource, got type={} layers={} tile={} base={} count={}",
+            descriptor.texture_type,
+            descriptor.layer_count,
+            descriptor.guest.tile_mode,
+            descriptor.base_mip_level,
+            descriptor.mip_level_count
+        ));
+    }
+    let underlying_mip_count = descriptor
+        .base_mip_level
+        .checked_add(descriptor.mip_level_count)
+        .ok_or("storage-image mip range overflows")?;
+    if let Some(resident) = resident_guest_textures
+        .get_mut(&descriptor.guest)
+        .filter(|resident| {
+            resident.texture_type == 9
+                && resident.layer_count == 1
+                && resident.mip_level_count >= underlying_mip_count
+        })
+    {
+        match refresh_resident_texture_write_watch(resident)? {
+            WriteWatchRefresh::Active
+            | WriteWatchRefresh::Reprotecting
+            | WriteWatchRefresh::Renewed { .. } => {
+                return resident_texture_for_sample(resident, descriptor).ok_or_else(|| {
+                    "resident mip hierarchy cannot represent storage view".to_owned()
+                });
+            }
+            WriteWatchRefresh::Replaced => {}
+        }
+    }
+    if resident_guest_textures
+        .get(&descriptor.guest)
+        .is_some_and(|resident| resident.gpu_written)
+    {
+        return Err(format!(
+            "cannot reinterpret GPU-written image {:#x} as a {underlying_mip_count}-level hierarchy",
+            descriptor.guest.address
+        ));
+    }
+    resident_guest_textures.remove(&descriptor.guest);
+    let layout = mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
+    let write_watch = watch_resident_texture(
+        descriptor.guest,
+        descriptor.texture_type,
+        descriptor.layer_count,
+        underlying_mip_count,
+    )?;
+    let raw =
+        snapshot_watched_guest_range(descriptor.guest.address, layout.byte_count, &write_watch)?;
+    let (_, linear_levels) =
+        decode_mode27_mip_chain_from_raw(descriptor.guest, underlying_mip_count, &raw)?;
+    let texture = create_mipmapped_guest_texture(
+        device,
+        descriptor.guest,
+        underlying_mip_count,
+        &linear_levels,
+    )?;
+    texture.set_label(&format!(
+        "REMu {}-level storage image {:#x}",
+        underlying_mip_count, descriptor.guest.address
+    ));
+    resident_guest_textures.insert(
+        descriptor.guest,
+        ResidentGuestTexture {
+            texture,
+            component_reorder_view: None,
+            descriptor: descriptor.guest,
+            texture_type: descriptor.texture_type,
+            layer_count: descriptor.layer_count,
+            mip_level_count: underlying_mip_count,
+            write_watch,
+            gpu_written: false,
+            content_version: 0,
+        },
+    );
+    resident_texture_for_sample(
+        resident_guest_textures
+            .get_mut(&descriptor.guest)
+            .expect("inserted mipmapped resident exists"),
+        descriptor,
+    )
+    .ok_or_else(|| "created mip hierarchy cannot represent storage view".to_owned())
 }
 
 fn metal_buffer_with_bytes(device: &Device, bytes: &[u8]) -> Result<Buffer, String> {
@@ -9438,17 +10263,17 @@ fn upload_image_textures(
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     multisample_textures: &HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
     sampled_texture_cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
+    sampled_texture_write_watches: &mut HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
     fallback_texture_cache: &mut HashMap<SampledTextureKey, Texture>,
     sampled_texture_admission_order: &mut VecDeque<(SampledTextureKey, u64)>,
     next_sampled_texture_admission_id: &mut u64,
 ) -> Result<Vec<UploadedImageTexture>, String> {
-    evaluation
-        .image_bindings
-        .iter()
+    canonical_texture_bindings(evaluation)
+        .into_iter()
         .map(|binding| {
             let writable = is_writable_image_opcode(binding.opcode);
             let storage = is_storage_image_opcode(binding.opcode);
-            let comparison = binding.opcode.contains("SampleC");
+            let comparison = image_is_comparison(binding.opcode);
             let decoded = decode_image_descriptor(&binding.resource_descriptor);
             let fallback = decoded.is_err();
             let descriptor = decoded
@@ -9548,13 +10373,18 @@ fn upload_image_textures(
                     );
                 }
             }
+            let underlying_mip_count = descriptor
+                .base_mip_level
+                .checked_add(descriptor.mip_level_count.max(1))
+                .ok_or("sampled resident mip range overflows")?;
             if matches!(descriptor.texture_type, 9 | 10) {
                 let replaced = if let Some(resident) = resident_guest_textures
-                    .get_mut(&descriptor.guest)
-                    .filter(|resident| {
-                        resident.texture_type == descriptor.texture_type
-                            && resident.layer_count == descriptor.layer_count
-                    })
+                .get_mut(&descriptor.guest)
+                .filter(|resident| {
+                    resident.texture_type == descriptor.texture_type
+                        && resident.layer_count == descriptor.layer_count
+                        && resident.mip_level_count >= underlying_mip_count
+                })
                 {
                     refresh_resident_texture_write_watch(resident)?
                         == WriteWatchRefresh::Replaced
@@ -9596,6 +10426,7 @@ fn upload_image_textures(
                             .filter(|resident| {
                                 resident.texture_type == descriptor.texture_type
                                     && resident.layer_count == descriptor.layer_count
+                                    && resident.mip_level_count >= underlying_mip_count
                             })
                             .map(|resident| resident.descriptor)
                             .or_else(|| {
@@ -9605,6 +10436,8 @@ fn upload_image_textures(
                                         .filter(|resident| {
                                             resident.texture_type == 9
                                                 && resident.layer_count == 1
+                                                && resident.mip_level_count
+                                                    >= underlying_mip_count
                                                 && (guest_texture_descriptors_share_storage(
                                                     resident.descriptor,
                                                     descriptor.guest,
@@ -9623,7 +10456,7 @@ fn upload_image_textures(
             let resident_resolve = resident_descriptor.and_then(|resident_descriptor| {
                 let resident = resident_guest_textures.get_mut(&resident_descriptor)?;
                 let version = resident.content_version;
-                resident_texture_for_sample(resident, descriptor.guest)
+                resident_texture_for_sample(resident, descriptor)
                     .map(|texture| (version, texture))
             });
             // A guest descriptor can retain an exact single-sample resident from an earlier
@@ -9719,7 +10552,19 @@ fn upload_image_textures(
                     texture
                 }
             } else if storage && descriptor.texture_type == 9 {
-                ensure_resident_texture_in_map(device, descriptor.guest, resident_guest_textures)?
+                if descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1 {
+                    ensure_mipmapped_resident_texture_in_map(
+                        device,
+                        descriptor,
+                        resident_guest_textures,
+                    )?
+                } else {
+                    ensure_resident_texture_in_map(
+                        device,
+                        descriptor.guest,
+                        resident_guest_textures,
+                    )?
+                }
             } else if let Some(texture) = render_resolve {
                 texture
             } else {
@@ -9733,7 +10578,11 @@ fn upload_image_textures(
                     comparison,
                 };
                 let replaced = if let Some(cached) = sampled_texture_cache.get_mut(&key) {
-                    refresh_sampled_texture_write_watch(key, cached)?
+                    refresh_sampled_texture_write_watch(
+                        key,
+                        cached,
+                        sampled_texture_write_watches,
+                    )?
                         == WriteWatchRefresh::Replaced
                 } else {
                     false
@@ -9746,23 +10595,42 @@ fn upload_image_textures(
                 if let Some(cached) = sampled_texture_cache.get(&key) {
                     cached.texture.clone()
                 } else {
-                    let write_watch = watch_sampled_texture(descriptor)
+                    let write_watch = persistent_sampled_texture_write_watch(
+                        key,
+                        descriptor,
+                        sampled_texture_write_watches,
+                    )
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
                     let raw = snapshot_watched_sampled_texture_raw(descriptor, &write_watch)
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                    let linear = decode_sampled_texture_linear_from_raw(descriptor, &raw)
-                        .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                    let texture = create_sampled_guest_texture(
-                        device,
-                        queue,
-                        descriptor.guest,
-                        &linear,
-                        descriptor.base_mip_level,
-                        descriptor.mip_level_count,
-                        descriptor.texture_type,
-                        descriptor.layer_count,
-                        comparison,
-                    )?;
+                    let texture =
+                        if descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1 {
+                            create_exact_mode27_sampled_mip_view(
+                                device,
+                                descriptor,
+                                &raw,
+                                comparison,
+                            )
+                            .map_err(|error| {
+                                format!("image at PC {:#x}: {error}", binding.pc)
+                            })?
+                        } else {
+                            let linear =
+                                decode_sampled_texture_linear_from_raw(descriptor, &raw).map_err(
+                                    |error| format!("image at PC {:#x}: {error}", binding.pc),
+                                )?;
+                            create_sampled_guest_texture(
+                                device,
+                                queue,
+                                descriptor.guest,
+                                &linear,
+                                descriptor.base_mip_level,
+                                descriptor.mip_level_count,
+                                descriptor.texture_type,
+                                descriptor.layer_count,
+                                comparison,
+                            )?
+                        };
                     texture.set_label(&format!(
                         "REMu sampled guest image {:#x}",
                         descriptor.guest.address
@@ -9857,6 +10725,51 @@ fn sampled_image_bindings(evaluation: &ShaderEvaluation) -> impl Iterator<Item =
     })
 }
 
+fn canonical_texture_bindings(evaluation: &ShaderEvaluation) -> Vec<&ImageBinding> {
+    let slots = evaluation.image_binding_slots();
+    let mut representatives = vec![
+        None;
+        usize::try_from(slots.texture_count)
+            .expect("canonical texture count fits the host index")
+    ];
+    for (binding, slot) in evaluation
+        .image_bindings
+        .iter()
+        .zip(slots.texture_slots.iter().copied())
+    {
+        let slot = usize::try_from(slot).expect("canonical texture slot fits the host index");
+        representatives[slot].get_or_insert(binding);
+    }
+    representatives
+        .into_iter()
+        .map(|binding| binding.expect("canonical texture slots are dense"))
+        .collect()
+}
+
+fn canonical_sampler_bindings(evaluation: &ShaderEvaluation) -> Vec<&ImageBinding> {
+    let slots = evaluation.image_binding_slots();
+    let mut representatives = vec![
+        None;
+        usize::try_from(slots.sampler_count)
+            .expect("canonical sampler count fits the host index")
+    ];
+    for (binding, slot) in evaluation
+        .image_bindings
+        .iter()
+        .zip(slots.sampler_slots.iter().copied())
+    {
+        let Some(slot) = slot else {
+            continue;
+        };
+        let slot = usize::try_from(slot).expect("canonical sampler slot fits the host index");
+        representatives[slot].get_or_insert(binding);
+    }
+    representatives
+        .into_iter()
+        .map(|binding| binding.expect("canonical sampler slots are dense"))
+        .collect()
+}
+
 fn sampler_uses_normalized_coordinates(words: &[u32]) -> bool {
     words.first().is_none_or(|word| word & (1 << 15) == 0)
 }
@@ -9873,7 +10786,7 @@ fn create_sampler_argument_buffer(
     buffer_index: Option<u32>,
     evaluation: &ShaderEvaluation,
 ) -> Result<(Option<Buffer>, Vec<SamplerState>), String> {
-    let sampled_bindings: Vec<_> = sampled_image_bindings(evaluation).collect();
+    let sampled_bindings = canonical_sampler_bindings(evaluation);
     let Some(buffer_index) = buffer_index else {
         if sampled_bindings.is_empty() {
             return Ok((None, Vec::new()));
@@ -9914,7 +10827,7 @@ fn create_sampler_argument_buffer(
         descriptor.set_mag_filter(sampler_min_mag_filter((words[2] >> 20) & 0x3));
         descriptor.set_min_filter(sampler_min_mag_filter((words[2] >> 22) & 0x3));
         descriptor.set_mip_filter(sampler_mip_filter((words[2] >> 26) & 0x3));
-        if binding.opcode.contains("SampleC") {
+        if image_is_comparison(binding.opcode) {
             descriptor.set_compare_function(sampler_compare_function((words[0] >> 12) & 0x7));
         }
         descriptor.set_lod_min_clamp(
@@ -10214,12 +11127,18 @@ fn decode_render_target_state(
     let mip_level = (view >> 26) & 0xf;
     let max_mip = (attrib2 >> 28) & 0xf;
     let mip0_depth = attrib3 & 0x1fff;
-    if mip_level != 0 || max_mip != 0 {
+    let tile_mode = (attrib3 >> 14) & 0x1f;
+    let maximum_extent_mip = 31 - width.max(height).leading_zeros();
+    if mip_level > max_mip || max_mip > maximum_extent_mip {
         return Err(format!(
-            "color target {guest_slot} requires unsupported mip view slices={slice_start}..={slice_max} mip={mip_level}/{max_mip} depth={mip0_depth}"
+            "color target {guest_slot} has invalid mip view slices={slice_start}..={slice_max} mip={mip_level}/{max_mip} maximum={maximum_extent_mip} depth={mip0_depth}"
         ));
     }
-    let tile_mode = (attrib3 >> 14) & 0x1f;
+    if max_mip != 0 && (sample_count != 1 || tile_mode != 27) {
+        return Err(format!(
+            "color target {guest_slot} mip hierarchy requires single-sample mode-27 storage, got samples={sample_count} tile={tile_mode} mip={mip_level}/{max_mip}"
+        ));
+    }
     if !matches!(tile_mode, 0 | 27) {
         return Err(format!(
             "color target {guest_slot} uses unsupported GFX10 swizzle mode {tile_mode}"
@@ -10255,6 +11174,11 @@ fn decode_render_target_state(
             ));
         }
     };
+    if max_mip != 0 && texture_type != 9 {
+        return Err(format!(
+            "color target {guest_slot} mipmapped resource type={resource_type} is not implemented"
+        ));
+    }
     let format =
         decode_render_target_format((info >> 2) & 0x1f, (info >> 8) & 0x7, (info >> 11) & 0x3)?;
     let pitch = if tile_mode == 0 {
@@ -10281,6 +11205,8 @@ fn decode_render_target_state(
         texture_type,
         layer_count,
         base_layer,
+        mip_level,
+        mip_level_count: max_mip + 1,
         dcc_enabled: dcc_enable != 0,
         fast_clear_enabled: fast_clear != 0,
     })
@@ -10359,6 +11285,8 @@ fn decode_scanout_target(target: GpuScanoutTarget) -> Result<DecodedRenderTarget
         texture_type: 9,
         layer_count: 1,
         base_layer: 0,
+        mip_level: 0,
+        mip_level_count: 1,
         dcc_enabled: false,
         fast_clear_enabled: false,
     })
@@ -10748,6 +11676,7 @@ fn graphics_shader_resource_key(
     evaluation: &ShaderEvaluation,
     _embeds_global_base: bool,
 ) -> GraphicsShaderResourceKey {
+    let image_slots = evaluation.image_binding_slots();
     GraphicsShaderResourceKey {
         initial_scalar_count: evaluation.initial_scalar_registers.len(),
         // Every lowering embeds the byte extent. Only GLOBAL instructions still embed a full
@@ -10764,17 +11693,20 @@ fn graphics_shader_resource_key(
         image_bindings: evaluation
             .image_bindings
             .iter()
-            .map(|binding| {
+            .enumerate()
+            .map(|(index, binding)| {
                 (
                     binding.pc,
                     image_component_class(binding),
                     is_storage_image_opcode(binding.opcode),
-                    binding.opcode.contains("SampleC"),
+                    image_is_comparison(binding.opcode),
                     binding.control.dimension,
                     binding
                         .resource_descriptor
                         .get(3)
                         .map_or(0, |word| (word >> 28) & 0xf),
+                    image_slots.texture_slots[index],
+                    image_slots.sampler_slots[index],
                 )
             })
             .collect(),
@@ -11080,6 +12012,327 @@ fn guest_texture_byte_count(descriptor: GuestTextureDescriptor) -> Option<u64> {
             .checked_mul(u64::try_from(height).ok()?)?
             .checked_mul(u64::try_from(bytes_per_element).ok()?)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestMipLevelLayout {
+    width: usize,
+    height: usize,
+    padded_width: usize,
+    offset: usize,
+    tail_x: usize,
+    tail_y: usize,
+    in_tail: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuestMipChainLayout {
+    levels: Vec<GuestMipLevelLayout>,
+    byte_count: usize,
+    block_width: usize,
+    block_height: usize,
+    bytes_per_element: usize,
+}
+
+const MODE27_MIP_TAIL_LOCATIONS: [[(usize, usize); 12]; 5] = [
+    [
+        (128, 0),
+        (0, 128),
+        (64, 0),
+        (0, 64),
+        (32, 0),
+        (16, 32),
+        (0, 48),
+        (0, 32),
+        (16, 16),
+        (16, 0),
+        (0, 16),
+        (0, 0),
+    ],
+    [
+        (128, 0),
+        (0, 64),
+        (64, 0),
+        (0, 32),
+        (32, 0),
+        (16, 16),
+        (0, 24),
+        (0, 16),
+        (16, 8),
+        (16, 0),
+        (0, 8),
+        (0, 0),
+    ],
+    [
+        (64, 0),
+        (0, 64),
+        (32, 0),
+        (0, 32),
+        (16, 0),
+        (8, 16),
+        (0, 24),
+        (0, 16),
+        (8, 8),
+        (8, 0),
+        (0, 8),
+        (0, 0),
+    ],
+    [
+        (64, 0),
+        (0, 32),
+        (32, 0),
+        (0, 16),
+        (16, 0),
+        (8, 8),
+        (0, 12),
+        (0, 8),
+        (8, 4),
+        (8, 0),
+        (0, 4),
+        (0, 0),
+    ],
+    [
+        (32, 0),
+        (0, 32),
+        (16, 0),
+        (0, 16),
+        (8, 0),
+        (4, 8),
+        (0, 12),
+        (0, 8),
+        (4, 4),
+        (4, 0),
+        (0, 4),
+        (0, 0),
+    ],
+];
+
+fn shift_ceil(value: usize, shift: u32) -> Option<usize> {
+    let divisor = 1_usize.checked_shl(shift)?;
+    value.checked_add(divisor - 1).map(|value| value / divisor)
+}
+
+fn mode27_mip_chain_layout(
+    descriptor: GuestTextureDescriptor,
+    mip_level_count: u32,
+) -> Result<GuestMipChainLayout, String> {
+    if descriptor.tile_mode != 27 || mip_level_count == 0 || mip_level_count > 16 {
+        return Err(format!(
+            "mode-27 mip layout requires 1..=16 levels, got tile={} levels={mip_level_count}",
+            descriptor.tile_mode
+        ));
+    }
+    let bytes_per_element = usize::try_from(descriptor.bytes_per_pixel)
+        .map_err(|_| "mip element byte count does not fit usize")?;
+    let bytes_log2 = usize::try_from(bytes_per_element.trailing_zeros())
+        .map_err(|_| "mip element byte logarithm does not fit usize")?;
+    if !bytes_per_element.is_power_of_two() || bytes_log2 >= MODE27_MIP_TAIL_LOCATIONS.len() {
+        return Err(format!(
+            "mode-27 mip layout has unsupported {}-byte elements",
+            descriptor.bytes_per_pixel
+        ));
+    }
+    let (block_width, block_height) = tiled_block_dimensions(65_536, bytes_per_element)
+        .ok_or("mode-27 mip layout requires a 1, 2, 4, 8, or 16-byte element format")?;
+    let width = usize::try_from(descriptor.width).map_err(|_| "mip width does not fit usize")?;
+    let height = usize::try_from(descriptor.height).map_err(|_| "mip height does not fit usize")?;
+    let level_count =
+        usize::try_from(mip_level_count).map_err(|_| "mip count does not fit usize")?;
+    let tail_width = block_width / 2;
+    let mut first_tail = level_count;
+    if level_count > 1 {
+        for level in 0..level_count {
+            let shift = u32::try_from(level).expect("level count is bounded");
+            if shift_ceil(width, shift).is_some_and(|width| width <= tail_width)
+                && shift_ceil(height, shift).is_some_and(|height| height <= block_height)
+                && level_count - level <= 12
+            {
+                first_tail = level;
+                break;
+            }
+        }
+    }
+    let empty = GuestMipLevelLayout {
+        width: 0,
+        height: 0,
+        padded_width: 0,
+        offset: 0,
+        tail_x: 0,
+        tail_y: 0,
+        in_tail: false,
+    };
+    let mut levels = vec![empty; level_count];
+    let mut offset = if first_tail < level_count {
+        65_536_usize
+    } else {
+        0
+    };
+    for level in (0..first_tail).rev() {
+        let shift = u32::try_from(level).expect("level count is bounded");
+        let mip_width = shift_ceil(width, shift)
+            .ok_or("mip width overflows")?
+            .max(1);
+        let mip_height = shift_ceil(height, shift)
+            .ok_or("mip height overflows")?
+            .max(1);
+        let padded_width = mip_width
+            .div_ceil(block_width)
+            .checked_mul(block_width)
+            .ok_or("mip padded width overflows")?;
+        let padded_height = mip_height
+            .div_ceil(block_height)
+            .checked_mul(block_height)
+            .ok_or("mip padded height overflows")?;
+        let size = padded_width
+            .checked_mul(padded_height)
+            .and_then(|elements| elements.checked_mul(bytes_per_element))
+            .ok_or("mip storage size overflows")?;
+        levels[level] = GuestMipLevelLayout {
+            width: (width >> shift).max(1),
+            height: (height >> shift).max(1),
+            padded_width,
+            offset,
+            ..empty
+        };
+        offset = offset.checked_add(size).ok_or("mip chain size overflows")?;
+    }
+    for level in first_tail..level_count {
+        let shift = u32::try_from(level).expect("level count is bounded");
+        let (tail_x, tail_y) = MODE27_MIP_TAIL_LOCATIONS[bytes_log2][level - first_tail];
+        let mip_width = (width >> shift).max(1);
+        let mip_height = (height >> shift).max(1);
+        if tail_x + mip_width > block_width || tail_y + mip_height > block_height {
+            return Err(format!(
+                "mode-27 mip {level} tail placement ({tail_x},{tail_y}) {mip_width}x{mip_height} exceeds {block_width}x{block_height}"
+            ));
+        }
+        levels[level] = GuestMipLevelLayout {
+            width: mip_width,
+            height: mip_height,
+            padded_width: block_width,
+            offset: 0,
+            tail_x,
+            tail_y,
+            in_tail: true,
+        };
+    }
+    Ok(GuestMipChainLayout {
+        levels,
+        byte_count: offset,
+        block_width,
+        block_height,
+        bytes_per_element,
+    })
+}
+
+fn mode27_mip_texel_offset(
+    layout: &GuestMipChainLayout,
+    level: GuestMipLevelLayout,
+    x: usize,
+    y: usize,
+) -> Result<usize, String> {
+    let (block_x, block_y, local_x, local_y) = if level.in_tail {
+        (0, 0, level.tail_x + x, level.tail_y + y)
+    } else {
+        (
+            x / layout.block_width,
+            y / layout.block_height,
+            x % layout.block_width,
+            y % layout.block_height,
+        )
+    };
+    let blocks_per_row = level.padded_width / layout.block_width;
+    let block_offset = if level.in_tail {
+        0
+    } else {
+        (block_y * blocks_per_row + block_x)
+            .checked_mul(65_536)
+            .ok_or("mip block offset overflows")?
+    };
+    let offsets = mode27_block_byte_offsets(
+        block_x,
+        block_y,
+        layout.bytes_per_element,
+        layout.block_width,
+        layout.block_height,
+    );
+    level
+        .offset
+        .checked_add(block_offset)
+        .and_then(|offset| {
+            offset.checked_add(usize::from(offsets[local_y * layout.block_width + local_x]))
+        })
+        .ok_or_else(|| "mip texel offset overflows".to_owned())
+}
+
+fn decode_mode27_mip_chain_from_raw(
+    descriptor: GuestTextureDescriptor,
+    mip_level_count: u32,
+    raw: &[u8],
+) -> Result<(GuestMipChainLayout, Vec<Vec<u8>>), String> {
+    let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
+    if raw.len() != layout.byte_count {
+        return Err(format!(
+            "mode-27 mip source has {} bytes, expected {}",
+            raw.len(),
+            layout.byte_count
+        ));
+    }
+    let mut decoded = Vec::with_capacity(layout.levels.len());
+    for &level in &layout.levels {
+        let mut linear = vec![
+            0_u8;
+            level
+                .width
+                .checked_mul(level.height)
+                .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
+                .ok_or("mip linear size overflows")?
+        ];
+        for y in 0..level.height {
+            for x in 0..level.width {
+                let source = mode27_mip_texel_offset(&layout, level, x, y)?;
+                let destination = (y * level.width + x) * layout.bytes_per_element;
+                linear[destination..destination + layout.bytes_per_element].copy_from_slice(
+                    raw.get(source..source + layout.bytes_per_element)
+                        .ok_or("mode-27 mip texel exceeds backing")?,
+                );
+            }
+        }
+        decoded.push(linear);
+    }
+    Ok((layout, decoded))
+}
+
+fn encode_mode27_mip_chain_into_raw(
+    layout: &GuestMipChainLayout,
+    linear_levels: &[Vec<u8>],
+    raw: &mut [u8],
+) -> Result<(), String> {
+    if raw.len() != layout.byte_count || linear_levels.len() != layout.levels.len() {
+        return Err("mode-27 mip writeback layout mismatch".to_owned());
+    }
+    for (&level, linear) in layout.levels.iter().zip(linear_levels) {
+        let expected = level
+            .width
+            .checked_mul(level.height)
+            .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
+            .ok_or("mip linear size overflows")?;
+        if linear.len() != expected {
+            return Err(format!(
+                "mode-27 mip writeback has {} bytes, expected {expected}",
+                linear.len()
+            ));
+        }
+        for y in 0..level.height {
+            for x in 0..level.width {
+                let source = (y * level.width + x) * layout.bytes_per_element;
+                let destination = mode27_mip_texel_offset(layout, level, x, y)?;
+                raw[destination..destination + layout.bytes_per_element]
+                    .copy_from_slice(&linear[source..source + layout.bytes_per_element]);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn guest_texture_descriptors_overlap(
@@ -12092,17 +13345,20 @@ mod tests {
         CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
         DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
         DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, DecodedRasterState, DecodedRenderTarget,
-        GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason, GuestCommandBatch,
-        GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
-        GuestRenderPassKey, GuestTextureDescriptor, MetalPresenter, OpenGuestRenderPass,
-        OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PA_SU_SC_MODE_CNTL,
-        PendingGuestMemoryWrite, PendingTextureReadback, PresentationResolution, QueueBlockReason,
-        SPI_PS_INPUT_CNTL_0, TextureReadbackLayout, apply_image_destination_select,
-        apply_pending_guest_memory_writes, comparison_depth32_upload, decode_depth_target,
-        decode_image_descriptor, decode_metal_blend_attachment, decode_raster_state,
-        decode_render_target_format, decode_render_targets_from_registers, decode_scanout_target,
-        decode_scissor, decode_viewport, effective_linear_pitch, fallback_image_descriptor,
-        graphics_shader_resource_key, guest_texture_byte_count, guest_texture_descriptors_overlap,
+        DisplayConfiguration, GraphicsPipelineKey, GraphicsShaderResourceKey,
+        GuestBatchFlushReason, GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery,
+        GuestMemoryWaitStatus, GuestMemoryWaitTracker, GuestRenderPassKey, GuestTextureDescriptor,
+        MetalPresenter, OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource,
+        OrderedGpuEventReceiver, PA_SU_SC_MODE_CNTL, PendingFlip, PendingGuestMemoryWrite,
+        PendingTextureReadback, PresentationResolution, QueueBlockReason, SPI_PS_INPUT_CNTL_0,
+        TextureReadbackLayout, apply_image_destination_select, apply_pending_guest_memory_writes,
+        canonical_sampler_bindings, canonical_texture_bindings, comparison_depth32_upload,
+        decode_depth_target, decode_image_descriptor, decode_metal_blend_attachment,
+        decode_mode27_mip_chain_from_raw, decode_raster_state, decode_render_target_format,
+        decode_render_targets_from_registers, decode_scanout_target, decode_scissor,
+        decode_viewport, effective_linear_pitch, encode_mode27_mip_chain_into_raw,
+        fallback_image_descriptor, graphics_shader_resource_key, guest_shared_mapping_identity,
+        guest_texture_byte_count, guest_texture_descriptors_overlap,
         guest_texture_descriptors_share_component_reordered_storage,
         guest_texture_descriptors_share_storage, guest_texture_raw_matches,
         half_float_to_srgb_unorm8, half_float_to_unorm8, headless_metal_value_is_enabled,
@@ -12111,7 +13367,7 @@ mod tests {
         metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
         metal_primitive_type, mode5_within_block_byte_offset, mode9_within_block_byte_offset,
         mode24_within_block_byte_offset_for_format, mode27_block_dimensions,
-        mode27_source_byte_offset, mode27_within_block_byte_offset,
+        mode27_mip_chain_layout, mode27_source_byte_offset, mode27_within_block_byte_offset,
         mode27_within_block_byte_offset_for_format, native_texture_capture_to_bgra,
         new_red_blue_swizzled_texture_view, parse_diagnostic_hex_address,
         parse_presentation_resolution, pixel_input_controls, presentation_drawable_size,
@@ -12119,10 +13375,12 @@ mod tests {
         read_draw_indices, read_texture_linear, render_resolve_candidate_matches, sampler_lod_bias,
         sampler_uses_normalized_coordinates, shader_scalar_metadata,
         shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
-        snapshot_guest_texture_linear, snapshot_guest_texture_raw, tiled_block_dimensions,
-        unsigned_float_to_f32, validate_compute_launch_for_metal, wave64_split_blockers,
-        write_guest_texture_linear,
+        snapshot_guest_texture_linear, snapshot_guest_texture_raw,
+        snapshot_watched_guest_texture_raw, tiled_block_dimensions, unsigned_float_to_f32,
+        validate_compute_launch_for_metal, watch_guest_texture, wave64_split_blockers,
+        write_guest_texture_linear, write_watched_guest_texture_linear,
     };
+    use remu_memory::CpuWriteWatchRetirement;
 
     #[test]
     fn diagnostic_shader_address_accepts_prefixed_and_plain_hex() {
@@ -12627,6 +13885,67 @@ mod tests {
         assert_eq!(
             graphics_shader_resource_key(&evaluation(0x7009_0605_ac), true),
             graphics_shader_resource_key(&evaluation(0x7009_1600_6c), true),
+        );
+    }
+
+    #[test]
+    fn runtime_upload_representatives_follow_canonical_texture_and_sampler_slots() {
+        let control = ImageControl {
+            dmask: 0xf,
+            vector_address: 0,
+            address_registers: vec![0, 1],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 8,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+        };
+        let binding = |pc, opcode, descriptor: Vec<u32>| ImageBinding {
+            pc,
+            opcode: remu_shader::Opcode::Known(opcode),
+            control: control.clone(),
+            resource_descriptor: descriptor.into(),
+            sampler_descriptor: if opcode.starts_with("ImageSample") {
+                vec![7, 8, 9, 10].into()
+            } else {
+                Vec::new().into()
+            },
+            mip_level: None,
+        };
+        let descriptor_a = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let descriptor_b = vec![11, 12, 13, 14, 15, 16, 17, 18];
+        let evaluation = ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: vec![
+                binding(0, "ImageSample", descriptor_a.clone()),
+                binding(8, "ImageSampleLz", descriptor_a.clone()),
+                binding(16, "ImageLoad", descriptor_a),
+                binding(24, "ImageSample", descriptor_b),
+            ],
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        };
+
+        assert_eq!(
+            canonical_texture_bindings(&evaluation)
+                .iter()
+                .map(|binding| binding.pc)
+                .collect::<Vec<_>>(),
+            [0, 16, 24]
+        );
+        assert_eq!(
+            canonical_sampler_bindings(&evaluation)
+                .iter()
+                .map(|binding| binding.pc)
+                .collect::<Vec<_>>(),
+            [0]
         );
     }
 
@@ -13831,6 +15150,46 @@ kernel void remu_sampler_cache_test(
     }
 
     #[test]
+    fn pending_flip_retries_after_its_translated_target_is_written() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let descriptor = GuestTextureDescriptor {
+            address: 0x0070_1234_5600,
+            width: 640,
+            height: 360,
+            pitch: 640,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        presenter.ensure_direct_scanout_texture(&device, descriptor);
+        presenter.display = Some(DisplayConfiguration {
+            width: descriptor.width,
+            height: descriptor.height,
+            pitch: descriptor.pitch,
+            pixel_format: 0x8000_0000_0000_0000,
+            tiling_mode: 0,
+        });
+        presenter.pending_flip = Some(PendingFlip {
+            address: descriptor.address,
+            sequence: 1,
+        });
+        presenter.next_flip_sequence = 1;
+        presenter.redraw_pending = false;
+
+        presenter.mark_direct_scanout_initialized(descriptor.address);
+        presenter.request_pending_flip_redraw_for_texture(descriptor);
+
+        assert!(presenter.redraw_pending);
+        assert_eq!(presenter.uploaded_flip_sequence, 0);
+        presenter.upload_pending_frame();
+        assert_eq!(presenter.uploaded_flip_sequence, 1);
+        assert_eq!(presenter.frame_texture_size, (640, 360));
+        assert!(presenter.frame_texture.is_some());
+    }
+
+    #[test]
     fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
         let (_sender, receiver) = std::sync::mpsc::channel();
         let mut presenter = super::MetalPresenter::new(receiver).expect("Metal presenter state");
@@ -13854,6 +15213,8 @@ kernel void remu_sampler_cache_test(
             texture_type: 9,
             layer_count: 1,
             base_layer: 0,
+            mip_level: 0,
+            mip_level_count: 1,
             dcc_enabled: false,
             fast_clear_enabled: false,
         };
@@ -14012,6 +15373,8 @@ kernel void remu_sampler_cache_test(
             texture_type: 9,
             layer_count: 1,
             base_layer: 0,
+            mip_level: 0,
+            mip_level_count: 1,
             dcc_enabled: false,
             fast_clear_enabled: false,
         };
@@ -14021,6 +15384,315 @@ kernel void remu_sampler_cache_test(
             .diagnostic_capture_texture(&target)
             .expect("exact resident target is diagnostic-capturable");
         assert!(std::ptr::eq(captured.as_ref(), resident.as_ref()));
+    }
+
+    #[test]
+    fn mode27_texture_uses_physically_contiguous_disjoint_cpu_aliases() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let mut memory = GuestAddressSpace::new(24 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing =
+            GuestPhysicalBacking::new(8 * GUEST_PAGE_SIZE).expect("guest physical backing");
+        let base = memory.base();
+        let first = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(base),
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("first physical half");
+        let second_address = base
+            .checked_add(16 * GUEST_PAGE_SIZE)
+            .expect("second alias address");
+        let second = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(second_address),
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                4 * GUEST_PAGE_SIZE,
+            )
+            .expect("second physical half");
+        memory.write(first, &[0x31; 32]).expect("first bytes");
+        memory.write(second, &[0x72; 32]).expect("second bytes");
+        let descriptor = GuestTextureDescriptor {
+            address: first.get(),
+            width: 256,
+            height: 128,
+            pitch: 256,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        assert_eq!(
+            guest_texture_byte_count(descriptor),
+            Some(8 * GUEST_PAGE_SIZE)
+        );
+        assert!(
+            guest_shared_mapping_identity(descriptor.address, 8 * GUEST_PAGE_SIZE).is_none(),
+            "the CPU VA has an intentional hole"
+        );
+
+        let watch = watch_guest_texture(descriptor)
+            .expect("GPU-physical texture has complete backing aliases");
+        assert_eq!(watch.ranges.len(), 2);
+        let raw = snapshot_watched_guest_texture_raw(descriptor, &watch)
+            .expect("disjoint aliases snapshot through physical backing");
+        assert_eq!(&raw[..32], &[0x31; 32]);
+        assert_eq!(
+            &raw[usize::try_from(4 * GUEST_PAGE_SIZE).unwrap()
+                ..usize::try_from(4 * GUEST_PAGE_SIZE).unwrap() + 32],
+            &[0x72; 32]
+        );
+    }
+
+    #[test]
+    fn texture_write_watch_observes_every_live_physical_alias_and_remap() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing =
+            GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+        let base = memory.base();
+        let primary = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(base),
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("primary alias");
+        let alias_address = base
+            .checked_add(8 * GUEST_PAGE_SIZE)
+            .expect("alias address");
+        let alias = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(alias_address),
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("second alias");
+        let descriptor = GuestTextureDescriptor {
+            address: primary.get(),
+            width: 64,
+            height: 64,
+            pitch: 64,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let watch = watch_guest_texture(descriptor).expect("watch every backing alias");
+        assert_eq!(watch.ranges.len(), 2);
+
+        memory.write(alias, &[0x5a]).expect("write through alias");
+        assert!(
+            watch.is_dirty(),
+            "a coherent alias write must invalidate the GPU texture"
+        );
+        memory
+            .unmap(alias, 4 * GUEST_PAGE_SIZE)
+            .expect("replace alias");
+        assert_eq!(
+            watch.retirement(),
+            Some(CpuWriteWatchRetirement::Replaced),
+            "mapping replacement retires the resource watch before direct access"
+        );
+        assert!(
+            watch
+                .with_contiguous_mapping(primary.get(), 4 * GUEST_PAGE_SIZE, || ())
+                .is_err(),
+            "a retired multi-alias watch cannot authorize a later VA dereference"
+        );
+    }
+
+    #[test]
+    fn contiguous_texture_snapshot_and_writeback_retain_direct_mapping_semantics() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing =
+            GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("contiguous texture mapping");
+        let descriptor = GuestTextureDescriptor {
+            address: address.get(),
+            width: 64,
+            height: 64,
+            pitch: 64,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let watch = watch_guest_texture(descriptor).expect("contiguous texture watch");
+        assert_eq!(watch.ranges.len(), 1);
+        let raw = snapshot_watched_guest_texture_raw(descriptor, &watch)
+            .expect("guarded direct snapshot");
+        assert_eq!(raw.len(), usize::try_from(4 * GUEST_PAGE_SIZE).unwrap());
+
+        let linear = vec![0x3c; 64 * 64 * 4];
+        write_watched_guest_texture_linear(descriptor, &linear, &watch)
+            .expect("guarded direct writeback");
+        let decoded =
+            snapshot_watched_guest_texture_raw(descriptor, &watch).expect("updated snapshot");
+        assert!(decoded.iter().any(|&byte| byte == 0x3c));
+    }
+
+    #[test]
+    fn contiguous_texture_access_pins_every_adjacent_mapping_record() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
+            GuestPhysicalBacking, GuestProtection, GuestSharedMapOptions,
+        };
+
+        let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing =
+            GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+        let base = memory.base();
+        let first = memory
+            .map_shared_with_coalescing(
+                GuestMapPlacement::Fixed(base),
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                GuestSharedMapOptions {
+                    backing_offset: 0,
+                    coalescing: GuestMapCoalescing::Disallowed,
+                },
+            )
+            .expect("first direct-memory mapping");
+        memory
+            .map_shared_with_coalescing(
+                GuestMapPlacement::Fixed(
+                    base.checked_add(2 * GUEST_PAGE_SIZE)
+                        .expect("second mapping address"),
+                ),
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                GuestSharedMapOptions {
+                    backing_offset: 2 * GUEST_PAGE_SIZE,
+                    coalescing: GuestMapCoalescing::Disallowed,
+                },
+            )
+            .expect("second direct-memory mapping");
+        let descriptor = GuestTextureDescriptor {
+            address: first.get(),
+            width: 64,
+            height: 64,
+            pitch: 64,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        assert!(guest_shared_mapping_identity(descriptor.address, 4 * GUEST_PAGE_SIZE).is_some());
+        let watch = watch_guest_texture(descriptor).expect("adjacent mapping watches");
+        assert_eq!(watch.ranges.len(), 2);
+        assert!(!watch.has_single_covering_mapping(descriptor.address, 4 * GUEST_PAGE_SIZE));
+        let raw = snapshot_watched_guest_texture_raw(descriptor, &watch)
+            .expect("snapshot uses the coherent physical backing slow path");
+        assert_eq!(raw.len(), usize::try_from(4 * GUEST_PAGE_SIZE).unwrap());
+    }
+
+    #[test]
+    fn silent_hill_mode27_mip_tail_round_trips_every_level() {
+        let descriptor = GuestTextureDescriptor {
+            address: 0x80b9_2700_00,
+            width: 32,
+            height: 32,
+            pitch: 32,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RG16Uint,
+            bytes_per_pixel: 4,
+        };
+        let layout = mode27_mip_chain_layout(descriptor, 6).expect("complete mip-tail layout");
+        assert_eq!(layout.byte_count, 65_536);
+        assert!(layout.levels.iter().all(|level| level.in_tail));
+        assert_eq!(
+            layout
+                .levels
+                .iter()
+                .map(|level| (level.width, level.height, level.tail_x, level.tail_y))
+                .collect::<Vec<_>>(),
+            vec![
+                (32, 32, 64, 0),
+                (16, 16, 0, 64),
+                (8, 8, 32, 0),
+                (4, 4, 0, 32),
+                (2, 2, 16, 0),
+                (1, 1, 8, 16),
+            ]
+        );
+
+        let levels = layout
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(index, level)| {
+                let byte_count = level.width * level.height * layout.bytes_per_element;
+                (0..byte_count)
+                    .map(|byte| {
+                        u8::try_from((index * 37 + byte) & 0xff).expect("masked test byte fits")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut raw = vec![0xa5; layout.byte_count];
+        encode_mode27_mip_chain_into_raw(&layout, &levels, &mut raw)
+            .expect("encode exact mip tail");
+        let (decoded_layout, decoded) =
+            decode_mode27_mip_chain_from_raw(descriptor, 6, &raw).expect("decode exact mip tail");
+        assert_eq!(decoded_layout, layout);
+        assert_eq!(decoded, levels);
+    }
+
+    #[test]
+    fn silent_hill_render_target_accepts_absolute_max_mip_hierarchy() {
+        let address = 0x80b9_2700_00;
+        let mut registers = vec![GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0xf,
+        }];
+        append_color_target_registers(&mut registers, 0, address, 32, 32, 5, 4, 27);
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_ATTRIB2)
+            .expect("color attrib2 exists")
+            .value |= 5 << 28;
+        registers.sort_by_key(|register| register.offset);
+        let targets = decode_render_targets_from_registers(&registers, 0xf)
+            .expect("observed mip=0/max_mip=5 target is complete");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].mip_level, 0);
+        assert_eq!(targets[0].mip_level_count, 6);
+        assert_eq!(targets[0].texture.pixel_format, MTLPixelFormat::RG16Uint);
     }
 
     #[test]
@@ -14622,6 +16294,11 @@ fragment int4 remu_format_sint() { return int4(-3); }
         assert_eq!(descriptor.mip_level_count, 5);
         assert_eq!(descriptor.guest.width, width);
         assert_eq!(descriptor.guest.height, height);
+        assert!(
+            super::sampled_texture_raw_range(descriptor)
+                .expect_err("initial mip chains require exact guest detiling")
+                .contains("requires a 2D single-layer mode-27")
+        );
     }
 
     #[test]
@@ -14641,6 +16318,149 @@ fragment int4 remu_format_sint() { return int4(-3); }
         assert_eq!(descriptor.mip_level_count, 4);
         assert_eq!(descriptor.guest.width, width);
         assert_eq!(descriptor.guest.height, height);
+        assert_eq!(
+            super::sampled_texture_raw_range(descriptor)
+                .expect("mode-27 nonzero mip view covers its full underlying chain")
+                .1,
+            mode27_mip_chain_layout(descriptor.guest, 5)
+                .expect("underlying mip layout")
+                .byte_count
+        );
+    }
+
+    #[test]
+    fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let allocation_size = 4 * GUEST_PAGE_SIZE;
+        let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("guest mip-tail mapping");
+        let guest = GuestTextureDescriptor {
+            address: address.get(),
+            width: 32,
+            height: 32,
+            pitch: 32,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RG16Uint,
+            bytes_per_pixel: 4,
+        };
+        assert_eq!(
+            mode27_mip_chain_layout(guest, 6)
+                .expect("six-level mode-27 tail")
+                .byte_count,
+            usize::try_from(allocation_size).expect("allocation size fits usize")
+        );
+
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let complete = super::DecodedImageDescriptor {
+            guest,
+            destination_select: 0x22c,
+            base_mip_level: 0,
+            mip_level_count: 6,
+            texture_type: 9,
+            layer_count: 1,
+        };
+        let original = super::ensure_mipmapped_resident_texture_in_map(
+            &device,
+            complete,
+            &mut presenter.resident_guest_textures,
+        )
+        .expect("complete mip hierarchy becomes resident");
+        assert_eq!(original.mipmap_level_count(), 6);
+
+        let preflight = presenter
+            .ensure_resident_texture(&device, guest)
+            .expect("single-level storage preflight reuses the hierarchy");
+        assert!(std::ptr::eq(original.as_ref(), preflight.as_ref()));
+        assert_eq!(
+            presenter
+                .resident_guest_textures
+                .get(&guest)
+                .expect("resident survives preflight")
+                .mip_level_count,
+            6
+        );
+
+        let sampled = super::DecodedImageDescriptor {
+            guest,
+            destination_select: 0x22c,
+            base_mip_level: 2,
+            mip_level_count: 2,
+            texture_type: 9,
+            layer_count: 1,
+        };
+        let view = super::ensure_mipmapped_resident_texture_in_map(
+            &device,
+            sampled,
+            &mut presenter.resident_guest_textures,
+        )
+        .expect("larger resident hierarchy covers the sampled mip range");
+        assert_eq!(view.width(), 8);
+        assert_eq!(view.height(), 8);
+        assert_eq!(view.mipmap_level_count(), 2);
+        assert!(view.parent_texture().is_some());
+        let resident = presenter
+            .resident_guest_textures
+            .get(&guest)
+            .expect("resident survives narrower view");
+        assert_eq!(resident.mip_level_count, 6);
+        assert!(std::ptr::eq(original.as_ref(), resident.texture.as_ref()));
+    }
+
+    #[test]
+    fn creates_exact_initial_mode27_base_three_and_seven_views() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        for base_mip_level in [3, 7] {
+            let descriptor = super::DecodedImageDescriptor {
+                guest: GuestTextureDescriptor {
+                    address: 0x80c0_0000_00,
+                    width: 1_024,
+                    height: 1_024,
+                    pitch: 1_024,
+                    tile_mode: 27,
+                    pixel_format: MTLPixelFormat::RGBA8Unorm,
+                    bytes_per_pixel: 4,
+                },
+                destination_select: 0xfac,
+                base_mip_level,
+                mip_level_count: 1,
+                texture_type: 9,
+                layer_count: 1,
+            };
+            let underlying_mip_count = base_mip_level + 1;
+            let layout = mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)
+                .expect("exact underlying mip layout");
+            let raw = vec![0; layout.byte_count];
+            let texture =
+                super::create_exact_mode27_sampled_mip_view(&device, descriptor, &raw, false)
+                    .expect("exact Metal mip view");
+            assert_eq!(
+                texture.width(),
+                u64::from((descriptor.guest.width >> base_mip_level).max(1))
+            );
+            assert_eq!(
+                texture.height(),
+                u64::from((descriptor.guest.height >> base_mip_level).max(1))
+            );
+            assert_eq!(texture.mipmap_level_count(), 1);
+        }
     }
 
     #[test]

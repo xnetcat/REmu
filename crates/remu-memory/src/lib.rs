@@ -20,8 +20,10 @@ mod address_space;
 #[cfg(target_os = "macos")]
 pub use address_space::{
     AddressSpaceError, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
-    GuestPhysicalBacking, GuestProtection, GuestSharedMapOptions, GuestSharedMappingIdentity,
-    GuestVmaInfo, GuestVmaState, RequestedAddress, guest_shared_mapping_identity,
+    GuestPhysicalBacking, GuestProtection, GuestSharedBackingSegment, GuestSharedMapOptions,
+    GuestSharedMappingIdentity, GuestVmaInfo, GuestVmaState, RequestedAddress,
+    guest_shared_backing_alias_segments, guest_shared_backing_segments,
+    guest_shared_mapping_identity, read_guest_shared_backing, write_guest_shared_backing,
 };
 
 pub const PS5_MAIN_IMAGE_BASE: GuestAddress = GuestAddress::new(0x0000_0008_0000_0000);
