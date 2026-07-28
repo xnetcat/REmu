@@ -366,7 +366,6 @@ enum Mode27WorkOrigin {
     AcquireReload,
     SampledCacheCreate,
     StorageCreate,
-    AutomaticPromotion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1597,7 +1596,6 @@ struct ResidentGuestTexture {
     texture_type: u32,
     layer_count: u32,
     mip_level_count: u32,
-    inferred_hierarchy: bool,
     write_watch: GuestTextureWriteWatch,
     gpu_written: bool,
     content_version: u64,
@@ -1637,45 +1635,15 @@ struct GuestTextureWriteWatch {
     address: u64,
     byte_count: u64,
     ranges: Vec<CpuWriteWatch>,
-    declared_alias_ranges: Vec<(u64, u64)>,
 }
 
 impl GuestTextureWriteWatch {
     fn new(address: u64, byte_count: u64) -> Result<Self, String> {
-        Self::new_with_declared_byte_count(address, byte_count, byte_count)
-    }
-
-    fn new_with_declared_byte_count(
-        address: u64,
-        byte_count: u64,
-        declared_byte_count: u64,
-    ) -> Result<Self, String> {
-        if declared_byte_count == 0 || declared_byte_count > byte_count {
-            return Err(format!(
-                "guest texture declared range {declared_byte_count:#x} exceeds watched range {byte_count:#x}"
-            ));
-        }
         let segments = guest_shared_backing_alias_segments(address, byte_count).ok_or_else(|| {
             format!(
                 "guest texture range {address:#x}+{byte_count:#x} has no complete live shared backing"
             )
         })?;
-        let declared_alias_ranges = if declared_byte_count == byte_count {
-            segments
-                .iter()
-                .map(|segment| (segment.address, segment.byte_count))
-                .collect()
-        } else {
-            guest_shared_backing_alias_segments(address, declared_byte_count)
-                .ok_or_else(|| {
-                    format!(
-                        "guest texture declared range {address:#x}+{declared_byte_count:#x} has no complete live shared backing"
-                    )
-                })?
-                .into_iter()
-                .map(|segment| (segment.address, segment.byte_count))
-                .collect()
-        };
         let ranges = segments
             .into_iter()
             .map(|segment| {
@@ -1695,7 +1663,6 @@ impl GuestTextureWriteWatch {
             address,
             byte_count,
             ranges,
-            declared_alias_ranges,
         })
     }
 
@@ -1845,14 +1812,6 @@ impl GuestTextureWriteWatch {
         Self::ranges_overlap_alias(&self.ranges, address, byte_count, |watch| watch.range())
     }
 
-    #[cfg(test)]
-    fn overlaps_aliases(&self, other: &Self) -> bool {
-        self.ranges.iter().any(|watch| {
-            let (address, byte_count) = watch.range();
-            other.overlaps_alias_range(address, byte_count)
-        })
-    }
-
     fn alias_ranges(&self) -> Vec<(u64, u64)> {
         self.ranges.iter().map(CpuWriteWatch::range).collect()
     }
@@ -1861,15 +1820,6 @@ impl GuestTextureWriteWatch {
         ranges
             .iter()
             .any(|&(address, byte_count)| self.overlaps_alias_range(address, byte_count))
-    }
-
-    fn overlaps_declared_alias_range(&self, address: u64, byte_count: u64) -> bool {
-        Self::ranges_overlap_alias(
-            &self.declared_alias_ranges,
-            address,
-            byte_count,
-            |&(range_address, range_byte_count)| (range_address, range_byte_count),
-        )
     }
 
     fn ranges_overlap_alias<T>(
@@ -2136,13 +2086,10 @@ fn watch_resident_texture(
             watch_guest_texture(descriptor)
         } else {
             let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
-            let declared_byte_count = guest_texture_byte_count(descriptor)
-                .ok_or("resident base texture byte count overflows")?;
-            GuestTextureWriteWatch::new_with_declared_byte_count(
+            GuestTextureWriteWatch::new(
                 descriptor.address,
                 u64::try_from(layout.byte_count)
                     .map_err(|_| "mip chain byte count does not fit u64")?,
-                declared_byte_count,
             )
         }
     } else {
@@ -4111,7 +4058,6 @@ impl MetalPresenter {
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
                 mip_level_count: target.mip_level_count,
-                inferred_hierarchy: false,
                 write_watch,
                 gpu_written: false,
                 content_version: 0,
@@ -4206,7 +4152,6 @@ impl MetalPresenter {
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
                 mip_level_count: 1,
-                inferred_hierarchy: false,
                 write_watch,
                 gpu_written: false,
                 content_version: 0,
@@ -4883,18 +4828,6 @@ impl MetalPresenter {
             {
                 continue;
             }
-            // A hierarchy inferred from a single-level render target deliberately watches more
-            // guest backing than that target declared. Writes to neighboring allocations inside
-            // that speculative span must not replace a newer GPU-authored image. Once a shader
-            // explicitly declares the hierarchy, ensure_mipmapped_resident_texture_in_map clears
-            // this flag and ordinary CPU/GPU acquire semantics resume.
-            if resident.inferred_hierarchy && resident.gpu_written {
-                if resident.write_watch.is_dirty() {
-                    let _ = resident.write_watch.consume_dirty();
-                    resident.write_watch.rearm()?;
-                }
-                continue;
-            }
             // When the CPU is already authoritative for the complete resident, an acquire only
             // invalidates its old Metal copy. Rebuilding it here eagerly decodes large Unreal
             // render allocations even when several more acquires arrive before the image is used.
@@ -5074,24 +5007,9 @@ impl MetalPresenter {
                         .values()
                         .filter(|resident| resident.gpu_written)
                         .filter(|resident| {
-                            let overlaps_resident = if resident.inferred_hierarchy {
-                                // The automatically inferred hierarchy deliberately watches the
-                                // allocation following the render target so that a later explicit
-                                // mip view can reuse it. That speculative span commonly contains
-                                // unrelated post-process targets. Treating every such neighbor as
-                                // an alias forced a full Metal-to-CPU-to-Metal round trip before
-                                // almost every Silent Hill draw. Only the declared base allocation
-                                // is architecturally resident until a shader confirms the larger
-                                // hierarchy and clears `inferred_hierarchy`.
-                                resident.write_watch.overlaps_declared_alias_range(
-                                    sampled.guest.address,
-                                    sampled_bytes,
-                                )
-                            } else {
-                                resident
-                                    .write_watch
-                                    .overlaps_alias_range(sampled.guest.address, sampled_bytes)
-                            };
+                            let overlaps_resident = resident
+                                .write_watch
+                                .overlaps_alias_range(sampled.guest.address, sampled_bytes);
                             let aliases_sample = overlaps_resident
                                 && resident.descriptor != sampled.guest
                                 && !guest_texture_descriptors_share_storage(
@@ -5127,7 +5045,7 @@ impl MetalPresenter {
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 if logged.len() < 256 && logged.insert(key) {
                                     eprintln!(
-                                        "[REMu][METAL][ALIAS-FLUSH] resident={:#x}/{}x{}/p{}/{:?}/tile{}/mips{} inferred={} sampled={:#x}/{}x{}/p{}/{:?}/tile{}/base{}/mips{} pc={:#x} declared_overlap={}",
+                                        "[REMu][METAL][ALIAS-FLUSH] resident={:#x}/{}x{}/p{}/{:?}/tile{}/mips{} sampled={:#x}/{}x{}/p{}/{:?}/tile{}/base{}/mips{} pc={:#x} declared_overlap={}",
                                         resident.descriptor.address,
                                         resident.descriptor.width,
                                         resident.descriptor.height,
@@ -5135,7 +5053,6 @@ impl MetalPresenter {
                                         resident.descriptor.pixel_format,
                                         resident.descriptor.tile_mode,
                                         resident.mip_level_count,
-                                        resident.inferred_hierarchy,
                                         sampled.guest.address,
                                         sampled.guest.width,
                                         sampled.guest.height,
@@ -5798,15 +5715,9 @@ impl MetalPresenter {
                 .values()
                 .filter(|resident| resident.gpu_written)
                 .filter(|resident| {
-                    if resident.inferred_hierarchy {
-                        resident
-                            .write_watch
-                            .overlaps_declared_alias_range(copy.source_address, copy.byte_count)
-                    } else {
-                        resident
-                            .write_watch
-                            .overlaps_alias_range(copy.source_address, copy.byte_count)
-                    }
+                    resident
+                        .write_watch
+                        .overlaps_alias_range(copy.source_address, copy.byte_count)
                 })
                 .map(|resident| resident.descriptor)
                 .collect::<Vec<_>>();
@@ -11098,18 +11009,12 @@ fn ensure_resident_texture_in_map(
             texture_type: 9,
             layer_count: 1,
             mip_level_count: 1,
-            inferred_hierarchy: false,
             write_watch,
             gpu_written: false,
             content_version: 0,
         },
     );
     Ok(texture)
-}
-
-fn complete_2d_mip_level_count(descriptor: GuestTextureDescriptor) -> u32 {
-    let maximum_extent = descriptor.width.max(descriptor.height).max(1);
-    (u32::BITS - maximum_extent.leading_zeros()).min(16)
 }
 
 fn ensure_mipmapped_resident_texture_in_map(
@@ -11148,9 +11053,6 @@ fn ensure_mipmapped_resident_texture_in_map(
             WriteWatchRefresh::Active
             | WriteWatchRefresh::Reprotecting
             | WriteWatchRefresh::Renewed { .. } => {
-                if origin != Mode27WorkOrigin::AutomaticPromotion {
-                    resident.inferred_hierarchy = false;
-                }
                 return resident_texture_for_sample(resident, descriptor).ok_or_else(|| {
                     "resident mip hierarchy cannot represent storage view".to_owned()
                 });
@@ -11206,7 +11108,6 @@ fn ensure_mipmapped_resident_texture_in_map(
             texture_type: descriptor.texture_type,
             layer_count: descriptor.layer_count,
             mip_level_count: underlying_mip_count,
-            inferred_hierarchy: origin == Mode27WorkOrigin::AutomaticPromotion,
             write_watch,
             gpu_written: false,
             content_version: 0,
@@ -19326,80 +19227,6 @@ kernel void remu_sampler_cache_test(
                 .is_err(),
             "a retired multi-alias watch cannot authorize a later VA dereference"
         );
-    }
-
-    #[test]
-    fn inferred_texture_watch_distinguishes_declared_storage_from_speculative_neighbors() {
-        use remu_memory::{
-            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
-            GuestProtection,
-        };
-
-        let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
-        let backing =
-            GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
-        let base = memory.base();
-        let primary = memory
-            .map_shared(
-                GuestMapPlacement::Fixed(base),
-                4 * GUEST_PAGE_SIZE,
-                GUEST_PAGE_SIZE,
-                GuestProtection::READ_WRITE,
-                &backing,
-                0,
-            )
-            .expect("primary alias");
-        let alias_address = base
-            .checked_add(8 * GUEST_PAGE_SIZE)
-            .expect("alias address");
-        let alias = memory
-            .map_shared(
-                GuestMapPlacement::Fixed(alias_address),
-                4 * GUEST_PAGE_SIZE,
-                GUEST_PAGE_SIZE,
-                GuestProtection::READ_WRITE,
-                &backing,
-                0,
-            )
-            .expect("second alias");
-        let watch = super::GuestTextureWriteWatch::new_with_declared_byte_count(
-            primary.get(),
-            4 * GUEST_PAGE_SIZE,
-            GUEST_PAGE_SIZE,
-        )
-        .expect("watch speculative hierarchy");
-
-        assert!(watch.overlaps_alias_range(alias.get() + 2 * GUEST_PAGE_SIZE, GUEST_PAGE_SIZE));
-        assert!(
-            !watch
-                .overlaps_declared_alias_range(alias.get() + 2 * GUEST_PAGE_SIZE, GUEST_PAGE_SIZE)
-        );
-        assert!(watch.overlaps_declared_alias_range(alias.get(), GUEST_PAGE_SIZE));
-
-        let first_page =
-            super::GuestTextureWriteWatch::new(primary.get(), GUEST_PAGE_SIZE).expect("first page");
-        let first_page_through_alias =
-            super::GuestTextureWriteWatch::new(alias.get(), GUEST_PAGE_SIZE)
-                .expect("aliased first page");
-        let third_page = super::GuestTextureWriteWatch::new(
-            primary.get() + 2 * GUEST_PAGE_SIZE,
-            GUEST_PAGE_SIZE,
-        )
-        .expect("disjoint physical page");
-        assert!(first_page.overlaps_aliases(&first_page_through_alias));
-        assert!(!first_page.overlaps_aliases(&third_page));
-        assert!(guest_physical_ranges_overlap(
-            primary.get(),
-            GUEST_PAGE_SIZE,
-            alias.get(),
-            GUEST_PAGE_SIZE,
-        ));
-        assert!(!guest_physical_ranges_overlap(
-            primary.get(),
-            GUEST_PAGE_SIZE,
-            alias.get() + 2 * GUEST_PAGE_SIZE,
-            GUEST_PAGE_SIZE,
-        ));
     }
 
     #[test]
