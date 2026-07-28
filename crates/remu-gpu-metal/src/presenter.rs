@@ -108,6 +108,10 @@ static SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS: AtomicU64 = AtomicU64::new(0);
 static SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
 static SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_DEPTH_SAMPLE_HITS: AtomicU64 = AtomicU64::new(0);
+static SAMPLED_ALIAS_WRITEBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+static SAMPLED_ALIAS_WRITEBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+static SAMPLED_ALIAS_WRITEBACK_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_COMPILE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_COMPILE_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_COMPILE_COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -212,6 +216,8 @@ const DB_DEPTH_CLEAR: u32 = 0x00b;
 const DB_Z_INFO: u32 = 0x010;
 const DB_Z_READ_BASE: u32 = 0x012;
 const DB_Z_WRITE_BASE: u32 = 0x014;
+const DB_DEPTH_SIZE: u32 = 0x016;
+const DB_DEPTH_SLICE: u32 = 0x017;
 const DB_Z_READ_BASE_HI: u32 = 0x01a;
 const DB_Z_WRITE_BASE_HI: u32 = 0x01c;
 const DB_DEPTH_CONTROL: u32 = 0x200;
@@ -1950,6 +1956,26 @@ fn resident_texture_for_sample(
     if resident.mip_level_count < underlying_mip_count {
         return None;
     }
+    if guest_texture_descriptors_share_depth_sample_storage(
+        resident.descriptor,
+        sampled.guest,
+        sampled.destination_select,
+    ) {
+        RESIDENT_DEPTH_SAMPLE_HITS.fetch_add(1, Ordering::Relaxed);
+        if sampled.base_mip_level == 0 && sampled.mip_level_count.max(1) == resident.mip_level_count
+        {
+            return Some(resident.texture.clone());
+        }
+        return Some(resident.texture.new_texture_view_from_slice(
+            resident.texture.pixel_format(),
+            MTLTextureType::D2,
+            NSRange::new(
+                u64::from(sampled.base_mip_level),
+                u64::from(sampled.mip_level_count.max(1)),
+            ),
+            NSRange::new(0, 1),
+        ));
+    }
     if guest_texture_descriptors_share_storage(resident.descriptor, sampled.guest) {
         if sampled.base_mip_level == 0 && sampled.mip_level_count.max(1) == resident.mip_level_count
         {
@@ -2037,6 +2063,26 @@ fn resident_component_reordered_sample_is_eligible(
         && guest_texture_descriptors_share_component_reordered_storage(
             resident.descriptor,
             sampled.guest,
+        )
+}
+
+fn resident_depth_sample_is_eligible(
+    resident: &ResidentGuestTexture,
+    sampled: DecodedImageDescriptor,
+) -> bool {
+    let underlying_mip_count = sampled
+        .base_mip_level
+        .checked_add(sampled.mip_level_count.max(1));
+    resident.gpu_written
+        && resident.texture_type == 9
+        && resident.layer_count == 1
+        && sampled.texture_type == 9
+        && sampled.layer_count == 1
+        && underlying_mip_count.is_some_and(|count| resident.mip_level_count >= count)
+        && guest_texture_descriptors_share_depth_sample_storage(
+            resident.descriptor,
+            sampled.guest,
+            sampled.destination_select,
         )
 }
 
@@ -2789,7 +2835,7 @@ struct MetalPresenter {
     device: Option<Device>,
     layer: Option<MetalLayer>,
     command_queue: Option<metal::CommandQueue>,
-    presentation: PresentationResources,
+    presentation: Option<PresentationResources>,
     presentation_resolution: PresentationResolution,
     guest_bgra_bytes: Vec<u8>,
     frame_texture: Option<Texture>,
@@ -2854,7 +2900,15 @@ impl MetalPresenter {
         let command_queue = device.new_command_queue();
         command_queue.set_label("REmu guest command queue");
         let presentation_resolution = PresentationResolution::from_environment()?;
-        let presentation = create_presentation_resources(&device)?;
+        // Headless traces exercise the complete guest draw/compute/scanout path and capture the
+        // finalized texture before CAMetalLayer presentation. They must not initialize the
+        // window-only fullscreen pipeline: doing so both wastes startup time and makes a trace
+        // depend on macOS's external MTLCompilerService even when every guest metallib is cached.
+        let presentation = if headless_metal_requested() {
+            None
+        } else {
+            Some(create_presentation_resources(&device)?)
+        };
         let (shader_compile_sender, shader_compile_requests) =
             mpsc::sync_channel::<ShaderCompileRequest>(SHADER_COMPILE_QUEUE_CAPACITY);
         let (shader_compile_results, shader_compile_receiver) =
@@ -5077,6 +5131,7 @@ impl MetalPresenter {
                                 && !resident_component_reordered_sample_is_eligible(
                                     resident, sampled, comparison,
                                 )
+                                && !resident_depth_sample_is_eligible(resident, sampled)
                                 && !self.multisample_textures.iter().any(|(key, multisample)| {
                                     multisample.initialized
                                         && key.descriptor == resident.descriptor
@@ -5146,6 +5201,11 @@ impl MetalPresenter {
         if aliases.is_empty() {
             return Ok(());
         }
+        let alias_started = Instant::now();
+        let alias_bytes = aliases.iter().fold(0_u64, |total, &descriptor| {
+            total.saturating_add(guest_texture_byte_count(descriptor).unwrap_or_default())
+        });
+        let alias_count = aliases.len();
         self.wait_for_guest_command_batches()?;
         let device = self
             .device
@@ -5204,6 +5264,15 @@ impl MetalPresenter {
             write_resident_texture_contents_to_guest(&device, &queue, resident)?;
             resident.gpu_written = false;
         }
+        SAMPLED_ALIAS_WRITEBACK_COUNT.fetch_add(
+            u64::try_from(alias_count).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        SAMPLED_ALIAS_WRITEBACK_BYTES.fetch_add(alias_bytes, Ordering::Relaxed);
+        SAMPLED_ALIAS_WRITEBACK_NANOSECONDS.fetch_add(
+            u64::try_from(alias_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -5450,8 +5519,13 @@ impl MetalPresenter {
                 SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS.swap(0, Ordering::Relaxed);
             let resident_acquire_invalidations =
                 RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.swap(0, Ordering::Relaxed);
+            let depth_resident_hits = RESIDENT_DEPTH_SAMPLE_HITS.swap(0, Ordering::Relaxed);
+            let alias_writeback_count = SAMPLED_ALIAS_WRITEBACK_COUNT.swap(0, Ordering::Relaxed);
+            let alias_writeback_bytes = SAMPLED_ALIAS_WRITEBACK_BYTES.swap(0, Ordering::Relaxed);
+            let alias_writeback_nanoseconds =
+                SAMPLED_ALIAS_WRITEBACK_NANOSECONDS.swap(0, Ordering::Relaxed);
             eprintln!(
-                "[REMu][PERF-TEXTURE-CACHE] resident={} watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={}",
+                "[REMu][PERF-TEXTURE-CACHE] resident={} watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms",
                 self.sampled_texture_cache.len(),
                 self.sampled_texture_write_watches.len(),
                 cache_hits,
@@ -5460,6 +5534,10 @@ impl MetalPresenter {
                 cache_acquire_invalidations,
                 resident_acquire_invalidations,
                 cache_capacity_evictions,
+                depth_resident_hits,
+                alias_writeback_count,
+                alias_writeback_bytes as f64 / (1024.0 * 1024.0),
+                alias_writeback_nanoseconds as f64 / 1_000_000.0,
             );
             let snapshot_details = take_texture_snapshot_work_details();
             if !snapshot_details.is_empty() {
@@ -9071,9 +9149,13 @@ impl MetalPresenter {
         let encoder = command_buffer.new_render_command_encoder(pass);
         encoder.set_label("REMu scaled display-buffer presentation");
         if let Some(texture) = frame_texture.as_ref() {
+            let presentation = self
+                .presentation
+                .as_ref()
+                .expect("windowed presenter has presentation resources");
             let (source_width, source_height) = source_dimensions
                 .expect("every presentation texture has validated source dimensions");
-            encoder.set_render_pipeline_state(&self.presentation.pipeline);
+            encoder.set_render_pipeline_state(&presentation.pipeline);
             encoder.set_viewport(presentation_viewport(
                 source_width,
                 source_height,
@@ -9081,7 +9163,7 @@ impl MetalPresenter {
                 destination_height,
             ));
             encoder.set_fragment_texture(0, Some(texture));
-            encoder.set_fragment_sampler_state(0, Some(&self.presentation.sampler));
+            encoder.set_fragment_sampler_state(0, Some(&presentation.sampler));
             encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
         }
         encoder.end_encoding();
@@ -13006,26 +13088,29 @@ fn upload_image_textures(
                         .max_by_key(|(version, _, _)| *version)
                 })
                 .flatten();
-            let resident_descriptor =
-                (!comparison && matches!(descriptor.texture_type, 9 | 10))
-                    .then(|| {
-                        resident_guest_textures
-                            .get(&descriptor.guest)
-                            .filter(|resident| {
-                                resident.texture_type == descriptor.texture_type
-                                    && resident.layer_count == descriptor.layer_count
-                                    && resident.mip_level_count >= underlying_mip_count
-                            })
-                            .map(|resident| resident.descriptor)
-                            .or_else(|| {
-                                (descriptor.texture_type == 9).then(|| {
-                                    resident_guest_textures
-                                        .values()
-                                        .filter(|resident| {
-                                            resident.texture_type == 9
-                                                && resident.layer_count == 1
-                                                && resident.mip_level_count
-                                                    >= underlying_mip_count
+            let resident_descriptor = matches!(descriptor.texture_type, 9 | 10)
+                .then(|| {
+                    (!comparison)
+                        .then(|| {
+                            resident_guest_textures
+                                .get(&descriptor.guest)
+                                .filter(|resident| {
+                                    resident.texture_type == descriptor.texture_type
+                                        && resident.layer_count == descriptor.layer_count
+                                        && resident.mip_level_count >= underlying_mip_count
+                                })
+                                .map(|resident| resident.descriptor)
+                        })
+                        .flatten()
+                        .or_else(|| {
+                            (descriptor.texture_type == 9).then(|| {
+                                resident_guest_textures
+                                    .values()
+                                    .filter(|resident| {
+                                        resident.texture_type == 9
+                                            && resident.layer_count == 1
+                                            && resident.mip_level_count >= underlying_mip_count
+                                            && ((!comparison
                                                 && (guest_texture_descriptors_share_storage(
                                                     resident.descriptor,
                                                     descriptor.guest,
@@ -13033,14 +13118,17 @@ fn upload_image_textures(
                                                     resident,
                                                     descriptor,
                                                     comparison,
+                                                )))
+                                                || resident_depth_sample_is_eligible(
+                                                    resident, descriptor,
                                                 ))
-                                        })
-                                        .max_by_key(|resident| resident.content_version)
-                                        .map(|resident| resident.descriptor)
-                                })?
-                            })
-                    })
-                    .flatten();
+                                    })
+                                    .max_by_key(|resident| resident.content_version)
+                                    .map(|resident| resident.descriptor)
+                            })?
+                        })
+                })
+                .flatten();
             let resident_resolve = resident_descriptor.and_then(|resident_descriptor| {
                 let resident = resident_guest_textures.get_mut(&resident_descriptor)?;
                 let version = resident.content_version;
@@ -14511,12 +14599,19 @@ fn decode_depth_target(draw: &IndexedDraw) -> Result<Option<DecodedDepthTarget>,
     };
     let samples_log2 = (z_info >> 2) & 0x3;
     let sample_count = 1_u32 << samples_log2;
-    let tile_mode = (z_info >> 4) & 0x1f;
-    if !matches!(tile_mode, 0 | 27) {
+    // DB_Z_INFO does not carry the GFX10 texture SW_MODE in bits 4..8. Prospero's depth-target
+    // packet carries a legacy tile-mode index in bits 20..22; index zero selects the fixed
+    // 64-KiB depth layout. Shader resource descriptors expose that same allocation as SW mode
+    // 0x18 (kDepth). Treating index zero as a linear texture caused every depth-sampling pass to
+    // read back, reinterpret, and upload the full surface, and decoded the guest bytes wrongly.
+    let depth_tile_mode_index = (z_info >> 20) & 0x7;
+    if depth_tile_mode_index != 0 {
         return Err(format!(
-            "active depth target uses unsupported GFX10 swizzle mode {tile_mode}"
+            "active depth target uses unsupported tile-mode index {depth_tile_mode_index} in DB_Z_INFO={z_info:#010x}"
         ));
     }
+    const DEPTH_TILE_MODE: u32 = 0x18;
+    let tile_mode = DEPTH_TILE_MODE;
 
     let width = (size & 0x3fff)
         .checked_add(1)
@@ -14551,11 +14646,17 @@ fn decode_depth_target(draw: &IndexedDraw) -> Result<Option<DecodedDepthTarget>,
             "invalid depth target address={address:#x} extent={width}x{height}"
         ));
     }
-    let pitch = if tile_mode == 0 {
-        effective_linear_pitch(width, format.1).ok_or("linear depth-target pitch overflows")?
-    } else {
-        width
-    };
+    let (block_width, _) = tiled_block_dimensions(
+        65_536,
+        usize::try_from(format.1).map_err(|_| "depth element size does not fit usize")?,
+    )
+    .ok_or("depth target has an unsupported element size")?;
+    let pitch = usize::try_from(width)
+        .map_err(|_| "depth-target width does not fit usize")?
+        .div_ceil(block_width)
+        .checked_mul(block_width)
+        .and_then(|pitch| u32::try_from(pitch).ok())
+        .ok_or("depth-target pitch overflows")?;
     let compare = match (control >> 4) & 0x7 {
         0 => MTLCompareFunction::Never,
         1 => MTLCompareFunction::Less,
@@ -14571,16 +14672,35 @@ fn decode_depth_target(draw: &IndexedDraw) -> Result<Option<DecodedDepthTarget>,
         .map(f32::from_bits)
         .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
         .unwrap_or(1.0);
+    let texture = GuestTextureDescriptor {
+        address,
+        width,
+        height,
+        pitch,
+        tile_mode,
+        pixel_format: format.0,
+        bytes_per_pixel: format.1,
+    };
+    if trace_target_sampling() {
+        static LOGGED_DEPTH_TARGETS: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, u32, u32)>>> =
+            OnceLock::new();
+        let key = (address, width, height, z_info, control, render_control);
+        let mut logged = LOGGED_DEPTH_TARGETS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if logged.len() < 256 && logged.insert(key) {
+            let encoded_size = register_value(&draw.context_registers, DB_DEPTH_SIZE);
+            let encoded_slice = register_value(&draw.context_registers, DB_DEPTH_SLICE);
+            let bytes = guest_texture_byte_count(texture);
+            eprintln!(
+                "[REMu][METAL][DEPTH] address={address:#x} read={read_address:#x} write={write_address:#x} extent={width}x{height} pitch={pitch} format={:?} samples={sample_count} guest_tile={tile_mode} z_info={z_info:#010x} tile_index={depth_tile_mode_index} control={control:#010x} render_control={render_control:#010x} size_xy={size:#010x} depth_size={encoded_size:08x?} depth_slice={encoded_slice:08x?} bytes={bytes:x?}",
+                format.0,
+            );
+        }
+    }
     Ok(Some(DecodedDepthTarget {
-        texture: GuestTextureDescriptor {
-            address,
-            width,
-            height,
-            pitch,
-            tile_mode,
-            pixel_format: format.0,
-            bytes_per_pixel: format.1,
-        },
+        texture,
         compare,
         test_enabled: depth_enabled,
         write_enabled,
@@ -15549,6 +15669,26 @@ fn guest_texture_descriptors_share_component_reordered_storage(
         && guest_texture_descriptors_share_byte_storage(left, right)
 }
 
+fn guest_texture_descriptors_share_depth_sample_storage(
+    rendered: GuestTextureDescriptor,
+    sampled: GuestTextureDescriptor,
+    destination_select: u32,
+) -> bool {
+    let formats_are_depth_sample_views = matches!(
+        (rendered.pixel_format, sampled.pixel_format),
+        (MTLPixelFormat::Depth16Unorm, MTLPixelFormat::R16Unorm)
+            | (MTLPixelFormat::Depth32Float, MTLPixelFormat::R32Float)
+    );
+    // Prospero depth SRDs expose the native Z plane through R, optionally replicating it or
+    // supplying zero/one in the other channels. Metal samples the native depth texture as a
+    // scalar float, so these encodings need no CPU materialization or pixel-format conversion.
+    let supported_select = matches!(destination_select, 0 | 0x004 | 0x204 | 0x924);
+    formats_are_depth_sample_views
+        && supported_select
+        && guest_texture_descriptors_have_same_byte_layout(rendered, sampled)
+        && guest_texture_descriptors_share_byte_storage(rendered, sampled)
+}
+
 fn guest_texture_descriptors_share_byte_storage(
     left: GuestTextureDescriptor,
     right: GuestTextureDescriptor,
@@ -16446,6 +16586,10 @@ fn run_headless_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
         });
         submission.map_err(|error| format!("guest command batch submission failed: {error}"))?;
         presenter.retire_completed_presentations();
+        // `render` performs pending-flip upload and translated-scanout capture before it checks
+        // for a CAMetalLayer. This keeps headless traces faithful through the last guest-visible
+        // image stage while intentionally omitting only the host window composite.
+        presenter.render();
         presenter.update_window_title();
         if flow == PresenterFlow::Shutdown {
             eprintln!("[REMu][METAL] headless event loop stopped");
@@ -16527,6 +16671,7 @@ mod tests {
         guest_physical_ranges_overlap, guest_shared_mapping_identity, guest_texture_byte_count,
         guest_texture_descriptors_overlap,
         guest_texture_descriptors_share_component_reordered_storage,
+        guest_texture_descriptors_share_depth_sample_storage,
         guest_texture_descriptors_share_storage, guest_texture_raw_matches,
         half_float_to_srgb_unorm8, half_float_to_unorm8, headless_metal_value_is_enabled,
         image_component_class, image_destination_select_is_native,
@@ -17687,12 +17832,60 @@ kernel void remu_sampler_cache_test(
             .expect("enabled depth target");
         assert_eq!(depth.texture.address, address);
         assert_eq!((depth.texture.width, depth.texture.height), (8, 8));
-        assert_eq!(depth.texture.pitch, 128);
-        assert_eq!(depth.texture.tile_mode, 0);
+        assert_eq!(depth.texture.pitch, 256);
+        assert_eq!(depth.texture.tile_mode, 24);
         assert_eq!(depth.texture.pixel_format, MTLPixelFormat::Depth16Unorm);
         assert_eq!(depth.compare, MTLCompareFunction::GreaterEqual);
         assert!(!depth.write_enabled);
         assert_eq!(initial_depth_clear_for_target(depth), 0.0);
+    }
+
+    #[test]
+    fn depth_target_uses_fixed_mode24_layout_and_rejects_nonzero_tile_index() {
+        let address = 0x0070_1412_0000;
+        let mut draw = indexed_draw(0, 0, 0);
+        append_depth_target_registers(&mut draw, address, 3_840, 2_160, 0xa000_0003, 0x66);
+
+        let depth = decode_depth_target(&draw)
+            .expect("fixed Prospero depth layout")
+            .expect("enabled depth target");
+        assert_eq!(depth.texture.tile_mode, 24);
+        assert_eq!(depth.texture.pitch, 3_840);
+        assert_eq!(
+            guest_texture_byte_count(depth.texture),
+            Some(3_840 * 2_176 * 4)
+        );
+
+        draw.context_registers
+            .iter_mut()
+            .find(|register| register.offset == DB_Z_INFO)
+            .expect("depth info")
+            .value |= 1 << 20;
+        let error = decode_depth_target(&draw).expect_err("nonzero tile index is unsupported");
+        assert!(error.contains("tile-mode index 1"), "{error}");
+    }
+
+    #[test]
+    fn native_depth_surface_matches_shader_r32_view_without_writeback() {
+        let rendered = GuestTextureDescriptor {
+            address: 0x0080_16c1_0000,
+            width: 3_840,
+            height: 2_160,
+            pitch: 3_840,
+            tile_mode: 24,
+            pixel_format: MTLPixelFormat::Depth32Float,
+            bytes_per_pixel: 4,
+        };
+        let sampled = GuestTextureDescriptor {
+            pixel_format: MTLPixelFormat::R32Float,
+            ..rendered
+        };
+        assert!(guest_texture_descriptors_share_depth_sample_storage(
+            rendered, sampled, 0x204
+        ));
+        assert!(!guest_texture_descriptors_share_depth_sample_storage(
+            rendered, sampled, 0xfac
+        ));
     }
 
     #[test]
@@ -18969,10 +19162,14 @@ kernel void remu_sampler_cache_test(
         attachment.set_clear_color(MTLClearColor::new(1.0, 0.0, 1.0, 1.0));
         let present = queue.new_command_buffer().to_owned();
         let encoder = present.new_render_command_encoder(pass);
-        encoder.set_render_pipeline_state(&presenter.presentation.pipeline);
+        let presentation = presenter
+            .presentation
+            .as_ref()
+            .expect("test presenter has presentation resources");
+        encoder.set_render_pipeline_state(&presentation.pipeline);
         encoder.set_viewport(presentation_viewport(640, 360, 320, 180));
         encoder.set_fragment_texture(0, Some(output_texture));
-        encoder.set_fragment_sampler_state(0, Some(&presenter.presentation.sampler));
+        encoder.set_fragment_sampler_state(0, Some(&presentation.sampler));
         encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
         encoder.end_encoding();
         present.commit();
