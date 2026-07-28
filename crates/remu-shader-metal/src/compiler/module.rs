@@ -167,9 +167,12 @@ impl Compiler<'_> {
             } else {
                 ""
             };
+            // GCN cube resources are addressed with face-atlas coordinates produced by
+            // V_CUBEID/SC/TC/MA, not with a direction vector, so they bind as 2D arrays and
+            // sampling indexes the face layer directly (see emit_image_sample).
             let texture_kind = if kind.comparison {
                 match kind.dimension {
-                    3 => "depthcube",
+                    3 => "depth2d_array",
                     _ => "depth2d",
                 }
             } else if kind.storage {
@@ -181,7 +184,7 @@ impl Compiler<'_> {
             } else {
                 match kind.dimension {
                     2 => "texture3d",
-                    3 => "texturecube",
+                    3 => "texture2d_array",
                     _ => "texture2d",
                 }
             };

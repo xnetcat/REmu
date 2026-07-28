@@ -32,9 +32,10 @@ mod tiling;
 use self::cache::{GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT};
 use self::decode::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_BLEND0_CONTROL,
-    CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, CB_TARGET_MASK,
-    DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO, PA_SC_AA_MASK_X0Y0_X1Y0,
-    PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, decode_depth_target, decode_image_descriptor,
+    CB_COLOR_CONTROL, CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT,
+    CB_TARGET_MASK, ColorOperationMode, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
+    DEFAULT_CB_COLOR_CONTROL, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
+    decode_color_operation_mode, decode_depth_target, decode_image_descriptor,
     decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
     decode_render_targets, decode_scissor, decode_viewport, fallback_image_descriptor,
     graphics_pipeline_key, image_component_class, initial_depth_clear_for_target,
@@ -46,11 +47,12 @@ use self::decode::{
 use self::decode::{
     CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_BASE, CB_COLOR0_BASE_EXT,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, DB_DEPTH_CLEAR,
-    DB_RENDER_CONTROL, DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI,
-    SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
-    VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length, decode_fast_clear_color,
-    decode_render_targets_from_registers, decode_scanout_target, graphics_shader_resource_key,
-    initial_depth_clear_value, metal_primitive_topology_class, raw_video_out_layout_is_linear,
+    DB_DEPTH_VIEW, DB_RENDER_CONTROL, DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE,
+    DB_Z_WRITE_BASE_HI, SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE,
+    VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length,
+    decode_fast_clear_color, decode_render_targets_from_registers, decode_scanout_target,
+    graphics_shader_resource_key, initial_depth_clear_value, metal_primitive_topology_class,
+    raw_video_out_layout_is_linear,
 };
 #[cfg(test)]
 use self::diagnostics::parse_diagnostic_hex_address;
@@ -61,26 +63,28 @@ use self::diagnostics::{
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
     diagnostic_disable_blending, diagnostic_disable_culling, diagnostic_disable_depth,
     diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
-    diagnostic_dump_target_address, diagnostic_dump_target_before_pixel_shader,
-    diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
-    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
-    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
-    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
-    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
-    diagnostic_force_visible_clip_depth, diagnostic_global_binding_head,
-    diagnostic_overlapping_global_writers, diagnostic_overlapping_memory_copies,
-    diagnostic_overlapping_texture_writers, diagnostic_procedural_rectangle_fallback,
-    diagnostic_related_texture_writers, diagnostic_scanout_writer, diagnostic_texture_writer,
-    diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
-    diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
+    diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_match_index,
+    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
+    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
+    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
+    diagnostic_global_binding_head, diagnostic_overlapping_global_writers,
+    diagnostic_overlapping_memory_copies, diagnostic_overlapping_texture_writers,
+    diagnostic_procedural_rectangle_fallback, diagnostic_related_texture_writers,
+    diagnostic_scanout_writer, diagnostic_texture_writer, diagnostic_texture_writer_enabled,
+    diagnostic_trace_all_target_contents, diagnostic_trace_target_contents,
+    diagnostic_trace_target_maximum_draw, diagnostic_trace_target_stride,
     diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
     dump_msl_compute_filter_matches, dump_msl_instruction_filter_matches,
     dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video,
-    record_diagnostic_global_writers, record_diagnostic_memory_copy,
-    record_diagnostic_scanout_writer, record_diagnostic_texture_writer,
-    should_record_diagnostic_target_writer, trace_image_descriptors, trace_msaa_writes,
-    trace_scanout_writes, trace_target_sampling, trace_video_target_compute_consumer,
-    trace_video_target_draw_consumer, video_target_binding_summary,
+    evaluation_samples_layered_comparison, record_diagnostic_global_writers,
+    record_diagnostic_memory_copy, record_diagnostic_scanout_writer,
+    record_diagnostic_texture_writer, should_record_diagnostic_target_writer,
+    trace_image_descriptors, trace_msaa_writes, trace_scanout_writes, trace_target_sampling,
+    trace_video_target_compute_consumer, trace_video_target_draw_consumer,
+    video_target_binding_summary,
 };
 use self::format::{
     compressed_texture_block_extent, decode_sampled_texture_format, half_float_to_f32,
@@ -97,8 +101,8 @@ use self::present::{
 };
 use self::readback::{
     capture_guest_frame, guest_frame_fingerprint, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, read_texture_linear, read_texture_volume_linear,
-    write_resident_texture_contents_to_guest,
+    native_texture_capture_to_bgra, read_texture_array_linear, read_texture_linear,
+    read_texture_volume_linear, write_resident_texture_contents_to_guest,
 };
 #[cfg(test)]
 use self::sampler::sampler_lod_bias;
@@ -136,15 +140,16 @@ use self::stats::{
 use self::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    completed_command_buffer_gpu_duration,
+    completed_command_buffer_gpu_duration, guest_batch_writes_overlap,
 };
 #[cfg(test)]
 use self::submission::{apply_pending_guest_memory_writes, write_back_pending_globals};
 #[cfg(test)]
 use self::texture::{
     apply_image_destination_select, comparison_depth32_upload,
-    create_exact_mode27_sampled_mip_view, decode_sampled_texture_linear_from_raw,
-    depth_array_face_descriptor, ensure_mipmapped_resident_texture_in_map,
+    create_exact_mode27_sampled_mip_view, create_sampled_guest_texture,
+    decode_sampled_texture_linear_from_raw, depth_array_face_descriptor,
+    depth_array_face_set_is_complete, ensure_mipmapped_resident_texture_in_map,
     guest_texture_raw_matches, image_destination_select_is_native,
     new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
     sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_raw_range,
@@ -160,19 +165,21 @@ use self::texture::{
     write_watched_guest_texture_linear,
 };
 use self::tiling::{
-    copy_linear_to_tiled, copy_tiled_to_linear_at_z, decode_mode27_mip_chain_from_raw,
-    effective_linear_pitch, encode_mode27_mip_chain_into_raw, guest_physical_ranges_overlap,
-    guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_component_reordered_storage,
+    copy_linear_to_tiled, copy_tiled_to_linear_at_z, decode_mode5_mip_chain_from_raw,
+    decode_mode27_mip_chain_from_raw, effective_linear_pitch, encode_mode27_mip_chain_into_raw,
+    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
+    guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
-    mode27_mip_chain_layout, render_resolve_candidate_matches, tiled_block_dimensions,
+    mode5_mip_chain_layout, mode27_mip_chain_layout, render_resolve_candidate_matches,
+    tiled_block_dimensions,
 };
 #[cfg(test)]
 use self::tiling::{
-    mode5_within_block_byte_offset, mode9_within_block_byte_offset,
-    mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_source_byte_offset,
-    mode27_surface_z_xor, mode27_within_block_byte_offset,
-    mode27_within_block_byte_offset_for_format,
+    encode_mode5_mip_chain_into_raw, mode5_within_block_byte_offset,
+    mode9_within_block_byte_offset, mode24_within_block_byte_offset_for_format,
+    mode27_block_dimensions, mode27_source_byte_offset, mode27_surface_z_xor,
+    mode27_within_block_byte_offset, mode27_within_block_byte_offset_for_format,
 };
 
 #[cfg(test)]
@@ -827,7 +834,6 @@ struct GuestMemoryWaitTracker {
 struct GuestRenderPassKey {
     targets: Vec<(GuestTextureDescriptor, u32, bool, u32, u32, u32, u32, u32)>,
     depth: Option<(GuestTextureDescriptor, u32, bool, u32)>,
-    resolve_multisample_targets: bool,
 }
 
 struct OpenGuestRenderPass {
@@ -882,9 +888,17 @@ struct MetalPresenter {
     compiling_shader_pairs: HashSet<GraphicsPipelineKey>,
     failed_shader_pairs: HashSet<GraphicsPipelineKey>,
     failed_draw_execution: HashSet<GraphicsPipelineKey>,
+    /// Draws whose execution failed after pipeline compilation, keyed by
+    /// (export shader address, pixel shader address). Every failing execution counts, not just
+    /// the first: a scene pass failing every frame must be visible in every run's perf trail
+    /// instead of being silently dropped after one log line.
+    dropped_draw_executions: HashMap<(u64, u64), u64>,
     compiled_compute_pipelines: HashMap<ComputePipelineKey, CompiledComputePipeline>,
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
+    /// Compute dispatches whose execution failed, keyed by shader address; same contract as
+    /// `dropped_draw_executions`.
+    dropped_compute_executions: HashMap<u64, u64>,
     resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     depth_array_textures: HashMap<DepthArrayKey, DepthArrayResidentTexture>,
     direct_scanout_textures: HashMap<u64, DirectScanoutTexture>,
@@ -1019,9 +1033,11 @@ impl MetalPresenter {
             compiling_shader_pairs: HashSet::new(),
             failed_shader_pairs: HashSet::new(),
             failed_draw_execution: HashSet::new(),
+            dropped_draw_executions: HashMap::new(),
             compiled_compute_pipelines: HashMap::new(),
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),
+            dropped_compute_executions: HashMap::new(),
             resident_guest_textures: HashMap::new(),
             depth_array_textures: HashMap::new(),
             direct_scanout_textures: HashMap::new(),

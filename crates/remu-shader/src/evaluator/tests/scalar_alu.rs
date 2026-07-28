@@ -36,8 +36,12 @@ fn initializes_merged_export_wave_info_before_user_sgprs() {
         user_data_scalar_register_base: 8,
     };
 
-    let evaluation = evaluate_shader(&TestMemory::default(), &shader, Default::default())
-        .expect("merged export evaluation");
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("merged export evaluation");
 
     assert_eq!(evaluation.initial_scalar_registers[3], 0x4040);
     assert_eq!(evaluation.scalar_registers[4], 0x4040);

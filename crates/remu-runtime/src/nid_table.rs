@@ -326,6 +326,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "GrQ9s4IrNaQ" => "sceAudioOutGetPortState",
         "KMcEa+rHsIo" => "sceAvPlayerAddSource",
         "x8uvuFOPZhU" => "sceAvPlayerAddSourceEx",
+        "buMCiJftcfw" => "sceAvPlayerChangeStream",
+        "av8Z++94rs0" => "sceAvPlayerSetTrickSpeed",
         "NkJwDzKmIlw" => "sceAvPlayerClose",
         "wwM99gjFf1Y" => "sceAvPlayerCurrentTime",
         "Wnp1OVcrZgk" => "sceAvPlayerGetAudioData",

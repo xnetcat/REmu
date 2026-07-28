@@ -162,17 +162,19 @@ pub(crate) use audio_out2_abi::{
 pub(crate) use av_player::av_player_nv12_layout;
 #[cfg(test)]
 pub(crate) use av_player::{
-    AV_PLAYER_ERROR_OPERATION_FAILED, AV_PLAYER_STREAM_TYPE_AUDIO, AV_PLAYER_STREAM_TYPE_VIDEO,
-    av_player_resolve_source, av_player_video_catch_up_target, av_player_video_frame_is_due,
-    av_player_write_stream_info, av_player_write_video_frame_info,
+    AV_PLAYER_ERROR_INVALID_PARAMS, AV_PLAYER_ERROR_OPERATION_FAILED, AV_PLAYER_STREAM_TYPE_AUDIO,
+    AV_PLAYER_STREAM_TYPE_VIDEO, av_player_resolve_source, av_player_tool,
+    av_player_video_catch_up_target, av_player_video_frame_is_due, av_player_write_stream_info,
+    av_player_write_video_frame_info,
 };
 pub(crate) use av_player::{
-    av_player_add_source, av_player_add_source_ex, av_player_close, av_player_current_time,
-    av_player_get_audio_data, av_player_get_stream_info, av_player_get_video_data,
-    av_player_init_ex, av_player_is_active, av_player_jump_to_time, av_player_pause,
-    av_player_post_init, av_player_set_log_callback, av_player_set_looping, av_player_start,
-    av_player_stop, av_player_stream_count, av_player_validate_handle,
-    invoke_av_player_event_callbacks, prepare_av_player_video_buffers,
+    av_player_add_source, av_player_add_source_ex, av_player_change_stream, av_player_close,
+    av_player_current_time, av_player_get_audio_data, av_player_get_stream_info,
+    av_player_get_video_data, av_player_init_ex, av_player_is_active, av_player_jump_to_time,
+    av_player_pause, av_player_post_init, av_player_resume, av_player_set_log_callback,
+    av_player_set_looping, av_player_set_trick_speed, av_player_start, av_player_stop,
+    av_player_stream_count, av_player_validate_handle, invoke_av_player_event_callbacks,
+    prepare_av_player_video_buffers,
 };
 #[cfg(test)]
 pub(crate) use dialog::{
@@ -327,9 +329,9 @@ pub(crate) use video_out::{
 };
 pub(crate) use video_out::{
     VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE, VIDEO_OUT_ERROR_INVALID_INDEX,
-    VIDEO_OUT_ERROR_INVALID_VALUE, av_player_flip_interval_microseconds, pace_video_out_flip,
-    video_out_get_output_status, video_out_is_flip_pending, video_out_open,
-    video_out_set_buffer_attribute2, video_out_set_flip_rate, video_out_submit_flip,
+    VIDEO_OUT_ERROR_INVALID_VALUE, pace_video_out_flip, video_out_get_output_status,
+    video_out_is_flip_pending, video_out_open, video_out_set_buffer_attribute2,
+    video_out_set_flip_rate, video_out_submit_flip,
 };
 
 #[cfg(target_os = "macos")]
@@ -495,6 +497,12 @@ struct AvPlayerInstance {
     playing_since: Option<Instant>,
     elapsed: Duration,
     looping: bool,
+    /// Media position freshly started decoders begin at. JumpToTime sets it so the ffmpeg
+    /// processes are launched with an input-side seek instead of replaying from byte zero.
+    decoder_seek: Duration,
+    /// Playback-rate percentage from sceAvPlayerSetTrickSpeed; 100 is normal speed. It scales
+    /// the player media clock, not media timestamps.
+    trick_speed_percent: u32,
     video_decoder: Option<Child>,
     video_output: Option<ChildStdout>,
     raw_video_frame: Vec<u8>,
@@ -504,11 +512,6 @@ struct AvPlayerInstance {
     video_buffer_stride: usize,
     next_video_buffer: usize,
     next_video_frame: u64,
-    /// Completed VideoOut flip and decoded-frame indices at the start of the current media-clock
-    /// segment. Native AVPlayer does not release every decoded frame merely because the guest
-    /// polls quickly; tying the clock to retired scanout work also keeps its three buffers from
-    /// being overwritten while the emulated GPU is still consuming them.
-    video_clock_origin: Option<(u64, u64)>,
     /// Host media-clock segment established only after the guest has consumed its first decoded
     /// frame. This prevents a long initial shader compile from seeking a short splash straight to
     /// EOF, while still allowing later frames to catch up when emulation runs below movie FPS.
@@ -541,11 +544,11 @@ impl AvPlayerInstance {
         self.elapsed = Duration::ZERO;
         self.end_of_stream = false;
         self.next_video_frame = 0;
-        self.video_clock_origin = None;
         self.video_catch_up_origin = None;
         self.next_audio_frame = 0;
         self.next_video_buffer = 0;
         self.next_audio_buffer = 0;
+        self.decoder_seek = Duration::ZERO;
     }
 
     fn playback_elapsed(&self) -> Duration {
@@ -553,15 +556,9 @@ impl AvPlayerInstance {
             .map_or(self.elapsed, |started| self.elapsed + started.elapsed())
     }
 
-    fn decoded_playback_elapsed(&self) -> Duration {
-        if self.source.is_none() {
-            return self.playback_elapsed();
-        }
-        let video = (self.frames_per_second.is_finite() && self.frames_per_second > 0.0)
-            .then(|| Duration::from_secs_f64(self.next_video_frame as f64 / self.frames_per_second))
-            .unwrap_or_default();
-        let audio = Duration::from_secs_f64(self.next_audio_frame as f64 * 1_024.0 / 48_000.0);
-        video.max(audio)
+    fn media_clock_elapsed(&self) -> Duration {
+        self.playback_elapsed()
+            .mul_f64(f64::from(self.trick_speed_percent) / 100.0)
     }
 }
 
@@ -2310,8 +2307,13 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         }
         return ProbeImportReturn::integer(0);
     }
-    let result = dispatch_probe_import(nid, call_args, stack_args, &mut state);
+    // AVPlayer state notifications originate on the native library's controller thread. Deliver
+    // only callbacks queued by an earlier import so AddSource/Start/Pause always return before
+    // their notification can re-enter Unity's backend. Calling a freshly queued Ready callback
+    // inside AddSourceEx lets Unity complete preparation and then overwrite that state when the
+    // still-active AddSourceEx caller resumes.
     let av_player_callbacks = std::mem::take(&mut state.av_player.pending_callbacks);
+    let result = dispatch_probe_import(nid, call_args, stack_args, &mut state);
     drop(state);
     invoke_av_player_event_callbacks(av_player_callbacks);
     // Paced after the dispatch lock is released: the submitting thread waits for its own vblank,
@@ -3381,9 +3383,12 @@ fn dispatch_probe_import(
         "UbQoYawOsfY" => av_player_is_active(arguments[0], state),
         "9y5v+fGN4Wk" => av_player_pause(arguments[0], state),
         "XC9wM+xULz8" => av_player_jump_to_time(arguments, state),
-        "w5moABNwnRY" | "ET4Gr-Uu07s" => av_player_start(arguments[0], state),
+        "w5moABNwnRY" => av_player_resume(arguments[0], state),
+        "ET4Gr-Uu07s" => av_player_start(arguments[0], state),
         "ZC17w3vB5Lo" => av_player_stop(arguments[0], state),
         "OVths0xGfho" => av_player_set_looping(arguments, state),
+        "buMCiJftcfw" => av_player_change_stream(arguments, state),
+        "av8Z++94rs0" => av_player_set_trick_speed(arguments, state),
         "Wnp1OVcrZgk" => av_player_get_audio_data(arguments, state),
         "o3+RWnHViSg" => av_player_get_video_data(arguments, false, state),
         "JdksQu8pNdQ" => av_player_get_video_data(arguments, true, state),

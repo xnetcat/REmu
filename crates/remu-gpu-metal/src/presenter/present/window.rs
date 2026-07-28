@@ -193,6 +193,34 @@ impl MetalPresenter {
             if !queue_diagnostics.is_empty() {
                 eprintln!("[REMu][PERF-QUEUES] {queue_diagnostics}");
             }
+            if !self.dropped_draw_executions.is_empty()
+                || !self.dropped_compute_executions.is_empty()
+            {
+                // Executions that failed after pipeline compilation are dropped; keep the running
+                // totals visible in every run's perf trail so a scene pass failing each frame
+                // cannot disappear behind its single once-per-key log line.
+                let dropped_draws: u64 = self.dropped_draw_executions.values().sum();
+                let dropped_dispatches: u64 = self.dropped_compute_executions.values().sum();
+                let worst_draw = self
+                    .dropped_draw_executions
+                    .iter()
+                    .max_by_key(|(_, count)| **count)
+                    .map_or_else(String::new, |((es, ps), count)| {
+                        format!(" worst_draw=es:{es:#x}/ps:{ps:#x}/{count}")
+                    });
+                let worst_dispatch = self
+                    .dropped_compute_executions
+                    .iter()
+                    .max_by_key(|(_, count)| **count)
+                    .map_or_else(String::new, |(cs, count)| {
+                        format!(" worst_cs={cs:#x}/{count}")
+                    });
+                eprintln!(
+                    "[REMu][PERF-DROPPED] draws={dropped_draws}/{} keys compute={dropped_dispatches}/{} keys{worst_draw}{worst_dispatch}",
+                    self.dropped_draw_executions.len(),
+                    self.dropped_compute_executions.len(),
+                );
+            }
             let snapshot_count = TEXTURE_SNAPSHOT_COUNT.swap(0, Ordering::Relaxed);
             let snapshot_bytes = TEXTURE_SNAPSHOT_BYTES.swap(0, Ordering::Relaxed);
             let snapshot_nanoseconds = TEXTURE_SNAPSHOT_NANOSECONDS.swap(0, Ordering::Relaxed);

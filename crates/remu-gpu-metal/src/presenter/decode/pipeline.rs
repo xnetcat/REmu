@@ -17,6 +17,28 @@ use remu_gpu::IndexedDraw;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColorOperationMode {
+    Disable,
+    Normal,
+    EliminateFastClear,
+    Resolve,
+    FmaskDecompress,
+}
+
+pub(crate) fn decode_color_operation_mode(control: u32) -> Result<ColorOperationMode, String> {
+    match (control >> 4) & 0x7 {
+        0 => Ok(ColorOperationMode::Disable),
+        1 => Ok(ColorOperationMode::Normal),
+        2 => Ok(ColorOperationMode::EliminateFastClear),
+        3 => Ok(ColorOperationMode::Resolve),
+        5 => Ok(ColorOperationMode::FmaskDecompress),
+        mode => Err(format!(
+            "unsupported CB_COLOR_CONTROL operation mode {mode} in {control:#010x}"
+        )),
+    }
+}
+
 pub(crate) fn metal_primitive_type(guest: u32) -> Result<MTLPrimitiveType, String> {
     match guest {
         1 => Ok(MTLPrimitiveType::Point),

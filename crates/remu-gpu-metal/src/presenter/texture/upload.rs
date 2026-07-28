@@ -7,18 +7,20 @@ use super::{
     ResidentGuestTexture, SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     SampledTextureKey, UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
-    create_exact_mode27_sampled_mip_view, create_sampled_guest_texture, decode_image_descriptor,
-    decode_sampled_texture_linear_from_raw, ensure_mipmapped_resident_texture_in_map,
-    ensure_resident_texture_in_map, fallback_image_descriptor, guest_texture_byte_count,
+    create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
+    create_sampled_guest_texture, decode_image_descriptor, decode_sampled_texture_linear_from_raw,
+    ensure_mipmapped_resident_texture_in_map, ensure_resident_texture_in_map,
+    fallback_image_descriptor, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_storage, is_storage_image_opcode, is_writable_image_opcode,
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
     refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
     resident_component_reordered_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
-    sampled_texture_key, sampled_texture_uses_exact_mode27_mips,
-    sampler_uses_normalized_coordinates, snapshot_watched_sampled_texture_raw,
-    storage_image_requires_mip_hierarchy, texture_element_layout, trace_target_sampling,
+    sampled_texture_key, sampled_texture_uses_exact_mode5_mips,
+    sampled_texture_uses_exact_mode27_mips, sampler_uses_normalized_coordinates,
+    snapshot_watched_sampled_texture_raw, storage_image_requires_mip_hierarchy,
+    texture_element_layout, trace_target_sampling,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
@@ -26,6 +28,24 @@ use remu_shader::{ShaderEvaluation, image_is_comparison};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
+
+fn diagnostic_r32_float_sample_override() -> Option<f32> {
+    static VALUE: OnceLock<Option<f32>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("REMU_DIAGNOSTIC_R32F_SAMPLE")
+            .ok()?
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+    })
+}
+
+fn diagnostic_zero_r16_row_samples() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_DIAGNOSTIC_ZERO_R16_ROW").is_some_and(|value| value == "1")
+    })
+}
 
 pub(crate) fn comparison_depth32_upload(
     format: MTLPixelFormat,
@@ -337,7 +357,60 @@ pub(crate) fn upload_image_textures(
                         .map(|entry| entry.texture.clone())
                 })
                 .flatten();
-            let texture = if fallback {
+            let texture = if !storage
+                && descriptor.guest.height == 1
+                && descriptor.guest.pixel_format == MTLPixelFormat::R16Unorm
+                && diagnostic_zero_r16_row_samples()
+            {
+                static LOGGED: OnceLock<()> = OnceLock::new();
+                LOGGED.get_or_init(|| {
+                    eprintln!(
+                        "[REMu][METAL][DIAGNOSTIC] replacing sampled R16Unorm rows with zero"
+                    );
+                });
+                let byte_count = usize::try_from(descriptor.guest.width)
+                    .ok()
+                    .and_then(|width| width.checked_mul(2))
+                    .ok_or("diagnostic R16Unorm row byte count overflows")?;
+                let texture = create_sampled_guest_texture(
+                    device,
+                    queue,
+                    descriptor.guest,
+                    &vec![0; byte_count],
+                    0,
+                    1,
+                    descriptor.texture_type,
+                    descriptor.layer_count,
+                    false,
+                )?;
+                texture.set_label("REMu diagnostic zero R16Unorm row");
+                texture
+            } else if !storage
+                && descriptor.guest.width == 1
+                && descriptor.guest.height == 1
+                && descriptor.guest.pixel_format == MTLPixelFormat::R32Float
+                && let Some(value) = diagnostic_r32_float_sample_override()
+            {
+                static LOGGED: OnceLock<()> = OnceLock::new();
+                LOGGED.get_or_init(|| {
+                    eprintln!(
+                        "[REMu][METAL][DIAGNOSTIC] overriding sampled 1x1 R32Float images with {value}"
+                    );
+                });
+                let texture = create_sampled_guest_texture(
+                    device,
+                    queue,
+                    descriptor.guest,
+                    &value.to_le_bytes(),
+                    0,
+                    1,
+                    descriptor.texture_type,
+                    descriptor.layer_count,
+                    false,
+                )?;
+                texture.set_label("REMu diagnostic R32Float sample");
+                texture
+            } else if fallback {
                 let key = sampled_texture_key(descriptor, comparison);
                 if let Some(texture) = fallback_texture_cache.get(&key) {
                     texture.clone()
@@ -434,8 +507,15 @@ pub(crate) fn upload_image_textures(
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
                     let raw = snapshot_watched_sampled_texture_raw(descriptor, &write_watch)
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                    let texture =
-                        if sampled_texture_uses_exact_mode27_mips(descriptor) {
+                    let texture = if sampled_texture_uses_exact_mode5_mips(descriptor) {
+                        create_exact_mode5_sampled_mip_view(
+                            device,
+                            descriptor,
+                            &raw,
+                            comparison,
+                        )
+                        .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?
+                    } else if sampled_texture_uses_exact_mode27_mips(descriptor) {
                             create_exact_mode27_sampled_mip_view(
                                 device,
                                 descriptor,

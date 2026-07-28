@@ -49,7 +49,7 @@ pub(crate) fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescr
         width
     };
     if trace_image_descriptors() && (tile_mode == 9 || (width >= 700 && height >= 500)) {
-        static LOGGED_IMAGES: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, u32, u32)>>> =
+        static LOGGED_IMAGES: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, u32, u32, u32, u32)>>> =
             OnceLock::new();
         let key = (
             address,
@@ -58,6 +58,8 @@ pub(crate) fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescr
             unified_format,
             descriptor_pitch,
             tile_mode,
+            base_level,
+            last_level,
         );
         let mut logged = LOGGED_IMAGES
             .get_or_init(|| Mutex::new(HashSet::new()))
@@ -65,7 +67,7 @@ pub(crate) fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescr
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if logged.len() < 128 && logged.insert(key) {
             eprintln!(
-                "[REMu][METAL][IMAGE] mode={tile_mode} address={address:#x} extent={width}x{height} pitch={descriptor_pitch} format={data_format}/{number_format} unified={unified_format} type={texture_type}"
+                "[REMu][METAL][IMAGE] mode={tile_mode} address={address:#x} extent={width}x{height} pitch={descriptor_pitch} format={data_format}/{number_format} unified={unified_format} type={texture_type} mips={base_level}..={last_level}"
             );
         }
     }

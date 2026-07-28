@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{
-    Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLStorageMode, MTLStoreAction,
-    MTLTextureType, MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
+    Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLRegion, MTLStorageMode,
+    MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
 };
 use remu_shader::PixelOutputKind;
+use std::ffi::c_void;
 
 use super::{
     DecodedRenderTarget, GuestTextureDescriptor, MetalPresenter, PendingTextureReadback,
     TextureReadbackLayout, guest_texture_byte_count, half_float_to_srgb_unorm8,
     half_float_to_unorm8, linear_unorm8_to_srgb_unorm8, native_texture_capture_to_bgra,
-    parse_diagnostic_hex_address, should_record_diagnostic_target_writer, unsigned_float_to_f32,
+    parse_diagnostic_hex_address, read_texture_array_linear,
+    should_record_diagnostic_target_writer, unsigned_float_to_f32,
 };
 
 #[test]
@@ -68,6 +70,23 @@ fn capture_maps_half_float_scanout_channels_to_unorm8() {
     assert_eq!(half_float_to_unorm8(0x7c00), 255);
     assert_eq!(half_float_to_unorm8(0x7e00), 0);
     assert_eq!(half_float_to_srgb_unorm8(0x3800), 188);
+}
+
+#[test]
+fn capture_maps_depth16_to_grayscale() {
+    let descriptor = GuestTextureDescriptor {
+        address: 0x1_0000,
+        width: 3,
+        height: 1,
+        pitch: 3,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::Depth16Unorm,
+        bytes_per_pixel: 2,
+    };
+    assert_eq!(
+        native_texture_capture_to_bgra(&[0, 0, 0, 128, 255, 255], descriptor),
+        Some(vec![0, 0, 0, 255, 188, 188, 188, 255, 255, 255, 255, 255]),
+    );
 }
 
 #[test]
@@ -244,6 +263,53 @@ fn private_depth32_target_readback_preserves_float_samples() {
             .map(|sample| f32::from_ne_bytes(sample.try_into().expect("four-byte depth")))
             .all(|sample| (sample - 0.25).abs() <= f32::EPSILON)
     );
+}
+
+#[test]
+fn texture_array_readback_flattens_slices_in_layer_order() {
+    let device = Device::system_default().expect("Metal device");
+    let queue = device.new_command_queue();
+    let descriptor = GuestTextureDescriptor {
+        address: 0,
+        width: 2,
+        height: 2,
+        pitch: 2,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::R16Unorm,
+        bytes_per_pixel: 2,
+    };
+    let metal_descriptor = TextureDescriptor::new();
+    metal_descriptor.set_texture_type(MTLTextureType::D2Array);
+    metal_descriptor.set_pixel_format(descriptor.pixel_format);
+    metal_descriptor.set_width(u64::from(descriptor.width));
+    metal_descriptor.set_height(u64::from(descriptor.height));
+    metal_descriptor.set_array_length(3);
+    metal_descriptor.set_storage_mode(MTLStorageMode::Shared);
+    metal_descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&metal_descriptor);
+    for slice in 0..3_u64 {
+        let values = [u16::try_from(slice + 1).expect("small slice"); 4];
+        texture.replace_region_in_slice(
+            MTLRegion::new_2d(0, 0, 2, 2),
+            0,
+            slice,
+            values.as_ptr().cast::<c_void>(),
+            4,
+            8,
+        );
+    }
+
+    let bytes = read_texture_array_linear(&device, &queue, &texture, descriptor)
+        .expect("read all array slices");
+    assert_eq!(bytes.len(), 24);
+    for (slice, image) in bytes.chunks_exact(8).enumerate() {
+        let expected = u16::try_from(slice + 1).expect("small slice");
+        assert!(
+            image
+                .chunks_exact(2)
+                .all(|value| u16::from_ne_bytes(value.try_into().expect("two bytes")) == expected)
+        );
+    }
 }
 
 #[test]

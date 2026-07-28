@@ -2,24 +2,25 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_REGISTER_STRIDE,
-    CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, CompiledComputePipeline, DB_DEPTH_CONTROL,
-    DB_DEPTH_SIZE_XY, DB_Z_INFO, DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX,
-    DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT, DIAGNOSTIC_PIXEL_OUTPUT_WIDTH,
-    DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX, DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY,
-    DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
-    GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
-    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_INDEX_BUFFER_INDEX, NGG_MESH_THREADS,
-    NGG_MESH_VERTICES_PER_GROUP, OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0,
-    PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, append_unique_global_writebacks,
-    append_unique_guest_write_ranges, capture_guest_frame, capture_target_sample_textures,
-    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
-    create_global_argument_buffer, decode_depth_target, decode_image_descriptor,
-    decode_raster_state, decode_render_targets, decode_scissor, decode_viewport,
-    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
-    diagnostic_disable_culling, diagnostic_disable_depth, diagnostic_disable_depth_and_culling,
-    diagnostic_dump_complex_msaa, diagnostic_dump_target_address,
+    CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_CONTROL,
+    CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, ColorOperationMode,
+    CompiledComputePipeline, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
+    DEFAULT_CB_COLOR_CONTROL, DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
+    DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
+    DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY,
+    GraphicsPipelineKey, GuestBatchFlushReason, GuestBatchWork, GuestRenderPassKey, GuestScissor,
+    GuestTextureDescriptor, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX,
+    NGG_MESH_INDEX_BUFFER_INDEX, NGG_MESH_THREADS, NGG_MESH_VERTICES_PER_GROUP,
+    OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
+    append_unique_global_writebacks, append_unique_guest_write_ranges, capture_guest_frame,
+    capture_target_sample_textures, collect_pending_global_writebacks,
+    collect_pending_guest_write_ranges, compile_metal_compute_library, compute_pipeline_key,
+    compute_program_can_split_wave64, create_global_argument_buffer, decode_color_operation_mode,
+    decode_depth_target, decode_image_descriptor, decode_raster_state, decode_render_targets,
+    decode_scissor, decode_viewport, diagnostic_capture_pixel_output,
+    diagnostic_capture_vertex_position, diagnostic_disable_culling, diagnostic_disable_depth,
+    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
     diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_match_index,
     diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
@@ -29,17 +30,18 @@ use super::{
     diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
     diagnostic_texture_writer, diagnostic_texture_writer_enabled,
     diagnostic_trace_all_target_contents, diagnostic_trace_target_contents,
-    diagnostic_trace_target_maximum_draw, diagnostic_use_draw_merged_wave_counts,
-    diagnostic_video_chain_selected_draw, dump_compute_shader_msl, dump_msl_compute_filter_matches,
-    dump_shader_pair_msl, evaluation_samples_large_linear_video, guest_frame_fingerprint,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage,
-    image_resource_descriptor_is_null, initial_depth_clear_for_target,
-    initial_render_target_clear_color, is_storage_image_opcode, metal_nonindexed_vertex_count,
-    metal_primitive_type, metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra,
-    read_draw_indices, read_texture_linear, read_texture_volume_linear,
-    record_diagnostic_global_writers, record_diagnostic_scanout_writer,
-    record_diagnostic_texture_writer, register_value, render_target_fast_clear_color,
-    sampled_image_bindings, shader_scalar_metadata_for_registers,
+    diagnostic_trace_target_maximum_draw, diagnostic_trace_target_stride,
+    diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
+    dump_compute_shader_msl, dump_msl_compute_filter_matches, dump_shader_pair_msl,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
+    guest_frame_fingerprint, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_storage, half_float_to_f32, image_resource_descriptor_is_null,
+    initial_depth_clear_for_target, initial_render_target_clear_color, is_storage_image_opcode,
+    metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
+    native_texture_capture_to_bgra, read_draw_indices, read_texture_array_linear,
+    read_texture_linear, read_texture_volume_linear, record_diagnostic_global_writers,
+    record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
+    render_target_fast_clear_color, sampled_image_bindings, shader_scalar_metadata_for_registers,
     should_record_diagnostic_target_writer, snapshot_guest_texture_raw, trace_image_descriptors,
     trace_msaa_writes, trace_scanout_writes, trace_target_sampling, upload_image_textures,
     validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
@@ -71,6 +73,42 @@ impl MetalPresenter {
         let targets = decode_render_targets(draw)?;
         let depth = decode_depth_target(draw)?;
         let raster = decode_raster_state(draw)?;
+        let color_control = register_value(&draw.context_registers, CB_COLOR_CONTROL)
+            .unwrap_or(DEFAULT_CB_COLOR_CONTROL);
+        let color_operation = decode_color_operation_mode(color_control)?;
+        if matches!(
+            color_operation,
+            ColorOperationMode::Resolve
+                | ColorOperationMode::EliminateFastClear
+                | ColorOperationMode::FmaskDecompress
+        ) {
+            // CB_COLOR_CONTROL special operations use a draw packet only as a command-processor
+            // trigger; its attached shader is not rasterized. REmu keeps color residents
+            // decompressed and resolves every ordinary Metal MSAA pass, so ending the current
+            // pass publishes the already-current single-sample image. Executing the trigger
+            // shader as a normal draw overwrote Superliminal's HDR scene with constant white.
+            if self
+                .open_guest_batch
+                .as_mut()
+                .is_some_and(super::GuestCommandBatch::end_render_pass)
+            {
+                self.statistics.render_pass_ends_for_target_change = self
+                    .statistics
+                    .render_pass_ends_for_target_change
+                    .saturating_add(1);
+            }
+            if trace_target_sampling() {
+                static LOGGED_COLOR_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
+                let sequence = LOGGED_COLOR_OPERATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][COLOR-OP] draw={} operation={color_operation:?} control={color_control:#010x} targets={targets:?}",
+                        draw.sequence,
+                    );
+                }
+            }
+            return Ok(());
+        }
         self.capture_scanout_before_pixel_shader(draw, &targets)?;
         if trace_scanout_writes() && draw.sequence >= diagnostic_dump_target_minimum_draw() {
             static LOGGED_SCANOUT_WRITES: AtomicUsize = AtomicUsize::new(0);
@@ -230,29 +268,20 @@ impl MetalPresenter {
             .pixel_shader_evaluation
             .as_ref()
             .ok_or("draw has no pixel resource evaluation")?;
-        // Unity lowers color clears to a resource-free fullscreen draw. On Gen5 the clear updates
-        // the multisample attachment without publishing a new shader-readable resolve; a later
-        // content pass performs that resolve. Resolving every Metal pass made the final white
-        // clear overwrite the adjacent single-sample image sampled by Superliminal's postprocess.
-        let multisample_constant_clear = targets.iter().any(|target| target.sample_count > 1)
-            && depth.is_none()
-            && !draw.indexed
-            && draw.index_count == 3
-            && draw.instance_count == 1
-            && draw
-                .pixel_shader
-                .as_ref()
-                .is_some_and(|shader| shader.program.instructions.len() <= 6)
-            && pixel_evaluation.image_bindings.is_empty()
-            && pixel_evaluation.global_memory_bindings.is_empty();
-        let resolve_multisample_targets = !multisample_constant_clear;
         if trace_msaa_writes() && draw.sequence >= diagnostic_dump_target_minimum_draw() {
             static LOGGED_MULTISAMPLE_WRITES: AtomicUsize = AtomicUsize::new(0);
             for target in targets.iter().filter(|target| target.sample_count > 1) {
                 let write = LOGGED_MULTISAMPLE_WRITES.fetch_add(1, Ordering::Relaxed);
                 if write < 2_048 {
+                    let blend = key
+                        .targets
+                        .iter()
+                        .find(|state| state.guest_slot == target.guest_slot)
+                        .map(|state| state.blend);
+                    let color_control = register_value(&draw.context_registers, CB_COLOR_CONTROL)
+                        .unwrap_or_default();
                     eprintln!(
-                        "[REMu][METAL][MSAA-WRITE] draw={} es={:#x} ps={:#x} instructions={} indexed={} count={} instances={} target={:#x} samples={} resolve={} depth={} sampled={} globals={}",
+                        "[REMu][METAL][MSAA-WRITE] draw={} es={:#x} ps={:#x} instructions={} indexed={} count={} instances={} target={:#x} samples={} depth={} sampled={} globals={} color_control={color_control:#010x} blend={blend:?}",
                         draw.sequence,
                         draw.export_shader_address,
                         draw.pixel_shader_address,
@@ -264,26 +293,11 @@ impl MetalPresenter {
                         draw.instance_count,
                         target.texture.address,
                         target.sample_count,
-                        resolve_multisample_targets,
                         depth.is_some(),
                         pixel_evaluation.image_bindings.len(),
                         pixel_evaluation.global_memory_bindings.len(),
                     );
                 }
-            }
-        }
-        if multisample_constant_clear && trace_target_sampling() {
-            static LOGGED_MULTISAMPLE_CLEARS: AtomicUsize = AtomicUsize::new(0);
-            let sequence = LOGGED_MULTISAMPLE_CLEARS.fetch_add(1, Ordering::Relaxed) + 1;
-            if sequence <= 16 || sequence.is_power_of_two() {
-                eprintln!(
-                    "[REMu][METAL][MSAA-CLEAR] draw={} ps={:#x} instructions={} preserves prior resolve",
-                    draw.sequence,
-                    draw.pixel_shader_address,
-                    draw.pixel_shader
-                        .as_ref()
-                        .map_or(0, |shader| shader.program.instructions.len()),
-                );
             }
         }
         if diagnostic_texture_writer_enabled() {
@@ -395,8 +409,7 @@ impl MetalPresenter {
                     target.texture.height,
                 )?;
                 target_textures.push(multisample);
-                target_resolve_textures
-                    .push(resolve_multisample_targets.then_some(resolved_texture));
+                target_resolve_textures.push(Some(resolved_texture));
                 if clear_multisample {
                     let clear_color =
                         render_target_fast_clear_color(target, &draw.context_registers)
@@ -874,7 +887,6 @@ impl MetalPresenter {
                     (depth.clear_depth as f32).to_bits(),
                 )
             }),
-            resolve_multisample_targets,
         };
         let needs_new_render_pass = self
             .open_guest_batch
@@ -1182,9 +1194,7 @@ impl MetalPresenter {
             } else {
                 if target.sample_count > 1 {
                     self.mark_multisample_texture_initialized(target.texture, target.sample_count);
-                    if resolve_multisample_targets {
-                        self.mark_resident_texture_written_preserving_multisample(target.texture);
-                    }
+                    self.mark_resident_texture_written_preserving_multisample(target.texture);
                 } else {
                     self.mark_resident_texture_written(target.texture);
                 }
@@ -1285,6 +1295,12 @@ impl MetalPresenter {
                 .flatten()
             })
             .or_else(|| {
+                (diagnostic_dump_shadow_consumer()
+                    && evaluation_samples_layered_comparison(pixel_evaluation))
+                .then(|| targets.first())
+                .flatten()
+            })
+            .or_else(|| {
                 let address = diagnostic_dump_target_address()?;
                 targets.iter().find(|target| {
                     if address == 0 {
@@ -1318,6 +1334,35 @@ impl MetalPresenter {
         {
             static TARGET_MATCHES: AtomicUsize = AtomicUsize::new(0);
             let target_match = TARGET_MATCHES.fetch_add(1, Ordering::Relaxed);
+            if diagnostic_dump_shadow_consumer()
+                && (target_match < 32 || target_match.is_multiple_of(128))
+            {
+                eprintln!(
+                    "[REMu][METAL][SHADOW-CONSUMER] index={target_match} draw={} ps={:#x} count={} target={:#x} pipeline_targets={:?} depth={depth:?} depth_control={:#010x} z_info={:#010x}",
+                    draw.sequence,
+                    draw.pixel_shader_address,
+                    draw.index_count,
+                    target.texture.address,
+                    key.targets,
+                    register_value(&draw.context_registers, DB_DEPTH_CONTROL).unwrap_or_default(),
+                    register_value(&draw.context_registers, DB_Z_INFO).unwrap_or_default(),
+                );
+                if target_match == 0 {
+                    let image_descriptors = pixel_evaluation
+                        .image_bindings
+                        .iter()
+                        .map(|binding| {
+                            (
+                                binding.pc,
+                                binding.opcode,
+                                decode_image_descriptor(&binding.resource_descriptor),
+                                binding.sampler_descriptor.as_slice(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    eprintln!("[REMu][METAL][SHADOW-CONSUMER-IMAGES] {image_descriptors:08x?}");
+                }
+            }
             static DUMPED: AtomicBool = AtomicBool::new(false);
             if target_match == diagnostic_dump_target_match_index()
                 && DUMPED
@@ -1384,22 +1429,25 @@ impl MetalPresenter {
                             )?,
                             ..uploaded.descriptor.guest
                         };
-                        let sampled_bytes = match if uploaded.texture.texture_type()
-                            == MTLTextureType::D3
-                        {
-                            read_texture_volume_linear(
+                        let sampled_bytes = match match uploaded.texture.texture_type() {
+                            MTLTextureType::D3 => read_texture_volume_linear(
                                 &device,
                                 &queue,
                                 &uploaded.texture,
                                 readback_descriptor,
-                            )
-                        } else {
-                            read_texture_linear(
+                            ),
+                            MTLTextureType::D2Array => read_texture_array_linear(
                                 &device,
                                 &queue,
                                 &uploaded.texture,
                                 readback_descriptor,
-                            )
+                            ),
+                            _ => read_texture_linear(
+                                &device,
+                                &queue,
+                                &uploaded.texture,
+                                readback_descriptor,
+                            ),
                         } {
                             Ok(bytes) => bytes,
                             Err(error) => {
@@ -1420,30 +1468,36 @@ impl MetalPresenter {
                         if capture_target_sample_textures()
                             && let Some(directory) = self.capture_directory.as_deref()
                         {
-                            let capture_descriptor =
-                                if uploaded.texture.texture_type() == MTLTextureType::D3 {
-                                    let Some(height) = readback_descriptor
-                                        .height
-                                        .checked_mul(
-                                            u32::try_from(uploaded.texture.depth())
-                                                .unwrap_or(u32::MAX),
-                                        )
-                                    else {
-                                        eprintln!(
-                                            "[REMu][METAL] could not flatten target 3D sample pc={:#x}: extent overflow",
-                                            binding.pc
-                                        );
-                                        return None;
-                                    };
-                                    GuestTextureDescriptor {
-                                        height,
-                                        pitch: readback_descriptor.width,
-                                        tile_mode: 0,
-                                        ..readback_descriptor
-                                    }
+                            let capture_descriptor = if matches!(
+                                uploaded.texture.texture_type(),
+                                MTLTextureType::D3 | MTLTextureType::D2Array
+                            ) {
+                                let slices = if uploaded.texture.texture_type()
+                                    == MTLTextureType::D3
+                                {
+                                    uploaded.texture.depth()
                                 } else {
-                                    readback_descriptor
+                                    uploaded.texture.array_length()
                                 };
+                                let Some(height) = readback_descriptor
+                                    .height
+                                    .checked_mul(u32::try_from(slices).unwrap_or(u32::MAX))
+                                else {
+                                    eprintln!(
+                                        "[REMu][METAL] could not flatten layered target sample pc={:#x}: extent overflow",
+                                        binding.pc
+                                    );
+                                    return None;
+                                };
+                                GuestTextureDescriptor {
+                                    height,
+                                    pitch: readback_descriptor.width,
+                                    tile_mode: 0,
+                                    ..readback_descriptor
+                                }
+                            } else {
+                                readback_descriptor
+                            };
                             match native_texture_capture_to_bgra(
                                 &sampled_bytes,
                                 capture_descriptor,
@@ -1486,10 +1540,33 @@ impl MetalPresenter {
                                 )
                             })
                             .map(|resident| {
+                                let contents = read_texture_linear(
+                                    &device,
+                                    &queue,
+                                    &resident.texture,
+                                    resident.descriptor,
+                                )
+                                .ok();
                                 (
                                     resident.descriptor,
                                     resident.gpu_written,
                                     resident.content_version,
+                                    contents.as_ref().map(|contents| {
+                                        contents.iter().filter(|&&value| value != 0).count()
+                                    }),
+                                    contents
+                                        .as_ref()
+                                        .map(|contents| guest_frame_fingerprint(contents)),
+                                    contents.as_ref().map(|contents| {
+                                        (
+                                            contents.iter().copied().min(),
+                                            contents.iter().copied().max(),
+                                            contents
+                                                .get(..contents.len().min(32))
+                                                .unwrap_or(&[])
+                                                .to_vec(),
+                                        )
+                                    }),
                                 )
                             })
                             .collect::<Vec<_>>();
@@ -1610,7 +1687,15 @@ impl MetalPresenter {
                             })
                             .unwrap_or_default();
                         Some((
-                            binding.pc,
+                            (
+                                binding.pc,
+                                binding.opcode,
+                                binding.sampler_descriptor.clone(),
+                                uploaded.descriptor.texture_type,
+                                uploaded.descriptor.layer_count,
+                                uploaded.texture.texture_type(),
+                                uploaded.texture.array_length(),
+                            ),
                             uploaded.descriptor.guest,
                             resident,
                             writer,
@@ -1731,6 +1816,32 @@ impl MetalPresenter {
                             .chunks_exact(5)
                             .filter(|pixel| pixel[0] != 0 && pixel[1..].iter().any(|&v| v != 0))
                             .count();
+                        let mut finite = 0_usize;
+                        let mut sum = [0.0_f64; 4];
+                        let mut minimum = [f32::INFINITY; 4];
+                        let mut maximum = [f32::NEG_INFINITY; 4];
+                        let mut above_one = [0_usize; 4];
+                        for pixel in words.chunks_exact(5).filter(|pixel| pixel[0] != 0) {
+                            let values: [f32; 4] = std::array::from_fn(|component| {
+                                f32::from_bits(pixel[component + 1])
+                            });
+                            if values.iter().all(|value| value.is_finite()) {
+                                finite += 1;
+                                for component in 0..4 {
+                                    sum[component] += f64::from(values[component]);
+                                    minimum[component] = minimum[component].min(values[component]);
+                                    maximum[component] = maximum[component].max(values[component]);
+                                    above_one[component] += usize::from(values[component] > 1.0);
+                                }
+                            }
+                        }
+                        let mean = sum.map(|value| {
+                            if finite == 0 {
+                                0.0
+                            } else {
+                                value / finite as f64
+                            }
+                        });
                         let first = words
                             .chunks_exact(5)
                             .enumerate()
@@ -1747,7 +1858,9 @@ impl MetalPresenter {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        Some((covered, nonzero, first))
+                        Some((
+                            covered, nonzero, finite, minimum, maximum, mean, above_one, first,
+                        ))
                     });
                 eprintln!(
                     "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_summaries:x?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals={:x?} pixel_globals={:x?}",
@@ -1802,6 +1915,8 @@ impl MetalPresenter {
         if diagnostic_trace_target_contents()
             && draw.sequence >= diagnostic_dump_target_minimum_draw()
             && draw.sequence <= diagnostic_trace_target_maximum_draw()
+            && (draw.sequence - diagnostic_dump_target_minimum_draw())
+                .is_multiple_of(diagnostic_trace_target_stride())
             && let Some(target) = targets.iter().find(|target| {
                 target.sample_count > 1
                     && target.texture.width == 1_920
@@ -1839,6 +1954,31 @@ impl MetalPresenter {
                 .clone()
                 .filter(|pixel| *pixel == WHITE_RGBA16F)
                 .count();
+            let mut sums = [0.0_f64; 4];
+            let mut minimum = [f32::INFINITY; 4];
+            let mut maximum = [f32::NEG_INFINITY; 4];
+            let mut finite_pixels = 0_usize;
+            for pixel in pixels.clone() {
+                let values: [f32; 4] = std::array::from_fn(|component| {
+                    let offset = component * 2;
+                    half_float_to_f32(u16::from_le_bytes([pixel[offset], pixel[offset + 1]]))
+                });
+                if values.iter().all(|value| value.is_finite()) {
+                    finite_pixels += 1;
+                    for component in 0..4 {
+                        sums[component] += f64::from(values[component]);
+                        minimum[component] = minimum[component].min(values[component]);
+                        maximum[component] = maximum[component].max(values[component]);
+                    }
+                }
+            }
+            let mean = sums.map(|sum| {
+                if finite_pixels == 0 {
+                    0.0
+                } else {
+                    sum / finite_pixels as f64
+                }
+            });
             let class = if zero == pixel_count {
                 0_u8
             } else if white == pixel_count {
@@ -1860,7 +2000,7 @@ impl MetalPresenter {
                     _ => "mixed",
                 };
                 eprintln!(
-                    "[REMu][METAL][TARGET-CONTENT] draw={} ps={:#x} ps_insns={} count={} instances={} address={:#x} class={} zero={} white={} pixels={} fingerprint={:016x} mask={:#x} aa_mask={:08x}/{:08x} scissor={scissor:?} viewport=({:.1},{:.1} {:.1}x{:.1} {:.3}..{:.3}) depth={depth:?} raster={raster:?}",
+                    "[REMu][METAL][TARGET-CONTENT] draw={} ps={:#x} ps_insns={} count={} instances={} address={:#x} class={} zero={} white={} pixels={} finite={} min={minimum:?} max={maximum:?} mean={mean:?} fingerprint={:016x} mask={:#x} aa_mask={:08x}/{:08x} scissor={scissor:?} viewport=({:.1},{:.1} {:.1}x{:.1} {:.3}..{:.3}) depth={depth:?} raster={raster:?}",
                     draw.sequence,
                     draw.pixel_shader_address,
                     draw.pixel_shader
@@ -1873,6 +2013,7 @@ impl MetalPresenter {
                     zero,
                     white,
                     pixel_count,
+                    finite_pixels,
                     guest_frame_fingerprint(&bytes),
                     target.write_mask,
                     register_value(&draw.context_registers, PA_SC_AA_MASK_X0Y0_X1Y0)

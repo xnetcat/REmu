@@ -1,9 +1,11 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::GuestMipChainLayout;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, ResidentGuestTexture, WriteWatchRefresh,
+    compressed_texture_block_extent, decode_mode5_mip_chain_from_raw,
     decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout, record_mode27_work_detail,
     record_texture_work, refresh_resident_texture_write_watch, resident_texture_for_sample,
     snapshot_watched_guest_range, watch_resident_texture,
@@ -128,8 +130,27 @@ pub(crate) fn create_mipmapped_guest_texture(
     mip_level_count: u32,
     linear_levels: &[Vec<u8>],
 ) -> Result<Texture, String> {
-    let started = Instant::now();
     let layout = mode27_mip_chain_layout(guest, mip_level_count)?;
+    create_mipmapped_guest_texture_from_layout(
+        device,
+        guest,
+        &layout,
+        linear_levels,
+        MTLTextureUsage::RenderTarget
+            | MTLTextureUsage::ShaderRead
+            | MTLTextureUsage::ShaderWrite
+            | MTLTextureUsage::PixelFormatView,
+    )
+}
+
+fn create_mipmapped_guest_texture_from_layout(
+    device: &Device,
+    guest: GuestTextureDescriptor,
+    layout: &GuestMipChainLayout,
+    linear_levels: &[Vec<u8>],
+    usage: MTLTextureUsage,
+) -> Result<Texture, String> {
+    let started = Instant::now();
     if linear_levels.len() != layout.levels.len() {
         return Err(format!(
             "Metal mip upload has {} levels, expected {}",
@@ -142,14 +163,11 @@ pub(crate) fn create_mipmapped_guest_texture(
     descriptor.set_pixel_format(guest.pixel_format);
     descriptor.set_width(u64::from(guest.width));
     descriptor.set_height(u64::from(guest.height));
-    descriptor.set_mipmap_level_count(u64::from(mip_level_count));
-    descriptor.set_storage_mode(MTLStorageMode::Shared);
-    descriptor.set_usage(
-        MTLTextureUsage::RenderTarget
-            | MTLTextureUsage::ShaderRead
-            | MTLTextureUsage::ShaderWrite
-            | MTLTextureUsage::PixelFormatView,
+    descriptor.set_mipmap_level_count(
+        u64::try_from(layout.levels.len()).expect("validated mip count fits u64"),
     );
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(usage);
     let texture = device.new_texture(&descriptor);
     for (level_index, (&level, linear)) in layout.levels.iter().zip(linear_levels).enumerate() {
         let expected = level
@@ -167,8 +185,24 @@ pub(crate) fn create_mipmapped_guest_texture(
             MTLRegion::new_2d(
                 0,
                 0,
-                u64::try_from(level.width).expect("validated mip width fits u64"),
-                u64::try_from(level.height).expect("validated mip height fits u64"),
+                u64::from(
+                    guest
+                        .width
+                        .checked_shr(
+                            u32::try_from(level_index).expect("validated mip index fits u32"),
+                        )
+                        .unwrap_or(0)
+                        .max(1),
+                ),
+                u64::from(
+                    guest
+                        .height
+                        .checked_shr(
+                            u32::try_from(level_index).expect("validated mip index fits u32"),
+                        )
+                        .unwrap_or(0)
+                        .max(1),
+                ),
             ),
             u64::try_from(level_index).expect("validated mip index fits u64"),
             linear.as_ptr().cast::<c_void>(),
@@ -184,6 +218,161 @@ pub(crate) fn create_mipmapped_guest_texture(
         started.elapsed(),
     );
     Ok(texture)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn create_exact_mode5_sampled_mip_view(
+    device: &Device,
+    descriptor: DecodedImageDescriptor,
+    raw: &[u8],
+    comparison: bool,
+) -> Result<Texture, String> {
+    if comparison {
+        return Err(format!(
+            "exact mode-5 comparison-sampled mip view base={} count={} is not implemented",
+            descriptor.base_mip_level, descriptor.mip_level_count
+        ));
+    }
+    if !matches!(descriptor.texture_type, 9 | 11 | 13)
+        || descriptor.layer_count == 0
+        || descriptor.guest.tile_mode != 5
+        || descriptor.mip_level_count == 0
+    {
+        return Err(format!(
+            "exact mode-5 sampled mip view requires a nonempty 2D or array resource, got type={} layers={} tile={} base={} count={}",
+            descriptor.texture_type,
+            descriptor.layer_count,
+            descriptor.guest.tile_mode,
+            descriptor.base_mip_level,
+            descriptor.mip_level_count
+        ));
+    }
+    let underlying_mip_count = descriptor
+        .base_mip_level
+        .checked_add(descriptor.mip_level_count)
+        .ok_or("sampled mip range overflows")?;
+    let layout = super::mode5_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
+    let layer_count = usize::try_from(descriptor.layer_count)
+        .map_err(|_| "sampled layer count does not fit usize")?;
+    let expected = layout
+        .byte_count
+        .checked_mul(layer_count)
+        .ok_or("mode-5 layered mip-chain byte count overflows")?;
+    if raw.len() != expected {
+        return Err(format!(
+            "mode-5 layered mip source has {} bytes, expected {expected}",
+            raw.len()
+        ));
+    }
+    let linear_layers = raw
+        .chunks_exact(layout.byte_count)
+        .map(|layer| {
+            decode_mode5_mip_chain_from_raw(descriptor.guest, underlying_mip_count, layer)
+                .map(|(_, levels)| levels)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let usage = if compressed_texture_block_extent(descriptor.guest.pixel_format).is_some() {
+        MTLTextureUsage::ShaderRead
+    } else {
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView
+    };
+    let metal_descriptor = TextureDescriptor::new();
+    let texture_type = if descriptor.texture_type == 9 {
+        MTLTextureType::D2
+    } else {
+        MTLTextureType::D2Array
+    };
+    metal_descriptor.set_texture_type(texture_type);
+    metal_descriptor.set_pixel_format(descriptor.guest.pixel_format);
+    metal_descriptor.set_width(u64::from(descriptor.guest.width));
+    metal_descriptor.set_height(u64::from(descriptor.guest.height));
+    metal_descriptor.set_mipmap_level_count(u64::from(underlying_mip_count));
+    if texture_type == MTLTextureType::D2Array {
+        metal_descriptor.set_array_length(u64::from(descriptor.layer_count));
+    }
+    metal_descriptor.set_storage_mode(MTLStorageMode::Shared);
+    metal_descriptor.set_usage(usage);
+    let texture = device.new_texture(&metal_descriptor);
+    let started = Instant::now();
+    for (layer_index, linear_levels) in linear_layers.iter().enumerate() {
+        for (level_index, (&level, linear)) in layout.levels.iter().zip(linear_levels).enumerate() {
+            let expected = level
+                .width
+                .checked_mul(level.height)
+                .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
+                .ok_or("Metal mode-5 mip upload size overflows")?;
+            if linear.len() != expected {
+                return Err(format!(
+                    "Metal mode-5 layer {layer_index} mip {level_index} upload has {} bytes, expected {expected}",
+                    linear.len()
+                ));
+            }
+            let shift = u32::try_from(level_index).expect("validated mip index fits u32");
+            let region = MTLRegion::new_2d(
+                0,
+                0,
+                u64::from(
+                    descriptor
+                        .guest
+                        .width
+                        .checked_shr(shift)
+                        .unwrap_or(0)
+                        .max(1),
+                ),
+                u64::from(
+                    descriptor
+                        .guest
+                        .height
+                        .checked_shr(shift)
+                        .unwrap_or(0)
+                        .max(1),
+                ),
+            );
+            let mip = u64::try_from(level_index).expect("validated mip index fits u64");
+            let bytes_per_row = u64::try_from(level.width * layout.bytes_per_element)
+                .expect("validated mode-5 mip row size fits u64");
+            if texture_type == MTLTextureType::D2Array {
+                texture.replace_region_in_slice(
+                    region,
+                    mip,
+                    u64::try_from(layer_index).expect("validated layer index fits u64"),
+                    linear.as_ptr().cast::<c_void>(),
+                    bytes_per_row,
+                    u64::try_from(linear.len()).expect("validated mode-5 mip size fits u64"),
+                );
+            } else {
+                texture.replace_region(
+                    region,
+                    mip,
+                    linear.as_ptr().cast::<c_void>(),
+                    bytes_per_row,
+                );
+            }
+        }
+    }
+    record_texture_work(
+        &MIP_UPLOAD_COUNT,
+        &MIP_UPLOAD_BYTES,
+        &MIP_UPLOAD_NANOSECONDS,
+        linear_layers
+            .iter()
+            .flat_map(|levels| levels.iter())
+            .map(Vec::len)
+            .sum(),
+        started.elapsed(),
+    );
+    if descriptor.base_mip_level == 0 && descriptor.mip_level_count == underlying_mip_count {
+        return Ok(texture);
+    }
+    Ok(texture.new_texture_view_from_slice(
+        descriptor.guest.pixel_format,
+        texture_type,
+        NSRange::new(
+            u64::from(descriptor.base_mip_level),
+            u64::from(descriptor.mip_level_count),
+        ),
+        NSRange::new(0, u64::from(descriptor.layer_count)),
+    ))
 }
 
 pub(crate) fn create_exact_mode27_sampled_mip_view(

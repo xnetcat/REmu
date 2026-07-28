@@ -54,10 +54,8 @@ pub fn image_is_comparison(opcode: Opcode) -> bool {
 fn image_access_class(opcode: Opcode) -> u8 {
     if opcode.starts_with("ImageStore") || opcode.starts_with("ImageAtomic") {
         2
-    } else if opcode.starts_with("ImageLoad") {
-        1
     } else {
-        0
+        u8::from(opcode.starts_with("ImageLoad"))
     }
 }
 
@@ -120,6 +118,11 @@ pub struct ShaderEvaluation {
 
 impl ShaderEvaluation {
     /// Canonicalizes image resources by descriptor, native type, and access semantics.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if one evaluation contains more than `u32::MAX` distinct native image or
+    /// sampler bindings, which cannot be represented by the public slot-map type.
     #[must_use]
     pub fn image_binding_slots(&self) -> ImageBindingSlotMap {
         let mut texture_representatives = Vec::<usize>::new();

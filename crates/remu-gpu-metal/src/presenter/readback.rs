@@ -264,6 +264,28 @@ impl PendingTextureReadback {
         mip_level: u32,
     ) -> Result<Self, String> {
         validate_texture_readback_source(texture, descriptor)?;
+        Self::encode_mip_slice(device, queue, texture, descriptor, mip_level, 0)
+    }
+
+    pub(super) fn encode_array_slice(
+        device: &Device,
+        queue: &metal::CommandQueue,
+        texture: &Texture,
+        descriptor: GuestTextureDescriptor,
+        slice: u32,
+    ) -> Result<Self, String> {
+        validate_texture_array_readback_source(texture, descriptor, slice)?;
+        Self::encode_mip_slice(device, queue, texture, descriptor, 0, slice)
+    }
+
+    fn encode_mip_slice(
+        device: &Device,
+        queue: &metal::CommandQueue,
+        texture: &Texture,
+        descriptor: GuestTextureDescriptor,
+        mip_level: u32,
+        slice: u32,
+    ) -> Result<Self, String> {
         if u64::from(mip_level) >= texture.mipmap_level_count() {
             return Err(format!(
                 "Metal texture has {} mip levels, cannot read level {mip_level}",
@@ -284,7 +306,7 @@ impl PendingTextureReadback {
         encoder.set_label("REMu texture-to-buffer readback blit");
         encoder.copy_from_texture_to_buffer(
             texture,
-            0,
+            u64::from(slice),
             u64::from(mip_level),
             MTLOrigin { x: 0, y: 0, z: 0 },
             MTLSize::new(u64::from(width), u64::from(height), 1),
@@ -391,6 +413,16 @@ pub(super) fn native_texture_capture_to_bgra(
             let byte_count = bgra.len();
             bgra.copy_from_slice(&native_bytes[..byte_count]);
         }
+        MTLPixelFormat::R16Unorm | MTLPixelFormat::Depth16Unorm => {
+            if native_bytes.len() < pixel_count.checked_mul(2)? {
+                return None;
+            }
+            for (source, destination) in native_bytes.chunks_exact(2).zip(bgra.chunks_exact_mut(4))
+            {
+                let value = linear_unorm8_to_srgb_unorm8(source[1]);
+                destination.copy_from_slice(&[value, value, value, 255]);
+            }
+        }
         MTLPixelFormat::RGBA16Float => {
             if native_bytes.len() < pixel_count.checked_mul(8)? {
                 return None;
@@ -436,6 +468,41 @@ pub(super) fn validate_texture_readback_source(
     texture: &Texture,
     descriptor: GuestTextureDescriptor,
 ) -> Result<(), String> {
+    validate_texture_readback_storage(texture, descriptor)?;
+    if texture.texture_type() != MTLTextureType::D2 {
+        return Err(format!(
+            "Metal texture readback requires a 2D single-slice source, got {:?}",
+            texture.texture_type()
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_texture_array_readback_source(
+    texture: &Texture,
+    descriptor: GuestTextureDescriptor,
+    slice: u32,
+) -> Result<(), String> {
+    validate_texture_readback_storage(texture, descriptor)?;
+    if texture.texture_type() != MTLTextureType::D2Array {
+        return Err(format!(
+            "Metal texture array readback requires a 2D-array source, got {:?}",
+            texture.texture_type()
+        ));
+    }
+    if u64::from(slice) >= texture.array_length() {
+        return Err(format!(
+            "Metal texture array has {} slices, cannot read slice {slice}",
+            texture.array_length()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_texture_readback_storage(
+    texture: &Texture,
+    descriptor: GuestTextureDescriptor,
+) -> Result<(), String> {
     if texture.framebuffer_only() {
         return Err("Metal framebuffer-only textures cannot be copied for readback".to_owned());
     }
@@ -446,12 +513,6 @@ pub(super) fn validate_texture_readback_source(
         return Err(format!(
             "Metal texture readback requires the single-sample resolve target, got {} samples",
             texture.sample_count()
-        ));
-    }
-    if texture.texture_type() != MTLTextureType::D2 {
-        return Err(format!(
-            "Metal texture readback requires a 2D single-slice source, got {:?}",
-            texture.texture_type()
         ));
     }
     if texture.width() < u64::from(descriptor.width)
@@ -559,6 +620,43 @@ pub(super) fn read_texture_mip_linear(
     mip_level: u32,
 ) -> Result<Vec<u8>, String> {
     PendingTextureReadback::encode_mip(device, queue, texture, descriptor, mip_level)?.finish()
+}
+
+pub(super) fn read_texture_array_linear(
+    device: &Device,
+    queue: &metal::CommandQueue,
+    texture: &Texture,
+    descriptor: GuestTextureDescriptor,
+) -> Result<Vec<u8>, String> {
+    if texture.texture_type() != MTLTextureType::D2Array {
+        return Err(format!(
+            "Metal array readback requires a 2D-array texture, got {:?}",
+            texture.texture_type()
+        ));
+    }
+    let slice_count = u32::try_from(texture.array_length())
+        .map_err(|_| "Metal texture array length does not fit u32")?;
+    let slice_length = TextureReadbackLayout::new(
+        descriptor.width,
+        descriptor.height,
+        descriptor.bytes_per_pixel,
+    )?
+    .packed_length(descriptor.height)?;
+    let mut packed = Vec::with_capacity(
+        slice_length
+            .checked_mul(
+                usize::try_from(slice_count)
+                    .map_err(|_| "Metal texture array length does not fit usize")?,
+            )
+            .ok_or("Metal texture array packed size overflows")?,
+    );
+    for slice in 0..slice_count {
+        packed.extend(
+            PendingTextureReadback::encode_array_slice(device, queue, texture, descriptor, slice)?
+                .finish()?,
+        );
+    }
+    Ok(packed)
 }
 
 pub(super) fn write_resident_texture_contents_to_guest(

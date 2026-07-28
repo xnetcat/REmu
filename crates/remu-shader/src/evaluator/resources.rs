@@ -246,6 +246,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn execute_scalar_load(
         &mut self,
         instruction: &Instruction,

@@ -8,6 +8,7 @@ use super::{
 mod blocks;
 mod descriptors;
 mod mode27;
+mod mode5;
 #[cfg(test)]
 pub(crate) use self::blocks::{
     mode5_within_block_byte_offset, mode9_within_block_byte_offset,
@@ -23,6 +24,9 @@ pub(crate) use self::descriptors::{
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
     render_resolve_candidate_matches,
 };
+#[cfg(test)]
+pub(crate) use self::mode5::encode_mode5_mip_chain_into_raw;
+pub(crate) use self::mode5::{decode_mode5_mip_chain_from_raw, mode5_mip_chain_layout};
 pub(crate) use self::mode27::{
     decode_mode27_mip_chain_from_raw, encode_mode27_mip_chain_into_raw, mode27_block_byte_offsets,
     mode27_mip_chain_layout, mode27_surface_z_xor,

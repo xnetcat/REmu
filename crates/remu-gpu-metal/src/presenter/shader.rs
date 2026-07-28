@@ -15,14 +15,16 @@ use super::{
     ProgramIdentity, RenderPipelineArchiveState, ShaderCompileRequest, ShaderFunctionCache,
     ShaderFunctionCacheEntry, ShaderFunctionStageCache, diagnostic_capture_pixel_output,
     diagnostic_capture_vertex_position, diagnostic_disable_blending,
-    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
-    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
-    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
-    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
-    diagnostic_force_visible_clip_depth, diagnostic_procedural_rectangle_fallback,
-    diagnostic_video_chain_selected_draw, dump_msl_instruction_filter_matches,
-    dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video, image_component_class,
-    metal_color_write_mask, pixel_input_controls, register_value, video_target_binding_summary,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
+    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
+    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
+    diagnostic_procedural_rectangle_fallback, diagnostic_video_chain_selected_draw,
+    dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
+    image_component_class, metal_color_write_mask, pixel_input_controls, register_value,
+    video_target_binding_summary,
 };
 mod archive;
 mod compile;
@@ -213,7 +215,9 @@ impl MetalPresenter {
             || (diagnostic_dump_video_target_consumer()
                 && video_target_binding_summary(pixel_evaluation).is_some())
             || (diagnostic_dump_video_chain_consumer()
-                && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence);
+                && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence)
+            || (diagnostic_dump_shadow_consumer()
+                && evaluation_samples_layered_comparison(pixel_evaluation));
         pixel_options.diagnostic_force_pixel_color = key.sample_count > 1
             && pixel.program.instructions.len() > 64
             && diagnostic_force_msaa_pixel_color();

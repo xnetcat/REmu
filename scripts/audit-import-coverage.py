@@ -105,14 +105,14 @@ def function_slice(source: str, name: str) -> str:
     """
 
     declaration = re.search(
-        rf"(?m)^(?:pub\s+)?(?:const\s+)?(?:unsafe\s+)?"
+        rf"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?"
         rf'(?:extern\s+"C"\s+)?fn\s+{re.escape(name)}\s*\(',
         source,
     )
     if declaration is None:
         raise ValueError(f"Rust function not found: {name}")
     following = re.search(
-        r"(?m)^((?:pub\s+)?(?:const\s+)?(?:unsafe\s+)?"
+        r"(?m)^((?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?"
         r'(?:extern\s+"C"\s+)?fn\s+[A-Za-z0-9_]+\s*\()',
         source[declaration.end() :],
     )
@@ -139,6 +139,44 @@ def quoted_nids(source: str) -> set[str]:
 def parse_known_names(source: str) -> dict[str, str]:
     body = function_slice(source, "known_nid_name")
     return dict(re.findall(r'"([A-Za-z0-9+-]{11})"\s*=>\s*"([^"]+)"', body))
+
+
+def sibling_function_slice(runtime_path: Path, name: str) -> str:
+    """Find a function by following modules declared from a Rust crate root."""
+
+    pending = [runtime_path]
+    visited: set[Path] = set()
+    root_error: ValueError | None = None
+    while pending:
+        source_path = pending.pop()
+        if source_path in visited:
+            continue
+        visited.add(source_path)
+        source = source_path.read_text(encoding="utf-8")
+        try:
+            return function_slice(source, name)
+        except ValueError as error:
+            if root_error is None:
+                root_error = error
+
+        module_base = (
+            source_path.parent
+            if source_path.stem in {"lib", "main", "mod"}
+            else source_path.parent / source_path.stem
+        )
+        modules = re.findall(
+            r"(?m)^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;",
+            source,
+        )
+        for module in modules:
+            candidates = (
+                module_base / f"{module}.rs",
+                module_base / module / "mod.rs",
+            )
+            pending.extend(candidate for candidate in candidates if candidate.is_file())
+
+    assert root_error is not None
+    raise root_error
 
 
 def parse_flat_stub_arms(dispatch_source: str, return_expression: str) -> set[str]:
@@ -181,7 +219,12 @@ def area_module_nids(runtime_path: Path) -> set[str]:
 
 def inspect_runtime_source(path: Path) -> RuntimeCoverage:
     source = path.read_text(encoding="utf-8")
-    names = parse_known_names(source)
+    names = dict(
+        re.findall(
+            r'"([A-Za-z0-9+-]{11})"\s*=>\s*"([^"]+)"',
+            sibling_function_slice(path, "known_nid_name"),
+        )
+    )
     agc_command_source_path = path.with_name("agc_command_abi.rs")
     native_agc_nids: set[str] = set()
     if agc_command_source_path.is_file():
@@ -203,7 +246,7 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
         (
             "native-host",
             set().union(
-                *(quoted_nids(function_slice(source, function)) for function in (
+                *(quoted_nids(sibling_function_slice(path, function)) for function in (
                     "native_cxx_symbol_name",
                     "native_unwind_symbol_name",
                     "native_libc_symbol_name",
@@ -212,8 +255,8 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
         ),
         (
             "synthetic-data",
-            quoted_nids(function_slice(source, "synthetic_data_imports"))
-            | quoted_nids(function_slice(source, "synthetic_data_import_target")),
+            quoted_nids(sibling_function_slice(path, "synthetic_data_imports"))
+            | quoted_nids(sibling_function_slice(path, "synthetic_data_import_target")),
         ),
         ("hle-native-agc", native_agc_nids),
         ("hle-area-module", area_module_nids(path)),
@@ -237,8 +280,8 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
                 quoted_nids(probe_dispatch)
                 | quoted_nids(function_slice(source, "dispatch_stateless_import"))
                 | quoted_nids(function_slice(source, "dispatch_kernel_file_import"))
-                | quoted_nids(function_slice(source, "is_guest_sync_import"))
-                | quoted_nids(function_slice(source, "dispatch_guest_sync_import")),
+                | quoted_nids(sibling_function_slice(path, "is_guest_sync_import"))
+                | quoted_nids(sibling_function_slice(path, "dispatch_guest_sync_import")),
             ),
         )
     )

@@ -138,6 +138,14 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   posts, intent-buffer/property behavior, trophy lifecycle validation, and callback retention.
 - REmu applies the four relocation types present in the first two authorized test titles before
   finalizing memory protections: `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE`.
+- AvPlayer pause/IsActive state semantics (a paused player remains an active playback session,
+  freezes `CurrentTime`, and releases neither video nor audio frames until Resume) were
+  cross-checked against shadPS4's GPL-2.0-or-later AvPlayer state machine
+  (`src/core/libraries/avplayer/`). The `sceAvPlayerChangeStream`/`sceAvPlayerSetTrickSpeed`
+  export names and the percent-based trick-speed rate follow the public PS4/PS5 AvPlayer API
+  surface as documented in open-source homebrew headers; REmu's ffmpeg pipe decoders, input-side
+  `-ss` seek, and host-elapsed media clock are independent implementations. No SDK material was
+  copied.
 
 ## `remu-shader`
 
@@ -170,9 +178,30 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   PC/opcode failures instead of substitute shaders, uses draw-evaluated resource bindings, and is
   validated against complete live shader pairs from the authorized local dumps. No game shader
   bytes, game fingerprints, or proprietary SDK material are included in the source tree.
+- The GCN cube-map addressing contract — `V_CUBEID/V_CUBESC/V_CUBETC/V_CUBEMA` face selection,
+  sign conventions, and the face-atlas coordinate form `(sc/(2|ma|)+1.5, tc/(2|ma|)+1.5, faceId)`
+  consumed by `IMAGE_SAMPLE*` on cube resources — follows AMD's public "GCN3 ISA" and
+  "RDNA Instruction Set Architecture" reference guides, and was cross-checked behaviorally
+  against shadPS4's GPL-2.0-or-later shader recompiler's cube handling. Binding cube resources
+  as Metal 2D arrays and indexing the face layer directly from the atlas triple is REmu's own
+  lowering choice; no code was copied.
 
 ## `remu-gpu-metal`
 
+- GFX10 `SW_4KB_S` address bits, thin-resource block dimensions, mip-tail entry
+  conditions and coordinates, reverse non-tail mip placement, and per-slice chain
+  stride follow AMD's MIT-licensed GPUOpen AddrLib implementation in PAL,
+  particularly `addrlib2.cpp`, `gfx10addrlib.cpp`, and
+  `gfx10SwizzlePattern.h`. The surrounding texture-cache policy and Metal upload
+  implementation are REmu's own. shadPS4's GPL-2.0-or-later texture cache was
+  used to cross-check that complete mip/layer ranges remain one image resource;
+  its PS4-specific tiling equations were not reused for this PS5 layout.
+- GFX10 `CB_COLOR_CONTROL` operation-mode decoding follows AMD's public PAL register
+  definitions and was cross-checked against shadPS4's GPL-2.0-or-later renderer handling.
+  In particular, `Resolve`, `EliminateFastClear`, and `FmaskDecompress` draw packets are
+  command-processor operations rather than ordinary shader rasterization. REmu ends the
+  current Metal pass for those operations because its color residents are already
+  decompressed and ordinary MSAA passes maintain a current single-sample resolve.
 - Texture readback storage, synchronization, resolve, and row-layout rules follow Apple's public
   Metal documentation for `MTLStorageMode`, `MTLBlitCommandEncoder`, `MTLCommandBuffer`,
   `MTLTexture.getBytes`, load/store actions, and the published Metal feature limits. They were also

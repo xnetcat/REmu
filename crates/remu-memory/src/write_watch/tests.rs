@@ -220,7 +220,7 @@ fn dropping_the_last_watch_restores_write_access() {
 #[test]
 fn concurrent_writes_cannot_observe_an_unpublished_protected_page() {
     let mapping = TestMapping::new(1);
-    let address = mapping.address() as usize;
+    let address = usize::try_from(mapping.address()).unwrap();
     let (write_sender, write_receiver) = std::sync::mpsc::sync_channel::<u8>(0);
     let (done_sender, done_receiver) = std::sync::mpsc::sync_channel::<()>(0);
     let writer = std::thread::spawn(move || {
@@ -321,11 +321,11 @@ fn mapping_retirement_forgets_dormant_writable_pages() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(
-        !state
+        state
             .writable_ranges
             .range(..=mapping.address())
             .next_back()
-            .is_some_and(|(_, &end)| mapping.address() < end)
+            .is_none_or(|(_, &end)| mapping.address() >= end)
     );
 }
 

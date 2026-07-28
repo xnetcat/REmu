@@ -110,6 +110,27 @@ pub(super) fn sampler_compare_function(value: u32) -> MTLCompareFunction {
     }
 }
 
+fn diagnostic_sampler_compare_function() -> Option<MTLCompareFunction> {
+    static FUNCTION: OnceLock<Option<MTLCompareFunction>> = OnceLock::new();
+    *FUNCTION.get_or_init(|| {
+        let value = std::env::var("REMU_DIAGNOSTIC_COMPARE_FUNCTION").ok()?;
+        match value.to_ascii_lowercase().as_str() {
+            "never" => Some(MTLCompareFunction::Never),
+            "less" => Some(MTLCompareFunction::Less),
+            "less-equal" => Some(MTLCompareFunction::LessEqual),
+            "greater" => Some(MTLCompareFunction::Greater),
+            "greater-equal" => Some(MTLCompareFunction::GreaterEqual),
+            "always" => Some(MTLCompareFunction::Always),
+            _ => {
+                eprintln!(
+                    "[REMu][METAL] ignoring unsupported REMU_DIAGNOSTIC_COMPARE_FUNCTION={value:?}"
+                );
+                None
+            }
+        }
+    })
+}
+
 pub(super) fn sampled_image_bindings(
     evaluation: &ShaderEvaluation,
 ) -> impl Iterator<Item = &ImageBinding> {
@@ -252,7 +273,17 @@ pub(super) fn create_sampler_argument_buffer(
         descriptor.set_min_filter(sampler_min_mag_filter((words[2] >> 22) & 0x3));
         descriptor.set_mip_filter(sampler_mip_filter((words[2] >> 26) & 0x3));
         if image_is_comparison(binding.opcode) {
-            descriptor.set_compare_function(sampler_compare_function((words[0] >> 12) & 0x7));
+            let guest_function = sampler_compare_function((words[0] >> 12) & 0x7);
+            let diagnostic_function = diagnostic_sampler_compare_function();
+            if let Some(function) = diagnostic_function {
+                static LOGGED: OnceLock<()> = OnceLock::new();
+                LOGGED.get_or_init(|| {
+                    eprintln!(
+                        "[REMu][METAL][DIAGNOSTIC] overriding comparison samplers from {guest_function:?} to {function:?}"
+                    );
+                });
+            }
+            descriptor.set_compare_function(diagnostic_function.unwrap_or(guest_function));
         }
         descriptor.set_lod_min_clamp(
             f32::from(u16::try_from(words[1] & 0xfff).expect("12-bit LOD fits u16")) / 256.0,

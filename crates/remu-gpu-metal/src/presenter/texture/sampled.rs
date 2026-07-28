@@ -87,7 +87,8 @@ impl MetalPresenter {
                                     resident, sampled, comparison,
                                 )
                                 && !resident_depth_sample_is_eligible(resident, sampled)
-                                && !resident_is_depth_array_face(resident, sampled)
+                                && !(resident_is_depth_array_face(resident, sampled)
+                                    && self.depth_array_is_fully_resident(sampled))
                                 && !self.multisample_textures.iter().any(|(key, multisample)| {
                                     multisample.initialized
                                         && key.descriptor == resident.descriptor
@@ -577,12 +578,14 @@ pub(crate) fn create_sampled_guest_texture(
         underlying_mip_level_count
     };
     let descriptor = TextureDescriptor::new();
+    // Cube resources (type 11) are created as 2D arrays: translated shaders address them with
+    // the GCN face-atlas convention (face layer plus in-face coordinates), which indexes array
+    // layers directly. This also matches the layered depth-sample assembly, which serves cube
+    // shadow SRDs as D2Array textures.
     descriptor.set_texture_type(match texture_type {
         9 => MTLTextureType::D2,
         10 => MTLTextureType::D3,
-        11 if layer_count == 6 => MTLTextureType::Cube,
-        11 => MTLTextureType::CubeArray,
-        13 => MTLTextureType::D2Array,
+        11 | 13 => MTLTextureType::D2Array,
         _ => {
             return Err(format!(
                 "unsupported sampled Metal texture type {texture_type}"
@@ -605,11 +608,8 @@ pub(crate) fn create_sampled_guest_texture(
         descriptor.set_depth(u64::from(layer_count));
     }
     descriptor.set_mipmap_level_count(u64::from(mip_level_count));
-    if texture_type == 13 {
+    if matches!(texture_type, 11 | 13) {
         descriptor.set_array_length(u64::from(layer_count));
-    }
-    if texture_type == 11 {
-        descriptor.set_array_length(u64::from(layer_count / 6));
     }
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(if texture_type == 10 && !comparison {

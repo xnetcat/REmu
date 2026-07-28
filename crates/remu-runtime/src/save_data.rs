@@ -708,8 +708,11 @@ fn write_guest_fixed_ascii(address: u64, length: usize, value: &str) {
 
 pub(crate) fn read_guest_bytes(address: u64, destination: &mut [u8]) {
     // SAFETY: the guest ABI supplies a readable range matching the declared buffer size.
+    // Use overlap-safe copying because native unit fixtures can place their guest allocation
+    // beside the host vector receiving the snapshot; the guest-facing operation is still just a
+    // byte read and does not require memcpy's stronger non-overlap precondition.
     unsafe {
-        std::ptr::copy_nonoverlapping(
+        std::ptr::copy(
             address as *const u8,
             destination.as_mut_ptr(),
             destination.len(),

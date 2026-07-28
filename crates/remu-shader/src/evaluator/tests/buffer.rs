@@ -174,8 +174,8 @@ fn unreadable_global_loads_use_a_bounded_zero_binding() {
         ],
         {
             let mut user_data = vec![0; 14];
-            user_data[12] = sentinel as u32;
-            user_data[13] = (sentinel >> 32) as u32;
+            user_data[12] = u32::try_from(sentinel & u64::from(u32::MAX)).unwrap();
+            user_data[13] = u32::try_from(sentinel >> 32).unwrap();
             user_data
         },
     );
@@ -230,8 +230,8 @@ fn unreadable_buffer_loads_use_a_bounded_zero_binding() {
         ],
         {
             let mut user_data = vec![0; 12];
-            user_data[8] = sentinel as u32;
-            user_data[9] = (sentinel >> 32) as u32;
+            user_data[8] = u32::try_from(sentinel & u64::from(u32::MAX)).unwrap();
+            user_data[9] = u32::try_from(sentinel >> 32).unwrap();
             user_data[10] = 16;
             user_data[11] = 3 << 28;
             user_data
@@ -283,8 +283,8 @@ fn unreadable_global_stores_and_atomics_remain_errors() {
             ],
             {
                 let mut user_data = vec![0; 14];
-                user_data[12] = sentinel as u32;
-                user_data[13] = (sentinel >> 32) as u32;
+                user_data[12] = u32::try_from(sentinel & u64::from(u32::MAX)).unwrap();
+                user_data[13] = u32::try_from(sentinel >> 32).unwrap();
                 user_data
             },
         );
@@ -335,8 +335,8 @@ fn unreadable_buffer_stores_and_atomics_remain_errors() {
             ],
             {
                 let mut user_data = vec![0; 12];
-                user_data[8] = sentinel as u32;
-                user_data[9] = (sentinel >> 32) as u32;
+                user_data[8] = u32::try_from(sentinel & u64::from(u32::MAX)).unwrap();
+                user_data[9] = u32::try_from(sentinel >> 32).unwrap();
                 user_data[10] = 16;
                 user_data[11] = 3 << 28;
                 user_data

@@ -3,17 +3,28 @@
 
 use super::{
     CachedGlobalBuffer, CachedSamplerArguments, DecodedDepthTarget, GlobalBufferCacheKey,
-    MetalPresenter, SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey, UploadedGlobalBuffer,
-    canonical_sampler_bindings, create_sampler_argument_buffer, guest_global_buffer_view,
-    metal_buffer_with_bytes,
+    GuestCommandBatch, MetalPresenter, PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY,
+    SamplerArgumentCacheKey, UploadedGlobalBuffer, canonical_sampler_bindings,
+    create_sampler_argument_buffer, guest_batch_writes_overlap, guest_global_buffer_view,
+    guest_physical_ranges_overlap, metal_buffer_with_bytes,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
     Buffer, DepthStencilDescriptor, DepthStencilState, Device, Function, MTLCompareFunction,
     MTLResourceOptions, SamplerState,
 };
+use remu_memory::read_guest_shared_backing;
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+enum QueuedGlobalReadSource {
+    None,
+    Buffer { buffer: Buffer, offset: u64 },
+    GuestMemory,
+    Synchronize,
+}
 
 impl MetalPresenter {
     pub(super) fn cached_sampler_argument_buffer(
@@ -87,54 +98,110 @@ impl MetalPresenter {
         device: &Device,
         evaluation: &ShaderEvaluation,
     ) -> Result<Vec<UploadedGlobalBuffer>, String> {
+        let sources = evaluation
+            .global_memory_bindings
+            .iter()
+            .map(|binding| self.queued_global_read_source(binding))
+            .collect::<Result<Vec<_>, _>>()?;
+        if sources
+            .iter()
+            .any(|source| matches!(source, QueuedGlobalReadSource::Synchronize))
+        {
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
+            self.wait_for_guest_command_batches()?;
+            self.ensure_open_guest_batch(&queue);
+            return evaluation
+                .global_memory_bindings
+                .iter()
+                .zip(sources)
+                .map(|(binding, source)| {
+                    if matches!(source, QueuedGlobalReadSource::None) {
+                        self.upload_global_buffer_from_packet(device, binding)
+                    } else {
+                        trace_global_coherence(binding, "synchronized");
+                        self.upload_fresh_global_buffer(device, binding)
+                    }
+                })
+                .collect();
+        }
         evaluation
             .global_memory_bindings
             .iter()
-            .map(|binding| self.upload_global_buffer(device, binding))
+            .zip(sources)
+            .map(|(binding, source)| self.upload_global_buffer_from_source(device, binding, source))
             .collect()
     }
 
+    #[cfg(test)]
     pub(super) fn upload_global_buffer(
+        &mut self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        let source = self.queued_global_read_source(binding)?;
+        if matches!(source, QueuedGlobalReadSource::Synchronize) {
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
+            self.wait_for_guest_command_batches()?;
+            self.ensure_open_guest_batch(&queue);
+            trace_global_coherence(binding, "synchronized");
+            return self.upload_fresh_global_buffer(device, binding);
+        }
+        self.upload_global_buffer_from_source(device, binding, source)
+    }
+
+    fn upload_global_buffer_from_source(
+        &mut self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+        source: QueuedGlobalReadSource,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        match source {
+            QueuedGlobalReadSource::Buffer { buffer, offset } => {
+                trace_global_coherence(binding, "forwarded-buffer");
+                Ok(UploadedGlobalBuffer {
+                    buffer,
+                    offset,
+                    guest_memory: false,
+                })
+            }
+            QueuedGlobalReadSource::GuestMemory => {
+                trace_global_coherence(binding, "forwarded-guest-memory");
+                self.upload_identity_global_buffer(device, binding)?
+                    .ok_or_else(|| {
+                        format!(
+                            "queued global writer at {:#x}/{} has no identity-mapped view",
+                            binding.base_address, binding.byte_count
+                        )
+                    })
+            }
+            QueuedGlobalReadSource::Synchronize => {
+                unreachable!("synchronizing global sources are handled before upload")
+            }
+            QueuedGlobalReadSource::None => self.upload_global_buffer_from_packet(device, binding),
+        }
+    }
+
+    fn upload_global_buffer_from_packet(
         &mut self,
         device: &Device,
         binding: &GlobalMemoryBinding,
     ) -> Result<UploadedGlobalBuffer, String> {
         // Packet-time snapshots must win over the identity-mapped view. The guest can recycle
         // transient constants and small vertex buffers while this presenter is still compiling
-        // shaders or draining older events. Zero-copy remains correct for writable or
-        // deliberately uncaptured large bindings.
+        // shaders or draining older events. A queued GPU writer is resolved before this method,
+        // because in that case the packet snapshot necessarily predates the producer.
         if (binding.data.len() != binding.byte_count || binding.writable)
-            && let Some((page_address, page_byte_count, offset)) =
-                guest_global_buffer_view(binding)?
+            && let Some(uploaded) = self.upload_identity_global_buffer(device, binding)?
         {
-            let key = (page_address, page_byte_count);
-            let buffer = if let Some(buffer) = self.guest_global_buffer_cache.get(&key) {
-                buffer.clone()
-            } else {
-                if self.guest_global_buffer_cache.len() >= GUEST_GLOBAL_BUFFER_CACHE_CAPACITY {
-                    self.guest_global_buffer_cache.clear();
-                }
-                let length = u64::try_from(page_byte_count)
-                    .map_err(|_| "page-aligned guest global size does not fit Metal")?;
-                let buffer = device.new_buffer_with_bytes_no_copy(
-                    usize::try_from(page_address)
-                        .map_err(|_| "guest global address does not fit the host pointer")?
-                        as *const c_void,
-                    length,
-                    MTLResourceOptions::StorageModeShared,
-                    None,
-                );
-                buffer.set_label(&format!(
-                    "REMu zero-copy guest global {page_address:#x}/{page_byte_count}"
-                ));
-                self.guest_global_buffer_cache.insert(key, buffer.clone());
-                buffer
-            };
-            return Ok(UploadedGlobalBuffer {
-                buffer,
-                offset,
-                guest_memory: true,
-            });
+            return Ok(uploaded);
         }
         if binding.data.len() != binding.byte_count {
             return Err(format!(
@@ -241,6 +308,92 @@ impl MetalPresenter {
         })
     }
 
+    fn upload_identity_global_buffer(
+        &mut self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+    ) -> Result<Option<UploadedGlobalBuffer>, String> {
+        let Some((page_address, page_byte_count, offset)) = guest_global_buffer_view(binding)?
+        else {
+            return Ok(None);
+        };
+        let key = (page_address, page_byte_count);
+        let buffer = if let Some(buffer) = self.guest_global_buffer_cache.get(&key) {
+            buffer.clone()
+        } else {
+            if self.guest_global_buffer_cache.len() >= GUEST_GLOBAL_BUFFER_CACHE_CAPACITY {
+                self.guest_global_buffer_cache.clear();
+            }
+            let length = u64::try_from(page_byte_count)
+                .map_err(|_| "page-aligned guest global size does not fit Metal")?;
+            let buffer = device.new_buffer_with_bytes_no_copy(
+                usize::try_from(page_address)
+                    .map_err(|_| "guest global address does not fit the host pointer")?
+                    as *const c_void,
+                length,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            buffer.set_label(&format!(
+                "REMu zero-copy guest global {page_address:#x}/{page_byte_count}"
+            ));
+            self.guest_global_buffer_cache.insert(key, buffer.clone());
+            buffer
+        };
+        Ok(Some(UploadedGlobalBuffer {
+            buffer,
+            offset,
+            guest_memory: true,
+        }))
+    }
+
+    fn upload_fresh_global_buffer(
+        &mut self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        let mut bytes = vec![0; binding.byte_count];
+        if !read_guest_shared_backing(binding.base_address, &mut bytes) {
+            return Err(format!(
+                "synchronized global binding {:#x}/{} has no readable guest backing",
+                binding.base_address, binding.byte_count
+            ));
+        }
+        let (buffer, offset) = self
+            .open_guest_batch
+            .as_mut()
+            .ok_or("synchronized global upload has no open guest batch")?
+            .upload_global_bytes(device, &bytes)?;
+        Ok(UploadedGlobalBuffer {
+            buffer,
+            offset,
+            guest_memory: false,
+        })
+    }
+
+    fn queued_global_read_source(
+        &self,
+        binding: &GlobalMemoryBinding,
+    ) -> Result<QueuedGlobalReadSource, String> {
+        let byte_count = u64::try_from(binding.byte_count)
+            .map_err(|_| "global binding byte count does not fit u64")?;
+        if let Some(batch) = self.open_guest_batch.as_ref() {
+            let source =
+                queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
+            if !matches!(source, QueuedGlobalReadSource::None) {
+                return Ok(source);
+            }
+        }
+        for batch in self.committed_guest_batches.iter().rev() {
+            let source =
+                queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
+            if !matches!(source, QueuedGlobalReadSource::None) {
+                return Ok(source);
+            }
+        }
+        Ok(QueuedGlobalReadSource::None)
+    }
+
     pub(super) fn cached_index_buffer(
         &mut self,
         device: &Device,
@@ -268,6 +421,82 @@ impl MetalPresenter {
             .insert(indices.to_vec(), buffer.clone());
         Ok(buffer)
     }
+}
+
+fn queued_global_read_source_in_batch(
+    batch: &GuestCommandBatch,
+    address: u64,
+    byte_count: u64,
+) -> QueuedGlobalReadSource {
+    if !guest_batch_writes_overlap(batch, address, byte_count) {
+        return QueuedGlobalReadSource::None;
+    }
+    if batch.memory_writes.iter().any(|write| {
+        let (write_address, write_byte_count) = write.range();
+        guest_physical_ranges_overlap(write_address, write_byte_count, address, byte_count)
+    }) {
+        return QueuedGlobalReadSource::Synchronize;
+    }
+    let mut overlapping_writebacks = batch.global_writebacks.iter().filter(|writeback| {
+        u64::try_from(writeback.byte_count).is_ok_and(|writeback_byte_count| {
+            guest_physical_ranges_overlap(
+                writeback.guest_address,
+                writeback_byte_count,
+                address,
+                byte_count,
+            )
+        })
+    });
+    let Some(first) = overlapping_writebacks.next() else {
+        return QueuedGlobalReadSource::GuestMemory;
+    };
+    let Some(offset) = contained_global_writeback_offset(first, address, byte_count) else {
+        return QueuedGlobalReadSource::Synchronize;
+    };
+    if overlapping_writebacks.any(|writeback| {
+        contained_global_writeback_offset(writeback, address, byte_count).is_none_or(
+            |candidate_offset| {
+                writeback.buffer.as_ptr() != first.buffer.as_ptr() || candidate_offset != offset
+            },
+        )
+    }) {
+        return QueuedGlobalReadSource::Synchronize;
+    }
+    QueuedGlobalReadSource::Buffer {
+        buffer: first.buffer.clone(),
+        offset,
+    }
+}
+
+fn contained_global_writeback_offset(
+    writeback: &PendingGlobalWriteback,
+    address: u64,
+    byte_count: u64,
+) -> Option<u64> {
+    let writeback_byte_count = u64::try_from(writeback.byte_count).ok()?;
+    let writeback_end = writeback.guest_address.checked_add(writeback_byte_count)?;
+    let read_end = address.checked_add(byte_count)?;
+    if address < writeback.guest_address || read_end > writeback_end {
+        return None;
+    }
+    writeback
+        .offset
+        .checked_add(address - writeback.guest_address)
+}
+
+fn trace_global_coherence(binding: &GlobalMemoryBinding, source: &str) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_GLOBAL_COHERENCE").is_some()) {
+        return;
+    }
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 128 {
+        return;
+    }
+    eprintln!(
+        "[REMu][METAL][GLOBAL_COHERENCE] address={:#x} bytes={} source={source}",
+        binding.base_address, binding.byte_count
+    );
 }
 pub(super) const GLOBAL_BUFFER_CACHE_CAPACITY: usize = 4_096;
 

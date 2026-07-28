@@ -138,6 +138,7 @@ pub(crate) fn decode_vop2(pc: u32, word: u32) -> Result<Frame, DecodeError> {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn decode_vopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 17) & 0xff;
     let name = match code {

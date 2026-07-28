@@ -11,7 +11,7 @@ use super::{
 };
 use metal::MTLPixelFormat;
 use remu_gpu::{ComputeDispatch, GpuMemoryCopy, IndexedDraw};
-use remu_shader::{GlobalMemoryBinding, ImageBinding, ShaderEvaluation};
+use remu_shader::{GlobalMemoryBinding, ImageBinding, ShaderEvaluation, image_is_comparison};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -56,6 +56,21 @@ pub(super) fn diagnostic_dump_video_chain_consumer() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("REMU_DUMP_VIDEO_CHAIN_CONSUMER").is_some_and(|value| value == "1")
+    })
+}
+
+pub(super) fn diagnostic_dump_shadow_consumer() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_DUMP_SHADOW_CONSUMER").is_some_and(|value| value == "1")
+    })
+}
+
+pub(super) fn evaluation_samples_layered_comparison(evaluation: &ShaderEvaluation) -> bool {
+    evaluation.image_bindings.iter().any(|binding| {
+        image_is_comparison(binding.opcode)
+            && decode_image_descriptor(&binding.resource_descriptor)
+                .is_ok_and(|descriptor| descriptor.layer_count > 1)
     })
 }
 
@@ -600,6 +615,7 @@ pub(super) fn diagnostic_texture_writer_enabled() -> bool {
         || diagnostic_dump_target_pixel_shader().is_some()
         || diagnostic_dump_target_pixel_instruction_count().is_some()
         || diagnostic_dump_complex_msaa()
+        || diagnostic_dump_shadow_consumer()
         || diagnostic_dump_video_target_consumer()
         || diagnostic_dump_video_chain_consumer()
 }
@@ -658,6 +674,17 @@ pub(super) fn diagnostic_trace_target_maximum_draw() -> u64 {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(u64::MAX)
+    })
+}
+
+pub(super) fn diagnostic_trace_target_stride() -> u64 {
+    static STRIDE: OnceLock<u64> = OnceLock::new();
+    *STRIDE.get_or_init(|| {
+        std::env::var("REMU_TRACE_TARGET_STRIDE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1)
+            .max(1)
     })
 }
 
@@ -791,10 +818,11 @@ pub(super) fn diagnostic_overlapping_memory_copies(
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Retained as structured fields for the diagnostic tuple's Debug output.
 pub(super) struct DiagnosticGlobalWriter {
-    stage: &'static str,
-    sequence: u64,
-    shader: u64,
+    pub(super) stage: &'static str,
+    pub(super) sequence: u64,
+    pub(super) shader: u64,
     address: u64,
     byte_count: u64,
 }
@@ -920,6 +948,9 @@ pub(super) fn dump_msl_compute_filter_matches(compute_shader_address: u64) -> bo
         return false;
     };
     let filter = filter.to_string_lossy();
+    if filter.eq_ignore_ascii_case("all") {
+        return true;
+    }
     let filter = filter.strip_prefix("0x").unwrap_or(&filter);
     u64::from_str_radix(filter, 16).is_ok_and(|filter| filter == compute_shader_address)
 }

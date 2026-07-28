@@ -140,18 +140,6 @@ fn effective_flip_interval_microseconds() -> u64 {
     }
 }
 
-pub(crate) fn av_player_flip_interval_microseconds() -> u64 {
-    let effective = effective_flip_interval_microseconds();
-    if effective != 0 {
-        return effective;
-    }
-    // Disabling host sleep is a presentation/debug option, not permission for AVPlayer to drain
-    // a movie as quickly as its worker can poll. Retain the guest-selected nominal media clock.
-    VIDEO_OUT_FLIP_INTERVAL
-        .load(Ordering::Relaxed)
-        .max(DEFAULT_FLIP_INTERVAL_MICROSECONDS)
-}
-
 /// Holds the submitting thread until its flip is due.
 ///
 /// Without this the guest's frame loop is never gated: flips complete the instant they are

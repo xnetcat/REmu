@@ -8,8 +8,8 @@ use super::{
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     WriteWatchRefresh, create_guest_texture, create_mipmapped_guest_texture,
     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    guest_texture_byte_count, guest_texture_descriptors_overlap, mode27_mip_chain_layout,
-    record_mode27_work_detail, record_texture_dirty_work_detail,
+    guest_texture_byte_count, guest_texture_descriptors_overlap, mode5_mip_chain_layout,
+    mode27_mip_chain_layout, record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
 };
 use metal::MTLTextureUsage;
@@ -569,11 +569,22 @@ pub(crate) fn watch_guest_texture(
 pub(crate) fn sampled_texture_raw_range(
     descriptor: DecodedImageDescriptor,
 ) -> Result<(usize, usize), String> {
-    let exact_mip_chain = sampled_texture_uses_exact_mode27_mips(descriptor);
-    let byte_count = if exact_mip_chain {
-        if descriptor.texture_type != 9 || descriptor.layer_count != 1 {
+    let exact_mode5_mip_chain = sampled_texture_uses_exact_mode5_mips(descriptor);
+    let exact_mode27_mip_chain = sampled_texture_uses_exact_mode27_mips(descriptor);
+    let byte_count = if exact_mode5_mip_chain || exact_mode27_mip_chain {
+        if exact_mode27_mip_chain && (descriptor.texture_type != 9 || descriptor.layer_count != 1) {
             return Err(format!(
-                "exact sampled mip-chain upload requires a 2D single-layer mode-27 resource, got type={} layers={} tile={} base={} count={}",
+                "exact mode-27 sampled mip-chain upload requires a 2D single-layer resource, got type={} layers={} tile={} base={} count={}",
+                descriptor.texture_type,
+                descriptor.layer_count,
+                descriptor.guest.tile_mode,
+                descriptor.base_mip_level,
+                descriptor.mip_level_count
+            ));
+        }
+        if exact_mode5_mip_chain && !matches!(descriptor.texture_type, 9 | 11 | 13) {
+            return Err(format!(
+                "exact mode-5 sampled mip-chain upload requires a 2D or array resource, got type={} layers={} tile={} base={} count={}",
                 descriptor.texture_type,
                 descriptor.layer_count,
                 descriptor.guest.tile_mode,
@@ -585,8 +596,18 @@ pub(crate) fn sampled_texture_raw_range(
             .base_mip_level
             .checked_add(descriptor.mip_level_count)
             .ok_or("sampled mip range overflows")?;
-        u64::try_from(mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?.byte_count)
-            .map_err(|_| "sampled mip-chain byte count does not fit u64")?
+        let byte_count = if exact_mode5_mip_chain {
+            mode5_mip_chain_layout(descriptor.guest, underlying_mip_count)?
+                .byte_count
+                .checked_mul(
+                    usize::try_from(descriptor.layer_count)
+                        .map_err(|_| "sampled layer count does not fit usize")?,
+                )
+                .ok_or("mode-5 sampled mip-chain byte count overflows")?
+        } else {
+            mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?.byte_count
+        };
+        u64::try_from(byte_count).map_err(|_| "sampled mip-chain byte count does not fit u64")?
     } else {
         guest_texture_byte_count(descriptor.guest)
             .ok_or("sampled texture face byte count overflows")?
@@ -604,6 +625,11 @@ pub(crate) fn sampled_texture_raw_range(
             .map_err(|_| "sampled texture address does not fit usize")?,
         usize::try_from(byte_count).map_err(|_| "sampled texture byte count does not fit usize")?,
     ))
+}
+
+pub(crate) fn sampled_texture_uses_exact_mode5_mips(descriptor: DecodedImageDescriptor) -> bool {
+    descriptor.guest.tile_mode == 5
+        && (descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1)
 }
 
 pub(crate) fn sampled_texture_uses_exact_mode27_mips(descriptor: DecodedImageDescriptor) -> bool {

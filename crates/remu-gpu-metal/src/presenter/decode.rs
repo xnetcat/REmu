@@ -22,8 +22,9 @@ pub(crate) use self::image::{
     sampled_alias_descriptor,
 };
 pub(crate) use self::pipeline::{
-    decode_metal_blend_attachment, decode_raster_state, graphics_pipeline_key,
-    metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
+    ColorOperationMode, decode_color_operation_mode, decode_metal_blend_attachment,
+    decode_raster_state, graphics_pipeline_key, metal_color_write_mask,
+    metal_nonindexed_vertex_count, metal_primitive_type,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{graphics_shader_resource_key, metal_primitive_topology_class};
@@ -56,6 +57,10 @@ pub(super) const CB_BLEND_ALPHA: u32 = 0x108;
 pub(super) const SPI_PS_INPUT_CNTL_0: u32 = 0x191;
 
 pub(super) const CB_BLEND0_CONTROL: u32 = 0x1e0;
+
+pub(super) const CB_COLOR_CONTROL: u32 = 0x202;
+
+pub(super) const DEFAULT_CB_COLOR_CONTROL: u32 = 0x00cc_0010;
 
 pub(super) const PA_SU_SC_MODE_CNTL: u32 = 0x205;
 
@@ -90,6 +95,8 @@ pub(super) const PA_SC_AA_MASK_X0Y1_X1Y1: u32 = 0x30f;
 pub(super) const COLOR_TARGET_COUNT: u32 = 8;
 
 pub(super) const DB_RENDER_CONTROL: u32 = 0x000;
+
+pub(super) const DB_DEPTH_VIEW: u32 = 0x002;
 
 pub(super) const DB_DEPTH_SIZE_XY: u32 = 0x007;
 

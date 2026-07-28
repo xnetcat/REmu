@@ -15,11 +15,12 @@ use metal::{
     TextureDescriptor,
 };
 use remu_shader::ShaderEvaluation;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
     DecodedImageDescriptor, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
     MetalPresenter, ResidentGuestTexture, decode_image_descriptor, guest_texture_byte_count,
-    image_resource_descriptor_is_null, is_storage_image_opcode,
+    image_resource_descriptor_is_null, is_storage_image_opcode, trace_target_sampling,
 };
 
 /// The layered texture types a depth-face array can serve: 2D arrays and cubes.
@@ -95,7 +96,32 @@ pub(crate) fn resident_is_depth_array_face(
     depth_array_face_descriptor(sampled, layer) == Some(resident.descriptor)
 }
 
+/// Returns whether every face required by a layered depth sample has a usable GPU resident.
+///
+/// Callers use this to decide whether a face can remain GPU-only. A partial set cannot be
+/// assembled without losing the available face contents, so those residents must take the
+/// ordinary alias-writeback path before the complete guest allocation is uploaded.
+pub(crate) fn depth_array_face_set_is_complete(
+    sampled: DecodedImageDescriptor,
+    mut face_is_resident: impl FnMut(GuestTextureDescriptor) -> bool,
+) -> bool {
+    sampled.layer_count >= 2
+        && (0..sampled.layer_count).all(|layer| {
+            depth_array_face_descriptor(sampled, layer).is_some_and(&mut face_is_resident)
+        })
+}
+
 impl MetalPresenter {
+    pub(crate) fn depth_array_is_fully_resident(&self, sampled: DecodedImageDescriptor) -> bool {
+        depth_array_face_set_is_complete(sampled, |face| {
+            self.resident_guest_textures
+                .get(&face)
+                .is_some_and(|resident| {
+                    resident.gpu_written && resident.texture_type == 9 && resident.layer_count == 1
+                })
+        })
+    }
+
     /// Assembles the depth-format array textures behind this draw's layered depth-sample SRDs.
     ///
     /// Every layer must resolve to a GPU-written resident depth face; partially resident arrays
@@ -117,7 +143,9 @@ impl MetalPresenter {
                 let Ok(descriptor) = decode_image_descriptor(&binding.resource_descriptor) else {
                     continue;
                 };
-                if !is_layered_sample_type(descriptor.texture_type) {
+                if !is_layered_sample_type(descriptor.texture_type)
+                    || depth_render_format_for_sample(descriptor.guest.pixel_format).is_none()
+                {
                     continue;
                 }
                 let key = DepthArrayKey {
@@ -135,6 +163,33 @@ impl MetalPresenter {
                     })
                     .collect();
                 let Some(faces) = faces else {
+                    static UNAVAILABLE_LOGS: AtomicUsize = AtomicUsize::new(0);
+                    if trace_target_sampling()
+                        && UNAVAILABLE_LOGS.fetch_add(1, Ordering::Relaxed) < 64
+                    {
+                        eprintln!(
+                            "[REMu][METAL][DEPTH-ARRAY] unavailable address={:#x} layers={} faces={:?}",
+                            descriptor.guest.address,
+                            descriptor.layer_count,
+                            (0..descriptor.layer_count)
+                                .filter_map(|layer| {
+                                    let face = depth_array_face_descriptor(descriptor, layer)?;
+                                    Some((
+                                        layer,
+                                        face.address,
+                                        self.resident_guest_textures.get(&face).map(|resident| {
+                                            (
+                                                resident.gpu_written,
+                                                resident.content_version,
+                                                resident.texture_type,
+                                                resident.layer_count,
+                                            )
+                                        }),
+                                    ))
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                    }
                     // Serving a previously assembled array after its faces stop being resident
                     // would replay stale contents over whatever the guest wrote since.
                     self.depth_array_textures.remove(&key);
@@ -169,6 +224,21 @@ impl MetalPresenter {
                 let stale: Vec<usize> = (0..faces.len())
                     .filter(|&index| entry.slice_versions[index] != faces[index].1)
                     .collect();
+                static ASSEMBLY_LOGS: AtomicUsize = AtomicUsize::new(0);
+                if trace_target_sampling()
+                    && !stale.is_empty()
+                    && ASSEMBLY_LOGS.fetch_add(1, Ordering::Relaxed) < 64
+                {
+                    eprintln!(
+                        "[REMu][METAL][DEPTH-ARRAY] assemble address={:#x} layers={} versions={:?} stale={stale:?}",
+                        descriptor.guest.address,
+                        descriptor.layer_count,
+                        faces
+                            .iter()
+                            .map(|(_, version)| *version)
+                            .collect::<Vec<_>>(),
+                    );
+                }
                 if stale.is_empty() {
                     continue;
                 }

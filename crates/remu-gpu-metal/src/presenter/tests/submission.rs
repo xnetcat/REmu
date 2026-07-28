@@ -3,14 +3,14 @@
 
 use metal::{
     Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveTopologyClass,
-    MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor,
-    TextureDescriptor,
+    MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
+    RenderPassDescriptor, TextureDescriptor,
 };
 use remu_gpu::{
     GpuEvent, GpuMemoryAcquire, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
     GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
 };
-use remu_shader::Program;
+use remu_shader::{GlobalMemoryBinding, Program};
 
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason,
@@ -65,7 +65,6 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
             key: GuestRenderPassKey {
                 targets: Vec::new(),
                 depth: None,
-                resolve_multisample_targets: false,
             },
             encoder,
         }),
@@ -167,6 +166,49 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
     apply_pending_guest_memory_writes(&committed.memory_writes)
         .expect("completed release publishes its label");
     assert_eq!(release_label, 1);
+}
+
+#[test]
+fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+
+    let producer = device.new_buffer(128, MTLResourceOptions::StorageModeShared);
+    presenter
+        .open_guest_batch
+        .as_mut()
+        .expect("guest batch")
+        .global_writebacks
+        .push(PendingGlobalWriteback {
+            buffer: producer.clone(),
+            offset: 32,
+            guest_address: 0x12_0000,
+            byte_count: 64,
+        });
+    let binding = GlobalMemoryBinding {
+        scalar_address: 4,
+        base_address: 0x12_0010,
+        instruction_pcs: Default::default(),
+        byte_count: 16,
+        data: vec![0xaa; 16],
+        writable: false,
+        write_back_to_guest: false,
+    };
+
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("queued writer is forwarded");
+
+    assert!(std::ptr::eq(uploaded.buffer.as_ref(), producer.as_ref()));
+    assert_eq!(uploaded.offset, 48);
+    assert!(!uploaded.guest_memory);
 }
 
 #[test]

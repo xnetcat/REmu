@@ -512,15 +512,41 @@ impl Compiler<'_> {
                 )
             };
         }
+        // GCN cube sampling receives face-atlas coordinates per the ISA contract established by
+        // V_CUBEID/V_CUBESC/V_CUBETC/V_CUBEMA: x = sc/(2|ma|) + 1.5, y = tc/(2|ma|) + 1.5 and
+        // z = faceId (plus 6*slice for cube arrays). The in-face texel position is therefore
+        // (x - 1, y - 1) with layer round(z). The cube resource is bound as a Metal 2D array,
+        // so this addresses exactly the texel the guest computed; passing the raw atlas triple
+        // to a direction-vector cube sampler reads arbitrary texels instead.
+        let coordinate_arguments = if image.dimension == 3 {
+            let face_uv = self.temp(
+                "float2",
+                &format!("float2({coordinates}.x - 1.0f, {coordinates}.y - 1.0f)"),
+            );
+            let layer = self.temp(
+                "uint",
+                &format!(
+                    "min(uint(rint(max({coordinates}.z, 0.0f))), tex{binding_index}.get_array_size() - 1u)"
+                ),
+            );
+            format!("{face_uv}, {layer}")
+        } else {
+            coordinates.clone()
+        };
         let extra = if is_gather {
             String::new()
         } else if has_gradients {
-            let gradient = match image.dimension {
-                2 => "gradient3d",
-                3 => "gradientcube",
-                _ => "gradient2d",
-            };
-            format!(", {gradient}({gradient_x}, {gradient_y})")
+            if image.dimension == 3 {
+                // The guest supplies derivatives of the face-atlas coordinates, which are the
+                // 2D face coordinates up to the constant offset, so they pass through directly.
+                format!(", gradient2d({gradient_x}.xy, {gradient_y}.xy)")
+            } else {
+                let gradient = match image.dimension {
+                    2 => "gradient3d",
+                    _ => "gradient2d",
+                };
+                format!(", {gradient}({gradient_x}, {gradient_y})")
+            }
         } else if has_zero_lod || has_lod {
             format!(", level({lod})")
         } else if has_bias {
@@ -584,7 +610,7 @@ impl Compiler<'_> {
             let compared = self.temp(
                 "float",
                 &format!(
-                    "tex{binding_index}.sample_compare({sampler}, {coordinates}, {compare}{extra})"
+                    "tex{binding_index}.sample_compare({sampler}, {coordinate_arguments}, {compare}{extra})"
                 ),
             );
             self.temp(
@@ -594,7 +620,7 @@ impl Compiler<'_> {
         } else {
             self.temp(
                 &vector_kind,
-                &format!("tex{binding_index}.sample({sampler}, {coordinates}{extra})"),
+                &format!("tex{binding_index}.sample({sampler}, {coordinate_arguments}{extra})"),
             )
         };
         if is_gather {

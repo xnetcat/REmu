@@ -400,3 +400,143 @@ fn comparison_samples_use_depth_texture_typing_and_the_z_reference_operand() {
     );
     assert!(shader.source.contains(", level(0.0f))"));
 }
+
+fn cube_image_control(address_registers: Vec<u32>, vector_data: u32) -> ImageControl {
+    ImageControl {
+        dmask: 1,
+        vector_address: 0,
+        address_registers,
+        vector_data,
+        scalar_resource: 0,
+        scalar_sampler: 8,
+        dimension: 3,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+    }
+}
+
+fn cube_evaluation(opcode: Opcode, control: &ImageControl) -> ShaderEvaluation {
+    let mut evaluation = empty_evaluation();
+    let mut resource_descriptor = vec![0; 8];
+    resource_descriptor[3] = 0x204 | (11 << 28);
+    evaluation.image_bindings.push(ImageBinding {
+        pc: 0,
+        opcode,
+        control: control.clone(),
+        resource_descriptor: resource_descriptor.into(),
+        sampler_descriptor: vec![3 << 12, 0, 0, 0].into(),
+        mip_level: None,
+    });
+    evaluation
+}
+
+#[test]
+fn cube_comparison_samples_bind_a_depth_array_and_invert_the_face_atlas_coordinates() {
+    // GCN cube sampling passes V_CUBEID/SC/TC/MA face-atlas coordinates
+    // (sc/(2|ma|) + 1.5, tc/(2|ma|) + 1.5, faceId), not a direction vector. The lowering
+    // must bind the cube as a 2D array and index (x - 1, y - 1) at layer round(z).
+    let control = cube_image_control(vec![0, 1, 2, 3], 4);
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSampleCLz"),
+        words: vec![0, 0],
+        sources: vec![
+            Operand::vector(0),
+            Operand::vector(1),
+            Operand::vector(2),
+            Operand::vector(3),
+            Operand::scalar(0),
+            Operand::scalar(8),
+        ],
+        destinations: vec![Operand::vector(4)],
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let evaluation = cube_evaluation(Opcode::Known("ImageSampleCLz"), &control);
+    let shader = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("cube depth comparison sample should lower");
+
+    assert!(shader.source.contains("depth2d_array<float> tex0"));
+    assert!(!shader.source.contains("depthcube"));
+    assert!(shader.source.contains(".x - 1.0f"));
+    assert!(shader.source.contains(".y - 1.0f"));
+    assert!(shader.source.contains("tex0.get_array_size() - 1u"));
+    assert!(shader.source.contains("tex0.sample_compare("));
+    assert!(shader.source.contains(", level(0.0f))"));
+    // The comparison reference is v0 and the atlas triple is v1..v3.
+    assert!(shader.source.contains("as_type<float>(remu_v_0)"));
+    assert!(shader.source.contains(
+        "float3(as_type<float>(remu_v_1), as_type<float>(remu_v_2), as_type<float>(remu_v_3))"
+    ));
+}
+
+#[test]
+fn cube_samples_bind_a_2d_array_and_index_the_rounded_face_layer() {
+    let control = cube_image_control(vec![0, 1, 2], 4);
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSampleLz"),
+        words: vec![0, 0],
+        sources: vec![
+            Operand::vector(0),
+            Operand::vector(1),
+            Operand::vector(2),
+            Operand::scalar(0),
+            Operand::scalar(8),
+        ],
+        destinations: vec![Operand::vector(4)],
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let evaluation = cube_evaluation(Opcode::Known("ImageSampleLz"), &control);
+    let shader = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("cube sample should lower");
+
+    assert!(shader.source.contains("texture2d_array<float> tex0"));
+    assert!(!shader.source.contains("texturecube"));
+    assert!(shader.source.contains(".x - 1.0f"));
+    assert!(shader.source.contains(".y - 1.0f"));
+    assert!(shader.source.contains("min(uint(rint(max("));
+    assert!(shader.source.contains("tex0.get_array_size() - 1u"));
+    assert!(shader.source.contains("tex0.sample("));
+}
+
+#[test]
+fn cube_gradient_samples_pass_2d_face_gradients_to_the_array_sampler() {
+    let control = cube_image_control(vec![0, 1, 2, 3, 4, 5, 6, 7, 8], 10);
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSampleD"),
+        words: vec![0, 0],
+        sources: (0..9)
+            .map(Operand::vector)
+            .chain([Operand::scalar(0), Operand::scalar(8)])
+            .collect(),
+        destinations: vec![Operand::vector(10)],
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let evaluation = cube_evaluation(Opcode::Known("ImageSampleD"), &control);
+    let shader = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("cube gradient sample should lower");
+
+    assert!(shader.source.contains("texture2d_array<float> tex0"));
+    assert!(shader.source.contains("gradient2d("));
+    assert!(!shader.source.contains("gradientcube"));
+    assert!(shader.source.contains(".xy,"));
+}

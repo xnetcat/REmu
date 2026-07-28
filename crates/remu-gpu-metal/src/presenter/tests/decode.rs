@@ -11,19 +11,41 @@ use remu_shader::PixelOutputKind;
 
 use super::{
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_CLEAR_WORD0,
-    CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, DB_DEPTH_CLEAR,
-    DB_DEPTH_CONTROL, DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState,
-    GuestTextureDescriptor, MetalPresenter, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0,
-    append_color_target_registers, append_depth_target_registers,
-    common_render_target_array_length, decode_depth_target, decode_fast_clear_color,
-    decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
-    decode_render_targets_from_registers, decode_scissor, decode_viewport, effective_linear_pitch,
-    guest_texture_byte_count, guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
+    CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, ColorOperationMode,
+    DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_RENDER_CONTROL, DB_Z_INFO,
+    DecodedDepthTarget, DecodedRasterState, GuestTextureDescriptor, MetalPresenter,
+    PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
+    append_depth_target_registers, common_render_target_array_length, decode_color_operation_mode,
+    decode_depth_target, decode_fast_clear_color, decode_metal_blend_attachment,
+    decode_raster_state, decode_render_target_format, decode_render_targets_from_registers,
+    decode_scissor, decode_viewport, effective_linear_pitch, guest_texture_byte_count,
+    guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
     metal_primitive_type, pixel_input_controls, read_draw_indices, read_texture_linear,
     render_target_fast_clear_color,
 };
+
+#[test]
+fn decodes_cb_color_control_operation_modes() {
+    assert_eq!(
+        decode_color_operation_mode(0x00cc_0010),
+        Ok(ColorOperationMode::Normal)
+    );
+    assert_eq!(
+        decode_color_operation_mode(0x00cc_0030),
+        Ok(ColorOperationMode::Resolve)
+    );
+    assert_eq!(
+        decode_color_operation_mode(0x00cc_0020),
+        Ok(ColorOperationMode::EliminateFastClear)
+    );
+    assert_eq!(
+        decode_color_operation_mode(0x00cc_0050),
+        Ok(ColorOperationMode::FmaskDecompress)
+    );
+    assert!(decode_color_operation_mode(0x00cc_0040).is_err());
+}
 
 #[test]
 fn pixel_input_controls_default_to_identity_and_preserve_programmed_remaps() {
@@ -89,6 +111,34 @@ fn depth_target_uses_fixed_mode24_layout_and_rejects_nonzero_tile_index() {
         .value |= 1 << 20;
     let error = decode_depth_target(&draw).expect_err("nonzero tile index is unsupported");
     assert!(error.contains("tile-mode index 1"), "{error}");
+}
+
+#[test]
+fn depth_target_view_selects_the_backing_array_slice() {
+    let address = 0x0070_69b9_0000;
+    let mut draw = indexed_draw(0, 0, 0);
+    append_depth_target_registers(&mut draw, address, 1_024, 1_024, 0xa000_0001, 0x66);
+    draw.context_registers.push(GpuRegister {
+        offset: DB_DEPTH_VIEW,
+        value: 3 | (3 << 13),
+    });
+    draw.context_registers
+        .sort_unstable_by_key(|register| register.offset);
+
+    let depth = decode_depth_target(&draw)
+        .expect("single depth slice is supported")
+        .expect("enabled depth target");
+    let slice_bytes = 2 * 1_024 * 1_024;
+    assert_eq!(depth.texture.address, address + 3 * slice_bytes);
+    assert_eq!(guest_texture_byte_count(depth.texture), Some(slice_bytes));
+
+    draw.context_registers
+        .iter_mut()
+        .find(|register| register.offset == DB_DEPTH_VIEW)
+        .expect("depth view")
+        .value = 2 | (4 << 13);
+    let error = decode_depth_target(&draw).expect_err("multi-slice view is unsupported");
+    assert!(error.contains("slice range 2..=4"), "{error}");
 }
 
 #[test]

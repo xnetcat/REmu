@@ -5,11 +5,12 @@ use super::{
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
     CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1,
     CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, COLOR_TARGET_COUNT, DB_DEPTH_CLEAR,
-    DB_DEPTH_CONTROL, DB_DEPTH_SIZE, DB_DEPTH_SIZE_XY, DB_DEPTH_SLICE, DB_RENDER_CONTROL,
-    DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI,
-    DecodedDepthTarget, DecodedRenderTarget, GuestTextureDescriptor, RenderTargetFormat,
-    decode_scanout_target, effective_linear_pitch, guest_texture_byte_count, half_float_to_f32,
-    register_value, tiled_block_dimensions, trace_target_sampling, unsigned_float_to_f32,
+    DB_DEPTH_CONTROL, DB_DEPTH_SIZE, DB_DEPTH_SIZE_XY, DB_DEPTH_SLICE, DB_DEPTH_VIEW,
+    DB_RENDER_CONTROL, DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE,
+    DB_Z_WRITE_BASE_HI, DecodedDepthTarget, DecodedRenderTarget, GuestTextureDescriptor,
+    RenderTargetFormat, decode_scanout_target, effective_linear_pitch, guest_texture_byte_count,
+    half_float_to_f32, register_value, tiled_block_dimensions, trace_target_sampling,
+    unsigned_float_to_f32,
 };
 use metal::{MTLClearColor, MTLCompareFunction, MTLPixelFormat};
 use remu_gpu::{GpuRegister, IndexedDraw};
@@ -540,6 +541,30 @@ pub(crate) fn decode_depth_target(
     let height = ((size >> 16) & 0x3fff)
         .checked_add(1)
         .ok_or("depth-target height overflows")?;
+    let encoded_view = register_value(&draw.context_registers, DB_DEPTH_VIEW).unwrap_or_default();
+    let slice_start = encoded_view & 0x1fff;
+    let slice_max = (encoded_view >> 13) & 0x1fff;
+    let mip_level = (encoded_view >> 26) & 0xf;
+    if slice_start > slice_max {
+        return Err(format!(
+            "depth target has invalid slice range {slice_start}..={slice_max} in DB_DEPTH_VIEW={encoded_view:#010x}"
+        ));
+    }
+    if slice_start != slice_max {
+        return Err(format!(
+            "layered depth rendering is unsupported for slice range {slice_start}..={slice_max} in DB_DEPTH_VIEW={encoded_view:#010x}"
+        ));
+    }
+    if mip_level != 0 {
+        return Err(format!(
+            "depth target mip level {mip_level} is unsupported in DB_DEPTH_VIEW={encoded_view:#010x}"
+        ));
+    }
+    if slice_start != 0 && sample_count != 1 {
+        return Err(format!(
+            "multisample depth target slice {slice_start} is unsupported for {sample_count} samples"
+        ));
+    }
     let read_address = (u64::from(
         register_value(&draw.context_registers, DB_Z_READ_BASE_HI).unwrap_or_default() & 0xff,
     ) << 40)
@@ -555,16 +580,16 @@ pub(crate) fn decode_depth_target(
             "separate depth read/write surfaces are unsupported (read={read_address:#x}, write={write_address:#x})"
         ));
     }
-    let address = if write_enabled && write_address != 0 {
+    let base_address = if write_enabled && write_address != 0 {
         write_address
     } else if read_address != 0 {
         read_address
     } else {
         write_address
     };
-    if address < 0x10_000 || width > 16_384 || height > 16_384 {
+    if base_address < 0x10_000 || width > 16_384 || height > 16_384 {
         return Err(format!(
-            "invalid depth target address={address:#x} extent={width}x{height}"
+            "invalid depth target address={base_address:#x} extent={width}x{height}"
         ));
     }
     let (block_width, _) = tiled_block_dimensions(
@@ -593,8 +618,8 @@ pub(crate) fn decode_depth_target(
         .map(f32::from_bits)
         .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
         .unwrap_or(1.0);
-    let texture = GuestTextureDescriptor {
-        address,
+    let base_texture = GuestTextureDescriptor {
+        address: base_address,
         width,
         height,
         pitch,
@@ -602,10 +627,28 @@ pub(crate) fn decode_depth_target(
         pixel_format: format.0,
         bytes_per_pixel: format.1,
     };
+    let slice_bytes =
+        guest_texture_byte_count(base_texture).ok_or("depth target slice byte count overflows")?;
+    let address = slice_bytes
+        .checked_mul(u64::from(slice_start))
+        .and_then(|offset| base_address.checked_add(offset))
+        .ok_or("depth target slice address overflows")?;
+    let texture = GuestTextureDescriptor {
+        address,
+        ..base_texture
+    };
     if trace_target_sampling() {
-        static LOGGED_DEPTH_TARGETS: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, u32, u32)>>> =
+        static LOGGED_DEPTH_TARGETS: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, u32, u32, u32)>>> =
             OnceLock::new();
-        let key = (address, width, height, z_info, control, render_control);
+        let key = (
+            base_address,
+            width,
+            height,
+            z_info,
+            control,
+            render_control,
+            encoded_view,
+        );
         let mut logged = LOGGED_DEPTH_TARGETS
             .get_or_init(|| Mutex::new(HashSet::new()))
             .lock()
@@ -615,7 +658,11 @@ pub(crate) fn decode_depth_target(
             let encoded_slice = register_value(&draw.context_registers, DB_DEPTH_SLICE);
             let bytes = guest_texture_byte_count(texture);
             eprintln!(
-                "[REMu][METAL][DEPTH] address={address:#x} read={read_address:#x} write={write_address:#x} extent={width}x{height} pitch={pitch} format={:?} samples={sample_count} guest_tile={tile_mode} z_info={z_info:#010x} tile_index={depth_tile_mode_index} control={control:#010x} render_control={render_control:#010x} size_xy={size:#010x} depth_size={encoded_size:08x?} depth_slice={encoded_slice:08x?} bytes={bytes:x?}",
+                "[REMu][METAL][DEPTH] draw={} es={:#x} ps={:#x} instances={} address={address:#x} base={base_address:#x} read={read_address:#x} write={write_address:#x} extent={width}x{height} pitch={pitch} format={:?} samples={sample_count} guest_tile={tile_mode} z_info={z_info:#010x} tile_index={depth_tile_mode_index} control={control:#010x} render_control={render_control:#010x} size_xy={size:#010x} depth_view={encoded_view:#010x} slice={slice_start} depth_size={encoded_size:08x?} depth_slice={encoded_slice:08x?} bytes={bytes:x?}",
+                draw.sequence,
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                draw.instance_count,
                 format.0,
             );
         }

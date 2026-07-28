@@ -237,17 +237,23 @@ impl MetalPresenter {
                             self.statistics.encoded_compute_dispatches =
                                 self.statistics.encoded_compute_dispatches.saturating_add(1);
                         }
-                        Err(error)
+                        Err(error) => {
+                            // Every dropped dispatch is counted so a pass failing each frame
+                            // stays visible in the perf trail; the message logs once per key.
+                            *self
+                                .dropped_compute_executions
+                                .entry(dispatch.shader_address)
+                                .or_default() += 1;
                             if self
                                 .failed_compute_execution
-                                .insert(dispatch.shader_address) =>
-                        {
-                            eprintln!(
-                                "[REMu][METAL] Gen5 compute cs={:#x} could not execute: {error}",
-                                dispatch.shader_address
-                            );
+                                .insert(dispatch.shader_address)
+                            {
+                                eprintln!(
+                                    "[REMu][METAL] Gen5 compute cs={:#x} could not execute: {error}",
+                                    dispatch.shader_address
+                                );
+                            }
                         }
-                        Err(_) => {}
                     }
                 }
                 GpuEvent::IndexedDraw(draw) => {
@@ -302,6 +308,12 @@ impl MetalPresenter {
                         Err(error) => Err(error.clone()),
                     };
                     if let Err(error) = result {
+                        // Every dropped draw is counted so a scene pass failing each frame stays
+                        // visible in the perf trail; the message still logs once per key.
+                        *self
+                            .dropped_draw_executions
+                            .entry((draw.export_shader_address, draw.pixel_shader_address))
+                            .or_default() += 1;
                         if key
                             .as_ref()
                             .is_ok_and(|key| self.failed_draw_execution.insert(key.clone()))

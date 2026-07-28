@@ -11,14 +11,14 @@ use remu_shader::{ImageBinding, ImageControl, Opcode};
 
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, WriteWatchRefresh,
-    apply_image_destination_select, comparison_depth32_upload, decode_image_descriptor,
-    depth_array_face_descriptor, fallback_image_descriptor, guest_shared_mapping_identity,
-    guest_texture_byte_count, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_component_reordered_storage,
+    apply_image_destination_select, comparison_depth32_upload, create_sampled_guest_texture,
+    decode_image_descriptor, depth_array_face_descriptor, depth_array_face_set_is_complete,
+    fallback_image_descriptor, guest_shared_mapping_identity, guest_texture_byte_count,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_storage, guest_texture_raw_matches,
-    image_destination_select_is_native, image_resource_descriptor_is_null, mode27_mip_chain_layout,
-    new_red_blue_swizzled_texture_view, render_resolve_candidate_matches, sampled_alias_descriptor,
-    sampled_texture_cache_needs_reload, snapshot_guest_texture_raw,
+    image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
+    mode27_mip_chain_layout, new_red_blue_swizzled_texture_view, render_resolve_candidate_matches,
+    sampled_alias_descriptor, sampled_texture_cache_needs_reload, snapshot_guest_texture_raw,
     snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy, watch_guest_texture,
     write_watched_guest_texture_linear,
 };
@@ -79,6 +79,36 @@ fn layered_depth_sample_faces_resolve_to_per_face_depth_targets() {
     let mut swizzled = sampled;
     swizzled.destination_select = 0xfac;
     assert_eq!(depth_array_face_descriptor(swizzled, 0), None);
+}
+
+#[test]
+fn layered_depth_sample_requires_every_face_before_skipping_alias_writeback() {
+    let sampled = DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            address: 0x70_6969_0000,
+            width: 1024,
+            height: 1024,
+            pitch: 1024,
+            tile_mode: 24,
+            pixel_format: MTLPixelFormat::R16Unorm,
+            bytes_per_pixel: 2,
+        },
+        destination_select: 0x924,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        texture_type: 11,
+        layer_count: 6,
+    };
+    let faces = (0..sampled.layer_count)
+        .map(|layer| depth_array_face_descriptor(sampled, layer).expect("face resolves"))
+        .collect::<Vec<_>>();
+
+    assert!(!depth_array_face_set_is_complete(sampled, |face| {
+        face == faces[0]
+    }));
+    assert!(depth_array_face_set_is_complete(sampled, |face| {
+        faces.contains(&face)
+    }));
 }
 
 #[test]
@@ -658,6 +688,72 @@ fn accepts_a_nonzero_sampled_mip_view() {
 }
 
 #[test]
+fn mode5_sampled_mip_range_covers_the_packed_prefix_and_deferred_base_image() {
+    let descriptor = DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            address: 0x70_2754_1000,
+            width: 512,
+            height: 512,
+            pitch: 512,
+            tile_mode: 5,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        },
+        destination_select: 0xfac,
+        base_mip_level: 0,
+        mip_level_count: 10,
+        texture_type: 9,
+        layer_count: 1,
+    };
+    assert_eq!(
+        super::sampled_texture_raw_range(descriptor)
+            .expect("mode-5 sampled hierarchy covers its complete packed chain")
+            .1,
+        mode5_mip_chain_layout(descriptor.guest, 10)
+            .expect("mode-5 underlying mip layout")
+            .byte_count
+    );
+    assert!(
+        super::sampled_texture_raw_range(descriptor)
+            .expect("mode-5 range")
+            .1
+            > usize::try_from(
+                guest_texture_byte_count(descriptor.guest).expect("base byte count fits")
+            )
+            .expect("base byte count fits usize")
+    );
+}
+
+#[test]
+fn mode5_cube_mip_range_uses_one_complete_chain_per_face() {
+    let descriptor = DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            address: 0x70_3000_0000,
+            width: 256,
+            height: 256,
+            pitch: 256,
+            tile_mode: 5,
+            pixel_format: MTLPixelFormat::RGBA16Float,
+            bytes_per_pixel: 8,
+        },
+        destination_select: 0xfac,
+        base_mip_level: 0,
+        mip_level_count: 9,
+        texture_type: 11,
+        layer_count: 6,
+    };
+    let face_bytes = mode5_mip_chain_layout(descriptor.guest, 9)
+        .expect("mode-5 cube face layout")
+        .byte_count;
+    assert_eq!(
+        super::sampled_texture_raw_range(descriptor)
+            .expect("mode-5 cube covers every face chain")
+            .1,
+        face_bytes * 6
+    );
+}
+
+#[test]
 fn a_single_level_descriptor_does_not_gain_an_inferred_mip_hierarchy() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1080,6 +1176,87 @@ kernel void read_swizzled(
     let guest_zyxw = [sampled[2], sampled[1], sampled[0], sampled[3]];
     for (actual, expected) in guest_zyxw.into_iter().zip([0.1, 0.2, 0.3, 0.4]) {
         assert!((actual - expected).abs() <= 1.0 / 255.0);
+    }
+}
+
+#[test]
+fn cube_sampled_textures_serve_face_atlas_coordinates_as_2d_array_layers() {
+    // GCN cube resources are addressed with V_CUBEID/SC/TC/MA face-atlas coordinates, so the
+    // presenter creates them as 2D arrays and the translated shader indexes
+    // (x - 1.5)*2 mapped back to [0,1] on the layer round(z). Every face texel must round-trip
+    // exactly through that addressing form; a direction-vector cube binding cannot.
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let queue = device.new_command_queue();
+    let guest = GuestTextureDescriptor {
+        address: 0x10_0000,
+        width: 4,
+        height: 4,
+        pitch: 4,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::R8Unorm,
+        bytes_per_pixel: 1,
+    };
+    let mut linear = Vec::with_capacity(96);
+    for face in 0..6_u32 {
+        for texel in 0..16_u32 {
+            linear.push(u8::try_from(face * 36 + texel + 1).expect("identity texel fits u8"));
+        }
+    }
+    let texture = create_sampled_guest_texture(&device, &queue, guest, &linear, 0, 1, 11, 6, false)
+        .expect("six-face cube uploads as a 2D array");
+    assert_eq!(texture.texture_type(), MTLTextureType::D2Array);
+    assert_eq!(texture.array_length(), 6);
+
+    // The addressing expressions mirror emit_image_sample's cube lowering exactly.
+    let source = r"
+#include <metal_stdlib>
+using namespace metal;
+kernel void sample_cube_atlas(
+    texture2d_array<float> input [[texture(0)]],
+    device float* output [[buffer(0)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    constexpr sampler s(coord::normalized, filter::nearest, address::clamp_to_edge);
+    float3 atlas = float3(
+        (float(gid.x) + 0.5f) / 4.0f + 1.0f,
+        (float(gid.y) + 0.5f) / 4.0f + 1.0f,
+        float(gid.z));
+    float2 face_uv = float2(atlas.x - 1.0f, atlas.y - 1.0f);
+    uint layer = min(uint(rint(max(atlas.z, 0.0f))), input.get_array_size() - 1u);
+    output[gid.z * 16u + gid.y * 4u + gid.x] = input.sample(s, face_uv, layer).x;
+}
+";
+    let library = device
+        .new_library_with_source(source, &CompileOptions::new())
+        .expect("cube atlas test MSL compiles");
+    let function = library
+        .get_function("sample_cube_atlas", None)
+        .expect("cube atlas test function exists");
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("cube atlas test pipeline compiles");
+    let output = device.new_buffer(96 * 4, MTLResourceOptions::StorageModeShared);
+    let command = queue.new_command_buffer().to_owned();
+    let compute = command.new_compute_command_encoder();
+    compute.set_compute_pipeline_state(&pipeline);
+    compute.set_texture(0, Some(&texture));
+    compute.set_buffer(0, Some(&output), 0);
+    compute.dispatch_threads(MTLSize::new(4, 4, 6), MTLSize::new(4, 4, 6));
+    compute.end_encoding();
+    command.commit();
+    command.wait_until_completed();
+    // SAFETY: `output` is a 384-byte shared buffer and the completed kernel wrote 96 floats.
+    let sampled = unsafe { std::slice::from_raw_parts(output.contents().cast::<f32>(), 96) };
+    for (index, &value) in sampled.iter().enumerate() {
+        let expected = f32::from(linear[index]) / 255.0;
+        assert!(
+            (value - expected).abs() <= 0.5 / 255.0,
+            "face {} texel {} sampled {value}, expected {expected}",
+            index / 16,
+            index % 16,
+        );
     }
 }
 

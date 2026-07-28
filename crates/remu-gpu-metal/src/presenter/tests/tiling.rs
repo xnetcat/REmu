@@ -4,13 +4,86 @@
 use metal::MTLPixelFormat;
 
 use super::{
-    GuestTextureDescriptor, decode_mode27_mip_chain_from_raw, encode_mode27_mip_chain_into_raw,
-    guest_texture_byte_count, mode5_within_block_byte_offset, mode9_within_block_byte_offset,
+    GuestTextureDescriptor, decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
+    encode_mode5_mip_chain_into_raw, encode_mode27_mip_chain_into_raw, guest_texture_byte_count,
+    mode5_mip_chain_layout, mode5_within_block_byte_offset, mode9_within_block_byte_offset,
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_mip_chain_layout,
     mode27_source_byte_offset, mode27_within_block_byte_offset,
     mode27_within_block_byte_offset_for_format, snapshot_guest_texture_linear,
     tiled_block_dimensions, write_guest_texture_linear,
 };
+
+#[test]
+fn superliminal_mode5_mip_chains_place_the_base_image_after_smaller_levels() {
+    let rgba8 = GuestTextureDescriptor {
+        address: 0x70_2754_1000,
+        width: 512,
+        height: 512,
+        pitch: 512,
+        tile_mode: 5,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let rgba8_layout = mode5_mip_chain_layout(rgba8, 10).expect("RGBA8 mode-5 mip layout");
+    assert_eq!(rgba8_layout.byte_count, 1_400_832);
+    assert_eq!(rgba8_layout.levels[0].offset, 352_256);
+    assert_eq!(rgba8_layout.levels[4].offset, 4_096);
+    assert!(rgba8_layout.levels[5..].iter().all(|level| level.in_tail));
+    assert_eq!(
+        rgba8_layout.levels[5..]
+            .iter()
+            .map(|level| (level.tail_x, level.tail_y))
+            .collect::<Vec<_>>(),
+        [(16, 0), (8, 16), (0, 24), (0, 16), (8, 8)]
+    );
+
+    let rgba16_float = GuestTextureDescriptor {
+        address: 0x70_2968_1000,
+        pixel_format: MTLPixelFormat::RGBA16Float,
+        bytes_per_pixel: 8,
+        ..rgba8
+    };
+    let rgba16_layout =
+        mode5_mip_chain_layout(rgba16_float, 10).expect("RGBA16F mode-5 mip layout");
+    assert_eq!(rgba16_layout.byte_count, 2_797_568);
+    assert_eq!(rgba16_layout.levels[0].offset, 700_416);
+    assert_eq!(rgba16_layout.levels[4].offset, 4_096);
+    assert!(rgba16_layout.levels[5..].iter().all(|level| level.in_tail));
+}
+
+#[test]
+fn mode5_mip_chain_round_trips_nontail_levels_and_the_tail() {
+    let descriptor = GuestTextureDescriptor {
+        address: 0x70_2754_1000,
+        width: 512,
+        height: 512,
+        pitch: 512,
+        tile_mode: 5,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let layout = mode5_mip_chain_layout(descriptor, 10).expect("complete mode-5 mip chain");
+    let levels = layout
+        .levels
+        .iter()
+        .enumerate()
+        .map(|(level_index, level)| {
+            (0..level.width * level.height * layout.bytes_per_element)
+                .map(|byte| {
+                    u8::try_from((level_index * 43 + byte * 19 + byte / 257) & 0xff)
+                        .expect("masked byte fits")
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut raw = vec![0x5a; layout.byte_count];
+    encode_mode5_mip_chain_into_raw(&layout, &levels, &mut raw)
+        .expect("encode complete mode-5 mip chain");
+    let (decoded_layout, decoded) = decode_mode5_mip_chain_from_raw(descriptor, 10, &raw)
+        .expect("decode complete mode-5 mip chain");
+    assert_eq!(decoded_layout, layout);
+    assert_eq!(decoded, levels);
+}
 
 #[test]
 fn silent_hill_mode27_mip_tail_round_trips_every_level() {
@@ -390,6 +463,73 @@ fn mode5_uses_the_exact_standard_4k_address_bits() {
     assert_eq!(mode5_within_block_byte_offset(0, 1, 4), 16);
     assert_eq!(mode5_within_block_byte_offset(0, 4, 4), 64);
     assert_eq!(mode5_within_block_byte_offset(4, 0, 4), 128);
+}
+
+#[test]
+fn mode5_matches_the_official_gfx10_standard_4k_equation_for_every_block_texel() {
+    fn reference(x: usize, y: usize, bytes_per_element: usize) -> usize {
+        // Scalar expansion of AMD AddrLib's GFX10_SW_4K_S pattern. Keeping this
+        // structurally separate catches swapped X/Y channels and shifted bits.
+        match bytes_per_element {
+            1 => {
+                ((y << 4) & 0x1f0)
+                    ^ ((y << 5) & 0x400)
+                    ^ (x & 0x00f)
+                    ^ ((x << 5) & 0x200)
+                    ^ ((x << 6) & 0x800)
+            }
+            2 => {
+                ((y << 4) & 0x070)
+                    ^ ((y << 5) & 0x100)
+                    ^ ((y << 6) & 0x400)
+                    ^ ((x << 1) & 0x00e)
+                    ^ ((x << 4) & 0x080)
+                    ^ ((x << 5) & 0x200)
+                    ^ ((x << 6) & 0x800)
+            }
+            4 => {
+                ((y << 4) & 0x070)
+                    ^ ((y << 5) & 0x100)
+                    ^ ((y << 6) & 0x400)
+                    ^ ((x << 2) & 0x00c)
+                    ^ ((x << 5) & 0x080)
+                    ^ ((x << 6) & 0x200)
+                    ^ ((x << 7) & 0x800)
+            }
+            8 => {
+                ((y << 4) & 0x030)
+                    ^ ((y << 6) & 0x100)
+                    ^ ((y << 7) & 0x400)
+                    ^ ((x << 3) & 0x008)
+                    ^ ((x << 5) & 0x0c0)
+                    ^ ((x << 6) & 0x200)
+                    ^ ((x << 7) & 0x800)
+            }
+            16 => {
+                ((y << 4) & 0x030)
+                    ^ ((y << 6) & 0x100)
+                    ^ ((y << 7) & 0x400)
+                    ^ ((x << 6) & 0x0c0)
+                    ^ ((x << 7) & 0x200)
+                    ^ ((x << 8) & 0x800)
+            }
+            _ => unreachable!("test covers supported element sizes"),
+        }
+    }
+
+    for bytes_per_element in [1, 2, 4, 8, 16] {
+        let (width, height) = tiled_block_dimensions(4_096, bytes_per_element)
+            .expect("supported mode-5 element size");
+        for y in 0..height {
+            for x in 0..width {
+                assert_eq!(
+                    mode5_within_block_byte_offset(x, y, bytes_per_element),
+                    reference(x, y, bytes_per_element),
+                    "element size {bytes_per_element} at ({x},{y})",
+                );
+            }
+        }
+    }
 }
 
 #[test]

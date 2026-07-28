@@ -14,17 +14,17 @@ use super::{
     SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, UploadedImageTexture, WriteWatchRefresh,
     canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled,
-    copy_tiled_to_linear_at_z, decode_image_descriptor, decode_mode27_mip_chain_from_raw,
-    fallback_image_descriptor, guest_frame_fingerprint, guest_ranges_overlap,
-    guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
+    copy_tiled_to_linear_at_z, decode_image_descriptor, decode_mode5_mip_chain_from_raw,
+    decode_mode27_mip_chain_from_raw, fallback_image_descriptor, guest_frame_fingerprint,
+    guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, initial_depth_clear_for_target, is_storage_image_opcode,
-    is_writable_image_opcode, mode27_mip_chain_layout, record_mode27_work_detail,
-    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
-    render_resolve_candidate_matches, sampled_alias_descriptor,
-    sampler_uses_normalized_coordinates, texture_element_layout, trace_image_descriptors,
-    trace_target_sampling, write_resident_texture_contents_to_guest,
+    is_writable_image_opcode, mode5_mip_chain_layout, mode27_mip_chain_layout,
+    record_mode27_work_detail, record_texture_dirty_work_detail,
+    record_texture_snapshot_work_detail, record_texture_work, render_resolve_candidate_matches,
+    sampled_alias_descriptor, sampler_uses_normalized_coordinates, texture_element_layout,
+    trace_image_descriptors, trace_target_sampling, write_resident_texture_contents_to_guest,
 };
 #[cfg(test)]
 use remu_memory::guest_shared_mapping_identity;
@@ -36,12 +36,13 @@ mod retire;
 mod sampled;
 mod upload;
 mod watch;
-#[cfg(test)]
-pub(crate) use self::depth_array::depth_array_face_descriptor;
 pub(crate) use self::depth_array::resident_is_depth_array_face;
+#[cfg(test)]
+pub(crate) use self::depth_array::{depth_array_face_descriptor, depth_array_face_set_is_complete};
 pub(crate) use self::mips::{
-    create_exact_mode27_sampled_mip_view, create_mipmapped_guest_texture,
-    ensure_mipmapped_resident_texture_in_map, storage_image_requires_mip_hierarchy,
+    create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
+    create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
+    storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::residency::{create_guest_texture, ensure_resident_texture_in_map};
 pub(crate) use self::retire::{
@@ -64,8 +65,9 @@ pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
 pub(crate) use self::watch::{guest_texture_raw_range, sampled_texture_raw_range};
 pub(crate) use self::watch::{
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
-    refresh_sampled_texture_write_watch, sampled_texture_uses_exact_mode27_mips,
-    snapshot_guest_texture_raw, snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
+    refresh_sampled_texture_write_watch, sampled_texture_uses_exact_mode5_mips,
+    sampled_texture_uses_exact_mode27_mips, snapshot_guest_texture_raw,
+    snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
     snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
     watch_sampled_texture, write_watched_guest_range,
 };

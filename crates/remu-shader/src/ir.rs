@@ -315,6 +315,7 @@ pub struct Program {
 
 impl Program {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn new(address: u64, instructions: Vec<Instruction>) -> Self {
         let pixel_color_export_masks = instructions.iter().fold(0, |masks, instruction| {
             let Some(InstructionControl::Export(export)) = instruction.control else {

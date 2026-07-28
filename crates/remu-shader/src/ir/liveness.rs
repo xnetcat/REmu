@@ -30,6 +30,7 @@ const SCALAR_LIVE_WORDS: usize = 4;
 
 type ScalarLiveSet = [u64; SCALAR_LIVE_WORDS];
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn evaluation_scalar_liveness(
     instructions: &[Instruction],
     next_evaluation_instruction_indices: &[u32],
@@ -173,6 +174,7 @@ pub(crate) fn evaluation_scalar_liveness(
 
 pub(crate) fn evaluation_branch_target(instruction: &Instruction) -> Option<u32> {
     let encoded = instruction.words.first().copied()?;
+    #[allow(clippy::cast_possible_truncation)]
     let offset = (encoded as u16).cast_signed();
     let next_pc = i64::from(instruction.pc)
         .checked_add(i64::try_from(instruction.words.len().checked_mul(4)?).ok()?)?;

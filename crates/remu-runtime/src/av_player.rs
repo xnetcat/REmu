@@ -6,16 +6,15 @@ use std::time::{Duration, Instant};
 
 use crate::{
     AvPlayerEventCallback, AvPlayerInstance, PROBE_DISPATCH, ProbeDispatchState,
-    av_player_flip_interval_microseconds, guest_aligned_alloc, guest_memset,
-    process_guest_range_is_readable, read_guest_cstring, read_guest_u8, read_guest_u32,
-    read_guest_u64, resolve_guest_path, sce_kernel_error, write_guest_u8, write_guest_u16,
-    write_guest_u32, write_guest_u64,
+    guest_aligned_alloc, guest_memset, process_guest_range_is_readable, read_guest_cstring,
+    read_guest_u8, read_guest_u32, read_guest_u64, resolve_guest_path, sce_kernel_error,
+    write_guest_u8, write_guest_u16, write_guest_u32, write_guest_u64,
 };
 
-const AV_PLAYER_ERROR_INVALID_PARAMS: u32 = 0x806a_0001;
+pub(crate) const AV_PLAYER_ERROR_INVALID_PARAMS: u32 = 0x806a_0001;
 pub(crate) const AV_PLAYER_ERROR_OPERATION_FAILED: u32 = 0x806a_0002;
 
-fn av_player_tool(name: &str, environment: &str) -> Option<PathBuf> {
+pub(crate) fn av_player_tool(name: &str, environment: &str) -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os(environment).map(PathBuf::from)
         && configured.is_file()
     {
@@ -228,6 +227,8 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             playing_since: None,
             elapsed: Duration::ZERO,
             looping: false,
+            decoder_seek: Duration::ZERO,
+            trick_speed_percent: 100,
             video_decoder: None,
             video_output: None,
             raw_video_frame: Vec::new(),
@@ -237,7 +238,6 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             video_buffer_stride: 0,
             next_video_buffer: 0,
             next_video_frame: 0,
-            video_clock_origin: None,
             video_catch_up_origin: None,
             audio_decoder: None,
             audio_output: None,
@@ -463,9 +463,13 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
         return false;
     };
     let mut command = Command::new(ffmpeg);
-    command
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(source);
+    command.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+    if !player.decoder_seek.is_zero() {
+        // JumpToTime restarts the decoders; the input-side seek makes them begin at the target
+        // instead of replaying the stream from byte zero.
+        command.args(["-ss", &format!("{:.3}", player.decoder_seek.as_secs_f64())]);
+    }
+    command.arg("-i").arg(source);
     if audio {
         command.args([
             "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1",
@@ -700,27 +704,12 @@ pub(crate) fn av_player_write_video_frame_info(
 }
 
 pub(crate) fn av_player_video_frame_is_due(
-    video_clock_origin: &mut Option<(u64, u64)>,
     next_video_frame: u64,
     frames_per_second: f64,
-    completed_flip_count: u64,
-    flip_interval_microseconds: u64,
+    media_clock: Duration,
 ) -> bool {
-    if flip_interval_microseconds == 0 {
-        return true;
-    }
-    let (origin_flip, origin_frame) =
-        *video_clock_origin.get_or_insert((completed_flip_count, next_video_frame));
-    let retired_flips = completed_flip_count.saturating_sub(origin_flip);
-    let frame_delta = next_video_frame.saturating_sub(origin_frame);
-    let frame_due_microseconds =
-        ((frame_delta as f64) * 1_000_000.0 / frames_per_second.max(1.0)).round() as u64;
-    // Select the video frame nearest the completed display vblank. The half-vblank tolerance
-    // gives a 29.97 fps movie the expected two-flip cadence on a nominal 60 Hz output.
-    let media_clock_microseconds = retired_flips
-        .saturating_mul(flip_interval_microseconds)
-        .saturating_add(flip_interval_microseconds / 2);
-    frame_due_microseconds <= media_clock_microseconds
+    let timestamp = Duration::from_secs_f64(next_video_frame as f64 / frames_per_second.max(1.0));
+    timestamp <= media_clock
 }
 
 pub(crate) fn av_player_video_catch_up_target(
@@ -768,6 +757,34 @@ fn av_player_wall_clock_catch_up_enabled() -> bool {
     })
 }
 
+fn av_player_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("REMU_TRACE_AVPLAYER").is_some_and(|value| value == "1"))
+}
+
+/// Counts every zero-return from the data exports by reason so a stalled guest player can be
+/// diagnosed from one run: which gate starves it, and how often.
+fn av_player_trace_zero_return(handle: u64, kind: &'static str, reason: &'static str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    if !av_player_trace_enabled() {
+        return;
+    }
+    static COUNTS: OnceLock<Mutex<HashMap<(&'static str, &'static str), u64>>> = OnceLock::new();
+    let mut counts = COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let count = counts.entry((kind, reason)).or_default();
+    *count += 1;
+    if *count <= 8 || count.is_power_of_two() {
+        eprintln!(
+            "[REMu][AVPLAYER][TRACE] handle={handle:#x} {kind} zero-return reason={reason} count={count}"
+        );
+    }
+}
+
 pub(crate) fn av_player_close(handle: u64, state: &mut ProbeDispatchState) -> u64 {
     if state.av_player.players.remove(&handle).is_some() {
         0
@@ -780,15 +797,17 @@ pub(crate) fn av_player_current_time(handle: u64, state: &ProbeDispatchState) ->
     let Some(player) = state.av_player.players.get(&handle) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
-    u64::try_from(player.decoded_playback_elapsed().as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(player.media_clock_elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn av_player_is_active(handle: u64, state: &ProbeDispatchState) -> u64 {
     state.av_player.players.get(&handle).map_or(0, |player| {
         // Host wall time can advance by many seconds while an emulated frame is translated.
         // AVPlayer stays active until its decoder actually reaches EOF so a short intro cannot
-        // disappear before the guest has received its first frame.
-        u64::from(player.playing_since.is_some() && !player.end_of_stream)
+        // disappear before the guest has received its first frame. A paused player is still
+        // active: pausing suspends the clock, not the playback session (behavior cross-checked
+        // against shadPS4's AvPlayer state machine).
+        u64::from((player.playing_since.is_some() || player.paused) && !player.end_of_stream)
     })
 }
 
@@ -796,11 +815,16 @@ pub(crate) fn av_player_pause(handle: u64, state: &mut ProbeDispatchState) -> u6
     let Some(player) = state.av_player.players.get_mut(&handle) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
+    if player.end_of_stream {
+        return 0;
+    }
+    if player.paused || player.playing_since.is_none() {
+        return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
+    }
     if let Some(started) = player.playing_since.take() {
         player.elapsed += started.elapsed();
     }
     player.paused = true;
-    player.video_clock_origin = None;
     player.video_catch_up_origin = None;
     let callback = (player.event_callback, player.event_object);
     av_player_queue_event(callback.0, callback.1, 4, state);
@@ -816,7 +840,6 @@ pub(crate) fn av_player_start(handle: u64, state: &mut ProbeDispatchState) -> u6
     }
     player.paused = false;
     player.end_of_stream = false;
-    player.video_clock_origin = None;
     player.video_catch_up_origin = None;
     player.playing_since.get_or_insert_with(Instant::now);
     let callback = (player.event_callback, player.event_object);
@@ -825,22 +848,50 @@ pub(crate) fn av_player_start(handle: u64, state: &mut ProbeDispatchState) -> u6
     0
 }
 
+pub(crate) fn av_player_resume(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&handle) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    if !player.paused || player.source.is_none() {
+        return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
+    }
+    player.paused = false;
+    player.video_catch_up_origin = None;
+    player.playing_since = Some(Instant::now());
+    let callback = (player.event_callback, player.event_object);
+    eprintln!("[REMu][AVPLAYER] resumed handle={handle:#x}");
+    av_player_queue_event(callback.0, callback.1, 3, state);
+    0
+}
+
 pub(crate) fn av_player_jump_to_time(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
+    // stop_decoders clears the running wall-clock segment, so capture it first: a jump during
+    // playback must keep playing from the target instead of silently pausing.
+    let was_playing = player.playing_since.is_some();
     player.stop_decoders();
-    player.elapsed = Duration::from_millis(arguments[1]);
-    player.next_video_frame = (player.elapsed.as_secs_f64() * player.frames_per_second) as u64;
-    player.video_clock_origin = None;
+    let target = Duration::from_millis(arguments[1]);
+    // Freshly started decoders are launched with an input-side seek to the target; the frame
+    // counters are aligned to the frames that seek actually emits, so delivered timestamps
+    // continue to reflect stream position.
+    player.decoder_seek = target;
+    player.elapsed = target;
+    player.end_of_stream = false;
+    player.next_video_frame = (target.as_secs_f64() * player.frames_per_second).round() as u64;
     player.video_catch_up_origin = None;
-    player.next_audio_frame = u64::try_from(player.elapsed.as_millis())
+    player.next_audio_frame = u64::try_from(target.as_millis())
         .unwrap_or(u64::MAX)
         .saturating_mul(48_000)
         / (1024 * 1_000);
-    if player.playing_since.is_some() {
+    if was_playing {
         player.playing_since = Some(Instant::now());
     }
+    eprintln!(
+        "[REMu][AVPLAYER] jump handle={:#x} target_ms={} video_frame={} audio_frame={} playing={was_playing} paused={}",
+        arguments[0], arguments[1], player.next_video_frame, player.next_audio_frame, player.paused,
+    );
     0
 }
 
@@ -863,38 +914,109 @@ pub(crate) fn av_player_set_looping(arguments: [u64; 6], state: &mut ProbeDispat
     0
 }
 
+/// sceAvPlayerChangeStream switches the active representation of a stream. Every source this
+/// backend serves has exactly one representation per stream (one video, at most one audio), so
+/// selecting any existing stream is already satisfied; anything else is a genuinely
+/// unimplemented multi-representation switch and fails loudly with the observed state.
+pub(crate) fn av_player_change_stream(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get(&arguments[0]) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    let stream_count = 1 + u64::from(player.has_audio);
+    if arguments[1] < stream_count {
+        eprintln!(
+            "[REMu][AVPLAYER] change stream handle={:#x} stream={} already active (single representation)",
+            arguments[0], arguments[1],
+        );
+        return 0;
+    }
+    eprintln!(
+        "[REMu][AVPLAYER] ChangeStream unimplemented for handle={:#x}: requested stream={} arguments={:#x?} but source {:?} exposes {stream_count} single-representation streams",
+        arguments[0],
+        arguments[1],
+        &arguments[1..3],
+        player.source,
+    );
+    sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS)
+}
+
+/// sceAvPlayerSetTrickSpeed sets the playback rate in percent (100 = normal). The rate scales
+/// the player media clock; media timestamps are unchanged. Reverse and paused-rate trick
+/// play would need a seeking decoder, so non-positive rates fail loudly instead of guessing.
+pub(crate) fn av_player_set_trick_speed(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let speed = arguments[1] as i32;
+    let Ok(speed) = u32::try_from(speed) else {
+        eprintln!(
+            "[REMu][AVPLAYER] SetTrickSpeed unimplemented for handle={:#x}: reverse rate {speed}% needs a seeking decoder",
+            arguments[0],
+        );
+        return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
+    };
+    if speed == 0 || speed > 3_200 {
+        eprintln!(
+            "[REMu][AVPLAYER] SetTrickSpeed rejected handle={:#x} rate={speed}%: outside the 1..=3200 forward range",
+            arguments[0],
+        );
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    player.trick_speed_percent = speed;
+    eprintln!(
+        "[REMu][AVPLAYER] trick speed handle={:#x} rate={speed}%",
+        arguments[0],
+    );
+    0
+}
+
 pub(crate) fn av_player_get_video_data(
     arguments: [u64; 6],
     extended: bool,
     state: &mut ProbeDispatchState,
 ) -> u64 {
-    let completed_flip_count = state.video_out.completed_flip_count;
-    let flip_interval_microseconds = av_player_flip_interval_microseconds();
     let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
         return 0;
     };
-    if arguments[1] == 0
-        || player.playing_since.is_none()
-        || player.paused
-        || player.end_of_stream
-        || !av_player_start_decoder(player, false)
-    {
+    if arguments[1] == 0 {
+        av_player_trace_zero_return(arguments[0], "video", "null-output");
+        return 0;
+    }
+    // Match the native state machine: decoder threads may continue filling their private queues,
+    // but neither data export releases a frame while the player is paused.
+    if player.paused {
+        av_player_trace_zero_return(arguments[0], "video", "paused");
+        return 0;
+    }
+    if player.playing_since.is_none() {
+        av_player_trace_zero_return(arguments[0], "video", "stopped");
+        return 0;
+    }
+    if player.end_of_stream {
+        av_player_trace_zero_return(arguments[0], "video", "end-of-stream");
+        return 0;
+    }
+    if !av_player_start_decoder(player, false) {
+        av_player_trace_zero_return(arguments[0], "video", "no-decoder");
         return 0;
     }
     if !av_player_video_frame_is_due(
-        &mut player.video_clock_origin,
         player.next_video_frame,
         player.frames_per_second,
-        completed_flip_count,
-        flip_interval_microseconds,
+        player.media_clock_elapsed(),
     ) {
+        av_player_trace_zero_return(arguments[0], "video", "clock-not-reached");
         return 0;
     }
     // Completed VideoOut flips are the emulated media clock. Wall-clock catch-up is useful only
     // when translation already sustains realtime; below that rate it discarded nearly every
     // Silent Hill splash/movie frame while audio and guest time continued ahead. Keep it as an
     // explicit diagnostic option rather than the correctness default.
-    let catch_up_target = if av_player_wall_clock_catch_up_enabled() {
+    let catch_up_target = if av_player_wall_clock_catch_up_enabled() && !player.paused {
         av_player_video_catch_up_target(
             player.video_catch_up_origin,
             player.next_video_frame,
@@ -915,9 +1037,6 @@ pub(crate) fn av_player_get_video_data(
         player.next_video_frame = player.next_video_frame.saturating_add(1);
     }
     if skipped_frames != 0 {
-        // Re-anchor completed-flip pacing at the frame the wall clock selected. Otherwise the
-        // original frame delta would unnecessarily stall after a legitimate catch-up jump.
-        player.video_clock_origin = Some((completed_flip_count, player.next_video_frame));
         eprintln!(
             "[REMu][AVPLAYER] caught up {skipped_frames} frames to frame={} wall_ms={}",
             player.next_video_frame,
@@ -955,17 +1074,32 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
     let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
         return 0;
     };
-    if arguments[1] == 0
-        || !player.has_audio
-        || player.playing_since.is_none()
-        || player.paused
-        || player.end_of_stream
-        || !av_player_start_decoder(player, true)
-        || player
-            .audio_output
-            .as_mut()
-            .is_none_or(|output| output.read_exact(&mut player.raw_audio_frame).is_err())
+    if arguments[1] == 0 || !player.has_audio {
+        av_player_trace_zero_return(arguments[0], "audio", "no-output-or-no-track");
+        return 0;
+    }
+    if player.paused {
+        av_player_trace_zero_return(arguments[0], "audio", "paused");
+        return 0;
+    }
+    if player.playing_since.is_none() {
+        av_player_trace_zero_return(arguments[0], "audio", "stopped");
+        return 0;
+    }
+    if player.end_of_stream {
+        av_player_trace_zero_return(arguments[0], "audio", "end-of-stream");
+        return 0;
+    }
+    if !av_player_start_decoder(player, true) {
+        av_player_trace_zero_return(arguments[0], "audio", "no-decoder");
+        return 0;
+    }
+    if player
+        .audio_output
+        .as_mut()
+        .is_none_or(|output| output.read_exact(&mut player.raw_audio_frame).is_err())
     {
+        av_player_trace_zero_return(arguments[0], "audio", "decoder-drained");
         return 0;
     }
     if player.audio_buffer_base == 0 {

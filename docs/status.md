@@ -9,8 +9,8 @@ draw streams, compiles observed RDNA2 shaders to Metal, and flips its display bu
 splash frames render correctly; full scene rendering and playability are still open. A second,
 Unity/IL2CPP title (which commits nearly all of its memory by reserving virtual ranges and
 `sceKernelMprotect`-committing them rather than mapping direct memory) now gets resident,
-write-watched textures; its environment backdrop renders with geometry, and its menu UI is not
-yet on screen.
+write-watched textures; its environment backdrop, lighting, and menu UI now render with the
+correct orientation. Lighting and post-processing are improved but not yet visually correct.
 
 ## Import coverage
 
@@ -99,7 +99,7 @@ is plain read/write. The fix shape is to carry the mapping's original protection
 arm/disarm (write-watch arming becomes "remove write, keep the rest"), or to refuse watch
 registration for non-read/write ranges explicitly.
 
-### The Unity title's menu runs at 14–22 FPS with washed-out post-processing
+### The Unity title's menu runs at 14–22 FPS
 
 With FMOD's AudioOut2 port accepted, the Unity title reaches its interactive menu. Three
 successive bottlenecks were profiled on its ~600-draw frames; two are fixed and one remains:
@@ -117,11 +117,45 @@ successive bottlenecks were profiled on its ~600-draw frames; two are fixed and 
   acquire-time re-validation. A further CPU-side layer remains beneath that (~20 FPS with watches
   off, GPU under 30%).
 
-The menu scene renders overexposed (near-white with faint geometry) while its UI text renders
-correctly. The scene targets are RGBA16Float and the title's real menu background is genuinely a
-bright white room, so part of this is authentic; whether the remainder is a post-processing
-(auto-exposure/tonemap) defect or purely the slow frame loop starving exposure adaptation is
-undetermined — re-judge it once the frame rate is fixed.
+The scene-orientation and white-overlay defects are fixed:
+
+- GFX10 `SW_4KB_S` textures now use AddrLib-compatible packed mip chains: the mip-tail occupies
+  the first 4 KiB, non-tail levels follow in reverse level order, and array/cube slices use the
+  full chain stride. The previous linear mip offset treated tail bytes as mip zero, producing
+  mirrored/upside-down scene regions and duplicate light fixtures.
+- `CB_COLOR_CONTROL` special modes are decoded. Resolve, eliminate-fast-clear, and FMASK
+  decompression packets end the current Metal render pass without rasterizing their attached
+  dummy shader. Rasterizing Superliminal's resolve trigger as an ordinary constant-white draw
+  caused the washed-out frame.
+- GCN cube-resource face-atlas coordinates are lowered to Metal 2D-array sampling rather than
+  being passed to direction-based cube samplers.
+
+A live run without diagnostic bypasses now presents the warehouse with the correct orientation,
+one physical light fixture, and readable menu text. Lighting, shadows, and post-processing still
+do not fully match the intended scene. Performance also remains defective, particularly CPU
+write-watch fault volume.
+
+### The Unity title's intro video remains paused after its first frame
+
+The retro-TV intro (60 fps 1440x1080 H.264 inside `sharedassets2.resource`) decodes through the
+ffmpeg pipe backend. AvPlayer now follows shadPS4's source-backed pause contract: Pause preserves
+an active session but freezes `CurrentTime`, and both data exports return no frame until Resume.
+The earlier bounded paused-preroll experiment was removed after live tracing showed that it
+advanced stream positions while Unity was paused and prevented the expected state transition.
+Start and Resume now use separate state transitions; JumpToTime restarts the decoders with an
+input-side `-ss` seek, and `sceAvPlayerChangeStream`/`sceAvPlayerSetTrickSpeed` cover the observed
+single-representation and forward-rate cases. `REMU_TRACE_AVPLAYER=1` counts every zero-return by
+reason. A live automated pass now reaches Ready, Start, and the first decoded video frame, after
+which Unity calls Pause and issues no later Resume in that input path. No intro frame is presented
+to the user, so the event/state transition between preparation, pause, and visible playback remains
+an open defect.
+
+### Gameplay after NEW GAME remains black
+
+The loading screen completes, but the following in-game view remains black. UI elements can still
+appear and the renderer continues submitting work with no failed pipelines, so this remains a
+scene-content, synchronization, or post-processing defect rather than a completed compatibility
+milestone.
 
 ### The runtime test suite is order-dependent
 
@@ -143,14 +177,14 @@ events through the existing thread-local capture instead of the process-global s
 | --- | --- | --- |
 | CPU, loader, linker | x86-64 guest execution behind a native CPU backend under Rosetta; SELF/ELF mapping, observed relocations, AMD64 DTV slots, per-thread `__tls_get_addr`, TLS clone rebasing, and import trampolines with synthetic coverage. | Continue source-backed HLE import closure. The AArch64 translator stays deferred until a milestone requires it. |
 | AGC / PM4 ordering | Native Gen5 command routing, type-2 packets, clear state, packet predication, targetless scanout association, compute submission, ordered memory copy/write/release/wait events, submission boundaries, and a bounded backpressured event channel with an ordered shader-compile gate. | Execution-side `SET_PREDICATION` semantics, then source-backed release/wait, cache visibility, fence writes, and graphics-equeue completion. |
-| Metal resources / readback | Persistent guest textures backed by either direct-memory views or committed (reserve-then-commit / flexible) guest memory, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, MSAA resolve targets, supported depth readback, and GPU-side assembly of layered depth-sample views (shadow cubemaps/cascades rendered as per-face 2D depth targets and bound through one layered SRD are blit-assembled into a cached depth-format array inside the guest batch instead of round-tripping every face through guest memory each frame). Covered by GPU tests. | Bounded asynchronous capture tickets and a reusable staging pool; explicit block-compressed and combined depth/stencil layouts when guest formats exercise them. |
+| Metal resources / readback | Persistent guest textures backed by either direct-memory views or committed (reserve-then-commit / flexible) guest memory, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, AddrLib-compatible GFX10 `SW_4KB_S` packed mip/array/cube upload, MSAA resolve targets, supported depth readback, and GPU-side assembly of layered depth-sample views (shadow cubemaps/cascades rendered as per-face 2D depth targets and bound through one layered SRD are blit-assembled into a cached depth-format array inside the guest batch instead of round-tripping every face through guest memory each frame). Covered by GPU tests. | Bounded asynchronous capture tickets and a reusable staging pool; explicit block-compressed and combined depth/stencil layouts when guest formats exercise them. |
 | Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, `MAP_NO_COALESCE` identity preservation, release-time alias invalidation, shared-mapping identity tracking, CPU write-watch retirement across remaps, and commit-on-protect reserve+commit semantics: `sceKernelMprotect` over a reserved range and flexible mappings commit zero-filled memory into a virtually-keyed shared backing, so GPU residency and write-watching resolve them exactly like direct-memory views, decommit zeroes pages before release, and guest-visible `VirtualQuery` categories are unchanged. The backing is keyed by virtual placement — a deliberate scope decision: this memory class never exposes a physical address to the guest, so physical aliasing of it is unrepresentable by construction, unlike direct memory, which keeps its own physically-keyed backing object. All with synthetic coverage. | Coalesce adjacent contiguous shared-registry records at registration: commit-heavy titles insert one record per `mprotect`, and resolution currently scans records linearly per watch creation and arms one watch segment per record. Mapping lifecycle counters and exact query error/flag behavior for all exercised cases. Memory-pool NIDs (`sceKernelMemoryPoolReserve`/`Commit`/`Expand`/`Move`/…) stay loudly unimplemented until designed: pools deal in guest-physical block addresses (`Expand` returns one, `Move` re-points committed blocks without copying), so they need physically-keyed backing and must not silently reuse the virtually-keyed commit path. |
-| Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, depth-target validity requirements, and translated shader pipelines with cached construction. | Complete reusable blend, depth/stencil, rasterization, culling, multisampling, resolve, and full structural pipeline-cache identity. |
+| Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, depth-target validity requirements, `CB_COLOR_CONTROL` resolve/eliminate-fast-clear/FMASK-decompression command handling, and translated shader pipelines with cached construction. | Complete reusable blend, depth/stencil, rasterization, culling, remaining multisampling behavior, and full structural pipeline-cache identity. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, zero-copy global bindings, wave64 ballot handling on SIMD32, and observed compute geometry, with offline Metal compilation tests. | Complete the remaining RDNA2 instruction/resource/control-flow surface and eliminate residual per-draw Metal buffer churn without weakening guest-memory visibility. |
 | Presentation / frame capture | Guest display size independent of host drawable size; opt-in headless Metal; interactive runs as a regular app bundle; direct scanout without routine GPU-to-CPU round trips; asynchronous shader compilation with strict event ordering; on-disk Metal library and pipeline caches; live title-bar performance statistics. | Resolve early post-boot output into the first real scene and use completed-presentation and guest-flip rates to measure pacing. |
 | Runtime / ABI | Whole-process import auditing across HLE, guest-libc, and host routes; FIFO-ticket condition variables with exact signal/broadcast cardinality; guest mutexes and semaphores; per-thread TLS resolution; video-out attributes; save-data basics; NP service objects. | Complete opaque sync-object lifecycle, cancellation, clock attributes, and absolute timed waits; continue source-backed AGC event queues, save dialogs, and remaining researched NIDs. |
-| Audio | Host output, guest port/config validation, bounded queues, resampling, stereo downmixing, and the complete defined AudioOut2 format lattice (float/i16 × mono/stereo/7.1 × standard order), which is what FMOD titles open. Twelve-channel layouts stay explicitly rejected until the mixer models them. | Audio underruns (~17%) under heavy import-thread contention on command-heavy titles; audit timing, backpressure, device change, pause, teardown, and A/V synchronization with deterministic offline mixer evidence. |
-| Video / Bink | No compatibility claim yet. | Identify each title's actual decoder/API path, then implement exact demux/decode/color/timing semantics with legal generated fixtures. |
+| Audio | Host output, guest port/config validation, bounded queues, resampling, stereo downmixing, and the complete defined AudioOut2 format lattice (float/i16 × mono/stereo/7.1 × standard order), which is what FMOD titles open. Twelve-channel layouts stay explicitly rejected until the mixer models them. | Crackling from 15–17% audio underruns under heavy import-thread contention on command-heavy titles; audit timing, backpressure, device change, pause, teardown, and A/V synchronization with deterministic offline mixer evidence. |
+| Video / Bink | Initial AvPlayer MP4/H.264 and audio decode through ffmpeg pipes, stream enumeration, play/pause/resume/seek/loop/trick-speed state, media-clock frame gating, NV12 buffers, and deferred event callbacks, covered by generated fixtures. | Present the Unity title's intro frames and resolve its preparation/pause transition; Bink has no compatibility claim yet. |
 | Storage / save data | Read-only app filesystem access and initial save transactions; dumps are never modified. | Complete namespace, path, permission, iteration, atomicity, durability, quota, slot, dialog, and concurrency semantics with crash-consistency tests. |
 | Input | Keyboard-backed pad state and opt-in deterministic input sequences. | Complete handle lifetime, disconnect, timestamps, dead zones, motion/touchpad, controller mapping, and focus semantics as titles exercise them. |
 | Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, and diagnostics; bounded logarithmic log checkpoints; opt-in VM tracing; live window-title performance statistics; per-run summaries. | A versioned, documented configuration file with strict precedence and validation, plus structured persistence of the live counters. |

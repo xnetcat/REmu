@@ -68,6 +68,7 @@ pub fn generated_nid_name(nid: &str) -> Option<&'static str> {
 }
 
 /// Returns how many names the table carries, for coverage reporting.
+#[cfg(test)]
 #[must_use]
 pub fn generated_nid_name_count() -> usize {
     header().map_or(0, |(count, _)| count)
