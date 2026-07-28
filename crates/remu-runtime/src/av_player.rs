@@ -1,0 +1,1083 @@
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use crate::{
+    AvPlayerEventCallback, AvPlayerInstance, PROBE_DISPATCH, ProbeDispatchState,
+    av_player_flip_interval_microseconds, guest_aligned_alloc, guest_memset,
+    process_guest_range_is_readable, read_guest_cstring, read_guest_u8, read_guest_u32,
+    read_guest_u64, resolve_guest_path, sce_kernel_error, write_guest_u8, write_guest_u16,
+    write_guest_u32, write_guest_u64,
+};
+
+const AV_PLAYER_ERROR_INVALID_PARAMS: u32 = 0x806a_0001;
+pub(crate) const AV_PLAYER_ERROR_OPERATION_FAILED: u32 = 0x806a_0002;
+
+fn av_player_tool(name: &str, environment: &str) -> Option<PathBuf> {
+    if let Some(configured) = std::env::var_os(environment).map(PathBuf::from)
+        && configured.is_file()
+    {
+        return Some(configured);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .chain(
+            ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+                .into_iter()
+                .map(Path::new)
+                .map(|directory| directory.join(name)),
+        )
+        .find(|candidate| candidate.is_file())
+}
+
+fn av_player_probe_video(path: &Path) -> Option<(u32, u32, f64, Duration)> {
+    let ffprobe = av_player_tool("ffprobe", "REMU_FFPROBE")?;
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,duration",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let fields = String::from_utf8(output.stdout).ok()?;
+    let mut width = 0;
+    let mut height = 0;
+    let mut frames_per_second = 30.0;
+    let mut duration = Duration::ZERO;
+    for line in fields.lines() {
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        match name {
+            "width" => width = value.parse().ok()?,
+            "height" => height = value.parse().ok()?,
+            "avg_frame_rate" => {
+                let (numerator, denominator) = value.split_once('/').unwrap_or((value, "1"));
+                let (Ok(numerator), Ok(denominator)) =
+                    (numerator.parse::<f64>(), denominator.parse::<f64>())
+                else {
+                    continue;
+                };
+                if numerator.is_finite() && denominator.is_finite() && denominator > 0.0 {
+                    frames_per_second = numerator / denominator;
+                }
+            }
+            "duration" => {
+                if let Ok(seconds) = value.parse::<f64>()
+                    && seconds.is_finite()
+                    && seconds >= 0.0
+                {
+                    duration = Duration::from_secs_f64(seconds);
+                }
+            }
+            _ => {}
+        }
+    }
+    (width != 0 && height != 0 && frames_per_second.is_finite() && frames_per_second > 0.0)
+        .then_some((width, height, frames_per_second, duration))
+}
+
+fn av_player_probe_has_audio(path: &Path) -> bool {
+    let Some(ffprobe) = av_player_tool("ffprobe", "REMU_FFPROBE") else {
+        return false;
+    };
+    Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
+/// Clamps a media source path at the application filesystem root.
+///
+/// AVPlayer resolves sources inside the mounted application filesystem, which has no parent above
+/// its root. A source beginning with `.` or `..` segments names a directory outside that root, so
+/// the segments are dropped and the remainder resolves from the root, matching how a sandboxed
+/// filesystem clamps an escape at its mount point. A bare filename left after one or more parent
+/// segments has no directory left to anchor it, so it is refused rather than silently becoming a
+/// root lookup.
+///
+/// A path with no leading dot segments is returned unchanged.
+fn av_player_clamp_leading_dot_segments(path: &str) -> Option<&str> {
+    let mut normalized = path;
+    let mut removed_parent = false;
+    loop {
+        if let Some(rest) = normalized.strip_prefix("../") {
+            normalized = rest;
+            removed_parent = true;
+        } else if let Some(rest) = normalized.strip_prefix("./") {
+            normalized = rest;
+        } else {
+            break;
+        }
+    }
+    (!removed_parent || normalized.contains('/')).then_some(normalized)
+}
+
+pub(crate) fn av_player_resolve_source(game_root: &Path, source: &str) -> Option<PathBuf> {
+    let mut normalized = source.trim().trim_end_matches('\0').replace('\\', "/");
+    let scheme_length = if normalized
+        .get(.."file://".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+    {
+        Some("file://".len())
+    } else if normalized
+        .get(.."file:".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        Some("file:".len())
+    } else {
+        None
+    };
+    if let Some(scheme_length) = scheme_length {
+        normalized = normalized[scheme_length..].to_owned();
+    }
+    // A `file:` source carries a filesystem-relative path once its scheme is stripped, so both
+    // forms reach the resolver already clamped to the application root.
+    let normalized = av_player_clamp_leading_dot_segments(&normalized)?.to_owned();
+    resolve_guest_path(game_root, &normalized).or_else(|| {
+        let media = normalized.find("Media/")?;
+        resolve_guest_path(game_root, &format!("/app0/{}", &normalized[media..]))
+    })
+}
+
+pub(crate) fn av_player_set_log_callback(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    state.av_player.log_callback = (arguments[0] != 0).then_some((arguments[0], arguments[1]));
+    0
+}
+
+pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    const MINIMUM_INITIALIZATION_SIZE: usize = 48;
+    const MAXIMUM_INITIALIZATION_SIZE: usize = 0x400;
+    let (parameter, output) = (arguments[0], arguments[1]);
+    if parameter == 0 || output == 0 {
+        eprintln!(
+            "[REMu][AVPLAYER] InitEx rejected null parameter={parameter:#x} output={output:#x}"
+        );
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    let raw_size = read_guest_u64(parameter);
+    let Ok(size) = usize::try_from(raw_size) else {
+        eprintln!("[REMu][AVPLAYER] InitEx rejected non-host size={raw_size:#x}");
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    if !(MINIMUM_INITIALIZATION_SIZE..=MAXIMUM_INITIALIZATION_SIZE).contains(&size) {
+        eprintln!(
+            "[REMu][AVPLAYER] InitEx rejected size={size:#x} parameter={parameter:#x} output={output:#x}"
+        );
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    let allocator_callbacks = [16_u64, 24, 32, 40].map(|offset| read_guest_u64(parameter + offset));
+    if allocator_callbacks.contains(&0) {
+        eprintln!(
+            "[REMu][AVPLAYER] InitEx rejected allocator callbacks={allocator_callbacks:#x?} size={size:#x}"
+        );
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    // SAFETY: the leading bounded size field describes a caller-owned initialization structure.
+    let initialization =
+        unsafe { std::slice::from_raw_parts(parameter as *const u8, size).to_vec() };
+    let handle = state.av_player.next_handle.max(1);
+    state.av_player.next_handle = handle.saturating_add(1);
+    state.av_player.players.insert(
+        handle,
+        AvPlayerInstance {
+            _initialization: initialization,
+            allocator_object: read_guest_u64(parameter + 8),
+            allocate_texture_callback: read_guest_u64(parameter + 32),
+            event_object: read_guest_u64(parameter + 88),
+            event_callback: read_guest_u64(parameter + 96),
+            source: None,
+            // Gen5 retains the PS4 InitDataEx prefix: the signed framebuffer count is at
+            // 0xa4 and the following byte is autoStart. Reading 0xa4 treated the count itself as
+            // a boolean and could make an explicitly-controlled player start a second time.
+            auto_start: read_guest_u8(parameter + 168) != 0,
+            width: 0,
+            height: 0,
+            frames_per_second: 30.0,
+            duration: Duration::ZERO,
+            has_audio: false,
+            paused: false,
+            end_of_stream: false,
+            playing_since: None,
+            elapsed: Duration::ZERO,
+            looping: false,
+            video_decoder: None,
+            video_output: None,
+            raw_video_frame: Vec::new(),
+            padded_video_frame: Vec::new(),
+            video_buffer_base: 0,
+            video_buffers: [0; 3],
+            video_buffer_stride: 0,
+            next_video_buffer: 0,
+            next_video_frame: 0,
+            video_clock_origin: None,
+            video_catch_up_origin: None,
+            audio_decoder: None,
+            audio_output: None,
+            raw_audio_frame: Vec::new(),
+            audio_buffer_base: 0,
+            next_audio_buffer: 0,
+            next_audio_frame: 0,
+        },
+    );
+    write_guest_u64(output, handle);
+    let player = &state.av_player.players[&handle];
+    eprintln!(
+        "[REMu][AVPLAYER] initialized handle={handle:#x} size={size:#x} texture_alloc={:#x}/{:#x} event={:#x}/{:#x}",
+        player.allocator_object,
+        player.allocate_texture_callback,
+        player.event_object,
+        player.event_callback
+    );
+    0
+}
+
+pub(crate) fn av_player_post_init(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let (handle, parameter) = (arguments[0], arguments[1]);
+    if parameter == 0 || !state.av_player.players.contains_key(&handle) {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    eprintln!("[REMu][AVPLAYER] post-initialized handle={handle:#x}");
+    0
+}
+
+fn av_player_queue_event(function: u64, object: u64, event: u64, state: &mut ProbeDispatchState) {
+    if function == 0 {
+        eprintln!("[REMu][AVPLAYER] skipped event={event} without callback");
+        return;
+    }
+    state
+        .av_player
+        .pending_callbacks
+        .push(AvPlayerEventCallback {
+            function,
+            object,
+            event,
+        });
+}
+
+pub(crate) fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallback>) {
+    for callback in callbacks {
+        if !process_guest_range_is_readable(callback.function, 1) {
+            eprintln!(
+                "[REMu][AVPLAYER] rejected unreadable event={} callback={:#x}",
+                callback.event, callback.function
+            );
+            continue;
+        }
+        type Callback = unsafe extern "C" fn(u64, u64, u64, u64);
+        // SAFETY: InitEx supplies a live guest SysV event callback and opaque event object. The
+        // process-wide dispatch lock has already been released, so this callback may re-enter any
+        // AVPlayer export exactly as the native library permits.
+        let function: Callback = unsafe { std::mem::transmute(callback.function) };
+        // SAFETY: The callback ABI is `(object, event, source_id, event_data)`.
+        unsafe { function(callback.object, callback.event, 0, 0) };
+        eprintln!(
+            "[REMu][AVPLAYER] delivered event={} callback={:#x}",
+            callback.event, callback.function
+        );
+    }
+}
+
+pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
+    let Some(dispatch) = PROBE_DISPATCH.get() else {
+        return;
+    };
+    let request = {
+        let state = dispatch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(player) = state.av_player.players.get(&handle) else {
+            return;
+        };
+        if player.video_buffers[0] != 0
+            || player.allocate_texture_callback == 0
+            || player.width == 0
+            || player.height == 0
+        {
+            return;
+        }
+        let Some((_, stride)) = av_player_nv12_layout(player.width, player.height, extended) else {
+            return;
+        };
+        (
+            player.allocate_texture_callback,
+            player.allocator_object,
+            stride,
+        )
+    };
+    if !process_guest_range_is_readable(request.0, 1) {
+        eprintln!(
+            "[REMu][AVPLAYER] texture allocator callback is unreadable: {:#x}",
+            request.0
+        );
+        return;
+    }
+    type AllocateTexture = unsafe extern "C" fn(u64, u32, u32) -> u64;
+    // SAFETY: InitEx supplies the live guest texture-allocation callback and opaque allocator
+    // object. This runs before the process dispatch lock is acquired, so the allocator may call
+    // kernel memory exports while it obtains GPU-visible storage.
+    let allocate: AllocateTexture = unsafe { std::mem::transmute(request.0) };
+    let mut buffers = [0_u64; 3];
+    for (index, buffer) in buffers.iter_mut().enumerate() {
+        let Ok(size) = u32::try_from(request.2) else {
+            return;
+        };
+        // SAFETY: The callback ABI is `(object, alignment, size)`.
+        *buffer = unsafe { allocate(request.1, 0x100, size) };
+        if *buffer == 0 {
+            eprintln!("[REMu][AVPLAYER] texture allocator returned null for buffer {index}");
+            return;
+        }
+    }
+    let mut state = dispatch
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(player) = state.av_player.players.get_mut(&handle) else {
+        return;
+    };
+    if player.video_buffers[0] == 0 {
+        player.video_buffers = buffers;
+        player.video_buffer_stride = request.2;
+        eprintln!(
+            "[REMu][AVPLAYER] allocated guest video buffers size={} addresses={buffers:#x?}",
+            request.2
+        );
+    }
+}
+
+pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(source) = read_guest_cstring(arguments[1]) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    let Some(host_path) = av_player_resolve_source(&state.game_root, &source) else {
+        eprintln!("[REMu][AVPLAYER] rejected source outside app0: {source:?}");
+        return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
+    };
+    let Some((width, height, frames_per_second, duration)) = av_player_probe_video(&host_path)
+    else {
+        eprintln!(
+            "[REMu][AVPLAYER] could not probe source guest={source:?} host={}",
+            host_path.display()
+        );
+        return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
+    };
+    let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    player.reset_playback();
+    player.source = Some(host_path.to_string_lossy().into_owned());
+    player.width = width;
+    player.height = height;
+    player.frames_per_second = frames_per_second;
+    player.duration = duration;
+    player.has_audio = av_player_probe_has_audio(&host_path);
+    player.paused = false;
+    if player.auto_start {
+        player.playing_since = Some(Instant::now());
+    }
+    let callback = (
+        player.event_callback,
+        player.event_object,
+        player.auto_start,
+    );
+    eprintln!(
+        "[REMu][AVPLAYER] source handle={:#x} guest={source:?} host={} {}x{} fps={frames_per_second:.3} duration_ms={} audio={} auto_start={}",
+        arguments[0],
+        host_path.display(),
+        width,
+        height,
+        duration.as_millis(),
+        player.has_audio,
+        player.auto_start,
+    );
+    av_player_queue_event(callback.0, callback.1, 2, state);
+    if callback.2 {
+        av_player_queue_event(callback.0, callback.1, 3, state);
+    }
+    0
+}
+
+pub(crate) fn av_player_add_source_ex(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let details = arguments[2];
+    if arguments[1] != 0 || details == 0 {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    let source_address = read_guest_u64(details);
+    let length = u64::from(read_guest_u32(details + 8));
+    let Ok(length) = usize::try_from(length) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    if source_address == 0 || length == 0 {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    // SAFETY: the source-details URI pairs this pointer with the exact readable byte length.
+    let bytes = unsafe { std::slice::from_raw_parts(source_address as *const u8, length) };
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    let terminated = format!("{}\0", source.trim_end_matches('\0'));
+    let forwarded = [arguments[0], terminated.as_ptr() as u64, 0, 0, 0, 0];
+    av_player_add_source(forwarded, state)
+}
+
+fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
+    if if audio {
+        player.audio_output.is_some()
+    } else {
+        player.video_output.is_some()
+    } {
+        return true;
+    }
+    let (Some(ffmpeg), Some(source)) = (
+        av_player_tool("ffmpeg", "REMU_FFMPEG"),
+        player.source.as_deref(),
+    ) else {
+        return false;
+    };
+    let mut command = Command::new(ffmpeg);
+    command
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(source);
+    if audio {
+        command.args([
+            "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1",
+        ]);
+    } else {
+        command.args([
+            "-map", "0:v:0", "-an", "-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1",
+        ]);
+    }
+    let Ok(mut child) = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+        return false;
+    };
+    let Some(output) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    if audio {
+        player.raw_audio_frame.resize(1024 * 2 * 2, 0);
+        player.audio_output = Some(output);
+        player.audio_decoder = Some(child);
+    } else {
+        let frame_bytes = u64::from(player.width)
+            .checked_mul(u64::from(player.height))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .and_then(|bytes| bytes.checked_div(2))
+            .and_then(|bytes| usize::try_from(bytes).ok());
+        let Some(frame_bytes) = frame_bytes else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        };
+        player.raw_video_frame.resize(frame_bytes, 0);
+        player.video_output = Some(output);
+        player.video_decoder = Some(child);
+    }
+    player.playing_since.get_or_insert_with(Instant::now);
+    eprintln!(
+        "[REMu][AVPLAYER] started {} decoder source={source:?}",
+        if audio { "audio" } else { "video" }
+    );
+    true
+}
+
+fn av_player_read_video_frame(player: &mut AvPlayerInstance) -> bool {
+    player
+        .video_output
+        .as_mut()
+        .is_some_and(|output| output.read_exact(&mut player.raw_video_frame).is_ok())
+}
+
+fn av_player_finish_stream(player: &mut AvPlayerInstance) {
+    if player.looping {
+        player.reset_playback();
+        player.playing_since = Some(Instant::now());
+    } else {
+        player.end_of_stream = true;
+        if let Some(started) = player.playing_since.take() {
+            player.elapsed += started.elapsed();
+        }
+    }
+}
+
+pub(crate) fn av_player_nv12_layout(
+    width: u32,
+    height: u32,
+    extended: bool,
+) -> Option<(usize, usize)> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    // The Gen5 extended ABI exposes a 256-byte-aligned pitch and the visible height. Legacy
+    // frame info has no explicit pitch and therefore uses its 16-pixel-aligned dimensions.
+    let (row_pitch, storage_height) = if extended {
+        (width.checked_add(255)? & !255, height)
+    } else {
+        (width.checked_add(15)? & !15, height.checked_add(15)? & !15)
+    };
+    let frame_bytes = row_pitch
+        .checked_mul(storage_height)?
+        .checked_mul(3)?
+        .checked_div(2)?;
+    Some((row_pitch, frame_bytes))
+}
+
+fn av_player_ensure_video_buffers(player: &mut AvPlayerInstance, extended: bool) -> bool {
+    if player.video_buffers[0] != 0 {
+        return true;
+    }
+    let Some((_, stride)) = av_player_nv12_layout(player.width, player.height, extended) else {
+        return false;
+    };
+    let Some(total) = stride
+        .checked_mul(3)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
+        return false;
+    };
+    let allocation = guest_aligned_alloc(0x4000, total);
+    if allocation == 0 {
+        return false;
+    }
+    // SAFETY: the dedicated aligned allocation has exactly `total` writable bytes.
+    unsafe {
+        std::ptr::write_bytes(
+            allocation as *mut u8,
+            0,
+            usize::try_from(total).unwrap_or(0),
+        )
+    };
+    player.video_buffer_base = allocation;
+    for (index, buffer) in player.video_buffers.iter_mut().enumerate() {
+        *buffer = allocation
+            + u64::try_from(index)
+                .unwrap_or(0)
+                .saturating_mul(u64::try_from(stride).unwrap_or(0));
+    }
+    player.video_buffer_stride = stride;
+    eprintln!(
+        "[REMu][AVPLAYER] allocated fallback video buffers size={stride} base={allocation:#x}"
+    );
+    true
+}
+
+fn av_player_write_video_frame(
+    player: &mut AvPlayerInstance,
+    output: u64,
+    timestamp_milliseconds: u64,
+    extended: bool,
+) -> bool {
+    if !av_player_ensure_video_buffers(player, extended) {
+        return false;
+    }
+    let Some((row_pitch, frame_bytes)) =
+        av_player_nv12_layout(player.width, player.height, extended)
+    else {
+        return false;
+    };
+    if player.video_buffer_stride < frame_bytes {
+        return false;
+    }
+    let width = usize::try_from(player.width).unwrap_or(0);
+    let height = usize::try_from(player.height).unwrap_or(0);
+    let storage_height = if extended {
+        height
+    } else {
+        height.saturating_add(15) & !15
+    };
+    let frame = if row_pitch == width {
+        &player.raw_video_frame
+    } else {
+        player.padded_video_frame.resize(frame_bytes, 0);
+        player.padded_video_frame.fill(0);
+        for row in 0..height {
+            let source = row * width;
+            let destination = row * row_pitch;
+            player.padded_video_frame[destination..destination + width]
+                .copy_from_slice(&player.raw_video_frame[source..source + width]);
+        }
+        let source_chroma = width * height;
+        let destination_chroma = row_pitch * storage_height;
+        for row in 0..height.div_ceil(2) {
+            let source = source_chroma + row * width;
+            let destination = destination_chroma + row * row_pitch;
+            player.padded_video_frame[destination..destination + width]
+                .copy_from_slice(&player.raw_video_frame[source..source + width]);
+        }
+        &player.padded_video_frame
+    };
+    let address = player.video_buffers[player.next_video_buffer];
+    player.next_video_buffer = (player.next_video_buffer + 1) % 3;
+    // SAFETY: the destination is one complete slice of the dedicated three-frame allocation.
+    unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), address as *mut u8, frame.len()) };
+    av_player_write_video_frame_info(
+        output,
+        address,
+        timestamp_milliseconds,
+        player.width,
+        player.height,
+        row_pitch,
+        player.frames_per_second,
+        extended,
+    );
+    true
+}
+
+pub(crate) fn av_player_write_video_frame_info(
+    output: u64,
+    address: u64,
+    timestamp_milliseconds: u64,
+    width: u32,
+    height: u32,
+    row_pitch: usize,
+    frames_per_second: f64,
+    extended: bool,
+) {
+    let visible_width = usize::try_from(width).unwrap_or(0);
+    let visible_height = usize::try_from(height).unwrap_or(0);
+    let output_width = if extended {
+        row_pitch
+    } else {
+        visible_width.saturating_add(15) & !15
+    };
+    let output_height = if extended {
+        visible_height
+    } else {
+        visible_height.saturating_add(15) & !15
+    };
+    guest_memset(output, 0, if extended { 104 } else { 40 });
+    write_guest_u64(output, address);
+    write_guest_u64(output + 16, timestamp_milliseconds);
+    write_guest_u32(output + 24, u32::try_from(output_width).unwrap_or(width));
+    write_guest_u32(output + 28, u32::try_from(output_height).unwrap_or(height));
+    write_guest_u32(output + 32, 1.0_f32.to_bits());
+    if extended {
+        write_guest_u32(output + 60, u32::try_from(row_pitch).unwrap_or(width));
+        write_guest_u8(output + 64, 8);
+        write_guest_u8(output + 65, 8);
+        // Silent Hill consumes the PS4-compatible 104-byte Gen5 VideoFrameInfoEx prefix. Crop
+        // fields are left, right, top, bottom at +44/+48/+52/+56 respectively; writing padding
+        // into left/top shifts the visible image even though its final extent happens to match.
+        write_guest_u32(
+            output + 48,
+            u32::try_from(row_pitch.saturating_sub(visible_width)).unwrap_or(0),
+        );
+        write_guest_u32(
+            output + 56,
+            u32::try_from(output_height.saturating_sub(visible_height)).unwrap_or(0),
+        );
+        // Gen5 replaces the legacy integer frame-rate field with a double in the extended tail.
+        write_guest_u64(output + 0x48, frames_per_second.to_bits());
+    }
+}
+
+pub(crate) fn av_player_video_frame_is_due(
+    video_clock_origin: &mut Option<(u64, u64)>,
+    next_video_frame: u64,
+    frames_per_second: f64,
+    completed_flip_count: u64,
+    flip_interval_microseconds: u64,
+) -> bool {
+    if flip_interval_microseconds == 0 {
+        return true;
+    }
+    let (origin_flip, origin_frame) =
+        *video_clock_origin.get_or_insert((completed_flip_count, next_video_frame));
+    let retired_flips = completed_flip_count.saturating_sub(origin_flip);
+    let frame_delta = next_video_frame.saturating_sub(origin_frame);
+    let frame_due_microseconds =
+        ((frame_delta as f64) * 1_000_000.0 / frames_per_second.max(1.0)).round() as u64;
+    // Select the video frame nearest the completed display vblank. The half-vblank tolerance
+    // gives a 29.97 fps movie the expected two-flip cadence on a nominal 60 Hz output.
+    let media_clock_microseconds = retired_flips
+        .saturating_mul(flip_interval_microseconds)
+        .saturating_add(flip_interval_microseconds / 2);
+    frame_due_microseconds <= media_clock_microseconds
+}
+
+pub(crate) fn av_player_video_catch_up_target(
+    origin: Option<(Instant, u64)>,
+    next_video_frame: u64,
+    frames_per_second: f64,
+    duration: Duration,
+    frame_bytes: usize,
+    now: Instant,
+) -> u64 {
+    let Some((origin_time, origin_frame)) = origin else {
+        // Always expose the first frame. Establishing the catch-up clock before this point made a
+        // slow first emulated draw skip an entire short movie without showing any splash frame.
+        return next_video_frame;
+    };
+    let elapsed_frames = (now.saturating_duration_since(origin_time).as_secs_f64()
+        * frames_per_second.max(1.0))
+    .floor() as u64;
+    let mut target = origin_frame.saturating_add(elapsed_frames);
+    if !duration.is_zero() {
+        let total_frames = (duration.as_secs_f64() * frames_per_second.max(1.0)).ceil() as u64;
+        target = target.min(total_frames.saturating_sub(1));
+    }
+
+    // Sequentially draining ffmpeg preserves decoder state and exact frame ordering. Bound the
+    // work by bytes as well as frames so a tiny UI movie can catch up promptly without one poll
+    // reading hundreds of MiB from a 4K stream.
+    const MAXIMUM_CATCH_UP_BYTES: usize = 64 * 1_024 * 1_024;
+    const MAXIMUM_CATCH_UP_FRAMES: u64 = 120;
+    let byte_limited_frames = if frame_bytes == 0 {
+        1
+    } else {
+        u64::try_from(MAXIMUM_CATCH_UP_BYTES / frame_bytes)
+            .unwrap_or(MAXIMUM_CATCH_UP_FRAMES)
+            .max(1)
+    };
+    let maximum_skip = byte_limited_frames.min(MAXIMUM_CATCH_UP_FRAMES);
+    target.min(next_video_frame.saturating_add(maximum_skip))
+}
+
+fn av_player_wall_clock_catch_up_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_AVPLAYER_WALL_CLOCK_CATCH_UP").is_some_and(|value| value == "1")
+    })
+}
+
+pub(crate) fn av_player_close(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    if state.av_player.players.remove(&handle).is_some() {
+        0
+    } else {
+        sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS)
+    }
+}
+
+pub(crate) fn av_player_current_time(handle: u64, state: &ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get(&handle) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    u64::try_from(player.decoded_playback_elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn av_player_is_active(handle: u64, state: &ProbeDispatchState) -> u64 {
+    state.av_player.players.get(&handle).map_or(0, |player| {
+        // Host wall time can advance by many seconds while an emulated frame is translated.
+        // AVPlayer stays active until its decoder actually reaches EOF so a short intro cannot
+        // disappear before the guest has received its first frame.
+        u64::from(player.playing_since.is_some() && !player.end_of_stream)
+    })
+}
+
+pub(crate) fn av_player_pause(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&handle) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    if let Some(started) = player.playing_since.take() {
+        player.elapsed += started.elapsed();
+    }
+    player.paused = true;
+    player.video_clock_origin = None;
+    player.video_catch_up_origin = None;
+    let callback = (player.event_callback, player.event_object);
+    av_player_queue_event(callback.0, callback.1, 4, state);
+    0
+}
+
+pub(crate) fn av_player_start(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&handle) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    if player.source.is_none() {
+        return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
+    }
+    player.paused = false;
+    player.end_of_stream = false;
+    player.video_clock_origin = None;
+    player.video_catch_up_origin = None;
+    player.playing_since.get_or_insert_with(Instant::now);
+    let callback = (player.event_callback, player.event_object);
+    eprintln!("[REMu][AVPLAYER] started handle={handle:#x}");
+    av_player_queue_event(callback.0, callback.1, 3, state);
+    0
+}
+
+pub(crate) fn av_player_jump_to_time(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    player.stop_decoders();
+    player.elapsed = Duration::from_millis(arguments[1]);
+    player.next_video_frame = (player.elapsed.as_secs_f64() * player.frames_per_second) as u64;
+    player.video_clock_origin = None;
+    player.video_catch_up_origin = None;
+    player.next_audio_frame = u64::try_from(player.elapsed.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(48_000)
+        / (1024 * 1_000);
+    if player.playing_since.is_some() {
+        player.playing_since = Some(Instant::now());
+    }
+    0
+}
+
+pub(crate) fn av_player_stop(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&handle) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    player.reset_playback();
+    player.paused = false;
+    let callback = (player.event_callback, player.event_object);
+    av_player_queue_event(callback.0, callback.1, 1, state);
+    0
+}
+
+pub(crate) fn av_player_set_looping(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    player.looping = arguments[1] & 1 != 0;
+    0
+}
+
+pub(crate) fn av_player_get_video_data(
+    arguments: [u64; 6],
+    extended: bool,
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let completed_flip_count = state.video_out.completed_flip_count;
+    let flip_interval_microseconds = av_player_flip_interval_microseconds();
+    let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
+        return 0;
+    };
+    if arguments[1] == 0
+        || player.playing_since.is_none()
+        || player.paused
+        || player.end_of_stream
+        || !av_player_start_decoder(player, false)
+    {
+        return 0;
+    }
+    if !av_player_video_frame_is_due(
+        &mut player.video_clock_origin,
+        player.next_video_frame,
+        player.frames_per_second,
+        completed_flip_count,
+        flip_interval_microseconds,
+    ) {
+        return 0;
+    }
+    // Completed VideoOut flips are the emulated media clock. Wall-clock catch-up is useful only
+    // when translation already sustains realtime; below that rate it discarded nearly every
+    // Silent Hill splash/movie frame while audio and guest time continued ahead. Keep it as an
+    // explicit diagnostic option rather than the correctness default.
+    let catch_up_target = if av_player_wall_clock_catch_up_enabled() {
+        av_player_video_catch_up_target(
+            player.video_catch_up_origin,
+            player.next_video_frame,
+            player.frames_per_second,
+            player.duration,
+            player.raw_video_frame.len(),
+            Instant::now(),
+        )
+    } else {
+        player.next_video_frame
+    };
+    let skipped_frames = catch_up_target.saturating_sub(player.next_video_frame);
+    for _ in 0..skipped_frames {
+        if !av_player_read_video_frame(player) {
+            av_player_finish_stream(player);
+            return 0;
+        }
+        player.next_video_frame = player.next_video_frame.saturating_add(1);
+    }
+    if skipped_frames != 0 {
+        // Re-anchor completed-flip pacing at the frame the wall clock selected. Otherwise the
+        // original frame delta would unnecessarily stall after a legitimate catch-up jump.
+        player.video_clock_origin = Some((completed_flip_count, player.next_video_frame));
+        eprintln!(
+            "[REMu][AVPLAYER] caught up {skipped_frames} frames to frame={} wall_ms={}",
+            player.next_video_frame,
+            player.playback_elapsed().as_millis()
+        );
+    }
+    if !av_player_read_video_frame(player) {
+        av_player_finish_stream(player);
+        return 0;
+    }
+    let timestamp = ((player.next_video_frame as f64) * 1_000.0 / player.frames_per_second.max(1.0))
+        .round() as u64;
+    player.next_video_frame = player.next_video_frame.saturating_add(1);
+    if av_player_write_video_frame(player, arguments[1], timestamp, extended) {
+        player
+            .video_catch_up_origin
+            .get_or_insert((Instant::now(), player.next_video_frame));
+        if player.next_video_frame <= 4 || player.next_video_frame.is_power_of_two() {
+            eprintln!(
+                "[REMu][AVPLAYER] video frame={} timestamp_ms={timestamp} extended={extended}",
+                player.next_video_frame
+            );
+        }
+        1
+    } else {
+        0
+    }
+}
+
+pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    const SAMPLES_PER_FRAME: usize = 1024;
+    const CHANNELS: usize = 2;
+    const SAMPLE_RATE: u32 = 48_000;
+    const FRAME_BYTES: usize = SAMPLES_PER_FRAME * CHANNELS * 2;
+    let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
+        return 0;
+    };
+    if arguments[1] == 0
+        || !player.has_audio
+        || player.playing_since.is_none()
+        || player.paused
+        || player.end_of_stream
+        || !av_player_start_decoder(player, true)
+        || player
+            .audio_output
+            .as_mut()
+            .is_none_or(|output| output.read_exact(&mut player.raw_audio_frame).is_err())
+    {
+        return 0;
+    }
+    if player.audio_buffer_base == 0 {
+        let total = u64::try_from(FRAME_BYTES * 8).unwrap_or(0);
+        player.audio_buffer_base = guest_aligned_alloc(0x100, total);
+        if player.audio_buffer_base == 0 {
+            return 0;
+        }
+    }
+    let address = player.audio_buffer_base
+        + u64::try_from(player.next_audio_buffer * FRAME_BYTES).unwrap_or(0);
+    player.next_audio_buffer = (player.next_audio_buffer + 1) % 8;
+    // SAFETY: `address` selects one complete frame in the dedicated eight-frame allocation.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            player.raw_audio_frame.as_ptr(),
+            address as *mut u8,
+            FRAME_BYTES,
+        )
+    };
+    let timestamp = player
+        .next_audio_frame
+        .saturating_mul(SAMPLES_PER_FRAME as u64)
+        * 1_000
+        / u64::from(SAMPLE_RATE);
+    player.next_audio_frame = player.next_audio_frame.saturating_add(1);
+    guest_memset(arguments[1], 0, 40);
+    write_guest_u64(arguments[1], address);
+    write_guest_u64(arguments[1] + 16, timestamp);
+    write_guest_u16(arguments[1] + 24, CHANNELS as u16);
+    write_guest_u32(arguments[1] + 28, SAMPLE_RATE);
+    write_guest_u32(arguments[1] + 32, FRAME_BYTES as u32);
+    1
+}
+
+pub(crate) fn av_player_stream_count(handle: u64, state: &ProbeDispatchState) -> u64 {
+    state.av_player.players.get(&handle).map_or_else(
+        || sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS),
+        |player| 1 + u64::from(player.has_audio),
+    )
+}
+
+pub(crate) fn av_player_validate_handle(handle: u64, state: &ProbeDispatchState) -> u64 {
+    if state.av_player.players.contains_key(&handle) {
+        0
+    } else {
+        sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS)
+    }
+}
+
+// Silent Hill's Gen5 Unreal media player consumes the same zero-based stream discriminator as
+// the public AvPlayer ABI: video=0, audio=1, timed text=2. Returning one-based values makes Unreal
+// classify its only video stream as audio and call GetAudioData forever, leaving the movie black.
+pub(crate) const AV_PLAYER_STREAM_TYPE_VIDEO: u32 = 0;
+pub(crate) const AV_PLAYER_STREAM_TYPE_AUDIO: u32 = 1;
+const AV_PLAYER_STREAM_INFO_SIZE: u64 = 32;
+
+pub(crate) fn av_player_write_stream_info(
+    output: u64,
+    stream_index: u64,
+    width: u32,
+    height: u32,
+    duration: Duration,
+) {
+    guest_memset(output, 0, AV_PLAYER_STREAM_INFO_SIZE);
+    let stream_type = if stream_index == 0 {
+        AV_PLAYER_STREAM_TYPE_VIDEO
+    } else {
+        AV_PLAYER_STREAM_TYPE_AUDIO
+    };
+    write_guest_u32(output, stream_type);
+    if stream_type == AV_PLAYER_STREAM_TYPE_VIDEO {
+        write_guest_u32(output + 8, width.saturating_add(15) & !15);
+        write_guest_u32(output + 12, height.saturating_add(15) & !15);
+        write_guest_u32(output + 16, ((width as f32) / (height as f32)).to_bits());
+    } else {
+        write_guest_u16(output + 8, 2);
+        write_guest_u32(output + 12, 48_000);
+    }
+    write_guest_u64(
+        output + 24,
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+    );
+}
+
+pub(crate) fn av_player_get_stream_info(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get(&arguments[0]) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    if arguments[1] > u64::from(player.has_audio)
+        || arguments[2] == 0
+        || player.width == 0
+        || player.height == 0
+    {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    // Gen5's stream-info structure is 32 bytes and omits the PS4 start-time tail.
+    av_player_write_stream_info(
+        arguments[2],
+        arguments[1],
+        player.width,
+        player.height,
+        player.duration,
+    );
+    eprintln!(
+        "[REMu][AVPLAYER] stream info handle={:#x} index={} type={} {}x{} duration_ms={}",
+        arguments[0],
+        arguments[1],
+        if arguments[1] == 0 { "video" } else { "audio" },
+        player.width,
+        player.height,
+        player.duration.as_millis(),
+    );
+    0
+}

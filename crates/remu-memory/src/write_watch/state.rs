@@ -1,0 +1,230 @@
+// Copyright (C) 2026 REmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+//! The mutex-protected registry of watched guest ranges and their armed host pages.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use super::page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size_infallible, protect_page};
+use super::snapshot::publish_snapshot;
+
+#[derive(Debug)]
+pub(super) struct WatchedPage {
+    pub(super) address: u64,
+    pub(super) dirty: AtomicBool,
+    pub(super) armed: AtomicBool,
+}
+
+#[derive(Debug)]
+pub(super) struct WatchedRange {
+    pub(super) id: u64,
+    pub(super) address: u64,
+    pub(super) byte_count: u64,
+    pub(super) precise_tracking: bool,
+    pub(super) generation: AtomicU64,
+    pub(super) dirty: AtomicBool,
+    pub(super) retirement: AtomicU8,
+    pub(super) pages: Box<[WatchedPage]>,
+}
+
+pub(super) const WATCH_ACTIVE: u8 = 0;
+
+pub(super) const WATCH_REPROTECTING: u8 = 1;
+
+pub(super) const WATCH_REPROTECTED: u8 = 2;
+
+pub(super) const WATCH_REPLACED: u8 = 3;
+
+#[derive(Default)]
+pub(super) struct WatchState {
+    pub(super) next_id: u64,
+    pub(super) ranges: BTreeMap<u64, Arc<WatchedRange>>,
+    /// Page-aligned live mappings whose last active watch was disarmed and removed.
+    ///
+    /// A protection fault can already be committed on another CPU when `mprotect(PROT_WRITE)`
+    /// returns. Retaining the mapping interval lets its delayed signal recover after the active
+    /// owner leaves the immutable snapshot. Guest mapping operations remove these intervals before
+    /// replacing or reprotecting the corresponding pages.
+    pub(super) writable_ranges: BTreeMap<u64, u64>,
+}
+
+static WATCH_STATE: OnceLock<Mutex<WatchState>> = OnceLock::new();
+
+pub(super) fn retire_overlapping(
+    address: u64,
+    byte_count: u64,
+    retirement: u8,
+) -> Vec<Arc<WatchedRange>> {
+    let Some(end) = address.checked_add(byte_count) else {
+        return Vec::new();
+    };
+    let mut state = state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let page_size = HOST_PAGE_SIZE.load(Ordering::Acquire);
+    let (page_start, page_end) = if page_size == 0 {
+        (address, end)
+    } else {
+        (
+            align_down(address, page_size),
+            align_up(end, page_size).unwrap_or(u64::MAX),
+        )
+    };
+    let forgot_writable_range = forget_writable_range(&mut state, page_start, page_end);
+    let retired_ids = state
+        .ranges
+        .iter()
+        .filter_map(|(&id, range)| {
+            let range_end = range.address.saturating_add(range.byte_count);
+            (range.address < end && address < range_end).then_some(id)
+        })
+        .collect::<Vec<_>>();
+    if retired_ids.is_empty() {
+        if forgot_writable_range {
+            publish_snapshot(&state);
+        }
+        return Vec::new();
+    }
+    let retired = retired_ids
+        .into_iter()
+        .filter_map(|id| state.ranges.remove(&id))
+        .collect::<Vec<_>>();
+    for range in &retired {
+        range.retirement.store(retirement, Ordering::Release);
+        for page in &range.pages {
+            page.armed.store(false, Ordering::Release);
+        }
+    }
+    // Keep the old snapshot published until every page is either writable or remains protected
+    // by an owner represented in the replacement snapshot. A guest store racing retirement can
+    // then be handled through the old snapshot instead of becoming an unowned protection fault.
+    for range in &retired {
+        restore_unowned_pages(range, &state);
+    }
+    publish_snapshot(&state);
+    retired
+}
+
+pub(super) fn state() -> &'static Mutex<WatchState> {
+    WATCH_STATE.get_or_init(|| Mutex::new(WatchState::default()))
+}
+
+pub(super) fn remember_writable_range(state: &mut WatchState, range: &WatchedRange) {
+    if !range.precise_tracking {
+        return;
+    }
+    let Some(first) = range.pages.first() else {
+        return;
+    };
+    let Some(last) = range.pages.last() else {
+        return;
+    };
+    let start = first.address;
+    let end = last.address.saturating_add(host_page_size_infallible());
+    let mut merged_start = start;
+    let mut merged_end = end;
+    let overlapping = state
+        .writable_ranges
+        .range(..=end)
+        .filter_map(|(&candidate_start, &candidate_end)| {
+            (candidate_end >= start).then_some((candidate_start, candidate_end))
+        })
+        .collect::<Vec<_>>();
+    for (candidate_start, candidate_end) in overlapping {
+        state.writable_ranges.remove(&candidate_start);
+        merged_start = merged_start.min(candidate_start);
+        merged_end = merged_end.max(candidate_end);
+    }
+    state.writable_ranges.insert(merged_start, merged_end);
+}
+
+fn forget_writable_range(state: &mut WatchState, start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    let overlapping = state
+        .writable_ranges
+        .range(..end)
+        .filter_map(|(&candidate_start, &candidate_end)| {
+            (candidate_end > start).then_some((candidate_start, candidate_end))
+        })
+        .collect::<Vec<_>>();
+    let changed = !overlapping.is_empty();
+    for (candidate_start, candidate_end) in overlapping {
+        state.writable_ranges.remove(&candidate_start);
+        if candidate_start < start {
+            state.writable_ranges.insert(candidate_start, start);
+        }
+        if end < candidate_end {
+            state.writable_ranges.insert(end, candidate_end);
+        }
+    }
+    changed
+}
+
+pub(super) fn arm_range(range: &WatchedRange, state: &WatchState) -> io::Result<()> {
+    if !range.precise_tracking {
+        return Ok(());
+    }
+    let mut changed = Vec::with_capacity(range.pages.len());
+    for (index, page) in range.pages.iter().enumerate() {
+        let was_dirty = page.dirty.swap(false, Ordering::AcqRel);
+        if page.armed.swap(true, Ordering::AcqRel) {
+            changed.push((index, false, was_dirty));
+            continue;
+        }
+        changed.push((index, true, was_dirty));
+        if let Err(error) = protect_page(page.address, true) {
+            rollback_arm(range, state, &changed);
+            return Err(error);
+        }
+        // A write can race the transition when another overlapping watch already protects this
+        // page. Its handler disarms us before making the page writable; do not leave that page
+        // read-only with no armed owner after our mprotect returns.
+        if !page.armed.load(Ordering::Acquire) {
+            restore_page_if_unowned(page.address, state);
+        }
+    }
+    Ok(())
+}
+
+fn rollback_arm(range: &WatchedRange, state: &WatchState, changed: &[(usize, bool, bool)]) {
+    for &(index, newly_armed, was_dirty) in changed {
+        let page = &range.pages[index];
+        if was_dirty {
+            page.dirty.store(true, Ordering::Release);
+        }
+        if newly_armed {
+            page.armed.store(false, Ordering::Release);
+        }
+    }
+    for &(index, newly_armed, _) in changed {
+        if newly_armed {
+            restore_page_if_unowned(range.pages[index].address, state);
+        }
+    }
+}
+
+pub(super) fn restore_unowned_pages(range: &WatchedRange, state: &WatchState) {
+    if !range.precise_tracking {
+        return;
+    }
+    for page in &range.pages {
+        restore_page_if_unowned(page.address, state);
+    }
+}
+
+fn restore_page_if_unowned(page_address: u64, state: &WatchState) {
+    if state.ranges.values().any(|range| {
+        range
+            .pages
+            .iter()
+            .any(|page| page.address == page_address && page.armed.load(Ordering::Acquire))
+    }) {
+        return;
+    }
+    let _ = protect_page(page_address, false);
+}
