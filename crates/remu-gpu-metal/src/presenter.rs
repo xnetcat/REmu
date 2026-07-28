@@ -144,10 +144,11 @@ use self::submission::{apply_pending_guest_memory_writes, write_back_pending_glo
 use self::texture::{
     apply_image_destination_select, comparison_depth32_upload,
     create_exact_mode27_sampled_mip_view, decode_sampled_texture_linear_from_raw,
-    ensure_mipmapped_resident_texture_in_map, guest_texture_raw_matches,
-    image_destination_select_is_native, new_red_blue_swizzled_texture_view,
-    prepare_sampled_texture_upload, sampled_texture_cache_needs_reload, sampled_texture_key,
-    sampled_texture_raw_range, snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
+    depth_array_face_descriptor, ensure_mipmapped_resident_texture_in_map,
+    guest_texture_raw_matches, image_destination_select_is_native,
+    new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
+    sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_raw_range,
+    snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
     storage_image_requires_mip_hierarchy, watch_guest_texture, write_guest_texture_linear,
 };
 use self::texture::{
@@ -649,6 +650,19 @@ struct SampledTextureKey {
     comparison: bool,
 }
 
+/// One layered depth-sample SRD whose faces are assembled on the GPU from resident depth targets.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DepthArrayKey {
+    descriptor: GuestTextureDescriptor,
+    layer_count: u32,
+}
+
+/// The assembled depth-format array texture and the face content versions its slices hold.
+struct DepthArrayResidentTexture {
+    texture: Texture,
+    slice_versions: Vec<u64>,
+}
+
 struct CachedSampledTexture {
     texture: Texture,
     write_watch: Arc<GuestTextureWriteWatch>,
@@ -872,6 +886,7 @@ struct MetalPresenter {
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
     resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    depth_array_textures: HashMap<DepthArrayKey, DepthArrayResidentTexture>,
     direct_scanout_textures: HashMap<u64, DirectScanoutTexture>,
     scanout_snapshot_textures: HashMap<u64, ScanoutSnapshotTexture>,
     multisample_textures: HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
@@ -1008,6 +1023,7 @@ impl MetalPresenter {
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),
             resident_guest_textures: HashMap::new(),
+            depth_array_textures: HashMap::new(),
             direct_scanout_textures: HashMap::new(),
             scanout_snapshot_textures: HashMap::new(),
             multisample_textures: HashMap::new(),

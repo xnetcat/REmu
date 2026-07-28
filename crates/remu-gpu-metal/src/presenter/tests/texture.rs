@@ -10,9 +10,10 @@ use remu_memory::CpuWriteWatchRetirement;
 use remu_shader::{ImageBinding, ImageControl, Opcode};
 
 use super::{
-    GuestTextureDescriptor, MetalPresenter, WriteWatchRefresh, apply_image_destination_select,
-    comparison_depth32_upload, decode_image_descriptor, fallback_image_descriptor,
-    guest_shared_mapping_identity, guest_texture_byte_count, guest_texture_descriptors_overlap,
+    DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, WriteWatchRefresh,
+    apply_image_destination_select, comparison_depth32_upload, decode_image_descriptor,
+    depth_array_face_descriptor, fallback_image_descriptor, guest_shared_mapping_identity,
+    guest_texture_byte_count, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_storage, guest_texture_raw_matches,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode27_mip_chain_layout,
@@ -21,6 +22,64 @@ use super::{
     snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy, watch_guest_texture,
     write_watched_guest_texture_linear,
 };
+
+#[test]
+fn layered_depth_sample_faces_resolve_to_per_face_depth_targets() {
+    // A shadow cubemap is rendered as six separate 2D depth targets and then bound through one
+    // six-layer R16Unorm array SRD. Each layer must resolve to the matching per-face depth
+    // descriptor so the faces can be served on the GPU instead of round-tripping through guest
+    // memory every frame.
+    let sampled = DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            address: 0x70_6969_0000,
+            width: 1024,
+            height: 1024,
+            pitch: 1024,
+            tile_mode: 24,
+            pixel_format: MTLPixelFormat::R16Unorm,
+            bytes_per_pixel: 2,
+        },
+        destination_select: 0x924,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        texture_type: 11,
+        layer_count: 6,
+    };
+    let face_bytes = guest_texture_byte_count(sampled.guest).expect("face bytes");
+    let first = depth_array_face_descriptor(sampled, 0).expect("first face resolves");
+    assert_eq!(first.pixel_format, MTLPixelFormat::Depth16Unorm);
+    assert_eq!(first.address, sampled.guest.address);
+    assert_eq!((first.width, first.height, first.pitch), (1024, 1024, 1024));
+    let last = depth_array_face_descriptor(sampled, 5).expect("last face resolves");
+    assert_eq!(last.address, sampled.guest.address + 5 * face_bytes);
+    assert_eq!(last.tile_mode, sampled.guest.tile_mode);
+
+    // A 32-bit depth pyramid resolves through the same pairing.
+    let mut float_depth = sampled;
+    float_depth.guest.pixel_format = MTLPixelFormat::R32Float;
+    float_depth.guest.bytes_per_pixel = 4;
+    assert_eq!(
+        depth_array_face_descriptor(float_depth, 0).map(|face| face.pixel_format),
+        Some(MTLPixelFormat::Depth32Float)
+    );
+
+    // Layers beyond the array, non-layered types, color formats, mip pyramids, and channel
+    // selections outside the supported depth set never resolve to a face.
+    assert_eq!(depth_array_face_descriptor(sampled, 6), None);
+    let mut flat = sampled;
+    flat.texture_type = 9;
+    flat.layer_count = 1;
+    assert_eq!(depth_array_face_descriptor(flat, 0), None);
+    let mut color = sampled;
+    color.guest.pixel_format = MTLPixelFormat::RGBA8Unorm;
+    assert_eq!(depth_array_face_descriptor(color, 0), None);
+    let mut mipped = sampled;
+    mipped.mip_level_count = 2;
+    assert_eq!(depth_array_face_descriptor(mipped, 0), None);
+    let mut swizzled = sampled;
+    swizzled.destination_select = 0xfac;
+    assert_eq!(depth_array_face_descriptor(swizzled, 0), None);
+}
 
 #[test]
 fn sampled_texture_cache_reloads_cpu_dirty_content_without_an_acquire() {

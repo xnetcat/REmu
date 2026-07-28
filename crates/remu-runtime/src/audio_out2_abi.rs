@@ -167,12 +167,22 @@ pub(crate) const AUDIO_OUT2_PORT_TYPE_VIBRATION: u16 = 6;
 pub(crate) const SCE_AUDIO_OUT2_ERROR_NOT_READY: u32 = 0x8026_8008;
 
 pub(crate) const fn decode_audio_out2_channel_format(format: u32) -> Option<(u8, u64)> {
+    // The AudioOut2 format word carries a data type in bit 0 (0 float, 1 i16), the
+    // standard-channel-order attribute in bit 7 (defined only for the eight-channel layouts),
+    // and the channel count in bits 8 and up. Each defined combination maps to the ordinary
+    // AudioOut format the host mixer consumes; both eight-channel orders keep the center and
+    // low-frequency lanes in the same slots, so the stereo downmix treats them alike. The
+    // twelve-channel layouts exist in the ABI but stay rejected until the mixer models twelve
+    // lanes, and anything outside the defined lattice is invalid input, never a nearest match.
     match format {
-        // AudioOut2's create descriptor encodes the channel count in this format word. Map it to
-        // the corresponding floating-point ordinary AudioOut format used by the host mixer.
         0x100 => Some((1, 3)),
+        0x101 => Some((1, 0)),
         0x200 => Some((2, 4)),
-        0x880 => Some((8, 5)),
+        0x201 => Some((2, 1)),
+        0x800 => Some((8, 5)),
+        0x801 => Some((8, 2)),
+        0x880 => Some((8, 7)),
+        0x881 => Some((8, 6)),
         _ => None,
     }
 }

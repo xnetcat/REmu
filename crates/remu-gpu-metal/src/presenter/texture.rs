@@ -3,15 +3,15 @@
 
 use super::{
     CachedSampledTexture, DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget,
-    DirectScanoutTexture, GuestTextureDescriptor, GuestTextureWriteWatch, MIP_UPLOAD_BYTES,
-    MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MetalPresenter, Mode27WorkOrigin,
-    MultisampleResidentTexture, MultisampleTextureKey, RESIDENT_DEPTH_SAMPLE_HITS,
-    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, SAMPLED_ALIAS_WRITEBACK_BYTES,
-    SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
-    SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY,
-    SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
-    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey,
-    ScanoutSnapshotTexture, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
+    DepthArrayKey, DepthArrayResidentTexture, DirectScanoutTexture, GuestTextureDescriptor,
+    GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
+    MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
+    RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
+    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
+    SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
+    SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
+    SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, UploadedImageTexture, WriteWatchRefresh,
     canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled,
     copy_tiled_to_linear_at_z, decode_image_descriptor, decode_mode27_mip_chain_from_raw,
@@ -29,12 +29,16 @@ use super::{
 #[cfg(test)]
 use remu_memory::guest_shared_mapping_identity;
 use remu_memory::{CpuWriteWatchRetirement, read_guest_shared_backing, write_guest_shared_backing};
+mod depth_array;
 mod mips;
 mod residency;
 mod retire;
 mod sampled;
 mod upload;
 mod watch;
+#[cfg(test)]
+pub(crate) use self::depth_array::depth_array_face_descriptor;
+pub(crate) use self::depth_array::resident_is_depth_array_face;
 pub(crate) use self::mips::{
     create_exact_mode27_sampled_mip_view, create_mipmapped_guest_texture,
     ensure_mipmapped_resident_texture_in_map, storage_image_requires_mip_hierarchy,

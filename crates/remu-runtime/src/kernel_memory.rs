@@ -275,6 +275,10 @@ impl KernelMemory {
     }
 
     /// Maps zero-filled flexible memory with the guest-visible protection metadata intact.
+    ///
+    /// Flexible memory is committed guest memory on a unified-memory console: the GPU may read
+    /// it through resource descriptors, so it maps through the committed-backing path rather
+    /// than as host-private anonymous pages.
     pub fn map_flexible(
         &mut self,
         placement: GuestMapPlacement,
@@ -282,7 +286,7 @@ impl KernelMemory {
         alignment: u64,
         raw_protection: i32,
     ) -> Result<GuestAddress, KernelMemoryError> {
-        let mapped = self.virtual_memory.map_anonymous(
+        let mapped = self.virtual_memory.map_committed(
             placement,
             size,
             alignment,
@@ -311,7 +315,7 @@ impl KernelMemory {
         for mapping in self.virtual_memory.vmas().into_iter().filter(|mapping| {
             matches!(
                 mapping.state,
-                GuestVmaState::Anonymous | GuestVmaState::Shared
+                GuestVmaState::Anonymous | GuestVmaState::Committed | GuestVmaState::Shared
             ) && mapping.protection.contains(GuestProtection::READ)
         }) {
             let Some(end) = mapping.start.get().checked_add(mapping.size) else {
@@ -431,23 +435,25 @@ impl KernelMemory {
         address: GuestAddress,
         size: u64,
         raw_protection: i32,
-    ) -> Result<(), KernelMemoryError> {
+    ) -> Result<u64, KernelMemoryError> {
         self.protect_with_type(address, size, raw_protection, None)
     }
 
     /// Changes protection and, when `memory_type` is supplied, the guest-visible memory type.
     ///
     /// `sceKernelMtypeprotect` retypes a range in the same operation that reprotects it, while
-    /// plain `sceKernelMprotect` must preserve each affected mapping's existing type.
+    /// plain `sceKernelMprotect` must preserve each affected mapping's existing type. Returns the
+    /// number of previously reserved bytes the operation committed.
     pub fn protect_with_type(
         &mut self,
         address: GuestAddress,
         size: u64,
         raw_protection: i32,
         memory_type: Option<i32>,
-    ) -> Result<(), KernelMemoryError> {
-        self.virtual_memory
-            .protect(address, size, translate_protection(raw_protection))?;
+    ) -> Result<u64, KernelMemoryError> {
+        let committed_bytes =
+            self.virtual_memory
+                .protect(address, size, translate_protection(raw_protection))?;
         let end = address.get().checked_add(size).ok_or_else(|| {
             KernelMemoryError::DirectMemoryOverflow {
                 start: address.get(),
@@ -472,7 +478,7 @@ impl KernelMemory {
                 ) | (vma.metadata & FLEXIBLE_METADATA_BIT),
             )?;
         }
-        Ok(())
+        Ok(committed_bytes)
     }
 
     pub fn unmap(&mut self, address: GuestAddress, size: u64) -> Result<(), KernelMemoryError> {
@@ -500,6 +506,9 @@ impl KernelMemory {
 }
 
 fn mapping_from_vma(info: GuestVmaInfo) -> KernelVirtualMapping {
+    // Committed memory reports through the same guest-visible categories as before it carried a
+    // backing: flexible mappings stay flexible, and commit-on-protect ranges keep reporting as
+    // the reservation the guest sees. Only direct-memory views expose a physical offset.
     let kind = if info.state == GuestVmaState::Shared {
         KernelVirtualMappingKind::Direct
     } else if info.metadata & FLEXIBLE_METADATA_BIT != 0 {
@@ -510,7 +519,11 @@ fn mapping_from_vma(info: GuestVmaInfo) -> KernelVirtualMapping {
     KernelVirtualMapping {
         address: info.start,
         size: info.size,
-        direct_start: info.backing_offset,
+        direct_start: if info.state == GuestVmaState::Shared {
+            info.backing_offset
+        } else {
+            0
+        },
         protection: decode_protection(info.metadata),
         memory_type: decode_memory_type(info.metadata),
         kind,
@@ -720,6 +733,77 @@ mod tests {
         assert_eq!(
             memory.readable_ranges(),
             vec![(reserved.get(), reserved.get() + GUEST_PAGE_SIZE)]
+        );
+    }
+
+    /// Unity's PS5 allocator never maps direct memory for most allocations: it reserves virtual
+    /// ranges and commits them with `sceKernelMprotect` carrying CPU, GPU, and AMPR protection
+    /// bits. Texture descriptors then point straight into that committed memory, so the GPU
+    /// residency layer must resolve it exactly like a direct-memory mapping.
+    #[test]
+    fn mprotect_committed_reservation_is_gpu_resolvable() {
+        let mut memory = KernelMemory::new().unwrap();
+        let reserved = memory
+            .reserve_virtual(
+                GuestMapPlacement::Anywhere,
+                32 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+            )
+            .unwrap();
+        memory
+            .protect(reserved, 32 * GUEST_PAGE_SIZE, 0xf2)
+            .unwrap();
+
+        // A texture that starts inside the committed block, exactly like Superliminal's
+        // rejected draw at reserve+0x1000.
+        let texture = page(reserved, 1);
+        let texture_bytes = 30 * GUEST_PAGE_SIZE;
+        assert!(
+            remu_memory::guest_shared_mapping_identity(texture.get(), texture_bytes).is_some(),
+            "committed pages must expose a physical backing identity"
+        );
+        let segments =
+            remu_memory::guest_shared_backing_alias_segments(texture.get(), texture_bytes)
+                .expect("committed pages enumerate their coherent alias");
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.byte_count)
+                .sum::<u64>(),
+            texture_bytes
+        );
+        let mut probe = vec![0_u8; 16];
+        assert!(remu_memory::read_guest_shared_backing(
+            texture.get(),
+            &mut probe
+        ));
+    }
+
+    #[test]
+    fn flexible_mapping_is_gpu_resolvable() {
+        let mut memory = KernelMemory::new().unwrap();
+        let mapped = memory
+            .map_flexible(
+                GuestMapPlacement::Anywhere,
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x02,
+            )
+            .unwrap();
+        assert!(
+            remu_memory::guest_shared_mapping_identity(mapped.get(), 2 * GUEST_PAGE_SIZE).is_some(),
+            "flexible memory is committed guest memory and must resolve for the GPU"
+        );
+        // The flexible query ABI observed by guests must be unchanged by the backing model.
+        assert_eq!(
+            memory.query(mapped, false).map(|mapping| mapping.kind),
+            Some(KernelVirtualMappingKind::Flexible)
+        );
+        assert_eq!(
+            memory
+                .query(mapped, false)
+                .map(|mapping| mapping.direct_start),
+            Some(0)
         );
     }
 

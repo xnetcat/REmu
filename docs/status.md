@@ -6,7 +6,11 @@ completion means stable interactive game progress with correct output and measur
 
 Current overall state: the first small test title boots through resource loading, submits AGC
 draw streams, compiles observed RDNA2 shaders to Metal, and flips its display buffers. Early
-splash frames render correctly; full scene rendering and playability are still open.
+splash frames render correctly; full scene rendering and playability are still open. A second,
+Unity/IL2CPP title (which commits nearly all of its memory by reserving virtual ranges and
+`sceKernelMprotect`-committing them rather than mapping direct memory) now gets resident,
+write-watched textures; its environment backdrop renders with geometry, and its menu UI is not
+yet on screen.
 
 ## Import coverage
 
@@ -54,8 +58,16 @@ allocator during this failure and are the current starting point.
 This was previously masked by a compatibility guard that patched the five consumer sites in the
 guest executable so they tested for the bad value and skipped their work. The guard was removed
 because it was locked to hardcoded addresses and byte signatures from one build of one title, and
-because suppressing the symptom removed the pressure to find the cause. The affected title is
-expected to fail at startup until the defect is fixed.
+because suppressing the symptom removed the pressure to find the cause.
+
+After commit-on-protect landed (2026-07-28), the startup crash no longer reproduces: two
+consecutive 45-second runs render real scenes (22–26 FPS, ~40 resident textures, heavy
+GPU-to-guest writeback traffic) and end only on the diagnostic timer, with no faults logged.
+That is consistent with this defect living in the same layer the fix repaired — guest objects
+in reserve-then-`mprotect`-committed memory were invisible to every shared-backing path, so
+GPU-to-guest writebacks into such storage could not land — but it is not proof. The five
+recorded consumer sites remain the checklist: this entry closes when sustained interactive
+progress shows none of them faulting, not because the crash stopped appearing in short runs.
 
 ### A run intermittently renders nothing
 
@@ -73,6 +85,43 @@ Frame rate is also not stable across successful runs of one binary: 59.9, 61.9, 
 and display state. Neither frame rate nor draw rate can therefore be used to detect a
 performance regression. There is no CPU-throughput benchmark in the tree, which is the gap
 to close before any performance claim can be made.
+
+### Write-watch arming assumes plain read/write data pages
+
+`CpuWriteWatch` arming and disarming reconstruct protection as read-only and read/write
+respectively (`write_watch/page.rs`), never consulting the mapping's real protection. Watching a
+read-only range therefore grants writes after the first fault instead of restoring read-only,
+and arming a watch whose page-aligned span touches executable pages strips execute permission
+permanently. This predates the committed-memory work — read-only direct-memory views were
+already registrable — but commit-on-protect widens the reachable surface to any committed
+protection. Neither regression title exercises it: every range the texture cache watches today
+is plain read/write. The fix shape is to carry the mapping's original protection into
+arm/disarm (write-watch arming becomes "remove write, keep the rest"), or to refuse watch
+registration for non-read/write ranges explicitly.
+
+### The Unity title's menu runs at 14–22 FPS with washed-out post-processing
+
+With FMOD's AudioOut2 port accepted, the Unity title reaches its interactive menu. Three
+successive bottlenecks were profiled on its ~600-draw frames; two are fixed and one remains:
+
+- Fixed: `scan_valid_command_stream_end` proved readability of every candidate command prefix by
+  allocating and copying the whole span (up to 4 MiB per candidate per submission). It now uses
+  the non-copying mapped-range check; this alone took the title from 4 to ~14 FPS.
+- Fixed: per-face shadow-depth writebacks (see the Metal resources row) — `alias_writeback`
+  dropped from 36/s (72 MiB/s) to zero.
+- Remaining: a mach-exception storm keeps the Rosetta exception server saturated. Disabling CPU
+  write watches lifts the title to ~20 FPS, so watch faults are roughly 40% of the remaining
+  frame time — Unity co-locates hot mutable data on the same 16 KiB pages as watched texture
+  bytes, so unrelated guest stores fault continuously. The fix direction is fault-rate reduction:
+  registry/watch coalescing, and demoting chronically dirty textures from fault-based watching to
+  acquire-time re-validation. A further CPU-side layer remains beneath that (~20 FPS with watches
+  off, GPU under 30%).
+
+The menu scene renders overexposed (near-white with faint geometry) while its UI text renders
+correctly. The scene targets are RGBA16Float and the title's real menu background is genuinely a
+bright white room, so part of this is authentic; whether the remainder is a post-processing
+(auto-exposure/tonemap) defect or purely the slow frame loop starving exposure adaptation is
+undetermined — re-judge it once the frame rate is fixed.
 
 ### The runtime test suite is order-dependent
 
@@ -94,13 +143,13 @@ events through the existing thread-local capture instead of the process-global s
 | --- | --- | --- |
 | CPU, loader, linker | x86-64 guest execution behind a native CPU backend under Rosetta; SELF/ELF mapping, observed relocations, AMD64 DTV slots, per-thread `__tls_get_addr`, TLS clone rebasing, and import trampolines with synthetic coverage. | Continue source-backed HLE import closure. The AArch64 translator stays deferred until a milestone requires it. |
 | AGC / PM4 ordering | Native Gen5 command routing, type-2 packets, clear state, packet predication, targetless scanout association, compute submission, ordered memory copy/write/release/wait events, submission boundaries, and a bounded backpressured event channel with an ordered shader-compile gate. | Execution-side `SET_PREDICATION` semantics, then source-backed release/wait, cache visibility, fence writes, and graphics-equeue completion. |
-| Metal resources / readback | Persistent guest textures, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, MSAA resolve targets, and supported depth readback, covered by GPU tests. | Bounded asynchronous capture tickets and a reusable staging pool; explicit block-compressed and combined depth/stencil layouts when guest formats exercise them. |
-| Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, `MAP_NO_COALESCE` identity preservation, release-time alias invalidation, shared-mapping identity tracking, and CPU write-watch retirement across remaps, all with synthetic coverage. | Mapping lifecycle counters and exact query error/flag behavior for all exercised cases. |
+| Metal resources / readback | Persistent guest textures backed by either direct-memory views or committed (reserve-then-commit / flexible) guest memory, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, MSAA resolve targets, supported depth readback, and GPU-side assembly of layered depth-sample views (shadow cubemaps/cascades rendered as per-face 2D depth targets and bound through one layered SRD are blit-assembled into a cached depth-format array inside the guest batch instead of round-tripping every face through guest memory each frame). Covered by GPU tests. | Bounded asynchronous capture tickets and a reusable staging pool; explicit block-compressed and combined depth/stencil layouts when guest formats exercise them. |
+| Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, `MAP_NO_COALESCE` identity preservation, release-time alias invalidation, shared-mapping identity tracking, CPU write-watch retirement across remaps, and commit-on-protect reserve+commit semantics: `sceKernelMprotect` over a reserved range and flexible mappings commit zero-filled memory into a virtually-keyed shared backing, so GPU residency and write-watching resolve them exactly like direct-memory views, decommit zeroes pages before release, and guest-visible `VirtualQuery` categories are unchanged. The backing is keyed by virtual placement — a deliberate scope decision: this memory class never exposes a physical address to the guest, so physical aliasing of it is unrepresentable by construction, unlike direct memory, which keeps its own physically-keyed backing object. All with synthetic coverage. | Coalesce adjacent contiguous shared-registry records at registration: commit-heavy titles insert one record per `mprotect`, and resolution currently scans records linearly per watch creation and arms one watch segment per record. Mapping lifecycle counters and exact query error/flag behavior for all exercised cases. Memory-pool NIDs (`sceKernelMemoryPoolReserve`/`Commit`/`Expand`/`Move`/…) stay loudly unimplemented until designed: pools deal in guest-physical block addresses (`Expand` returns one, `Move` re-points committed blocks without copying), so they need physically-keyed backing and must not silently reuse the virtually-keyed commit path. |
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, depth-target validity requirements, and translated shader pipelines with cached construction. | Complete reusable blend, depth/stencil, rasterization, culling, multisampling, resolve, and full structural pipeline-cache identity. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, zero-copy global bindings, wave64 ballot handling on SIMD32, and observed compute geometry, with offline Metal compilation tests. | Complete the remaining RDNA2 instruction/resource/control-flow surface and eliminate residual per-draw Metal buffer churn without weakening guest-memory visibility. |
 | Presentation / frame capture | Guest display size independent of host drawable size; opt-in headless Metal; interactive runs as a regular app bundle; direct scanout without routine GPU-to-CPU round trips; asynchronous shader compilation with strict event ordering; on-disk Metal library and pipeline caches; live title-bar performance statistics. | Resolve early post-boot output into the first real scene and use completed-presentation and guest-flip rates to measure pacing. |
 | Runtime / ABI | Whole-process import auditing across HLE, guest-libc, and host routes; FIFO-ticket condition variables with exact signal/broadcast cardinality; guest mutexes and semaphores; per-thread TLS resolution; video-out attributes; save-data basics; NP service objects. | Complete opaque sync-object lifecycle, cancellation, clock attributes, and absolute timed waits; continue source-backed AGC event queues, save dialogs, and remaining researched NIDs. |
-| Audio | Host output, guest port/config validation, bounded queues, resampling, and stereo downmixing. | Audit timing, backpressure, device change, pause, teardown, and A/V synchronization against real title use with deterministic offline mixer evidence. |
+| Audio | Host output, guest port/config validation, bounded queues, resampling, stereo downmixing, and the complete defined AudioOut2 format lattice (float/i16 × mono/stereo/7.1 × standard order), which is what FMOD titles open. Twelve-channel layouts stay explicitly rejected until the mixer models them. | Audio underruns (~17%) under heavy import-thread contention on command-heavy titles; audit timing, backpressure, device change, pause, teardown, and A/V synchronization with deterministic offline mixer evidence. |
 | Video / Bink | No compatibility claim yet. | Identify each title's actual decoder/API path, then implement exact demux/decode/color/timing semantics with legal generated fixtures. |
 | Storage / save data | Read-only app filesystem access and initial save transactions; dumps are never modified. | Complete namespace, path, permission, iteration, atomicity, durability, quota, slot, dialog, and concurrency semantics with crash-consistency tests. |
 | Input | Keyboard-backed pad state and opt-in deterministic input sequences. | Complete handle lifetime, disconnect, timestamps, dead zones, motion/touchpad, controller mapping, and focus semantics as titles exercise them. |

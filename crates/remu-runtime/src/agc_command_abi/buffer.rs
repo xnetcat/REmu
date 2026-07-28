@@ -437,7 +437,11 @@ pub(super) fn scan_valid_command_stream_end(start: u64, recorded_end: u64) -> u6
     let Ok(byte_count) = usize::try_from(recorded_end - start) else {
         return start;
     };
-    if !crate::process_guest_range_is_readable(start, byte_count) {
+    // Prove readability from the mapped-range snapshot without materializing the span: this runs
+    // once per recorded candidate per submission, and copying multi-megabyte prefixes here
+    // dominated whole frames on command-heavy titles while starving other import threads of the
+    // dispatch lock.
+    if !crate::process_guest_range_has_read_access(start, byte_count) {
         return start;
     }
     let mut command = start;

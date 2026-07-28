@@ -22,7 +22,7 @@ use super::{
     decode_mode27_mip_chain_from_raw, decode_raster_state, decode_render_target_format,
     decode_render_targets_from_registers, decode_sampled_texture_format,
     decode_sampled_texture_linear_from_raw, decode_scanout_target, decode_scissor, decode_viewport,
-    effective_linear_pitch, encode_mode27_mip_chain_into_raw,
+    depth_array_face_descriptor, effective_linear_pitch, encode_mode27_mip_chain_into_raw,
     ensure_mipmapped_resident_texture_in_map, fallback_image_descriptor,
     graphics_shader_resource_key, guest_physical_ranges_overlap, guest_shared_mapping_identity,
     guest_texture_byte_count, guest_texture_descriptors_overlap,

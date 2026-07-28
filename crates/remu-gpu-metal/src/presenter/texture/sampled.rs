@@ -11,7 +11,7 @@ use super::{
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
-    retire_multisample_textures_overlapping_writeback,
+    resident_is_depth_array_face, retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
     sampled_alias_descriptor, texture_element_layout, trace_image_descriptors,
     trace_target_sampling, write_resident_texture_contents_to_guest,
@@ -87,6 +87,7 @@ impl MetalPresenter {
                                     resident, sampled, comparison,
                                 )
                                 && !resident_depth_sample_is_eligible(resident, sampled)
+                                && !resident_is_depth_array_face(resident, sampled)
                                 && !self.multisample_textures.iter().any(|(key, multisample)| {
                                     multisample.initialized
                                         && key.descriptor == resident.descriptor
@@ -112,7 +113,7 @@ impl MetalPresenter {
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 if logged.len() < 256 && logged.insert(key) {
                                     eprintln!(
-                                        "[REMu][METAL][ALIAS-FLUSH] resident={:#x}/{}x{}/p{}/{:?}/tile{}/mips{} sampled={:#x}/{}x{}/p{}/{:?}/tile{}/base{}/mips{} pc={:#x} declared_overlap={}",
+                                        "[REMu][METAL][ALIAS-FLUSH] resident={:#x}/{}x{}/p{}/{:?}/tile{}/mips{}/type{}/layers{} sampled={:#x}/{}x{}/p{}/{:?}/tile{}/base{}/mips{}/type{}/layers{} select={:#x} comparison={comparison} pc={:#x} declared_overlap={}",
                                         resident.descriptor.address,
                                         resident.descriptor.width,
                                         resident.descriptor.height,
@@ -120,6 +121,8 @@ impl MetalPresenter {
                                         resident.descriptor.pixel_format,
                                         resident.descriptor.tile_mode,
                                         resident.mip_level_count,
+                                        resident.texture_type,
+                                        resident.layer_count,
                                         sampled.guest.address,
                                         sampled.guest.width,
                                         sampled.guest.height,
@@ -128,6 +131,9 @@ impl MetalPresenter {
                                         sampled.guest.tile_mode,
                                         sampled.base_mip_level,
                                         sampled.mip_level_count,
+                                        sampled.texture_type,
+                                        sampled.layer_count,
+                                        sampled.destination_select,
                                         binding.pc,
                                         guest_texture_descriptors_overlap(
                                             resident.descriptor,

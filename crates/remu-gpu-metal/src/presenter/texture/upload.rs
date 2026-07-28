@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedSampledTexture, GuestTextureDescriptor, GuestTextureWriteWatch, Mode27WorkOrigin,
-    MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture,
-    SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
+    CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
+    GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
+    ResidentGuestTexture, SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     SampledTextureKey, UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
     create_exact_mode27_sampled_mip_view, create_sampled_guest_texture, decode_image_descriptor,
@@ -75,6 +75,7 @@ pub(crate) fn upload_image_textures(
     queue: &metal::CommandQueue,
     evaluation: &ShaderEvaluation,
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    depth_array_textures: &HashMap<DepthArrayKey, DepthArrayResidentTexture>,
     multisample_textures: &HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
     sampled_texture_cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
     sampled_texture_write_watches: &mut HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
@@ -323,6 +324,19 @@ pub(crate) fn upload_image_textures(
                     .as_ref()
                     .map(|(_, texture)| texture.clone())
             };
+            // A layered depth-sample SRD assembled from resident depth faces is served directly:
+            // the assembly ran before this upload pass, inside the guest command batch, so the
+            // array already orders after the face render passes.
+            let depth_array_resolve = (!fallback && !storage)
+                .then(|| {
+                    depth_array_textures
+                        .get(&DepthArrayKey {
+                            descriptor: descriptor.guest,
+                            layer_count: descriptor.layer_count,
+                        })
+                        .map(|entry| entry.texture.clone())
+                })
+                .flatten();
             let texture = if fallback {
                 let key = sampled_texture_key(descriptor, comparison);
                 if let Some(texture) = fallback_texture_cache.get(&key) {
@@ -379,6 +393,8 @@ pub(crate) fn upload_image_textures(
                         true,
                     )?
                 }
+            } else if let Some(texture) = depth_array_resolve {
+                texture
             } else if let Some(texture) = render_resolve {
                 texture
             } else {

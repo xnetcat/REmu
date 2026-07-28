@@ -23,6 +23,41 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   `SharpEmu.Core/Memory/PhysicalVirtualMemory.cs`.
 - REmu reserves one contiguous main-image range before copying segments, avoiding partial mapping
   state and handling shared host pages deterministically.
+- Commit-on-protect semantics (a guest `mprotect` over a reserved virtual range commits real,
+  zero-filled, GPU-referencable memory; flexible mappings are the same committed class) were
+  established by black-box observation of an authorized Unity title's VM trace: its allocator
+  reserves ranges, commits them with `sceKernelMprotect` carrying CPU, GPU, and AMPR protection
+  bits, decommits with `sceKernelMunmap`, and then binds texture descriptors directly into that
+  memory — while the title renders correctly on hardware. The in-tree protection translation
+  already accepted the GPU bits; no new ABI constants were introduced. The committed-backing
+  design (one sparse per-space object whose byte offsets equal virtual offsets) is REmu's own:
+  reserve-then-commit memory never exposes a physical address to the guest, so its only stable
+  physical identity is its virtual placement, mirroring GPU page-table addressing on the console.
+  Decommit zeroes backing pages before releasing them so recommitted ranges read as fresh zeros.
+  No upstream emulator code was copied for this path.
+- The commit-on-protect design was cross-checked after implementation against shadPS4 at its
+  2026-07-28 `main` (GPL-2.0-or-later, SPDX headers verified): its `MemoryManager::PoolCommit`
+  (`src/core/memory.cpp`) likewise turns a reservation into real shared host backing
+  (shm/memfd-backed) and registers the range with the GPU layer, and its GPU-visibility test
+  (`IsValidGpuMapping`, `src/core/memory.h`) is an address-range check, not a memory-class
+  check — corroborating that committed non-direct memory is GPU-referencable. fpPS4
+  (LGPL-2.1, not GPL — any future borrowing is a relicensing event) corroborates that *pooled*
+  memory is physically-block-based ("section of direct memory, 64 KiB blocks",
+  `kernel/ps4_map_mm.pas`), which is why REmu's virtually-keyed committed backing is scoped to
+  the no-physical-address classes only and pool NIDs remain unimplemented. Kyty (MIT) implements
+  neither pools nor reserve-then-commit and was uninformative here. Both projects were read as
+  behavioral research only; no source was copied.
+- Whether `sceKernelMprotect` alone commits reserved memory is a recorded PS4/PS5 divergence.
+  OpenOrbis-based tests running on real PS4 hardware (ps4emulation/integration_tests,
+  `tests/code/memory_test/code/test_100.cpp`) show PS4 accepting the call while clamping the
+  reservation's protection to zero, and rejecting AMPR protection bits outright. The authorized
+  Unity title's complete VM trace under REmu contains zero flexible mappings and no fixed
+  direct mapping covering its texture blocks, so reserve-then-`mprotect(0xf2)` is the only
+  operation that can commit them — and the title ships and renders on retail PS5 hardware. The
+  `0xf2` protection decode (CPU read/write, GPU read/write, AMPR read/write) matches the
+  constants in drakmor/ampr_emu, a public PS5 userland `sce::Ampr` reimplementation, whose AMPR
+  event surface exists only in PS5 libkernel exports — confirming PS5's protection model
+  extends PS4's. All read as behavioral research; no code copied.
 
 ## `remu-runtime`
 

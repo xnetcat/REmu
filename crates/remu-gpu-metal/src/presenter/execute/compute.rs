@@ -169,6 +169,7 @@ impl MetalPresenter {
         self.synchronize_sampled_aliases(&[evaluation])?;
 
         self.ensure_open_guest_batch(&queue);
+        self.prepare_depth_array_textures(&device, &[evaluation])?;
         let buffers = self.upload_global_buffers(&device, evaluation)?;
         let global_argument_buffer = create_global_argument_buffer(
             &device,
@@ -181,6 +182,7 @@ impl MetalPresenter {
             &queue,
             evaluation,
             &mut self.resident_guest_textures,
+            &self.depth_array_textures,
             &self.multisample_textures,
             &mut self.sampled_texture_cache,
             &mut self.sampled_texture_write_watches,

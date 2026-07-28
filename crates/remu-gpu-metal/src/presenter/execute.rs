@@ -484,6 +484,7 @@ impl MetalPresenter {
         self.synchronize_sampled_aliases(&[export_evaluation, pixel_evaluation])?;
 
         self.ensure_open_guest_batch(&queue);
+        self.prepare_depth_array_textures(&device, &[export_evaluation, pixel_evaluation])?;
         let export_buffers = self.upload_global_buffers(&device, export_evaluation)?;
         let pixel_buffers = self.upload_global_buffers(&device, pixel_evaluation)?;
         let export_textures = upload_image_textures(
@@ -491,6 +492,7 @@ impl MetalPresenter {
             &queue,
             export_evaluation,
             &mut self.resident_guest_textures,
+            &self.depth_array_textures,
             &self.multisample_textures,
             &mut self.sampled_texture_cache,
             &mut self.sampled_texture_write_watches,
@@ -503,6 +505,7 @@ impl MetalPresenter {
             &queue,
             pixel_evaluation,
             &mut self.resident_guest_textures,
+            &self.depth_array_textures,
             &self.multisample_textures,
             &mut self.sampled_texture_cache,
             &mut self.sampled_texture_write_watches,

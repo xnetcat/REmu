@@ -27,11 +27,27 @@ fn audio_out2_mastering_initialization_is_an_accepted_mixer_stage() {
 
 #[test]
 fn audio_out2_channel_formats_map_to_matching_host_layouts() {
+    // The format word is a data type in bit 0 (0 float, 1 i16), the standard-channel-order
+    // attribute in bit 7 (defined only for eight channels), and the channel count in bits 8+.
+    // Each defined combination maps to the ordinary AudioOut format the host mixer consumes.
     assert_eq!(decode_audio_out2_channel_format(0x100), Some((1, 3)));
+    assert_eq!(decode_audio_out2_channel_format(0x101), Some((1, 0)));
     assert_eq!(decode_audio_out2_channel_format(0x200), Some((2, 4)));
-    assert_eq!(decode_audio_out2_channel_format(0x880), Some((8, 5)));
+    assert_eq!(decode_audio_out2_channel_format(0x201), Some((2, 1)));
+    assert_eq!(decode_audio_out2_channel_format(0x800), Some((8, 5)));
+    assert_eq!(decode_audio_out2_channel_format(0x801), Some((8, 2)));
+    assert_eq!(decode_audio_out2_channel_format(0x880), Some((8, 7)));
+    assert_eq!(decode_audio_out2_channel_format(0x881), Some((8, 6)));
     assert_eq!(decode_audio_out2_channel_format(0), None);
+    // The standard-order attribute is not defined for mono or stereo layouts.
+    assert_eq!(decode_audio_out2_channel_format(0x180), None);
+    assert_eq!(decode_audio_out2_channel_format(0x280), None);
     assert_eq!(decode_audio_out2_channel_format(0x480), None);
+    // Twelve-channel layouts exist in the ABI but stay rejected until the mixer models them.
+    assert_eq!(decode_audio_out2_channel_format(0xc00), None);
+    assert_eq!(decode_audio_out2_channel_format(0xc01), None);
+    // Unknown data-type bits are invalid input, never a nearest-match guess.
+    assert_eq!(decode_audio_out2_channel_format(0x802), None);
 }
 
 #[test]

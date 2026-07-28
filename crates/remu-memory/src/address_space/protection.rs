@@ -110,6 +110,12 @@ pub enum GuestVmaState {
     Free,
     Reserved,
     Anonymous,
+    /// Committed guest memory whose only physical identity is its virtual placement.
+    ///
+    /// Reserve-then-commit allocations never expose a physical address to the guest, so unlike
+    /// [`Self::Shared`] direct-memory views they cannot be aliased at another VA. They still
+    /// carry a shared physical backing so GPU residency and write-watching resolve them.
+    Committed,
     Shared,
 }
 

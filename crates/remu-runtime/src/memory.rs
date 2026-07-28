@@ -508,15 +508,22 @@ pub(crate) fn kernel_mtypeprotect(arguments: [u64; 6], state: &mut ProbeDispatch
         Ok(memory) => memory,
         Err(error) => return kernel_memory_error(&error),
     };
-    if let Err(error) = memory.protect_with_type(
+    let committed = match memory.protect_with_type(
         GuestAddress::new(aligned_address),
         aligned_end - aligned_address,
         protection,
         Some(memory_type),
     ) {
-        return kernel_memory_error(&error);
-    }
+        Ok(committed) => committed,
+        Err(error) => return kernel_memory_error(&error),
+    };
     refresh_kernel_memory_readable_ranges(memory);
+    if trace_guest_vm() {
+        eprintln!(
+            "[REMu][VM] type-protected address={aligned_address:#x} length={:#x} type={memory_type:#x} protection={protection:#x} committed={committed:#x}",
+            aligned_end - aligned_address
+        );
+    }
     0
 }
 
@@ -649,17 +656,18 @@ pub(crate) fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchStat
         Ok(memory) => memory,
         Err(error) => return kernel_memory_error(&error),
     };
-    if let Err(error) = memory.protect(
+    let committed = match memory.protect(
         GuestAddress::new(aligned_address),
         aligned_length,
         protection,
     ) {
-        return kernel_memory_error(&error);
-    }
+        Ok(committed) => committed,
+        Err(error) => return kernel_memory_error(&error),
+    };
     refresh_kernel_memory_readable_ranges(memory);
     if trace_guest_vm() {
         eprintln!(
-            "[REMu][VM] protected address={aligned_address:#x} length={aligned_length:#x} protection={protection:#x}"
+            "[REMu][VM] protected address={aligned_address:#x} length={aligned_length:#x} protection={protection:#x} committed={committed:#x}"
         );
     }
     0

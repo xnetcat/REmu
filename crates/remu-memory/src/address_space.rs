@@ -54,6 +54,15 @@ pub struct GuestAddressSpace {
     reservation: HostReservation,
     end: u64,
     vmas: BTreeMap<u64, Vma>,
+    /// Lazily created backing for committed memory, spanning the whole space.
+    ///
+    /// Reserve-then-commit and flexible allocations have no guest-visible physical address, so
+    /// their physical identity is their virtual placement: byte `address` of the space is byte
+    /// `address - base` of this sparse object. Committing adjacent ranges in separate operations
+    /// therefore yields contiguous backing slices, and a GPU resource spanning that seam still
+    /// resolves as one physical run — mirroring hardware, where the GPU reads such memory through
+    /// per-process page tables by virtual address.
+    commit_backing: Option<GuestPhysicalBacking>,
 }
 
 impl GuestAddressSpace {
@@ -79,7 +88,23 @@ impl GuestAddressSpace {
             reservation,
             end,
             vmas: BTreeMap::new(),
+            commit_backing: None,
         })
+    }
+
+    /// Returns the space-wide committed-memory backing, creating it on first commit.
+    ///
+    /// The object is sparse: pages materialize when first touched, so its full-space size costs
+    /// address range only. Decommit zeroes pages before releasing them (see [`Self::unmap`]),
+    /// which keeps retained object pages trivially compressible and guarantees that recommitting
+    /// the same addresses observes fresh zeroed memory.
+    fn committed_backing(&mut self) -> Result<GuestPhysicalBacking, AddressSpaceError> {
+        if let Some(backing) = &self.commit_backing {
+            return Ok(backing.clone());
+        }
+        let backing = GuestPhysicalBacking::new(self.size())?;
+        self.commit_backing = Some(backing.clone());
+        Ok(backing)
     }
 
     #[must_use]
@@ -226,46 +251,151 @@ impl GuestAddressSpace {
         Ok(GuestAddress::new(start))
     }
 
+    /// Maps zero-filled committed memory backed by the space's virtually-keyed backing object.
+    ///
+    /// This is the mapping form for guest allocations that never see a physical address —
+    /// flexible memory and commit-on-protect ranges. The result behaves like anonymous memory for
+    /// the CPU while remaining resolvable by GPU residency and write-watching through the shared
+    /// backing registry. A fixed placement may commit free or reserved pages, but never replaces
+    /// an existing anonymous, committed, or shared mapping.
+    pub fn map_committed(
+        &mut self,
+        placement: GuestMapPlacement,
+        size: u64,
+        alignment: u64,
+        protection: GuestProtection,
+    ) -> Result<GuestAddress, AddressSpaceError> {
+        Self::validate_allocation(size, alignment)?;
+        let start = self.resolve_mapping_placement(placement, size, alignment)?;
+        let end = checked_end(start, size)?;
+        let backing = self.committed_backing()?;
+        let backing_offset = start - self.base().get();
+        self.map_host_shared(start, size, protection, &backing, backing_offset)?;
+        self.remove_metadata_range(start, end);
+        self.vmas.insert(
+            start,
+            Vma {
+                start,
+                end,
+                protection,
+                kind: VmaKind::Committed(backing),
+                backing_offset,
+                metadata: 0,
+                mapping_id: 0,
+            },
+        );
+        self.normalize();
+        Ok(GuestAddress::new(start))
+    }
+
     /// Releases mapped or reserved pages and restores the host guard mapping.
+    ///
+    /// Committed pages are zeroed in their backing object: decommitted contents must never
+    /// resurface when the guest later recommits the same addresses, and zeroed retained pages
+    /// cost the host nothing once compressed.
     pub fn unmap(&mut self, address: GuestAddress, size: u64) -> Result<(), AddressSpaceError> {
         let (start, end) = self.validate_page_range(address, size)?;
         self.ensure_covered(start, end, false, None)?;
         self.map_host_anonymous(start, size, GuestProtection::NONE)?;
+        // Zero only after the host remap above has retired overlapping write watches. A GPU
+        // writeback pinned by a still-live watch could otherwise land between zeroing and
+        // retirement and leave its bytes in the retained backing, so a later recommit of these
+        // addresses would observe them instead of fresh zeros.
+        self.zero_committed_backing(start, end);
         self.remove_metadata_range(start, end);
         self.normalize();
         Ok(())
     }
 
-    /// Changes protection on claimed pages. Granting access to reserved pages commits anonymous
-    /// memory there; partial ranges split VMAs and equal adjacent pieces are merged again
-    /// automatically.
+    /// Zeroes the committed-backing bytes behind every committed VMA intersecting the range.
+    fn zero_committed_backing(&self, start: u64, end: u64) {
+        const ZERO_CHUNK: usize = 1 << 20;
+        let zeroes = vec![0_u8; ZERO_CHUNK];
+        for vma in self.vmas.values() {
+            let VmaKind::Committed(backing) = &vma.kind else {
+                continue;
+            };
+            let intersection_start = vma.start.max(start);
+            let intersection_end = vma.end.min(end);
+            if intersection_start >= intersection_end {
+                continue;
+            }
+            let mut offset = vma.backing_offset + (intersection_start - vma.start);
+            let mut remaining = intersection_end - intersection_start;
+            while remaining > 0 {
+                let chunk = usize::try_from(remaining.min(ZERO_CHUNK as u64))
+                    .expect("chunk length is bounded by ZERO_CHUNK");
+                backing.write_all_at(offset, &zeroes[..chunk]);
+                offset += chunk as u64;
+                remaining -= chunk as u64;
+            }
+        }
+    }
+
+    /// Changes protection on claimed pages and returns how many reserved bytes were committed.
+    ///
+    /// Granting access to reserved pages commits them: on the console, `sceKernelMprotect` over a
+    /// reserved range is the commit step of the reserve-then-commit allocation pattern, and the
+    /// resulting memory is real, zero-filled, and GPU-referencable. Committed pages join the
+    /// space's virtually-keyed backing so the shared-backing registry resolves them. Partial
+    /// ranges split VMAs and equal adjacent pieces are merged again automatically; protection
+    /// changes on already-committed pages never move or clear their contents.
     pub fn protect(
         &mut self,
         address: GuestAddress,
         size: u64,
         protection: GuestProtection,
-    ) -> Result<(), AddressSpaceError> {
+    ) -> Result<u64, AddressSpaceError> {
         let (start, end) = self.validate_page_range(address, size)?;
         self.ensure_covered(start, end, false, None)?;
-        let reprotection = CpuWriteWatch::begin_reprotect_overlapping(start, size);
-        let address_pointer = host_pointer(start)?;
-        // SAFETY: Validation proves the complete range is claimed inside our host reservation.
-        let result =
-            unsafe { libc::mprotect(address_pointer, host_size(size)?, protection.host_flags()) };
-        drop(reprotection);
-        if result != 0 {
-            return Err(host_error("protection change", start, end));
-        }
         self.split_at(start);
         self.split_at(end);
-        for (_, vma) in self.vmas.range_mut(start..end) {
-            vma.protection = protection;
-            if protection != GuestProtection::NONE && matches!(vma.kind, VmaKind::Reserved) {
-                vma.kind = VmaKind::Anonymous;
+        let subranges: Vec<(u64, u64, bool)> = self
+            .vmas
+            .range(start..end)
+            .map(|(&sub_start, vma)| {
+                (
+                    sub_start,
+                    vma.end,
+                    matches!(vma.kind, VmaKind::Reserved) && protection != GuestProtection::NONE,
+                )
+            })
+            .collect();
+        let mut committed_bytes = 0;
+        for (sub_start, sub_end, commit) in subranges {
+            let sub_size = sub_end - sub_start;
+            if commit {
+                let backing = self.committed_backing()?;
+                let backing_offset = sub_start - self.base().get();
+                self.map_host_shared(sub_start, sub_size, protection, &backing, backing_offset)?;
+                if let Some(vma) = self.vmas.get_mut(&sub_start) {
+                    vma.kind = VmaKind::Committed(backing);
+                    vma.backing_offset = backing_offset;
+                    vma.protection = protection;
+                }
+                committed_bytes += sub_size;
+                continue;
+            }
+            let reprotection = CpuWriteWatch::begin_reprotect_overlapping(sub_start, sub_size);
+            // SAFETY: Validation proves this subrange is claimed inside our host reservation.
+            let result = unsafe {
+                libc::mprotect(
+                    host_pointer(sub_start)?,
+                    host_size(sub_size)?,
+                    protection.host_flags(),
+                )
+            };
+            drop(reprotection);
+            if result != 0 {
+                self.normalize();
+                return Err(host_error("protection change", sub_start, sub_end));
+            }
+            if let Some(vma) = self.vmas.get_mut(&sub_start) {
+                vma.protection = protection;
             }
         }
         self.normalize();
-        Ok(())
+        Ok(committed_bytes)
     }
 
     /// Associates opaque subsystem metadata with mapped pages. The value participates in VMA

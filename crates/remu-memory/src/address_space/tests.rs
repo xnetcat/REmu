@@ -140,7 +140,7 @@ fn protection_commits_only_the_selected_reserved_pages() {
     );
     assert_eq!(
         memory.query(committed).unwrap().state,
-        GuestVmaState::Anonymous
+        GuestVmaState::Committed
     );
     assert_eq!(
         memory.query(page(reserved, 2)).unwrap().state,
@@ -154,7 +154,7 @@ fn protection_commits_only_the_selected_reserved_pages() {
             GuestProtection::READ_WRITE,
         ),
         Err(AddressSpaceError::Overlap {
-            state: GuestVmaState::Anonymous,
+            state: GuestVmaState::Committed,
             ..
         })
     ));
@@ -643,6 +643,243 @@ fn unmap_is_atomic_on_unmapped_gap_validation_failure() {
     ));
     assert_eq!(memory.vmas(), before);
     memory.write(base, b"still mapped").unwrap();
+}
+
+#[test]
+fn protect_committed_reserved_pages_have_resolvable_shared_backing() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let reserved = memory
+        .reserve(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    memory
+        .protect(reserved, 4 * GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+    memory.write(page(reserved, 1), b"texels").unwrap();
+
+    // The committed range is one live coherent alias of its own physical backing, exactly like
+    // a direct-memory mapping: the GPU residency layer must resolve it end to end.
+    let interior = page(reserved, 1).get();
+    let identity = guest_shared_mapping_identity(interior, 2 * GUEST_PAGE_SIZE)
+        .expect("committed pages resolve to a physical backing identity");
+    assert_eq!(
+        guest_shared_backing_segments(interior, 2 * GUEST_PAGE_SIZE),
+        Some(vec![GuestSharedBackingSegment {
+            address: interior,
+            byte_count: 2 * GUEST_PAGE_SIZE,
+        }])
+    );
+    assert_eq!(
+        guest_shared_backing_alias_segments(interior, 2 * GUEST_PAGE_SIZE),
+        Some(vec![GuestSharedBackingSegment {
+            address: interior,
+            byte_count: 2 * GUEST_PAGE_SIZE,
+        }])
+    );
+    let mut bytes = [0_u8; 6];
+    assert!(read_guest_shared_backing(interior, &mut bytes));
+    assert_eq!(&bytes, b"texels");
+    assert!(write_guest_shared_backing(interior, b"stored"));
+    let mut round_trip = [0_u8; 6];
+    memory.read(page(reserved, 1), &mut round_trip).unwrap();
+    assert_eq!(&round_trip, b"stored");
+
+    // Distinct committed ranges stay one backing object with virtually-keyed offsets.
+    let identity_next = guest_shared_mapping_identity(page(reserved, 2).get(), GUEST_PAGE_SIZE)
+        .expect("the rest of the committed range shares the backing");
+    assert_eq!(identity_next.backing_id, identity.backing_id);
+    assert_eq!(
+        identity_next.backing_offset,
+        identity.backing_offset + GUEST_PAGE_SIZE
+    );
+}
+
+#[test]
+fn separately_committed_adjacent_pages_resolve_as_one_backing_run() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let reserved = memory
+        .reserve(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    // A guest allocator grows a block with a second commit; a GPU resource may then span the
+    // seam between the two commit operations.
+    memory
+        .protect(reserved, 2 * GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+    memory
+        .protect(
+            page(reserved, 2),
+            2 * GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .unwrap();
+
+    assert!(
+        guest_shared_mapping_identity(reserved.get(), 4 * GUEST_PAGE_SIZE).is_some(),
+        "a resource spanning both commits resolves as one physical run"
+    );
+    assert_eq!(
+        guest_shared_backing_segments(reserved.get(), 4 * GUEST_PAGE_SIZE)
+            .map(|segments| segments.iter().map(|segment| segment.byte_count).sum()),
+        Some(4 * GUEST_PAGE_SIZE)
+    );
+}
+
+#[test]
+fn decommit_zeroes_pages_and_severs_backing_resolution() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let reserved = memory
+        .reserve(
+            GuestMapPlacement::Anywhere,
+            3 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    memory
+        .protect(reserved, 3 * GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+    assert!(guest_shared_mapping_identity(reserved.get(), 3 * GUEST_PAGE_SIZE).is_some());
+    memory.write(page(reserved, 1), b"stale").unwrap();
+
+    memory.unmap(page(reserved, 1), GUEST_PAGE_SIZE).unwrap();
+    assert_eq!(
+        guest_shared_mapping_identity(reserved.get(), 3 * GUEST_PAGE_SIZE),
+        None,
+        "a decommitted hole severs resolution across the range"
+    );
+    assert!(
+        guest_shared_mapping_identity(reserved.get(), GUEST_PAGE_SIZE).is_some(),
+        "pages on either side of the hole stay resolvable"
+    );
+
+    // Recommitting the hole must produce fresh zero pages, never the prior contents.
+    memory
+        .reserve(
+            GuestMapPlacement::Fixed(page(reserved, 1)),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    memory
+        .protect(
+            page(reserved, 1),
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .unwrap();
+    let mut recommitted = [0xff_u8; 5];
+    memory.read(page(reserved, 1), &mut recommitted).unwrap();
+    assert_eq!(&recommitted, &[0; 5], "recommitted pages read as zero");
+    assert!(guest_shared_mapping_identity(reserved.get(), 3 * GUEST_PAGE_SIZE).is_some());
+}
+
+#[test]
+fn reprotecting_committed_pages_preserves_contents_and_identity() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let reserved = memory
+        .reserve(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    memory
+        .protect(reserved, GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+    memory.write(reserved, b"kept").unwrap();
+    let identity = guest_shared_mapping_identity(reserved.get(), GUEST_PAGE_SIZE)
+        .expect("committed pages have a backing identity");
+
+    memory
+        .protect(reserved, GUEST_PAGE_SIZE, GuestProtection::READ)
+        .unwrap();
+    memory
+        .protect(reserved, GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+
+    assert_eq!(
+        guest_shared_mapping_identity(reserved.get(), GUEST_PAGE_SIZE),
+        Some(identity),
+        "permission changes never reallocate committed backing"
+    );
+    let mut bytes = [0_u8; 4];
+    memory.read(reserved, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"kept");
+}
+
+#[test]
+fn distinct_committed_allocations_never_share_backing_identity() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let first = memory
+        .reserve(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    let second = memory
+        .reserve(
+            GuestMapPlacement::Hint(page(first, 4)),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    memory
+        .protect(first, GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+    memory
+        .protect(second, GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+
+    let first_identity = guest_shared_mapping_identity(first.get(), GUEST_PAGE_SIZE).unwrap();
+    let second_identity = guest_shared_mapping_identity(second.get(), GUEST_PAGE_SIZE).unwrap();
+    // One space-wide backing object, but virtually-keyed offsets: unrelated committed
+    // allocations must never compare as sharing byte storage, because GPU descriptor overlap
+    // detection distinguishes resources by (backing id, backing offset).
+    assert_eq!(first_identity.backing_id, second_identity.backing_id);
+    assert_ne!(
+        first_identity.backing_offset,
+        second_identity.backing_offset
+    );
+    assert_eq!(
+        second_identity.backing_offset - first_identity.backing_offset,
+        second.get() - first.get()
+    );
+}
+
+#[test]
+fn committed_range_watch_observes_stores_through_alias_segments() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let reserved = memory
+        .reserve(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    memory
+        .protect(reserved, GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+
+    let aliases = guest_shared_backing_alias_segments(reserved.get(), GUEST_PAGE_SIZE)
+        .expect("committed pages enumerate their single coherent alias");
+    assert_eq!(aliases.len(), 1);
+    // SAFETY: the committed mapping stays live until the watch is dropped below.
+    let watch = unsafe {
+        CpuWriteWatch::new(aliases[0].address, aliases[0].byte_count).expect("alias watch")
+    };
+    assert!(!watch.is_dirty());
+    memory.write(reserved, b"dirty").unwrap();
+    assert!(
+        watch.is_dirty(),
+        "a CPU store through the committed alias is observed"
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
