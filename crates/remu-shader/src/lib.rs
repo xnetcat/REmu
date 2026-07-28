@@ -13,7 +13,10 @@ mod metadata;
 mod state;
 
 pub use coverage::{OpcodeHistogram, OpcodeUsage, opcode_coverage_report};
-pub use decoder::{DecodeError, decode_program, read_program, read_program_bounded};
+pub use decoder::{
+    DecodeError, decode_program, decode_program_segments, read_program, read_program_bounded,
+    read_program_segments_bounded,
+};
 pub use evaluator::{EvaluationError, EvaluationOptions, evaluate_shader};
 pub use format::decode_unified_format;
 pub use inline_constant::{decode_inline_constant, decode_v2f16_inline_constant};

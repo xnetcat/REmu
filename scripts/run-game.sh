@@ -40,6 +40,17 @@ fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
 bundled_metal_compiler="$repo_dir/.remu/toolchains/Metal.xctoolchain/usr/bin/metal"
+# Xcode's downloadable Metal component is normally unpacked under a versioned directory (for
+# example Metal-27A5209h/Metal.xctoolchain). Accept both that layout and the stable developer
+# override above so an installed offline compiler is not silently ignored.
+if [ ! -x "$bundled_metal_compiler" ]; then
+    for candidate in "$repo_dir"/.remu/toolchains/Metal-*/Metal.xctoolchain/usr/bin/metal; do
+        if [ -x "$candidate" ] && [ -x "$(dirname -- "$candidate")/metallib" ]; then
+            bundled_metal_compiler=$candidate
+            break
+        fi
+    done
+fi
 # Offline libraries can be retained across launches, avoiding tens of seconds of repeated cold
 # runtime compilation for Unity's large shader set. Set REMU_USE_BUNDLED_METAL_COMPILER=0 to
 # diagnose Apple's in-process source compiler explicitly.
@@ -55,10 +66,49 @@ run_id=$(date -u +%Y%m%dT%H%M%SZ)
 run_root=${REMU_RUN_ROOT:-"${TMPDIR:-/tmp}/remu-runs"}
 run_dir="$run_root/$run_id-$game_name"
 frame_dir="$run_dir/frames"
+guest_code_dir="$run_dir/guest-code"
+msl_dir="$run_dir/msl"
+graphics_lds_ir_dir="$run_dir/graphics-lds-ir"
+scanout_msl_dir="$run_dir/scanout-msl"
 raw_binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
 app_bundle=${REMU_APP_BUNDLE:-"$repo_dir/target/x86_64-apple-darwin/release/REMu.app"}
 launch_working_directory=${REMU_LAUNCH_WORKING_DIRECTORY:-"$repo_dir"}
 mkdir -p "$frame_dir"
+if [ "${REMU_DEEP_TRACE:-0}" = 1 ]; then
+    # Keep one reproducible, self-contained view of the path from guest command construction
+    # through shader translation and host presentation. These traces are intentionally opt-in:
+    # register/draw logging and periodic frame readback perturb timing too much for ordinary
+    # performance measurements.
+    mkdir -p "$msl_dir" "$graphics_lds_ir_dir" "$scanout_msl_dir"
+    REMU_CAPTURE_FRAMES=1
+    REMU_CAPTURE_INTERVAL_SECONDS=${REMU_CAPTURE_INTERVAL_SECONDS:-2}
+    REMU_TRACE_AGC_SHADERS=1
+    REMU_TRACE_AGC_DRAWS=1
+    REMU_TRACE_AGC_REGISTERS=1
+    REMU_TRACE_AGC_PROGRAMS=1
+    REMU_TRACE_IMAGES=1
+    REMU_TRACE_TARGET_SAMPLING=1
+    REMU_TRACE_SHADER_OPCODES=1
+    REMU_TRACE_VFS=1
+    REMU_TRACE_VM=1
+    REMU_TRACE_SYNC=1
+    REMU_TRACE_TIME=1
+    REMU_TRACE_DISPATCH_STALLS=1
+    REMU_DUMP_MSL_DIR=$msl_dir
+    REMU_DUMP_GRAPHICS_LDS_IR_DIR=$graphics_lds_ir_dir
+    REMU_DUMP_SCANOUT_MSL_DIR=$scanout_msl_dir
+    export REMU_CAPTURE_FRAMES REMU_CAPTURE_INTERVAL_SECONDS
+    export REMU_TRACE_AGC_SHADERS REMU_TRACE_AGC_DRAWS
+    export REMU_TRACE_AGC_REGISTERS REMU_TRACE_AGC_PROGRAMS
+    export REMU_TRACE_IMAGES REMU_TRACE_TARGET_SAMPLING REMU_TRACE_SHADER_OPCODES
+    export REMU_TRACE_VFS REMU_TRACE_VM REMU_TRACE_SYNC REMU_TRACE_TIME
+    export REMU_TRACE_DISPATCH_STALLS REMU_DUMP_MSL_DIR
+    export REMU_DUMP_GRAPHICS_LDS_IR_DIR REMU_DUMP_SCANOUT_MSL_DIR
+fi
+if [ -n "${REMU_TRACE_GUEST_CODE:-}" ] && [ -z "${REMU_DUMP_GUEST_CODE_DIR:-}" ]; then
+    REMU_DUMP_GUEST_CODE_DIR=$guest_code_dir
+    export REMU_DUMP_GUEST_CODE_DIR
+fi
 
 if [ ! -d "$launch_working_directory" ]; then
     echo "error: launch working directory not found: $launch_working_directory" >&2
@@ -118,6 +168,9 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 echo "[REMu] launching $game_name; artifacts: $run_dir"
+if [ "${REMU_DEEP_TRACE:-0}" = 1 ]; then
+    echo "[REMu] unified deep trace enabled"
+fi
 if [ "${REMU_HEADLESS_METAL:-0}" != 1 ]; then
     echo "[REMu] launching the interactive REmu.app bundle"
 fi

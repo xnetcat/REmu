@@ -107,6 +107,59 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
     })
 }
 
+/// Decodes every adjacent entry point within one exact AGC shader-code allocation.
+///
+/// Geometry and other merged Gen5 binaries can contain multiple independently terminated
+/// programs in the same allocation. `decode_program` intentionally returns the first entry point;
+/// this variant preserves every `S_ENDPGM`-delimited segment so callers can lower the complete
+/// merged stage instead of silently discarding its trailing producer/consumer half.
+pub fn decode_program_segments(address: u64, words: &[u32]) -> Result<Vec<Program>, DecodeError> {
+    if words.is_empty() {
+        return Err(DecodeError::Empty);
+    }
+
+    let mut segments = Vec::new();
+    let mut word_index = 0usize;
+    while word_index < words.len() {
+        // AGC code extents are dword aligned but some toolchains retain zero-filled allocation
+        // padding after the final entry point. It carries no executable program.
+        if words[word_index..].iter().all(|word| *word == 0) {
+            break;
+        }
+        let byte_offset = word_index
+            .checked_mul(4)
+            .ok_or(DecodeError::ProgramCounterOverflow)?;
+        let segment_address = address
+            .checked_add(
+                u64::try_from(byte_offset).map_err(|_| DecodeError::ProgramCounterOverflow)?,
+            )
+            .ok_or(DecodeError::AddressOverflow {
+                pc: u32::try_from(byte_offset).unwrap_or(u32::MAX),
+            })?;
+        let segment = decode_program(segment_address, &words[word_index..])?;
+        let last = segment.instructions.last().ok_or(DecodeError::Empty)?;
+        let segment_dwords = usize::try_from(last.pc / 4)
+            .map_err(|_| DecodeError::ProgramCounterOverflow)?
+            .checked_add(last.words.len())
+            .ok_or(DecodeError::ProgramCounterOverflow)?;
+        if segment_dwords == 0 {
+            return Err(DecodeError::Unterminated {
+                inspected_instructions: 0,
+            });
+        }
+        word_index = word_index
+            .checked_add(segment_dwords)
+            .ok_or(DecodeError::ProgramCounterOverflow)?;
+        segments.push(segment);
+    }
+
+    if segments.is_empty() {
+        Err(DecodeError::Empty)
+    } else {
+        Ok(segments)
+    }
+}
+
 /// Reads and decodes a program through a fault-reporting guest-memory interface. Only the words
 /// required by each decoded frame are touched, so an `S_ENDPGM` at the end of a mapping does not
 /// cause speculative reads into the following page.
@@ -132,6 +185,30 @@ pub fn read_program_bounded(
     }
     let code_dwords = code_size_bytes / 4;
     read_program_with_limits(memory, address, code_dwords, code_dwords)
+}
+
+/// Reads an exact AGC shader-code allocation and decodes each adjacent entry point in it.
+pub fn read_program_segments_bounded(
+    memory: &impl GuestMemoryReader,
+    address: u64,
+    code_size_bytes: usize,
+) -> Result<Vec<Program>, DecodeError> {
+    if code_size_bytes == 0 || !code_size_bytes.is_multiple_of(4) {
+        return Err(DecodeError::InvalidCodeSize {
+            bytes: code_size_bytes,
+        });
+    }
+    let mut words = Vec::with_capacity(code_size_bytes / 4);
+    for word_index in 0..(code_size_bytes / 4) {
+        let pc = u32::try_from(
+            word_index
+                .checked_mul(4)
+                .ok_or(DecodeError::ProgramCounterOverflow)?,
+        )
+        .map_err(|_| DecodeError::ProgramCounterOverflow)?;
+        words.push(read_memory_word(memory, address, pc, 0)?);
+    }
+    decode_program_segments(address, &words)
 }
 
 fn read_program_with_limits(
@@ -591,7 +668,11 @@ fn decode_vop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x43 => Some("VMovrelsB32"),
         0x44 => Some("VMovrelsdB32"),
         0x52 => Some("VCvtU16F16"),
+        0x54 => Some("VRcpF16"),
+        0x55 => Some("VSqrtF16"),
         0x56 => Some("VRsqF16"),
+        0x57 => Some("VLogF16"),
+        0x58 => Some("VExpF16"),
         _ => None,
     };
     known_frame(
@@ -835,13 +916,17 @@ fn decode_vop3(word: u32, extra: u32) -> Frame {
             0x16a => Some("VMulHiU32"),
             0x16b => Some("VMulLoI32"),
             0x16c => Some("VMulHiI32"),
+            0x178 => Some("VXor3B32"),
             // VOP1 opcodes use their architectural opcode plus 0x180 in the VOP3/e64
             // encoding. V_CVT_FLR_I32_F32 is opcode 0x0d, hence 0x18d here.
             0x18d => Some("VCvtFlrI32F32"),
+            0x2ff => Some("VLshlrevB64"),
+            0x300 => Some("VLshrrevB64"),
             0x345 => Some("VXadU32"),
             0x346 => Some("VLshlAddU32"),
             0x347 => Some("VAddLshlU32"),
             0x34b => Some("VFmaF16"),
+            0x351 => Some("VDivFixupF32"),
             0x360 => Some("VReadlaneB32"),
             0x361 => Some("VWritelaneB32"),
             0x362 => Some("VLdexpF32"),
@@ -952,6 +1037,7 @@ fn decode_ds(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x38 => Some("DsRead2St64B32"),
         0x4d => Some("DsWriteB64"),
         0xb0 => Some("DsWriteAddtidB32"),
+        0xb1 => Some("DsReadAddtidB32"),
         0xde => Some("DsWriteB96"),
         0xdf => Some("DsWriteB128"),
         0xfe => Some("DsReadB96"),
@@ -1377,7 +1463,10 @@ fn create_instruction(
             ]);
             if opcode.is("VReadlaneB32") {
                 destinations.push(Operand::scalar(word & 0xff));
-            } else if opcode.is("VMadU64U32") {
+            } else if opcode.is("VMadU64U32")
+                || opcode.is("VLshlrevB64")
+                || opcode.is("VLshrrevB64")
+            {
                 push_vector_range(&mut destinations, word & 0xff, 2);
             } else {
                 destinations.push(Operand::vector(word & 0xff));
@@ -1552,6 +1641,8 @@ fn decode_data_share(
     if opcode.is("DsWriteAddtidB32") {
         sources.clear();
         sources.push(Operand::vector(vector_data0));
+    } else if opcode.is("DsReadAddtidB32") {
+        sources.clear();
     } else if opcode.is("DsWriteB32") {
         sources.push(Operand::vector(vector_data0));
     } else if opcode.is("DsWriteB64") {
@@ -1571,7 +1662,7 @@ fn decode_data_share(
         sources.push(Operand::vector(vector_data0));
     }
 
-    if opcode.is("DsReadB32") || opcode.is("DsSwizzleB32") {
+    if opcode.is("DsReadB32") || opcode.is("DsReadAddtidB32") || opcode.is("DsSwizzleB32") {
         destinations.push(Operand::vector(vector_destination));
     } else if opcode.is("DsRead2B32") || opcode.is("DsRead2St64B32") {
         push_vector_range(destinations, vector_destination, 2);
@@ -1968,6 +2059,37 @@ mod tests {
     }
 
     #[test]
+    fn decodes_adjacent_merged_shader_entry_points_within_one_allocation() {
+        let words = [
+            0xbf80_0000, // first entry point
+            0xbf81_0000,
+            0xbf80_0000, // second entry point
+            0xbf80_0000,
+            0xbf81_0000,
+        ];
+        let segments =
+            decode_program_segments(0x2000, &words).expect("adjacent shader entry points");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].address, 0x2000);
+        assert_eq!(segments[0].instructions.len(), 2);
+        assert_eq!(segments[1].address, 0x2008);
+        assert_eq!(segments[1].instructions.len(), 3);
+
+        let memory = SliceMemory {
+            base: 0x2000,
+            words: words.to_vec(),
+        };
+        let segments = read_program_segments_bounded(
+            &memory,
+            memory.base,
+            memory.words.len() * std::mem::size_of::<u32>(),
+        )
+        .expect("memory-backed adjacent entry points");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].address, 0x2008);
+    }
+
+    #[test]
     fn registered_code_extent_allows_a_shader_larger_than_the_fallback_scan() {
         let mut words = vec![0xbf80_0000; FALLBACK_MAX_INSTRUCTIONS + 1];
         words.push(0xbf81_0000);
@@ -2046,6 +2168,45 @@ mod tests {
     }
 
     #[test]
+    fn decodes_exercised_xor3_and_64_bit_vector_shift_pairs() {
+        let xor_sources = 257_u32 | (258_u32 << 9) | (259_u32 << 18);
+        let shift_sources = 4_u32 | (258_u32 << 9) | (259_u32 << 18);
+        let program = decode_program(
+            0x1000,
+            &[
+                0xd178_0008,
+                xor_sources,
+                0xd2ff_000a,
+                shift_sources,
+                0xd300_000c,
+                shift_sources,
+                0xbf81_0000,
+            ],
+        )
+        .expect("observed RDNA2 XOR3 and B64 shift stream");
+
+        assert!(program.instructions[0].opcode.is("VXor3B32"));
+        assert_eq!(program.instructions[0].destinations, [Operand::vector(8)]);
+        for (instruction, opcode, destination) in [
+            (&program.instructions[1], "VLshlrevB64", 10),
+            (&program.instructions[2], "VLshrrevB64", 12),
+        ] {
+            assert!(instruction.opcode.is(opcode));
+            assert_eq!(
+                instruction.sources,
+                [Operand::scalar(4), Operand::vector(2), Operand::vector(3)]
+            );
+            assert_eq!(
+                instruction.destinations,
+                [
+                    Operand::vector(destination),
+                    Operand::vector(destination + 1)
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn decodes_silent_hill_half_to_u16_and_signed_bitfield_extract() {
         let sources = 257_u32 | (258_u32 << 9) | (259_u32 << 18);
         let program = decode_program(0x1000, &[0x7e06_a4f9, 0, 0xd149_0008, sources, 0xbf81_0000])
@@ -2065,6 +2226,50 @@ mod tests {
             [Operand::vector(1), Operand::vector(2), Operand::vector(3)]
         );
         assert_eq!(program.instructions[1].destinations, [Operand::vector(8)]);
+    }
+
+    #[test]
+    fn decodes_silent_hill_half_transcendentals_sdwa() {
+        let program = decode_program(
+            0x8009_c10000,
+            &[
+                0x7e0c_aef9, // v_log_f16 v6, src_sdwa
+                0,
+                0x7e12_b0f9, // v_exp_f16 v9, src_sdwa
+                0,
+                0xbf81_0000,
+            ],
+        )
+        .expect("observed Silent Hill half-transcendental SDWA stream");
+
+        assert!(program.instructions[0].opcode.is("VLogF16"));
+        assert_eq!(program.instructions[0].destinations, [Operand::vector(6)]);
+        assert!(matches!(
+            program.instructions[0].control,
+            Some(InstructionControl::Sdwa(_))
+        ));
+        assert!(program.instructions[1].opcode.is("VExpF16"));
+        assert_eq!(program.instructions[1].destinations, [Operand::vector(9)]);
+        assert!(matches!(
+            program.instructions[1].control,
+            Some(InstructionControl::Sdwa(_))
+        ));
+        assert_eq!(program.instructions[2].opcode, Opcode::END_PROGRAM);
+    }
+
+    #[test]
+    fn decodes_silent_hill_single_precision_division_fixup() {
+        let sources = 257_u32 | (258_u32 << 9) | (259_u32 << 18);
+        let program = decode_program(0x8009_c10000, &[0xd351_0008, sources, 0xbf81_0000])
+            .expect("observed Silent Hill V_DIV_FIXUP_F32 stream");
+
+        assert!(program.instructions[0].opcode.is("VDivFixupF32"));
+        assert_eq!(
+            program.instructions[0].sources,
+            [Operand::vector(1), Operand::vector(2), Operand::vector(3)]
+        );
+        assert_eq!(program.instructions[0].destinations, [Operand::vector(8)]);
+        assert_eq!(program.instructions[1].opcode, Opcode::END_PROGRAM);
     }
 
     #[test]
@@ -2194,7 +2399,7 @@ mod tests {
 
     #[test]
     fn decodes_every_supported_ds_opcode_and_every_control_bit_pattern() {
-        const OPCODES: [(u32, &str, usize, usize); 38] = [
+        const OPCODES: [(u32, &str, usize, usize); 39] = [
             (0x00, "DsAddU32", 2, 0),
             (0x01, "DsSubU32", 2, 0),
             (0x03, "DsIncU32", 2, 0),
@@ -2229,6 +2434,7 @@ mod tests {
             (0x38, "DsRead2St64B32", 1, 2),
             (0x4d, "DsWriteB64", 3, 0),
             (0xb0, "DsWriteAddtidB32", 1, 0),
+            (0xb1, "DsReadAddtidB32", 0, 1),
             (0xde, "DsWriteB96", 4, 0),
             (0xdf, "DsWriteB128", 5, 0),
             (0xfe, "DsReadB96", 1, 3),

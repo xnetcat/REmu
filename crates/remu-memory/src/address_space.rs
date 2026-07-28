@@ -1981,6 +1981,60 @@ mod tests {
     }
 
     #[test]
+    fn private_backing_write_is_coherent_without_falsely_dirtying_cpu_watches() {
+        let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+        let first = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .unwrap();
+        let second = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .unwrap();
+        // SAFETY: both mappings remain live until the watches are dropped at the end of the test.
+        let first_watch =
+            unsafe { CpuWriteWatch::new(first.get(), GUEST_PAGE_SIZE).expect("first watch") };
+        // SAFETY: same backing and lifetime guarantee as the first alias.
+        let second_watch =
+            unsafe { CpuWriteWatch::new(second.get(), GUEST_PAGE_SIZE).expect("second watch") };
+
+        assert!(write_guest_shared_backing(first.get(), b"gpu"));
+        let mut coherent = [0_u8; 3];
+        memory.read(second, &mut coherent).unwrap();
+        assert_eq!(&coherent, b"gpu");
+        assert_eq!(first_watch.generation(), 0);
+        assert_eq!(second_watch.generation(), 0);
+        assert!(!first_watch.is_dirty());
+        assert!(!second_watch.is_dirty());
+
+        // Fault ownership is virtual-address-specific. A texture watcher covers every physical
+        // alias and therefore observes this store through `first_watch`; the untouched alias does
+        // not need a duplicate dirty transition.
+        memory.write(first, b"cpu").unwrap();
+        assert!(first_watch.is_dirty());
+        assert!(!second_watch.is_dirty());
+        assert_eq!(first_watch.generation(), 1);
+        assert_eq!(second_watch.generation(), 0);
+
+        assert!(write_guest_shared_backing(first.get(), b"gpu"));
+        assert!(first_watch.is_dirty());
+        assert_eq!(first_watch.generation(), 1);
+    }
+
+    #[test]
     fn replacing_shared_pages_removes_their_backing_identity() {
         let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
         let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();

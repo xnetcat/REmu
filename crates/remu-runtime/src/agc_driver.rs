@@ -296,16 +296,19 @@ fn submit_graphics(
             },
         )
     });
-    for (handle, buffer_index, flip_argument) in flips {
-        queue_video_out_flip(state, handle, buffer_index, flip_argument);
-    }
-    for event in event_writes {
-        queue_agc_event_write(state, event);
-    }
     match result {
         Ok(()) => {
             agc_command_abi::track_graphics_submission(command_address, dword_count);
-            request_agc_submission_completion(state, u64::from(queue), gpu_events);
+            if !request_agc_submission_completion(state, u64::from(queue), gpu_events) {
+                eprintln!("[REMu][AGC] rejected graphics submission: presenter is unavailable");
+                return AGC_ERROR_UNEXPECTED_PARAMETER;
+            }
+            for (handle, buffer_index, flip_argument) in flips {
+                queue_video_out_flip(state, handle, buffer_index, flip_argument);
+            }
+            for event in event_writes {
+                queue_agc_event_write(state, event);
+            }
             0
         }
         Err(error) => {

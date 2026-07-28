@@ -387,7 +387,9 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             instruction.pc,
             scalar_state_hash(
                 &path.registers,
-                self.state.program.runtime_scalar_register_indices(),
+                self.state
+                    .program
+                    .evaluation_live_scalar_register_indices(instruction_index),
                 path.exec_mask,
                 path.scalar_condition,
             ),
@@ -758,7 +760,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         let prefix_bytes = base_address.wrapping_sub(binding_base);
         let writable = instruction.opcode.starts_with("GlobalStore")
             || instruction.opcode.starts_with("GlobalAtomic");
-        self.record_global_binding(
+        self.record_global_binding_or_readonly_zero(
             instruction,
             BindingRequest {
                 scalar_address,
@@ -844,7 +846,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             } else {
                 let binding_base = descriptor.base_address & !3;
                 let prefix_bytes = descriptor.base_address - binding_base;
-                self.record_global_binding(
+                self.record_global_binding_or_readonly_zero(
                     instruction,
                     BindingRequest {
                         scalar_address: control.scalar_resource,
@@ -859,7 +861,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         }
         let binding_base = descriptor.base_address & !3;
         let prefix_bytes = descriptor.base_address - binding_base;
-        self.record_global_binding(
+        self.record_global_binding_or_readonly_zero(
             instruction,
             BindingRequest {
                 scalar_address: control.scalar_resource,
@@ -966,6 +968,34 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         };
         self.global_bindings.push(binding);
         Ok(())
+    }
+
+    fn record_global_binding_or_readonly_zero(
+        &mut self,
+        instruction: &Instruction,
+        request: BindingRequest,
+    ) -> Result<(), EvaluationError> {
+        match self.record_global_binding(instruction, request) {
+            Ok(()) => Ok(()),
+            Err(EvaluationError::MemoryFault { .. }) if !request.writable => {
+                // Material permutations can retain an unreadable sentinel descriptor for a
+                // vector-memory path whose lanes are inactive or out of bounds. Metal still
+                // needs a binding for the instruction to type-check. Its generated load helpers
+                // bounds-check against this four-byte placeholder and return zero, matching the
+                // scalar-resource compatibility path without making stores silently disappear.
+                self.record_global_binding(
+                    instruction,
+                    BindingRequest {
+                        scalar_address: request.scalar_address,
+                        base_address: 0,
+                        requested_bytes: 4,
+                        writable: false,
+                        allow_shorter: false,
+                    },
+                )
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn read_binding_request(
@@ -2393,6 +2423,214 @@ mod tests {
         assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
         assert!(!evaluation.global_memory_bindings[0].writable);
         assert!(!evaluation.global_memory_bindings[0].write_back_to_guest);
+    }
+
+    #[test]
+    fn unreadable_global_loads_use_a_bounded_zero_binding() {
+        let sentinel = 0xf000_0000_0090_u64;
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Flat,
+                    "GlobalLoadDword",
+                    Vec::new(),
+                    vec![Operand::vector(0)],
+                    Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        vector_destination: 0,
+                        scalar_address: Some(12),
+                        offset_bytes: 0,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                    })),
+                ),
+                end(8),
+            ],
+            {
+                let mut user_data = vec![0; 14];
+                user_data[12] = sentinel as u32;
+                user_data[13] = (sentinel >> 32) as u32;
+                user_data
+            },
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions {
+                maximum_binding_bytes: 64,
+                ..EvaluationOptions::default()
+            },
+        )
+        .expect("an unreadable read-only global must receive a zero binding");
+
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].scalar_address, 12);
+        assert_eq!(evaluation.global_memory_bindings[0].base_address, 0);
+        assert_eq!(evaluation.global_memory_bindings[0].byte_count, 4);
+        assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
+        assert!(!evaluation.global_memory_bindings[0].writable);
+        assert!(!evaluation.global_memory_bindings[0].write_back_to_guest);
+    }
+
+    #[test]
+    fn unreadable_buffer_loads_use_a_bounded_zero_binding() {
+        let sentinel = 0xf000_0000_0090_u64;
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Mubuf,
+                    "BufferLoadDword",
+                    Vec::new(),
+                    vec![Operand::vector(0)],
+                    Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        scalar_resource: 8,
+                        instruction_format: None,
+                        offset_bytes: 0,
+                        index_enabled: false,
+                        offset_enabled: false,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                        tfe: false,
+                    })),
+                ),
+                end(8),
+            ],
+            {
+                let mut user_data = vec![0; 12];
+                user_data[8] = sentinel as u32;
+                user_data[9] = (sentinel >> 32) as u32;
+                user_data[10] = 16;
+                user_data[11] = 3 << 28;
+                user_data
+            },
+        );
+
+        let evaluation = evaluate_shader(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+        )
+        .expect("an unreadable read-only buffer must receive a zero binding");
+
+        assert_eq!(evaluation.global_memory_bindings.len(), 1);
+        assert_eq!(evaluation.global_memory_bindings[0].scalar_address, 8);
+        assert_eq!(evaluation.global_memory_bindings[0].base_address, 0);
+        assert_eq!(evaluation.global_memory_bindings[0].byte_count, 4);
+        assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
+        assert!(!evaluation.global_memory_bindings[0].writable);
+        assert!(!evaluation.global_memory_bindings[0].write_back_to_guest);
+    }
+
+    #[test]
+    fn unreadable_global_stores_and_atomics_remain_errors() {
+        let sentinel = 0xf000_0000_0090_u64;
+        for opcode in ["GlobalStoreDword", "GlobalAtomicAdd"] {
+            let shader = state(
+                vec![
+                    instruction(
+                        0,
+                        ShaderEncoding::Flat,
+                        opcode,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                            dword_count: 1,
+                            vector_address: 0,
+                            vector_data: 0,
+                            vector_destination: 0,
+                            scalar_address: Some(12),
+                            offset_bytes: 0,
+                            dlc: false,
+                            lds: false,
+                            glc: false,
+                            slc: false,
+                        })),
+                    ),
+                    end(8),
+                ],
+                {
+                    let mut user_data = vec![0; 14];
+                    user_data[12] = sentinel as u32;
+                    user_data[13] = (sentinel >> 32) as u32;
+                    user_data
+                },
+            );
+
+            assert!(matches!(
+                evaluate_shader(
+                    &TestMemory::default(),
+                    &shader,
+                    EvaluationOptions {
+                        maximum_binding_bytes: 64,
+                        ..EvaluationOptions::default()
+                    },
+                ),
+                Err(EvaluationError::MemoryFault { address, .. }) if address == sentinel
+            ));
+        }
+    }
+
+    #[test]
+    fn unreadable_buffer_stores_and_atomics_remain_errors() {
+        let sentinel = 0xf000_0000_0090_u64;
+        for opcode in ["BufferStoreDword", "BufferAtomicAdd"] {
+            let shader = state(
+                vec![
+                    instruction(
+                        0,
+                        ShaderEncoding::Mubuf,
+                        opcode,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                            dword_count: 1,
+                            vector_address: 0,
+                            vector_data: 0,
+                            scalar_resource: 8,
+                            instruction_format: None,
+                            offset_bytes: 0,
+                            index_enabled: false,
+                            offset_enabled: false,
+                            dlc: false,
+                            lds: false,
+                            glc: false,
+                            slc: false,
+                            tfe: false,
+                        })),
+                    ),
+                    end(8),
+                ],
+                {
+                    let mut user_data = vec![0; 12];
+                    user_data[8] = sentinel as u32;
+                    user_data[9] = (sentinel >> 32) as u32;
+                    user_data[10] = 16;
+                    user_data[11] = 3 << 28;
+                    user_data
+                },
+            );
+
+            assert!(matches!(
+                evaluate_shader(
+                    &TestMemory::default(),
+                    &shader,
+                    EvaluationOptions::default(),
+                ),
+                Err(EvaluationError::MemoryFault { address, .. }) if address == sentinel
+            ));
+        }
     }
 
     #[test]

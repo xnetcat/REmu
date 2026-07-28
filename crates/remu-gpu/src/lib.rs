@@ -25,12 +25,23 @@ pub const PAD_BUTTON_CIRCLE: u32 = 0x2000;
 pub const PAD_BUTTON_CROSS: u32 = 0x4000;
 pub const PAD_BUTTON_SQUARE: u32 = 0x8000;
 
-/// Maximum number of decoded GPU events retained between the guest command processor and the
-/// host presenter. Modern Unity frames contain hundreds of draws plus synchronization packets;
-/// retaining several thousand events lets the guest command processor and Metal encoder run in
-/// parallel instead of context-switching every few draws. The queue remains bounded so a shader
-/// compilation stall cannot grow memory without limit.
-pub const GPU_EVENT_QUEUE_CAPACITY: usize = 2048;
+/// Maximum number of submission chunks retained in the bounded channel.
+///
+/// A guest submission can contain thousands of decoded events, so bounding only the number of
+/// outer `QueueSubmission` values does not bound retained guest state. [`emit_event`] splits those
+/// submissions into [`GPU_EVENT_SUBMISSION_CHUNK_SIZE`] event chunks, making this limit effective
+/// while preserving queue-local order and the final submission boundary.
+pub const GPU_EVENT_QUEUE_CAPACITY: usize = 8;
+
+/// Maximum decoded events placed in one bounded-channel submission chunk.
+pub const GPU_EVENT_SUBMISSION_CHUNK_SIZE: usize = 32;
+
+/// Maximum decoded events retained after the presenter moves chunks out of the channel.
+///
+/// The ordered receiver stops ingesting at this threshold. That leaves the bounded channel full
+/// and applies backpressure to the guest command processor while cold shader compilation or large
+/// texture uploads delay the consumer.
+pub const GPU_PENDING_EVENT_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostPadState {
@@ -58,17 +69,23 @@ impl Default for HostPadState {
 }
 
 static HOST_PAD_BUTTONS: AtomicU32 = AtomicU32::new(0);
+static HOST_PAD_PRESSED_EDGES: AtomicU32 = AtomicU32::new(0);
 static HOST_PAD_AXES: AtomicU32 = AtomicU32::new(0x8080_8080);
 static HOST_PAD_TRIGGERS: AtomicU32 = AtomicU32::new(0);
 static GPU_EVENTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static GPU_WORK_ITEMS_PENDING: AtomicUsize = AtomicUsize::new(0);
+static GPU_FLIPS_PENDING: AtomicUsize = AtomicUsize::new(0);
 static GPU_COMPLETED_SUBMISSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static GPU_COMPLETED_SUBMISSIONS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
+static GPU_COMPLETED_FLIPS: OnceLock<Mutex<Vec<GpuFlipCompletion>>> = OnceLock::new();
 static AUDIO_OUTPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
 static AUDIO_UNDERRUN_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_host_pad_state(state: HostPadState) {
     let axes = u32::from_le_bytes([state.left_x, state.left_y, state.right_x, state.right_y]);
     let triggers = u32::from_le_bytes([state.l2, state.r2, 0, 0]);
+    let previous_buttons = HOST_PAD_BUTTONS.load(Ordering::Acquire);
+    HOST_PAD_PRESSED_EDGES.fetch_or(state.buttons & !previous_buttons, Ordering::AcqRel);
     HOST_PAD_AXES.store(axes, Ordering::Release);
     HOST_PAD_TRIGGERS.store(triggers, Ordering::Release);
     HOST_PAD_BUTTONS.store(state.buttons, Ordering::Release);
@@ -76,7 +93,11 @@ pub fn set_host_pad_state(state: HostPadState) {
 
 #[must_use]
 pub fn host_pad_state() -> HostPadState {
-    let buttons = HOST_PAD_BUTTONS.load(Ordering::Acquire);
+    // The AppKit event loop can publish key-down and key-up between two guest pad polls,
+    // especially while a title is compiling shaders or rendering below the host refresh rate.
+    // Preserve each rising edge for one read so a valid short press cannot disappear entirely.
+    let buttons =
+        HOST_PAD_BUTTONS.load(Ordering::Acquire) | HOST_PAD_PRESSED_EDGES.swap(0, Ordering::AcqRel);
     let [left_x, left_y, right_x, right_y] = HOST_PAD_AXES.load(Ordering::Acquire).to_le_bytes();
     let [l2, r2, _, _] = HOST_PAD_TRIGGERS.load(Ordering::Acquire).to_le_bytes();
     HostPadState {
@@ -100,6 +121,41 @@ pub fn gpu_events_in_flight() -> usize {
 pub fn record_gpu_event_consumed() {
     let _ = GPU_EVENTS_IN_FLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(1))
+    });
+}
+
+/// Returns the number of individual GPU work items emitted by the guest but not yet processed by
+/// the presenter.
+///
+/// Unlike [`gpu_events_in_flight`], queue submissions contribute their decoded event count and
+/// remain pending after the bounded channel has been drained. This is the useful measure of how
+/// far guest rendering is running ahead of translation and presentation.
+#[must_use]
+pub fn gpu_work_items_pending() -> usize {
+    GPU_WORK_ITEMS_PENDING.load(Ordering::Relaxed)
+}
+
+/// Returns the number of accepted guest flips which have not reached a terminal presentation
+/// command buffer yet.
+#[must_use]
+pub fn gpu_flips_pending() -> usize {
+    GPU_FLIPS_PENDING.load(Ordering::Relaxed)
+}
+
+/// Records that the presenter finished processing one individual guest GPU work item.
+pub fn record_gpu_work_item_processed() {
+    cancel_pending_gpu_work_items(1);
+}
+
+fn cancel_pending_gpu_work_items(count: usize) {
+    let _ = GPU_WORK_ITEMS_PENDING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(count))
+    });
+}
+
+fn cancel_pending_gpu_flips(count: usize) {
+    let _ = GPU_FLIPS_PENDING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(count))
     });
 }
 
@@ -155,6 +211,11 @@ pub struct GpuRegister {
 pub struct ShaderSnapshot {
     pub header_address: u64,
     pub program: Arc<Program>,
+    /// Additional independently terminated entry points retained in the same AGC code
+    /// allocation. Merged geometry binaries use these trailing programs for the other hardware
+    /// half; dropping them loses vertex parameters even though the leading program still exports
+    /// position.
+    pub supplemental_programs: Arc<[Program]>,
     pub metadata: Option<Arc<ShaderMetadata>>,
 }
 
@@ -553,6 +614,54 @@ pub trait GpuProbe {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuHostImage {
+    width: u32,
+    height: u32,
+    rgba8: Arc<[u8]>,
+}
+
+impl GpuHostImage {
+    const MAXIMUM_BYTE_COUNT: usize = 256 * 1024 * 1024;
+
+    /// Builds a validated, tightly packed RGBA8 host image.
+    #[must_use]
+    pub fn new(width: u32, height: u32, rgba8: impl Into<Arc<[u8]>>) -> Option<Self> {
+        let rgba8 = rgba8.into();
+        let expected = usize::try_from(width)
+            .ok()?
+            .checked_mul(usize::try_from(height).ok()?)?
+            .checked_mul(4)?;
+        if width == 0
+            || height == 0
+            || expected > Self::MAXIMUM_BYTE_COUNT
+            || rgba8.len() != expected
+        {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            rgba8,
+        })
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[must_use]
+    pub fn rgba8(&self) -> &[u8] {
+        &self.rgba8
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GpuEvent {
     /// One complete guest command-buffer submission and the hardware queue that owns it.
     ///
@@ -571,6 +680,10 @@ pub enum GpuEvent {
         tiling_mode: u32,
         buffers: Vec<u64>,
     },
+    /// A host-decoded installed-title image displayed while the system splash is visible.
+    ShowHostSplash(GpuHostImage),
+    /// Removes the system-owned splash, revealing the newest guest scanout (or black).
+    HideHostSplash,
     Flip {
         address: u64,
         buffer_index: u32,
@@ -607,6 +720,18 @@ pub enum GpuEvent {
     /// monotonic value to deliver `sceAgcDriverAddEqEvent` completion notifications.
     SubmissionBoundary(u64),
     Shutdown,
+}
+
+/// One display-buffer flip whose presentation command reached a terminal backend state.
+///
+/// The address, buffer index and guest argument form the VideoOut-visible identity. A title may
+/// reuse an argument, so the completion tracker retains duplicates and the runtime consumes them
+/// one-for-one in submission order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuFlipCompletion {
+    pub address: u64,
+    pub buffer_index: u32,
+    pub flip_argument: u64,
 }
 
 /// A guest pipeline-stage completion boundary emitted by a PM4 partial-flush event.
@@ -975,9 +1100,16 @@ pub fn gpu_event_channel() -> (SyncSender<GpuEvent>, Receiver<GpuEvent>) {
 
 pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
     GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
+    GPU_WORK_ITEMS_PENDING.store(0, Ordering::Relaxed);
+    GPU_FLIPS_PENDING.store(0, Ordering::Relaxed);
     GPU_COMPLETED_SUBMISSION_SEQUENCE.store(0, Ordering::Release);
     GPU_COMPLETED_SUBMISSIONS
         .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    GPU_COMPLETED_FLIPS
+        .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
@@ -996,9 +1128,16 @@ pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
 
 pub fn clear_event_sink() {
     GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
+    GPU_WORK_ITEMS_PENDING.store(0, Ordering::Relaxed);
+    GPU_FLIPS_PENDING.store(0, Ordering::Relaxed);
     GPU_COMPLETED_SUBMISSION_SEQUENCE.store(0, Ordering::Release);
     GPU_COMPLETED_SUBMISSIONS
         .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    GPU_COMPLETED_FLIPS
+        .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
@@ -1007,6 +1146,12 @@ pub fn clear_event_sink() {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *sink = None;
+        // A producer may have incremented either counter and blocked in `send` while holding this
+        // sink mutex before teardown began. Reset again after taking ownership so its failed-send
+        // rollback cannot leave stale work (or underflow an already reset counter).
+        GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
+        GPU_WORK_ITEMS_PENDING.store(0, Ordering::Relaxed);
+        GPU_FLIPS_PENDING.store(0, Ordering::Relaxed);
         gpu_wait_registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1054,6 +1199,25 @@ pub fn take_gpu_completed_submission_ids() -> Vec<u64> {
     std::mem::take(&mut *completed).into_iter().collect()
 }
 
+/// Publishes completion of one display-buffer presentation.
+pub fn record_gpu_flip_completed(completion: GpuFlipCompletion) {
+    cancel_pending_gpu_flips(1);
+    GPU_COMPLETED_FLIPS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(completion);
+}
+
+/// Drains display-buffer presentations completed since the previous runtime refresh.
+pub fn take_gpu_completed_flips() -> Vec<GpuFlipCompletion> {
+    let mut completed = GPU_COMPLETED_FLIPS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *completed)
+}
+
 /// Publishes one decoded GPU event to the installed bounded presenter channel.
 ///
 /// Queue-submission waits are registered before the potentially blocking channel send. Returning
@@ -1078,9 +1242,70 @@ pub fn emit_event(mut event: GpuEvent) -> bool {
             return false;
         }
     };
-    GPU_EVENTS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-    if sender.send(event).is_err() {
-        record_gpu_event_consumed();
+    let sent = match event {
+        GpuEvent::QueueSubmission {
+            queue_id,
+            mut events,
+        } if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE => {
+            let mut all_sent = true;
+            loop {
+                let remaining = if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE {
+                    events.split_off(GPU_EVENT_SUBMISSION_CHUNK_SIZE)
+                } else {
+                    Vec::new()
+                };
+                let work_item_count = events.len();
+                let flip_count = events
+                    .iter()
+                    .filter(|event| matches!(event, GpuEvent::Flip { .. }))
+                    .count();
+                GPU_EVENTS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+                GPU_WORK_ITEMS_PENDING.fetch_add(work_item_count, Ordering::Relaxed);
+                GPU_FLIPS_PENDING.fetch_add(flip_count, Ordering::Relaxed);
+                if sender
+                    .send(GpuEvent::QueueSubmission { queue_id, events })
+                    .is_err()
+                {
+                    record_gpu_event_consumed();
+                    cancel_pending_gpu_work_items(work_item_count);
+                    cancel_pending_gpu_flips(flip_count);
+                    all_sent = false;
+                    break;
+                }
+                if remaining.is_empty() {
+                    break;
+                }
+                events = remaining;
+            }
+            all_sent
+        }
+        event => {
+            let work_item_count = match &event {
+                GpuEvent::QueueSubmission { events, .. } => events.len(),
+                _ => 1,
+            };
+            let flip_count = match &event {
+                GpuEvent::QueueSubmission { events, .. } => events
+                    .iter()
+                    .filter(|event| matches!(event, GpuEvent::Flip { .. }))
+                    .count(),
+                GpuEvent::Flip { .. } => 1,
+                _ => 0,
+            };
+            GPU_EVENTS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+            GPU_WORK_ITEMS_PENDING.fetch_add(work_item_count, Ordering::Relaxed);
+            GPU_FLIPS_PENDING.fetch_add(flip_count, Ordering::Relaxed);
+            if sender.send(event).is_err() {
+                record_gpu_event_consumed();
+                cancel_pending_gpu_work_items(work_item_count);
+                cancel_pending_gpu_flips(flip_count);
+                false
+            } else {
+                true
+            }
+        }
+    };
+    if !sent {
         gpu_wait_registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1109,18 +1334,30 @@ mod tests {
         COMPUTE_NUM_THREAD_Z_REGISTER, COMPUTE_PGM_HI_REGISTER, COMPUTE_PGM_LO_REGISTER,
         COMPUTE_PGM_RSRC2_REGISTER, COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER,
         COMPUTE_START_Z_REGISTER, ComputeDispatchDecodeError, ComputeGrid,
-        GPU_EVENT_QUEUE_CAPACITY, GpuEvent, GpuMemoryAcquire, GpuMemoryWait, GpuRegister,
-        HostPadState, audio_output_frames, audio_underrun_frames, clear_event_sink,
-        compute_program_address, decode_compute_dispatch_direct, decode_compute_dispatch_indirect,
-        decode_compute_launch, decode_compute_system_registers, emit_event,
-        gpu_completed_submission_sequence, gpu_event_channel, gpu_events_in_flight, host_pad_state,
-        install_event_sink, record_gpu_event_consumed, record_gpu_submission_completed,
-        record_gpu_wait_producer, report_audio_frames, set_host_pad_state,
+        GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GpuEvent, GpuFlipCompletion,
+        GpuHostImage, GpuMemoryAcquire, GpuMemoryWait, GpuRegister, HostPadState,
+        audio_output_frames, audio_underrun_frames, clear_event_sink, compute_program_address,
+        decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
+        decode_compute_system_registers, emit_event, gpu_completed_submission_sequence,
+        gpu_event_channel, gpu_events_in_flight, gpu_work_items_pending, host_pad_state,
+        install_event_sink, record_gpu_event_consumed, record_gpu_flip_completed,
+        record_gpu_submission_completed, record_gpu_wait_producer, record_gpu_work_item_processed,
+        report_audio_frames, set_host_pad_state, take_gpu_completed_flips,
         take_gpu_completed_submission_ids, take_gpu_wait_latch,
     };
     use std::sync::Mutex;
 
     static EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn host_image_requires_exact_nonempty_rgba8_storage() {
+        let image = GpuHostImage::new(2, 1, vec![0_u8; 8]).expect("complete RGBA image");
+        assert_eq!((image.width(), image.height()), (2, 1));
+        assert_eq!(image.rgba8().len(), 8);
+        assert!(GpuHostImage::new(0, 1, Vec::<u8>::new()).is_none());
+        assert!(GpuHostImage::new(2, 1, vec![0_u8; 7]).is_none());
+        assert!(GpuHostImage::new(u32::MAX, u32::MAX, Vec::<u8>::new()).is_none());
+    }
 
     #[test]
     fn gpu_event_channel_applies_bounded_backpressure() {
@@ -1149,18 +1386,58 @@ mod tests {
         install_event_sink(sender);
         assert!(emit_event(GpuEvent::Shutdown));
         assert_eq!(gpu_events_in_flight(), 1);
+        assert_eq!(gpu_work_items_pending(), 1);
         assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
         record_gpu_event_consumed();
         assert_eq!(gpu_events_in_flight(), 0);
+        assert_eq!(gpu_work_items_pending(), 1);
+        record_gpu_work_item_processed();
+        assert_eq!(gpu_work_items_pending(), 0);
 
         record_gpu_submission_completed(2);
         record_gpu_submission_completed(1);
         assert_eq!(gpu_completed_submission_sequence(), 2);
         assert_eq!(take_gpu_completed_submission_ids(), [1, 2]);
 
+        let flip = GpuFlipCompletion {
+            address: 0x7000_0000,
+            buffer_index: 1,
+            flip_argument: 42,
+        };
+        record_gpu_flip_completed(flip);
+        record_gpu_flip_completed(flip);
+        assert_eq!(take_gpu_completed_flips(), [flip, flip]);
+
         report_audio_frames(480, 12);
         assert_eq!(audio_output_frames(), 480);
         assert_eq!(audio_underrun_frames(), 12);
+        clear_event_sink();
+    }
+
+    #[test]
+    fn queued_submission_telemetry_counts_decoded_work_until_processed() {
+        let _event_guard = EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (sender, receiver) = gpu_event_channel();
+        install_event_sink(sender);
+        assert!(emit_event(GpuEvent::QueueSubmission {
+            queue_id: 7,
+            events: vec![GpuEvent::Shutdown, GpuEvent::Shutdown, GpuEvent::Shutdown,],
+        }));
+        assert_eq!(gpu_events_in_flight(), 1);
+        assert_eq!(gpu_work_items_pending(), 3);
+        let GpuEvent::QueueSubmission { events, .. } = receiver.recv().expect("queued submission")
+        else {
+            panic!("emitted submission must retain its wrapper");
+        };
+        record_gpu_event_consumed();
+        assert_eq!(gpu_events_in_flight(), 0);
+        assert_eq!(gpu_work_items_pending(), 3);
+        for _ in events {
+            record_gpu_work_item_processed();
+        }
+        assert_eq!(gpu_work_items_pending(), 0);
         clear_event_sink();
     }
 
@@ -1197,6 +1474,49 @@ mod tests {
         assert_eq!(*actual, wait);
         assert_eq!(take_gpu_wait_latch(*id), Some(1));
         assert_eq!(take_gpu_wait_latch(*id), None);
+        clear_event_sink();
+    }
+
+    #[test]
+    fn large_queue_submission_is_chunked_before_bounded_ingress() {
+        let _event_guard = EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (sender, receiver) = gpu_event_channel();
+        install_event_sink(sender);
+        let event_count = GPU_EVENT_SUBMISSION_CHUNK_SIZE * 2 + 3;
+        let events = vec![
+            GpuEvent::PipelineBarrier(super::GpuPipelineBarrier {
+                wait_for: super::GpuPipelineStage::PixelShader,
+            });
+            event_count
+        ];
+
+        assert!(emit_event(GpuEvent::QueueSubmission {
+            queue_id: 17,
+            events,
+        }));
+
+        let chunk_lengths = (0..3)
+            .map(|_| {
+                let GpuEvent::QueueSubmission { queue_id, events } =
+                    receiver.recv().expect("chunked queue submission")
+                else {
+                    panic!("queue submission wrapper was lost");
+                };
+                assert_eq!(queue_id, 17);
+                events.len()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chunk_lengths,
+            [
+                GPU_EVENT_SUBMISSION_CHUNK_SIZE,
+                GPU_EVENT_SUBMISSION_CHUNK_SIZE,
+                3
+            ]
+        );
+        assert_eq!(gpu_work_items_pending(), event_count);
         clear_event_sink();
     }
 
@@ -1260,6 +1580,7 @@ mod tests {
                 .waits
                 .is_empty()
         );
+        assert_eq!(gpu_work_items_pending(), 0);
         clear_event_sink();
     }
 
@@ -1277,6 +1598,12 @@ mod tests {
         set_host_pad_state(state);
         assert_eq!(host_pad_state(), state);
         set_host_pad_state(HostPadState::default());
+        assert_eq!(host_pad_state(), HostPadState::default());
+
+        set_host_pad_state(state);
+        set_host_pad_state(HostPadState::default());
+        assert_eq!(host_pad_state().buttons, state.buttons);
+        assert_eq!(host_pad_state(), HostPadState::default());
     }
 
     #[test]

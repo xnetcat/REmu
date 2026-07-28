@@ -7,9 +7,9 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use core_graphics_types::geometry::CGSize;
@@ -20,20 +20,22 @@ use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLBlitOption, MTLClearColor, MTLColorWriteMask,
     MTLCommandBufferStatus, MTLCompareFunction, MTLCullMode, MTLIndexType, MTLLoadAction,
     MTLOrigin, MTLPixelFormat, MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLRegion,
-    MTLRenderStages, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter,
-    MTLSamplerMipFilter, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
-    MTLTextureUsage, MTLTriangleFillMode, MTLViewport, MTLWinding, MetalLayer, NSRange, NSUInteger,
-    RenderCommandEncoder, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState,
-    SamplerDescriptor, SamplerState, Texture, TextureDescriptor, URL,
+    MTLRenderStages, MTLResourceOptions, MTLResourceUsage, MTLSamplerAddressMode,
+    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLScissorRect, MTLSize, MTLStorageMode,
+    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLTriangleFillMode, MTLViewport, MTLWinding,
+    MeshRenderPipelineDescriptor, MetalLayer, NSRange, NSUInteger, RenderCommandEncoder,
+    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
+    SamplerState, Texture, TextureDescriptor, URL,
 };
 use objc::runtime::{Object, YES};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{
-    ComputeDispatch, ComputeGrid, GpuEvent, GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease,
-    GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuRegister, GpuScanoutTarget, GpuWaitId,
-    HostPadState, IndexedDraw, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
-    PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2,
-    PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
+    ComputeDispatch, ComputeGrid, GpuEvent, GpuHostImage, GpuMemoryAcquire, GpuMemoryCopy,
+    GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuRegister,
+    GpuScanoutTarget, GpuWaitId, HostPadState, IndexedDraw, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS,
+    PAD_BUTTON_DOWN, PAD_BUTTON_L1, PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS,
+    PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE,
+    PAD_BUTTON_UP, set_host_pad_state,
 };
 use remu_memory::{
     CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_backing_alias_segments,
@@ -70,17 +72,65 @@ const GUEST_BATCH_WORK_CAPACITY: usize = 256;
 const SAMPLER_ARGUMENT_CACHE_CAPACITY: usize = 1_024;
 const GLOBAL_BUFFER_CACHE_CAPACITY: usize = 4_096;
 const GLOBAL_BUFFER_CACHE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+const GLOBAL_UPLOAD_CHUNK_BYTE_COUNT: usize = 2 * 1024 * 1024;
+const GLOBAL_UPLOAD_ALIGNMENT: usize = 256;
 const GUEST_GLOBAL_BUFFER_CACHE_CAPACITY: usize = 4_096;
 const INDEX_BUFFER_CACHE_CAPACITY: usize = 256;
 const SAMPLED_TEXTURE_CACHE_CAPACITY: usize = 2_048;
 const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
 const METAL_LIBRARY_CACHE_FORMAT: &[u8] = b"remu-metal-library-v1\0";
 const METAL_RENDER_PIPELINE_ARCHIVE_FORMAT: &[u8] = b"remu-metal-render-pipeline-v1\0";
+const SLOW_PIPELINE_ARCHIVE_ADMISSION: Duration = Duration::from_millis(100);
+const LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS: usize = 2;
 const DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY: usize = 262_144;
 const DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX: u64 = 30;
 const DIAGNOSTIC_PIXEL_OUTPUT_WIDTH: usize = 1_920;
 const DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT: usize = 1_080;
 const DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX: u64 = 30;
+const NGG_MESH_INDEX_BUFFER_INDEX: u64 = 29;
+const NGG_MESH_DRAW_BUFFER_INDEX: u64 = 30;
+const NGG_MESH_LDS_BYTES: u32 = 16 * 1024;
+const NGG_MESH_THREADS: u64 = 64;
+const NGG_MESH_VERTICES_PER_GROUP: u64 = 63;
+
+static TEXTURE_SNAPSHOT_COUNT: AtomicU64 = AtomicU64::new(0);
+static TEXTURE_SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
+static TEXTURE_SNAPSHOT_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
+static MODE27_DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
+static MODE27_DECODE_BYTES: AtomicU64 = AtomicU64::new(0);
+static MODE27_DECODE_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
+static MIP_UPLOAD_COUNT: AtomicU64 = AtomicU64::new(0);
+static MIP_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+static MIP_UPLOAD_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
+static SAMPLED_TEXTURE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static SAMPLED_TEXTURE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS: AtomicU64 = AtomicU64::new(0);
+static SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+static SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+static PIPELINE_COMPILE_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+static PIPELINE_COMPILE_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
+static PIPELINE_COMPILE_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static PIPELINE_COMPILE_FAILED: AtomicU64 = AtomicU64::new(0);
+static PIPELINE_DRAW_GATES: AtomicU64 = AtomicU64::new(0);
+
+fn record_texture_work(
+    count: &AtomicU64,
+    bytes: &AtomicU64,
+    nanoseconds: &AtomicU64,
+    byte_count: usize,
+    elapsed: Duration,
+) {
+    count.fetch_add(1, Ordering::Relaxed);
+    bytes.fetch_add(
+        u64::try_from(byte_count).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    nanoseconds.fetch_add(
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PresenterFlow {
@@ -147,6 +197,8 @@ const CB_COLOR0_VIEW: u32 = 0x31b;
 const CB_COLOR0_INFO: u32 = 0x31c;
 const CB_COLOR0_ATTRIB: u32 = 0x31d;
 const CB_COLOR0_FMASK: u32 = 0x321;
+const CB_COLOR0_CLEAR_WORD0: u32 = 0x323;
+const CB_COLOR0_CLEAR_WORD1: u32 = 0x324;
 const CB_COLOR0_BASE_EXT: u32 = 0x390;
 const CB_COLOR0_FMASK_BASE_EXT: u32 = 0x3a0;
 const CB_COLOR0_ATTRIB2: u32 = 0x3b0;
@@ -154,7 +206,9 @@ const CB_COLOR0_ATTRIB3: u32 = 0x3b8;
 const PA_SC_AA_MASK_X0Y0_X1Y0: u32 = 0x30e;
 const PA_SC_AA_MASK_X0Y1_X1Y1: u32 = 0x30f;
 const COLOR_TARGET_COUNT: u32 = 8;
+const DB_RENDER_CONTROL: u32 = 0x000;
 const DB_DEPTH_SIZE_XY: u32 = 0x007;
+const DB_DEPTH_CLEAR: u32 = 0x00b;
 const DB_Z_INFO: u32 = 0x010;
 const DB_Z_READ_BASE: u32 = 0x012;
 const DB_Z_WRITE_BASE: u32 = 0x014;
@@ -234,15 +288,58 @@ struct DisplayConfiguration {
     tiling_mode: u32,
 }
 
-const VIDEO_OUT_TILING_MODE_LINEAR: u32 = 1;
+#[derive(Clone)]
+struct HostSplashTexture {
+    texture: Texture,
+    width: u32,
+    height: u32,
+}
 
+const VIDEO_OUT_TILING_MODE_TILE: u32 = 0;
+const VIDEO_OUT_TILING_MODE_LINEAR: u32 = 1;
+const VIDEO_OUT_DISPLAY_TILE_MODE: u32 = 27;
+
+#[cfg(test)]
 const fn raw_video_out_layout_is_linear(tiling_mode: u32, pitch: u32, width: u32) -> bool {
     tiling_mode == VIDEO_OUT_TILING_MODE_LINEAR && pitch >= width
+}
+
+const fn raw_video_out_texture_descriptor(
+    address: u64,
+    display: DisplayConfiguration,
+) -> Option<GuestTextureDescriptor> {
+    if display.pitch < display.width {
+        return None;
+    }
+    let tile_mode = match display.tiling_mode {
+        VIDEO_OUT_TILING_MODE_TILE => VIDEO_OUT_DISPLAY_TILE_MODE,
+        VIDEO_OUT_TILING_MODE_LINEAR => 0,
+        _ => return None,
+    };
+    Some(GuestTextureDescriptor {
+        address,
+        width: display.width,
+        height: display.height,
+        pitch: display.pitch,
+        tile_mode,
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        bytes_per_pixel: 4,
+    })
 }
 
 #[derive(Clone, Copy)]
 struct PendingFlip {
     address: u64,
+    buffer_index: u32,
+    flip_argument: u64,
+    sequence: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveTranslatedScanout {
+    address: u64,
+    width: u32,
+    height: u32,
     sequence: u64,
 }
 
@@ -255,6 +352,192 @@ struct GuestTextureDescriptor {
     tile_mode: u32,
     pixel_format: MTLPixelFormat,
     bytes_per_pixel: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum Mode27WorkOrigin {
+    RenderTargetCreate,
+    AcquireReload,
+    SampledCacheCreate,
+    StorageCreate,
+    AutomaticPromotion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Mode27WorkKey {
+    origin: Mode27WorkOrigin,
+    descriptor: GuestTextureDescriptor,
+    mip_level_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Mode27WorkAggregate {
+    count: u64,
+    bytes: u64,
+    nanoseconds: u64,
+}
+
+static MODE27_WORK_DETAILS: OnceLock<Mutex<HashMap<Mode27WorkKey, Mode27WorkAggregate>>> =
+    OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TextureSnapshotWorkKey {
+    address: u64,
+    byte_count: usize,
+    caller_line: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TextureDirtyWorkAggregate {
+    snapshots: u64,
+    clean_snapshots: u64,
+    imprecise_snapshots: u64,
+    dirty_pages: u64,
+    dirty_bytes: u64,
+    full_bytes: u64,
+}
+
+static TEXTURE_SNAPSHOT_WORK_DETAILS: OnceLock<
+    Mutex<HashMap<TextureSnapshotWorkKey, Mode27WorkAggregate>>,
+> = OnceLock::new();
+static TEXTURE_DIRTY_WORK_DETAILS: OnceLock<
+    Mutex<HashMap<TextureSnapshotWorkKey, TextureDirtyWorkAggregate>>,
+> = OnceLock::new();
+
+fn record_mode27_work_detail(
+    origin: Mode27WorkOrigin,
+    descriptor: GuestTextureDescriptor,
+    mip_level_count: u32,
+    byte_count: usize,
+    elapsed: Duration,
+) {
+    let key = Mode27WorkKey {
+        origin,
+        descriptor,
+        mip_level_count,
+    };
+    let mut details = MODE27_WORK_DETAILS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let aggregate = details.entry(key).or_default();
+    aggregate.count = aggregate.count.saturating_add(1);
+    aggregate.bytes = aggregate
+        .bytes
+        .saturating_add(u64::try_from(byte_count).unwrap_or(u64::MAX));
+    aggregate.nanoseconds = aggregate
+        .nanoseconds
+        .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+}
+
+fn record_texture_snapshot_work_detail(
+    address: u64,
+    byte_count: usize,
+    caller_line: u32,
+    elapsed: Duration,
+) {
+    let key = TextureSnapshotWorkKey {
+        address,
+        byte_count,
+        caller_line,
+    };
+    let mut details = TEXTURE_SNAPSHOT_WORK_DETAILS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let aggregate = details.entry(key).or_default();
+    aggregate.count = aggregate.count.saturating_add(1);
+    aggregate.bytes = aggregate
+        .bytes
+        .saturating_add(u64::try_from(byte_count).unwrap_or(u64::MAX));
+    aggregate.nanoseconds = aggregate
+        .nanoseconds
+        .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+}
+
+fn take_texture_snapshot_work_details() -> Vec<(TextureSnapshotWorkKey, Mode27WorkAggregate)> {
+    let Some(details) = TEXTURE_SNAPSHOT_WORK_DETAILS.get() else {
+        return Vec::new();
+    };
+    let mut details = details
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut snapshot = std::mem::take(&mut *details)
+        .into_iter()
+        .collect::<Vec<_>>();
+    snapshot.sort_unstable_by_key(|(_, aggregate)| {
+        std::cmp::Reverse((aggregate.nanoseconds, aggregate.bytes, aggregate.count))
+    });
+    snapshot
+}
+
+fn record_texture_dirty_work_detail(
+    address: u64,
+    byte_count: usize,
+    caller_line: u32,
+    precise: bool,
+    dirty_pages: usize,
+    dirty_bytes: u64,
+) {
+    let key = TextureSnapshotWorkKey {
+        address,
+        byte_count,
+        caller_line,
+    };
+    let mut details = TEXTURE_DIRTY_WORK_DETAILS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let aggregate = details.entry(key).or_default();
+    aggregate.snapshots = aggregate.snapshots.saturating_add(1);
+    aggregate.full_bytes = aggregate
+        .full_bytes
+        .saturating_add(u64::try_from(byte_count).unwrap_or(u64::MAX));
+    if !precise {
+        aggregate.imprecise_snapshots = aggregate.imprecise_snapshots.saturating_add(1);
+    } else if dirty_pages == 0 {
+        aggregate.clean_snapshots = aggregate.clean_snapshots.saturating_add(1);
+    }
+    aggregate.dirty_pages = aggregate
+        .dirty_pages
+        .saturating_add(u64::try_from(dirty_pages).unwrap_or(u64::MAX));
+    aggregate.dirty_bytes = aggregate.dirty_bytes.saturating_add(dirty_bytes);
+}
+
+fn take_texture_dirty_work_details() -> Vec<(TextureSnapshotWorkKey, TextureDirtyWorkAggregate)> {
+    let Some(details) = TEXTURE_DIRTY_WORK_DETAILS.get() else {
+        return Vec::new();
+    };
+    let mut details = details
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut snapshot = std::mem::take(&mut *details)
+        .into_iter()
+        .collect::<Vec<_>>();
+    snapshot.sort_unstable_by_key(|(_, aggregate)| {
+        std::cmp::Reverse((
+            aggregate.full_bytes,
+            aggregate.dirty_bytes,
+            aggregate.snapshots,
+        ))
+    });
+    snapshot
+}
+
+fn take_mode27_work_details() -> Vec<(Mode27WorkKey, Mode27WorkAggregate)> {
+    let Some(details) = MODE27_WORK_DETAILS.get() else {
+        return Vec::new();
+    };
+    let mut details = details
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut snapshot = std::mem::take(&mut *details)
+        .into_iter()
+        .collect::<Vec<_>>();
+    snapshot.sort_unstable_by_key(|(_, aggregate)| {
+        std::cmp::Reverse((aggregate.nanoseconds, aggregate.bytes, aggregate.count))
+    });
+    snapshot
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -435,6 +718,12 @@ struct MetalBlendAttachmentState {
 struct GraphicsPipelineKey {
     export_shader_address: u64,
     pixel_shader_address: u64,
+    /// Shader code allocations are recycled by Unreal during level and movie transitions.
+    /// Guest addresses alone therefore do not identify a compiled program. Retain the decoded
+    /// program allocations so re-registering different code at the same address cannot select a
+    /// stale Metal pipeline.
+    export_program_identity: ProgramIdentity,
+    pixel_program_identity: ProgramIdentity,
     export_resources: GraphicsShaderResourceKey,
     pixel_resources: GraphicsShaderResourceKey,
     pixel_input_controls: [u32; 32],
@@ -477,11 +766,14 @@ struct DiagnosticScanoutWriter {
     pixel_shader: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct DecodedDepthTarget {
     texture: GuestTextureDescriptor,
     compare: MTLCompareFunction,
+    test_enabled: bool,
     write_enabled: bool,
+    clear_enabled: bool,
+    clear_depth: f64,
     sample_count: u32,
 }
 
@@ -522,23 +814,30 @@ struct CompiledShaderPair {
     pixel: remu_shader_metal::MetalShader,
     reused_vertex_function: bool,
     reused_pixel_function: bool,
+    lowering_duration: Duration,
+    function_duration: Duration,
+    pipeline_duration: Duration,
+    uses_mesh_stage: bool,
 }
 
 struct CompiledComputePipeline {
     pipeline: ComputePipelineState,
     function: Function,
     shader: remu_shader_metal::MetalShader,
+    lowering_duration: Duration,
+    function_duration: Duration,
+    pipeline_duration: Duration,
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct SamplerArgumentCacheKey {
     function: usize,
-    buffer_index: u32,
+    buffer_index: Option<u32>,
     descriptors: Vec<Vec<u32>>,
 }
 
 struct CachedSamplerArguments {
-    buffer: Buffer,
+    buffer: Option<Buffer>,
     samplers: Vec<SamplerState>,
 }
 
@@ -593,14 +892,16 @@ struct ShaderCompileRequest {
 #[derive(Debug, Default)]
 struct RenderPipelineArchiveState {
     additions: usize,
+    checkpoint_serialized: bool,
 }
 
 #[derive(Clone)]
 struct PersistentRenderPipelineArchive {
     archive: BinaryArchive,
     path: Arc<PathBuf>,
+    loaded: bool,
     state: Arc<Mutex<RenderPipelineArchiveState>>,
-    driver_lock: Arc<Mutex<()>>,
+    driver_lock: Arc<RwLock<()>>,
 }
 
 impl PersistentRenderPipelineArchive {
@@ -622,12 +923,13 @@ impl PersistentRenderPipelineArchive {
             path.display()
         )));
         let descriptor = BinaryArchiveDescriptor::new();
-        if path.is_file() {
+        let mut loaded = path.is_file();
+        if loaded {
             descriptor.set_url(&url);
         }
         let archive = match device.new_binary_archive_with_descriptor(&descriptor) {
             Ok(archive) => archive,
-            Err(error) if path.is_file() => {
+            Err(error) if loaded => {
                 eprintln!(
                     "[REMu][METAL] discarding unreadable pipeline archive {}: {error}",
                     path.display()
@@ -638,6 +940,7 @@ impl PersistentRenderPipelineArchive {
                         path.display()
                     )
                 })?;
+                loaded = false;
                 device
                     .new_binary_archive_with_descriptor(&BinaryArchiveDescriptor::new())
                     .map_err(|error| format!("could not create Metal pipeline archive: {error}"))?
@@ -647,14 +950,15 @@ impl PersistentRenderPipelineArchive {
         archive.set_label("REMu persistent render pipelines");
         eprintln!(
             "[REMu][METAL] {} render pipeline archive {}",
-            if path.is_file() { "loaded" } else { "created" },
+            if loaded { "loaded" } else { "created" },
             path.display()
         );
         Ok(Self {
             archive,
             path: Arc::new(path),
+            loaded,
             state: Arc::new(Mutex::new(RenderPipelineArchiveState::default())),
-            driver_lock: Arc::new(Mutex::new(())),
+            driver_lock: Arc::new(RwLock::new(())),
         })
     }
 
@@ -663,6 +967,61 @@ impl PersistentRenderPipelineArchive {
         device: &Device,
         make_descriptor: impl FnOnce() -> Result<RenderPipelineDescriptor, String>,
     ) -> Result<RenderPipelineState, String> {
+        if self.loaded {
+            // Cached pipeline creation remains concurrent. Only a demonstrably slow archive miss
+            // is admitted after creation, under the exclusive lock, so an old archive can learn
+            // shaders from later scenes without serializing every ordinary cache hit.
+            let descriptor = make_descriptor()?;
+            descriptor.set_binary_archives(&[&self.archive]);
+            let started = Instant::now();
+            let pipeline = {
+                let _reader = self
+                    .driver_lock
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                device
+                    .new_render_pipeline_state(&descriptor)
+                    .map_err(|error| format!("Metal render pipeline: {error}"))?
+            };
+            if started.elapsed() >= SLOW_PIPELINE_ARCHIVE_ADMISSION {
+                let _writer = self
+                    .driver_lock
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match self
+                    .archive
+                    .add_render_pipeline_functions_with_descriptor(&descriptor)
+                {
+                    Ok(true) => {
+                        let should_serialize = {
+                            let mut state = self
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.additions = state.additions.saturating_add(1);
+                            if !state.checkpoint_serialized
+                                && state.additions >= LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS
+                            {
+                                state.checkpoint_serialized = true;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_serialize && let Err(error) = self.serialize_locked() {
+                            eprintln!(
+                                "[REMu][METAL] slow-pipeline archive checkpoint failed: {error}"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "[REMu][METAL] could not admit slow pipeline to loaded archive: {error}"
+                    ),
+                }
+            }
+            return Ok(pipeline);
+        }
         // MTLBinaryArchive is documented as a resource shared by pipeline descriptors, but its
         // Rosetta driver path crashes while autoreleased descriptor internals from one thread are
         // drained concurrently with another archive mutation. Keep just descriptor/archive/
@@ -670,7 +1029,7 @@ impl PersistentRenderPipelineArchive {
         // MSL lowering and metallib loading remain parallel outside this critical section.
         let _driver = self
             .driver_lock
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         objc::rc::autoreleasepool(|| {
             let descriptor = make_descriptor()?;
@@ -686,15 +1045,23 @@ impl PersistentRenderPipelineArchive {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.additions = state.additions.saturating_add(1);
-                state.additions.is_power_of_two() && state.additions >= 8
+                if !state.checkpoint_serialized && state.additions >= 256 {
+                    state.checkpoint_serialized = true;
+                    true
+                } else {
+                    false
+                }
             };
             let pipeline = device
                 .new_render_pipeline_state(&descriptor)
                 .map_err(|error| format!("Metal render pipeline: {error}"))?;
-            // Persist progressively because diagnostic and interactive game runs are often
-            // stopped by SIGALRM or from the window close button rather than a clean guest
-            // shutdown. Powers of two bound serialization overhead while retaining nearly all
-            // newly discovered pipelines.
+            // Diagnostic and interactive launches often end through SIGALRM or a window close
+            // rather than a clean guest shutdown, so retain one mid-run checkpoint. The archive
+            // can exceed 100 MiB for Unreal titles; rewriting it at every power of two additions
+            // repeatedly stalls every compiler worker behind `driver_lock` during scene changes.
+            // One checkpoint saves useful warm-up progress without turning a title transition
+            // into nearly a gigabyte of synchronous archive writes. Clean shutdown still performs
+            // the final serialization below.
             if should_serialize {
                 self.serialize_locked()?;
             }
@@ -719,48 +1086,103 @@ impl PersistentRenderPipelineArchive {
     }
 
     fn serialize(&self) -> Result<(), String> {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .additions
+            == 0
+        {
+            return Ok(());
+        }
         let _driver = self
             .driver_lock
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.serialize_locked()
     }
 }
 
+enum ShaderFunctionCacheEntry {
+    Compiling,
+    Ready(Function),
+    Failed(String),
+}
+
+#[derive(Default)]
+struct ShaderFunctionStageCache {
+    entries: Mutex<HashMap<String, ShaderFunctionCacheEntry>>,
+    completed: Condvar,
+}
+
 #[derive(Clone, Default)]
 struct ShaderFunctionCache {
-    vertex: Arc<Mutex<HashMap<String, Function>>>,
-    pixel: Arc<Mutex<HashMap<String, Function>>>,
+    vertex: Arc<ShaderFunctionStageCache>,
+    mesh: Arc<ShaderFunctionStageCache>,
+    pixel: Arc<ShaderFunctionStageCache>,
 }
 
 impl ShaderFunctionCache {
     fn function(
-        cache: &Mutex<HashMap<String, Function>>,
+        cache: &ShaderFunctionStageCache,
         device: &Device,
         stage: &str,
         shader: &remu_shader_metal::MetalShader,
     ) -> Result<(Function, bool), String> {
-        if let Some(function) = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&shader.source)
-        {
-            return Ok((function.clone(), true));
-        }
-        let library = compile_metal_shader_library(device, stage, &shader.source)?;
-        let function = library
-            .get_function(&shader.entry_point, None)
-            .map_err(|error| format!("Metal {stage} function: {error}"))?;
-        let mut cache = cache
+        let mut entries = cache
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = cache.get(&shader.source) {
-            // Another compiler may have completed the same stage while this one was in Apple's
-            // compiler. Keep one canonical retained function for all later pipeline variants.
-            return Ok((existing.clone(), true));
+        loop {
+            match entries.get(&shader.source) {
+                Some(ShaderFunctionCacheEntry::Ready(function)) => {
+                    return Ok((function.clone(), true));
+                }
+                Some(ShaderFunctionCacheEntry::Failed(error)) => return Err(error.clone()),
+                Some(ShaderFunctionCacheEntry::Compiling) => {
+                    entries = cache
+                        .completed
+                        .wait(entries)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                None => {
+                    entries.insert(shader.source.clone(), ShaderFunctionCacheEntry::Compiling);
+                    break;
+                }
+            }
         }
-        cache.insert(shader.source.clone(), function.clone());
-        Ok((function, false))
+
+        // Pipeline variants often reach different compiler workers together while sharing an
+        // identical stage. Claim the exact source above before leaving the lock, so only one
+        // worker invokes Apple's compiler or loads the persistent metallib. Other workers wait
+        // for that result instead of compiling the same 100-400 KiB source concurrently.
+        drop(entries);
+        let compiled = (|| {
+            let library = compile_metal_shader_library(device, stage, &shader.source)?;
+            library
+                .get_function(&shader.entry_point, None)
+                .map_err(|error| format!("Metal {stage} function: {error}"))
+        })();
+        let mut entries = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &compiled {
+            Ok(function) => {
+                entries.insert(
+                    shader.source.clone(),
+                    ShaderFunctionCacheEntry::Ready(function.clone()),
+                );
+            }
+            Err(error) => {
+                entries.insert(
+                    shader.source.clone(),
+                    ShaderFunctionCacheEntry::Failed(error.clone()),
+                );
+            }
+        }
+        cache.completed.notify_all();
+        compiled.map(|function| (function, false))
     }
 
     fn vertex(
@@ -777,6 +1199,14 @@ impl ShaderFunctionCache {
         shader: &remu_shader_metal::MetalShader,
     ) -> Result<(Function, bool), String> {
         Self::function(&self.pixel, device, "pixel", shader)
+    }
+
+    fn mesh(
+        &self,
+        device: &Device,
+        shader: &remu_shader_metal::MetalShader,
+    ) -> Result<(Function, bool), String> {
+        Self::function(&self.mesh, device, "mesh", shader)
     }
 }
 
@@ -847,6 +1277,12 @@ impl OrderedGpuEventReceiver {
             return;
         }
         for _ in 0..receive_limit {
+            if self.pending_event_count()
+                > remu_gpu::GPU_PENDING_EVENT_CAPACITY
+                    .saturating_sub(remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE)
+            {
+                break;
+            }
             let event = match self.receiver.try_recv() {
                 Ok(event) => {
                     remu_gpu::record_gpu_event_consumed();
@@ -970,6 +1406,7 @@ impl OrderedGpuEventReceiver {
     }
 
     fn finish_event(&mut self, source: OrderedEventSource) {
+        remu_gpu::record_gpu_work_item_processed();
         let OrderedEventSource::GuestQueue(queue_id) = source else {
             return;
         };
@@ -1065,6 +1502,80 @@ impl OrderedGpuEventReceiver {
                 .sum::<usize>(),
         )
     }
+
+    fn block_reason_counts(&self) -> (usize, usize) {
+        let mut pipeline = 0;
+        let mut memory = 0;
+        for reason in self.blocked_queues.values().chain(self.host_block.iter()) {
+            match reason {
+                QueueBlockReason::GraphicsPipeline(_) => pipeline += 1,
+                QueueBlockReason::GuestMemoryWait => memory += 1,
+            }
+        }
+        (pipeline, memory)
+    }
+
+    fn queue_diagnostics(&self) -> String {
+        self.queue_order
+            .iter()
+            .take(8)
+            .filter_map(|queue_id| {
+                let submissions = self.submissions.get(queue_id)?;
+                let pending = submissions
+                    .iter()
+                    .map(|submission| submission.events.len())
+                    .sum::<usize>();
+                let front = submissions
+                    .front()
+                    .and_then(|submission| submission.events.front())
+                    .map_or_else(
+                        || "empty".to_owned(),
+                        |event| match event {
+                            GpuEvent::RegisteredMemoryWait { id, wait } => format!(
+                                "wait:{id:?}@{:#x}/ref:{:#x}/mask:{:#x}/cmp:{}",
+                                wait.address, wait.reference, wait.mask, wait.compare_function
+                            ),
+                            GpuEvent::MemoryWait(wait) => format!(
+                                "wait:unregistered@{:#x}/ref:{:#x}/mask:{:#x}/cmp:{}",
+                                wait.address, wait.reference, wait.mask, wait.compare_function
+                            ),
+                            GpuEvent::IndexedDraw(draw) => format!(
+                                "draw:{}/es:{:#x}/ps:{:#x}",
+                                draw.sequence,
+                                draw.export_shader_address,
+                                draw.pixel_shader_address
+                            ),
+                            GpuEvent::ComputeDispatch(dispatch) => {
+                                format!(
+                                    "compute:{}/cs:{:#x}",
+                                    dispatch.sequence, dispatch.shader_address
+                                )
+                            }
+                            GpuEvent::Flip { address, .. } => format!("flip:{address:#x}"),
+                            GpuEvent::SubmissionBoundary(sequence) => {
+                                format!("boundary:{sequence}")
+                            }
+                            _ => "other".to_owned(),
+                        },
+                    );
+                let blocked =
+                    self.blocked_queues
+                        .get(queue_id)
+                        .map_or("none".to_owned(), |reason| match reason {
+                            QueueBlockReason::GuestMemoryWait => "memory".to_owned(),
+                            QueueBlockReason::GraphicsPipeline(key) => format!(
+                                "pipeline:{:#x}/{:#x}",
+                                key.export_shader_address, key.pixel_shader_address
+                            ),
+                        });
+                Some(format!(
+                    "q{queue_id}:pending:{pending}/submissions:{}/blocked:{blocked}/front:{front}",
+                    submissions.len()
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 struct UploadedImageTexture {
@@ -1080,6 +1591,7 @@ struct ResidentGuestTexture {
     texture_type: u32,
     layer_count: u32,
     mip_level_count: u32,
+    inferred_hierarchy: bool,
     write_watch: GuestTextureWriteWatch,
     gpu_written: bool,
     content_version: u64,
@@ -1088,12 +1600,25 @@ struct ResidentGuestTexture {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SampledTextureKey {
     descriptor: GuestTextureDescriptor,
-    destination_select: u32,
     base_mip_level: u32,
     mip_level_count: u32,
     texture_type: u32,
     layer_count: u32,
     comparison: bool,
+}
+
+fn sampled_texture_key(descriptor: DecodedImageDescriptor, comparison: bool) -> SampledTextureKey {
+    // GFX10 destination selection is applied by generated MSL at sample/load time. It neither
+    // changes the decoded backing nor the Metal texture allocation, so including it here creates
+    // duplicate 4–64 MiB uploads for views that differ only by channel selection.
+    SampledTextureKey {
+        descriptor: descriptor.guest,
+        base_mip_level: descriptor.base_mip_level,
+        mip_level_count: descriptor.mip_level_count,
+        texture_type: descriptor.texture_type,
+        layer_count: descriptor.layer_count,
+        comparison,
+    }
 }
 
 struct CachedSampledTexture {
@@ -1106,15 +1631,45 @@ struct GuestTextureWriteWatch {
     address: u64,
     byte_count: u64,
     ranges: Vec<CpuWriteWatch>,
+    declared_alias_ranges: Vec<(u64, u64)>,
 }
 
 impl GuestTextureWriteWatch {
     fn new(address: u64, byte_count: u64) -> Result<Self, String> {
+        Self::new_with_declared_byte_count(address, byte_count, byte_count)
+    }
+
+    fn new_with_declared_byte_count(
+        address: u64,
+        byte_count: u64,
+        declared_byte_count: u64,
+    ) -> Result<Self, String> {
+        if declared_byte_count == 0 || declared_byte_count > byte_count {
+            return Err(format!(
+                "guest texture declared range {declared_byte_count:#x} exceeds watched range {byte_count:#x}"
+            ));
+        }
         let segments = guest_shared_backing_alias_segments(address, byte_count).ok_or_else(|| {
             format!(
                 "guest texture range {address:#x}+{byte_count:#x} has no complete live shared backing"
             )
         })?;
+        let declared_alias_ranges = if declared_byte_count == byte_count {
+            segments
+                .iter()
+                .map(|segment| (segment.address, segment.byte_count))
+                .collect()
+        } else {
+            guest_shared_backing_alias_segments(address, declared_byte_count)
+                .ok_or_else(|| {
+                    format!(
+                        "guest texture declared range {address:#x}+{declared_byte_count:#x} has no complete live shared backing"
+                    )
+                })?
+                .into_iter()
+                .map(|segment| (segment.address, segment.byte_count))
+                .collect()
+        };
         let ranges = segments
             .into_iter()
             .map(|segment| {
@@ -1134,6 +1689,7 @@ impl GuestTextureWriteWatch {
             address,
             byte_count,
             ranges,
+            declared_alias_ranges,
         })
     }
 
@@ -1174,6 +1730,13 @@ impl GuestTextureWriteWatch {
 
     fn generations(&self) -> Vec<u64> {
         self.ranges.iter().map(CpuWriteWatch::generation).collect()
+    }
+
+    fn dirty_page_ranges(&self) -> Vec<(u64, u64)> {
+        self.ranges
+            .iter()
+            .flat_map(CpuWriteWatch::dirty_page_ranges)
+            .collect()
     }
 
     fn rearm(&self) -> Result<(), String> {
@@ -1225,6 +1788,40 @@ impl GuestTextureWriteWatch {
         })
     }
 
+    fn with_live_backing<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
+        if let Some(retirement) = self.retirement() {
+            return Err(format!(
+                "guest texture backing {:#x}+{:#x} is retired ({retirement:?})",
+                self.address, self.byte_count
+            ));
+        }
+        let watch = self
+            .ranges
+            .first()
+            .ok_or("guest texture backing has no live write-watch range")?;
+        // Mapping mutation retires watches under the same process-wide lock held by this guard.
+        // Pinning any one live alias therefore pins the shared backing transaction even when the
+        // physical resource is exposed through several disjoint guest virtual mappings.
+        watch
+            .with_live_mapping(|| {
+                if let Some(retirement) = self.retirement() {
+                    Err(format!(
+                        "guest texture backing {:#x}+{:#x} is retired ({retirement:?})",
+                        self.address, self.byte_count
+                    ))
+                } else {
+                    Ok(operation())
+                }
+            })
+            .map_err(|error| {
+                format!(
+                    "guest texture backing {:#x}+{:#x} was retired during access: {error}",
+                    self.address, self.byte_count
+                )
+            })
+            .and_then(|result| result)
+    }
+
     fn has_single_covering_mapping(&self, address: u64, byte_count: u64) -> bool {
         let Some(end) = address.checked_add(byte_count) else {
             return false;
@@ -1236,6 +1833,56 @@ impl GuestTextureWriteWatch {
                     .checked_add(watch_bytes)
                     .is_some_and(|watch_end| end <= watch_end)
         })
+    }
+
+    fn overlaps_alias_range(&self, address: u64, byte_count: u64) -> bool {
+        Self::ranges_overlap_alias(&self.ranges, address, byte_count, |watch| watch.range())
+    }
+
+    #[cfg(test)]
+    fn overlaps_aliases(&self, other: &Self) -> bool {
+        self.ranges.iter().any(|watch| {
+            let (address, byte_count) = watch.range();
+            other.overlaps_alias_range(address, byte_count)
+        })
+    }
+
+    fn alias_ranges(&self) -> Vec<(u64, u64)> {
+        self.ranges.iter().map(CpuWriteWatch::range).collect()
+    }
+
+    fn overlaps_alias_ranges(&self, ranges: &[(u64, u64)]) -> bool {
+        ranges
+            .iter()
+            .any(|&(address, byte_count)| self.overlaps_alias_range(address, byte_count))
+    }
+
+    fn overlaps_declared_alias_range(&self, address: u64, byte_count: u64) -> bool {
+        Self::ranges_overlap_alias(
+            &self.declared_alias_ranges,
+            address,
+            byte_count,
+            |&(range_address, range_byte_count)| (range_address, range_byte_count),
+        )
+    }
+
+    fn ranges_overlap_alias<T>(
+        ranges: &[T],
+        address: u64,
+        byte_count: u64,
+        range: impl Fn(&T) -> (u64, u64),
+    ) -> bool {
+        let Some(end) = address.checked_add(byte_count) else {
+            return false;
+        };
+        byte_count != 0
+            && ranges.iter().any(|entry| {
+                let (watch_address, watch_bytes) = range(entry);
+                watch_address < end
+                    && watch_address
+                        .checked_add(watch_bytes)
+                        .is_some_and(|watch_end| address < watch_end)
+            })
     }
 }
 
@@ -1401,6 +2048,17 @@ enum WriteWatchRefresh {
     Replaced,
 }
 
+fn sampled_texture_cache_needs_reload(
+    refresh: WriteWatchRefresh,
+    active_watch_is_dirty: bool,
+) -> bool {
+    match refresh {
+        WriteWatchRefresh::Active => active_watch_is_dirty,
+        WriteWatchRefresh::Renewed { was_dirty: true } | WriteWatchRefresh::Replaced => true,
+        WriteWatchRefresh::Reprotecting | WriteWatchRefresh::Renewed { was_dirty: false } => false,
+    }
+}
+
 fn refresh_resident_texture_write_watch(
     resident: &mut ResidentGuestTexture,
 ) -> Result<WriteWatchRefresh, String> {
@@ -1432,10 +2090,13 @@ fn watch_resident_texture(
             watch_guest_texture(descriptor)
         } else {
             let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
-            GuestTextureWriteWatch::new(
+            let declared_byte_count = guest_texture_byte_count(descriptor)
+                .ok_or("resident base texture byte count overflows")?;
+            GuestTextureWriteWatch::new_with_declared_byte_count(
                 descriptor.address,
                 u64::try_from(layout.byte_count)
                     .map_err(|_| "mip chain byte count does not fit u64")?,
+                declared_byte_count,
             )
         }
     } else {
@@ -1467,7 +2128,9 @@ fn refresh_sampled_texture_write_watch(
             let was_dirty = cached.write_watch.is_dirty();
             let write_watch = Arc::new(watch_sampled_texture(DecodedImageDescriptor {
                 guest: key.descriptor,
-                destination_select: key.destination_select,
+                // Component selection is lowered into each shader and does not change the host
+                // texture allocation or the guest bytes covered by its write watch.
+                destination_select: 0,
                 base_mip_level: key.base_mip_level,
                 mip_level_count: key.mip_level_count,
                 texture_type: key.texture_type,
@@ -1557,6 +2220,59 @@ fn retire_overlapping_sampled_textures(
     });
 }
 
+fn retire_sampled_textures_overlapping_writeback(
+    cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
+    alias_ranges: &[(u64, u64)],
+) {
+    let retired = cache
+        .iter()
+        .filter_map(|(key, cached)| {
+            cached
+                .write_watch
+                .overlaps_alias_ranges(alias_ranges)
+                .then_some(*key)
+        })
+        .collect::<Vec<_>>();
+    for key in retired {
+        if let Some(texture) = cache.remove(&key) {
+            retire_sampled_texture(texture);
+        }
+    }
+}
+
+fn retire_resident_textures_overlapping_writeback(
+    cache: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    alias_ranges: &[(u64, u64)],
+    source_descriptor: GuestTextureDescriptor,
+    source_content_version: u64,
+) {
+    let retired = cache
+        .iter()
+        .filter_map(|(descriptor, resident)| {
+            (*descriptor != source_descriptor
+                && resident.content_version <= source_content_version
+                && resident.write_watch.overlaps_alias_ranges(alias_ranges))
+            .then_some(*descriptor)
+        })
+        .collect::<Vec<_>>();
+    for descriptor in retired {
+        cache.remove(&descriptor);
+    }
+}
+
+fn retire_multisample_textures_overlapping_writeback(
+    cache: &mut HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
+    alias_ranges: &[(u64, u64)],
+) {
+    cache.retain(|key, _| {
+        guest_texture_byte_count(key.descriptor).is_none_or(|byte_count| {
+            !alias_ranges.iter().any(|&(address, alias_bytes)| {
+                guest_ranges_overlap(address, alias_bytes, key.descriptor.address, byte_count)
+            })
+        })
+    });
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct GlobalBufferCacheKey {
     base_address: u64,
@@ -1566,6 +2282,7 @@ struct GlobalBufferCacheKey {
 struct CachedGlobalBuffer {
     bytes: Vec<u8>,
     buffer: Buffer,
+    offset: u64,
 }
 
 struct UploadedGlobalBuffer {
@@ -1576,6 +2293,7 @@ struct UploadedGlobalBuffer {
 
 struct PendingGlobalWriteback {
     buffer: Buffer,
+    offset: u64,
     guest_address: u64,
     byte_count: usize,
 }
@@ -1583,6 +2301,7 @@ struct PendingGlobalWriteback {
 struct PendingPresentation {
     command_buffer: CommandBuffer,
     submitted_at: Instant,
+    flip_completion: Option<remu_gpu::GpuFlipCompletion>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1747,6 +2466,7 @@ fn image_resource_descriptor_is_null(words: &[u32]) -> bool {
 struct GuestCommandBatch {
     command_buffer: CommandBuffer,
     work: Vec<GuestBatchWork>,
+    global_upload_chunks: Vec<GlobalUploadChunk>,
     global_writebacks: Vec<PendingGlobalWriteback>,
     guest_write_ranges: Vec<PendingGuestWriteRange>,
     memory_writes: Vec<PendingGuestMemoryWrite>,
@@ -1756,6 +2476,11 @@ struct GuestCommandBatch {
     /// Queue scheduling can complete a newer global sequence before an older blocked queue, so
     /// every boundary is retained rather than incorrectly treating the maximum as a prefix.
     completion_sequences: Vec<u64>,
+}
+
+struct GlobalUploadChunk {
+    buffer: Buffer,
+    used: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1937,7 +2662,7 @@ impl PendingGuestMemoryWrite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GuestRenderPassKey {
     targets: Vec<(GuestTextureDescriptor, u32, bool, u32, u32, u32, u32, u32)>,
-    depth: Option<(GuestTextureDescriptor, u32)>,
+    depth: Option<(GuestTextureDescriptor, u32, bool, u32)>,
     resolve_multisample_targets: bool,
 }
 
@@ -1947,6 +2672,54 @@ struct OpenGuestRenderPass {
 }
 
 impl GuestCommandBatch {
+    fn upload_global_bytes(
+        &mut self,
+        device: &Device,
+        bytes: &[u8],
+    ) -> Result<(Buffer, u64), String> {
+        let byte_count = bytes.len().max(1);
+        let aligned_byte_count = byte_count
+            .checked_add(GLOBAL_UPLOAD_ALIGNMENT - 1)
+            .map(|value| value & !(GLOBAL_UPLOAD_ALIGNMENT - 1))
+            .ok_or("global upload size overflows")?;
+        let needs_chunk = self.global_upload_chunks.last().is_none_or(|chunk| {
+            chunk
+                .used
+                .checked_add(aligned_byte_count)
+                .is_none_or(|end| end > chunk.buffer.length() as usize)
+        });
+        if needs_chunk {
+            let chunk_byte_count = GLOBAL_UPLOAD_CHUNK_BYTE_COUNT.max(aligned_byte_count);
+            let length = u64::try_from(chunk_byte_count)
+                .map_err(|_| "global upload chunk size does not fit Metal")?;
+            let buffer = device.new_buffer(length, MTLResourceOptions::StorageModeShared);
+            buffer.set_label("REMu guest-batch global upload arena");
+            self.global_upload_chunks
+                .push(GlobalUploadChunk { buffer, used: 0 });
+        }
+        let chunk = self
+            .global_upload_chunks
+            .last_mut()
+            .expect("global upload chunk was created");
+        let offset = chunk.used;
+        if !bytes.is_empty() {
+            // SAFETY: the shared Metal buffer is at least `aligned_byte_count` bytes beyond
+            // `offset`, and the source slice remains live for the exact non-overlapping copy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    chunk.buffer.contents().cast::<u8>().add(offset),
+                    bytes.len(),
+                );
+            }
+        }
+        chunk.used = offset + aligned_byte_count;
+        Ok((
+            chunk.buffer.clone(),
+            u64::try_from(offset).map_err(|_| "global upload offset does not fit Metal")?,
+        ))
+    }
+
     fn end_render_pass(&mut self) -> bool {
         if let Some(pass) = self.render_pass.take() {
             pass.encoder.end_encoding();
@@ -1958,19 +2731,16 @@ impl GuestCommandBatch {
 }
 
 fn guest_batch_writes_overlap(batch: &GuestCommandBatch, address: u64, byte_count: u64) -> bool {
-    batch
-        .guest_write_ranges
-        .iter()
-        .any(|range| guest_ranges_overlap(range.address, range.byte_count, address, byte_count))
-        || batch.global_writebacks.iter().any(|writeback| {
-            u64::try_from(writeback.byte_count).is_ok_and(|length| {
-                guest_ranges_overlap(writeback.guest_address, length, address, byte_count)
-            })
+    batch.guest_write_ranges.iter().any(|range| {
+        guest_physical_ranges_overlap(range.address, range.byte_count, address, byte_count)
+    }) || batch.global_writebacks.iter().any(|writeback| {
+        u64::try_from(writeback.byte_count).is_ok_and(|length| {
+            guest_physical_ranges_overlap(writeback.guest_address, length, address, byte_count)
         })
-        || batch
-            .memory_writes
-            .iter()
-            .any(|write| write.overlaps(address, byte_count))
+    }) || batch.memory_writes.iter().any(|write| {
+        let (write_address, write_bytes) = write.range();
+        guest_physical_ranges_overlap(write_address, write_bytes, address, byte_count)
+    })
 }
 
 fn publish_guest_batch_completion(batch: &GuestCommandBatch) {
@@ -2024,11 +2794,16 @@ struct MetalPresenter {
     guest_bgra_bytes: Vec<u8>,
     frame_texture: Option<Texture>,
     frame_texture_size: (u32, u32),
+    host_splash: Option<HostSplashTexture>,
     display: Option<DisplayConfiguration>,
     pending_flip: Option<PendingFlip>,
     pending_flip_queue: Option<u64>,
+    pending_flip_target_written_since_boundary: bool,
+    active_translated_scanout: Option<ActiveTranslatedScanout>,
     next_flip_sequence: u64,
+    finalized_flip_sequence: u64,
     uploaded_flip_sequence: u64,
+    submitted_flip_sequence: u64,
     startup_error: Option<String>,
     logged_unsupported_layout: bool,
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
@@ -2147,11 +2922,16 @@ impl MetalPresenter {
             guest_bgra_bytes: Vec::new(),
             frame_texture: None,
             frame_texture_size: (0, 0),
+            host_splash: None,
             display: None,
             pending_flip: None,
             pending_flip_queue: None,
+            pending_flip_target_written_since_boundary: false,
+            active_translated_scanout: None,
             next_flip_sequence: 0,
+            finalized_flip_sequence: 0,
             uploaded_flip_sequence: 0,
+            submitted_flip_sequence: 0,
             startup_error: None,
             logged_unsupported_layout: false,
             logged_unsupported_guest_draws: HashSet::new(),
@@ -2249,6 +3029,11 @@ impl MetalPresenter {
             self.presentation_resolution
         );
 
+        // A CLI-launched AppKit process can become the active application before its first
+        // NSWindow is ordered onto the current Space. Explicitly order and focus the completed
+        // window so a running game cannot remain hidden behind the launching application.
+        window.set_visible(true);
+        window.focus_window();
         self.window = Some(window);
         self.layer = Some(layer);
         Ok(())
@@ -2271,7 +3056,37 @@ impl MetalPresenter {
                 eprintln!("[REMu][METAL] translated scanout synchronization failed: {error}");
             }
         }
+        self.finalized_flip_sequence = flip.sequence;
         self.redraw_pending = true;
+    }
+
+    fn show_host_splash(&mut self, image: GpuHostImage) -> Result<(), String> {
+        let device = self.device.as_ref().ok_or("Metal device is unavailable")?;
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2);
+        descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm_sRGB);
+        descriptor.set_width(u64::from(image.width()));
+        descriptor.set_height(u64::from(image.height()));
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        descriptor.set_usage(MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&descriptor);
+        texture.set_label("REMu installed-title system splash");
+        let bytes_per_row = u64::from(image.width())
+            .checked_mul(4)
+            .ok_or("system splash row size overflows")?;
+        texture.replace_region(
+            MTLRegion::new_2d(0, 0, u64::from(image.width()), u64::from(image.height())),
+            0,
+            image.rgba8().as_ptr().cast::<c_void>(),
+            bytes_per_row,
+        );
+        self.host_splash = Some(HostSplashTexture {
+            texture,
+            width: image.width(),
+            height: image.height(),
+        });
+        self.redraw_pending = true;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2283,6 +3098,16 @@ impl MetalPresenter {
         // AppKit tick. Retry suspended queue fronts once; an unsatisfied wait is re-suspended
         // without permitting any later event from that queue to overtake it.
         self.receiver.retry_guest_memory_waits();
+        // Feed the existing compile workers from bounded ordered lookahead even while the current
+        // queue front is runnable. Waiting until a cold draw becomes the blocked front serialized
+        // multi-second first-scene Metal compilation behind the warning/movie UI. This only
+        // snapshots immutable draw descriptions and schedules deduplicated pipeline keys; event
+        // execution and every queue-local dependency remain in their original order.
+        for draw in self.receiver.prefetch_draws(512, 128) {
+            if let Ok(key) = graphics_pipeline_key(&draw) {
+                self.compile_draw_shaders(&draw, &key);
+            }
+        }
         // A bounded batch prevents a continuously producing guest from starving redraw and input
         // delivery. Queue-local shader and memory waits leave independent guest queues runnable.
         for _ in 0..GPU_EVENTS_PER_TICK {
@@ -2333,12 +3158,33 @@ impl MetalPresenter {
                         tiling_mode,
                     });
                     self.frame_texture = None;
+                    self.active_translated_scanout = None;
                     eprintln!(
                         "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode}"
                     );
                 }
+                GpuEvent::ShowHostSplash(image) => {
+                    let dimensions = (image.width(), image.height());
+                    match self.show_host_splash(image) {
+                        Ok(()) => eprintln!(
+                            "[REMu][METAL] installed-title system splash ready {}x{}",
+                            dimensions.0, dimensions.1
+                        ),
+                        Err(error) => {
+                            eprintln!("[REMu][METAL] could not upload system splash: {error}");
+                        }
+                    }
+                }
+                GpuEvent::HideHostSplash => {
+                    if self.host_splash.take().is_some() {
+                        eprintln!("[REMu][METAL] hiding installed-title system splash");
+                    }
+                    self.redraw_pending = true;
+                }
                 GpuEvent::Flip {
                     address,
+                    buffer_index,
+                    flip_argument,
                     width,
                     height,
                     pitch,
@@ -2357,10 +3203,21 @@ impl MetalPresenter {
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
                     self.pending_flip = Some(PendingFlip {
                         address,
+                        buffer_index,
+                        flip_argument,
                         sequence: self.next_flip_sequence,
                     });
+                    self.pending_flip_target_written_since_boundary = false;
+                    self.active_translated_scanout = None;
                     self.pending_flip_queue = match source {
-                        OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
+                        OrderedEventSource::GuestQueue(queue_id) => {
+                            // The flip packet is an order-visible point inside the guest command
+                            // stream. Preserve the target here, after all preceding draws but before
+                            // following work can reuse the same allocation for the next frame.
+                            self.finalize_pending_flip();
+                            (self.uploaded_flip_sequence != self.next_flip_sequence)
+                                .then_some(queue_id)
+                        }
                         OrderedEventSource::Host { .. } => {
                             self.finalize_pending_flip();
                             None
@@ -2425,6 +3282,7 @@ impl MetalPresenter {
                     }
                 }
                 GpuEvent::ComputeDispatch(dispatch) => {
+                    trace_video_target_compute_consumer(&dispatch);
                     match self.execute_compute_dispatch(&dispatch) {
                         Ok(()) => {
                             self.statistics.encoded_compute_dispatches =
@@ -2444,13 +3302,44 @@ impl MetalPresenter {
                     }
                 }
                 GpuEvent::IndexedDraw(draw) => {
+                    trace_video_target_draw_consumer(&draw);
+                    if skip_incomplete_rectangle_draw(&draw) {
+                        static SKIPPED_INCOMPLETE_RECTANGLES: AtomicUsize = AtomicUsize::new(0);
+                        let sequence =
+                            SKIPPED_INCOMPLETE_RECTANGLES.fetch_add(1, Ordering::Relaxed) + 1;
+                        if sequence <= 32 || sequence.is_power_of_two() {
+                            eprintln!(
+                                "[REMu][METAL][RECT-INTERFACE-SKIP] sequence={sequence} draw={} es={:#x} ps={:#x} preserves prior target contents",
+                                draw.sequence,
+                                draw.export_shader_address,
+                                draw.pixel_shader_address,
+                            );
+                        }
+                        self.receiver.finish_event(source);
+                        continue;
+                    }
                     let key = graphics_pipeline_key(&draw);
                     if let Ok(key) = key.as_ref() {
                         self.compile_draw_shaders(&draw, key);
                         if !self.compiled_shader_pairs.contains_key(key)
                             && !self.failed_shader_pairs.contains(key)
                         {
-                            debug_assert!(self.compiling_shader_pairs.contains(key));
+                            PIPELINE_DRAW_GATES.fetch_add(1, Ordering::Relaxed);
+                            static LOGGED_PIPELINE_GATES: AtomicUsize = AtomicUsize::new(0);
+                            if LOGGED_PIPELINE_GATES.fetch_add(1, Ordering::Relaxed) < 16 {
+                                eprintln!(
+                                    "[REMu][METAL] preserving cold draw={} es={:#x} ps={:#x} while its pipeline compiles",
+                                    draw.sequence,
+                                    draw.export_shader_address,
+                                    draw.pixel_shader_address,
+                                );
+                            }
+                            // A draw may be the only producer of a render target or synchronization
+                            // value. Keep it at the front of its guest queue until the worker
+                            // returns its pipeline; dropping it lets later barriers and submission
+                            // boundaries retire work that Metal never encoded. Other guest queues
+                            // remain runnable, and the blocked poll path looks ahead to compile
+                            // subsequent shader pairs in parallel without executing them.
                             self.receiver.block_event(
                                 source,
                                 GpuEvent::IndexedDraw(draw),
@@ -2518,14 +3407,7 @@ impl MetalPresenter {
                         // empty and can complete immediately.
                         remu_gpu::record_gpu_submission_completed(sequence);
                     }
-                    if matches!(
-                        (source, self.pending_flip_queue),
-                        (OrderedEventSource::GuestQueue(queue_id), Some(pending_queue))
-                            if queue_id == pending_queue
-                    ) {
-                        self.pending_flip_queue = None;
-                        self.finalize_pending_flip();
-                    }
+                    self.finalize_pending_flip_at_submission_boundary(source);
                 }
                 GpuEvent::Shutdown => {
                     eprintln!("[REMu][METAL] guest runtime requested presenter shutdown");
@@ -2569,10 +3451,14 @@ impl MetalPresenter {
         };
         match self.shader_compile_sender.try_send(request) {
             Ok(()) => {
+                PIPELINE_COMPILE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
                 self.compiling_shader_pairs.insert(key.clone());
             }
-            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                PIPELINE_COMPILE_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
+            }
             Err(TrySendError::Disconnected(_)) => {
+                PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
                 self.failed_shader_pairs.insert(key.clone());
                 eprintln!(
                     "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: compiler worker stopped",
@@ -2601,10 +3487,19 @@ impl MetalPresenter {
             self.compiling_shader_pairs.remove(&result.key);
             match result.compiled {
                 Ok(compiled) => {
+                    PIPELINE_COMPILE_COMPLETED.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
-                        "[REMu][METAL] compiled Gen5 shader pair es={:#x} ps={:#x} MSL={vertex_bytes}/{pixel_bytes} bytes reuse={vertex_reuse}/{pixel_reuse} diagnostic={vertex_pattern}/{pixel_color}",
+                        "[REMu][METAL] compiled Gen5 shader pair es={:#x} ps={:#x} stage={} MSL={vertex_bytes}/{pixel_bytes} bytes time={:.1}/{:.1}/{:.1}ms lower/function/pipeline reuse={vertex_reuse}/{pixel_reuse} diagnostic={vertex_pattern}/{pixel_color}",
                         result.key.export_shader_address,
                         result.key.pixel_shader_address,
+                        if compiled.uses_mesh_stage {
+                            "mesh"
+                        } else {
+                            "vertex"
+                        },
+                        compiled.lowering_duration.as_secs_f64() * 1_000.0,
+                        compiled.function_duration.as_secs_f64() * 1_000.0,
+                        compiled.pipeline_duration.as_secs_f64() * 1_000.0,
                         vertex_bytes = compiled.vertex.source.len(),
                         pixel_bytes = compiled.pixel.source.len(),
                         vertex_reuse = compiled.reused_vertex_function,
@@ -2635,6 +3530,7 @@ impl MetalPresenter {
         function_cache: &ShaderFunctionCache,
         render_pipeline_archive: Option<&PersistentRenderPipelineArchive>,
     ) -> Result<CompiledShaderPair, String> {
+        let lowering_started = Instant::now();
         let export = draw
             .export_shader
             .as_ref()
@@ -2651,6 +3547,40 @@ impl MetalPresenter {
             .pixel_shader_evaluation
             .as_ref()
             .ok_or("draw has no evaluated pixel shader resources")?;
+        // Emit decoded IR before either stage is lowered. Keeping this ahead of `compile_msl`
+        // makes the one-shot dump useful for precisely the shaders that fail translation instead
+        // of only recording pairs that already compiled successfully.
+        if let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR")
+            && dump_msl_pixel_filter_matches(draw.pixel_shader_address)
+            && dump_msl_instruction_filter_matches(pixel.program.instructions.len())
+            && let Err(error) = dump_shader_pair_ir(
+                Path::new(&directory),
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                &export.program.instructions,
+                &pixel.program.instructions,
+            )
+        {
+            eprintln!(
+                "[REMu][METAL] could not dump shader IR for es={:#x} ps={:#x}: {error}",
+                draw.export_shader_address, draw.pixel_shader_address
+            );
+        }
+        if let Some(directory) = std::env::var_os("REMU_DUMP_GRAPHICS_LDS_IR_DIR")
+            && (program_uses_lds(&export.program) || program_uses_lds(&pixel.program))
+            && let Err(error) = dump_shader_pair_ir(
+                Path::new(&directory),
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                &export.program.instructions,
+                &pixel.program.instructions,
+            )
+        {
+            eprintln!(
+                "[REMu][METAL] could not dump graphics LDS IR for es={:#x} ps={:#x}: {error}",
+                draw.export_shader_address, draw.pixel_shader_address
+            );
+        }
         let pixel_outputs = key
             .targets
             .iter()
@@ -2667,13 +3597,18 @@ impl MetalPresenter {
             register_value(&draw.context_registers, 0x1b3).unwrap_or_default(),
             register_value(&draw.context_registers, 0x1b4).unwrap_or_default(),
         );
+        pixel_options.render_target_array_length = key.render_target_array_length;
         pixel_options.pixel_input_controls = key
             .pixel_input_controls
             .map(remu_shader_metal::PixelInputControl::from_register);
         let selected_diagnostic_shader = diagnostic_dump_target_pixel_shader()
             == Some(draw.pixel_shader_address)
             || diagnostic_dump_target_pixel_instruction_count()
-                == Some(pixel.program.instructions.len());
+                == Some(pixel.program.instructions.len())
+            || (diagnostic_dump_video_target_consumer()
+                && video_target_binding_summary(pixel_evaluation).is_some())
+            || (diagnostic_dump_video_chain_consumer()
+                && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence);
         pixel_options.diagnostic_force_pixel_color = key.sample_count > 1
             && pixel.program.instructions.len() > 64
             && diagnostic_force_msaa_pixel_color();
@@ -2685,8 +3620,50 @@ impl MetalPresenter {
         let pixel_msl =
             remu_shader_metal::compile_msl(&pixel.program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
-        let mut vertex_options =
-            remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count);
+        if key.render_target_array_length == 1 {
+            let exported_parameters = vertex_parameter_export_mask(&export.program);
+            let interpolated_attributes = pixel_interpolation_attribute_mask(&pixel.program);
+            let missing = missing_vertex_parameter_exports(
+                exported_parameters,
+                interpolated_attributes,
+                &key.pixel_input_controls,
+            );
+            if !missing.is_empty() {
+                // NGG shaders may stage parameter exports through LDS/primitive export rather
+                // than exposing a conventional EXP PARAM instruction in the decoded program.
+                // Metal still requires the vertex and fragment interfaces to match exactly.
+                // `required_vertex_output_count` below declares those physical locations and the
+                // zero-initialized RemuVsOut supplies deterministic values until NGG staging is
+                // lowered. Rejecting the pair here prevented even final scanout/composite draws
+                // from executing and guaranteed a permanently black display. This matches the
+                // other backend's established required-output behavior while keeping the missing
+                // semantics explicit in the trace.
+                eprintln!(
+                    "[REMu][METAL][INTERFACE-FILL] draw={} indexed={} count={} instances={} primitive={:#x} target={:#x} es={:#x} exports={exported_parameters:#010x} ps={:#x} interpolates={interpolated_attributes:#010x} missing logical/physical/control={missing:08x?} vertex_inputs={:x?}",
+                    draw.sequence,
+                    draw.indexed,
+                    draw.index_count,
+                    draw.instance_count,
+                    draw.primitive_type,
+                    draw.color_target_address,
+                    draw.export_shader_address,
+                    draw.pixel_shader_address,
+                    export_evaluation.vertex_inputs,
+                );
+            }
+        }
+        let uses_mesh_stage = draw.indexed
+            && draw.instance_count == 1
+            && draw.primitive_type == 4
+            && ngg_mesh_export_stage(&export.program);
+        let mut vertex_options = if uses_mesh_stage {
+            remu_shader_metal::MetalCompileOptions::mesh(
+                pixel_msl.interpolated_attribute_count,
+                NGG_MESH_LDS_BYTES,
+            )
+        } else {
+            remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count)
+        };
         vertex_options.render_target_array_length = key.render_target_array_length;
         vertex_options.diagnostic_force_visible_clip_depth =
             key.sample_count > 1 && diagnostic_force_visible_clip_depth();
@@ -2699,32 +3676,30 @@ impl MetalPresenter {
                 || selected_diagnostic_shader
                 || (diagnostic_dump_video_draw()
                     && evaluation_samples_large_linear_video(pixel_evaluation)));
-        let vertex_msl = if key.render_target_array_length > 1 {
+        let vertex_msl = if uses_mesh_stage {
+            remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)
+                .map_err(|error| format!("mesh lowering: {error}"))?
+        } else if key.render_target_array_length > 1 {
             remu_shader_metal::compile_layered_rectangle_vertex(
                 pixel_msl.interpolated_attribute_count,
                 key.render_target_array_length,
+            )
+        } else if diagnostic_procedural_rectangle_fallback()
+            && procedural_rectangle_export_stage(&export.program)
+        {
+            remu_shader_metal::compile_procedural_rectangle_vertex(
+                pixel_msl.interpolated_attribute_count,
             )
         } else {
             remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)
                 .map_err(|error| format!("vertex lowering: {error}"))?
         };
+        let lowering_duration = lowering_started.elapsed();
         if let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR")
             && dump_msl_pixel_filter_matches(draw.pixel_shader_address)
             && dump_msl_instruction_filter_matches(pixel.program.instructions.len())
         {
             let directory = Path::new(&directory);
-            if let Err(error) = dump_shader_pair_ir(
-                directory,
-                draw.export_shader_address,
-                draw.pixel_shader_address,
-                &export.program.instructions,
-                &pixel.program.instructions,
-            ) {
-                eprintln!(
-                    "[REMu][METAL] could not dump shader IR for es={:#x} ps={:#x}: {error}",
-                    draw.export_shader_address, draw.pixel_shader_address
-                );
-            }
             if let Err(error) = dump_shader_pair_msl(
                 directory,
                 draw.export_shader_address,
@@ -2755,14 +3730,36 @@ impl MetalPresenter {
                 );
             }
         }
+        if let Some(directory) = std::env::var_os("REMU_DUMP_VIDEO_TARGET_MSL_DIR")
+            && video_target_binding_summary(pixel_evaluation).is_some()
+        {
+            let directory = Path::new(&directory);
+            if let Err(error) = dump_shader_pair_msl(
+                directory,
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                &vertex_msl.source,
+                &pixel_msl.source,
+            ) {
+                eprintln!(
+                    "[REMu][METAL] could not dump video-target MSL for es={:#x} ps={:#x}: {error}",
+                    draw.export_shader_address, draw.pixel_shader_address
+                );
+            }
+        }
         // Render-target formats, blending, depth state, and sample count produce distinct Metal
         // pipelines but do not alter the generated stage functions. Unity frequently emits many
         // such variants during scene loading, so compiling the same 70-100 KiB MSL function for
         // each variant stalls the guest for tens of seconds. Retain functions independently from
         // pipeline states and compile each exact MSL source only once on this worker.
-        let (vertex_function, reused_vertex_function) =
-            function_cache.vertex(device, &vertex_msl)?;
+        let function_started = Instant::now();
+        let (vertex_function, reused_vertex_function) = if uses_mesh_stage {
+            function_cache.mesh(device, &vertex_msl)?
+        } else {
+            function_cache.vertex(device, &vertex_msl)?
+        };
         let (pixel_function, reused_pixel_function) = function_cache.pixel(device, &pixel_msl)?;
+        let function_duration = function_started.elapsed();
         let make_descriptor = || {
             let descriptor = RenderPipelineDescriptor::new();
             descriptor.set_label(&format!(
@@ -2798,7 +3795,45 @@ impl MetalPresenter {
             }
             Ok(descriptor)
         };
-        let pipeline = if let Some(archive) = render_pipeline_archive {
+        let pipeline_started = Instant::now();
+        let pipeline = if uses_mesh_stage {
+            let descriptor = MeshRenderPipelineDescriptor::new();
+            descriptor.set_label(&format!(
+                "REMu Gen5 NGG ES {:#x} PS {:#x}",
+                draw.export_shader_address, draw.pixel_shader_address
+            ));
+            descriptor.set_mesh_function(Some(&vertex_function));
+            descriptor.set_fragment_function(Some(&pixel_function));
+            descriptor.set_raster_sample_count(u64::from(key.sample_count));
+            descriptor.set_max_total_threads_per_mesh_threadgroup(NGG_MESH_THREADS);
+            descriptor.set_mesh_threadgroup_size_is_multiple_of_thread_execution_width(true);
+            for (location, target) in key.targets.iter().enumerate() {
+                let attachment = descriptor
+                    .color_attachments()
+                    .object_at(u64::try_from(location).expect("color location fits u64"))
+                    .ok_or_else(|| format!("Metal has no color attachment {location}"))?;
+                attachment.set_pixel_format(target.pixel_format);
+                attachment.set_write_mask(metal_color_write_mask(target.write_mask));
+                let blending_enabled = target.blend.enabled
+                    && !pixel_options.diagnostic_force_pixel_color
+                    && !diagnostic_disable_blending();
+                attachment.set_blending_enabled(blending_enabled);
+                if blending_enabled {
+                    attachment.set_source_rgb_blend_factor(target.blend.source_rgb);
+                    attachment.set_destination_rgb_blend_factor(target.blend.destination_rgb);
+                    attachment.set_rgb_blend_operation(target.blend.rgb_operation);
+                    attachment.set_source_alpha_blend_factor(target.blend.source_alpha);
+                    attachment.set_destination_alpha_blend_factor(target.blend.destination_alpha);
+                    attachment.set_alpha_blend_operation(target.blend.alpha_operation);
+                }
+            }
+            if let Some(depth) = key.depth {
+                descriptor.set_depth_attachment_pixel_format(depth.pixel_format);
+            }
+            device
+                .new_mesh_render_pipeline_state(&descriptor)
+                .map_err(|error| format!("Metal mesh render pipeline: {error}"))?
+        } else if let Some(archive) = render_pipeline_archive {
             archive.new_render_pipeline_state(device, make_descriptor)?
         } else {
             let descriptor = make_descriptor()?;
@@ -2806,6 +3841,7 @@ impl MetalPresenter {
                 .new_render_pipeline_state(&descriptor)
                 .map_err(|error| format!("Metal render pipeline: {error}"))?
         };
+        let pipeline_duration = pipeline_started.elapsed();
         Ok(CompiledShaderPair {
             pipeline,
             vertex_function,
@@ -2814,6 +3850,10 @@ impl MetalPresenter {
             pixel: pixel_msl,
             reused_vertex_function,
             reused_pixel_function,
+            lowering_duration,
+            function_duration,
+            pipeline_duration,
+            uses_mesh_stage,
         })
     }
 
@@ -2821,6 +3861,15 @@ impl MetalPresenter {
         &mut self,
         device: &Device,
         descriptor: GuestTextureDescriptor,
+    ) -> Result<Texture, String> {
+        self.ensure_resident_texture_with_initial_contents(device, descriptor, true)
+    }
+
+    fn ensure_resident_texture_with_initial_contents(
+        &mut self,
+        device: &Device,
+        descriptor: GuestTextureDescriptor,
+        upload_guest_contents: bool,
     ) -> Result<Texture, String> {
         if let Some(resident) =
             self.resident_guest_textures
@@ -2896,22 +3945,39 @@ impl MetalPresenter {
                     .remove(&alias)
                     .expect("collected resident alias exists");
                 if refresh != WriteWatchRefresh::Replaced && resident.gpu_written {
+                    let alias_ranges = resident.write_watch.alias_ranges();
+                    retire_sampled_textures_overlapping_writeback(
+                        &mut self.sampled_texture_cache,
+                        &alias_ranges,
+                    );
+                    retire_resident_textures_overlapping_writeback(
+                        &mut self.resident_guest_textures,
+                        &alias_ranges,
+                        resident.descriptor,
+                        resident.content_version,
+                    );
+                    retire_multisample_textures_overlapping_writeback(
+                        &mut self.multisample_textures,
+                        &alias_ranges,
+                    );
                     write_resident_texture_contents_to_guest(device, &queue, &resident)?;
                 }
             }
             retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
         }
-        // GFX10 image descriptors may expose only the mip selected by one shader even though
-        // later passes reinterpret the same mode-27 allocation as a larger hierarchy. Metal
-        // cannot grow a texture after a compute/render pass has written it, so create the complete
-        // hierarchy at first residency whenever the guest allocation covers it. This keeps the
-        // first GPU-written level live and lets later single-level and mip-tail views share the
-        // same backing instead of dropping the later compute pass.
-        if descriptor.tile_mode == 27 {
+        // Some GFX10 image descriptors expose only the mip selected by one shader even though
+        // following passes reinterpret the same mode-27 allocation as a larger hierarchy. Metal
+        // cannot grow a texture after a compute/render pass has written it, so the compatibility
+        // path creates the complete hierarchy at first residency. This is temporarily switchable
+        // for differential profiling: Silent Hill currently needs at least one inferred hierarchy
+        // to advance past its warning screen, while indiscriminately inferring all of them causes
+        // expensive false-positive write-watch reloads.
+        if guessed_mode27_hierarchies_enabled() && descriptor.tile_mode == 27 {
             let mip_level_count = complete_2d_mip_level_count(descriptor);
             if mip_level_count > 1
                 && let Ok(layout) = mode27_mip_chain_layout(descriptor, mip_level_count)
                 && let Ok(byte_count) = u64::try_from(layout.byte_count)
+                && byte_count <= guessed_mode27_hierarchy_maximum_bytes()
                 && guest_shared_backing_alias_segments(descriptor.address, byte_count).is_some()
             {
                 return ensure_mipmapped_resident_texture_in_map(
@@ -2925,10 +3991,16 @@ impl MetalPresenter {
                         layer_count: 1,
                     },
                     &mut self.resident_guest_textures,
+                    Mode27WorkOrigin::AutomaticPromotion,
                 );
             }
         }
-        ensure_resident_texture_in_map(device, descriptor, &mut self.resident_guest_textures)
+        ensure_resident_texture_in_map(
+            device,
+            descriptor,
+            &mut self.resident_guest_textures,
+            upload_guest_contents,
+        )
     }
 
     fn ensure_mipmapped_render_target_texture(
@@ -2977,6 +4049,7 @@ impl MetalPresenter {
         }
         self.resident_guest_textures.remove(&target.texture);
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
+        let started = Instant::now();
         let layout = mode27_mip_chain_layout(target.texture, target.mip_level_count)?;
         let write_watch = watch_resident_texture(
             target.texture,
@@ -2994,6 +4067,13 @@ impl MetalPresenter {
             target.mip_level_count,
             &linear_levels,
         )?;
+        record_mode27_work_detail(
+            Mode27WorkOrigin::RenderTargetCreate,
+            target.texture,
+            target.mip_level_count,
+            layout.byte_count,
+            started.elapsed(),
+        );
         texture.set_label(&format!(
             "REMu {}-level guest image {:#x}",
             target.mip_level_count, target.texture.address
@@ -3007,6 +4087,7 @@ impl MetalPresenter {
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
                 mip_level_count: target.mip_level_count,
+                inferred_hierarchy: false,
                 write_watch,
                 gpu_written: false,
                 content_version: 0,
@@ -3019,10 +4100,15 @@ impl MetalPresenter {
         &mut self,
         device: &Device,
         target: DecodedRenderTarget,
+        discard_guest_contents: bool,
     ) -> Result<Texture, String> {
         if target.texture_type == 9 && target.layer_count == 1 {
             return if target.mip_level_count == 1 {
-                self.ensure_resident_texture(device, target.texture)
+                self.ensure_resident_texture_with_initial_contents(
+                    device,
+                    target.texture,
+                    !discard_guest_contents,
+                )
             } else {
                 self.ensure_mipmapped_render_target_texture(device, target)
             };
@@ -3096,12 +4182,120 @@ impl MetalPresenter {
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
                 mip_level_count: 1,
+                inferred_hierarchy: false,
                 write_watch,
                 gpu_written: false,
                 content_version: 0,
             },
         );
         Ok(texture)
+    }
+
+    fn ensure_depth_render_target_texture(
+        &mut self,
+        device: &Device,
+        depth: DecodedDepthTarget,
+        minimum_width: u32,
+        minimum_height: u32,
+    ) -> Result<Texture, String> {
+        let texture = self.ensure_resident_texture(device, depth.texture)?;
+        let host_width = depth.texture.width.max(minimum_width);
+        let host_height = depth.texture.height.max(minimum_height);
+        if texture.width() >= u64::from(host_width) && texture.height() >= u64::from(host_height) {
+            return Ok(texture);
+        }
+
+        // Unreal can bind a hierarchically sized DB surface beside a larger color target. The
+        // console expands the fast-cleared depth allocation to the active framebuffer extent;
+        // Metal instead requires every attachment to cover the explicit render-pass extent.
+        // Promote the host depth image, initialize the extra area to a comparison-neutral value,
+        // and preserve the guest-declared portion. This is the same strategy used by SharpEmu's
+        // working Metal backend and prevents menus/scenes from being clipped to the small DB
+        // metadata extent.
+        self.wait_for_guest_command_batches()?;
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
+        let metal_descriptor = TextureDescriptor::new();
+        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_pixel_format(depth.texture.pixel_format);
+        metal_descriptor.set_width(u64::from(host_width));
+        metal_descriptor.set_height(u64::from(host_height));
+        metal_descriptor.set_storage_mode(MTLStorageMode::Shared);
+        metal_descriptor.set_usage(
+            MTLTextureUsage::RenderTarget
+                | MTLTextureUsage::ShaderRead
+                | MTLTextureUsage::ShaderWrite,
+        );
+        let promoted = device.new_texture(&metal_descriptor);
+        promoted.set_label(&format!(
+            "REMu promoted depth image {:#x} {}x{}",
+            depth.texture.address, host_width, host_height
+        ));
+
+        let command_buffer = queue.new_command_buffer().to_owned();
+        command_buffer.set_label("REMu depth-target promotion");
+        let pass = RenderPassDescriptor::new();
+        pass.set_render_target_width(u64::from(host_width));
+        pass.set_render_target_height(u64::from(host_height));
+        let attachment = pass
+            .depth_attachment()
+            .ok_or("Metal render pass has no depth attachment")?;
+        attachment.set_texture(Some(&promoted));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_store_action(MTLStoreAction::Store);
+        attachment.set_clear_depth(initial_depth_clear_for_target(depth));
+        let encoder = command_buffer.new_render_command_encoder(pass);
+        encoder.end_encoding();
+
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            &texture,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize::new(
+                texture.width().min(u64::from(host_width)),
+                texture.height().min(u64::from(host_height)),
+                1,
+            ),
+            &promoted,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "depth-target promotion ended in {:?}",
+                command_buffer.status()
+            ));
+        }
+
+        let resident_descriptor = self
+            .resident_guest_textures
+            .contains_key(&depth.texture)
+            .then_some(depth.texture)
+            .or_else(|| {
+                self.resident_guest_textures
+                    .values()
+                    .find(|resident| {
+                        guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
+                    })
+                    .map(|resident| resident.descriptor)
+            })
+            .ok_or("promoted depth target lost its resident identity")?;
+        let resident = self
+            .resident_guest_textures
+            .get_mut(&resident_descriptor)
+            .expect("selected depth resident exists");
+        resident.texture = promoted.clone();
+        resident.component_reorder_view = None;
+        Ok(promoted)
     }
 
     fn ensure_direct_scanout_texture(
@@ -3167,6 +4361,8 @@ impl MetalPresenter {
         device: &Device,
         descriptor: GuestTextureDescriptor,
         sample_count: u32,
+        minimum_width: u32,
+        minimum_height: u32,
     ) -> Result<(Texture, bool), String> {
         if sample_count <= 1 {
             return Err("multisample texture requires at least two samples".to_owned());
@@ -3181,14 +4377,20 @@ impl MetalPresenter {
             descriptor,
             sample_count,
         };
-        if let Some(resident) = self.multisample_textures.get(&key) {
+        let host_width = descriptor.width.max(minimum_width);
+        let host_height = descriptor.height.max(minimum_height);
+        if let Some(resident) = self.multisample_textures.get(&key)
+            && resident.texture.width() >= u64::from(host_width)
+            && resident.texture.height() >= u64::from(host_height)
+        {
             return Ok((resident.texture.clone(), !resident.initialized));
         }
+        self.multisample_textures.remove(&key);
         let metal_descriptor = TextureDescriptor::new();
         metal_descriptor.set_texture_type(MTLTextureType::D2Multisample);
         metal_descriptor.set_pixel_format(descriptor.pixel_format);
-        metal_descriptor.set_width(u64::from(descriptor.width));
-        metal_descriptor.set_height(u64::from(descriptor.height));
+        metal_descriptor.set_width(u64::from(host_width));
+        metal_descriptor.set_height(u64::from(host_height));
         metal_descriptor.set_sample_count(u64::from(sample_count));
         metal_descriptor.set_storage_mode(MTLStorageMode::Private);
         metal_descriptor.set_usage(MTLTextureUsage::RenderTarget);
@@ -3231,8 +4433,11 @@ impl MetalPresenter {
             .into_iter()
             .map(|binding| binding.sampler_descriptor.clone())
             .collect::<Vec<_>>();
-        let key = buffer_index.map(|buffer_index| SamplerArgumentCacheKey {
-            function: function.as_ptr() as usize,
+        let key = (!sampled_descriptors.is_empty()).then(|| SamplerArgumentCacheKey {
+            function: buffer_index
+                .is_some()
+                .then_some(function.as_ptr() as usize)
+                .unwrap_or_default(),
             buffer_index,
             descriptors: sampled_descriptors
                 .into_iter()
@@ -3243,16 +4448,16 @@ impl MetalPresenter {
             .as_ref()
             .and_then(|key| self.sampler_argument_cache.get(key))
         {
-            return Ok((Some(cached.buffer.clone()), cached.samplers.clone()));
+            return Ok((cached.buffer.clone(), cached.samplers.clone()));
         }
         let created = create_sampler_argument_buffer(device, function, buffer_index, evaluation)?;
         if self.sampler_argument_cache.len() < SAMPLER_ARGUMENT_CACHE_CAPACITY
-            && let (Some(key), Some(buffer)) = (key, created.0.as_ref())
+            && let Some(key) = key
         {
             self.sampler_argument_cache.insert(
                 key,
                 CachedSamplerArguments {
-                    buffer: buffer.clone(),
+                    buffer: created.0.clone(),
                     samplers: created.1.clone(),
                 },
             );
@@ -3265,16 +4470,40 @@ impl MetalPresenter {
         device: &Device,
         depth: DecodedDepthTarget,
     ) -> DepthStencilState {
-        let key = (depth.compare as u64, depth.write_enabled);
+        let compare = if depth.test_enabled && !depth.clear_enabled {
+            depth.compare
+        } else {
+            MTLCompareFunction::Always
+        };
+        let write_enabled = depth.write_enabled && !depth.clear_enabled;
+        let key = (compare as u64, write_enabled);
         if let Some(state) = self.depth_stencil_cache.get(&key) {
             return state.clone();
         }
         let descriptor = DepthStencilDescriptor::new();
-        descriptor.set_depth_compare_function(depth.compare);
-        descriptor.set_depth_write_enabled(depth.write_enabled);
+        descriptor.set_depth_compare_function(compare);
+        descriptor.set_depth_write_enabled(write_enabled);
         let state = device.new_depth_stencil_state(&descriptor);
         self.depth_stencil_cache.insert(key, state.clone());
         state
+    }
+
+    fn ensure_open_guest_batch(&mut self, queue: &metal::CommandQueue) {
+        if self.open_guest_batch.is_some() {
+            return;
+        }
+        let command_buffer = queue.new_command_buffer().to_owned();
+        command_buffer.set_label("REMu translated guest batch");
+        self.open_guest_batch = Some(GuestCommandBatch {
+            command_buffer,
+            work: Vec::new(),
+            global_upload_chunks: Vec::new(),
+            global_writebacks: Vec::new(),
+            guest_write_ranges: Vec::new(),
+            memory_writes: Vec::new(),
+            render_pass: None,
+            completion_sequences: Vec::new(),
+        });
     }
 
     fn upload_global_buffers(
@@ -3294,7 +4523,14 @@ impl MetalPresenter {
         device: &Device,
         binding: &GlobalMemoryBinding,
     ) -> Result<UploadedGlobalBuffer, String> {
-        if let Some((page_address, page_byte_count, offset)) = guest_global_buffer_view(binding)? {
+        // Packet-time snapshots must win over the identity-mapped view. The guest can recycle
+        // transient constants and small vertex buffers while this presenter is still compiling
+        // shaders or draining older events. Zero-copy remains correct for writable or
+        // deliberately uncaptured large bindings.
+        if (binding.data.len() != binding.byte_count || binding.writable)
+            && let Some((page_address, page_byte_count, offset)) =
+                guest_global_buffer_view(binding)?
+        {
             let key = (page_address, page_byte_count);
             let buffer = if let Some(buffer) = self.guest_global_buffer_cache.get(&key) {
                 buffer.clone()
@@ -3340,26 +4576,26 @@ impl MetalPresenter {
             {
                 return Ok(UploadedGlobalBuffer {
                     buffer: cached.buffer.clone(),
-                    offset: 0,
+                    offset: cached.offset,
                     guest_memory: false,
                 });
             }
-            let buffer = metal_buffer_with_bytes(device, &binding.data)?;
-            buffer.set_label(&format!(
-                "REMu transient global {:#x}/{}",
-                binding.base_address,
-                binding.data.len()
-            ));
+            let (buffer, offset) = self
+                .open_guest_batch
+                .as_mut()
+                .ok_or("captured global upload has no open guest batch")?
+                .upload_global_bytes(device, &binding.data)?;
             self.transient_global_buffer_cache.insert(
                 key,
                 CachedGlobalBuffer {
                     bytes: binding.data.clone(),
                     buffer: buffer.clone(),
+                    offset,
                 },
             );
             return Ok(UploadedGlobalBuffer {
                 buffer,
-                offset: 0,
+                offset,
                 guest_memory: false,
             });
         }
@@ -3368,25 +4604,51 @@ impl MetalPresenter {
         {
             return Ok(UploadedGlobalBuffer {
                 buffer: cached.buffer.clone(),
-                offset: 0,
+                offset: cached.offset,
                 guest_memory: false,
             });
         }
-        let buffer = metal_buffer_with_bytes(device, &binding.data)?;
+        // A stable guest address whose packet-time bytes keep changing is a transient constant
+        // stream. Keep its first immutable cache entry as a possible exact hit, but place later
+        // variants in the current command batch's arena instead of allocating and destroying an
+        // MTLBuffer for every draw.
+        if self.global_buffer_cache.contains_key(&key) {
+            let (buffer, offset) = self
+                .open_guest_batch
+                .as_mut()
+                .ok_or("captured global upload has no open guest batch")?
+                .upload_global_bytes(device, &binding.data)?;
+            return Ok(UploadedGlobalBuffer {
+                buffer,
+                offset,
+                guest_memory: false,
+            });
+        }
         if self.global_buffer_cache.len() >= GLOBAL_BUFFER_CACHE_CAPACITY
             || self
                 .global_buffer_cache_bytes
                 .saturating_add(binding.data.len())
                 > GLOBAL_BUFFER_CACHE_BYTE_CAPACITY
         {
-            self.global_buffer_cache.clear();
-            self.global_buffer_cache_bytes = 0;
+            let (buffer, offset) = self
+                .open_guest_batch
+                .as_mut()
+                .ok_or("captured global upload has no open guest batch")?
+                .upload_global_bytes(device, &binding.data)?;
+            return Ok(UploadedGlobalBuffer {
+                buffer,
+                offset,
+                guest_memory: false,
+            });
         }
+        let buffer = metal_buffer_with_bytes(device, &binding.data)?;
+        let offset = 0;
         if let Some(replaced) = self.global_buffer_cache.insert(
             key,
             CachedGlobalBuffer {
                 bytes: binding.data.clone(),
                 buffer: buffer.clone(),
+                offset,
             },
         ) {
             self.global_buffer_cache_bytes = self
@@ -3398,7 +4660,7 @@ impl MetalPresenter {
             .saturating_add(binding.data.len());
         Ok(UploadedGlobalBuffer {
             buffer,
-            offset: 0,
+            offset,
             guest_memory: false,
         })
     }
@@ -3439,10 +4701,33 @@ impl MetalPresenter {
         // address identity as well so they can follow writers that arrive without the synthetic
         // scanout target metadata. This predicate is intentionally not used for texture routing
         // or initialization, and therefore cannot alter guest rendering.
+        let overlaps_translated_scanout = |address: u64, width: u32, height: u32| {
+            self.resident_guest_textures
+                .values()
+                .filter(|resident| {
+                    resident.descriptor.address == address
+                        && resident.descriptor.width == width
+                        && resident.descriptor.height == height
+                })
+                .any(|resident| {
+                    guest_texture_descriptors_overlap(resident.descriptor, target.texture)
+                })
+        };
         target.direct_scanout
             || self
                 .direct_scanout_textures
                 .contains_key(&target.texture.address)
+            || self
+                .pending_flip
+                .zip(self.display)
+                .is_some_and(|(flip, display)| {
+                    flip.address == target.texture.address
+                        || overlaps_translated_scanout(flip.address, display.width, display.height)
+                })
+            || self.active_translated_scanout.is_some_and(|scanout| {
+                scanout.address == target.texture.address
+                    || overlaps_translated_scanout(scanout.address, scanout.width, scanout.height)
+            })
     }
 
     fn diagnostic_capture_texture(&self, target: &DecodedRenderTarget) -> Option<Texture> {
@@ -3463,45 +4748,41 @@ impl MetalPresenter {
         }
     }
 
-    fn refresh_pending_flip_after_target_write(&mut self, target: DecodedRenderTarget) {
+    fn note_pending_flip_target_write(&mut self, descriptor: GuestTextureDescriptor) {
         let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
             return;
         };
-        if flip.address != target.texture.address
-            || display.width != target.texture.width
-            || display.height != target.texture.height
-        {
+        if flip.sequence == self.uploaded_flip_sequence {
+            // This flip already owns an immutable GPU snapshot. Later writes target a future
+            // frame, even when the title reuses the same VideoOut allocation.
             return;
         }
-
-        // A guest may announce a flip before its final compositor pass, and reinterpreting an
-        // overlapping allocation can replace the Metal texture object after that announcement.
-        // Refresh the presented object after every matching target write instead of treating an
-        // already-uploaded flip sequence as immutable. Otherwise the window keeps sampling the
-        // stale solid texture while later passes render the real menu into its replacement.
-        let refreshed = if target.direct_scanout {
-            self.direct_scanout_textures
-                .get(&target.texture.address)
-                .filter(|scanout| scanout.initialized && scanout.descriptor == target.texture)
-                .map(|scanout| scanout.texture.clone())
-        } else {
-            self.resident_guest_textures
-                .values()
-                .filter(|resident| {
-                    resident.gpu_written
-                        && resident.descriptor.address == target.texture.address
-                        && resident.descriptor.width == target.texture.width
-                        && resident.descriptor.height == target.texture.height
-                })
-                .max_by_key(|resident| resident.content_version)
-                .map(|resident| resident.texture.clone())
-        };
-        if let Some(texture) = refreshed {
-            self.frame_texture = Some(texture);
-            self.frame_texture_size = (target.texture.width, target.texture.height);
-            self.uploaded_flip_sequence = flip.sequence;
+        if flip.address == descriptor.address
+            && display.width == descriptor.width
+            && display.height == descriptor.height
+        {
+            // A guest submission can clear, composite, and decorate one VideoOut target through
+            // several render passes. Presenting the first write exposes the clear pass and can
+            // retire the flip before the interface/game image is complete. Coalesce all matching
+            // writes and activate the final resident at the ordered submission boundary.
+            self.pending_flip_target_written_since_boundary = true;
         }
-        self.redraw_pending = true;
+    }
+
+    fn finalize_pending_flip_at_submission_boundary(&mut self, source: OrderedEventSource) {
+        let initial_flip_boundary = matches!(
+            (source, self.pending_flip_queue),
+            (OrderedEventSource::GuestQueue(queue_id), Some(pending_queue))
+                if queue_id == pending_queue
+        );
+        if !initial_flip_boundary && !self.pending_flip_target_written_since_boundary {
+            return;
+        }
+        if initial_flip_boundary {
+            self.pending_flip_queue = None;
+        }
+        self.pending_flip_target_written_since_boundary = false;
+        self.finalize_pending_flip();
     }
 
     fn synchronize_cpu_written_guest_resources(
@@ -3516,12 +4797,6 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
-
         let mut invalidated_multisample_descriptors = Vec::new();
         let mut dirty_reprotected_residents = HashSet::new();
         let resident_descriptors = self
@@ -3575,6 +4850,7 @@ impl MetalPresenter {
                 | WriteWatchRefresh::Renewed { was_dirty: false } => {}
             }
         }
+        let mut invalidated_resident_descriptors = Vec::new();
         for resident in self.resident_guest_textures.values_mut() {
             let (_, byte_count) = resident.write_watch.range();
             if !acquire.overlaps(resident.descriptor.address, byte_count)
@@ -3583,6 +4859,30 @@ impl MetalPresenter {
             {
                 continue;
             }
+            // A hierarchy inferred from a single-level render target deliberately watches more
+            // guest backing than that target declared. Writes to neighboring allocations inside
+            // that speculative span must not replace a newer GPU-authored image. Once a shader
+            // explicitly declares the hierarchy, ensure_mipmapped_resident_texture_in_map clears
+            // this flag and ordinary CPU/GPU acquire semantics resume.
+            if resident.inferred_hierarchy && resident.gpu_written {
+                if resident.write_watch.is_dirty() {
+                    let _ = resident.write_watch.consume_dirty();
+                    resident.write_watch.rearm()?;
+                }
+                continue;
+            }
+            // When the CPU is already authoritative for the complete resident, an acquire only
+            // invalidates its old Metal copy. Rebuilding it here eagerly decodes large Unreal
+            // render allocations even when several more acquires arrive before the image is used.
+            // Drop the stale resident and let the ordinary render/sample path materialize one
+            // stable snapshot on demand. GPU-authored residents cannot take this path because
+            // clean bytes may still exist only in Metal and must be merged by the writeback path.
+            if !resident.gpu_written {
+                invalidated_resident_descriptors.push(resident.descriptor);
+                invalidated_multisample_descriptors.push(resident.descriptor);
+                continue;
+            }
+            let started = Instant::now();
             let texture = if resident.mip_level_count == 1 {
                 let raw =
                     snapshot_watched_guest_texture_raw(resident.descriptor, &resident.write_watch)?;
@@ -3615,6 +4915,17 @@ impl MetalPresenter {
                     &linear_levels,
                 )?
             };
+            if resident.mip_level_count > 1 {
+                let layout =
+                    mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
+                record_mode27_work_detail(
+                    Mode27WorkOrigin::AcquireReload,
+                    resident.descriptor,
+                    resident.mip_level_count,
+                    layout.byte_count,
+                    started.elapsed(),
+                );
+            }
             texture.set_label(&format!(
                 "REMu guest image {:#x}",
                 resident.descriptor.address
@@ -3626,49 +4937,40 @@ impl MetalPresenter {
             resident.gpu_written = false;
             invalidated_multisample_descriptors.push(resident.descriptor);
         }
+        for descriptor in invalidated_resident_descriptors {
+            if self.resident_guest_textures.remove(&descriptor).is_some() {
+                RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.multisample_textures.retain(|key, _| {
             !invalidated_multisample_descriptors
                 .iter()
                 .any(|descriptor| guest_texture_descriptors_overlap(key.descriptor, *descriptor))
         });
 
-        for (key, cached) in &mut self.sampled_texture_cache {
-            let (_, byte_count) = cached.write_watch.range();
-            if !acquire.overlaps(key.descriptor.address, byte_count)
-                || (!cached.write_watch.is_dirty() && !dirty_reprotected_sampled.contains(key))
-            {
-                continue;
+        let invalidated_sampled_keys = self
+            .sampled_texture_cache
+            .iter()
+            .filter_map(|(key, cached)| {
+                let (_, byte_count) = cached.write_watch.range();
+                if !acquire.overlaps(key.descriptor.address, byte_count)
+                    || (!cached.write_watch.is_dirty() && !dirty_reprotected_sampled.contains(key))
+                {
+                    return None;
+                }
+                Some(*key)
+            })
+            .collect::<Vec<_>>();
+        // ACQUIRE_MEM makes CPU-authored bytes authoritative, but it does not require eagerly
+        // materializing a new Metal texture. Evict the stale cache entry and let the ordinary
+        // upload path rebuild it from a stable watched snapshot only if a later shader actually
+        // samples it. This also coalesces repeated acquires before first use instead of decoding
+        // and uploading the same full texture after every packet.
+        for key in invalidated_sampled_keys {
+            if let Some(retired) = self.sampled_texture_cache.remove(&key) {
+                SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+                retire_sampled_texture(retired);
             }
-            let descriptor = DecodedImageDescriptor {
-                guest: key.descriptor,
-                destination_select: key.destination_select,
-                base_mip_level: key.base_mip_level,
-                mip_level_count: key.mip_level_count,
-                texture_type: key.texture_type,
-                layer_count: key.layer_count,
-            };
-            let raw = snapshot_watched_sampled_texture_raw(descriptor, &cached.write_watch)?;
-            let texture = if sampled_texture_uses_exact_mode27_mips(descriptor) {
-                create_exact_mode27_sampled_mip_view(&device, descriptor, &raw, key.comparison)?
-            } else {
-                let linear = decode_sampled_texture_linear_from_raw(descriptor, &raw)?;
-                create_sampled_guest_texture(
-                    &device,
-                    &queue,
-                    key.descriptor,
-                    &linear,
-                    key.base_mip_level,
-                    key.mip_level_count,
-                    key.texture_type,
-                    key.layer_count,
-                    key.comparison,
-                )?
-            };
-            texture.set_label(&format!(
-                "REMu sampled guest image {:#x}",
-                key.descriptor.address
-            ));
-            cached.texture = texture;
         }
         Ok(())
     }
@@ -3717,20 +5019,56 @@ impl MetalPresenter {
                 .filter(|binding| !is_storage_image_opcode(binding.opcode))
                 .filter(|binding| !image_resource_descriptor_is_null(&binding.resource_descriptor))
             {
-                let sampled = decode_image_descriptor(&binding.resource_descriptor)
-                    .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+                let Some(sampled) = sampled_alias_descriptor(binding) else {
+                    // The upload path binds a dimension-compatible zero texture for malformed,
+                    // sentinel, or otherwise unreadable sampled descriptors. Alias
+                    // synchronization has no guest range to publish in that case and must not
+                    // reject the entire draw before the fallback can be installed.
+                    continue;
+                };
                 let comparison = image_is_comparison(binding.opcode);
+                let sampled_bytes = guest_texture_byte_count(sampled.guest).ok_or_else(|| {
+                    format!(
+                        "image at PC {:#x} has an invalid guest byte extent",
+                        binding.pc
+                    )
+                })?;
                 // A Gen5 MSAA allocation can expose its shader-readable resolved image through
                 // an overlapping SRD whose base follows the allocation's mask metadata. Keep the
                 // Metal resolve GPU-current so `upload_image_textures` can bind it directly. A
                 // CPU writeback here both discards that provenance and decodes from the shifted
                 // SRD base, producing an empty post-process input.
+                //
+                // Each resident write watch already records every coherent CPU alias of the
+                // underlying physical range. Consult those immutable ranges directly instead of
+                // resolving both descriptors through the global mapping table for every
+                // resident/sample pair. Silent Hill has roughly one hundred residents and
+                // performs this query for nearly every draw; the old nested mapping-lock lookup
+                // consumed about one quarter of presenter CPU time in a sampled title workload.
                 aliases.extend(
                     self.resident_guest_textures
                         .values()
                         .filter(|resident| resident.gpu_written)
                         .filter(|resident| {
-                            guest_texture_descriptors_overlap(resident.descriptor, sampled.guest)
+                            let overlaps_resident = if resident.inferred_hierarchy {
+                                // The automatically inferred hierarchy deliberately watches the
+                                // allocation following the render target so that a later explicit
+                                // mip view can reuse it. That speculative span commonly contains
+                                // unrelated post-process targets. Treating every such neighbor as
+                                // an alias forced a full Metal-to-CPU-to-Metal round trip before
+                                // almost every Silent Hill draw. Only the declared base allocation
+                                // is architecturally resident until a shader confirms the larger
+                                // hierarchy and clears `inferred_hierarchy`.
+                                resident.write_watch.overlaps_declared_alias_range(
+                                    sampled.guest.address,
+                                    sampled_bytes,
+                                )
+                            } else {
+                                resident
+                                    .write_watch
+                                    .overlaps_alias_range(sampled.guest.address, sampled_bytes)
+                            };
+                            let aliases_sample = overlaps_resident
                                 && resident.descriptor != sampled.guest
                                 && !guest_texture_descriptors_share_storage(
                                     resident.descriptor,
@@ -3747,7 +5085,49 @@ impl MetalPresenter {
                                             key.descriptor,
                                             key.sample_count,
                                         )
-                                })
+                                });
+                            if aliases_sample && trace_target_sampling() {
+                                static LOGGED_ALIAS_FLUSHES: OnceLock<
+                                    Mutex<HashSet<(u64, u64, u32, u32)>>,
+                                > = OnceLock::new();
+                                let key = (
+                                    resident.descriptor.address,
+                                    sampled.guest.address,
+                                    sampled.base_mip_level,
+                                    sampled.mip_level_count,
+                                );
+                                let mut logged = LOGGED_ALIAS_FLUSHES
+                                    .get_or_init(|| Mutex::new(HashSet::new()))
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if logged.len() < 256 && logged.insert(key) {
+                                    eprintln!(
+                                        "[REMu][METAL][ALIAS-FLUSH] resident={:#x}/{}x{}/p{}/{:?}/tile{}/mips{} inferred={} sampled={:#x}/{}x{}/p{}/{:?}/tile{}/base{}/mips{} pc={:#x} declared_overlap={}",
+                                        resident.descriptor.address,
+                                        resident.descriptor.width,
+                                        resident.descriptor.height,
+                                        resident.descriptor.pitch,
+                                        resident.descriptor.pixel_format,
+                                        resident.descriptor.tile_mode,
+                                        resident.mip_level_count,
+                                        resident.inferred_hierarchy,
+                                        sampled.guest.address,
+                                        sampled.guest.width,
+                                        sampled.guest.height,
+                                        sampled.guest.pitch,
+                                        sampled.guest.pixel_format,
+                                        sampled.guest.tile_mode,
+                                        sampled.base_mip_level,
+                                        sampled.mip_level_count,
+                                        binding.pc,
+                                        guest_texture_descriptors_overlap(
+                                            resident.descriptor,
+                                            sampled.guest,
+                                        ),
+                                    );
+                                }
+                            }
+                            aliases_sample
                         })
                         .map(|resident| resident.descriptor),
                 );
@@ -3755,6 +5135,14 @@ impl MetalPresenter {
         }
         aliases.sort_unstable_by_key(|descriptor| descriptor.address);
         aliases.dedup();
+        aliases.sort_by_key(|descriptor| {
+            (
+                self.resident_guest_textures
+                    .get(descriptor)
+                    .map_or(0, |resident| resident.content_version),
+                descriptor.address,
+            )
+        });
         if aliases.is_empty() {
             return Ok(());
         }
@@ -3785,12 +5173,35 @@ impl MetalPresenter {
                     descriptor.address
                 ));
             }
+            let (alias_ranges, content_version) = {
+                let resident = self
+                    .resident_guest_textures
+                    .get(&descriptor)
+                    .expect("collected sampled alias exists");
+                (
+                    resident.write_watch.alias_ranges(),
+                    resident.content_version,
+                )
+            };
+            retire_sampled_textures_overlapping_writeback(
+                &mut self.sampled_texture_cache,
+                &alias_ranges,
+            );
+            retire_resident_textures_overlapping_writeback(
+                &mut self.resident_guest_textures,
+                &alias_ranges,
+                descriptor,
+                content_version,
+            );
+            retire_multisample_textures_overlapping_writeback(
+                &mut self.multisample_textures,
+                &alias_ranges,
+            );
             let resident = self
                 .resident_guest_textures
                 .get_mut(&descriptor)
                 .expect("collected sampled alias exists");
             write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-            rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
             resident.gpu_written = false;
         }
         Ok(())
@@ -3894,10 +5305,22 @@ impl MetalPresenter {
                         completed_command_buffer_gpu_duration(&presentation.command_buffer);
                     self.statistics.presentation_queue_latency +=
                         presentation.submitted_at.elapsed();
+                    if let Some(completion) = presentation.flip_completion {
+                        remu_gpu::record_gpu_flip_completed(completion);
+                    }
                 }
                 MTLCommandBufferStatus::Error => {
-                    self.pending_presentations.pop_front();
+                    let presentation = self
+                        .pending_presentations
+                        .pop_front()
+                        .expect("front presentation exists");
                     eprintln!("[REMu][METAL] presentation command buffer failed");
+                    // A terminal presentation failure cannot be retried in place. Complete the
+                    // flip after reporting it so the guest does not deadlock on an unavailable
+                    // drawable while later frames may still recover.
+                    if let Some(completion) = presentation.flip_completion {
+                        remu_gpu::record_gpu_flip_completed(completion);
+                    }
                 }
                 _ => return,
             }
@@ -3954,13 +5377,17 @@ impl MetalPresenter {
         };
         let resident =
             resident_mib.map_or_else(|| "RSS ?".to_owned(), |mib| format!("RSS {mib} MiB"));
-        let pending_gpu_events =
-            remu_gpu::gpu_events_in_flight().saturating_add(self.receiver.pending_event_count());
+        let pending_gpu_events = remu_gpu::gpu_work_items_pending();
+        let pending_flips = remu_gpu::gpu_flips_pending();
         let title = format!(
-            "REMu | FPS {flip_rate:.1} ({frame_milliseconds:.1} ms) | Present {present_rate:.1}/s | GPU {gpu_utilization:.0}% Lat {presentation_latency_milliseconds:.1} ms | {resident} | Draw {draw_rate:.0}/s RP {render_pass_rate:.0}/s CS {compute_rate:.0}/s | CB {guest_batch_rate:.0}/s PB {pipeline_barrier_rate:.0}/s ({}) | Q {}/{} | Audio {audio_output_rate:.0}/s U {audio_underrun_percent:.1}%",
+            "REMu | FPS {flip_rate:.1} ({frame_milliseconds:.1} ms) | Present {present_rate:.1}/s | GPU {gpu_utilization:.0}% Lat {presentation_latency_milliseconds:.1} ms | {resident} | Draw {draw_rate:.0}/s RP {render_pass_rate:.0}/s CS {compute_rate:.0}/s | CB {guest_batch_rate:.0}/s PB {pipeline_barrier_rate:.0}/s ({}) | Q W{} P{} F{} | Tex {} | Pipe {}/{} | Audio {audio_output_rate:.0}/s U {audio_underrun_percent:.1}%",
             self.committed_guest_batches.len(),
             pending_gpu_events,
             self.pending_presentations.len(),
+            pending_flips,
+            self.sampled_texture_cache.len(),
+            self.compiled_shader_pairs.len(),
+            self.compiling_shader_pairs.len(),
         );
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);
@@ -3979,6 +5406,133 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_for_work_capacity) / seconds,
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
             );
+            let compile_enqueued = PIPELINE_COMPILE_ENQUEUED.swap(0, Ordering::Relaxed);
+            let compile_queue_full = PIPELINE_COMPILE_QUEUE_FULL.swap(0, Ordering::Relaxed);
+            let compile_completed = PIPELINE_COMPILE_COMPLETED.swap(0, Ordering::Relaxed);
+            let compile_failed = PIPELINE_COMPILE_FAILED.swap(0, Ordering::Relaxed);
+            let draw_gates = PIPELINE_DRAW_GATES.swap(0, Ordering::Relaxed);
+            let (pipeline_blocks, memory_blocks) = self.receiver.block_reason_counts();
+            eprintln!(
+                "[REMu][PERF-PIPELINE] ready={} active={} failed={} interval=enqueued:{compile_enqueued}/full:{compile_queue_full}/done:{compile_completed}/failed:{compile_failed}/gates:{draw_gates} blocked=pipeline:{pipeline_blocks}/memory:{memory_blocks}",
+                self.compiled_shader_pairs.len(),
+                self.compiling_shader_pairs.len(),
+                self.failed_shader_pairs.len(),
+            );
+            let queue_diagnostics = self.receiver.queue_diagnostics();
+            if !queue_diagnostics.is_empty() {
+                eprintln!("[REMu][PERF-QUEUES] {queue_diagnostics}");
+            }
+            let snapshot_count = TEXTURE_SNAPSHOT_COUNT.swap(0, Ordering::Relaxed);
+            let snapshot_bytes = TEXTURE_SNAPSHOT_BYTES.swap(0, Ordering::Relaxed);
+            let snapshot_nanoseconds = TEXTURE_SNAPSHOT_NANOSECONDS.swap(0, Ordering::Relaxed);
+            let decode_count = MODE27_DECODE_COUNT.swap(0, Ordering::Relaxed);
+            let decode_bytes = MODE27_DECODE_BYTES.swap(0, Ordering::Relaxed);
+            let decode_nanoseconds = MODE27_DECODE_NANOSECONDS.swap(0, Ordering::Relaxed);
+            let upload_count = MIP_UPLOAD_COUNT.swap(0, Ordering::Relaxed);
+            let upload_bytes = MIP_UPLOAD_BYTES.swap(0, Ordering::Relaxed);
+            let upload_nanoseconds = MIP_UPLOAD_NANOSECONDS.swap(0, Ordering::Relaxed);
+            eprintln!(
+                "[REMu][PERF-TEXTURE] snapshot={snapshot_count}/{:.1}MiB/{:.1}ms mode27={decode_count}/{:.1}MiB/{:.1}ms upload={upload_count}/{:.1}MiB/{:.1}ms",
+                snapshot_bytes as f64 / (1024.0 * 1024.0),
+                snapshot_nanoseconds as f64 / 1_000_000.0,
+                decode_bytes as f64 / (1024.0 * 1024.0),
+                decode_nanoseconds as f64 / 1_000_000.0,
+                upload_bytes as f64 / (1024.0 * 1024.0),
+                upload_nanoseconds as f64 / 1_000_000.0,
+            );
+            let cache_hits = SAMPLED_TEXTURE_CACHE_HITS.swap(0, Ordering::Relaxed);
+            let cache_misses = SAMPLED_TEXTURE_CACHE_MISSES.swap(0, Ordering::Relaxed);
+            let cache_dirty_reloads =
+                SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS.swap(0, Ordering::Relaxed);
+            let cache_acquire_invalidations =
+                SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS.swap(0, Ordering::Relaxed);
+            let cache_capacity_evictions =
+                SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS.swap(0, Ordering::Relaxed);
+            let resident_acquire_invalidations =
+                RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.swap(0, Ordering::Relaxed);
+            eprintln!(
+                "[REMu][PERF-TEXTURE-CACHE] resident={} watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={}",
+                self.sampled_texture_cache.len(),
+                self.sampled_texture_write_watches.len(),
+                cache_hits,
+                cache_misses,
+                cache_dirty_reloads,
+                cache_acquire_invalidations,
+                resident_acquire_invalidations,
+                cache_capacity_evictions,
+            );
+            let snapshot_details = take_texture_snapshot_work_details();
+            if !snapshot_details.is_empty() {
+                let top = snapshot_details
+                    .into_iter()
+                    .take(8)
+                    .map(|(key, aggregate)| {
+                        format!(
+                            "{:#x}/{:.1}MiB@L{}={}/{:.1}MiB/{:.1}ms",
+                            key.address,
+                            key.byte_count as f64 / (1024.0 * 1024.0),
+                            key.caller_line,
+                            aggregate.count,
+                            aggregate.bytes as f64 / (1024.0 * 1024.0),
+                            aggregate.nanoseconds as f64 / 1_000_000.0,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!("[REMu][PERF-SNAPSHOT-TOP] {top}");
+            }
+            let dirty_details = take_texture_dirty_work_details();
+            if !dirty_details.is_empty() {
+                let top = dirty_details
+                    .into_iter()
+                    .take(8)
+                    .map(|(key, aggregate)| {
+                        let dirty_percent = if aggregate.full_bytes == 0 {
+                            0.0
+                        } else {
+                            aggregate.dirty_bytes as f64 * 100.0
+                                / aggregate.full_bytes as f64
+                        };
+                        format!(
+                            "{:#x}/{:.1}MiB@L{}={}snap/{}clean/{}imprecise dirty={:.1}MiB({dirty_percent:.3}%)/{}pages",
+                            key.address,
+                            key.byte_count as f64 / (1024.0 * 1024.0),
+                            key.caller_line,
+                            aggregate.snapshots,
+                            aggregate.clean_snapshots,
+                            aggregate.imprecise_snapshots,
+                            aggregate.dirty_bytes as f64 / (1024.0 * 1024.0),
+                            aggregate.dirty_pages,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!("[REMu][PERF-TEXTURE-DIRTY-TOP] {top}");
+            }
+            let mode27_details = take_mode27_work_details();
+            if !mode27_details.is_empty() {
+                let top = mode27_details
+                    .into_iter()
+                    .take(8)
+                    .map(|(key, aggregate)| {
+                        format!(
+                            "{:?}@{:#x}/{}x{}/p{}/fmt{:?}/m{}={}/{:.1}MiB/{:.1}ms",
+                            key.origin,
+                            key.descriptor.address,
+                            key.descriptor.width,
+                            key.descriptor.height,
+                            key.descriptor.pitch,
+                            key.descriptor.pixel_format,
+                            key.mip_level_count,
+                            aggregate.count,
+                            aggregate.bytes as f64 / (1024.0 * 1024.0),
+                            aggregate.nanoseconds as f64 / 1_000_000.0,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!("[REMu][PERF-TEXTURE-TOP] {top}");
+            }
             self.statistics.last_logged = Instant::now();
         }
         self.statistics.interval_started = Instant::now();
@@ -4191,22 +5745,31 @@ impl MetalPresenter {
             // synchronously waiting for the complete Metal queue for every one of those packets
             // cuts frame rate in half. Track actual writable guest ranges so only a real
             // read-after-write dependency pays for retirement/readback.
-            let source_descriptors = self
+            let mut source_descriptors = self
                 .resident_guest_textures
                 .values()
                 .filter(|resident| resident.gpu_written)
                 .filter(|resident| {
-                    guest_texture_byte_count(resident.descriptor).is_some_and(|length| {
-                        guest_ranges_overlap(
-                            resident.descriptor.address,
-                            length,
-                            copy.source_address,
-                            copy.byte_count,
-                        )
-                    })
+                    if resident.inferred_hierarchy {
+                        resident
+                            .write_watch
+                            .overlaps_declared_alias_range(copy.source_address, copy.byte_count)
+                    } else {
+                        resident
+                            .write_watch
+                            .overlaps_alias_range(copy.source_address, copy.byte_count)
+                    }
                 })
                 .map(|resident| resident.descriptor)
                 .collect::<Vec<_>>();
+            source_descriptors.sort_by_key(|descriptor| {
+                (
+                    self.resident_guest_textures
+                        .get(descriptor)
+                        .map_or(0, |resident| resident.content_version),
+                    descriptor.address,
+                )
+            });
             let pending_source_write = self.open_guest_batch.as_ref().is_some_and(|batch| {
                 guest_batch_writes_overlap(batch, copy.source_address, copy.byte_count)
             }) || self.committed_guest_batches.iter().any(|batch| {
@@ -4243,12 +5806,35 @@ impl MetalPresenter {
                             descriptor.address
                         ));
                     }
+                    let (alias_ranges, content_version) = {
+                        let resident = self
+                            .resident_guest_textures
+                            .get(&descriptor)
+                            .expect("collected DMA source texture exists");
+                        (
+                            resident.write_watch.alias_ranges(),
+                            resident.content_version,
+                        )
+                    };
+                    retire_sampled_textures_overlapping_writeback(
+                        &mut self.sampled_texture_cache,
+                        &alias_ranges,
+                    );
+                    retire_resident_textures_overlapping_writeback(
+                        &mut self.resident_guest_textures,
+                        &alias_ranges,
+                        descriptor,
+                        content_version,
+                    );
+                    retire_multisample_textures_overlapping_writeback(
+                        &mut self.multisample_textures,
+                        &alias_ranges,
+                    );
                     let resident = self
                         .resident_guest_textures
                         .get_mut(&descriptor)
                         .expect("collected DMA source texture exists");
                     write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-                    rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
                     resident.gpu_written = false;
                 }
             }
@@ -4652,22 +6238,59 @@ impl MetalPresenter {
             WriteWatchRefresh::Reprotecting => return Ok(()),
             WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {}
         }
+        let (alias_ranges, content_version) = {
+            let resident = self
+                .resident_guest_textures
+                .get(&descriptor)
+                .expect("refreshed resident texture exists");
+            (
+                resident.write_watch.alias_ranges(),
+                resident.content_version,
+            )
+        };
+        retire_sampled_textures_overlapping_writeback(
+            &mut self.sampled_texture_cache,
+            &alias_ranges,
+        );
+        retire_resident_textures_overlapping_writeback(
+            &mut self.resident_guest_textures,
+            &alias_ranges,
+            descriptor,
+            content_version,
+        );
+        retire_multisample_textures_overlapping_writeback(
+            &mut self.multisample_textures,
+            &alias_ranges,
+        );
         let resident = self
             .resident_guest_textures
             .get_mut(&descriptor)
             .expect("refreshed resident texture exists");
         write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-        rearm_guest_texture_after_gpu_writeback(&resident.write_watch)?;
         resident.gpu_written = false;
         Ok(())
     }
 
-    fn activate_translated_scanout(
-        &mut self,
+    fn translated_scanout_source(
+        &self,
         address: u64,
         width: u32,
         height: u32,
-    ) -> Result<bool, String> {
+    ) -> Option<(GuestTextureDescriptor, Texture, &'static str)> {
+        // A CB-backed resident represents the architectural render target and carries a content
+        // version. A synthetic direct target is only a fallback for streams whose CB state was
+        // absent, so it must never outrank newer resident compositor output at the same VideoOut
+        // address.
+        let resident = self
+            .resident_guest_textures
+            .values()
+            .filter(|resident| {
+                resident.descriptor.address == address
+                    && resident.descriptor.width == width
+                    && resident.descriptor.height == height
+            })
+            .max_by_key(|resident| resident.content_version)
+            .map(|resident| (resident.descriptor, resident.texture.clone(), "resident"));
         let direct = self
             .direct_scanout_textures
             .get(&address)
@@ -4677,25 +6300,56 @@ impl MetalPresenter {
                     && scanout.descriptor.height == height
             })
             .map(|scanout| (scanout.descriptor, scanout.texture.clone(), "direct"));
-        let resident = self
+        resident.or(direct)
+    }
+
+    fn trace_translated_scanout_candidates(
+        &self,
+        address: u64,
+        width: u32,
+        height: u32,
+        selected: GuestTextureDescriptor,
+    ) {
+        if !trace_scanout_writes() {
+            return;
+        }
+        let candidates = self
             .resident_guest_textures
             .values()
             .filter(|resident| {
-                resident.gpu_written
-                    && resident.descriptor.address == address
+                resident.descriptor.address == address
                     && resident.descriptor.width == width
                     && resident.descriptor.height == height
             })
-            .max_by_key(|resident| resident.content_version)
-            .map(|resident| (resident.descriptor, resident.texture.clone(), "resident"));
-        let Some((descriptor, source_texture, source)) = direct.or(resident) else {
+            .map(|resident| {
+                (
+                    resident.descriptor,
+                    resident.content_version,
+                    resident.gpu_written,
+                )
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[REMu][METAL][SCANOUT-SOURCE] address={address:#x} {}x{} selected={selected:?} candidates={candidates:?} last_writer={:?} last_texture_writer={:?}",
+            width,
+            height,
+            diagnostic_scanout_writer(address),
+            diagnostic_texture_writer(selected),
+        );
+    }
+
+    fn activate_translated_scanout(
+        &mut self,
+        address: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<bool, String> {
+        let Some((descriptor, source_texture, source)) =
+            self.translated_scanout_source(address, width, height)
+        else {
             return Ok(false);
         };
-        // Keep the scanout resident on the GPU and let the serial Metal queue order presentation
-        // after the guest work that produced it. AGC's embedded flip marker can precede Silent
-        // Hill's final composition work, so copying at that marker preserves a stale solid buffer.
-        // Presenting the live resident also avoids a 32 MiB 4K blit on every frame.
-        self.flush_guest_command_batch(false, GuestBatchFlushReason::FlipSnapshot)?;
+        self.trace_translated_scanout_candidates(address, width, height, descriptor);
         let device = self
             .device
             .as_ref()
@@ -4706,25 +6360,39 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal command queue is unavailable")?
             .clone();
-        let capture_due = self.capture_directory.is_some()
-            && self
-                .last_guest_capture
-                .is_none_or(|last| last.elapsed() >= capture_interval());
-        if capture_due
-            && matches!(
-                descriptor.pixel_format,
-                MTLPixelFormat::RGBA8Unorm
-                    | MTLPixelFormat::RGBA8Unorm_sRGB
-                    | MTLPixelFormat::BGRA8Unorm
-                    | MTLPixelFormat::BGRA8Unorm_sRGB
-                    | MTLPixelFormat::RGBA16Float
-            )
-        {
-            let rendered = read_texture_linear(&device, &queue, &source_texture, descriptor)?;
-            self.capture_translated_frame_if_changed(descriptor, &rendered);
-        }
-        self.frame_texture = Some(source_texture);
+        let snapshot = self.ensure_scanout_snapshot_texture(&device, descriptor);
+        // End and commit every encoder before the flip. The single Metal queue then orders this
+        // private-to-private copy between the frame's producer work and any later command stream
+        // that clears or reuses the same VideoOut allocation.
+        self.flush_guest_command_batch(false, GuestBatchFlushReason::FlipSnapshot)?;
+        let command_buffer = queue.new_command_buffer().to_owned();
+        command_buffer.set_label("REMu ordered VideoOut snapshot");
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.set_label("REMu translated scanout snapshot");
+        blit.copy_from_texture(
+            &source_texture,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize::new(u64::from(descriptor.width), u64::from(descriptor.height), 1),
+            &snapshot,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+        command_buffer.commit();
+        self.frame_texture = Some(snapshot);
         self.frame_texture_size = (descriptor.width, descriptor.height);
+        self.active_translated_scanout = Some(ActiveTranslatedScanout {
+            address,
+            width,
+            height,
+            sequence: self
+                .pending_flip
+                .filter(|flip| flip.address == address)
+                .map_or(self.next_flip_sequence, |flip| flip.sequence),
+        });
         static LOGGED_TRANSLATED_SCANOUTS: OnceLock<Mutex<HashSet<(u64, &'static str)>>> =
             OnceLock::new();
         let first_for_source = LOGGED_TRANSLATED_SCANOUTS
@@ -4734,7 +6402,7 @@ impl MetalPresenter {
             .insert((address, source));
         if first_for_source {
             eprintln!(
-                "[REMu][METAL] presenting translated {source} scanout sequence={} at {address:#x} {}x{} format={:?} tile={}",
+                "[REMu][METAL] snapshotted translated {source} scanout sequence={} at {address:#x} {}x{} format={:?} tile={}",
                 self.next_flip_sequence,
                 descriptor.width,
                 descriptor.height,
@@ -4783,23 +6451,32 @@ impl MetalPresenter {
                     dispatch.launch.lds_size_bytes,
                     dispatch.launch.wave_lane_count,
                 );
+                let lowering_started = Instant::now();
                 let lowered =
                     remu_shader_metal::compile_msl(&snapshot.program, evaluation, &options)
                         .map_err(|error| format!("compute lowering: {error}"))?;
+                let lowering_duration = lowering_started.elapsed();
                 if lowered.stage != remu_shader_metal::MetalShaderStage::Compute {
                     return Err("compute lowering returned a non-compute Metal stage".to_owned());
                 }
+                let function_started = Instant::now();
                 let library = compile_metal_compute_library(&device, &lowered.source)?;
                 let function = library
                     .get_function(&lowered.entry_point, None)
                     .map_err(|error| format!("Metal compute function: {error}"))?;
+                let function_duration = function_started.elapsed();
+                let pipeline_started = Instant::now();
                 let pipeline = device
                     .new_compute_pipeline_state_with_function(&function)
                     .map_err(|error| format!("Metal compute pipeline: {error}"))?;
+                let pipeline_duration = pipeline_started.elapsed();
                 Ok::<_, String>(CompiledComputePipeline {
                     pipeline,
                     function,
                     shader: lowered,
+                    lowering_duration,
+                    function_duration,
+                    pipeline_duration,
                 })
             })();
             let compiled = match compiled {
@@ -4810,9 +6487,12 @@ impl MetalPresenter {
                 }
             };
             eprintln!(
-                "[REMu][METAL] compiled Gen5 compute cs={:#x} MSL={} bytes local={:?} LDS={} bytes",
+                "[REMu][METAL] compiled Gen5 compute cs={:#x} MSL={} bytes time={:.1}/{:.1}/{:.1}ms lower/function/pipeline local={:?} LDS={} bytes",
                 dispatch.shader_address,
                 compiled.shader.source.len(),
+                compiled.lowering_duration.as_secs_f64() * 1_000.0,
+                compiled.function_duration.as_secs_f64() * 1_000.0,
+                compiled.pipeline_duration.as_secs_f64() * 1_000.0,
                 dispatch.launch.threads_per_group,
                 compiled.shader.bindings.threadgroup_memory_bytes,
             );
@@ -4879,7 +6559,14 @@ impl MetalPresenter {
         }
         self.synchronize_sampled_aliases(&[evaluation])?;
 
+        self.ensure_open_guest_batch(&queue);
         let buffers = self.upload_global_buffers(&device, evaluation)?;
+        let global_argument_buffer = create_global_argument_buffer(
+            &device,
+            &function,
+            bindings.global_argument_buffer_index,
+            &buffers,
+        )?;
         let textures = upload_image_textures(
             &device,
             &queue,
@@ -4892,7 +6579,7 @@ impl MetalPresenter {
             &mut self.sampled_texture_admission_order,
             &mut self.next_sampled_texture_admission_id,
         )?;
-        let (sampler_buffer, _samplers) = self.cached_sampler_argument_buffer(
+        let (sampler_buffer, samplers) = self.cached_sampler_argument_buffer(
             &device,
             &function,
             bindings.sampler_argument_buffer_index,
@@ -4915,19 +6602,6 @@ impl MetalPresenter {
         collect_pending_global_writebacks(&buffers, evaluation, &mut pending_writebacks)?;
         let mut pending_guest_write_ranges = Vec::new();
         collect_pending_guest_write_ranges(&buffers, evaluation, &mut pending_guest_write_ranges)?;
-        if self.open_guest_batch.is_none() {
-            let command_buffer = queue.new_command_buffer().to_owned();
-            command_buffer.set_label("REMu translated guest batch");
-            self.open_guest_batch = Some(GuestCommandBatch {
-                command_buffer,
-                work: Vec::new(),
-                global_writebacks: Vec::new(),
-                guest_write_ranges: Vec::new(),
-                memory_writes: Vec::new(),
-                render_pass: None,
-                completion_sequences: Vec::new(),
-            });
-        }
         {
             let batch = self
                 .open_guest_batch
@@ -4950,8 +6624,23 @@ impl MetalPresenter {
             let encoder = batch.command_buffer.new_compute_command_encoder();
             encoder.set_label(&format!("REMu Gen5 compute {:#x}", dispatch.shader_address));
             encoder.set_compute_pipeline_state(&pipeline);
-            for (index, buffer) in buffer_indices.iter().zip(&buffers) {
-                encoder.set_buffer(*index, Some(&buffer.buffer), buffer.offset);
+            if let (Some(index), Some(argument_buffer)) = (
+                bindings.global_argument_buffer_index,
+                global_argument_buffer.as_ref(),
+            ) {
+                encoder.set_buffer(u64::from(index), Some(argument_buffer), 0);
+                for (buffer, binding) in buffers.iter().zip(&evaluation.global_memory_bindings) {
+                    let usage = if binding.writable {
+                        MTLResourceUsage::Read | MTLResourceUsage::Write
+                    } else {
+                        MTLResourceUsage::Read
+                    };
+                    encoder.use_resource(&buffer.buffer, usage);
+                }
+            } else {
+                for (index, buffer) in buffer_indices.iter().zip(&buffers) {
+                    encoder.set_buffer(*index, Some(&buffer.buffer), buffer.offset);
+                }
             }
             encoder.set_bytes(
                 u64::from(bindings.initial_scalar_buffer_index),
@@ -4966,6 +6655,13 @@ impl MetalPresenter {
                 sampler_buffer.as_ref(),
             ) {
                 encoder.set_buffer(u64::from(index), Some(buffer), 0);
+            } else {
+                for (index, sampler) in samplers.iter().enumerate() {
+                    encoder.set_sampler_state(
+                        u64::try_from(index).map_err(|_| "compute sampler index overflow")?,
+                        Some(sampler),
+                    );
+                }
             }
             if dynamic_lds != 0 {
                 encoder.set_threadgroup_memory_length(0, u64::from(dynamic_lds));
@@ -5013,6 +6709,11 @@ impl MetalPresenter {
                     );
                 }
                 self.mark_resident_texture_written(texture.descriptor.guest);
+                // Gen5 presentation targets are ordinary guest images and may be completed by a
+                // storage-image compute pass (upscaling, tone mapping, or format conversion)
+                // rather than a color attachment. Treat that write exactly like a render-target
+                // write so the pending flip is finalized only after the producing submission.
+                self.note_pending_flip_target_write(texture.descriptor.guest);
             }
         }
         if self
@@ -5266,19 +6967,19 @@ impl MetalPresenter {
                     diagnostic_sampled.clone(),
                 );
             }
-            record_diagnostic_global_writers(
-                "vertex",
-                draw.sequence,
-                draw.export_shader_address,
-                export_evaluation,
-            );
-            record_diagnostic_global_writers(
-                "pixel",
-                draw.sequence,
-                draw.pixel_shader_address,
-                pixel_evaluation,
-            );
         }
+        record_diagnostic_global_writers(
+            "vertex",
+            draw.sequence,
+            draw.export_shader_address,
+            export_evaluation,
+        );
+        record_diagnostic_global_writers(
+            "pixel",
+            draw.sequence,
+            draw.pixel_shader_address,
+            pixel_evaluation,
+        );
         let device = self
             .device
             .as_ref()
@@ -5289,60 +6990,105 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal command queue is unavailable")?
             .clone();
+        // Color attachments determine the framebuffer extent when present. Unreal's early-Z and
+        // masked-depth passes intentionally program CB_TARGET_MASK=0, so a depth-only pass derives
+        // its extent from DB instead. Rejecting those passes leaves the later depth-equal base
+        // pass with an empty depth buffer and makes otherwise valid 3D scenes entirely black.
+        let render_width = targets
+            .iter()
+            .map(|target| (target.texture.width >> target.mip_level).max(1))
+            .min()
+            .or_else(|| depth.map(|depth| depth.texture.width))
+            .ok_or("draw has neither a color nor depth attachment")?;
+        let render_height = targets
+            .iter()
+            .map(|target| (target.texture.height >> target.mip_level).max(1))
+            .min()
+            .or_else(|| depth.map(|depth| depth.texture.height))
+            .ok_or("draw has neither a color nor depth attachment")?;
         let mut target_textures = Vec::with_capacity(targets.len());
         let mut target_resolve_textures = Vec::with_capacity(targets.len());
-        let mut clear_uninitialized_targets = Vec::with_capacity(targets.len());
+        let mut initial_target_clear_colors = Vec::with_capacity(targets.len());
         for target in &targets {
             let resolved_texture = if target.direct_scanout {
                 let texture = self.ensure_direct_scanout_texture(&device, target.texture);
-                clear_uninitialized_targets
-                    .push(self.direct_scanout_needs_initial_clear(target.texture.address));
+                initial_target_clear_colors.push(
+                    self.direct_scanout_needs_initial_clear(target.texture.address)
+                        .then_some(MTLClearColor::new(0.0, 0.0, 0.0, 1.0)),
+                );
                 texture
             } else {
                 let has_resident_storage = self.resident_guest_textures.values().any(|resident| {
                     guest_texture_descriptors_share_storage(resident.descriptor, target.texture)
                 });
-                let clear_compressed_initial_contents =
-                    (target.dcc_enabled || target.fast_clear_enabled) && !has_resident_storage;
-                clear_uninitialized_targets.push(clear_compressed_initial_contents);
-                if clear_compressed_initial_contents {
+                let initial_clear_color = initial_render_target_clear_color(
+                    target,
+                    &draw.context_registers,
+                    has_resident_storage,
+                );
+                initial_target_clear_colors.push(initial_clear_color);
+                if !has_resident_storage && (target.dcc_enabled || target.fast_clear_enabled) {
                     static DISCARDED_DCC_TARGETS: AtomicUsize = AtomicUsize::new(0);
                     let sequence = DISCARDED_DCC_TARGETS.fetch_add(1, Ordering::Relaxed) + 1;
                     if sequence <= 16 || sequence.is_power_of_two() {
                         eprintln!(
-                            "[REMu][METAL] initializing compressed color target {} at {:#x} as uncompressed Metal storage dcc={} fast_clear={} sequence={sequence}",
+                            "[REMu][METAL] materializing compressed color target {} at {:#x} as uncompressed Metal storage dcc={} fast_clear={} initial_clear={} sequence={sequence}",
                             target.guest_slot,
                             target.texture.address,
                             target.dcc_enabled,
                             target.fast_clear_enabled,
+                            initial_clear_color.is_some(),
                         );
                     }
                 }
-                self.ensure_layered_render_target_texture(&device, *target)
-                    .map_err(|error| {
-                        format!(
-                            "render target {} guest memory is unreadable: {error}",
-                            target.guest_slot
-                        )
-                    })?
+                self.ensure_layered_render_target_texture(
+                    &device,
+                    *target,
+                    initial_clear_color.is_some(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "render target {} guest memory is unreadable: {error}",
+                        target.guest_slot
+                    )
+                })?
             };
             if target.sample_count > 1 {
-                let (multisample, clear_multisample) =
-                    self.ensure_multisample_texture(&device, target.texture, target.sample_count)?;
+                let (multisample, clear_multisample) = self.ensure_multisample_texture(
+                    &device,
+                    target.texture,
+                    target.sample_count,
+                    target.texture.width,
+                    target.texture.height,
+                )?;
                 target_textures.push(multisample);
                 target_resolve_textures
                     .push(resolve_multisample_targets.then_some(resolved_texture));
-                *clear_uninitialized_targets
-                    .last_mut()
-                    .expect("target clear state was just added") = clear_multisample;
+                if clear_multisample {
+                    let clear_color =
+                        render_target_fast_clear_color(target, &draw.context_registers)
+                            .unwrap_or_else(|| MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+                    *initial_target_clear_colors
+                        .last_mut()
+                        .expect("target clear state was just added") = Some(clear_color);
+                } else {
+                    *initial_target_clear_colors
+                        .last_mut()
+                        .expect("target clear state was just added") = None;
+                }
             } else {
                 target_textures.push(resolved_texture);
                 target_resolve_textures.push(None);
             }
         }
+        let depth_had_resident_storage = depth.is_some_and(|depth| {
+            self.resident_guest_textures.values().any(|resident| {
+                guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
+            })
+        });
         let resolved_depth_texture = depth
             .map(|depth| {
-                self.ensure_resident_texture(&device, depth.texture)
+                self.ensure_depth_render_target_texture(&device, depth, render_width, render_height)
                     .map_err(|error| format!("depth target guest memory is unreadable: {error}"))
             })
             .transpose()?;
@@ -5353,10 +7099,17 @@ impl MetalPresenter {
                         &device,
                         depth.texture,
                         depth.sample_count,
+                        render_width,
+                        render_height,
                     )?;
                     (Some(multisample), Some(resolved), clear)
                 } else {
-                    (Some(resolved), None, false)
+                    // A fresh Gen5 Z allocation is generally represented by HTILE metadata and
+                    // its base tiled pixels are not meaningful until decompressed. Importing
+                    // those bytes as ordinary depth made a first read-only pass reject arbitrary
+                    // geometry. Materialize first use with the programmed DB clear, just as the
+                    // hardware expands an HTILE fast clear.
+                    (Some(resolved), None, !depth_had_resident_storage)
                 }
             } else {
                 (None, None, false)
@@ -5397,6 +7150,7 @@ impl MetalPresenter {
         }
         self.synchronize_sampled_aliases(&[export_evaluation, pixel_evaluation])?;
 
+        self.ensure_open_guest_batch(&queue);
         let export_buffers = self.upload_global_buffers(&device, export_evaluation)?;
         let pixel_buffers = self.upload_global_buffers(&device, pixel_evaluation)?;
         let export_textures = upload_image_textures(
@@ -5427,10 +7181,13 @@ impl MetalPresenter {
             pipeline,
             vertex_function,
             pixel_function,
+            vertex_global_argument_buffer_index,
+            pixel_global_argument_buffer_index,
             vertex_scalar_buffer_index,
             pixel_scalar_buffer_index,
             vertex_sampler_buffer_index,
             pixel_sampler_buffer_index,
+            uses_mesh_stage,
         ) = {
             let compiled = self
                 .compiled_shader_pairs
@@ -5483,23 +7240,38 @@ impl MetalPresenter {
                 compiled.pipeline.clone(),
                 compiled.vertex_function.clone(),
                 compiled.pixel_function.clone(),
+                compiled.vertex.bindings.global_argument_buffer_index,
+                compiled.pixel.bindings.global_argument_buffer_index,
                 compiled.vertex.bindings.initial_scalar_buffer_index,
                 compiled.pixel.bindings.initial_scalar_buffer_index,
                 compiled.vertex.bindings.sampler_argument_buffer_index,
                 compiled.pixel.bindings.sampler_argument_buffer_index,
+                compiled.uses_mesh_stage,
             )
         };
-        let (export_sampler_buffer, _export_samplers) = self.cached_sampler_argument_buffer(
+        let (export_sampler_buffer, export_samplers) = self.cached_sampler_argument_buffer(
             &device,
             &vertex_function,
             vertex_sampler_buffer_index,
             export_evaluation,
         )?;
-        let (pixel_sampler_buffer, _pixel_samplers) = self.cached_sampler_argument_buffer(
+        let (pixel_sampler_buffer, pixel_samplers) = self.cached_sampler_argument_buffer(
             &device,
             &pixel_function,
             pixel_sampler_buffer_index,
             pixel_evaluation,
+        )?;
+        let export_global_argument_buffer = create_global_argument_buffer(
+            &device,
+            &vertex_function,
+            vertex_global_argument_buffer_index,
+            &export_buffers,
+        )?;
+        let pixel_global_argument_buffer = create_global_argument_buffer(
+            &device,
+            &pixel_function,
+            pixel_global_argument_buffer_index,
+            &pixel_buffers,
         )?;
         let indexed_draw = if draw.indexed {
             let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
@@ -5508,25 +7280,6 @@ impl MetalPresenter {
         } else {
             None
         };
-        let primary_target = targets
-            .first()
-            .expect("render-target decoder requires at least one target")
-            .texture;
-        // Vulkan framebuffers use the shared minimum attachment extent. Unreal relies on that
-        // behavior for passes that bind a small hierarchical depth surface beside a larger color
-        // target. Metal exposes the same explicit render-target extent on the pass descriptor.
-        let render_width = targets
-            .iter()
-            .map(|target| (target.texture.width >> target.mip_level).max(1))
-            .chain(depth.map(|depth| depth.texture.width))
-            .min()
-            .unwrap_or(primary_target.width);
-        let render_height = targets
-            .iter()
-            .map(|target| (target.texture.height >> target.mip_level).max(1))
-            .chain(depth.map(|depth| depth.texture.height))
-            .min()
-            .unwrap_or(primary_target.height);
         let scissor = decode_scissor(draw, render_width, render_height)?;
         let diagnostic_force_triangle = diagnostic_disable_combined_raster
             && diagnostic_complex_msaa_raster
@@ -5649,12 +7402,36 @@ impl MetalPresenter {
             vertex_scalar_metadata[3] = u32::try_from(vertex_threads).expect("wave count fits u32")
                 | (u32::try_from(primitive_threads).expect("wave count fits u32") << 8);
         }
-        let pixel_scalar_metadata = shader_scalar_metadata_for_registers(
+        let mut pixel_scalar_metadata = shader_scalar_metadata_for_registers(
             pixel_evaluation,
             &draw.shader_registers,
             0x00c,
             0,
         )?;
+        let diagnostic_capture_enabled = if diagnostic_dump_video_target_consumer() {
+            static VIDEO_CAPTURE_MATCHES: AtomicUsize = AtomicUsize::new(0);
+            let is_target_candidate = draw.sequence >= diagnostic_dump_target_minimum_draw()
+                && !targets.is_empty()
+                && video_target_binding_summary(pixel_evaluation).is_some()
+                && diagnostic_dump_target_pixel_instruction_count().is_none_or(|count| {
+                    draw.pixel_shader
+                        .as_ref()
+                        .is_some_and(|shader| shader.program.instructions.len() == count)
+                });
+            is_target_candidate
+                && VIDEO_CAPTURE_MATCHES.fetch_add(1, Ordering::Relaxed)
+                    == diagnostic_dump_target_match_index()
+        } else if diagnostic_dump_video_chain_consumer() {
+            diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence
+        } else {
+            true
+        };
+        if diagnostic_capture_vertex_position() {
+            vertex_scalar_metadata.push(u32::from(diagnostic_capture_enabled));
+        }
+        if diagnostic_capture_pixel_output() {
+            pixel_scalar_metadata.push(u32::from(diagnostic_capture_enabled));
+        }
         let vertex_scalar_byte_count = vertex_scalar_metadata
             .len()
             .checked_mul(4)
@@ -5734,19 +7511,6 @@ impl MetalPresenter {
             None
         };
 
-        if self.open_guest_batch.is_none() {
-            let command_buffer = queue.new_command_buffer().to_owned();
-            command_buffer.set_label("REMu translated guest batch");
-            self.open_guest_batch = Some(GuestCommandBatch {
-                command_buffer,
-                work: Vec::new(),
-                global_writebacks: Vec::new(),
-                guest_write_ranges: Vec::new(),
-                memory_writes: Vec::new(),
-                render_pass: None,
-                completion_sequences: Vec::new(),
-            });
-        }
         let render_pass_key = GuestRenderPassKey {
             targets: targets
                 .iter()
@@ -5763,7 +7527,17 @@ impl MetalPresenter {
                     )
                 })
                 .collect(),
-            depth: depth.map(|depth| (depth.texture, depth.sample_count)),
+            // An explicit DB clear is an operation, not persistent attachment state. Include it
+            // in the key so it always terminates a preceding load pass, and so the following draw
+            // opens a new load pass instead of continuing to clear on the same encoder.
+            depth: depth.map(|depth| {
+                (
+                    depth.texture,
+                    depth.sample_count,
+                    depth.clear_enabled,
+                    (depth.clear_depth as f32).to_bits(),
+                )
+            }),
             resolve_multisample_targets,
         };
         let needs_new_render_pass = self
@@ -5776,10 +7550,10 @@ impl MetalPresenter {
             pass.set_render_target_width(u64::from(render_width));
             pass.set_render_target_height(u64::from(render_height));
             pass.set_render_target_array_length(u64::from(key.render_target_array_length));
-            for (location, ((texture, resolve_texture), clear_uninitialized)) in target_textures
+            for (location, ((texture, resolve_texture), initial_clear_color)) in target_textures
                 .iter()
                 .zip(&target_resolve_textures)
-                .zip(&clear_uninitialized_targets)
+                .zip(&initial_target_clear_colors)
                 .enumerate()
             {
                 let attachment = pass
@@ -5795,9 +7569,9 @@ impl MetalPresenter {
                 } else {
                     attachment.set_slice(u64::from(targets[location].base_layer));
                 }
-                if *clear_uninitialized {
+                if let Some(clear_color) = initial_clear_color {
                     attachment.set_load_action(MTLLoadAction::Clear);
-                    attachment.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+                    attachment.set_clear_color(*clear_color);
                 } else {
                     attachment.set_load_action(MTLLoadAction::Load);
                 }
@@ -5813,9 +7587,9 @@ impl MetalPresenter {
                     .depth_attachment()
                     .ok_or("Metal render pass has no depth attachment")?;
                 attachment.set_texture(Some(texture));
-                if clear_uninitialized_depth {
+                if depth.clear_enabled || clear_uninitialized_depth {
                     attachment.set_load_action(MTLLoadAction::Clear);
-                    attachment.set_clear_depth(initial_depth_clear_value(depth.compare));
+                    attachment.set_clear_depth(initial_depth_clear_for_target(depth));
                 } else {
                     attachment.set_load_action(MTLLoadAction::Load);
                 }
@@ -5901,17 +7675,69 @@ impl MetalPresenter {
             if !diagnostic_force_triangle && let GuestScissor::Rect(rect) = scissor {
                 encoder.set_scissor_rect(rect);
             }
-            for (index, buffer) in export_buffer_indices.iter().zip(&export_buffers) {
-                encoder.set_vertex_buffer(*index, Some(&buffer.buffer), buffer.offset);
+            if let (Some(index), Some(argument_buffer)) = (
+                vertex_global_argument_buffer_index,
+                export_global_argument_buffer.as_ref(),
+            ) {
+                if uses_mesh_stage {
+                    encoder.set_mesh_buffer(u64::from(index), Some(argument_buffer), 0);
+                } else {
+                    encoder.set_vertex_buffer(u64::from(index), Some(argument_buffer), 0);
+                }
+                for (buffer, binding) in export_buffers
+                    .iter()
+                    .zip(&export_evaluation.global_memory_bindings)
+                {
+                    let usage = if binding.writable {
+                        MTLResourceUsage::Read | MTLResourceUsage::Write
+                    } else {
+                        MTLResourceUsage::Read
+                    };
+                    encoder.use_resource_at(&buffer.buffer, usage, MTLRenderStages::Vertex);
+                }
+            } else {
+                for (index, buffer) in export_buffer_indices.iter().zip(&export_buffers) {
+                    if uses_mesh_stage {
+                        encoder.set_mesh_buffer(*index, Some(&buffer.buffer), buffer.offset);
+                    } else {
+                        encoder.set_vertex_buffer(*index, Some(&buffer.buffer), buffer.offset);
+                    }
+                }
             }
-            for (index, buffer) in pixel_buffer_indices.iter().zip(&pixel_buffers) {
-                encoder.set_fragment_buffer(*index, Some(&buffer.buffer), buffer.offset);
+            if let (Some(index), Some(argument_buffer)) = (
+                pixel_global_argument_buffer_index,
+                pixel_global_argument_buffer.as_ref(),
+            ) {
+                encoder.set_fragment_buffer(u64::from(index), Some(argument_buffer), 0);
+                for (buffer, binding) in pixel_buffers
+                    .iter()
+                    .zip(&pixel_evaluation.global_memory_bindings)
+                {
+                    let usage = if binding.writable {
+                        MTLResourceUsage::Read | MTLResourceUsage::Write
+                    } else {
+                        MTLResourceUsage::Read
+                    };
+                    encoder.use_resource_at(&buffer.buffer, usage, MTLRenderStages::Fragment);
+                }
+            } else {
+                for (index, buffer) in pixel_buffer_indices.iter().zip(&pixel_buffers) {
+                    encoder.set_fragment_buffer(*index, Some(&buffer.buffer), buffer.offset);
+                }
             }
-            encoder.set_vertex_bytes(
-                u64::from(vertex_scalar_buffer_index),
-                vertex_scalar_byte_count,
-                vertex_scalar_metadata.as_ptr().cast::<c_void>(),
-            );
+            if uses_mesh_stage {
+                encoder.set_mesh_bytes(
+                    u64::from(vertex_scalar_buffer_index),
+                    vertex_scalar_byte_count,
+                    vertex_scalar_metadata.as_ptr().cast::<c_void>(),
+                );
+            } else {
+                encoder.set_vertex_bytes(
+                    u64::from(vertex_scalar_buffer_index),
+                    vertex_scalar_byte_count,
+                    vertex_scalar_metadata.as_ptr().cast::<c_void>(),
+                );
+            }
             if let Some(buffer) = diagnostic_vertex_position_buffer.as_ref() {
                 encoder.set_vertex_buffer(DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX, Some(buffer), 0);
             }
@@ -5924,7 +7750,11 @@ impl MetalPresenter {
                 encoder.set_fragment_buffer(DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, Some(buffer), 0);
             }
             for (index, texture) in export_texture_indices.iter().zip(&export_textures) {
-                encoder.set_vertex_texture(*index, Some(&texture.texture));
+                if uses_mesh_stage {
+                    encoder.set_mesh_texture(*index, Some(&texture.texture));
+                } else {
+                    encoder.set_vertex_texture(*index, Some(&texture.texture));
+                }
             }
             for (index, texture) in pixel_texture_indices.iter().zip(&pixel_textures) {
                 encoder.set_fragment_texture(*index, Some(&texture.texture));
@@ -5932,15 +7762,58 @@ impl MetalPresenter {
             if let (Some(index), Some(buffer)) =
                 (vertex_sampler_buffer_index, export_sampler_buffer.as_ref())
             {
-                encoder.set_vertex_buffer(u64::from(index), Some(buffer), 0);
+                if uses_mesh_stage {
+                    encoder.set_mesh_buffer(u64::from(index), Some(buffer), 0);
+                } else {
+                    encoder.set_vertex_buffer(u64::from(index), Some(buffer), 0);
+                }
+            } else {
+                for (index, sampler) in export_samplers.iter().enumerate() {
+                    let index =
+                        u64::try_from(index).map_err(|_| "vertex sampler index overflow")?;
+                    if uses_mesh_stage {
+                        encoder.set_mesh_sampler_state(index, Some(sampler));
+                    } else {
+                        encoder.set_vertex_sampler_state(index, Some(sampler));
+                    }
+                }
             }
             if let (Some(index), Some(buffer)) =
                 (pixel_sampler_buffer_index, pixel_sampler_buffer.as_ref())
             {
                 encoder.set_fragment_buffer(u64::from(index), Some(buffer), 0);
+            } else {
+                for (index, sampler) in pixel_samplers.iter().enumerate() {
+                    encoder.set_fragment_sampler_state(
+                        u64::try_from(index).map_err(|_| "pixel sampler index overflow")?,
+                        Some(sampler),
+                    );
+                }
             }
 
-            if diagnostic_force_triangle {
+            if uses_mesh_stage {
+                let (indices, index_buffer) = indexed_draw
+                    .as_ref()
+                    .ok_or("NGG mesh draw requires captured indices")?;
+                let index_count =
+                    u32::try_from(indices.len()).map_err(|_| "mesh index count exceeds u32")?;
+                let mesh_draw = [index_count, 0_u32];
+                encoder.set_mesh_buffer(NGG_MESH_INDEX_BUFFER_INDEX, Some(index_buffer), 0);
+                encoder.set_mesh_bytes(
+                    NGG_MESH_DRAW_BUFFER_INDEX,
+                    u64::try_from(std::mem::size_of_val(&mesh_draw))
+                        .expect("mesh draw metadata size fits u64"),
+                    mesh_draw.as_ptr().cast::<c_void>(),
+                );
+                let threadgroups = u64::from(index_count)
+                    .div_ceil(NGG_MESH_VERTICES_PER_GROUP)
+                    .max(1);
+                encoder.draw_mesh_threadgroups(
+                    MTLSize::new(threadgroups, 1, 1),
+                    MTLSize::new(1, 1, 1),
+                    MTLSize::new(NGG_MESH_THREADS, 1, 1),
+                );
+            } else if diagnostic_force_triangle {
                 encoder.draw_primitives_instanced(MTLPrimitiveType::Triangle, 0, 3, 1);
             } else if matches!(scissor, GuestScissor::Empty) {
                 // Metal rejects an empty scissor, so a guest empty-scissor draw encodes no
@@ -5980,10 +7853,10 @@ impl MetalPresenter {
                     self.mark_resident_texture_written(target.texture);
                 }
             }
-            // A flip can arrive before the presenter has translated the render target that
-            // backs it, and the translated texture can later be replaced by an overlapping
-            // reinterpretation. Always refresh the live scanout after a matching target write.
-            self.refresh_pending_flip_after_target_write(*target);
+            // A flip can arrive before the presenter has translated its render target. Remember
+            // that this submission wrote the exact target, but defer presentation until the
+            // boundary so later compositor and interface passes cannot be skipped.
+            self.note_pending_flip_target_write(target.texture);
         }
         let dump_target_before_pixel_shader =
             diagnostic_dump_target_before_pixel_shader().is_some();
@@ -5994,21 +7867,25 @@ impl MetalPresenter {
                 trace_scanout_writers,
                 self.is_diagnostic_scanout_target(target),
             ) {
-                record_diagnostic_scanout_writer(
-                    target.texture.address,
-                    DiagnosticScanoutWriter {
-                        draw: draw.sequence,
-                        export_shader: draw.export_shader_address,
-                        pixel_shader: draw.pixel_shader_address,
-                    },
-                );
+                let writer = DiagnosticScanoutWriter {
+                    draw: draw.sequence,
+                    export_shader: draw.export_shader_address,
+                    pixel_shader: draw.pixel_shader_address,
+                };
+                record_diagnostic_scanout_writer(target.texture.address, writer);
+                if trace_scanout_writers {
+                    eprintln!(
+                        "[REMu][METAL][SCANOUT-WRITE] writer={writer:?} target={:?} direct={}",
+                        target.texture, target.direct_scanout,
+                    );
+                }
             }
         }
         if let Some(depth) = depth {
             if depth.sample_count > 1 {
                 self.mark_multisample_texture_initialized(depth.texture, depth.sample_count);
             }
-            if depth.write_enabled {
+            if depth.write_enabled || depth.clear_enabled {
                 if depth.sample_count > 1 {
                     self.mark_resident_texture_written_preserving_multisample(depth.texture);
                 } else {
@@ -6016,9 +7893,36 @@ impl MetalPresenter {
                 }
             }
         }
-        for texture in export_textures.iter().chain(&pixel_textures) {
-            if texture.writable {
+        let diagnostic_sampled_storage = diagnostic_texture_writer_enabled().then(|| {
+            sampled_image_bindings(pixel_evaluation)
+                .filter_map(|binding| decode_image_descriptor(&binding.resource_descriptor).ok())
+                .map(|descriptor| descriptor.guest)
+                .collect::<Vec<_>>()
+        });
+        for (stage, shader, textures) in [
+            (
+                "vertex-storage",
+                draw.export_shader_address,
+                export_textures.as_slice(),
+            ),
+            (
+                "pixel-storage",
+                draw.pixel_shader_address,
+                pixel_textures.as_slice(),
+            ),
+        ] {
+            for texture in textures.iter().filter(|texture| texture.writable) {
+                if let Some(sampled) = diagnostic_sampled_storage.as_ref() {
+                    record_diagnostic_texture_writer(
+                        texture.descriptor.guest,
+                        stage,
+                        draw.sequence,
+                        shader,
+                        sampled.clone(),
+                    );
+                }
                 self.mark_resident_texture_written(texture.descriptor.guest);
+                self.note_pending_flip_target_write(texture.descriptor.guest);
             }
         }
         let diagnostic_target = diagnostic_dump_target_pixel_shader()
@@ -6030,6 +7934,8 @@ impl MetalPresenter {
                         draw.pixel_shader
                             .as_ref()
                             .is_some_and(|shader| shader.program.instructions.len() == count)
+                            && (!diagnostic_dump_video_target_consumer()
+                                || video_target_binding_summary(pixel_evaluation).is_some())
                     })
                     .and_then(|_| targets.first())
             })
@@ -6057,6 +7963,19 @@ impl MetalPresenter {
                     && evaluation_samples_large_linear_video(pixel_evaluation))
                 .then(|| targets.first())
                 .flatten()
+            })
+            .or_else(|| {
+                (diagnostic_dump_video_target_consumer()
+                    && video_target_binding_summary(pixel_evaluation).is_some())
+                .then(|| targets.first())
+                .flatten()
+            })
+            .or_else(|| {
+                (diagnostic_dump_video_chain_consumer()
+                    && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed)
+                        == draw.sequence)
+                    .then(|| targets.first())
+                    .flatten()
             });
         if draw.sequence >= diagnostic_dump_target_minimum_draw()
             && let Some(target) = diagnostic_target
@@ -6069,6 +7988,10 @@ impl MetalPresenter {
                     .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
             {
+                eprintln!(
+                    "[REMu][METAL][TARGET-MATCH] index={target_match} draw={} es={:#x} ps={:#x} target={:?}",
+                    draw.sequence, draw.export_shader_address, draw.pixel_shader_address, target,
+                );
                 self.wait_for_guest_command_batches()?;
                 let descriptor = target.texture;
                 let texture = if target.direct_scanout {
@@ -6077,10 +8000,19 @@ impl MetalPresenter {
                         .ok_or("diagnostic target has no direct scanout Metal texture")?
                         .texture
                         .clone()
+                } else if let Some(resident) = self.resident_guest_textures.get(&descriptor) {
+                    resident.texture.clone()
+                } else if let Some(snapshot) =
+                    self.scanout_snapshot_textures.get(&descriptor.address)
+                {
+                    snapshot.texture.clone()
                 } else {
                     self.resident_guest_textures
-                        .get(&descriptor)
-                        .ok_or("diagnostic target has no resident Metal texture")?
+                        .values()
+                        .find(|resident| {
+                            guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
+                        })
+                        .ok_or("diagnostic target has no resident or scanout Metal texture")?
                         .texture
                         .clone()
                 };
@@ -6837,10 +8769,12 @@ impl MetalPresenter {
                 eprintln!("[REMu][METAL] translated scanout retry failed: {error}");
             }
         }
-        // The VideoOut ABI uses zero for the console's tiled scanout and one for a linear
-        // allocation. Raw guest-memory upload is valid only for the latter; translated render
-        // targets take the texture path above and retain their architectural tile mode.
-        if !raw_video_out_layout_is_linear(display.tiling_mode, display.pitch, display.width) {
+        // A translated render target is authoritative when one exists. Before the first GPU
+        // render pass, however, splash screens and decoded videos can be written directly into a
+        // registered VideoOut allocation. Preserve both ABI layouts here: zero is the console's
+        // display-tiled mode (the same mode-27 layout exposed by its color target), while one is
+        // row-linear.
+        let Some(guest_descriptor) = raw_video_out_texture_descriptor(flip.address, display) else {
             if !self.logged_unsupported_layout {
                 eprintln!(
                     "[REMu][METAL] cannot upload display layout tiling={} pitch={} width={} yet",
@@ -6849,19 +8783,31 @@ impl MetalPresenter {
                 self.logged_unsupported_layout = true;
             }
             return;
-        }
+        };
         let Some(device) = self.device.as_ref() else {
             return;
         };
-        let Some(row_bytes) = u64::from(display.pitch).checked_mul(4) else {
+        let Some(row_bytes) = u64::from(display.width).checked_mul(4) else {
             return;
         };
-        let Some(frame_bytes) = row_bytes.checked_mul(u64::from(display.height)) else {
-            return;
-        };
-        if flip.address == 0 || frame_bytes > 128 * 1024 * 1024 {
+        if flip.address == 0 {
             return;
         }
+        let frame = match snapshot_guest_texture_raw(guest_descriptor)
+            .and_then(|raw| decode_guest_texture_linear_from_raw(guest_descriptor, &raw))
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                if !self.logged_unsupported_layout {
+                    eprintln!(
+                        "[REMu][METAL] could not upload raw display buffer at {:#x}: {error}",
+                        flip.address
+                    );
+                    self.logged_unsupported_layout = true;
+                }
+                return;
+            }
+        };
         if self.frame_texture_size != (display.width, display.height) {
             let descriptor = TextureDescriptor::new();
             descriptor.set_texture_type(MTLTextureType::D2);
@@ -6879,15 +8825,13 @@ impl MetalPresenter {
         let Ok(bytes_per_row) = usize::try_from(row_bytes) else {
             return;
         };
-        let Ok(source) = usize::try_from(flip.address) else {
-            return;
-        };
         texture.replace_region(
             MTLRegion::new_2d(0, 0, u64::from(display.width), u64::from(display.height)),
             0,
-            source as *const c_void,
+            frame.as_ptr().cast::<c_void>(),
             bytes_per_row as u64,
         );
+        self.active_translated_scanout = None;
         let capture = (self.capture_directory.is_some()
             && self
                 .last_guest_capture
@@ -7046,14 +8990,61 @@ impl MetalPresenter {
             return;
         }
         self.upload_pending_frame();
-        // A resize can request a redraw before the guest has registered or flipped a display
-        // buffer. Retire that request without acquiring a drawable: leaving it pending makes
-        // Winit call this path every millisecond, needlessly presenting an empty surface while
-        // the guest is still starting. The first real flip sets `redraw_pending` again.
-        let (Some(display), Some(texture)) = (self.display, self.frame_texture.as_ref()) else {
-            self.redraw_pending = false;
-            return;
+        let translated_snapshot = self
+            .active_translated_scanout
+            .filter(|scanout| scanout.sequence == self.uploaded_flip_sequence)
+            .and_then(|scanout| {
+                self.scanout_snapshot_textures
+                    .get(&scanout.address)
+                    .filter(|snapshot| {
+                        snapshot.descriptor.width == scanout.width
+                            && snapshot.descriptor.height == scanout.height
+                    })
+                    .map(|snapshot| (snapshot.descriptor, snapshot.texture.clone()))
+            });
+        let guest_frame_texture = self.frame_texture.clone();
+        let host_splash = self
+            .host_splash
+            .as_ref()
+            .map(|splash| (splash.texture.clone(), splash.width, splash.height));
+        let (frame_texture, source_dimensions) = if let Some((texture, width, height)) = host_splash
+        {
+            (Some(texture), Some((width, height)))
+        } else {
+            (
+                guest_frame_texture,
+                self.display.map(|display| (display.width, display.height)),
+            )
         };
+        let capture_due = self.capture_directory.is_some()
+            && self
+                .last_guest_capture
+                .is_none_or(|last| last.elapsed() >= capture_interval());
+        if capture_due
+            && let Some((descriptor, texture)) = translated_snapshot.as_ref()
+            && matches!(
+                descriptor.pixel_format,
+                MTLPixelFormat::RGBA8Unorm
+                    | MTLPixelFormat::RGBA8Unorm_sRGB
+                    | MTLPixelFormat::BGRA8Unorm
+                    | MTLPixelFormat::BGRA8Unorm_sRGB
+                    | MTLPixelFormat::RGBA16Float
+            )
+            && let (Some(device), Some(queue)) = (
+                self.device.as_ref().cloned(),
+                self.command_queue.as_ref().cloned(),
+            )
+        {
+            match read_texture_linear(&device, &queue, texture, *descriptor) {
+                Ok(rendered) => self.capture_translated_frame_if_changed(*descriptor, &rendered),
+                Err(error) => {
+                    eprintln!("[REMu][METAL] could not capture live translated frame: {error}");
+                }
+            }
+        }
+        // A host splash is presentable before VideoOut registration. After HideSplash, a missing
+        // guest texture intentionally clears the old system-owned image to black until the first
+        // guest scanout is ready.
         let (Some(layer), Some(queue)) = (self.layer.as_ref(), self.command_queue.as_ref()) else {
             return;
         };
@@ -7079,22 +9070,41 @@ impl MetalPresenter {
         attachment.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
         let encoder = command_buffer.new_render_command_encoder(pass);
         encoder.set_label("REMu scaled display-buffer presentation");
-        encoder.set_render_pipeline_state(&self.presentation.pipeline);
-        encoder.set_viewport(presentation_viewport(
-            display.width,
-            display.height,
-            destination_width,
-            destination_height,
-        ));
-        encoder.set_fragment_texture(0, Some(texture));
-        encoder.set_fragment_sampler_state(0, Some(&self.presentation.sampler));
-        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+        if let Some(texture) = frame_texture.as_ref() {
+            let (source_width, source_height) = source_dimensions
+                .expect("every presentation texture has validated source dimensions");
+            encoder.set_render_pipeline_state(&self.presentation.pipeline);
+            encoder.set_viewport(presentation_viewport(
+                source_width,
+                source_height,
+                destination_width,
+                destination_height,
+            ));
+            encoder.set_fragment_texture(0, Some(texture));
+            encoder.set_fragment_sampler_state(0, Some(&self.presentation.sampler));
+            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+        }
         encoder.end_encoding();
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        let flip_completion = self
+            .pending_flip
+            .filter(|flip| {
+                flip.sequence == self.finalized_flip_sequence
+                    && flip.sequence > self.submitted_flip_sequence
+            })
+            .map(|flip| {
+                self.submitted_flip_sequence = flip.sequence;
+                remu_gpu::GpuFlipCompletion {
+                    address: flip.address,
+                    buffer_index: flip.buffer_index,
+                    flip_argument: flip.flip_argument,
+                }
+            });
         self.pending_presentations.push_back(PendingPresentation {
             command_buffer,
             submitted_at: Instant::now(),
+            flip_completion,
         });
         self.redraw_pending = false;
     }
@@ -7159,6 +9169,10 @@ fn unsigned_float_to_srgb_unorm8(bits: u32, mantissa_bits: u32) -> u8 {
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn half_float_to_unorm8(bits: u16) -> u8 {
+    float_to_unorm8(half_float_to_f32(bits))
+}
+
+fn half_float_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15);
     let exponent = u32::from((bits >> 10) & 0x1f);
     let significand = u32::from(bits & 0x03ff);
@@ -7173,7 +9187,7 @@ fn half_float_to_unorm8(bits: u16) -> u8 {
         0x1f => (sign << 31) | 0x7f80_0000 | (significand << 13),
         _ => (sign << 31) | ((exponent + 112) << 23) | (significand << 13),
     };
-    float_to_unorm8(f32::from_bits(float_bits))
+    f32::from_bits(float_bits)
 }
 
 fn native_texture_capture_to_bgra(
@@ -7326,35 +9340,18 @@ fn compute_program_can_split_wave64(program: &Program) -> bool {
 fn wave64_split_blockers(program: &Program) -> Vec<String> {
     let mut blockers = Vec::new();
     for instruction in &program.instructions {
-        let dpp = matches!(
-            instruction.control.as_ref(),
-            Some(InstructionControl::Dpp(_) | InstructionControl::Dpp8(_))
-        );
         let name = instruction.opcode.known_name();
         let wave_sensitive = name.is_none_or(|name| {
-            [
-                "Readlane",
-                "Writelane",
-                "Mbcnt",
-                "Swizzle",
-                "Ballot",
-                "Saveexec",
-            ]
-            .iter()
-            .any(|wave_operation| name.contains(wave_operation))
+            ["Swizzle", "Ballot", "Saveexec"]
+                .iter()
+                .any(|wave_operation| name.contains(wave_operation))
                 // Structured wave64 predication is represented half-locally across the two
-                // Metal SIMD32 groups. The observed SAndSaveexecB64 operation is therefore
-                // split-safe; other saveexec variants remain rejected until their full-mask
-                // behavior is proven.
-                && name != "SAndSaveexecB64"
+                // Metal SIMD32 groups. These exercised operations consume only the current
+                // architectural half of the mask, so each SIMD32 subgroup computes it exactly.
+                && !matches!(name, "SAndSaveexecB64" | "SOrn2SaveexecB64")
         });
-        if dpp || wave_sensitive {
-            blockers.push(format!(
-                "{:#x}:{}{}",
-                instruction.pc,
-                instruction.opcode,
-                if dpp { "/dpp" } else { "" }
-            ));
+        if wave_sensitive {
+            blockers.push(format!("{:#x}:{}", instruction.pc, instruction.opcode));
         }
     }
     blockers
@@ -7461,6 +9458,7 @@ fn compile_metal_library_with_tools(
                 return Ok(library);
             }
             Err(error) => {
+                PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "[REMu][METAL] discarding unreadable cached {stage} library {}: {error}",
                     cache_path.display()
@@ -7847,6 +9845,7 @@ fn watch_sampled_texture(
     )
 }
 
+#[track_caller]
 fn snapshot_watched_sampled_texture_raw(
     descriptor: DecodedImageDescriptor,
     write_watch: &GuestTextureWriteWatch,
@@ -7887,11 +9886,31 @@ fn decode_sampled_texture_linear_from_raw(
     Ok(linear)
 }
 
+#[track_caller]
 fn snapshot_watched_guest_range(
     address: u64,
     byte_count: usize,
     write_watch: &GuestTextureWriteWatch,
 ) -> Result<Vec<u8>, String> {
+    let started = Instant::now();
+    let caller_line = std::panic::Location::caller().line();
+    let precise_tracking = write_watch.precise_tracking();
+    let dirty_page_ranges = precise_tracking
+        .then(|| write_watch.dirty_page_ranges())
+        .unwrap_or_default();
+    let dirty_bytes = dirty_page_ranges
+        .iter()
+        .fold(0_u64, |total, (_, range_byte_count)| {
+            total.saturating_add(*range_byte_count)
+        });
+    record_texture_dirty_work_detail(
+        address,
+        byte_count,
+        caller_line,
+        precise_tracking,
+        dirty_page_ranges.len(),
+        dirty_bytes,
+    );
     let byte_count_u64 =
         u64::try_from(byte_count).map_err(|_| "guest range length does not fit u64")?;
     let source_address =
@@ -7916,20 +9935,34 @@ fn snapshot_watched_guest_range(
             }
         }
     };
-    if !write_watch.precise_tracking() {
-        return snapshot();
-    }
-    loop {
-        let _ = write_watch.consume_dirty();
-        write_watch.rearm()?;
-        let generations = write_watch.generations();
-        let raw = snapshot()?;
-        if write_watch.generations() == generations && !write_watch.is_dirty() {
-            return Ok(raw);
+    let result = if !write_watch.precise_tracking() {
+        snapshot()
+    } else {
+        loop {
+            let _ = write_watch.consume_dirty();
+            write_watch.rearm()?;
+            let generations = write_watch.generations();
+            let raw = snapshot()?;
+            if write_watch.generations() == generations && !write_watch.is_dirty() {
+                break Ok(raw);
+            }
         }
+    };
+    if result.is_ok() {
+        let elapsed = started.elapsed();
+        record_texture_work(
+            &TEXTURE_SNAPSHOT_COUNT,
+            &TEXTURE_SNAPSHOT_BYTES,
+            &TEXTURE_SNAPSHOT_NANOSECONDS,
+            byte_count,
+            elapsed,
+        );
+        record_texture_snapshot_work_detail(address, byte_count, caller_line, elapsed);
     }
+    result
 }
 
+#[track_caller]
 fn snapshot_watched_guest_texture_raw(
     descriptor: GuestTextureDescriptor,
     write_watch: &GuestTextureWriteWatch,
@@ -7949,40 +9982,13 @@ fn write_watched_guest_range(
         ));
     }
     let byte_count = u64::try_from(raw.len()).map_err(|_| "guest range length does not fit u64")?;
-    if guest_shared_mapping_identity(address, byte_count).is_some()
-        && write_watch.has_single_covering_mapping(address, byte_count)
-    {
-        let destination =
-            usize::try_from(address).map_err(|_| "guest range address does not fit usize")?;
-        return write_watch.with_contiguous_mapping(address, byte_count, || {
-            // SAFETY: with_contiguous_mapping pins the complete writable mapping for this copy.
-            unsafe {
-                std::ptr::copy_nonoverlapping(raw.as_ptr(), destination as *mut u8, raw.len());
-            }
-        });
-    }
-    if write_guest_shared_backing(address, raw) {
+    let wrote = write_watch.with_live_backing(|| write_guest_shared_backing(address, raw))?;
+    if wrote {
         Ok(())
     } else {
         Err(format!(
             "guest range {address:#x}+{byte_count:#x} lost shared backing during writeback"
         ))
-    }
-}
-
-fn rearm_guest_texture_after_gpu_writeback(
-    write_watch: &GuestTextureWriteWatch,
-) -> Result<(), String> {
-    if !write_watch.precise_tracking() {
-        return Ok(());
-    }
-    loop {
-        let generations = write_watch.generations();
-        let _ = write_watch.consume_dirty();
-        write_watch.rearm()?;
-        if write_watch.generations() == generations && !write_watch.is_dirty() {
-            return Ok(());
-        }
     }
 }
 
@@ -8061,6 +10067,7 @@ fn snapshot_guest_texture_linear(descriptor: GuestTextureDescriptor) -> Result<V
     decode_guest_texture_linear_from_raw(descriptor, source)
 }
 
+#[cfg(test)]
 fn write_guest_texture_linear(
     descriptor: GuestTextureDescriptor,
     linear: &[u8],
@@ -8185,30 +10192,27 @@ fn write_watched_guest_texture_linear(
     }
     let byte_count = guest_texture_byte_count(descriptor)
         .ok_or("guest texture byte count overflows the host address space")?;
-    if guest_shared_mapping_identity(descriptor.address, byte_count).is_some()
-        && write_watch.has_single_covering_mapping(descriptor.address, byte_count)
-    {
-        return write_watch.with_contiguous_mapping(descriptor.address, byte_count, || {
-            write_guest_texture_linear(descriptor, linear)
-        })?;
-    }
     let destination_length =
         usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
-    let mut destination = vec![0; destination_length];
-    if !read_guest_shared_backing(descriptor.address, &mut destination) {
-        return Err(format!(
-            "guest texture range {:#x}+{byte_count:#x} has no complete live shared backing",
-            descriptor.address
-        ));
-    }
-    write_guest_texture_linear_into_raw(descriptor, linear, &mut destination)?;
-    if !write_guest_shared_backing(descriptor.address, &destination) {
-        return Err(format!(
-            "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
-            descriptor.address
-        ));
-    }
-    Ok(())
+    write_watch
+        .with_live_backing(|| {
+            let mut destination = vec![0; destination_length];
+            if !read_guest_shared_backing(descriptor.address, &mut destination) {
+                return Err(format!(
+                    "guest texture range {:#x}+{byte_count:#x} has no complete live shared backing",
+                    descriptor.address
+                ));
+            }
+            write_guest_texture_linear_into_raw(descriptor, linear, &mut destination)?;
+            if !write_guest_shared_backing(descriptor.address, &destination) {
+                return Err(format!(
+                    "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
+                    descriptor.address
+                ));
+            }
+            Ok(())
+        })
+        .and_then(|result| result)
 }
 
 fn create_guest_texture(
@@ -8233,14 +10237,7 @@ fn create_guest_texture(
             linear.len()
         ));
     }
-    let descriptor = TextureDescriptor::new();
-    descriptor.set_texture_type(MTLTextureType::D2);
-    descriptor.set_pixel_format(guest.pixel_format);
-    descriptor.set_width(u64::from(guest.width));
-    descriptor.set_height(u64::from(guest.height));
-    descriptor.set_storage_mode(MTLStorageMode::Shared);
-    descriptor.set_usage(usage);
-    let texture = device.new_texture(&descriptor);
+    let texture = create_uninitialized_guest_texture(device, guest, usage)?;
     texture.replace_region(
         MTLRegion::new_2d(0, 0, u64::from(guest.width), u64::from(guest.height)),
         0,
@@ -8252,12 +10249,37 @@ fn create_guest_texture(
     Ok(texture)
 }
 
+fn create_uninitialized_guest_texture(
+    device: &Device,
+    guest: GuestTextureDescriptor,
+    usage: MTLTextureUsage,
+) -> Result<Texture, String> {
+    if guest.width == 0 || guest.height == 0 {
+        return Err(format!(
+            "invalid zero-sized guest texture {}x{} format {:?}",
+            guest.width, guest.height, guest.pixel_format,
+        ));
+    }
+    // Validate the guest/Metal format relationship even though a following render-pass clear,
+    // rather than a CPU upload, supplies the initial contents.
+    let _ = texture_element_layout(guest)?;
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(guest.pixel_format);
+    descriptor.set_width(u64::from(guest.width));
+    descriptor.set_height(u64::from(guest.height));
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(usage);
+    Ok(device.new_texture(&descriptor))
+}
+
 fn create_mipmapped_guest_texture(
     device: &Device,
     guest: GuestTextureDescriptor,
     mip_level_count: u32,
     linear_levels: &[Vec<u8>],
 ) -> Result<Texture, String> {
+    let started = Instant::now();
     let layout = mode27_mip_chain_layout(guest, mip_level_count)?;
     if linear_levels.len() != layout.levels.len() {
         return Err(format!(
@@ -8305,6 +10327,13 @@ fn create_mipmapped_guest_texture(
                 .expect("validated mip row size fits u64"),
         );
     }
+    record_texture_work(
+        &MIP_UPLOAD_COUNT,
+        &MIP_UPLOAD_BYTES,
+        &MIP_UPLOAD_NANOSECONDS,
+        linear_levels.iter().map(Vec::len).sum(),
+        started.elapsed(),
+    );
     Ok(texture)
 }
 
@@ -8338,6 +10367,7 @@ fn create_exact_mode27_sampled_mip_view(
         .base_mip_level
         .checked_add(descriptor.mip_level_count)
         .ok_or("sampled mip range overflows")?;
+    let started = Instant::now();
     let (_, linear_levels) =
         decode_mode27_mip_chain_from_raw(descriptor.guest, underlying_mip_count, raw)?;
     let texture = create_mipmapped_guest_texture(
@@ -8346,6 +10376,13 @@ fn create_exact_mode27_sampled_mip_view(
         underlying_mip_count,
         &linear_levels,
     )?;
+    record_mode27_work_detail(
+        Mode27WorkOrigin::SampledCacheCreate,
+        descriptor.guest,
+        underlying_mip_count,
+        raw.len(),
+        started.elapsed(),
+    );
     if descriptor.base_mip_level == 0 && descriptor.mip_level_count == underlying_mip_count {
         return Ok(texture);
     }
@@ -8699,11 +10736,11 @@ fn validate_texture_readback_source(
             texture.texture_type()
         ));
     }
-    if texture.width() != u64::from(descriptor.width)
-        || texture.height() != u64::from(descriptor.height)
+    if texture.width() < u64::from(descriptor.width)
+        || texture.height() < u64::from(descriptor.height)
     {
         return Err(format!(
-            "Metal texture readback extent mismatch: texture={}x{} descriptor={}x{}",
+            "Metal texture readback source is smaller than its guest region: texture={}x{} descriptor={}x{}",
             texture.width(),
             texture.height(),
             descriptor.width,
@@ -8973,6 +11010,7 @@ fn ensure_resident_texture_in_map(
     device: &Device,
     descriptor: GuestTextureDescriptor,
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    upload_guest_contents: bool,
 ) -> Result<Texture, String> {
     if let Some(resident) = resident_guest_textures
         .get_mut(&descriptor)
@@ -8989,14 +11027,15 @@ fn ensure_resident_texture_in_map(
     }
     resident_guest_textures.remove(&descriptor);
     let write_watch = watch_guest_texture(descriptor)?;
-    let raw = snapshot_watched_guest_texture_raw(descriptor, &write_watch)?;
-    let linear = decode_guest_texture_linear_from_raw(descriptor, &raw)?;
-    let texture = create_guest_texture(
-        device,
-        descriptor,
-        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite,
-        &linear,
-    )?;
+    let usage =
+        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
+    let texture = if upload_guest_contents {
+        let raw = snapshot_watched_guest_texture_raw(descriptor, &write_watch)?;
+        let linear = decode_guest_texture_linear_from_raw(descriptor, &raw)?;
+        create_guest_texture(device, descriptor, usage, &linear)?
+    } else {
+        create_uninitialized_guest_texture(device, descriptor, usage)?
+    };
     texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));
     resident_guest_textures.insert(
         descriptor,
@@ -9007,6 +11046,7 @@ fn ensure_resident_texture_in_map(
             texture_type: 9,
             layer_count: 1,
             mip_level_count: 1,
+            inferred_hierarchy: false,
             write_watch,
             gpu_written: false,
             content_version: 0,
@@ -9024,6 +11064,7 @@ fn ensure_mipmapped_resident_texture_in_map(
     device: &Device,
     descriptor: DecodedImageDescriptor,
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    origin: Mode27WorkOrigin,
 ) -> Result<Texture, String> {
     if descriptor.texture_type != 9
         || descriptor.layer_count != 1
@@ -9055,6 +11096,9 @@ fn ensure_mipmapped_resident_texture_in_map(
             WriteWatchRefresh::Active
             | WriteWatchRefresh::Reprotecting
             | WriteWatchRefresh::Renewed { .. } => {
+                if origin != Mode27WorkOrigin::AutomaticPromotion {
+                    resident.inferred_hierarchy = false;
+                }
                 return resident_texture_for_sample(resident, descriptor).ok_or_else(|| {
                     "resident mip hierarchy cannot represent storage view".to_owned()
                 });
@@ -9072,6 +11116,7 @@ fn ensure_mipmapped_resident_texture_in_map(
         ));
     }
     resident_guest_textures.remove(&descriptor.guest);
+    let started = Instant::now();
     let layout = mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
     let write_watch = watch_resident_texture(
         descriptor.guest,
@@ -9089,6 +11134,13 @@ fn ensure_mipmapped_resident_texture_in_map(
         underlying_mip_count,
         &linear_levels,
     )?;
+    record_mode27_work_detail(
+        origin,
+        descriptor.guest,
+        underlying_mip_count,
+        layout.byte_count,
+        started.elapsed(),
+    );
     texture.set_label(&format!(
         "REMu {}-level storage image {:#x}",
         underlying_mip_count, descriptor.guest.address
@@ -9102,6 +11154,7 @@ fn ensure_mipmapped_resident_texture_in_map(
             texture_type: descriptor.texture_type,
             layer_count: descriptor.layer_count,
             mip_level_count: underlying_mip_count,
+            inferred_hierarchy: origin == Mode27WorkOrigin::AutomaticPromotion,
             write_watch,
             gpu_written: false,
             content_version: 0,
@@ -9193,6 +11246,11 @@ fn shader_scalar_metadata_for_registers(
     user_data_register: u32,
     scalar_register_base: usize,
 ) -> Result<Vec<u32>, String> {
+    debug_assert!(
+        shader_registers
+            .windows(2)
+            .all(|registers| registers[0].offset <= registers[1].offset)
+    );
     let mut words = shader_scalar_metadata(evaluation)?;
     let scalar_end = scalar_register_base
         .saturating_add(64)
@@ -9200,10 +11258,8 @@ fn shader_scalar_metadata_for_registers(
     for scalar_register in scalar_register_base..scalar_end {
         let offset = u32::try_from(scalar_register - scalar_register_base)
             .map_err(|_| "shader scalar register offset does not fit u32")?;
-        words[scalar_register] = shader_registers
-            .iter()
-            .find(|register| register.offset == user_data_register + offset)
-            .map_or(0, |register| register.value);
+        words[scalar_register] =
+            register_value(shader_registers, user_data_register + offset).unwrap_or_default();
     }
     Ok(words)
 }
@@ -9231,6 +11287,7 @@ fn collect_pending_global_writebacks(
         }
         if pending.iter().any(|writeback| {
             writeback.buffer.as_ptr() == buffer.buffer.as_ptr()
+                && writeback.offset == buffer.offset
                 && writeback.guest_address == binding.base_address
                 && writeback.byte_count == binding.byte_count
         }) {
@@ -9238,6 +11295,7 @@ fn collect_pending_global_writebacks(
         }
         pending.push(PendingGlobalWriteback {
             buffer: buffer.buffer.clone(),
+            offset: buffer.offset,
             guest_address: binding.base_address,
             byte_count: binding.byte_count,
         });
@@ -9280,6 +11338,7 @@ fn append_unique_global_writebacks(
     for writeback in source {
         let duplicate = destination.iter().any(|existing| {
             existing.buffer.as_ptr() == writeback.buffer.as_ptr()
+                && existing.offset == writeback.offset
                 && existing.guest_address == writeback.guest_address
                 && existing.byte_count == writeback.byte_count
         });
@@ -9308,7 +11367,10 @@ fn write_back_pending_globals(pending: &[PendingGlobalWriteback]) -> Result<(), 
         // command buffer owns a Metal buffer of the same exact byte length.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                writeback.buffer.contents().cast::<u8>(),
+                writeback.buffer.contents().cast::<u8>().add(
+                    usize::try_from(writeback.offset)
+                        .map_err(|_| "writable global buffer offset does not fit usize")?,
+                ),
                 destination as *mut u8,
                 writeback.byte_count,
             );
@@ -9586,6 +11648,10 @@ fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescriptor, Stri
     })
 }
 
+fn sampled_alias_descriptor(binding: &ImageBinding) -> Option<DecodedImageDescriptor> {
+    decode_image_descriptor(&binding.resource_descriptor).ok()
+}
+
 fn fallback_image_descriptor(binding: &ImageBinding) -> Result<DecodedImageDescriptor, String> {
     let unified_format = binding
         .resource_descriptor
@@ -9648,6 +11714,395 @@ fn trace_target_sampling() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("REMU_TRACE_TARGET_SAMPLING").is_some_and(|value| value == "1")
+    })
+}
+
+fn trace_video_target_consumers() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_VIDEO_TARGETS").is_some_and(|value| value == "1")
+    })
+}
+
+fn diagnostic_dump_video_target_consumer() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_DUMP_VIDEO_TARGET_CONSUMER").is_some_and(|value| value == "1")
+    })
+}
+
+fn diagnostic_dump_video_chain_consumer() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_DUMP_VIDEO_CHAIN_CONSUMER").is_some_and(|value| value == "1")
+    })
+}
+
+fn diagnostic_video_chain_selected_draw() -> &'static AtomicU64 {
+    static DRAW: AtomicU64 = AtomicU64::new(0);
+    &DRAW
+}
+
+fn video_target_binding_summary(evaluation: &ShaderEvaluation) -> Option<String> {
+    let bindings = evaluation
+        .image_bindings
+        .iter()
+        .filter_map(|binding| {
+            let descriptor = decode_image_descriptor(&binding.resource_descriptor).ok()?;
+            (descriptor.guest.width == 378 && descriptor.guest.height == 150).then(|| {
+                format!(
+                    "pc={:#x} op={:?} addr={:#x} format={:?} tile={} base_mip={} mips={} storage={}",
+                    binding.pc,
+                    binding.opcode,
+                    descriptor.guest.address,
+                    descriptor.guest.pixel_format,
+                    descriptor.guest.tile_mode,
+                    descriptor.base_mip_level,
+                    descriptor.mip_level_count,
+                    is_storage_image_opcode(binding.opcode),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    (!bindings.is_empty()).then(|| bindings.join("; "))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DiagnosticVideoChainProducer {
+    stage: &'static str,
+    sequence: u64,
+    shader: u64,
+    generation: u32,
+}
+
+fn diagnostic_video_chain_textures()
+-> &'static Mutex<HashMap<GuestTextureDescriptor, DiagnosticVideoChainProducer>> {
+    static TEXTURES: OnceLock<
+        Mutex<HashMap<GuestTextureDescriptor, DiagnosticVideoChainProducer>>,
+    > = OnceLock::new();
+    TEXTURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn diagnostic_video_chain_matches(
+    evaluation: &ShaderEvaluation,
+) -> Vec<(
+    &ImageBinding,
+    DecodedImageDescriptor,
+    GuestTextureDescriptor,
+    DiagnosticVideoChainProducer,
+)> {
+    let tracked = diagnostic_video_chain_textures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(descriptor, producer)| (*descriptor, *producer))
+        .collect::<Vec<_>>();
+    evaluation
+        .image_bindings
+        .iter()
+        .filter(|binding| !is_writable_image_opcode(binding.opcode))
+        .filter_map(|binding| {
+            let descriptor = decode_image_descriptor(&binding.resource_descriptor).ok()?;
+            tracked
+                .iter()
+                .find(|(candidate, _)| {
+                    candidate.address == descriptor.guest.address
+                        || guest_texture_descriptors_share_storage(*candidate, descriptor.guest)
+                        || guest_texture_descriptors_overlap(*candidate, descriptor.guest)
+                })
+                .map(|(candidate, producer)| (binding, descriptor, *candidate, *producer))
+        })
+        .collect()
+}
+
+fn video_chain_binding_summary(evaluation: &ShaderEvaluation) -> Option<String> {
+    let bindings = diagnostic_video_chain_matches(evaluation)
+        .into_iter()
+        .map(|(binding, descriptor, source, producer)| {
+            format!(
+                "pc={:#x} op={:?} addr={:#x} {}x{} format={:?} tile={} base_mip={} mips={} source={:#x}/{}x{} producer={}:{}:{:#x} generation={}",
+                binding.pc,
+                binding.opcode,
+                descriptor.guest.address,
+                descriptor.guest.width,
+                descriptor.guest.height,
+                descriptor.guest.pixel_format,
+                descriptor.guest.tile_mode,
+                descriptor.base_mip_level,
+                descriptor.mip_level_count,
+                source.address,
+                source.width,
+                source.height,
+                producer.stage,
+                producer.sequence,
+                producer.shader,
+                producer.generation,
+            )
+        })
+        .collect::<Vec<_>>();
+    (!bindings.is_empty()).then(|| bindings.join("; "))
+}
+
+fn record_diagnostic_video_chain_texture(
+    descriptor: GuestTextureDescriptor,
+    stage: &'static str,
+    sequence: u64,
+    shader: u64,
+    generation: u32,
+) {
+    diagnostic_video_chain_textures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            descriptor,
+            DiagnosticVideoChainProducer {
+                stage,
+                sequence,
+                shader,
+                generation,
+            },
+        );
+}
+
+fn trace_video_target_draw_consumer(draw: &IndexedDraw) {
+    if !trace_video_target_consumers() && !diagnostic_dump_video_chain_consumer() {
+        return;
+    }
+    let export = draw
+        .export_shader_evaluation
+        .as_deref()
+        .and_then(video_target_binding_summary);
+    let pixel = draw
+        .pixel_shader_evaluation
+        .as_deref()
+        .and_then(video_target_binding_summary);
+    let export_chain = draw
+        .export_shader_evaluation
+        .as_deref()
+        .and_then(video_chain_binding_summary);
+    let pixel_chain = draw
+        .pixel_shader_evaluation
+        .as_deref()
+        .and_then(video_chain_binding_summary);
+    let root = export.is_some() || pixel.is_some();
+    let chained = export_chain.is_some() || pixel_chain.is_some();
+    if !root && !chained {
+        return;
+    }
+    if chained
+        && diagnostic_dump_video_chain_consumer()
+        && draw.sequence >= diagnostic_dump_target_minimum_draw()
+        && decode_render_targets(draw).is_ok_and(|targets| !targets.is_empty())
+    {
+        let _ = diagnostic_video_chain_selected_draw().compare_exchange(
+            0,
+            draw.sequence,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+    let target_mask = register_value(&draw.context_registers, CB_TARGET_MASK).unwrap_or_default();
+    let depth = decode_depth_target(draw)
+        .map(|depth| format!("{depth:?}"))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let raster = decode_raster_state(draw)
+        .map(|raster| format!("{raster:?}"))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    let geometry = decode_render_targets(draw)
+        .ok()
+        .and_then(|targets| {
+            targets
+                .first()
+                .map(|target| (target.texture.width, target.texture.height))
+        })
+        .or_else(|| {
+            decode_depth_target(draw)
+                .ok()
+                .flatten()
+                .map(|depth| (depth.texture.width, depth.texture.height))
+        })
+        .map(|(width, height)| {
+            decode_scissor(draw, width, height)
+                .map(|scissor| {
+                    let viewport = decode_viewport(draw, width, height, scissor);
+                    format!(
+                        "scissor={scissor:?} viewport=({:.1},{:.1} {:.1}x{:.1} {:.3}..{:.3})",
+                        viewport.originX,
+                        viewport.originY,
+                        viewport.width,
+                        viewport.height,
+                        viewport.znear,
+                        viewport.zfar,
+                    )
+                })
+                .unwrap_or_else(|error| format!("unavailable: {error}"))
+        })
+        .unwrap_or_else(|| "unavailable: no attachment extent".to_owned());
+    let decoded_targets = decode_render_targets(draw);
+    let targets = decoded_targets
+        .as_ref()
+        .map(|targets| {
+            targets
+                .iter()
+                .map(|target| {
+                    let blend_control = register_value(
+                        &draw.context_registers,
+                        CB_BLEND0_CONTROL + target.guest_slot,
+                    )
+                    .unwrap_or(0x2001_0001);
+                    let blend = decode_metal_blend_attachment(blend_control)
+                        .map(|blend| format!("{blend:?}"))
+                        .unwrap_or_else(|error| format!("unavailable: {error}"));
+                    format!(
+                        "slot={} addr={:#x} {}x{} format={:?} mask={:#x} blend_control={:#010x} blend=[{}]",
+                        target.guest_slot,
+                        target.texture.address,
+                        target.texture.width,
+                        target.texture.height,
+                        target.texture.pixel_format,
+                        target.write_mask,
+                        blend_control,
+                        blend,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    if let Ok(targets) = &decoded_targets {
+        let generation = if root {
+            1
+        } else {
+            diagnostic_video_chain_matches(
+                draw.pixel_shader_evaluation
+                    .as_deref()
+                    .or(draw.export_shader_evaluation.as_deref())
+                    .expect("a chained draw has an evaluated stage"),
+            )
+            .into_iter()
+            .map(|(_, _, _, producer)| producer.generation.saturating_add(1))
+            .min()
+            .unwrap_or(2)
+        };
+        for target in targets {
+            // A direct root draw may intentionally position the movie outside the scanout while
+            // another draw writes the actual intermediate. Do not let that known-empty terminal
+            // branch contaminate the transitive compositor trace.
+            if !root || !target.direct_scanout {
+                record_diagnostic_video_chain_texture(
+                    target.texture,
+                    "draw",
+                    draw.sequence,
+                    draw.pixel_shader_address,
+                    generation,
+                );
+            }
+        }
+    }
+    eprintln!(
+        "[REMu][METAL][VIDEO-CHAIN] kind=draw generation={} root={} sequence={} es={:#x} ps={:#x} ps_insns={} indexed={} count={} instances={} target_mask={:#010x} depth=[{}] raster=[{}] geometry=[{}] export=[{}] pixel=[{}] export_chain=[{}] pixel_chain=[{}] targets=[{}]",
+        if root { 1 } else { 2 },
+        root,
+        draw.sequence,
+        draw.export_shader_address,
+        draw.pixel_shader_address,
+        draw.pixel_shader
+            .as_ref()
+            .map_or(0, |shader| shader.program.instructions.len()),
+        draw.indexed,
+        draw.index_count,
+        draw.instance_count,
+        target_mask,
+        depth,
+        raster,
+        geometry,
+        export.as_deref().unwrap_or(""),
+        pixel.as_deref().unwrap_or(""),
+        export_chain.as_deref().unwrap_or(""),
+        pixel_chain.as_deref().unwrap_or(""),
+        targets,
+    );
+}
+
+fn trace_video_target_compute_consumer(dispatch: &ComputeDispatch) {
+    if !trace_video_target_consumers() && !diagnostic_dump_video_chain_consumer() {
+        return;
+    }
+    let Some(evaluation) = dispatch.shader_evaluation.as_deref() else {
+        return;
+    };
+    let root = video_target_binding_summary(evaluation);
+    let chain = video_chain_binding_summary(evaluation);
+    if root.is_none() && chain.is_none() {
+        return;
+    }
+    let generation = if root.is_some() {
+        1
+    } else {
+        diagnostic_video_chain_matches(evaluation)
+            .into_iter()
+            .map(|(_, _, _, producer)| producer.generation.saturating_add(1))
+            .min()
+            .unwrap_or(2)
+    };
+    let mut outputs = Vec::new();
+    for binding in evaluation
+        .image_bindings
+        .iter()
+        .filter(|binding| is_writable_image_opcode(binding.opcode))
+    {
+        let Ok(descriptor) = decode_image_descriptor(&binding.resource_descriptor) else {
+            continue;
+        };
+        record_diagnostic_video_chain_texture(
+            descriptor.guest,
+            "compute",
+            dispatch.sequence,
+            dispatch.shader_address,
+            generation,
+        );
+        outputs.push(format!(
+            "pc={:#x} op={:?} addr={:#x} {}x{} format={:?} tile={}",
+            binding.pc,
+            binding.opcode,
+            descriptor.guest.address,
+            descriptor.guest.width,
+            descriptor.guest.height,
+            descriptor.guest.pixel_format,
+            descriptor.guest.tile_mode,
+        ));
+    }
+    eprintln!(
+        "[REMu][METAL][VIDEO-CHAIN] kind=compute generation={} root={} sequence={} cs={:#x} grid={:?} groups={:?} threads_per_group={:?} root_bindings=[{}] chain_bindings=[{}] outputs=[{}]",
+        generation,
+        root.is_some(),
+        dispatch.sequence,
+        dispatch.shader_address,
+        dispatch.launch.grid,
+        dispatch.launch.group_count,
+        dispatch.launch.threads_per_group,
+        root.as_deref().unwrap_or(""),
+        chain.as_deref().unwrap_or(""),
+        outputs.join("; "),
+    );
+}
+
+fn guessed_mode27_hierarchies_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_GUESS_MODE27_HIERARCHIES").is_none_or(|value| value != "0")
+    })
+}
+
+fn guessed_mode27_hierarchy_maximum_bytes() -> u64 {
+    const DEFAULT_MAXIMUM_MIB: u64 = 16;
+    static MAXIMUM_BYTES: OnceLock<u64> = OnceLock::new();
+    *MAXIMUM_BYTES.get_or_init(|| {
+        std::env::var("REMU_GUESS_MODE27_MAX_MIB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAXIMUM_MIB)
+            .saturating_mul(1024 * 1024)
     })
 }
 
@@ -9837,10 +12292,13 @@ fn diagnostic_dump_complex_msaa() -> bool {
 }
 
 fn diagnostic_texture_writer_enabled() -> bool {
-    diagnostic_dump_target_address().is_some()
+    trace_scanout_writes()
+        || diagnostic_dump_target_address().is_some()
         || diagnostic_dump_target_pixel_shader().is_some()
         || diagnostic_dump_target_pixel_instruction_count().is_some()
         || diagnostic_dump_complex_msaa()
+        || diagnostic_dump_video_target_consumer()
+        || diagnostic_dump_video_chain_consumer()
 }
 
 fn diagnostic_dump_target_minimum_draw() -> u64 {
@@ -9901,7 +12359,7 @@ fn diagnostic_trace_target_maximum_draw() -> u64 {
 }
 
 fn diagnostic_global_binding_head(binding: &GlobalMemoryBinding) -> Vec<u8> {
-    let byte_count = binding.byte_count.min(32);
+    let byte_count = binding.byte_count.min(256);
     if byte_count == 0 {
         return Vec::new();
     }
@@ -10042,7 +12500,9 @@ fn record_diagnostic_global_writers(
     shader: u64,
     evaluation: &ShaderEvaluation,
 ) {
-    if !diagnostic_texture_writer_enabled() {
+    let retain_history = diagnostic_texture_writer_enabled();
+    let trace_range = diagnostic_guest_write_trace_range();
+    if !retain_history && trace_range.is_none() {
         return;
     }
     let writable = evaluation
@@ -10050,16 +12510,29 @@ fn record_diagnostic_global_writers(
         .iter()
         .filter(|binding| binding.writable && binding.base_address >= 0x10_000)
         .filter_map(|binding| {
-            Some(DiagnosticGlobalWriter {
+            let writer = DiagnosticGlobalWriter {
                 stage,
                 sequence,
                 shader,
                 address: binding.base_address,
                 byte_count: u64::try_from(binding.byte_count).ok()?,
-            })
+            };
+            if trace_range.is_some_and(|(address, byte_count)| {
+                guest_ranges_overlap(address, byte_count, writer.address, writer.byte_count)
+            }) {
+                eprintln!(
+                    "[REMu][METAL][GUEST-WRITE] stage={stage} sequence={sequence} shader={shader:#x} address={:#x} bytes={} snapshot={} writeback={} pcs={:x?}",
+                    binding.base_address,
+                    binding.byte_count,
+                    binding.data.len() == binding.byte_count,
+                    binding.write_back_to_guest,
+                    binding.instruction_pcs,
+                );
+            }
+            Some(writer)
         })
         .collect::<Vec<_>>();
-    if writable.is_empty() {
+    if writable.is_empty() || !retain_history {
         return;
     }
     const CAPACITY: usize = 16_384;
@@ -10072,6 +12545,17 @@ fn record_diagnostic_global_writers(
         }
         writers.push_back(writer);
     }
+}
+
+fn diagnostic_guest_write_trace_range() -> Option<(u64, u64)> {
+    static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let value = std::env::var("REMU_TRACE_GUEST_WRITE_RANGE").ok()?;
+        let (start, end) = value.split_once(':')?;
+        let start = parse_diagnostic_hex_address(start)?;
+        let end = parse_diagnostic_hex_address(end)?;
+        (end > start).then_some((start, end - start))
+    })
 }
 
 fn diagnostic_global_writers() -> &'static Mutex<VecDeque<DiagnosticGlobalWriter>> {
@@ -10143,6 +12627,13 @@ fn dump_msl_instruction_filter_matches(pixel_instruction_count: usize) -> bool {
         .to_string_lossy()
         .parse::<usize>()
         .is_ok_and(|filter| filter == pixel_instruction_count)
+}
+
+fn program_uses_lds(program: &remu_shader::Program) -> bool {
+    program.instructions.iter().any(|instruction| {
+        instruction.encoding == remu_shader::ShaderEncoding::Ds
+            && !instruction.opcode.is("DsSwizzleB32")
+    })
 }
 
 fn decode_sampled_texture_format(
@@ -10601,15 +13092,7 @@ fn upload_image_textures(
                     .map(|(_, texture)| texture.clone())
             };
             let texture = if fallback {
-                let key = SampledTextureKey {
-                    descriptor: descriptor.guest,
-                    destination_select: descriptor.destination_select,
-                    base_mip_level: descriptor.base_mip_level,
-                    mip_level_count: descriptor.mip_level_count,
-                    texture_type: descriptor.texture_type,
-                    layer_count: descriptor.layer_count,
-                    comparison,
-                };
+                let key = sampled_texture_key(descriptor, comparison);
                 if let Some(texture) = fallback_texture_cache.get(&key) {
                     texture.clone()
                 } else {
@@ -10649,49 +13132,52 @@ fn upload_image_textures(
                     texture
                 }
             } else if storage && descriptor.texture_type == 9 {
-                if descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1 {
+                if storage_image_requires_mip_hierarchy(binding, descriptor) {
                     ensure_mipmapped_resident_texture_in_map(
                         device,
                         descriptor,
                         resident_guest_textures,
+                        Mode27WorkOrigin::StorageCreate,
                     )?
                 } else {
                     ensure_resident_texture_in_map(
                         device,
                         descriptor.guest,
                         resident_guest_textures,
+                        true,
                     )?
                 }
             } else if let Some(texture) = render_resolve {
                 texture
             } else {
-                let key = SampledTextureKey {
-                    descriptor: descriptor.guest,
-                    destination_select: descriptor.destination_select,
-                    base_mip_level: descriptor.base_mip_level,
-                    mip_level_count: descriptor.mip_level_count,
-                    texture_type: descriptor.texture_type,
-                    layer_count: descriptor.layer_count,
-                    comparison,
-                };
-                let replaced = if let Some(cached) = sampled_texture_cache.get_mut(&key) {
-                    refresh_sampled_texture_write_watch(
+                let key = sampled_texture_key(descriptor, comparison);
+                let reload = if let Some(cached) = sampled_texture_cache.get_mut(&key) {
+                    let refresh = refresh_sampled_texture_write_watch(
                         key,
                         cached,
                         sampled_texture_write_watches,
-                    )?
-                        == WriteWatchRefresh::Replaced
+                    )?;
+                    sampled_texture_cache_needs_reload(refresh, cached.write_watch.is_dirty())
                 } else {
                     false
                 };
-                if replaced {
+                if reload {
+                    // CPU-produced images such as AvPlayer's rotating NV12 frames can be updated
+                    // immediately before a draw without an intervening ACQUIRE_MEM packet. The
+                    // write watch has already observed that store, so retaining the Metal cache
+                    // here would sample the zero-filled/predecessor frame forever. Rebuild from a
+                    // stable watched snapshot; the persistent watch is shared with the new entry
+                    // and is rearmed by snapshot_watched_sampled_texture_raw.
                     if let Some(retired) = sampled_texture_cache.remove(&key) {
+                        SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS.fetch_add(1, Ordering::Relaxed);
                         retire_sampled_texture(retired);
                     }
                 }
                 if let Some(cached) = sampled_texture_cache.get(&key) {
+                    SAMPLED_TEXTURE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                     cached.texture.clone()
                 } else {
+                    SAMPLED_TEXTURE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
                     let write_watch = persistent_sampled_texture_write_watch(
                         key,
                         descriptor,
@@ -10743,6 +13229,8 @@ fn upload_image_textures(
                             .is_some_and(|cached| cached.admission_id == admission_id);
                         if is_current {
                             if let Some(retired) = sampled_texture_cache.remove(&old_key) {
+                                SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS
+                                    .fetch_add(1, Ordering::Relaxed);
                                 retire_sampled_texture(retired);
                             }
                         }
@@ -10772,6 +13260,20 @@ fn upload_image_textures(
             })
         })
         .collect()
+}
+
+fn storage_image_requires_mip_hierarchy(
+    binding: &ImageBinding,
+    descriptor: DecodedImageDescriptor,
+) -> bool {
+    // IMAGE_LOAD/STORE address the resource view's BASE_LEVEL. LAST_LEVEL only bounds the view
+    // and does not make an ordinary base-zero access touch every exposed mip. Only the _MIP
+    // variants consume a per-invocation mip coordinate. Avoid promoting a normal full-view UAV
+    // to a complete CPU-decoded hierarchy; besides doing needless work, that incorrectly rejects
+    // valid SW_64KB_S (mode 9) base-level resources.
+    descriptor.base_mip_level != 0
+        || binding.opcode.is("ImageLoadMip")
+        || binding.opcode.is("ImageStoreMip")
 }
 
 fn sampler_address_mode(value: u32) -> MTLSamplerAddressMode {
@@ -10877,6 +13379,35 @@ fn sampler_lod_bias(words: &[u32]) -> f32 {
     signed / 256.0
 }
 
+fn create_global_argument_buffer(
+    device: &Device,
+    function: &Function,
+    buffer_index: Option<u32>,
+    buffers: &[UploadedGlobalBuffer],
+) -> Result<Option<Buffer>, String> {
+    let Some(buffer_index) = buffer_index else {
+        return Ok(None);
+    };
+    if buffers.is_empty() {
+        return Err("Metal shader declares an empty global argument buffer".to_owned());
+    }
+    let encoder = function.new_argument_encoder(u64::from(buffer_index));
+    let argument_buffer = device.new_buffer(
+        encoder.encoded_length(),
+        MTLResourceOptions::StorageModeShared,
+    );
+    argument_buffer.set_label("REMu guest global argument buffer");
+    encoder.set_argument_buffer(&argument_buffer, 0);
+    for (slot, buffer) in buffers.iter().enumerate() {
+        encoder.set_buffer(
+            u64::try_from(slot).map_err(|_| "global argument slot does not fit Metal")?,
+            &buffer.buffer,
+            buffer.offset,
+        );
+    }
+    Ok(Some(argument_buffer))
+}
+
 fn create_sampler_argument_buffer(
     device: &Device,
     function: &Function,
@@ -10884,21 +13415,23 @@ fn create_sampler_argument_buffer(
     evaluation: &ShaderEvaluation,
 ) -> Result<(Option<Buffer>, Vec<SamplerState>), String> {
     let sampled_bindings = canonical_sampler_bindings(evaluation);
-    let Some(buffer_index) = buffer_index else {
-        if sampled_bindings.is_empty() {
-            return Ok((None, Vec::new()));
-        }
-        return Err("Metal shader has sampled images but no sampler argument buffer".to_owned());
-    };
     if sampled_bindings.is_empty() {
-        return Err("Metal shader declares a sampler argument buffer without samplers".to_owned());
+        return if buffer_index.is_some() {
+            Err("Metal shader declares a sampler argument buffer without samplers".to_owned())
+        } else {
+            Ok((None, Vec::new()))
+        };
     }
-    let argument_encoder = function.new_argument_encoder(u64::from(buffer_index));
-    let argument_buffer = device.new_buffer(
-        argument_encoder.encoded_length(),
-        MTLResourceOptions::StorageModeShared,
-    );
-    argument_encoder.set_argument_buffer(&argument_buffer, 0);
+    let argument_encoder =
+        buffer_index.map(|index| function.new_argument_encoder(u64::from(index)));
+    let argument_buffer = argument_encoder.as_ref().map(|encoder| {
+        let buffer = device.new_buffer(
+            encoder.encoded_length(),
+            MTLResourceOptions::StorageModeShared,
+        );
+        encoder.set_argument_buffer(&buffer, 0);
+        buffer
+    });
     let mut samplers = Vec::with_capacity(sampled_bindings.len());
     for (slot, binding) in sampled_bindings.iter().enumerate() {
         if binding.sampler_descriptor.len() < 4 {
@@ -10934,15 +13467,17 @@ fn create_sampler_argument_buffer(
             f32::from(u16::try_from((words[1] >> 12) & 0xfff).expect("12-bit LOD fits u16"))
                 / 256.0,
         );
-        descriptor.set_support_argument_buffers(true);
+        descriptor.set_support_argument_buffers(argument_encoder.is_some());
         let sampler = device.new_sampler(&descriptor);
-        argument_encoder.set_sampler_state(
-            u64::try_from(slot).map_err(|_| "sampler slot does not fit Metal")?,
-            &sampler,
-        );
+        if let Some(encoder) = argument_encoder.as_ref() {
+            encoder.set_sampler_state(
+                u64::try_from(slot).map_err(|_| "sampler slot does not fit Metal")?,
+                &sampler,
+            );
+        }
         samplers.push(sampler);
     }
-    Ok((Some(argument_buffer), samplers))
+    Ok((argument_buffer, samplers))
 }
 
 fn metal_primitive_type(guest: u32) -> Result<MTLPrimitiveType, String> {
@@ -11089,6 +13624,206 @@ fn pixel_input_controls(registers: &[GpuRegister]) -> [u32; 32] {
     })
 }
 
+fn vertex_parameter_export_mask(program: &Program) -> u32 {
+    program
+        .instructions
+        .iter()
+        .filter_map(|instruction| {
+            let InstructionControl::Export(export) = instruction.control.as_ref()? else {
+                return None;
+            };
+            ((32..64).contains(&export.target) && export.enable_mask != 0)
+                .then_some(1_u32 << (export.target - 32))
+        })
+        .fold(0, |mask, export| mask | export)
+}
+
+fn pixel_interpolation_attribute_mask(program: &Program) -> u32 {
+    program
+        .instructions
+        .iter()
+        .filter_map(|instruction| {
+            let InstructionControl::Interpolation(interpolation) = instruction.control.as_ref()?
+            else {
+                return None;
+            };
+            (interpolation.attribute < 32).then_some(1_u32 << interpolation.attribute)
+        })
+        .fold(0, |mask, attribute| mask | attribute)
+}
+
+fn missing_vertex_parameter_exports(
+    exported_parameters: u32,
+    interpolated_attributes: u32,
+    controls: &[u32; 32],
+) -> Vec<(u32, u32, u32)> {
+    (0..32)
+        .filter(|logical| interpolated_attributes & (1 << logical) != 0)
+        .filter_map(|logical| {
+            let raw = controls[logical as usize];
+            let control = remu_shader_metal::PixelInputControl::from_register(raw);
+            if control.uses_default() {
+                return None;
+            }
+            let physical = u32::from(control.input_offset);
+            (exported_parameters & (1 << physical) == 0).then_some((logical, physical, raw))
+        })
+        .collect()
+}
+
+fn skip_incomplete_rectangle_draw(draw: &IndexedDraw) -> bool {
+    // A non-default pixel interpolation has no defined source when the vertex/primitive stage
+    // exports no matching PARAM. Synthesizing zero varyings turns the trailing invalid RECTLIST
+    // packets in Silent Hill into full-screen black clears, erasing the correctly rendered
+    // composite immediately before every flip. Treat the invalid interface as a rejected draw,
+    // which preserves the last valid target contents. Keep an explicit diagnostic escape hatch
+    // for comparing the old zero-fill behavior.
+    static ALLOW_INVALID: OnceLock<bool> = OnceLock::new();
+    !*ALLOW_INVALID.get_or_init(|| {
+        std::env::var_os("REMU_ALLOW_INCOMPLETE_RECTANGLES").is_some_and(|value| value == "1")
+    }) && rectangle_draw_has_incomplete_interface(draw)
+        && !(diagnostic_procedural_rectangle_fallback()
+            && draw
+                .export_shader
+                .as_ref()
+                .is_some_and(|shader| procedural_rectangle_export_stage(&shader.program)))
+}
+
+fn diagnostic_procedural_rectangle_fallback() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_DIAGNOSTIC_PROCEDURAL_RECTANGLE").is_some_and(|value| value == "1")
+    })
+}
+
+/// Recognizes a fused GFX10 NGG export/geometry program that requires a Metal mesh stage.
+///
+/// These programs allocate primitive output, exchange records through general LDS, then publish
+/// both primitive connectivity and position. Lane-private ADDTID compiler spills alone do not
+/// qualify: ordinary vertex/pixel lowering already preserves those without a mesh pipeline.
+fn ngg_mesh_export_stage(program: &Program) -> bool {
+    let mut allocation_message = false;
+    let mut primitive_export = false;
+    let mut position_export = false;
+    let mut general_lds = false;
+    for instruction in &program.instructions {
+        if instruction.opcode.is("SSendmsg")
+            && instruction
+                .sources
+                .first()
+                .is_some_and(|source| source.value == 9)
+        {
+            allocation_message = true;
+        }
+        if let Some(InstructionControl::Export(export)) = instruction.control.as_ref() {
+            primitive_export |= export.target == 20 && export.enable_mask != 0;
+            position_export |= export.target == 12 && export.enable_mask != 0;
+        }
+        if matches!(instruction.control, Some(InstructionControl::DataShare(_)))
+            && !matches!(
+                instruction.opcode.known_name(),
+                Some("DsSwizzleB32" | "DsWriteAddtidB32" | "DsReadAddtidB32")
+            )
+        {
+            general_lds = true;
+        }
+    }
+    allocation_message && primitive_export && position_export && general_lds
+}
+
+/// Recognizes the position-only AGC primitive stage used for procedural fullscreen rectangles.
+///
+/// This deliberately describes architectural behavior instead of matching a game address or an
+/// exact byte string: the stage sends GS allocation message 9, exports primitive data at target
+/// 20, derives X/Y from the vertex ID, and exports position at target 12. It must have no memory,
+/// LDS, image, interpolation, or PARAM-export work. More complex merged ES/GS programs are not
+/// accepted here and continue through the ordinary translator/rejection path.
+fn procedural_rectangle_export_stage(program: &Program) -> bool {
+    let mut primitive_export = false;
+    let mut position_export = false;
+    let mut allocation_message = false;
+    let mut vertex_id_x = false;
+    let mut vertex_id_y = false;
+    let mut coordinate_conversions = 0_u32;
+    let mut coordinate_mads = 0_u32;
+
+    for instruction in &program.instructions {
+        match instruction.control.as_ref() {
+            Some(InstructionControl::Export(export)) => match export.target {
+                20 if export.enable_mask != 0 && export.done => primitive_export = true,
+                12 if export.enable_mask == 0x0f && export.done => position_export = true,
+                _ => return false,
+            },
+            Some(
+                InstructionControl::Image(_)
+                | InstructionControl::GlobalMemory(_)
+                | InstructionControl::BufferMemory(_)
+                | InstructionControl::Interpolation(_)
+                | InstructionControl::DataShare(_),
+            ) => return false,
+            _ => {}
+        }
+
+        match instruction.opcode.known_name() {
+            Some("SSendmsg")
+                if instruction
+                    .sources
+                    .first()
+                    .is_some_and(|source| source.value == 9) =>
+            {
+                allocation_message = true;
+            }
+            Some("VAndB32") => vertex_id_x = true,
+            Some("VLshrrevB32") => vertex_id_y = true,
+            Some("VCvtF32U32" | "VCvtF32I32") => {
+                coordinate_conversions = coordinate_conversions.saturating_add(1);
+            }
+            Some("VMadF32" | "VFmaF32" | "VLshlAddU32") => {
+                coordinate_mads = coordinate_mads.saturating_add(1);
+            }
+            Some(name)
+                if name.starts_with("Ds")
+                    || name.starts_with("Image")
+                    || name.starts_with("Buffer")
+                    || name.starts_with("Global")
+                    || name.starts_with("Flat") =>
+            {
+                return false;
+            }
+            None => return false,
+            _ => {}
+        }
+    }
+
+    primitive_export
+        && position_export
+        && allocation_message
+        && vertex_id_x
+        && vertex_id_y
+        && coordinate_conversions >= 2
+        && coordinate_mads >= 2
+}
+
+fn rectangle_draw_has_incomplete_interface(draw: &IndexedDraw) -> bool {
+    if !matches!(draw.primitive_type, 7 | 0x11) || draw.indexed || draw.index_count != 3 {
+        return false;
+    }
+    let Some(export) = draw.export_shader.as_ref() else {
+        return false;
+    };
+    let Some(pixel) = draw.pixel_shader.as_ref() else {
+        return false;
+    };
+    let exported_parameters = vertex_parameter_export_mask(&export.program);
+    let interpolated_attributes = pixel_interpolation_attribute_mask(&pixel.program);
+    !missing_vertex_parameter_exports(
+        exported_parameters,
+        interpolated_attributes,
+        &pixel_input_controls(&draw.context_registers),
+    )
+    .is_empty()
+}
+
 fn pixel_scalars(draw: &IndexedDraw) -> [u32; 4] {
     std::array::from_fn(|index| {
         register_value(
@@ -11176,6 +13911,199 @@ fn decode_render_target_format(
         pixel_format,
         output_kind,
         bytes_per_pixel,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClearChannelEncoding {
+    Unorm,
+    Snorm,
+    Uint,
+    Sint,
+    Float,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastClearLayout {
+    R8,
+    R16,
+    R32,
+    Rg8,
+    Rg16,
+    Rg32,
+    Rgba8,
+    Bgra8,
+    Rgba16,
+    Rgba32,
+    Rgb10A2,
+    Rg11B10Float,
+    Rgb9E5Float,
+}
+
+fn sign_extend_clear_lane(value: u32, bits: u32) -> i64 {
+    debug_assert!((1..=32).contains(&bits));
+    let shift = 64 - bits;
+    ((u64::from(value) << shift) as i64) >> shift
+}
+
+fn decode_clear_lane(value: u32, bits: u32, encoding: ClearChannelEncoding) -> f64 {
+    let mask = if bits == 32 {
+        u32::MAX
+    } else {
+        (1_u32 << bits) - 1
+    };
+    let value = value & mask;
+    match encoding {
+        ClearChannelEncoding::Unorm => f64::from(value) / f64::from(mask),
+        ClearChannelEncoding::Snorm => {
+            let maximum = (1_i64 << (bits - 1)) - 1;
+            ((sign_extend_clear_lane(value, bits) as f64) / (maximum as f64)).max(-1.0)
+        }
+        ClearChannelEncoding::Uint => f64::from(value),
+        ClearChannelEncoding::Sint => sign_extend_clear_lane(value, bits) as f64,
+        ClearChannelEncoding::Float if bits == 16 => f64::from(half_float_to_f32(value as u16)),
+        ClearChannelEncoding::Float if bits == 32 => f64::from(f32::from_bits(value)),
+        ClearChannelEncoding::Float => unreachable!("only IEEE 16- and 32-bit lanes are supported"),
+    }
+}
+
+fn inverse_srgb_clear_component(encoded: f64) -> f64 {
+    if encoded <= 0.040_45 {
+        encoded / 12.92
+    } else {
+        ((encoded + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn decode_fast_clear_color(pixel_format: MTLPixelFormat, words: [u32; 2]) -> Option<MTLClearColor> {
+    use ClearChannelEncoding::{Float, Sint, Snorm, Uint, Unorm};
+    use FastClearLayout::{
+        Bgra8, R8, R16, R32, Rg8, Rg11B10Float, Rg16, Rg32, Rgb9E5Float, Rgb10A2, Rgba8, Rgba16,
+        Rgba32,
+    };
+
+    let (encoding, layout, srgb) = match pixel_format {
+        MTLPixelFormat::R8Unorm => (Unorm, R8, false),
+        MTLPixelFormat::R8Snorm => (Snorm, R8, false),
+        MTLPixelFormat::R8Uint => (Uint, R8, false),
+        MTLPixelFormat::R8Sint => (Sint, R8, false),
+        MTLPixelFormat::R8Unorm_sRGB => (Unorm, R8, true),
+        MTLPixelFormat::R16Unorm => (Unorm, R16, false),
+        MTLPixelFormat::R16Snorm => (Snorm, R16, false),
+        MTLPixelFormat::R16Uint => (Uint, R16, false),
+        MTLPixelFormat::R16Sint => (Sint, R16, false),
+        MTLPixelFormat::R16Float => (Float, R16, false),
+        MTLPixelFormat::RG8Unorm => (Unorm, Rg8, false),
+        MTLPixelFormat::RG8Snorm => (Snorm, Rg8, false),
+        MTLPixelFormat::RG8Uint => (Uint, Rg8, false),
+        MTLPixelFormat::RG8Sint => (Sint, Rg8, false),
+        MTLPixelFormat::RG8Unorm_sRGB => (Unorm, Rg8, true),
+        MTLPixelFormat::R32Uint => (Uint, R32, false),
+        MTLPixelFormat::R32Sint => (Sint, R32, false),
+        MTLPixelFormat::R32Float => (Float, R32, false),
+        MTLPixelFormat::RG16Unorm => (Unorm, Rg16, false),
+        MTLPixelFormat::RG16Snorm => (Snorm, Rg16, false),
+        MTLPixelFormat::RG16Uint => (Uint, Rg16, false),
+        MTLPixelFormat::RG16Sint => (Sint, Rg16, false),
+        MTLPixelFormat::RG16Float => (Float, Rg16, false),
+        MTLPixelFormat::RG11B10Float => (Float, Rg11B10Float, false),
+        MTLPixelFormat::RGB10A2Unorm => (Unorm, Rgb10A2, false),
+        MTLPixelFormat::RGBA8Unorm => (Unorm, Rgba8, false),
+        MTLPixelFormat::BGRA8Unorm => (Unorm, Bgra8, false),
+        MTLPixelFormat::RGBA8Snorm => (Snorm, Rgba8, false),
+        MTLPixelFormat::RGBA8Uint => (Uint, Rgba8, false),
+        MTLPixelFormat::RGBA8Sint => (Sint, Rgba8, false),
+        MTLPixelFormat::RGBA8Unorm_sRGB => (Unorm, Rgba8, true),
+        MTLPixelFormat::BGRA8Unorm_sRGB => (Unorm, Bgra8, true),
+        MTLPixelFormat::RG32Uint => (Uint, Rg32, false),
+        MTLPixelFormat::RG32Sint => (Sint, Rg32, false),
+        MTLPixelFormat::RG32Float => (Float, Rg32, false),
+        MTLPixelFormat::RGBA16Unorm => (Unorm, Rgba16, false),
+        MTLPixelFormat::RGBA16Snorm => (Snorm, Rgba16, false),
+        MTLPixelFormat::RGBA16Uint => (Uint, Rgba16, false),
+        MTLPixelFormat::RGBA16Sint => (Sint, Rgba16, false),
+        MTLPixelFormat::RGBA16Float => (Float, Rgba16, false),
+        MTLPixelFormat::RGBA32Uint => (Uint, Rgba32, false),
+        MTLPixelFormat::RGBA32Sint => (Sint, Rgba32, false),
+        MTLPixelFormat::RGBA32Float => (Float, Rgba32, false),
+        MTLPixelFormat::RGB9E5Float => (Float, Rgb9E5Float, false),
+        _ => return None,
+    };
+
+    let packed = u64::from(words[0]) | (u64::from(words[1]) << 32);
+    let lane = |shift: u32, bits: u32| decode_clear_lane((packed >> shift) as u32, bits, encoding);
+    let (mut red, mut green, mut blue, alpha) = match layout {
+        R8 => (lane(0, 8), 0.0, 0.0, 1.0),
+        R16 => (lane(0, 16), 0.0, 0.0, 1.0),
+        R32 => (lane(0, 32), 0.0, 0.0, 1.0),
+        Rg8 => (lane(0, 8), lane(8, 8), 0.0, 1.0),
+        Rg16 => (lane(0, 16), lane(16, 16), 0.0, 1.0),
+        Rg32 => (lane(0, 32), lane(32, 32), 0.0, 1.0),
+        Rgba8 => (lane(0, 8), lane(8, 8), lane(16, 8), lane(24, 8)),
+        Bgra8 => (lane(16, 8), lane(8, 8), lane(0, 8), lane(24, 8)),
+        Rgba16 => (lane(0, 16), lane(16, 16), lane(32, 16), lane(48, 16)),
+        // GFX10 represents a fast clear for a 128-bit target with one shared RGB word and a
+        // separate alpha word. Mesa only enables this representation when R, G, and B are equal.
+        Rgba32 => {
+            let rgb = decode_clear_lane(words[0], 32, encoding);
+            (rgb, rgb, rgb, decode_clear_lane(words[1], 32, encoding))
+        }
+        Rgb10A2 => (lane(0, 10), lane(10, 10), lane(20, 10), lane(30, 2)),
+        Rg11B10Float => (
+            f64::from(unsigned_float_to_f32(words[0] & 0x7ff, 6)),
+            f64::from(unsigned_float_to_f32((words[0] >> 11) & 0x7ff, 6)),
+            f64::from(unsigned_float_to_f32((words[0] >> 22) & 0x3ff, 5)),
+            1.0,
+        ),
+        Rgb9E5Float => {
+            let exponent = ((words[0] >> 27) & 0x1f) as i32 - 24;
+            let scale = 2.0_f64.powi(exponent);
+            (
+                f64::from(words[0] & 0x1ff) * scale,
+                f64::from((words[0] >> 9) & 0x1ff) * scale,
+                f64::from((words[0] >> 18) & 0x1ff) * scale,
+                1.0,
+            )
+        }
+    };
+    if srgb {
+        red = inverse_srgb_clear_component(red);
+        green = inverse_srgb_clear_component(green);
+        blue = inverse_srgb_clear_component(blue);
+    }
+    Some(MTLClearColor::new(red, green, blue, alpha))
+}
+
+fn render_target_fast_clear_color(
+    target: &DecodedRenderTarget,
+    context_registers: &[GpuRegister],
+) -> Option<MTLClearColor> {
+    if !target.fast_clear_enabled {
+        return None;
+    }
+    let primary = target.guest_slot * CB_COLOR_REGISTER_STRIDE;
+    let words = [
+        register_value(context_registers, CB_COLOR0_CLEAR_WORD0 + primary).unwrap_or_default(),
+        register_value(context_registers, CB_COLOR0_CLEAR_WORD1 + primary).unwrap_or_default(),
+    ];
+    decode_fast_clear_color(target.texture.pixel_format, words)
+}
+
+fn initial_render_target_clear_color(
+    target: &DecodedRenderTarget,
+    context_registers: &[GpuRegister],
+    has_resident_storage: bool,
+) -> Option<MTLClearColor> {
+    if has_resident_storage {
+        return None;
+    }
+    render_target_fast_clear_color(target, context_registers).or_else(|| {
+        // DCC backing memory cannot be decoded as the uncompressed image represented by the
+        // resident Metal texture. Without a programmed fast clear, discard that compressed
+        // first-use content instead of loading its raw bytes through an uncompressed attachment.
+        target
+            .dcc_enabled
+            .then(|| MTLClearColor::new(0.0, 0.0, 0.0, 1.0))
     })
 }
 
@@ -11474,7 +14402,7 @@ fn decode_render_targets_from_registers(
             guest_slot, address, view, info, attrib, attrib2, attrib3, write_mask,
         )?);
     }
-    if targets.is_empty() {
+    if targets.is_empty() && target_mask != 0 {
         return Err(format!(
             "draw has no color target enabled by both CB_TARGET_MASK={target_mask:#010x} and pixel exports={export_masks:#010x}"
         ));
@@ -11552,12 +14480,13 @@ fn decode_raster_state(draw: &IndexedDraw) -> Result<DecodedRasterState, String>
 }
 
 fn decode_depth_target(draw: &IndexedDraw) -> Result<Option<DecodedDepthTarget>, String> {
-    let Some(control) = register_value(&draw.context_registers, DB_DEPTH_CONTROL) else {
-        return Ok(None);
-    };
+    let control = register_value(&draw.context_registers, DB_DEPTH_CONTROL).unwrap_or_default();
+    let render_control =
+        register_value(&draw.context_registers, DB_RENDER_CONTROL).unwrap_or_default();
     let depth_enabled = control & (1 << 1) != 0;
     let write_enabled = control & (1 << 2) != 0;
-    if !depth_enabled {
+    let clear_enabled = render_control & 1 != 0;
+    if !depth_enabled && !write_enabled && !clear_enabled {
         return Ok(None);
     }
 
@@ -11638,6 +14567,10 @@ fn decode_depth_target(draw: &IndexedDraw) -> Result<Option<DecodedDepthTarget>,
         7 => MTLCompareFunction::Always,
         _ => unreachable!("three-bit compare function"),
     };
+    let clear_depth = register_value(&draw.context_registers, DB_DEPTH_CLEAR)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .unwrap_or(1.0);
     Ok(Some(DecodedDepthTarget {
         texture: GuestTextureDescriptor {
             address,
@@ -11649,7 +14582,10 @@ fn decode_depth_target(draw: &IndexedDraw) -> Result<Option<DecodedDepthTarget>,
             bytes_per_pixel: format.1,
         },
         compare,
+        test_enabled: depth_enabled,
         write_enabled,
+        clear_enabled,
+        clear_depth: f64::from(clear_depth),
         sample_count,
     }))
 }
@@ -11665,6 +14601,17 @@ fn initial_depth_clear_value(compare: MTLCompareFunction) -> f64 {
     }
 }
 
+fn initial_depth_clear_for_target(depth: DecodedDepthTarget) -> f64 {
+    if depth.clear_enabled || !depth.test_enabled || depth.write_enabled {
+        depth.clear_depth
+    } else {
+        // If a depth surface is first encountered as read-only, its guest clear register can be
+        // stale state from another target. Pick the comparison-neutral far value so first use
+        // cannot discard the whole scene. This is also SharpEmu's proven Silent Hill behavior.
+        initial_depth_clear_value(depth.compare)
+    }
+}
+
 fn graphics_pipeline_key(draw: &IndexedDraw) -> Result<GraphicsPipelineKey, String> {
     let targets = decode_render_targets(draw)?;
     graphics_pipeline_key_from_targets(draw, &targets)
@@ -11675,6 +14622,11 @@ fn graphics_pipeline_key_from_targets(
     targets: &[DecodedRenderTarget],
 ) -> Result<GraphicsPipelineKey, String> {
     let depth = decode_depth_target(draw)?;
+    if targets.is_empty() && depth.is_none() {
+        return Err(
+            "draw has neither an enabled color target nor an active depth target".to_owned(),
+        );
+    }
     let export_evaluation = draw
         .export_shader_evaluation
         .as_ref()
@@ -11693,8 +14645,13 @@ fn graphics_pipeline_key_from_targets(
         .as_ref()
         .ok_or("draw has no decoded pixel shader")?
         .program;
-    let sample_count = targets.first().map_or(1, |target| target.sample_count);
-    let render_target_array_length = targets.first().map_or(1, |target| target.layer_count);
+    let sample_count = targets
+        .first()
+        .map(|target| target.sample_count)
+        .or_else(|| depth.map(|depth| depth.sample_count))
+        .unwrap_or(1);
+    let render_target_array_length =
+        common_render_target_array_length(targets.iter().map(|target| target.layer_count));
     if let Some(target) = targets
         .iter()
         .find(|target| target.sample_count != sample_count)
@@ -11712,15 +14669,6 @@ fn graphics_pipeline_key_from_targets(
             depth.sample_count
         ));
     }
-    if let Some(target) = targets
-        .iter()
-        .find(|target| target.layer_count != render_target_array_length)
-    {
-        return Err(format!(
-            "color target {} exposes {} layers while the render pass exposes {render_target_array_length}",
-            target.guest_slot, target.layer_count
-        ));
-    }
     if render_target_array_length > 1 && depth.is_some() {
         return Err(
             "layered color rendering with a depth attachment is not implemented".to_owned(),
@@ -11729,6 +14677,8 @@ fn graphics_pipeline_key_from_targets(
     Ok(GraphicsPipelineKey {
         export_shader_address: draw.export_shader_address,
         pixel_shader_address: draw.pixel_shader_address,
+        export_program_identity: ProgramIdentity(Arc::clone(export_program)),
+        pixel_program_identity: ProgramIdentity(Arc::clone(pixel_program)),
         export_resources: graphics_shader_resource_key(
             export_evaluation,
             program_embeds_global_base(export_program),
@@ -11767,6 +14717,14 @@ fn graphics_pipeline_key_from_targets(
         render_target_array_length,
         primitive_topology_class: metal_primitive_topology_class(draw.primitive_type)?,
     })
+}
+
+fn common_render_target_array_length(layer_counts: impl IntoIterator<Item = u32>) -> u32 {
+    layer_counts
+        .into_iter()
+        .map(|count| count.max(1))
+        .min()
+        .unwrap_or(1)
 }
 
 fn graphics_shader_resource_key(
@@ -12322,44 +15280,159 @@ fn mode27_mip_chain_layout(
     })
 }
 
-fn mode27_mip_texel_offset(
+fn copy_mode27_mip_level_to_linear(
     layout: &GuestMipChainLayout,
     level: GuestMipLevelLayout,
-    x: usize,
-    y: usize,
-) -> Result<usize, String> {
-    let (block_x, block_y, local_x, local_y) = if level.in_tail {
-        (0, 0, level.tail_x + x, level.tail_y + y)
+    raw: &[u8],
+    linear: &mut [u8],
+) -> Result<(), String> {
+    let expected = level
+        .width
+        .checked_mul(level.height)
+        .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
+        .ok_or("mip linear size overflows")?;
+    if linear.len() != expected {
+        return Err(format!(
+            "mode-27 mip destination has {} bytes, expected {expected}",
+            linear.len()
+        ));
+    }
+    if level.in_tail {
+        let offsets = mode27_block_byte_offsets(
+            0,
+            0,
+            layout.bytes_per_element,
+            layout.block_width,
+            layout.block_height,
+        );
+        for y in 0..level.height {
+            let destination_row = y * level.width * layout.bytes_per_element;
+            let offset_row = (level.tail_y + y) * layout.block_width + level.tail_x;
+            for x in 0..level.width {
+                let source = level
+                    .offset
+                    .checked_add(usize::from(offsets[offset_row + x]))
+                    .ok_or("mip-tail source offset overflows")?;
+                let destination = destination_row + x * layout.bytes_per_element;
+                linear[destination..destination + layout.bytes_per_element].copy_from_slice(
+                    raw.get(source..source + layout.bytes_per_element)
+                        .ok_or("mode-27 mip-tail texel exceeds backing")?,
+                );
+            }
+        }
     } else {
-        (
-            x / layout.block_width,
-            y / layout.block_height,
-            x % layout.block_width,
-            y % layout.block_height,
-        )
-    };
-    let blocks_per_row = level.padded_width / layout.block_width;
-    let block_offset = if level.in_tail {
-        0
+        let blocks_per_row = level.padded_width / layout.block_width;
+        let visible_blocks_per_row = level.width.div_ceil(layout.block_width);
+        for block_y in 0..level.height.div_ceil(layout.block_height) {
+            let rows = (level.height - block_y * layout.block_height).min(layout.block_height);
+            for block_x in 0..visible_blocks_per_row {
+                let columns = (level.width - block_x * layout.block_width).min(layout.block_width);
+                let block_base = (block_y * blocks_per_row + block_x)
+                    .checked_mul(65_536)
+                    .and_then(|offset| level.offset.checked_add(offset))
+                    .ok_or("mip block offset overflows")?;
+                let offsets = mode27_block_byte_offsets(
+                    block_x,
+                    block_y,
+                    layout.bytes_per_element,
+                    layout.block_width,
+                    layout.block_height,
+                );
+                for local_y in 0..rows {
+                    let destination_row = ((block_y * layout.block_height + local_y) * level.width
+                        + block_x * layout.block_width)
+                        * layout.bytes_per_element;
+                    let offset_row = local_y * layout.block_width;
+                    for local_x in 0..columns {
+                        let source = block_base + usize::from(offsets[offset_row + local_x]);
+                        let destination = destination_row + local_x * layout.bytes_per_element;
+                        linear[destination..destination + layout.bytes_per_element]
+                            .copy_from_slice(
+                                raw.get(source..source + layout.bytes_per_element)
+                                    .ok_or("mode-27 mip texel exceeds backing")?,
+                            );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_linear_to_mode27_mip_level(
+    layout: &GuestMipChainLayout,
+    level: GuestMipLevelLayout,
+    linear: &[u8],
+    raw: &mut [u8],
+) -> Result<(), String> {
+    let expected = level
+        .width
+        .checked_mul(level.height)
+        .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
+        .ok_or("mip linear size overflows")?;
+    if linear.len() != expected {
+        return Err(format!(
+            "mode-27 mip source has {} bytes, expected {expected}",
+            linear.len()
+        ));
+    }
+    if level.in_tail {
+        let offsets = mode27_block_byte_offsets(
+            0,
+            0,
+            layout.bytes_per_element,
+            layout.block_width,
+            layout.block_height,
+        );
+        for y in 0..level.height {
+            let source_row = y * level.width * layout.bytes_per_element;
+            let offset_row = (level.tail_y + y) * layout.block_width + level.tail_x;
+            for x in 0..level.width {
+                let source = source_row + x * layout.bytes_per_element;
+                let destination = level
+                    .offset
+                    .checked_add(usize::from(offsets[offset_row + x]))
+                    .ok_or("mip-tail destination offset overflows")?;
+                raw.get_mut(destination..destination + layout.bytes_per_element)
+                    .ok_or("mode-27 mip-tail texel exceeds backing")?
+                    .copy_from_slice(&linear[source..source + layout.bytes_per_element]);
+            }
+        }
     } else {
-        (block_y * blocks_per_row + block_x)
-            .checked_mul(65_536)
-            .ok_or("mip block offset overflows")?
-    };
-    let offsets = mode27_block_byte_offsets(
-        block_x,
-        block_y,
-        layout.bytes_per_element,
-        layout.block_width,
-        layout.block_height,
-    );
-    level
-        .offset
-        .checked_add(block_offset)
-        .and_then(|offset| {
-            offset.checked_add(usize::from(offsets[local_y * layout.block_width + local_x]))
-        })
-        .ok_or_else(|| "mip texel offset overflows".to_owned())
+        let blocks_per_row = level.padded_width / layout.block_width;
+        let visible_blocks_per_row = level.width.div_ceil(layout.block_width);
+        for block_y in 0..level.height.div_ceil(layout.block_height) {
+            let rows = (level.height - block_y * layout.block_height).min(layout.block_height);
+            for block_x in 0..visible_blocks_per_row {
+                let columns = (level.width - block_x * layout.block_width).min(layout.block_width);
+                let block_base = (block_y * blocks_per_row + block_x)
+                    .checked_mul(65_536)
+                    .and_then(|offset| level.offset.checked_add(offset))
+                    .ok_or("mip block offset overflows")?;
+                let offsets = mode27_block_byte_offsets(
+                    block_x,
+                    block_y,
+                    layout.bytes_per_element,
+                    layout.block_width,
+                    layout.block_height,
+                );
+                for local_y in 0..rows {
+                    let source_row = ((block_y * layout.block_height + local_y) * level.width
+                        + block_x * layout.block_width)
+                        * layout.bytes_per_element;
+                    let offset_row = local_y * layout.block_width;
+                    for local_x in 0..columns {
+                        let source = source_row + local_x * layout.bytes_per_element;
+                        let destination = block_base + usize::from(offsets[offset_row + local_x]);
+                        raw.get_mut(destination..destination + layout.bytes_per_element)
+                            .ok_or("mode-27 mip texel exceeds backing")?
+                            .copy_from_slice(&linear[source..source + layout.bytes_per_element]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn decode_mode27_mip_chain_from_raw(
@@ -12375,6 +15448,7 @@ fn decode_mode27_mip_chain_from_raw(
             layout.byte_count
         ));
     }
+    let started = Instant::now();
     let mut decoded = Vec::with_capacity(layout.levels.len());
     for &level in &layout.levels {
         let mut linear = vec![
@@ -12385,18 +15459,16 @@ fn decode_mode27_mip_chain_from_raw(
                 .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
                 .ok_or("mip linear size overflows")?
         ];
-        for y in 0..level.height {
-            for x in 0..level.width {
-                let source = mode27_mip_texel_offset(&layout, level, x, y)?;
-                let destination = (y * level.width + x) * layout.bytes_per_element;
-                linear[destination..destination + layout.bytes_per_element].copy_from_slice(
-                    raw.get(source..source + layout.bytes_per_element)
-                        .ok_or("mode-27 mip texel exceeds backing")?,
-                );
-            }
-        }
+        copy_mode27_mip_level_to_linear(&layout, level, raw, &mut linear)?;
         decoded.push(linear);
     }
+    record_texture_work(
+        &MODE27_DECODE_COUNT,
+        &MODE27_DECODE_BYTES,
+        &MODE27_DECODE_NANOSECONDS,
+        raw.len(),
+        started.elapsed(),
+    );
     Ok((layout, decoded))
 }
 
@@ -12409,25 +15481,7 @@ fn encode_mode27_mip_chain_into_raw(
         return Err("mode-27 mip writeback layout mismatch".to_owned());
     }
     for (&level, linear) in layout.levels.iter().zip(linear_levels) {
-        let expected = level
-            .width
-            .checked_mul(level.height)
-            .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
-            .ok_or("mip linear size overflows")?;
-        if linear.len() != expected {
-            return Err(format!(
-                "mode-27 mip writeback has {} bytes, expected {expected}",
-                linear.len()
-            ));
-        }
-        for y in 0..level.height {
-            for x in 0..level.width {
-                let source = (y * level.width + x) * layout.bytes_per_element;
-                let destination = mode27_mip_texel_offset(layout, level, x, y)?;
-                raw[destination..destination + layout.bytes_per_element]
-                    .copy_from_slice(&linear[source..source + layout.bytes_per_element]);
-            }
-        }
+        copy_linear_to_mode27_mip_level(layout, level, linear, raw)?;
     }
     Ok(())
 }
@@ -12576,6 +15630,17 @@ fn guest_ranges_overlap(left: u64, left_bytes: u64, right: u64, right_bytes: u64
     let left_end = left.saturating_add(left_bytes);
     let right_end = right.saturating_add(right_bytes);
     left < right_end && right < left_end
+}
+
+fn guest_physical_ranges_overlap(left: u64, left_bytes: u64, right: u64, right_bytes: u64) -> bool {
+    if guest_ranges_overlap(left, left_bytes, right, right_bytes) {
+        return true;
+    }
+    guest_shared_backing_alias_segments(left, left_bytes).is_some_and(|aliases| {
+        aliases
+            .into_iter()
+            .any(|alias| guest_ranges_overlap(alias.address, alias.byte_count, right, right_bytes))
+    })
 }
 
 #[cfg(test)]
@@ -13187,6 +16252,7 @@ fn presenter_window_attributes() -> winit::window::WindowAttributes {
     Window::default_attributes()
         .with_title("REmu")
         .with_inner_size(LogicalSize::new(1280, 720))
+        .with_active(true)
 }
 
 fn parse_presentation_resolution(value: &str) -> Result<PresentationResolution, String> {
@@ -13428,56 +16494,89 @@ mod tests {
         RenderPipelineDescriptor, TextureDescriptor,
     };
     use remu_gpu::{
-        ComputeGrid, ComputeLaunch, GpuColorTarget, GpuEvent, GpuMemoryAcquire, GpuMemoryRelease,
-        GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage,
-        GpuRegister, GpuScanoutTarget, IndexedDraw, gpu_event_channel,
+        ComputeGrid, ComputeLaunch, GpuColorTarget, GpuEvent, GpuHostImage, GpuMemoryAcquire,
+        GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier,
+        GpuPipelineStage, GpuRegister, GpuScanoutTarget, IndexedDraw, gpu_event_channel,
     };
     use remu_shader::{
         GlobalMemoryBinding, ImageBinding, ImageControl, Instruction, Opcode, Operand,
-        PixelOutputKind, Program, ShaderEncoding, ShaderEvaluation,
+        PixelOutputKind, Program, ShaderEncoding, ShaderEvaluation, decode_program,
     };
 
     use super::{
         CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
-        CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
-        DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
-        DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, DecodedRasterState, DecodedRenderTarget,
-        DisplayConfiguration, GraphicsPipelineKey, GraphicsShaderResourceKey,
-        GuestBatchFlushReason, GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery,
-        GuestMemoryWaitStatus, GuestMemoryWaitTracker, GuestRenderPassKey, GuestTextureDescriptor,
-        MetalPresenter, OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource,
-        OrderedGpuEventReceiver, PA_SU_SC_MODE_CNTL, PendingFlip, PendingGuestMemoryWrite,
-        PendingTextureReadback, PresentationResolution, QueueBlockReason, SPI_PS_INPUT_CNTL_0,
-        TextureReadbackLayout, apply_image_destination_select, apply_pending_guest_memory_writes,
-        canonical_sampler_bindings, canonical_texture_bindings, comparison_depth32_upload,
-        decode_depth_target, decode_image_descriptor, decode_metal_blend_attachment,
-        decode_mode27_mip_chain_from_raw, decode_raster_state, decode_render_target_format,
-        decode_render_targets_from_registers, decode_scanout_target, decode_scissor,
-        decode_viewport, effective_linear_pitch, encode_mode27_mip_chain_into_raw,
-        fallback_image_descriptor, graphics_shader_resource_key, guest_shared_mapping_identity,
-        guest_texture_byte_count, guest_texture_descriptors_overlap,
+        CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1,
+        CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL,
+        DB_DEPTH_SIZE_XY, DB_RENDER_CONTROL, DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
+        DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, DecodedDepthTarget, DecodedRasterState,
+        DecodedRenderTarget, DisplayConfiguration, GLOBAL_UPLOAD_ALIGNMENT, GraphicsPipelineKey,
+        GraphicsShaderResourceKey, GuestBatchFlushReason, GuestCommandBatch, GuestMemoryWaitKey,
+        GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker, GuestRenderPassKey,
+        GuestTextureDescriptor, MetalPresenter, OpenGuestRenderPass, OrderedEventPoll,
+        OrderedEventSource, OrderedGpuEventReceiver, PA_SU_SC_MODE_CNTL, PendingFlip,
+        PendingGlobalWriteback, PendingGuestMemoryWrite, PendingTextureReadback,
+        PresentationResolution, QueueBlockReason, SPI_PS_INPUT_CNTL_0, TextureReadbackLayout,
+        VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
+        WriteWatchRefresh, apply_image_destination_select, apply_pending_guest_memory_writes,
+        canonical_sampler_bindings, canonical_texture_bindings, common_render_target_array_length,
+        comparison_depth32_upload, decode_depth_target, decode_fast_clear_color,
+        decode_image_descriptor, decode_metal_blend_attachment, decode_mode27_mip_chain_from_raw,
+        decode_raster_state, decode_render_target_format, decode_render_targets_from_registers,
+        decode_scanout_target, decode_scissor, decode_viewport, effective_linear_pitch,
+        encode_mode27_mip_chain_into_raw, fallback_image_descriptor, graphics_shader_resource_key,
+        guest_physical_ranges_overlap, guest_shared_mapping_identity, guest_texture_byte_count,
+        guest_texture_descriptors_overlap,
         guest_texture_descriptors_share_component_reordered_storage,
         guest_texture_descriptors_share_storage, guest_texture_raw_matches,
         half_float_to_srgb_unorm8, half_float_to_unorm8, headless_metal_value_is_enabled,
         image_component_class, image_destination_select_is_native,
-        image_resource_descriptor_is_null, initial_depth_clear_value, linear_unorm8_to_srgb_unorm8,
+        image_resource_descriptor_is_null, initial_depth_clear_for_target,
+        initial_depth_clear_value, initial_render_target_clear_color, linear_unorm8_to_srgb_unorm8,
         metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
-        metal_primitive_type, mode5_within_block_byte_offset, mode9_within_block_byte_offset,
-        mode24_within_block_byte_offset_for_format, mode27_block_dimensions,
-        mode27_mip_chain_layout, mode27_source_byte_offset, mode27_within_block_byte_offset,
-        mode27_within_block_byte_offset_for_format, native_texture_capture_to_bgra,
-        new_red_blue_swizzled_texture_view, parse_diagnostic_hex_address,
-        parse_presentation_resolution, pixel_input_controls, presentation_drawable_size,
-        presentation_viewport, process_resident_bytes, raw_video_out_layout_is_linear,
-        read_draw_indices, read_texture_linear, render_resolve_candidate_matches, sampler_lod_bias,
-        sampler_uses_normalized_coordinates, shader_scalar_metadata,
-        shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
-        snapshot_guest_texture_linear, snapshot_guest_texture_raw,
-        snapshot_watched_guest_texture_raw, tiled_block_dimensions, unsigned_float_to_f32,
+        metal_primitive_type, missing_vertex_parameter_exports, mode5_within_block_byte_offset,
+        mode9_within_block_byte_offset, mode24_within_block_byte_offset_for_format,
+        mode27_block_dimensions, mode27_mip_chain_layout, mode27_source_byte_offset,
+        mode27_within_block_byte_offset, mode27_within_block_byte_offset_for_format,
+        native_texture_capture_to_bgra, new_red_blue_swizzled_texture_view,
+        parse_diagnostic_hex_address, parse_presentation_resolution, pixel_input_controls,
+        presentation_drawable_size, presentation_viewport, procedural_rectangle_export_stage,
+        process_resident_bytes, raw_video_out_layout_is_linear, raw_video_out_texture_descriptor,
+        read_draw_indices, read_texture_linear, render_resolve_candidate_matches,
+        render_target_fast_clear_color, sampled_alias_descriptor,
+        sampled_texture_cache_needs_reload, sampler_lod_bias, sampler_uses_normalized_coordinates,
+        shader_scalar_metadata, shader_scalar_metadata_for_registers,
+        should_record_diagnostic_target_writer, snapshot_guest_texture_linear,
+        snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
+        storage_image_requires_mip_hierarchy, tiled_block_dimensions, unsigned_float_to_f32,
         validate_compute_launch_for_metal, watch_guest_texture, wave64_split_blockers,
-        write_guest_texture_linear, write_watched_guest_texture_linear,
+        write_back_pending_globals, write_guest_texture_linear, write_watched_guest_texture_linear,
     };
     use remu_memory::CpuWriteWatchRetirement;
+
+    #[test]
+    fn presenter_shows_and_hides_a_host_splash_without_guest_video_out() {
+        let (sender, receiver) = gpu_event_channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+        let image = GpuHostImage::new(1, 1, vec![10, 20, 30, 255]).expect("complete host image");
+
+        sender
+            .send(GpuEvent::ShowHostSplash(image))
+            .expect("show event reaches presenter");
+        assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+        let splash = presenter.host_splash.as_ref().expect("splash texture");
+        assert_eq!((splash.width, splash.height), (1, 1));
+        assert_eq!(
+            splash.texture.pixel_format(),
+            MTLPixelFormat::RGBA8Unorm_sRGB
+        );
+
+        sender
+            .send(GpuEvent::HideHostSplash)
+            .expect("hide event reaches presenter");
+        assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+        assert!(presenter.host_splash.is_none());
+        assert!(presenter.redraw_pending);
+    }
 
     #[test]
     fn diagnostic_shader_address_accepts_prefixed_and_plain_hex() {
@@ -13491,6 +16590,34 @@ mod tests {
         );
         assert_eq!(parse_diagnostic_hex_address(""), None);
         assert_eq!(parse_diagnostic_hex_address("not-hex"), None);
+    }
+
+    #[test]
+    fn sampled_texture_cache_reloads_cpu_dirty_content_without_an_acquire() {
+        assert!(sampled_texture_cache_needs_reload(
+            WriteWatchRefresh::Active,
+            true
+        ));
+        assert!(!sampled_texture_cache_needs_reload(
+            WriteWatchRefresh::Active,
+            false
+        ));
+        assert!(sampled_texture_cache_needs_reload(
+            WriteWatchRefresh::Renewed { was_dirty: true },
+            false
+        ));
+        assert!(sampled_texture_cache_needs_reload(
+            WriteWatchRefresh::Replaced,
+            false
+        ));
+        assert!(!sampled_texture_cache_needs_reload(
+            WriteWatchRefresh::Renewed { was_dirty: false },
+            true
+        ));
+        assert!(!sampled_texture_cache_needs_reload(
+            WriteWatchRefresh::Reprotecting,
+            true
+        ));
     }
 
     #[test]
@@ -13517,11 +16644,47 @@ mod tests {
     }
 
     #[test]
-    fn raw_video_out_upload_accepts_only_the_abi_linear_tiling_mode() {
+    fn raw_video_out_upload_maps_both_abi_layouts() {
         assert!(raw_video_out_layout_is_linear(1, 3_840, 3_840));
         assert!(!raw_video_out_layout_is_linear(0, 3_840, 3_840));
         assert!(!raw_video_out_layout_is_linear(1, 1_919, 1_920));
         assert!(!raw_video_out_layout_is_linear(27, 3_840, 3_840));
+
+        let display = DisplayConfiguration {
+            width: 3_840,
+            height: 2_160,
+            pitch: 3_840,
+            pixel_format: 0x8000_0000_0000_0000,
+            tiling_mode: VIDEO_OUT_TILING_MODE_TILE,
+        };
+        assert_eq!(
+            raw_video_out_texture_descriptor(0xefc0_0000_00, display)
+                .expect("display-tiled VideoOut allocation")
+                .tile_mode,
+            VIDEO_OUT_DISPLAY_TILE_MODE
+        );
+        assert_eq!(
+            raw_video_out_texture_descriptor(
+                0xefc0_0000_00,
+                DisplayConfiguration {
+                    tiling_mode: VIDEO_OUT_TILING_MODE_LINEAR,
+                    ..display
+                }
+            )
+            .expect("linear VideoOut allocation")
+            .tile_mode,
+            0
+        );
+        assert!(
+            raw_video_out_texture_descriptor(
+                0xefc0_0000_00,
+                DisplayConfiguration {
+                    pitch: 1_919,
+                    ..display
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -13565,6 +16728,7 @@ mod tests {
         presenter.open_guest_batch = Some(GuestCommandBatch {
             command_buffer,
             work: Vec::new(),
+            global_upload_chunks: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),
@@ -13688,6 +16852,7 @@ mod tests {
         presenter.open_guest_batch = Some(GuestCommandBatch {
             command_buffer: queue.new_command_buffer().to_owned(),
             work: Vec::new(),
+            global_upload_chunks: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),
@@ -13841,6 +17006,7 @@ mod tests {
                 .push_back(GuestCommandBatch {
                     command_buffer,
                     work: Vec::new(),
+                    global_upload_chunks: Vec::new(),
                     global_writebacks: Vec::new(),
                     guest_write_ranges: Vec::new(),
                     memory_writes,
@@ -13863,6 +17029,43 @@ mod tests {
             completion_label, 9,
             "the later batch's ordered completion label must still publish"
         );
+    }
+
+    #[test]
+    fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
+        let device = Device::system_default().expect("Metal device");
+        let queue = device.new_command_queue();
+        let mut batch = GuestCommandBatch {
+            command_buffer: queue.new_command_buffer().to_owned(),
+            work: Vec::new(),
+            global_upload_chunks: Vec::new(),
+            global_writebacks: Vec::new(),
+            guest_write_ranges: Vec::new(),
+            memory_writes: Vec::new(),
+            render_pass: None,
+            completion_sequences: Vec::new(),
+        };
+        let (first_buffer, first_offset) = batch
+            .upload_global_bytes(&device, &[1, 2, 3])
+            .expect("first upload");
+        let (second_buffer, second_offset) = batch
+            .upload_global_bytes(&device, &[9, 8, 7, 6])
+            .expect("second upload");
+        assert_eq!(first_buffer.contents(), second_buffer.contents());
+        assert_eq!(first_offset, 0);
+        assert_eq!(second_offset, GLOBAL_UPLOAD_ALIGNMENT as u64);
+
+        let mut destination = [0_u8; 4];
+        let guest_address =
+            u64::try_from(destination.as_mut_ptr() as usize).expect("host pointer fits u64");
+        write_back_pending_globals(&[PendingGlobalWriteback {
+            buffer: second_buffer,
+            offset: second_offset,
+            guest_address,
+            byte_count: destination.len(),
+        }])
+        .expect("sliced global writeback");
+        assert_eq!(destination, [9, 8, 7, 6]);
     }
 
     #[test]
@@ -13898,6 +17101,66 @@ mod tests {
         assert_eq!(controls[0], 4);
         assert_eq!(controls[1], 0x220);
         assert_eq!(controls[2], 2);
+    }
+
+    #[test]
+    fn rejects_only_non_default_pixel_inputs_without_vertex_exports() {
+        let mut controls = std::array::from_fn(|index| {
+            u32::try_from(index).expect("input-control index fits u32")
+        });
+        controls[0] = 0x320;
+        controls[1] = 3;
+
+        assert_eq!(
+            missing_vertex_parameter_exports(1 << 3, 0b11, &controls),
+            Vec::new(),
+            "logical input zero uses architectural default 3 and input one maps to PARAM3"
+        );
+        assert_eq!(
+            missing_vertex_parameter_exports(0, 0b11, &controls),
+            vec![(1, 3, 3)],
+            "a non-default PARAM3 input cannot be supplied by a position-only stage"
+        );
+    }
+
+    #[test]
+    fn recognizes_the_architectural_procedural_rectangle_export_stage() {
+        let words = [
+            0xbfa0_0001,
+            0x7e00_0000,
+            0x7e00_0000,
+            0x7e00_0000,
+            0x93eb_ff03,
+            0x0008_0008,
+            0x8f6a_8c6b,
+            0x8700_ff03,
+            0x0000_00ff,
+            0x887c_6a00,
+            0xbf90_0009,
+            0x81ea_6bc0,
+            0x90fe_6ac1,
+            0xf800_0941,
+            0x0000_0000,
+            0x81ea_00c0,
+            0xbf8c_ff0f,
+            0x90fe_6ac1,
+            0x3604_0a81,
+            0x2c06_0a81,
+            0x7e00_0280,
+            0x7e02_02f2,
+            0xd746_0002,
+            0x0305_0302,
+            0xd746_0003,
+            0x0305_0303,
+            0x7e04_0b02,
+            0x7e06_0b03,
+            0xf800_08cf,
+            0x0100_0302,
+            0xbf81_0000,
+        ];
+        let program = decode_program(0x1000, &words).expect("observed AGC rectangle stage decodes");
+
+        assert!(procedural_rectangle_export_stage(&program));
     }
 
     #[test]
@@ -14133,6 +17396,42 @@ mod tests {
             .expect("live scalar metadata fits"),
             [30, 40, 0x1234_5678, 0x70, 96, 1]
         );
+    }
+
+    #[test]
+    fn live_scalar_metadata_matches_sorted_register_snapshot_values() {
+        let evaluation = ShaderEvaluation {
+            initial_scalar_registers: vec![u32::MAX; 64].into(),
+            scalar_registers: vec![u32::MAX; 64].into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: Vec::new(),
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        };
+        let registers = (0..256_u32)
+            .filter(|offset| *offset != 0x20)
+            .map(|offset| GpuRegister {
+                offset: 0x200 + offset,
+                value: 0xa500_0000 | offset,
+            })
+            .collect::<Vec<_>>();
+        let expected = std::array::from_fn::<_, 64, _>(|scalar| {
+            let offset = 0x200 + u32::try_from(scalar).expect("scalar index fits u32");
+            registers
+                .iter()
+                .find(|register| register.offset == offset)
+                .map_or(0, |register| register.value)
+        });
+
+        assert_eq!(
+            shader_scalar_metadata_for_registers(&evaluation, &registers, 0x200, 0)
+                .expect("live scalar metadata fits"),
+            expected
+        );
+        assert_eq!(expected[0], 0xa500_0000);
+        assert_eq!(expected[0x20], 0);
+        assert_eq!(expected[63], 0xa500_003f);
     }
 
     #[test]
@@ -14373,6 +17672,8 @@ kernel void remu_sampler_cache_test(
                 value: depth_control,
             },
         ]);
+        draw.context_registers
+            .sort_unstable_by_key(|register| register.offset);
     }
 
     #[test]
@@ -14391,6 +17692,7 @@ kernel void remu_sampler_cache_test(
         assert_eq!(depth.texture.pixel_format, MTLPixelFormat::Depth16Unorm);
         assert_eq!(depth.compare, MTLCompareFunction::GreaterEqual);
         assert!(!depth.write_enabled);
+        assert_eq!(initial_depth_clear_for_target(depth), 0.0);
     }
 
     #[test]
@@ -14403,6 +17705,7 @@ kernel void remu_sampler_cache_test(
         assert_eq!(depth.texture.pixel_format, MTLPixelFormat::Depth32Float);
         assert_eq!(depth.compare, MTLCompareFunction::GreaterEqual);
         assert!(depth.write_enabled);
+        assert_eq!(initial_depth_clear_for_target(depth), 1.0);
 
         draw.context_registers
             .iter_mut()
@@ -14428,6 +17731,50 @@ kernel void remu_sampler_cache_test(
             decode_depth_target(&draw).expect("format-zero depth state is valid"),
             None
         );
+    }
+
+    #[test]
+    fn decodes_explicit_guest_depth_clear_without_depth_test() {
+        let mut draw = indexed_draw(0, 0, 0);
+        append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0);
+        draw.context_registers.extend([
+            GpuRegister {
+                offset: DB_RENDER_CONTROL,
+                value: 1,
+            },
+            GpuRegister {
+                offset: DB_DEPTH_CLEAR,
+                value: 0.25_f32.to_bits(),
+            },
+        ]);
+        draw.context_registers
+            .sort_unstable_by_key(|register| register.offset);
+
+        let depth = decode_depth_target(&draw)
+            .expect("valid explicit clear state")
+            .expect("clear-only operation retains its depth target");
+        assert!(!depth.test_enabled);
+        assert!(!depth.write_enabled);
+        assert!(depth.clear_enabled);
+        assert_eq!(depth.clear_depth, 0.25);
+        assert_eq!(initial_depth_clear_for_target(depth), 0.25);
+    }
+
+    #[test]
+    fn rejects_non_finite_guest_depth_clear_value() {
+        let mut draw = indexed_draw(0, 0, 0);
+        append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0x2);
+        draw.context_registers.push(GpuRegister {
+            offset: DB_DEPTH_CLEAR,
+            value: f32::NAN.to_bits(),
+        });
+        draw.context_registers
+            .sort_unstable_by_key(|register| register.offset);
+
+        let depth = decode_depth_target(&draw)
+            .expect("invalid clear register falls back safely")
+            .expect("depth test remains active");
+        assert_eq!(depth.clear_depth, 1.0);
     }
 
     #[test]
@@ -14529,6 +17876,14 @@ kernel void remu_sampler_cache_test(
         let key = GraphicsPipelineKey {
             export_shader_address: 0x1000,
             pixel_shader_address: 0x2000,
+            export_program_identity: super::ProgramIdentity(std::sync::Arc::new(Program::new(
+                0x1000,
+                Vec::new(),
+            ))),
+            pixel_program_identity: super::ProgramIdentity(std::sync::Arc::new(Program::new(
+                0x2000,
+                Vec::new(),
+            ))),
             export_resources: GraphicsShaderResourceKey {
                 initial_scalar_count: 0,
                 global_bindings: Vec::new(),
@@ -14715,6 +18070,30 @@ kernel void remu_sampler_cache_test(
             ordered.try_recv(|_| true),
             OrderedEventPoll::Empty
         ));
+    }
+
+    #[test]
+    fn ordered_ingress_stops_at_the_decoded_event_backpressure_limit() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for _ in 0..(remu_gpu::GPU_PENDING_EVENT_CAPACITY
+            / remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
+            + 4)
+        {
+            sender
+                .send(GpuEvent::QueueSubmission {
+                    queue_id: 0,
+                    events: vec![GpuEvent::Shutdown; remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE],
+                })
+                .expect("queue decoded event chunk");
+        }
+        let mut ordered = OrderedGpuEventReceiver::new(receiver);
+
+        ordered.ingest(usize::MAX);
+
+        assert_eq!(
+            ordered.pending_event_count(),
+            remu_gpu::GPU_PENDING_EVENT_CAPACITY
+        );
     }
 
     #[test]
@@ -15113,6 +18492,74 @@ kernel void remu_sampler_cache_test(
     }
 
     #[test]
+    fn promotes_small_depth_target_to_the_color_framebuffer_extent() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let allocation_size = 4 * GUEST_PAGE_SIZE;
+        let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("guest depth mapping");
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let descriptor = GuestTextureDescriptor {
+            address: address.get(),
+            width: 64,
+            height: 64,
+            pitch: 64,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::Depth32Float,
+            bytes_per_pixel: 4,
+        };
+        let depth = DecodedDepthTarget {
+            texture: descriptor,
+            compare: MTLCompareFunction::Less,
+            test_enabled: true,
+            write_enabled: false,
+            clear_enabled: false,
+            clear_depth: 1.0,
+            sample_count: 1,
+        };
+
+        let promoted = presenter
+            .ensure_depth_render_target_texture(&device, depth, 128, 96)
+            .expect("promote depth target");
+        assert_eq!((promoted.width(), promoted.height()), (128, 96));
+
+        let promoted_descriptor = GuestTextureDescriptor {
+            width: 128,
+            height: 96,
+            pitch: 128,
+            ..descriptor
+        };
+        let queue = presenter
+            .command_queue
+            .as_ref()
+            .expect("Metal queue")
+            .clone();
+        let bytes = read_texture_linear(&device, &queue, &promoted, promoted_descriptor)
+            .expect("read promoted depth target");
+        let sample = |x: usize, y: usize| {
+            let offset = (y * 128 + x) * 4;
+            f32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("depth sample"))
+        };
+        assert_eq!(sample(0, 0), 0.0);
+        assert_eq!(sample(100, 50), 1.0);
+    }
+
+    #[test]
     fn decodes_agc_16_and_32_bit_index_types() {
         let indices_16 = [0_u16, 1, 2, 0, 2, 3];
         let draw_16 = indexed_draw(indices_16.as_ptr().addr() as u64, 0, 6);
@@ -15183,6 +18630,18 @@ kernel void remu_sampler_cache_test(
     }
 
     #[test]
+    fn zero_color_target_mask_is_a_valid_depth_only_attachment_set() {
+        let registers = [GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0,
+        }];
+
+        let targets = decode_render_targets_from_registers(&registers, 0xf)
+            .expect("depth-only draws have no color attachments");
+        assert!(targets.is_empty());
+    }
+
+    #[test]
     fn decodes_explicit_scanout_target_without_fabricating_context_registers() {
         let surface = GpuColorTarget {
             slot: 0,
@@ -15247,7 +18706,7 @@ kernel void remu_sampler_cache_test(
     }
 
     #[test]
-    fn pending_flip_retries_after_its_translated_target_is_written() {
+    fn pending_flip_without_a_source_retries_at_the_submission_boundary() {
         let (_sender, receiver) = std::sync::mpsc::channel();
         let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
         let device = presenter.device.as_ref().expect("Metal device").clone();
@@ -15270,41 +18729,106 @@ kernel void remu_sampler_cache_test(
         });
         presenter.pending_flip = Some(PendingFlip {
             address: descriptor.address,
+            buffer_index: 0,
+            flip_argument: 0,
             sequence: 1,
         });
+        presenter.pending_flip_queue = Some(7);
         presenter.next_flip_sequence = 1;
         presenter.redraw_pending = false;
 
         presenter.mark_direct_scanout_initialized(descriptor.address);
-        let target = DecodedRenderTarget {
-            guest_slot: 0,
-            texture: descriptor,
-            output_kind: PixelOutputKind::Float,
-            write_mask: 0xf,
-            direct_scanout: true,
-            sample_count: 1,
-            texture_type: 9,
-            layer_count: 1,
-            base_layer: 0,
-            mip_level: 0,
-            mip_level_count: 1,
-            dcc_enabled: false,
-            fast_clear_enabled: false,
-        };
-        presenter.refresh_pending_flip_after_target_write(target);
+        presenter.note_pending_flip_target_write(descriptor);
 
+        assert!(!presenter.redraw_pending);
+        assert!(presenter.pending_flip_target_written_since_boundary);
+        assert_eq!(presenter.uploaded_flip_sequence, 0);
+        presenter.finalize_pending_flip_at_submission_boundary(OrderedEventSource::GuestQueue(7));
         assert!(presenter.redraw_pending);
-        assert_eq!(presenter.uploaded_flip_sequence, 1);
-        presenter.upload_pending_frame();
+        assert!(!presenter.pending_flip_target_written_since_boundary);
         assert_eq!(presenter.uploaded_flip_sequence, 1);
         assert_eq!(presenter.frame_texture_size, (640, 360));
         assert!(presenter.frame_texture.is_some());
 
-        // The same guest flip remains live while later compositor passes update its target.
-        // An uploaded sequence must not suppress the redraw for those newer contents.
+        // Once the flip has an immutable snapshot, later writes to the same allocation belong to
+        // a future frame and must not replace it at another submission boundary.
         presenter.redraw_pending = false;
-        presenter.refresh_pending_flip_after_target_write(target);
-        assert!(presenter.redraw_pending);
+        presenter.note_pending_flip_target_write(descriptor);
+        assert!(!presenter.pending_flip_target_written_since_boundary);
+        assert!(!presenter.redraw_pending);
+        presenter.finalize_pending_flip_at_submission_boundary(OrderedEventSource::GuestQueue(7));
+        assert!(!presenter.redraw_pending);
+    }
+
+    #[test]
+    fn translated_scanout_resolution_prefers_the_current_resident_object() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let allocation_size = 4 * GUEST_PAGE_SIZE;
+        let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("guest texture mapping");
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let descriptor = GuestTextureDescriptor {
+            address: address.get(),
+            width: 64,
+            height: 64,
+            pitch: 64,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let original = presenter
+            .ensure_resident_texture(&device, descriptor)
+            .expect("resident scanout");
+        presenter.mark_resident_texture_written(descriptor);
+        presenter.ensure_direct_scanout_texture(&device, descriptor);
+        presenter.mark_direct_scanout_initialized(address.get());
+
+        let (_, selected, source) = presenter
+            .translated_scanout_source(address.get(), descriptor.width, descriptor.height)
+            .expect("translated source");
+        assert_eq!(source, "resident");
+        assert!(std::ptr::eq(selected.as_ref(), original.as_ref()));
+
+        let metal_descriptor = TextureDescriptor::new();
+        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_pixel_format(descriptor.pixel_format);
+        metal_descriptor.set_width(u64::from(descriptor.width));
+        metal_descriptor.set_height(u64::from(descriptor.height));
+        metal_descriptor.set_storage_mode(MTLStorageMode::Private);
+        metal_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let replacement = device.new_texture(&metal_descriptor);
+        let resident = presenter
+            .resident_guest_textures
+            .get_mut(&descriptor)
+            .expect("resident map entry");
+        resident.texture = replacement.clone();
+        resident.content_version = resident.content_version.saturating_add(1);
+        // A synchronization can write Metal's current contents back to guest memory and clear
+        // this dirty bit without invalidating the Metal texture. Presentation validity must not
+        // be tied to whether another writeback is presently required.
+        resident.gpu_written = false;
+
+        let (_, selected, source) = presenter
+            .translated_scanout_source(address.get(), descriptor.width, descriptor.height)
+            .expect("replacement translated source");
+        assert_eq!(source, "resident");
+        assert!(std::ptr::eq(selected.as_ref(), replacement.as_ref()));
     }
 
     #[test]
@@ -15392,6 +18916,23 @@ kernel void remu_sampler_cache_test(
         let output_texture = presenter.frame_texture.as_ref().expect("presented texture");
         assert_eq!(output_texture.width(), texture.width());
         assert_eq!(output_texture.height(), texture.height());
+
+        // Reuse the original VideoOut allocation immediately after the ordered flip. The host
+        // frame must retain the contents captured at the flip rather than following the mutation.
+        let pass = RenderPassDescriptor::new();
+        let attachment = pass
+            .color_attachments()
+            .object_at(0)
+            .expect("color attachment zero");
+        attachment.set_texture(Some(&texture));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_store_action(MTLStoreAction::Store);
+        attachment.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+        let reuse = queue.new_command_buffer().to_owned();
+        let encoder = reuse.new_render_command_encoder(pass);
+        encoder.end_encoding();
+        reuse.commit();
+
         let output = read_texture_linear(&device, &queue, output_texture, descriptor)
             .expect("read snapshotted scanout");
         assert!(
@@ -15640,6 +19181,80 @@ kernel void remu_sampler_cache_test(
     }
 
     #[test]
+    fn inferred_texture_watch_distinguishes_declared_storage_from_speculative_neighbors() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing =
+            GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+        let base = memory.base();
+        let primary = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(base),
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("primary alias");
+        let alias_address = base
+            .checked_add(8 * GUEST_PAGE_SIZE)
+            .expect("alias address");
+        let alias = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(alias_address),
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("second alias");
+        let watch = super::GuestTextureWriteWatch::new_with_declared_byte_count(
+            primary.get(),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .expect("watch speculative hierarchy");
+
+        assert!(watch.overlaps_alias_range(alias.get() + 2 * GUEST_PAGE_SIZE, GUEST_PAGE_SIZE));
+        assert!(
+            !watch
+                .overlaps_declared_alias_range(alias.get() + 2 * GUEST_PAGE_SIZE, GUEST_PAGE_SIZE)
+        );
+        assert!(watch.overlaps_declared_alias_range(alias.get(), GUEST_PAGE_SIZE));
+
+        let first_page =
+            super::GuestTextureWriteWatch::new(primary.get(), GUEST_PAGE_SIZE).expect("first page");
+        let first_page_through_alias =
+            super::GuestTextureWriteWatch::new(alias.get(), GUEST_PAGE_SIZE)
+                .expect("aliased first page");
+        let third_page = super::GuestTextureWriteWatch::new(
+            primary.get() + 2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .expect("disjoint physical page");
+        assert!(first_page.overlaps_aliases(&first_page_through_alias));
+        assert!(!first_page.overlaps_aliases(&third_page));
+        assert!(guest_physical_ranges_overlap(
+            primary.get(),
+            GUEST_PAGE_SIZE,
+            alias.get(),
+            GUEST_PAGE_SIZE,
+        ));
+        assert!(!guest_physical_ranges_overlap(
+            primary.get(),
+            GUEST_PAGE_SIZE,
+            alias.get() + 2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        ));
+    }
+
+    #[test]
     fn contiguous_texture_snapshot_and_writeback_retain_direct_mapping_semantics() {
         use remu_memory::{
             GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -15675,8 +19290,11 @@ kernel void remu_sampler_cache_test(
         assert_eq!(raw.len(), usize::try_from(4 * GUEST_PAGE_SIZE).unwrap());
 
         let linear = vec![0x3c; 64 * 64 * 4];
+        let generations = watch.generations();
         write_watched_guest_texture_linear(descriptor, &linear, &watch)
             .expect("guarded direct writeback");
+        assert_eq!(watch.generations(), generations);
+        assert!(!watch.is_dirty());
         let decoded =
             snapshot_watched_guest_texture_raw(descriptor, &watch).expect("updated snapshot");
         assert!(decoded.iter().any(|&byte| byte == 0x3c));
@@ -15788,6 +19406,42 @@ kernel void remu_sampler_cache_test(
             .expect("encode exact mip tail");
         let (decoded_layout, decoded) =
             decode_mode27_mip_chain_from_raw(descriptor, 6, &raw).expect("decode exact mip tail");
+        assert_eq!(decoded_layout, layout);
+        assert_eq!(decoded, levels);
+    }
+
+    #[test]
+    fn mode27_mip_chain_round_trips_multiple_nontail_blocks_and_tail() {
+        let descriptor = GuestTextureDescriptor {
+            address: 0x80b9_2800_00,
+            width: 512,
+            height: 256,
+            pitch: 512,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let layout = mode27_mip_chain_layout(descriptor, 10).expect("complete mip-chain layout");
+        assert!(layout.levels.iter().any(|level| !level.in_tail));
+        assert!(layout.levels.iter().any(|level| level.in_tail));
+        let levels = layout
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(level_index, level)| {
+                (0..level.width * level.height * layout.bytes_per_element)
+                    .map(|byte| {
+                        u8::try_from((level_index * 41 + byte * 17 + byte / 251) & 0xff)
+                            .expect("masked test byte fits")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut raw = vec![0x5a; layout.byte_count];
+        encode_mode27_mip_chain_into_raw(&layout, &levels, &mut raw)
+            .expect("encode complete mip chain");
+        let (decoded_layout, decoded) = decode_mode27_mip_chain_from_raw(descriptor, 10, &raw)
+            .expect("decode complete mip chain");
         assert_eq!(decoded_layout, layout);
         assert_eq!(decoded, levels);
     }
@@ -15929,6 +19583,13 @@ kernel void remu_sampler_cache_test(
     }
 
     #[test]
+    fn mixed_render_targets_use_their_common_layer_capacity() {
+        assert_eq!(common_render_target_array_length([1, 64]), 1);
+        assert_eq!(common_render_target_array_length([64, 64]), 64);
+        assert_eq!(common_render_target_array_length([]), 1);
+    }
+
+    #[test]
     fn maps_guest_number_types_to_matching_metal_export_types() {
         let float = decode_render_target_format(10, 0, 0).expect("RGBA8 unorm");
         let uint = decode_render_target_format(10, 4, 0).expect("RGBA8 uint");
@@ -15950,6 +19611,193 @@ kernel void remu_sampler_cache_test(
         assert!(decode_render_target_format(8, 0, 0).is_err());
         assert!(decode_render_target_format(10, 2, 0).is_err());
         assert!(decode_render_target_format(10, 0, 2).is_err());
+    }
+
+    #[test]
+    fn decodes_gfx10_fast_clear_words_for_metal_formats() {
+        let close = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() < 0.000_01,
+                "actual {actual} differs from expected {expected}"
+            );
+        };
+
+        let rgba = decode_fast_clear_color(MTLPixelFormat::RGBA8Unorm, [0x8040_2010, 0])
+            .expect("RGBA8 clear color");
+        close(rgba.red, 16.0 / 255.0);
+        close(rgba.green, 32.0 / 255.0);
+        close(rgba.blue, 64.0 / 255.0);
+        close(rgba.alpha, 128.0 / 255.0);
+
+        let bgra = decode_fast_clear_color(MTLPixelFormat::BGRA8Unorm, [0x8040_2010, 0])
+            .expect("BGRA8 clear color");
+        close(bgra.red, 64.0 / 255.0);
+        close(bgra.green, 32.0 / 255.0);
+        close(bgra.blue, 16.0 / 255.0);
+        close(bgra.alpha, 128.0 / 255.0);
+
+        let srgb = decode_fast_clear_color(MTLPixelFormat::RGBA8Unorm_sRGB, [0xffbc_bcbc, 0])
+            .expect("sRGB clear color");
+        close(srgb.red, 0.502_886_458);
+        close(srgb.green, 0.502_886_458);
+        close(srgb.blue, 0.502_886_458);
+        close(srgb.alpha, 1.0);
+
+        let rgba16f =
+            decode_fast_clear_color(MTLPixelFormat::RGBA16Float, [0x3c00_3800, 0xbc00_4000])
+                .expect("RGBA16 float clear color");
+        close(rgba16f.red, 0.5);
+        close(rgba16f.green, 1.0);
+        close(rgba16f.blue, 2.0);
+        close(rgba16f.alpha, -1.0);
+
+        let rg32u = decode_fast_clear_color(MTLPixelFormat::RG32Uint, [u32::MAX, 0x8000_0000])
+            .expect("RG32 uint clear color");
+        close(rg32u.red, f64::from(u32::MAX));
+        close(rg32u.green, f64::from(0x8000_0000_u32));
+
+        let rgb10a2 = decode_fast_clear_color(MTLPixelFormat::RGB10A2Unorm, [u32::MAX, 0])
+            .expect("RGB10A2 clear color");
+        close(rgb10a2.red, 1.0);
+        close(rgb10a2.green, 1.0);
+        close(rgb10a2.blue, 1.0);
+        close(rgb10a2.alpha, 1.0);
+
+        let rg11b10_word = 0x3c0 | (0x380 << 11) | (0x1a0 << 22);
+        let rg11b10 = decode_fast_clear_color(MTLPixelFormat::RG11B10Float, [rg11b10_word, 0])
+            .expect("RG11B10 clear color");
+        close(rg11b10.red, 1.0);
+        close(rg11b10.green, 0.5);
+        close(rg11b10.blue, 0.25);
+
+        let rgb9e5_word = (16 << 27) | 256 | (256 << 9) | (256 << 18);
+        let rgb9e5 = decode_fast_clear_color(MTLPixelFormat::RGB9E5Float, [rgb9e5_word, 0])
+            .expect("RGB9E5 clear color");
+        close(rgb9e5.red, 1.0);
+        close(rgb9e5.green, 1.0);
+        close(rgb9e5.blue, 1.0);
+
+        let rgba32f = decode_fast_clear_color(
+            MTLPixelFormat::RGBA32Float,
+            [0.25_f32.to_bits(), 0.75_f32.to_bits()],
+        )
+        .expect("RGBA32 float clear color");
+        close(rgba32f.red, 0.25);
+        close(rgba32f.green, 0.25);
+        close(rgba32f.blue, 0.25);
+        close(rgba32f.alpha, 0.75);
+    }
+
+    #[test]
+    fn reads_fast_clear_words_with_the_color_target_register_stride() {
+        let slot = 3;
+        let primary = slot * CB_COLOR_REGISTER_STRIDE;
+        let mut registers = vec![GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0xf << (slot * 4),
+        }];
+        append_color_target_registers(&mut registers, slot, 0x0070_1234_5600, 640, 360, 10, 0, 27);
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_INFO + primary)
+            .expect("slot info exists")
+            .value |= 1 << 13;
+        registers.extend([
+            GpuRegister {
+                offset: CB_COLOR0_CLEAR_WORD0 + primary,
+                value: 0x8040_2010,
+            },
+            GpuRegister {
+                offset: CB_COLOR0_CLEAR_WORD1 + primary,
+                value: 0xfeed_beef,
+            },
+        ]);
+        registers.sort_by_key(|register| register.offset);
+
+        let target = decode_render_targets_from_registers(&registers, 0xf << (slot * 4))
+            .expect("slot-three target")
+            .remove(0);
+        let color =
+            render_target_fast_clear_color(&target, &registers).expect("programmed clear color");
+        assert!((color.red - 16.0 / 255.0).abs() < 0.000_01);
+        assert!((color.alpha - 128.0 / 255.0).abs() < 0.000_01);
+
+        registers.retain(|register| {
+            !matches!(
+                register.offset,
+                offset
+                    if offset == CB_COLOR0_CLEAR_WORD0 + primary
+                        || offset == CB_COLOR0_CLEAR_WORD1 + primary
+            )
+        });
+        let reset = render_target_fast_clear_color(&target, &registers).expect("reset clear words");
+        assert_eq!(
+            (reset.red, reset.green, reset.blue, reset.alpha),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn first_use_dcc_target_clears_instead_of_loading_compressed_backing() {
+        let slot = 0;
+        let mut registers = vec![GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0xf,
+        }];
+        append_color_target_registers(&mut registers, slot, 0x0070_1234_5600, 640, 360, 10, 0, 27);
+        registers.extend([
+            GpuRegister {
+                offset: CB_COLOR0_CLEAR_WORD0,
+                value: 0x8040_2010,
+            },
+            GpuRegister {
+                offset: CB_COLOR0_CLEAR_WORD1,
+                value: 0,
+            },
+        ]);
+        registers.sort_by_key(|register| register.offset);
+        let ordinary = decode_render_targets_from_registers(&registers, 0xf)
+            .expect("ordinary color target")
+            .remove(0);
+
+        assert!(
+            initial_render_target_clear_color(&ordinary, &registers, false).is_none(),
+            "ordinary first-use targets preserve their existing load behavior"
+        );
+
+        let mut dcc = ordinary;
+        dcc.dcc_enabled = true;
+        let discarded = initial_render_target_clear_color(&dcc, &registers, false)
+            .expect("first-use DCC backing is discarded");
+        assert_eq!(
+            (
+                discarded.red,
+                discarded.green,
+                discarded.blue,
+                discarded.alpha
+            ),
+            (0.0, 0.0, 0.0, 1.0)
+        );
+        assert!(
+            initial_render_target_clear_color(&dcc, &registers, true).is_none(),
+            "resident DCC targets keep their accumulated Metal contents"
+        );
+
+        dcc.fast_clear_enabled = true;
+        let programmed = initial_render_target_clear_color(&dcc, &registers, false)
+            .expect("programmed DCC fast clear");
+        assert!((programmed.red - 16.0 / 255.0).abs() < 0.000_01);
+        assert!((programmed.green - 32.0 / 255.0).abs() < 0.000_01);
+        assert!((programmed.blue - 64.0 / 255.0).abs() < 0.000_01);
+        assert!((programmed.alpha - 128.0 / 255.0).abs() < 0.000_01);
+
+        dcc.dcc_enabled = false;
+        let ordinary_fast_clear = initial_render_target_clear_color(&dcc, &registers, false)
+            .expect("ordinary fast clear behavior is preserved");
+        assert_eq!(ordinary_fast_clear.red, programmed.red);
+        assert_eq!(ordinary_fast_clear.green, programmed.green);
+        assert_eq!(ordinary_fast_clear.blue, programmed.blue);
+        assert_eq!(ordinary_fast_clear.alpha, programmed.alpha);
     }
 
     #[test]
@@ -16252,6 +20100,23 @@ fragment int4 remu_format_sint() { return int4(-3); }
     }
 
     #[test]
+    fn sampled_texture_cache_key_ignores_shader_applied_component_selection() {
+        let descriptor =
+            decode_image_descriptor(&[0x804b_9100, 0xc240_0000, 0x021b_c3bf, 0x91b0_03ac])
+                .expect("observed Silent Hill HDR source descriptor decodes");
+        let mut alternate = descriptor;
+        alternate.destination_select = 0xfac;
+        assert_eq!(
+            super::sampled_texture_key(descriptor, false),
+            super::sampled_texture_key(alternate, false)
+        );
+        assert_ne!(
+            super::sampled_texture_key(descriptor, false),
+            super::sampled_texture_key(alternate, true)
+        );
+    }
+
+    #[test]
     fn decodes_silent_hill_rg11b10_tone_map_source_descriptor() {
         let descriptor =
             decode_image_descriptor(&[0x804b_9100, 0xc240_0000, 0x021b_c3bf, 0x91b0_03ac])
@@ -16270,6 +20135,40 @@ fragment int4 remu_format_sint() { return int4(-3); }
         assert_eq!(descriptor.mip_level_count, 1);
         assert_eq!(descriptor.texture_type, 9);
         assert_eq!(descriptor.layer_count, 1);
+    }
+
+    #[test]
+    fn ordinary_storage_load_does_not_promote_a_full_mip_view() {
+        let descriptor =
+            decode_image_descriptor(&[0x804b_9100, 0xc240_0000, 0x021b_c3bf, 0x9098_03ac])
+                .expect("observed-style mode-9 full mip view decodes");
+        assert_eq!(descriptor.guest.tile_mode, 9);
+        assert_eq!(descriptor.base_mip_level, 0);
+        assert_eq!(descriptor.mip_level_count, 9);
+        let mut binding = ImageBinding {
+            pc: 0x190,
+            opcode: Opcode::Known("ImageLoad"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 12,
+                scalar_sampler: 0,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+            },
+            resource_descriptor: Vec::new().into(),
+            sampler_descriptor: Vec::new().into(),
+            mip_level: None,
+        };
+        assert!(!storage_image_requires_mip_hierarchy(&binding, descriptor));
+        binding.opcode = Opcode::Known("ImageLoadMip");
+        assert!(storage_image_requires_mip_hierarchy(&binding, descriptor));
     }
 
     #[test]
@@ -16307,6 +20206,23 @@ fragment int4 remu_format_sint() { return int4(-3); }
         assert_eq!(fallback.guest.pixel_format, MTLPixelFormat::RGBA8Unorm);
         assert_eq!(fallback.texture_type, 9);
         assert_eq!(fallback.layer_count, 1);
+
+        let mut buffer_descriptor = binding.clone();
+        buffer_descriptor.pc = 0xc4;
+        buffer_descriptor.resource_descriptor =
+            vec![0x804b_9100, 0xc240_0000, 0x021b_c3bf, 0x01b0_03ac].into();
+        assert!(!image_resource_descriptor_is_null(
+            &buffer_descriptor.resource_descriptor
+        ));
+        assert!(decode_image_descriptor(&buffer_descriptor.resource_descriptor).is_err());
+        assert!(sampled_alias_descriptor(&buffer_descriptor).is_none());
+        let fallback =
+            fallback_image_descriptor(&buffer_descriptor).expect("type-zero sampled fallback");
+        assert_eq!(fallback.texture_type, 9);
+
+        buffer_descriptor.resource_descriptor =
+            vec![0x804b_9100, 0xc240_0000, 0x021b_c3bf, 0x91b0_03ac].into();
+        assert!(sampled_alias_descriptor(&buffer_descriptor).is_some());
     }
 
     #[test]
@@ -16509,6 +20425,7 @@ fragment int4 remu_format_sint() { return int4(-3); }
             &device,
             complete,
             &mut presenter.resident_guest_textures,
+            super::Mode27WorkOrigin::StorageCreate,
         )
         .expect("later complete mip view reuses first residency");
         assert!(std::ptr::eq(original.as_ref(), complete_view.as_ref()));
@@ -16533,6 +20450,7 @@ fragment int4 remu_format_sint() { return int4(-3); }
             &device,
             sampled,
             &mut presenter.resident_guest_textures,
+            super::Mode27WorkOrigin::StorageCreate,
         )
         .expect("larger resident hierarchy covers the sampled mip range");
         assert_eq!(view.width(), 8);
@@ -17428,6 +21346,53 @@ kernel void read_swizzled(
                 "{opcode} only permutes within one SIMD32 half"
             );
         }
+    }
+
+    #[test]
+    fn permits_exercised_split_wave64_lane_dpp_and_predication_operations() {
+        let instructions = vec![
+            Instruction {
+                pc: 0x10,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VReadlaneB32"),
+                words: Vec::new(),
+                sources: vec![Operand::vector(1), Operand::scalar(2)],
+                destinations: vec![Operand::scalar(4)],
+                control: None,
+            },
+            Instruction {
+                pc: 0x18,
+                encoding: ShaderEncoding::Vop2,
+                opcode: Opcode::Known("VMbcntLoU32B32"),
+                words: Vec::new(),
+                sources: vec![Operand::scalar(2), Operand::vector(1)],
+                destinations: vec![Operand::vector(1)],
+                control: Some(remu_shader::InstructionControl::Dpp(
+                    remu_shader::DppControl {
+                        control: 0x101,
+                        fetch_inactive: false,
+                        row_mask: 0xf,
+                        bank_mask: 0xf,
+                        bound_control: false,
+                        absolute_mask: 0,
+                        negate_mask: 0,
+                    },
+                )),
+            },
+            Instruction {
+                pc: 0x20,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SOrn2SaveexecB64"),
+                words: Vec::new(),
+                sources: vec![Operand::scalar(8)],
+                destinations: vec![Operand::scalar(10)],
+                control: None,
+            },
+        ];
+        assert!(
+            wave64_split_blockers(&Program::new(0x1000, instructions)).is_empty(),
+            "implemented cross-half lane exchange and half-local DPP/predication are split-safe"
+        );
     }
 
     #[test]

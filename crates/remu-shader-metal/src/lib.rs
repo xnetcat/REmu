@@ -31,6 +31,12 @@ pub enum MetalShaderStage {
     Vertex,
     Pixel,
     Compute,
+    /// A fused GFX10 export/geometry program lowered to a Metal mesh function.
+    ///
+    /// Unlike a vertex function, a mesh function has workgroup-shared memory and can publish
+    /// primitive connectivity as well as vertex outputs. That is the closest Metal execution
+    /// model for RDNA2 NGG programs which exchange ES/GS records through LDS.
+    Mesh,
 }
 
 pub const PIXEL_INPUT_CONTROL_COUNT: usize = 32;
@@ -226,11 +232,43 @@ impl MetalCompileOptions {
             wave_lane_count,
         }
     }
+
+    /// Builds options for one wave64 GFX10 NGG mesh workgroup.
+    ///
+    /// The presenter supplies 64 threads. Up to 63 lanes carry triangle-list vertices so every
+    /// workgroup contains 21 whole primitives; the remaining lane participates in wave/LDS
+    /// operations but exports only degenerate initialization data.
+    #[must_use]
+    pub const fn mesh(required_vertex_output_count: u32, lds_size_bytes: u32) -> Self {
+        Self {
+            stage: MetalShaderStage::Mesh,
+            required_vertex_output_count,
+            render_target_array_length: 1,
+            pixel_outputs: Vec::new(),
+            pixel_input_enable: 0,
+            pixel_input_address: 0,
+            pixel_input_controls: identity_pixel_input_controls(),
+            diagnostic_force_visible_clip_depth: false,
+            diagnostic_force_vertex_pattern: false,
+            diagnostic_force_vertex_fetch_id: false,
+            diagnostic_capture_vertex_position: false,
+            diagnostic_capture_pixel_output: false,
+            diagnostic_force_pixel_color: false,
+            lds_size_bytes,
+            wave_lane_count: 64,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalBindingLayout {
     pub global_buffer_count: u32,
+    /// Metal buffer slot containing an argument buffer of guest global-memory pointers.
+    ///
+    /// Direct stage bindings are cheaper for ordinary shaders. Large Unreal shaders can expose
+    /// more than Metal's 31 per-stage buffer slots, so those shaders place every guest pointer in
+    /// one tier-2 argument buffer instead.
+    pub global_argument_buffer_index: Option<u32>,
     pub initial_scalar_buffer_index: u32,
     pub sampler_argument_buffer_index: Option<u32>,
     pub texture_count: u32,
@@ -348,6 +386,68 @@ pub fn compile_layered_rectangle_vertex(
         stage: MetalShaderStage::Vertex,
         bindings: MetalBindingLayout {
             global_buffer_count: 0,
+            global_argument_buffer_index: None,
+            initial_scalar_buffer_index: 0,
+            sampler_argument_buffer_index: None,
+            texture_count: 0,
+            sampler_count: 0,
+            threadgroup_memory_bytes: 0,
+        },
+        vertex_inputs: Vec::new(),
+        interpolated_attribute_count,
+        register_footprint: MetalRegisterFootprint {
+            scalar_values: 0,
+            vector_values: 0,
+            direct_control_flow: true,
+        },
+    }
+}
+
+/// Builds the fixed-function equivalent of a procedural Gen5 rectangle export stage.
+///
+/// The common AGC fullscreen stage emits primitive data and position, but no conventional
+/// `EXP PARAM` instructions. On Prospero those rectangle parameters are generated as part of the
+/// primitive path. Metal exposes no equivalent stage, so emit the complete four-corner strip and
+/// its screen-space parameters directly. Attribute zero is the conventional modulation/tint
+/// parameter when a paired UI shader consumes more than one attribute; subsequent attributes
+/// carry UV and unit scale. A single attribute is treated as UV.
+#[must_use]
+pub fn compile_procedural_rectangle_vertex(interpolated_attribute_count: u32) -> MetalShader {
+    let mut source = String::from(
+        "#include <metal_stdlib>\nusing namespace metal;\n\n\
+         struct RemuVsOut {\n\
+         \x20   float4 position [[position]];\n",
+    );
+    for location in 0..interpolated_attribute_count {
+        let _ = writeln!(
+            source,
+            "    float4 param{location} [[user(locn{location})]];"
+        );
+    }
+    source.push_str(
+        "};\n\n\
+         vertex RemuVsOut remu_main(uint remu_vertex_id [[vertex_id]]) {\n\
+         \x20   RemuVsOut remu_out = {};\n\
+         \x20   uint remu_corner = remu_vertex_id & 3u;\n\
+         \x20   float2 remu_uv = float2(float(remu_corner & 1u), float((remu_corner >> 1u) & 1u));\n\
+         \x20   remu_out.position = float4(remu_uv * 2.0f - 1.0f, 0.0f, 1.0f);\n",
+    );
+    for location in 0..interpolated_attribute_count {
+        let value = if interpolated_attribute_count > 1 && location == 0 {
+            "float4(1.0f)"
+        } else {
+            "float4(remu_uv, 1.0f, 1.0f)"
+        };
+        let _ = writeln!(source, "    remu_out.param{location} = {value};");
+    }
+    source.push_str("    return remu_out;\n}\n");
+    MetalShader {
+        source,
+        entry_point: "remu_main".to_owned(),
+        stage: MetalShaderStage::Vertex,
+        bindings: MetalBindingLayout {
+            global_buffer_count: 0,
+            global_argument_buffer_index: None,
             initial_scalar_buffer_index: 0,
             sampler_argument_buffer_index: None,
             texture_count: 0,
@@ -509,8 +609,15 @@ struct ImageKind {
 }
 
 impl<'a> Compiler<'a> {
+    fn is_threadgroup_stage(&self) -> bool {
+        matches!(
+            self.options.stage,
+            MetalShaderStage::Compute | MetalShaderStage::Mesh
+        )
+    }
+
     fn split_wave64(&self) -> bool {
-        self.options.stage == MetalShaderStage::Compute && self.options.wave_lane_count == 64
+        self.is_threadgroup_stage() && self.options.wave_lane_count == 64
     }
 
     fn uses_lds_memory(&self) -> bool {
@@ -518,6 +625,25 @@ impl<'a> Compiler<'a> {
             .instructions
             .iter()
             .any(is_lds_memory_instruction)
+    }
+
+    fn graphics_addtid_write_slot_count(&self) -> usize {
+        if self.is_threadgroup_stage() {
+            return 0;
+        }
+        self.program
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.opcode.is("DsWriteAddtidB32"))
+            .count()
+    }
+
+    fn graphics_addtid_write_slot(&self, pc: u32) -> Option<usize> {
+        self.program
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.opcode.is("DsWriteAddtidB32"))
+            .position(|instruction| instruction.pc == pc)
     }
 
     fn architectural_lane(&self) -> &'static str {
@@ -604,8 +730,10 @@ impl<'a> Compiler<'a> {
         for instruction in &program.instructions {
             match instruction.control.as_ref() {
                 Some(InstructionControl::Export(export))
-                    if options.stage == MetalShaderStage::Vertex
-                        && (32..64).contains(&export.target) =>
+                    if matches!(
+                        options.stage,
+                        MetalShaderStage::Vertex | MetalShaderStage::Mesh
+                    ) && (32..64).contains(&export.target) =>
                 {
                     vertex_outputs.insert(export.target - 32);
                 }
@@ -674,7 +802,10 @@ impl<'a> Compiler<'a> {
                 _ => {}
             }
         }
-        if options.stage == MetalShaderStage::Vertex {
+        if matches!(
+            options.stage,
+            MetalShaderStage::Vertex | MetalShaderStage::Mesh
+        ) {
             vertex_outputs.extend(0..options.required_vertex_output_count);
         }
 
@@ -791,7 +922,14 @@ impl<'a> Compiler<'a> {
         let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
             .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
         let sampler_count = self.image_slots.sampler_count;
-        let initial_scalar_buffer_index = global_buffer_count;
+        let global_argument_buffer_index = (global_buffer_count > 30).then_some(0);
+        let initial_scalar_buffer_index = if global_argument_buffer_index.is_some() {
+            1
+        } else {
+            global_buffer_count
+        };
+        let direct_sampler_bindings =
+            sampler_count != 0 && initial_scalar_buffer_index.saturating_add(1) > 30;
         let threadgroup_memory_bytes = if self
             .program
             .instructions
@@ -808,8 +946,9 @@ impl<'a> Compiler<'a> {
             stage: self.options.stage,
             bindings: MetalBindingLayout {
                 global_buffer_count,
+                global_argument_buffer_index,
                 initial_scalar_buffer_index,
-                sampler_argument_buffer_index: (sampler_count != 0)
+                sampler_argument_buffer_index: (sampler_count != 0 && !direct_sampler_bindings)
                     .then_some(initial_scalar_buffer_index + 1),
                 texture_count: self.image_slots.texture_count,
                 sampler_count,
@@ -892,7 +1031,7 @@ impl<'a> Compiler<'a> {
             "SNop" | "SWaitcnt" | "SWaitcntDepctr" | "SInstPrefetch" | "STtraceData"
             | "SClause" | "SSendmsg" | "VNop" => {}
             "SBarrier" => {
-                if self.options.stage != MetalShaderStage::Compute {
+                if !self.is_threadgroup_stage() {
                     return Err(
                         "workgroup barriers cannot be represented by a Metal graphics stage"
                             .to_owned(),
@@ -952,9 +1091,30 @@ impl<'a> Compiler<'a> {
     #[allow(clippy::too_many_lines)]
     fn emit_module(&self) -> Result<(String, RegisterReferences), MetalCompileError> {
         let global_count = self.evaluation.global_memory_bindings.len();
-        let initial_index = global_count;
+        let global_argument_buffer = global_count > 30;
+        let initial_index = if global_argument_buffer {
+            1
+        } else {
+            global_count
+        };
         let sampler_count = usize::try_from(self.image_slots.sampler_count)
             .map_err(|_| MetalCompileError::InvalidInterface("too many samplers".into()))?;
+        let direct_sampler_bindings = sampler_count != 0 && initial_index.saturating_add(1) > 30;
+        if direct_sampler_bindings && sampler_count > 16 {
+            return Err(MetalCompileError::InvalidInterface(format!(
+                "{sampler_count} direct samplers exceed Metal's per-stage limit of 16"
+            )));
+        }
+        if self.options.stage == MetalShaderStage::Mesh
+            && !global_argument_buffer
+            && (initial_index >= 29
+                || (!direct_sampler_bindings && sampler_count != 0 && initial_index + 1 >= 29))
+        {
+            return Err(MetalCompileError::InvalidInterface(
+                "mesh lowering reserves Metal buffers 29 and 30 for indices and draw geometry"
+                    .into(),
+            ));
+        }
         let mut source = String::from(
             "#include <metal_stdlib>\nusing namespace metal;\n\n\
              inline bool remu_range_valid(uint offset, uint size, uint length) {\n\
@@ -995,6 +1155,14 @@ impl<'a> Compiler<'a> {
         }) {
             emit_vop3p_prelude(&mut source);
         }
+        if self
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| instruction.opcode.is("VDivFixupF32"))
+        {
+            emit_div_fixup_f32_prelude(&mut source);
+        }
         let uses_lds_memory = self
             .program
             .instructions
@@ -1003,16 +1171,30 @@ impl<'a> Compiler<'a> {
         if uses_lds_memory {
             emit_data_share_prelude(&mut source);
         }
-        if sampler_count != 0 {
+        if sampler_count != 0 && !direct_sampler_bindings {
             source.push_str("struct RemuSamplers {\n");
             for slot in 0..sampler_count {
                 let _ = writeln!(source, "    sampler s{slot} [[id({slot})]];");
             }
             source.push_str("};\n\n");
         }
+        if global_argument_buffer {
+            source.push_str("struct RemuGlobalBuffers {\n");
+            for (index, binding) in self.evaluation.global_memory_bindings.iter().enumerate() {
+                let qualifier = if binding.writable {
+                    "device"
+                } else {
+                    "const device"
+                };
+                let _ = writeln!(source, "    {qualifier} uchar* b{index} [[id({index})]];");
+            }
+            source.push_str("};\n\n");
+        }
 
         match self.options.stage {
-            MetalShaderStage::Vertex => self.emit_vertex_interface(&mut source),
+            MetalShaderStage::Vertex | MetalShaderStage::Mesh => {
+                self.emit_vertex_interface(&mut source);
+            }
             MetalShaderStage::Pixel => self.emit_pixel_interface(&mut source),
             MetalShaderStage::Compute => {}
         }
@@ -1025,15 +1207,19 @@ impl<'a> Compiler<'a> {
                 }
             }
             MetalShaderStage::Pixel => parameters.push("RemuPsIn remu_in [[stage_in]]".to_owned()),
-            MetalShaderStage::Compute => {}
+            MetalShaderStage::Compute | MetalShaderStage::Mesh => {}
         }
-        for (index, binding) in self.evaluation.global_memory_bindings.iter().enumerate() {
-            let qualifier = if binding.writable {
-                "device"
-            } else {
-                "const device"
-            };
-            parameters.push(format!("{qualifier} uchar* b{index} [[buffer({index})]]"));
+        if global_argument_buffer {
+            parameters.push("constant RemuGlobalBuffers& remu_globals [[buffer(0)]]".to_owned());
+        } else {
+            for (index, binding) in self.evaluation.global_memory_bindings.iter().enumerate() {
+                let qualifier = if binding.writable {
+                    "device"
+                } else {
+                    "const device"
+                };
+                parameters.push(format!("{qualifier} uchar* b{index} [[buffer({index})]]"));
+            }
         }
         parameters.push(format!(
             "constant uint* remu_initial_s [[buffer({initial_index})]]"
@@ -1073,7 +1259,11 @@ impl<'a> Compiler<'a> {
                 "{texture_kind}<{component}{access}> tex{index} [[texture({index})]]"
             ));
         }
-        if sampler_count != 0 {
+        if direct_sampler_bindings {
+            for slot in 0..sampler_count {
+                parameters.push(format!("sampler remu_sampler_{slot} [[sampler({slot})]]"));
+            }
+        } else if sampler_count != 0 {
             parameters.push(format!(
                 "constant RemuSamplers& remu_samplers [[buffer({})]]",
                 initial_index + 1
@@ -1105,11 +1295,12 @@ impl<'a> Compiler<'a> {
                 parameters.push("uint3 remu_group_id [[threadgroup_position_in_grid]]".to_owned());
                 parameters.push("uint remu_lane [[thread_index_in_simdgroup]]".to_owned());
                 if self.split_wave64()
-                    || self
-                        .program
-                        .instructions
-                        .iter()
-                        .any(|instruction| instruction.opcode.is("DsWriteAddtidB32"))
+                    || self.program.instructions.iter().any(|instruction| {
+                        matches!(
+                            instruction.opcode.known_name(),
+                            Some("DsWriteAddtidB32" | "DsReadAddtidB32")
+                        )
+                    })
                     || self
                         .evaluation
                         .compute_system_registers
@@ -1123,19 +1314,56 @@ impl<'a> Compiler<'a> {
                     parameters.push("uint3 remu_group_size [[threads_per_threadgroup]]".to_owned());
                 }
             }
+            MetalShaderStage::Mesh => {
+                parameters
+                    .push("mesh<RemuVsOut, void, 64, 64, topology::triangle> remu_mesh".to_owned());
+                parameters.push("const device uint* remu_indices [[buffer(29)]]".to_owned());
+                parameters.push("constant uint* remu_draw [[buffer(30)]]".to_owned());
+                parameters
+                    .push("uint3 remu_local_id [[thread_position_in_threadgroup]]".to_owned());
+                parameters.push("uint3 remu_group_id [[threadgroup_position_in_grid]]".to_owned());
+                parameters.push("uint remu_lane [[thread_index_in_simdgroup]]".to_owned());
+                parameters
+                    .push("uint remu_thread_index [[thread_index_in_threadgroup]]".to_owned());
+                parameters.push("uint3 remu_group_size [[threads_per_threadgroup]]".to_owned());
+            }
         }
         let signature = match self.options.stage {
             MetalShaderStage::Vertex => "vertex RemuVsOut remu_main",
+            MetalShaderStage::Pixel if self.options.pixel_outputs.is_empty() => {
+                "fragment void remu_main"
+            }
             MetalShaderStage::Pixel => "fragment RemuPsOut remu_main",
             MetalShaderStage::Compute => "kernel void remu_main",
+            MetalShaderStage::Mesh => "[[mesh]] void remu_main",
         };
         let _ = writeln!(
             source,
             "{signature}(\n    {}\n) {{",
             parameters.join(",\n    ")
         );
+        if global_argument_buffer {
+            for (index, binding) in self.evaluation.global_memory_bindings.iter().enumerate() {
+                let qualifier = if binding.writable {
+                    "device"
+                } else {
+                    "const device"
+                };
+                let _ = writeln!(
+                    source,
+                    "    {qualifier} uchar* b{index} = remu_globals.b{index};"
+                );
+            }
+        }
         source.push_str("    /* REMU_REGISTER_STATE */\n");
         source.push_str("    bool exec = true;\n    bool vcc = false;\n    bool scc = false;\n");
+        if self.options.stage == MetalShaderStage::Mesh && uses_lds_memory {
+            let _ = writeln!(
+                source,
+                "    threadgroup atomic_uint remu_lds_storage[{}];\n    threadgroup atomic_uint* remu_lds = remu_lds_storage;",
+                self.options.lds_size_bytes / 4
+            );
+        }
         if self.split_wave64() {
             source.push_str(
                 "    uint remu_wave_index = remu_thread_index >> 6u;\n\
@@ -1156,15 +1384,54 @@ impl<'a> Compiler<'a> {
                      \x20   threadgroup uint remu_readfirstlane_active[32];\n",
                 );
             }
+            if self
+                .program
+                .instructions
+                .iter()
+                .any(|instruction| instruction.opcode.is("VReadlaneB32"))
+            {
+                // V_READLANE may select either half of a guest wave64. Metal's simd_shuffle
+                // cannot cross the two SIMD32 groups, so exchange every architectural lane
+                // through threadgroup memory. The maximum Metal threadgroup is 1,024 threads.
+                source.push_str("    threadgroup uint remu_readlane_values[1024];\n");
+            }
         }
         if matches!(self.control_flow, ControlFlowLowering::Dispatcher) {
             source.push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
         }
-        if self.options.stage != MetalShaderStage::Compute {
+        if matches!(
+            self.options.stage,
+            MetalShaderStage::Vertex | MetalShaderStage::Pixel
+        ) {
             // Graphics stages cannot declare thread_index_in_simdgroup, but the exclusive prefix
             // of one is the architectural lane index. Wave operations are emitted before the
             // EXEC-guarded write, keeping every host lane converged at simdgroup intrinsics.
             source.push_str("    uint remu_lane = simd_prefix_exclusive_sum(1u);\n");
+        }
+        let graphics_addtid_slots = self.graphics_addtid_write_slot_count();
+        if graphics_addtid_slots != 0 {
+            // DS_*_ADDTID_B32 is the architectural lane-private spill form: the only implicit
+            // address term is TID*4, and compiler-generated spill regions are separated by the
+            // 256-byte wave footprint. Metal graphics stages have no threadgroup address space,
+            // so preserve each invocation's dynamically selected M0+offset records locally.
+            // One slot per static write plus a sequence number also preserves branches and loops.
+            let _ = writeln!(
+                source,
+                "    uint remu_addtid_address[{graphics_addtid_slots}] = {{}};"
+            );
+            let _ = writeln!(
+                source,
+                "    uint remu_addtid_value[{graphics_addtid_slots}] = {{}};"
+            );
+            let _ = writeln!(
+                source,
+                "    uint remu_addtid_sequence[{graphics_addtid_slots}] = {{}};"
+            );
+            let _ = writeln!(
+                source,
+                "    bool remu_addtid_valid[{graphics_addtid_slots}] = {{}};"
+            );
+            source.push_str("    uint remu_addtid_clock = 0u;\n");
         }
         match self.options.stage {
             MetalShaderStage::Vertex => {
@@ -1184,7 +1451,9 @@ impl<'a> Compiler<'a> {
                 }
             }
             MetalShaderStage::Pixel => {
-                source.push_str("    RemuPsOut remu_out = {};\n");
+                if !self.options.pixel_outputs.is_empty() {
+                    source.push_str("    RemuPsOut remu_out = {};\n");
+                }
                 self.emit_pixel_input_state(&mut source);
             }
             MetalShaderStage::Compute => {
@@ -1194,6 +1463,44 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 self.emit_compute_system_registers(&mut source);
+            }
+            MetalShaderStage::Mesh => {
+                source.push_str(
+                    "    RemuVsOut remu_out = {};\n\
+                     \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 1.0f);\n\
+                     \x20   uint remu_mesh_vertex_base = remu_group_id.x * 63u;\n\
+                     \x20   uint remu_mesh_remaining = remu_draw[0] - min(remu_draw[0], remu_mesh_vertex_base);\n\
+                     \x20   uint remu_mesh_vertex_count = min(remu_mesh_remaining, 63u);\n\
+                     \x20   uint remu_mesh_primitive_count = remu_mesh_vertex_count / 3u;\n\
+                     \x20   uint remu_mesh_primitive_vertex = remu_thread_index * 3u;\n\
+                     \x20   uint remu_mesh_primitive = remu_mesh_primitive_vertex | ((remu_mesh_primitive_vertex + 1u) << 10u) | ((remu_mesh_primitive_vertex + 2u) << 20u);\n\
+                     \x20   if (remu_thread_index >= remu_mesh_primitive_count) remu_mesh_primitive = 0x80000000u;\n\
+                     \x20   remu_mesh.set_index(remu_thread_index * 3u + 0u, 0u);\n\
+                     \x20   remu_mesh.set_index(remu_thread_index * 3u + 1u, 0u);\n\
+                     \x20   remu_mesh.set_index(remu_thread_index * 3u + 2u, 0u);\n",
+                );
+                if contains_register_reference(&self.body, 's', 3) {
+                    source.push_str(
+                        "    s[3] = remu_mesh_vertex_count | (remu_mesh_primitive_count << 8u);\n",
+                    );
+                }
+                if contains_register_reference(&self.body, 'v', 0) {
+                    source.push_str("    v[0] = remu_mesh_primitive;\n");
+                }
+                if contains_register_reference(&self.body, 'v', 1) {
+                    source.push_str("    v[1] = remu_group_id.x * 21u + remu_thread_index;\n");
+                }
+                if contains_register_reference(&self.body, 'v', 2) {
+                    source.push_str("    v[2] = 0u;\n");
+                }
+                if contains_register_reference(&self.body, 'v', 5) {
+                    source.push_str(
+                        "    v[5] = remu_thread_index < remu_mesh_vertex_count ? remu_indices[remu_mesh_vertex_base + remu_thread_index] : 0u;\n",
+                    );
+                }
+                if contains_register_reference(&self.body, 'v', 8) {
+                    source.push_str("    v[8] = remu_draw[1];\n");
+                }
             }
         }
         for register in [VCC_LO, VCC_HI] {
@@ -1229,11 +1536,22 @@ impl<'a> Compiler<'a> {
                     if self.options.diagnostic_capture_pixel_output
                         && let Some(output) = self.options.pixel_outputs.first()
                     {
+                        let diagnostic_enable_index = self
+                            .evaluation
+                            .initial_scalar_registers
+                            .len()
+                            .saturating_add(
+                                self.evaluation
+                                    .global_memory_bindings
+                                    .len()
+                                    .saturating_mul(4),
+                            );
                         let field = format!("remu_out.mrt{}", output.guest_slot);
-                        source.push_str(
+                        let _ = writeln!(
+                            source,
                             "    uint2 remu_debug_pixel_xy = uint2(remu_in.frag_coord.xy);\n\
-                             \x20   if (remu_debug_pixel_xy.x < 1920u && remu_debug_pixel_xy.y < 1080u) {\n\
-                             \x20       uint remu_debug_pixel_base = (remu_debug_pixel_xy.y * 1920u + remu_debug_pixel_xy.x) * 5u;\n",
+                             \x20   if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_debug_pixel_xy.x < 1920u && remu_debug_pixel_xy.y < 1080u) {{\n\
+                             \x20       uint remu_debug_pixel_base = (remu_debug_pixel_xy.y * 1920u + remu_debug_pixel_xy.x) * 5u;"
                         );
                         for component in 0..4 {
                             let value = match output.kind {
@@ -1294,19 +1612,40 @@ impl<'a> Compiler<'a> {
                     );
                 }
                 if self.options.diagnostic_capture_vertex_position {
-                    source.push_str(
-                        "    if (remu_vertex_id < 262144u) {\n\
+                    let diagnostic_enable_index = self
+                        .evaluation
+                        .initial_scalar_registers
+                        .len()
+                        .saturating_add(
+                            self.evaluation
+                                .global_memory_bindings
+                                .len()
+                                .saturating_mul(4),
+                        );
+                    let _ = writeln!(
+                        source,
+                        "    if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_vertex_id < 262144u) {{\n\
                          \x20       uint remu_debug_base = remu_vertex_id * 4u;\n\
                          \x20       remu_debug_position[remu_debug_base + 0u] = as_type<uint>(remu_out.position.x);\n\
                          \x20       remu_debug_position[remu_debug_base + 1u] = as_type<uint>(remu_out.position.y);\n\
                          \x20       remu_debug_position[remu_debug_base + 2u] = as_type<uint>(remu_out.position.z);\n\
                          \x20       remu_debug_position[remu_debug_base + 3u] = as_type<uint>(remu_out.position.w);\n\
-                         \x20   }\n",
+                         \x20   }}"
                     );
                 }
-                source.push_str("    return remu_out;\n");
+                if self.options.stage == MetalShaderStage::Vertex
+                    || !self.options.pixel_outputs.is_empty()
+                {
+                    source.push_str("    return remu_out;\n");
+                }
             }
             MetalShaderStage::Compute => {}
+            MetalShaderStage::Mesh => {
+                source.push_str(
+                    "    remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
+                     \x20   if (remu_thread_index == 0u) remu_mesh.set_primitive_count(64u);\n",
+                );
+            }
         }
         source.push_str("}\n");
         scalarize_register_state(&source)
@@ -1387,6 +1726,9 @@ impl<'a> Compiler<'a> {
 
     fn emit_pixel_interface(&self, source: &mut String) {
         source.push_str("struct RemuPsIn {\n    float4 frag_coord [[position]];\n");
+        if self.options.render_target_array_length > 1 {
+            source.push_str("    uint render_target_array_index [[render_target_array_index]];\n");
+        }
         for attribute in &self.pixel_attributes {
             let input = self.options.pixel_input_controls[*attribute as usize];
             if input.uses_default() {
@@ -1444,11 +1786,34 @@ impl<'a> Compiler<'a> {
                 {
                     let _ = writeln!(
                         source,
-                        "    v[{vgpr}] = as_type<uint>(remu_in.frag_coord.{component});"
+                        "    remu_v_{vgpr} = as_type<uint>(remu_in.frag_coord.{component});"
                     );
                 }
                 vgpr += 1;
             }
+        }
+        for bit in 12..=15 {
+            let mask = 1_u32 << bit;
+            if self.options.pixel_input_address & mask == 0 {
+                continue;
+            }
+            if bit == 13
+                && self.options.pixel_input_enable & mask != 0
+                && self.options.render_target_array_length > 1
+                && contains_register_reference(&self.body, 'v', vgpr)
+            {
+                // GFX10 ANCILLARY packs the render-target array index into bits 28:16. Metal
+                // exposes the exact layer selected by the vertex-stage system value to the
+                // fragment stage, so preserve the architectural VGPR layout instead of leaving
+                // every volume slice at the zero-initialized layer.
+                let _ = writeln!(
+                    source,
+                    "    remu_v_{vgpr} = remu_in.render_target_array_index << 16u;"
+                );
+            }
+            // SPI_PS_INPUT_ADDR controls compact VGPR allocation independently of INPUT_ENA.
+            // Reserve every addressed system input even while its host semantic is not enabled.
+            vgpr += 1;
         }
     }
 
@@ -1463,7 +1828,38 @@ impl<'a> Compiler<'a> {
             MetalShaderStage::Vertex => self.emit_vertex_export(instruction, export),
             MetalShaderStage::Pixel => self.emit_pixel_export(instruction, export),
             MetalShaderStage::Compute => Ok(()),
+            MetalShaderStage::Mesh => self.emit_mesh_export(instruction, export),
         }
+    }
+
+    fn emit_mesh_export(
+        &mut self,
+        instruction: &Instruction,
+        export: &ExportControl,
+    ) -> Result<(), String> {
+        if export.target == 20 {
+            let primitive = self.temp("uint", &self.raw_source(instruction, 0)?);
+            let lane = self.architectural_lane();
+            self.line(
+                3,
+                &format!("if (exec && ({primitive} & 0x80000000u) == 0u) {{"),
+            );
+            self.line(
+                4,
+                &format!("remu_mesh.set_index({lane} * 3u + 0u, ({primitive} >> 0u) & 0x1ffu);"),
+            );
+            self.line(
+                4,
+                &format!("remu_mesh.set_index({lane} * 3u + 1u, ({primitive} >> 10u) & 0x1ffu);"),
+            );
+            self.line(
+                4,
+                &format!("remu_mesh.set_index({lane} * 3u + 2u, ({primitive} >> 20u) & 0x1ffu);"),
+            );
+            self.line(3, "}");
+            return Ok(());
+        }
+        self.emit_vertex_export(instruction, export)
     }
 
     fn emit_vertex_export(
@@ -2175,10 +2571,28 @@ impl<'a> Compiler<'a> {
             let destination = destination_scalar(instruction)?;
             let value = self.raw_source(instruction, 0)?;
             let lane = self.raw_source(instruction, 1)?;
-            let selected = self.temp(
-                "uint",
-                &format!("simd_shuffle({value}, (ushort)({lane} & 31u))"),
-            );
+            let selected = if self.split_wave64() {
+                self.line(
+                    3,
+                    &format!("remu_readlane_values[remu_thread_index] = {value};"),
+                );
+                self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
+                let selected_lane = self.temp("uint", &format!("({lane}) & 63u"));
+                let wave_base = self.temp("uint", "remu_wave_index << 6u");
+                let selected = self.temp(
+                    "uint",
+                    &format!("remu_readlane_values[{wave_base} + {selected_lane}]"),
+                );
+                // No lane may reuse its slot for a later V_READLANE until both SIMD32 halves
+                // have consumed the current value.
+                self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
+                selected
+            } else {
+                self.temp(
+                    "uint",
+                    &format!("simd_shuffle({value}, (ushort)({lane} & 31u))"),
+                )
+            };
             // V_READLANE is a wave operation and is architecturally independent of EXEC.
             self.store_scalar(destination, &selected);
             return Ok(());
@@ -2209,6 +2623,7 @@ impl<'a> Compiler<'a> {
                         "remu_readfirstlane_active[{low_slot}] != 0u ? remu_readfirstlane_values[{low_slot}] : (remu_readfirstlane_active[{low_slot} + 1u] != 0u ? remu_readfirstlane_values[{low_slot} + 1u] : remu_readfirstlane_values[{low_slot}])"
                     ),
                 );
+                self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
             }
             self.store_scalar(destination, &selected);
             return Ok(());
@@ -2219,15 +2634,30 @@ impl<'a> Compiler<'a> {
         if name == "VMadU64U32" {
             return self.emit_mad_u64_u32(instruction);
         }
+        if matches!(name, "VLshlrevB64" | "VLshrrevB64") {
+            return self.emit_vector_shift64(instruction, name == "VLshlrevB64");
+        }
         if name == "VWritelaneB32" {
             let destination = destination_vector(instruction)?;
             let value = self.raw_source(instruction, 0)?;
             let lane = self.raw_source(instruction, 1)?;
             // V_WRITELANE also ignores EXEC: exactly the selected physical lane is replaced and
             // all other lanes retain the old VGPR value.
+            let architectural_lane = if self.split_wave64() {
+                "remu_wave_lane"
+            } else {
+                "remu_lane"
+            };
+            let lane_mask = if self.options.wave_lane_count == 64 {
+                63
+            } else {
+                31
+            };
             self.line(
                 3,
-                &format!("if (remu_lane == (({lane}) & 31u)) v[{destination}] = {value};"),
+                &format!(
+                    "if ({architectural_lane} == (({lane}) & {lane_mask}u)) v[{destination}] = {value};"
+                ),
             );
             return Ok(());
         }
@@ -2273,6 +2703,29 @@ impl<'a> Compiler<'a> {
                 "popcount({}) + {}",
                 self.raw_source(instruction, 0)?,
                 self.raw_source(instruction, 1)?
+            ),
+            "VMbcntLoU32B32" | "VMbcntHiU32B32" => {
+                let source = self.raw_source(instruction, 0)?;
+                let addend = self.raw_source(instruction, 1)?;
+                let below = self.temp("uint", "remu_lane == 0u ? 0u : ((1u << remu_lane) - 1u)");
+                let mask = match (name, self.split_wave64()) {
+                    ("VMbcntLoU32B32", true) => {
+                        format!("remu_wave_half == 0u ? {below} : 0xFFFFFFFFu")
+                    }
+                    ("VMbcntHiU32B32", true) => {
+                        format!("remu_wave_half == 0u ? 0u : {below}")
+                    }
+                    ("VMbcntLoU32B32", false) => below,
+                    ("VMbcntHiU32B32", false) => "0u".to_owned(),
+                    _ => unreachable!("matched masked bit-count operation"),
+                };
+                format!("popcount(({source}) & ({mask})) + {addend}")
+            }
+            "VXor3B32" => format!(
+                "{} ^ {} ^ {}",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?,
+                self.raw_source(instruction, 2)?
             ),
             "VAddF32" => self.float_result(
                 instruction,
@@ -2488,6 +2941,46 @@ impl<'a> Compiler<'a> {
                 );
                 format!("remu_f32_to_f16_bits({result})")
             }
+            "VRcpF16" => {
+                let result = self.temp(
+                    "uint",
+                    &format!(
+                        "as_type<uint>(1.0f / {})",
+                        self.half_float_source(instruction, 0)?
+                    ),
+                );
+                format!("remu_f32_to_f16_bits({result})")
+            }
+            "VSqrtF16" => {
+                let result = self.temp(
+                    "uint",
+                    &format!(
+                        "as_type<uint>(sqrt({}))",
+                        self.half_float_source(instruction, 0)?
+                    ),
+                );
+                format!("remu_f32_to_f16_bits({result})")
+            }
+            "VLogF16" => {
+                let result = self.temp(
+                    "uint",
+                    &format!(
+                        "as_type<uint>(log2({}))",
+                        self.half_float_source(instruction, 0)?
+                    ),
+                );
+                format!("remu_f32_to_f16_bits({result})")
+            }
+            "VExpF16" => {
+                let result = self.temp(
+                    "uint",
+                    &format!(
+                        "as_type<uint>(exp2({}))",
+                        self.half_float_source(instruction, 0)?
+                    ),
+                );
+                format!("remu_f32_to_f16_bits({result})")
+            }
             "VRcpF32" | "VRcpIflagF32" => self.float_result(
                 instruction,
                 &format!("1.0f / {}", self.float_source(instruction, 0)?),
@@ -2499,6 +2992,23 @@ impl<'a> Compiler<'a> {
             "VExpF32" => self.float_result(
                 instruction,
                 &format!("exp2({})", self.float_source(instruction, 0)?),
+            ),
+            "VLdexpF32" => self.float_result(
+                instruction,
+                &format!(
+                    "ldexp({}, as_type<int>({}))",
+                    self.float_source(instruction, 0)?,
+                    self.raw_source(instruction, 1)?
+                ),
+            ),
+            "VDivFixupF32" => self.float_result(
+                instruction,
+                &format!(
+                    "as_type<float>(remu_div_fixup_f32_bits(as_type<uint>({}), as_type<uint>({}), as_type<uint>({})))",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?,
+                    self.float_source(instruction, 2)?
+                ),
             ),
             "VSinF32" => self.float_result(
                 instruction,
@@ -2954,6 +3464,42 @@ impl<'a> Compiler<'a> {
         let result = self.temp("ulong", &format!("{product} + {addend}"));
         let carry = self.temp("bool", &format!("{result} < {product}"));
         self.store_lane_mask(scalar_destination, &format!("exec && {carry}"));
+        self.store_vector(destination, &format!("(uint){result}"));
+        self.store_vector(destination + 1, &format!("(uint)({result} >> 32)"));
+        Ok(())
+    }
+
+    fn emit_vector_shift64(
+        &mut self,
+        instruction: &Instruction,
+        shift_left: bool,
+    ) -> Result<(), String> {
+        let destination = destination_vector(instruction)?;
+        if destination + 1 >= VECTOR_REGISTER_COUNT {
+            return Err("64-bit vector shift destination pair exceeds the VGPR file".to_owned());
+        }
+        let Some(InstructionControl::Vop3(control)) = instruction.control else {
+            return Err("64-bit vector shift requires VOP3 control".to_owned());
+        };
+        if control.absolute_mask != 0
+            || control.negate_mask != 0
+            || control.output_modifier != 0
+            || control.clamp
+            || control.operand_select != 0
+            || control.scalar_destination.is_some()
+        {
+            return Err("64-bit vector shift uses reserved VOP3 modifier bits".to_owned());
+        }
+
+        let shift = self.temp(
+            "uint",
+            &format!("{} & 63u", self.raw_source(instruction, 0)?),
+        );
+        let value = self.temp("ulong", &self.raw_source64(instruction, 1)?);
+        let result = self.temp(
+            "ulong",
+            &format!("{value} {} {shift}", if shift_left { "<<" } else { ">>" }),
+        );
         self.store_vector(destination, &format!("(uint){result}"));
         self.store_vector(destination + 1, &format!("(uint)({result} >> 32)"));
         Ok(())
@@ -3965,11 +4511,15 @@ impl<'a> Compiler<'a> {
         if name == "DsSwizzleB32" {
             return self.emit_ds_swizzle(instruction, control);
         }
-        if self.options.stage != MetalShaderStage::Compute {
-            return Err(
-                "LDS memory is workgroup-shared and cannot be represented by a Metal graphics stage"
-                    .to_owned(),
-            );
+        if !self.is_threadgroup_stage() {
+            return match name {
+                "DsWriteAddtidB32" => self.emit_graphics_ds_write_addtid(instruction, control),
+                "DsReadAddtidB32" => self.emit_graphics_ds_read_addtid(instruction, control),
+                _ => Err(
+                    "LDS memory is workgroup-shared and cannot be represented by a Metal graphics stage"
+                        .to_owned(),
+                ),
+            };
         }
         if self.options.lds_size_bytes == 0 || self.options.lds_size_bytes & 3 != 0 {
             return Err(
@@ -3982,9 +4532,17 @@ impl<'a> Compiler<'a> {
                 self.options.lds_size_bytes
             ));
         }
+        if self.options.stage == MetalShaderStage::Mesh && name.starts_with("DsRead") {
+            // One guest wave64 is executed by two Apple SIMD32 groups. RDNA2 wave-ordering makes
+            // an earlier LDS write visible to a later read without an explicit S_BARRIER, but
+            // the two host SIMD groups otherwise advance independently. Converge both halves
+            // before a read so the mesh function observes the same wave-local LDS state.
+            self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
+        }
 
         match name {
             "DsWriteAddtidB32" => self.emit_ds_write_addtid(instruction, control),
+            "DsReadAddtidB32" => self.emit_ds_read_addtid(instruction, control),
             "DsWriteB32" => self.emit_ds_write(instruction, control, 1),
             "DsWriteB64" => self.emit_ds_write(instruction, control, 2),
             "DsWriteB96" => self.emit_ds_write(instruction, control, 3),
@@ -4046,6 +4604,116 @@ impl<'a> Compiler<'a> {
         );
         let index = self.temp("uint", &format!("{address} >> 2"));
         self.emit_ds_store_index(&index, &value);
+        Ok(())
+    }
+
+    fn emit_ds_read_addtid(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+    ) -> Result<(), String> {
+        if !instruction.sources.is_empty() || instruction.destinations.len() != 1 {
+            return Err("DS_READ_ADDTID_B32 requires VDST only".to_owned());
+        }
+        let offset = ds_combined_offset(control);
+        let address = self.temp(
+            "uint",
+            &format!(
+                "(s[124] & 0xFFFFu) + {} + remu_thread_index * 4u",
+                format_u32(offset)
+            ),
+        );
+        let index = self.temp("uint", &format!("{address} >> 2"));
+        let value = self.emit_ds_load_index(&index);
+        self.store_vector(vector_operand(instruction.destinations[0])?, &value);
+        Ok(())
+    }
+
+    fn emit_graphics_ds_write_addtid(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+    ) -> Result<(), String> {
+        if instruction.sources.len() != 1 {
+            return Err("DS_WRITE_ADDTID_B32 requires DATA0 only".to_owned());
+        }
+        let offset = ds_combined_offset(control);
+        if !offset.is_multiple_of(256) {
+            return Err(format!(
+                "graphics DS_WRITE_ADDTID_B32 offset {offset} can overlap another lane"
+            ));
+        }
+        let slot = self
+            .graphics_addtid_write_slot(instruction.pc)
+            .ok_or_else(|| "graphics ADDTID write has no local spill slot".to_owned())?;
+        let value = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let address = self.temp(
+            "uint",
+            &format!(
+                "(s[124] & 0xFFFFu) + {}",
+                format_u32(ds_combined_offset(control))
+            ),
+        );
+        self.line(3, "if (exec) {");
+        self.line(4, "remu_addtid_clock += 1u;");
+        self.line(4, &format!("remu_addtid_address[{slot}] = {address};"));
+        self.line(4, &format!("remu_addtid_value[{slot}] = {value};"));
+        self.line(
+            4,
+            &format!("remu_addtid_sequence[{slot}] = remu_addtid_clock;"),
+        );
+        self.line(4, &format!("remu_addtid_valid[{slot}] = true;"));
+        self.line(3, "}");
+        Ok(())
+    }
+
+    fn emit_graphics_ds_read_addtid(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+    ) -> Result<(), String> {
+        if !instruction.sources.is_empty() || instruction.destinations.len() != 1 {
+            return Err("DS_READ_ADDTID_B32 requires VDST only".to_owned());
+        }
+        let offset = ds_combined_offset(control);
+        if !offset.is_multiple_of(256) {
+            return Err(format!(
+                "graphics DS_READ_ADDTID_B32 offset {offset} can overlap another lane"
+            ));
+        }
+        let slot_count = self.graphics_addtid_write_slot_count();
+        if slot_count == 0 {
+            return Err("graphics ADDTID read has no local spill writes".to_owned());
+        }
+        let address = self.temp(
+            "uint",
+            &format!(
+                "(s[124] & 0xFFFFu) + {}",
+                format_u32(ds_combined_offset(control))
+            ),
+        );
+        let value = self.temp("uint", "0u");
+        let sequence = self.temp("uint", "0u");
+        self.line(3, "if (exec) {");
+        let _ = writeln!(
+            self.body,
+            "        for (uint remu_addtid_i = 0u; remu_addtid_i < {slot_count}u; ++remu_addtid_i) {{"
+        );
+        self.line(
+            5,
+            &format!(
+                "if (remu_addtid_valid[remu_addtid_i] && remu_addtid_address[remu_addtid_i] == {address} && remu_addtid_sequence[remu_addtid_i] >= {sequence}) {{"
+            ),
+        );
+        self.line(
+            6,
+            &format!("{sequence} = remu_addtid_sequence[remu_addtid_i];"),
+        );
+        self.line(6, &format!("{value} = remu_addtid_value[remu_addtid_i];"));
+        self.line(5, "}");
+        self.line(4, "}");
+        self.line(3, "}");
+        self.store_vector(vector_operand(instruction.destinations[0])?, &value);
         Ok(())
     }
 
@@ -4297,7 +4965,7 @@ impl<'a> Compiler<'a> {
         if load {
             let (width, signed, d16, high) = raw_load_shape(name)?;
             if lds {
-                if self.options.stage != MetalShaderStage::Compute {
+                if !self.is_threadgroup_stage() {
                     return Err("memory-to-LDS transfers require a Metal compute stage".to_owned());
                 }
                 if dword_count != 1 || tfe {
@@ -4542,11 +5210,7 @@ impl<'a> Compiler<'a> {
         let d16 = instruction.opcode.contains("FormatD16");
         let d16_hi = instruction.opcode.contains("FormatD16Hi");
         if control.lds {
-            if self.options.stage != MetalShaderStage::Compute
-                || component_count != 1
-                || d16
-                || control.tfe
-            {
+            if !self.is_threadgroup_stage() || component_count != 1 || d16 || control.tfe {
                 return Err(
                     "formatted memory-to-LDS requires a non-D16 FORMAT_X compute load".to_owned(),
                 );
@@ -4789,12 +5453,12 @@ impl<'a> Compiler<'a> {
         _name: &str,
         binding_index: usize,
     ) -> Result<(), String> {
-        // GFX10 DIM still describes the address operand layout for storage operations, but a
-        // descriptor-backed storage view remains a 2D resource. In particular Unity emits DIM=5
-        // for its single-layer stores; the third address component must not change the Metal view.
+        // GFX10 DIM describes the address operand layout, while the descriptor selects the actual
+        // Metal resource view. Unreal can execute DIM=2/5 instructions through a single-layer 2D
+        // descriptor; consume the extra address only when that descriptor really is a 3D view.
         let image_kind = self.image_kinds[binding_index];
         let is_3d = image_kind.texture_type == 10;
-        if !(matches!(image.dimension, 0 | 1 | 4 | 5) || (is_3d && image.dimension == 2)) {
+        if !matches!(image.dimension, 0 | 1 | 2 | 4 | 5) {
             return Err(format!(
                 "storage image dimension {} requires a non-2D Metal texture type",
                 image.dimension
@@ -4859,7 +5523,7 @@ impl<'a> Compiler<'a> {
     ) -> Result<(), String> {
         let image_kind = self.image_kinds[binding_index];
         let is_3d = image_kind.texture_type == 10;
-        if !(matches!(image.dimension, 0 | 1 | 4 | 5) || (is_3d && image.dimension == 2)) {
+        if !matches!(image.dimension, 0 | 1 | 2 | 4 | 5) {
             return Err(format!(
                 "storage image dimension {} requires a non-2D Metal texture type",
                 image.dimension
@@ -5175,11 +5839,18 @@ impl<'a> Compiler<'a> {
         };
         let kind = self.image_kinds[binding_index];
         let vector_kind = format!("vec<{}, 4>", kind.component);
+        let global_count = self.evaluation.global_memory_bindings.len();
+        let initial_index = if global_count > 30 { 1 } else { global_count };
+        let sampler = if initial_index.saturating_add(1) > 30 {
+            format!("remu_sampler_{sampler_slot}")
+        } else {
+            format!("remu_samplers.s{sampler_slot}")
+        };
         let physical = if is_gather && has_compare {
             self.temp(
                 &vector_kind,
                 &format!(
-                    "tex{binding_index}.gather_compare(remu_samplers.s{sampler_slot}, {coordinates}, {compare}, int2(0))"
+                    "tex{binding_index}.gather_compare({sampler}, {coordinates}, {compare}, int2(0))"
                 ),
             )
         } else if is_gather {
@@ -5193,7 +5864,7 @@ impl<'a> Compiler<'a> {
                 self.temp(
                     &vector_kind,
                     &format!(
-                        "tex{binding_index}.gather(remu_samplers.s{sampler_slot}, {coordinates}, int2(0), component::{component})"
+                        "tex{binding_index}.gather({sampler}, {coordinates}, int2(0), component::{component})"
                     ),
                 )
             });
@@ -5222,7 +5893,7 @@ impl<'a> Compiler<'a> {
             let compared = self.temp(
                 "float",
                 &format!(
-                    "tex{binding_index}.sample_compare(remu_samplers.s{sampler_slot}, {coordinates}, {compare}{extra})"
+                    "tex{binding_index}.sample_compare({sampler}, {coordinates}, {compare}{extra})"
                 ),
             );
             self.temp(
@@ -5232,9 +5903,7 @@ impl<'a> Compiler<'a> {
         } else {
             self.temp(
                 &vector_kind,
-                &format!(
-                    "tex{binding_index}.sample(remu_samplers.s{sampler_slot}, {coordinates}{extra})"
-                ),
+                &format!("tex{binding_index}.sample({sampler}, {coordinates}{extra})"),
             )
         };
         if is_gather {
@@ -6150,6 +6819,53 @@ inline uint remu_f16_fma_rto_bits(float left, float right, float addend) {
     );
 }
 
+fn emit_div_fixup_f32_prelude(source: &mut String) {
+    source.push_str(
+        r"inline bool remu_div_fixup_f32_is_nan(uint bits) {
+    return (bits & 0x7FFFFFFFu) > 0x7F800000u;
+}
+
+inline uint remu_div_fixup_f32_quiet_nan(uint bits) {
+    return bits | 0x00400000u;
+}
+
+inline uint remu_div_fixup_f32_bits(uint quotient_bits, uint denominator_bits, uint numerator_bits) {
+    uint denominator_magnitude = denominator_bits & 0x7FFFFFFFu;
+    uint numerator_magnitude = numerator_bits & 0x7FFFFFFFu;
+    uint output_sign = (denominator_bits ^ numerator_bits) & 0x80000000u;
+
+    if (remu_div_fixup_f32_is_nan(numerator_bits)) {
+        return remu_div_fixup_f32_quiet_nan(numerator_bits);
+    }
+    if (remu_div_fixup_f32_is_nan(denominator_bits)) {
+        return remu_div_fixup_f32_quiet_nan(denominator_bits);
+    }
+    if (denominator_magnitude == 0u && numerator_magnitude == 0u) {
+        return 0xFFC00000u;
+    }
+    if (denominator_magnitude == 0x7F800000u && numerator_magnitude == 0x7F800000u) {
+        return 0xFFC00000u;
+    }
+    if (denominator_magnitude == 0u || numerator_magnitude == 0x7F800000u) {
+        return output_sign | 0x7F800000u;
+    }
+    if (denominator_magnitude == 0x7F800000u || numerator_magnitude == 0u) {
+        return output_sign;
+    }
+
+    int denominator_exponent = int((denominator_bits >> 23) & 0xFFu);
+    int numerator_exponent = int((numerator_bits >> 23) & 0xFFu);
+    if (numerator_exponent - denominator_exponent < -150 || denominator_exponent == 255) {
+        float corrected = as_type<float>(numerator_bits) / as_type<float>(denominator_bits);
+        return as_type<uint>(corrected);
+    }
+    return output_sign | (quotient_bits & 0x7FFFFFFFu);
+}
+
+",
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_format_prelude(source: &mut String) {
     source.push_str("static constant uint remu_gfx10_formats[128] = {\n    ");
@@ -6672,6 +7388,110 @@ mod tests {
                 .source
                 .contains("remu_out.param1 = float4(remu_uv, remu_layer, 1.0f);")
         );
+    }
+
+    #[test]
+    fn builds_procedural_rectangle_with_tint_and_scaled_uv_parameters() {
+        let shader = compile_procedural_rectangle_vertex(2);
+
+        assert_eq!(shader.stage, MetalShaderStage::Vertex);
+        assert_eq!(shader.interpolated_attribute_count, 2);
+        assert!(
+            shader
+                .source
+                .contains("remu_out.position = float4(remu_uv * 2.0f - 1.0f, 0.0f, 1.0f);")
+        );
+        assert!(shader.source.contains("remu_out.param0 = float4(1.0f);"));
+        assert!(
+            shader
+                .source
+                .contains("remu_out.param1 = float4(remu_uv, 1.0f, 1.0f);")
+        );
+    }
+
+    fn compile_pixel_system_input_shader(
+        referenced_vgpr: u32,
+        pixel_input_enable: u32,
+        pixel_input_address: u32,
+        render_target_array_length: u32,
+    ) -> MetalShader {
+        let program = Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(referenced_vgpr)],
+                destinations: vec![Operand::vector(8)],
+                control: None,
+            }],
+        );
+        let mut options =
+            MetalCompileOptions::pixel(Vec::new(), pixel_input_enable, pixel_input_address);
+        options.render_target_array_length = render_target_array_length;
+        compile_msl(&program, &empty_evaluation(), &options)
+            .expect("pixel system input should lower")
+    }
+
+    #[test]
+    fn routes_layered_render_target_index_into_ancillary_vgpr() {
+        let addressed = (1 << 0) | (1 << 13);
+        let shader = compile_pixel_system_input_shader(2, addressed, addressed, 32);
+
+        assert!(
+            shader
+                .source
+                .contains("uint render_target_array_index [[render_target_array_index]];")
+        );
+        assert!(
+            shader
+                .source
+                .contains("remu_v_2 = remu_in.render_target_array_index << 16u;")
+        );
+    }
+
+    #[test]
+    fn disabled_system_inputs_still_reserve_compacted_pixel_vgprs() {
+        let address = (1 << 0) | (1 << 12) | (1 << 13);
+        let enable = (1 << 0) | (1 << 13);
+        let shader = compile_pixel_system_input_shader(3, enable, address, 32);
+
+        assert!(
+            shader
+                .source
+                .contains("remu_v_3 = remu_in.render_target_array_index << 16u;")
+        );
+        assert!(
+            !shader
+                .source
+                .contains("remu_v_2 = remu_in.render_target_array_index << 16u;")
+        );
+    }
+
+    #[test]
+    fn omits_layer_index_input_for_single_layer_pixel_shader() {
+        let addressed = (1 << 0) | (1 << 13);
+        let shader = compile_pixel_system_input_shader(2, addressed, addressed, 1);
+
+        assert!(
+            !shader
+                .source
+                .contains("uint render_target_array_index [[render_target_array_index]];")
+        );
+        assert!(!shader.source.contains("remu_in.render_target_array_index"));
+    }
+
+    #[test]
+    fn materializes_pixel_position_into_the_named_vgpr() {
+        let shader = compile_pixel_system_input_shader(0, 1 << 8, 1 << 8, 1);
+
+        assert!(
+            shader
+                .source
+                .contains("remu_v_0 = as_type<uint>(remu_in.frag_coord.x);")
+        );
+        assert!(!shader.source.contains("    v[0] ="));
     }
 
     fn interpolation_instruction(
@@ -7279,7 +8099,7 @@ mod tests {
         }
     }
 
-    const DS_OPCODES: [(u32, &str); 38] = [
+    const DS_OPCODES: [(u32, &str); 39] = [
         (0x00, "DsAddU32"),
         (0x01, "DsSubU32"),
         (0x03, "DsIncU32"),
@@ -7314,6 +8134,7 @@ mod tests {
         (0x38, "DsRead2St64B32"),
         (0x4d, "DsWriteB64"),
         (0xb0, "DsWriteAddtidB32"),
+        (0xb1, "DsReadAddtidB32"),
         (0xde, "DsWriteB96"),
         (0xdf, "DsWriteB128"),
         (0xfe, "DsReadB96"),
@@ -7374,6 +8195,17 @@ mod tests {
         .expect("vector instruction should lower")
     }
 
+    const fn unmodified_vop3() -> InstructionControl {
+        InstructionControl::Vop3(remu_shader::Vop3Control {
+            absolute_mask: 0,
+            negate_mask: 0,
+            output_modifier: 0,
+            clamp: false,
+            operand_select: 0,
+            scalar_destination: None,
+        })
+    }
+
     #[test]
     fn lowers_observed_64_bit_and_not_scalar_operation() {
         let shader = compile_vector_instruction(
@@ -7392,6 +8224,26 @@ mod tests {
         assert!(shader.source.contains("& ~"));
         assert!(shader.source.contains("s[20]"));
         assert!(shader.source.contains("s[21]"));
+    }
+
+    #[test]
+    fn outputless_pixel_shader_lowers_to_void_depth_fragment() {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(2)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+
+        assert!(shader.source.contains("fragment void remu_main"));
+        assert!(!shader.source.contains("RemuPsOut remu_out"));
+        assert!(!shader.source.contains("return remu_out"));
     }
 
     #[test]
@@ -7664,6 +8516,65 @@ mod tests {
         assert!(rsqrt.source.contains("remu_f16_to_f32_bits"));
         assert!(rsqrt.source.contains("remu_f32_to_f16_bits"));
 
+        for (name, operation) in [
+            ("VRcpF16", "1.0f /"),
+            ("VSqrtF16", "sqrt("),
+            ("VLogF16", "log2("),
+            ("VExpF16", "exp2("),
+        ] {
+            let unary = compile_vector_instruction(
+                Instruction {
+                    pc: 0x644,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known(name),
+                    words: vec![0],
+                    sources: vec![Operand::vector(5)],
+                    destinations: vec![Operand::vector(6)],
+                    control: None,
+                },
+                MetalShaderStage::Pixel,
+            );
+            assert!(unary.source.contains(operation));
+            assert!(unary.source.contains("remu_f16_to_f32_bits"));
+            assert!(unary.source.contains("remu_f32_to_f16_bits"));
+        }
+
+        let ldexp = compile_vector_instruction(
+            Instruction {
+                pc: 0xd80,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VLdexpF32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(1), Operand::vector(2)],
+                destinations: vec![Operand::vector(3)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+        assert!(ldexp.source.contains("ldexp("));
+        assert!(ldexp.source.contains("as_type<int>"));
+
+        let div_fixup = compile_vector_instruction(
+            Instruction {
+                pc: 0x9d8,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VDivFixupF32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(1), Operand::vector(2), Operand::vector(3)],
+                destinations: vec![Operand::vector(4)],
+                control: None,
+            },
+            MetalShaderStage::Pixel,
+        );
+        assert!(
+            div_fixup
+                .source
+                .contains("remu_div_fixup_f32_bits(as_type<uint>")
+        );
+        assert!(div_fixup.source.contains("0xFFC00000u"));
+        assert!(div_fixup.source.contains("numerator_bits"));
+        assert!(div_fixup.source.contains("denominator_bits"));
+
         let compare = compile_vector_instruction(
             Instruction {
                 pc: 0x190,
@@ -7916,6 +8827,137 @@ mod tests {
                 .contains("if (remu_lane == ((remu_s_4) & 31u)) remu_v_8 = remu_s_2;")
         );
         assert!(!write.source.contains("if (exec) remu_v_8 ="));
+    }
+
+    #[test]
+    fn lowers_wave64_readlane_and_writelane_across_simd32_halves() {
+        let program = Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Vop3,
+                    opcode: Opcode::Known("VReadlaneB32"),
+                    words: vec![0, 0],
+                    sources: vec![Operand::vector(2), Operand::scalar(4)],
+                    destinations: vec![Operand::scalar(8)],
+                    control: Some(unmodified_vop3()),
+                },
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Vop3,
+                    opcode: Opcode::Known("VWritelaneB32"),
+                    words: vec![0, 0],
+                    sources: vec![Operand::scalar(2), Operand::scalar(4)],
+                    destinations: vec![Operand::vector(8)],
+                    control: Some(unmodified_vop3()),
+                },
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::compute_wave(0, 64),
+        )
+        .expect("wave64 explicit lane operations should lower");
+
+        assert!(
+            shader
+                .source
+                .contains("threadgroup uint remu_readlane_values[1024]")
+        );
+        assert!(
+            shader
+                .source
+                .contains("remu_readlane_values[remu_thread_index] = remu_v_2;")
+        );
+        assert!(shader.source.contains("remu_wave_index << 6u"));
+        assert!(shader.source.contains("remu_s_4) & 63u"));
+        assert!(
+            shader
+                .source
+                .contains("if (remu_wave_lane == ((remu_s_4) & 63u)) remu_v_8 = remu_s_2;")
+        );
+    }
+
+    #[test]
+    fn lowers_masked_bit_count_for_wave32_and_both_wave64_halves() {
+        let low = Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vop2,
+            opcode: Opcode::Known("VMbcntLoU32B32"),
+            words: vec![0],
+            sources: vec![Operand::scalar(2), Operand::vector(1)],
+            destinations: vec![Operand::vector(1)],
+            control: None,
+        };
+        let high = Instruction {
+            pc: 4,
+            encoding: ShaderEncoding::Vop2,
+            opcode: Opcode::Known("VMbcntHiU32B32"),
+            words: vec![0],
+            sources: vec![Operand::scalar(2), Operand::vector(1)],
+            destinations: vec![Operand::vector(1)],
+            control: None,
+        };
+        let wave32 = compile_vector_instruction(low.clone(), MetalShaderStage::Compute);
+        assert!(wave32.source.contains("popcount((remu_s_2) & (t"));
+        let wave32_high = compile_vector_instruction(high.clone(), MetalShaderStage::Compute);
+        assert!(wave32_high.source.contains("& (0u)"));
+
+        let wave64 = compile_msl(
+            &Program::new(0x1000, vec![low, high]),
+            &empty_evaluation(),
+            &MetalCompileOptions::compute_wave(0, 64),
+        )
+        .expect("wave64 masked bit count should lower");
+        assert!(
+            wave64
+                .source
+                .contains("remu_wave_half == 0u ? t0 : 0xFFFFFFFFu")
+        );
+        assert!(wave64.source.contains("remu_wave_half == 0u ? 0u : t"));
+    }
+
+    #[test]
+    fn lowers_exercised_rdna2_xor3_and_vector_shifts() {
+        let xor = compile_vector_instruction(
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VXor3B32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(1), Operand::vector(2), Operand::scalar(4)],
+                destinations: vec![Operand::vector(8)],
+                control: Some(unmodified_vop3()),
+            },
+            MetalShaderStage::Compute,
+        );
+        assert!(xor.source.contains("remu_v_1 ^ remu_v_2 ^ remu_s_4"));
+
+        for (opcode, operator) in [("VLshlrevB64", "<<"), ("VLshrrevB64", ">>")] {
+            let shift = compile_vector_instruction(
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Vop3,
+                    opcode: Opcode::Known(opcode),
+                    words: vec![0, 0],
+                    sources: vec![Operand::scalar(4), Operand::vector(2), Operand::vector(3)],
+                    destinations: vec![Operand::vector(8), Operand::vector(9)],
+                    control: Some(unmodified_vop3()),
+                },
+                MetalShaderStage::Compute,
+            );
+            assert!(shift.source.contains("remu_s_4 & 63u"));
+            assert!(
+                shift
+                    .source
+                    .contains("((ulong)remu_v_2 | ((ulong)remu_v_3 << 32))")
+            );
+            assert!(shift.source.contains(&format!(" {operator} ")));
+            assert!(shift.source.contains("if (exec) remu_v_8 = (uint)"));
+            assert!(shift.source.contains("if (exec) remu_v_9 = (uint)("));
+        }
     }
 
     #[test]
@@ -8867,7 +9909,7 @@ mod tests {
         }
 
         let shader = compile_msl(
-            &Program::new(0x1000, vec![ordinary, comparison]),
+            &Program::new(0x1000, vec![ordinary.clone(), comparison.clone()]),
             &evaluation,
             &MetalCompileOptions::compute(0),
         )
@@ -8887,6 +9929,79 @@ mod tests {
                 .source
                 .contains("tex1.gather_compare(remu_samplers.s1")
         );
+
+        for index in 0..30_u32 {
+            evaluation
+                .global_memory_bindings
+                .push(remu_shader::GlobalMemoryBinding {
+                    scalar_address: index * 4,
+                    base_address: 0x10_0000 + u64::from(index) * 0x1000,
+                    instruction_pcs: Vec::new().into(),
+                    byte_count: 4,
+                    data: vec![0; 4],
+                    writable: false,
+                    write_back_to_guest: false,
+                });
+        }
+        let direct = compile_msl(
+            &Program::new(0x1000, vec![ordinary.clone(), comparison.clone()]),
+            &evaluation,
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("samplers should fall back to direct stage bindings at Metal's buffer limit");
+        assert_eq!(direct.bindings.initial_scalar_buffer_index, 30);
+        assert_eq!(direct.bindings.sampler_argument_buffer_index, None);
+        assert!(
+            direct
+                .source
+                .contains("sampler remu_sampler_0 [[sampler(0)]]")
+        );
+        assert!(direct.source.contains("tex0.gather(remu_sampler_0"));
+        assert!(
+            !direct
+                .source
+                .contains("RemuSamplers& remu_samplers [[buffer(31)]]")
+        );
+
+        evaluation
+            .global_memory_bindings
+            .push(remu_shader::GlobalMemoryBinding {
+                scalar_address: 30 * 4,
+                base_address: 0x20_0000,
+                instruction_pcs: Vec::new().into(),
+                byte_count: 4,
+                data: vec![0; 4],
+                writable: false,
+                write_back_to_guest: false,
+            });
+        let packed = compile_msl(
+            &Program::new(0x1000, vec![ordinary, comparison]),
+            &evaluation,
+            &MetalCompileOptions::compute(0),
+        )
+        .expect("large global interfaces should use one Metal argument buffer");
+        assert_eq!(packed.bindings.global_buffer_count, 31);
+        assert_eq!(packed.bindings.global_argument_buffer_index, Some(0));
+        assert_eq!(packed.bindings.initial_scalar_buffer_index, 1);
+        assert_eq!(packed.bindings.sampler_argument_buffer_index, Some(2));
+        assert!(
+            packed
+                .source
+                .contains("constant RemuGlobalBuffers& remu_globals [[buffer(0)]]")
+        );
+        assert!(
+            packed
+                .source
+                .contains("const device uchar* b30 = remu_globals.b30;")
+        );
+        assert!(packed.source.contains("tex0.gather(remu_samplers.s0"));
+        assert!(
+            packed
+                .source
+                .contains("tex1.gather_compare(remu_samplers.s1")
+        );
+        assert!(!packed.source.contains("tex0.gather(remu_sampler_0"));
+        assert!(!packed.source.contains("[[buffer(31)]]"));
     }
 
     #[test]
@@ -9307,6 +10422,184 @@ mod tests {
         )
         .expect_err("GDS needs a system-wide resource");
         assert!(gds_error.to_string().contains("system-wide"));
+    }
+
+    #[test]
+    fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
+        let data_share = |pc, opcode, sources, destinations| Instruction {
+            pc,
+            encoding: ShaderEncoding::Ds,
+            opcode: Opcode::Known(opcode),
+            words: vec![0, 0],
+            sources,
+            destinations,
+            control: Some(InstructionControl::DataShare(DataShareControl {
+                offset0: 0,
+                offset1: 0,
+                gds: false,
+            })),
+        };
+        let export = |pc, target, sources| Instruction {
+            pc,
+            encoding: ShaderEncoding::Exp,
+            opcode: Opcode::Known("Exp"),
+            words: vec![0, 0],
+            sources,
+            destinations: Vec::new(),
+            control: Some(InstructionControl::Export(ExportControl {
+                target,
+                enable_mask: if target == 20 { 1 } else { 15 },
+                compressed: false,
+                done: true,
+                valid_mask: false,
+            })),
+        };
+        let program = Program::new(
+            0x1000,
+            vec![
+                data_share(
+                    0,
+                    "DsWriteB32",
+                    vec![Operand::vector(0), Operand::vector(1)],
+                    Vec::new(),
+                ),
+                data_share(
+                    8,
+                    "DsReadB32",
+                    vec![Operand::vector(0)],
+                    vec![Operand::vector(2)],
+                ),
+                export(
+                    16,
+                    20,
+                    vec![
+                        Operand::vector(3),
+                        Operand::vector(3),
+                        Operand::vector(3),
+                        Operand::vector(3),
+                    ],
+                ),
+                export(
+                    24,
+                    12,
+                    vec![
+                        Operand::vector(4),
+                        Operand::vector(5),
+                        Operand::vector(6),
+                        Operand::vector(7),
+                    ],
+                ),
+                Instruction {
+                    pc: 32,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::mesh(2, 16 * 1024),
+        )
+        .expect("NGG mesh lowering");
+
+        assert_eq!(shader.stage, MetalShaderStage::Mesh);
+        assert!(shader.source.contains("[[mesh]] void remu_main"));
+        assert!(
+            shader
+                .source
+                .contains("mesh<RemuVsOut, void, 64, 64, topology::triangle>")
+        );
+        assert!(
+            shader
+                .source
+                .contains("threadgroup atomic_uint remu_lds_storage[4096]")
+        );
+        assert!(
+            shader
+                .source
+                .contains("threadgroup_barrier(mem_flags::mem_threadgroup)")
+        );
+        assert!(shader.source.contains("remu_mesh.set_index("));
+        assert!(shader.source.contains("remu_mesh.set_vertex("));
+        assert!(shader.source.contains("remu_mesh.set_primitive_count(64u)"));
+        #[cfg(target_os = "macos")]
+        if let Some(compiler) = std::env::var_os("REMU_METAL_COMPILER") {
+            let directory =
+                std::env::temp_dir().join(format!("remu-ngg-mesh-metal-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).expect("create mesh Metal test directory");
+            let source = directory.join("mesh.metal");
+            let air = directory.join("mesh.air");
+            std::fs::write(&source, &shader.source).expect("write generated mesh MSL");
+            let output = std::process::Command::new(compiler)
+                .args(["-c", "-target", "air64-apple-macosx15.0"])
+                .arg("-fmetal-math-mode=safe")
+                .arg("-o")
+                .arg(&air)
+                .arg(&source)
+                .output()
+                .expect("run Apple Metal compiler");
+            assert!(
+                output.status.success(),
+                "mesh MSL failed to compile:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::remove_dir_all(directory).expect("remove mesh Metal test directory");
+        }
+    }
+
+    #[test]
+    fn lowers_graphics_addtid_spills_to_lane_private_records() {
+        let program = Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0x100,
+                    encoding: ShaderEncoding::Ds,
+                    opcode: Opcode::Known("DsWriteAddtidB32"),
+                    words: vec![0, 0],
+                    sources: vec![Operand::vector(7)],
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::DataShare(DataShareControl {
+                        offset0: 0,
+                        offset1: 2,
+                        gds: false,
+                    })),
+                },
+                Instruction {
+                    pc: 0x108,
+                    encoding: ShaderEncoding::Ds,
+                    opcode: Opcode::Known("DsReadAddtidB32"),
+                    words: vec![0, 0],
+                    sources: Vec::new(),
+                    destinations: vec![Operand::vector(8)],
+                    control: Some(InstructionControl::DataShare(DataShareControl {
+                        offset0: 0,
+                        offset1: 2,
+                        gds: false,
+                    })),
+                },
+            ],
+        );
+        let shader = compile_msl(
+            &program,
+            &empty_evaluation(),
+            &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+        )
+        .expect("lane-private ADDTID spill should lower in a graphics stage");
+
+        assert!(shader.source.contains("uint remu_addtid_address[1] = {};"));
+        assert!(shader.source.contains("remu_addtid_address[0] ="));
+        assert!(shader.source.contains("remu_addtid_sequence[0] ="));
+        assert!(shader.source.contains("remu_addtid_i < 1u"));
+        assert!(shader.source.contains("(remu_s_124 & 0xFFFFu) + 0x200u"));
+        assert!(!shader.source.contains("threadgroup atomic_uint* remu_lds"));
+        assert_eq!(shader.bindings.threadgroup_memory_bytes, 0);
     }
 
     #[test]
@@ -10269,6 +11562,7 @@ mod tests {
                     lds_size_bytes: 0,
                     wave_lane_count: 32,
                 },
+                MetalShaderStage::Mesh => MetalCompileOptions::mesh(0, 16 * 1024),
             };
             let shader = compile_msl(&program, &empty_evaluation(), &options)
                 .expect("VOP3P, conversion, lane, and integer program should lower");
@@ -10276,6 +11570,7 @@ mod tests {
                 MetalShaderStage::Vertex => "vertex",
                 MetalShaderStage::Pixel => "pixel",
                 MetalShaderStage::Compute => "compute",
+                MetalShaderStage::Mesh => "mesh",
             };
             let source = directory.join(format!("{stem}.metal"));
             let air = directory.join(format!("{stem}.air"));

@@ -76,59 +76,45 @@ struct PageOwner {
     page_index: usize,
 }
 
-struct SnapshotPage {
-    address: u64,
-    owner_start: usize,
-    owner_count: usize,
+#[derive(Clone, Copy)]
+struct SnapshotRange {
+    start: u64,
+    end: u64,
+    prefix_max_end: u64,
+    range: *const WatchedRange,
 }
 
 struct WatchSnapshot {
-    pages: Box<[SnapshotPage]>,
-    owners: Box<[PageOwner]>,
+    ranges: Box<[SnapshotRange]>,
     writable_ranges: Box<[(u64, u64)]>,
 }
 
 impl WatchSnapshot {
     fn from_state(state: &WatchState) -> Self {
-        let owner_count = state
-            .ranges
-            .values()
-            .filter(|range| range.precise_tracking)
-            .map(|range| range.pages.len())
-            .sum();
-        let mut entries = Vec::with_capacity(owner_count);
+        let page_size = host_page_size_infallible();
+        let mut ranges = Vec::with_capacity(state.ranges.len());
         for range in state.ranges.values().filter(|range| range.precise_tracking) {
-            let range_pointer = Arc::as_ptr(&range);
-            for (page_index, page) in range.pages.iter().enumerate() {
-                entries.push((
-                    page.address,
-                    PageOwner {
-                        range: range_pointer,
-                        page_index,
-                    },
-                ));
-            }
+            let Some(first) = range.pages.first() else {
+                continue;
+            };
+            let Some(last) = range.pages.last() else {
+                continue;
+            };
+            ranges.push(SnapshotRange {
+                start: first.address,
+                end: last.address.saturating_add(page_size),
+                prefix_max_end: 0,
+                range: Arc::as_ptr(range),
+            });
         }
-        entries.sort_unstable_by_key(|(address, _)| *address);
-        let mut pages = Vec::<SnapshotPage>::with_capacity(entries.len());
-        let mut owners = Vec::<PageOwner>::with_capacity(entries.len());
-        for (address, owner) in entries {
-            if pages.last().is_none_or(|page| page.address != address) {
-                pages.push(SnapshotPage {
-                    address,
-                    owner_start: owners.len(),
-                    owner_count: 0,
-                });
-            }
-            owners.push(owner);
-            pages
-                .last_mut()
-                .expect("snapshot page was inserted")
-                .owner_count += 1;
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut prefix_max_end = 0;
+        for range in &mut ranges {
+            prefix_max_end = prefix_max_end.max(range.end);
+            range.prefix_max_end = prefix_max_end;
         }
         Self {
-            pages: pages.into_boxed_slice(),
-            owners: owners.into_boxed_slice(),
+            ranges: ranges.into_boxed_slice(),
             writable_ranges: state
                 .writable_ranges
                 .iter()
@@ -137,22 +123,16 @@ impl WatchSnapshot {
         }
     }
 
-    fn page(&self, address: u64) -> Option<&SnapshotPage> {
-        let mut start = 0;
-        let mut end = self.pages.len();
-        while start < end {
-            let middle = start + (end - start) / 2;
-            match self.pages[middle].address.cmp(&address) {
-                std::cmp::Ordering::Less => start = middle + 1,
-                std::cmp::Ordering::Greater => end = middle,
-                std::cmp::Ordering::Equal => return Some(&self.pages[middle]),
-            }
+    fn owners(&self, address: u64) -> SnapshotOwners<'_> {
+        SnapshotOwners {
+            ranges: &self.ranges,
+            address,
+            next_index: self.ranges.partition_point(|range| range.start <= address),
         }
-        None
     }
 
-    fn owners(&self, page: &SnapshotPage) -> &[PageOwner] {
-        &self.owners[page.owner_start..page.owner_start + page.owner_count]
+    fn contains_page(&self, address: u64) -> bool {
+        self.owners(address).next().is_some()
     }
 
     fn contains_writable_page(&self, address: u64) -> bool {
@@ -160,6 +140,37 @@ impl WatchSnapshot {
             .writable_ranges
             .partition_point(|&(start, _)| start <= address);
         index != 0 && address < self.writable_ranges[index - 1].1
+    }
+}
+
+struct SnapshotOwners<'a> {
+    ranges: &'a [SnapshotRange],
+    address: u64,
+    next_index: usize,
+}
+
+impl Iterator for SnapshotOwners<'_> {
+    type Item = PageOwner;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next_index != 0 {
+            self.next_index -= 1;
+            let candidate = self.ranges[self.next_index];
+            if candidate.prefix_max_end <= self.address {
+                self.next_index = 0;
+                return None;
+            }
+            if self.address < candidate.end {
+                let page_index =
+                    usize::try_from((self.address - candidate.start) / host_page_size_infallible())
+                        .expect("a watched-page index fits usize");
+                return Some(PageOwner {
+                    range: candidate.range,
+                    page_index,
+                });
+            }
+        }
+        None
     }
 }
 
@@ -665,15 +676,19 @@ fn restore_page_if_unowned(page_address: u64, state: &WatchState) {
 }
 
 fn protect_page(page_address: u64, read_only: bool) -> io::Result<()> {
-    let address = usize::try_from(page_address)
+    protect_range(page_address, host_page_size_infallible(), read_only)
+}
+
+fn protect_range(address: u64, byte_count: u64, read_only: bool) -> io::Result<()> {
+    let address = usize::try_from(address)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "page address does not fit"))?
         as *mut c_void;
-    let page_size = usize::try_from(host_page_size_infallible())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "page size does not fit"))?;
+    let byte_count = usize::try_from(byte_count)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "byte count does not fit"))?;
     let protection = libc::PROT_READ | if read_only { 0 } else { libc::PROT_WRITE };
     // SAFETY: CpuWriteWatch's contract keeps every registered page live and permits exactly these
     // read-only/read-write transitions.
-    if unsafe { libc::mprotect(address, page_size, protection) } != 0 {
+    if unsafe { libc::mprotect(address, byte_count, protection) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -794,18 +809,22 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
     let snapshot = unsafe { &*snapshot_pointer };
     let page_size = host_page_size_infallible();
     let page_address = align_down(fault_address, page_size);
-    let page = snapshot.page(page_address);
-    if page.is_none() && !snapshot.contains_writable_page(page_address) {
-        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: page is not watched\n");
+    let has_page = snapshot.contains_page(page_address);
+    if !has_page && !snapshot.contains_writable_page(page_address) {
+        // This handler receives every process SIGSEGV/SIGBUS while CPU write watching is active.
+        // A fault outside the immutable watch snapshot is not a write-watch failure; forward it
+        // unchanged so the system crash report retains the guest RIP and register state.
+        write_signal_diagnostic(
+            b"[REMu][WATCH] unrelated fault outside watched memory; forwarding\n",
+        );
         return false;
     }
-    let has_armed_owner = page.is_some_and(|page| {
-        snapshot.owners(page).iter().any(|owner| {
+    let has_armed_owner = has_page
+        && snapshot.owners(page_address).any(|owner| {
             // SAFETY: the snapshot pins all range allocations referenced by its owners.
             let range = unsafe { &*owner.range };
             range.pages[owner.page_index].armed.load(Ordering::Acquire)
-        })
-    });
+        });
 
     let Ok(address) = usize::try_from(page_address) else {
         write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: address conversion failed\n");
@@ -842,18 +861,15 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         RECOVERED_DISARMED_FAULTS.fetch_add(1, Ordering::Relaxed);
     }
 
-    if let Some(page) = page {
-        for owner in snapshot.owners(page) {
-            // SAFETY: the active snapshot pins the range, and page_index was produced from that
-            // range.
-            let range = unsafe { &*owner.range };
-            let watched_page = &range.pages[owner.page_index];
-            if watched_page.armed.swap(false, Ordering::AcqRel) {
-                range.generation.fetch_add(1, Ordering::AcqRel);
-            }
-            watched_page.dirty.store(true, Ordering::Release);
-            range.dirty.store(true, Ordering::Release);
+    for owner in snapshot.owners(page_address) {
+        // SAFETY: the active snapshot pins the range, and page_index was produced from that range.
+        let range = unsafe { &*owner.range };
+        let watched_page = &range.pages[owner.page_index];
+        if watched_page.armed.swap(false, Ordering::AcqRel) {
+            range.generation.fetch_add(1, Ordering::AcqRel);
         }
+        watched_page.dirty.store(true, Ordering::Release);
+        range.dirty.store(true, Ordering::Release);
     }
     true
 }

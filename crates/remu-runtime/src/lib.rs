@@ -22,7 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::io::{Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -529,6 +529,7 @@ impl LinkedImage {
         }))
         .collect::<Vec<_>>();
         let tls = install_tls_support(&mut memory, &tls_inputs)?;
+        install_known_incomplete_graphics_pso_guard(&mut memory)?;
         memory.finalize_permissions()?;
         Ok(Self {
             memory,
@@ -1276,6 +1277,399 @@ fn seed_tls_thread_control(
     Ok(())
 }
 
+/// Keeps one known Silent Hill graphics-state lifetime failure from publishing a recycled PSO.
+///
+/// The title's only caller of the state translator first stores and references the candidate PSO,
+/// then unconditionally dereferences its mandatory `+0x18` child. Startup can submit the object
+/// after its storage has been zeroed, poisoning the engine's current-PSO slot and crashing a few
+/// instructions later. The title's constructor guarantees the child is non-null, so this cannot
+/// be an object that merely needs more construction time. Rejecting the update before the
+/// reference-counted publication preserves the previous complete state and lets a later valid
+/// update replace it normally.
+///
+/// This compatibility guard is deliberately locked to the complete caller prefix from the known
+/// executable. A different build or title cannot be changed merely because it maps text at the
+/// same address. Set `REMU_DISABLE_KNOWN_GUEST_PATCHES=1` for an unmodified diagnostic run.
+#[cfg(target_arch = "x86_64")]
+fn install_known_incomplete_graphics_pso_guard(memory: &mut GuestImage) -> Result<bool, LinkError> {
+    const ENTRY: u64 = 0x0000_0008_0113_e3e0;
+    const RENDER_TASK_SITE: u64 = 0x0000_0008_01b7_ccde;
+    const NULL_CONTAINER_SITE: u64 = 0x0000_0008_03d1_1d29;
+    const NULL_CONTAINER_LOOP: u64 = 0x0000_0008_03d1_1d20;
+    const NULL_FIELD_HANDLER_SITE: u64 = 0x0000_0008_0153_a917;
+    const NULL_FIELD_HANDLER_LOOP: u64 = 0x0000_0008_0153_a851;
+    const STALE_POST_UPDATE_SITE: u64 = 0x0000_0008_0180_e8bc;
+    const STALE_POST_UPDATE_SKIP: u64 = 0x0000_0008_0180_e8c8;
+    const STOLEN_BYTES: usize = 6;
+    const SIGNATURE: [u8; 41] = [
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50, 0x48,
+        0x8d, 0x9f, 0xf8, 0x0d, 0x00, 0x00, 0x49, 0x89, 0xfe, 0x41, 0x89, 0xd7, 0x48, 0x89, 0xdf,
+        0xe8, 0x2d, 0x3b, 0x00, 0x00, 0x49, 0x8b, 0xbe, 0xf8, 0x0d, 0x00,
+    ];
+    const HELPER_BYTES: u64 = MACOS_GUEST_PAGE_ALIGNMENT;
+    const HELPER_CODE_BYTES: usize = 46;
+    const RENDER_TASK_SIGNATURE: [u8; 17] = [
+        0x48, 0x8b, 0x07, 0xff, 0x50, 0x08, 0x48, 0xc7, 0x05, 0xd1, 0x49, 0x11, 0x06, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+    const RENDER_TASK_HELPER_CODE_BYTES: usize = 32;
+    const NULL_CONTAINER_SIGNATURE: [u8; 32] = [
+        0x4b, 0x8b, 0x7c, 0x35, 0x00, 0xe8, 0xfd, 0x33, 0xfa, 0xff, 0x48, 0x8b, 0x38, 0x48, 0x85,
+        0xff, 0x74, 0xe5, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x38, 0x48, 0x85, 0xc0, 0x74, 0xda, 0x48,
+        0x89, 0xc3,
+    ];
+    const NULL_CONTAINER_HELPER_CODE_BYTES: usize = 38;
+    const NULL_FIELD_HANDLER_SIGNATURE: [u8; 36] = [
+        0x48, 0x8b, 0x3b, 0x4c, 0x89, 0xee, 0x48, 0x01, 0xca, 0x48, 0x03, 0x4c, 0x24, 0x20, 0x39,
+        0x44, 0x24, 0x18, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x0f, 0x46, 0xc8, 0x48, 0x8b, 0x07,
+        0xff, 0x90, 0x98, 0x00, 0x00, 0x00,
+    ];
+    const NULL_FIELD_HANDLER_HELPER_CODE_BYTES: usize = 39;
+    const STALE_POST_UPDATE_SIGNATURE: [u8; 18] = [
+        0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0xff, 0x90, 0x70, 0x01, 0x00, 0x00, 0x80, 0x63, 0x39,
+        0xfd, 0x48, 0x83,
+    ];
+    const STALE_POST_UPDATE_HELPER_CODE_BYTES: usize = 36;
+    const RENDER_TASK_HELPER_OFFSET: u64 = 0x100;
+    const NULL_CONTAINER_HELPER_OFFSET: u64 = 0x200;
+    const NULL_FIELD_HANDLER_HELPER_OFFSET: u64 = 0x300;
+    const STALE_POST_UPDATE_HELPER_OFFSET: u64 = 0x400;
+
+    if std::env::var_os("REMU_DISABLE_KNOWN_GUEST_PATCHES").is_some_and(|value| value == "1") {
+        return Ok(false);
+    }
+    let mut actual = [0_u8; SIGNATURE.len()];
+    if memory.read(GuestAddress::new(ENTRY), &mut actual).is_err() || actual != SIGNATURE {
+        return Ok(false);
+    }
+    let mut render_task_actual = [0_u8; RENDER_TASK_SIGNATURE.len()];
+    if memory
+        .read(GuestAddress::new(RENDER_TASK_SITE), &mut render_task_actual)
+        .is_err()
+        || render_task_actual != RENDER_TASK_SIGNATURE
+    {
+        return Ok(false);
+    }
+    let mut stale_post_update_actual = [0_u8; STALE_POST_UPDATE_SIGNATURE.len()];
+    if memory
+        .read(
+            GuestAddress::new(STALE_POST_UPDATE_SITE),
+            &mut stale_post_update_actual,
+        )
+        .is_err()
+        || stale_post_update_actual != STALE_POST_UPDATE_SIGNATURE
+    {
+        return Ok(false);
+    }
+    let mut null_field_handler_actual = [0_u8; NULL_FIELD_HANDLER_SIGNATURE.len()];
+    if memory
+        .read(
+            GuestAddress::new(NULL_FIELD_HANDLER_SITE),
+            &mut null_field_handler_actual,
+        )
+        .is_err()
+        || null_field_handler_actual != NULL_FIELD_HANDLER_SIGNATURE
+    {
+        return Ok(false);
+    }
+    let mut null_container_actual = [0_u8; NULL_CONTAINER_SIGNATURE.len()];
+    if memory
+        .read(
+            GuestAddress::new(NULL_CONTAINER_SITE),
+            &mut null_container_actual,
+        )
+        .is_err()
+        || null_container_actual != NULL_CONTAINER_SIGNATURE
+    {
+        return Ok(false);
+    }
+    let helper = memory.allocate_staging(
+        HELPER_BYTES,
+        MACOS_GUEST_PAGE_ALIGNMENT,
+        GUEST_READ | GUEST_EXECUTE,
+    )?;
+    let mut code = [0x90_u8; HELPER_CODE_BYTES];
+    // test rsi,rsi; je invalid
+    code[0..5].copy_from_slice(&[0x48, 0x85, 0xf6, 0x74, 0x12]);
+    // cmp qword ptr [rsi+0x18],0; je invalid
+    code[5..12].copy_from_slice(&[0x48, 0x83, 0x7e, 0x18, 0x00, 0x74, 0x0b]);
+    // Replay `push rbp; mov rbp,rsp; push r15`, then resume the original function at +6.
+    code[12..18].copy_from_slice(&SIGNATURE[..STOLEN_BYTES]);
+    code[18] = 0xe9;
+    code[19..23].copy_from_slice(&relative_x86_branch(
+        helper.get() + 23,
+        ENTRY + STOLEN_BYTES as u64,
+    )?);
+    // Invalid candidate: report the rejection, then return a neutral result without publishing or
+    // partially resetting state. The guest enters with rsp%16=8, so one shadow qword restores the
+    // SysV call-site alignment before crossing back into this host helper.
+    code[23..29].copy_from_slice(&[0x48, 0x83, 0xec, 0x08, 0x48, 0xb8]);
+    code[29..37].copy_from_slice(
+        &(report_incomplete_graphics_pso_rejection as *const () as usize as u64).to_le_bytes(),
+    );
+    code[37..46].copy_from_slice(&[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x08, 0x31, 0xc0, 0xc3]);
+    memory.write(helper, &code)?;
+
+    let mut entry_patch = [0x90_u8; STOLEN_BYTES];
+    entry_patch[0] = 0xe9;
+    entry_patch[1..5].copy_from_slice(&relative_x86_branch(ENTRY + 5, helper.get())?);
+    memory.write(GuestAddress::new(ENTRY), &entry_patch)?;
+    let render_task_helper = GuestAddress::new(helper.get() + RENDER_TASK_HELPER_OFFSET);
+    let mut render_task_code = [0x90_u8; RENDER_TASK_HELPER_CODE_BYTES];
+    // Preserve the valid hot path as a tail-call so the virtual method returns directly to the
+    // original queue consumer. A zero vptr is stale/recycled task storage and is discarded.
+    render_task_code[0..11].copy_from_slice(&[
+        0x48, 0x8b, 0x07, 0x48, 0x85, 0xc0, 0x74, 0x03, 0xff, 0x60, 0x08,
+    ]);
+    render_task_code[11..17].copy_from_slice(&[0x48, 0x83, 0xec, 0x08, 0x48, 0xb8]);
+    render_task_code[17..25]
+        .copy_from_slice(&(report_stale_render_task as *const () as usize as u64).to_le_bytes());
+    render_task_code[25..32].copy_from_slice(&[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x08, 0xc3]);
+    memory.write(render_task_helper, &render_task_code)?;
+    let mut render_task_patch = [0x90_u8; STOLEN_BYTES];
+    render_task_patch[0] = 0xe8;
+    render_task_patch[1..5].copy_from_slice(&relative_x86_branch(
+        RENDER_TASK_SITE + 5,
+        render_task_helper.get(),
+    )?);
+    memory.write(GuestAddress::new(RENDER_TASK_SITE), &render_task_patch)?;
+
+    let null_container_helper = GuestAddress::new(helper.get() + NULL_CONTAINER_HELPER_OFFSET);
+    let mut null_container_code = [0x90_u8; NULL_CONTAINER_HELPER_CODE_BYTES];
+    // Replay `mov rdi,[r13+r14]`. Valid entries resume at the original helper call.
+    null_container_code[0..10]
+        .copy_from_slice(&[0x4b, 0x8b, 0x7c, 0x35, 0x00, 0x48, 0x85, 0xff, 0x75, 0x17]);
+    // Null entries are invalid in this title's object list. Report the slot, then use the
+    // original loop's increment/termination path without fabricating an object at address 0x118.
+    null_container_code[10..18].copy_from_slice(&[0x4c, 0x89, 0xef, 0x4c, 0x89, 0xf6, 0x48, 0xb8]);
+    null_container_code[18..26].copy_from_slice(
+        &(report_null_guest_container_entry as *const () as usize as u64).to_le_bytes(),
+    );
+    null_container_code[26..29].copy_from_slice(&[0xff, 0xd0, 0xe9]);
+    null_container_code[29..33].copy_from_slice(&relative_x86_branch(
+        null_container_helper.get() + 33,
+        NULL_CONTAINER_LOOP,
+    )?);
+    null_container_code[33] = 0xe9;
+    null_container_code[34..38].copy_from_slice(&relative_x86_branch(
+        null_container_helper.get() + 38,
+        NULL_CONTAINER_SITE + 5,
+    )?);
+    memory.write(null_container_helper, &null_container_code)?;
+    let mut null_container_patch = [0x90_u8; 5];
+    null_container_patch[0] = 0xe9;
+    null_container_patch[1..5].copy_from_slice(&relative_x86_branch(
+        NULL_CONTAINER_SITE + 5,
+        null_container_helper.get(),
+    )?);
+    memory.write(
+        GuestAddress::new(NULL_CONTAINER_SITE),
+        &null_container_patch,
+    )?;
+
+    let null_field_handler_helper =
+        GuestAddress::new(helper.get() + NULL_FIELD_HANDLER_HELPER_OFFSET);
+    let mut null_field_handler_code = [0x90_u8; NULL_FIELD_HANDLER_HELPER_CODE_BYTES];
+    // Replay `mov rdi,[rbx]; mov rsi,r13`. A valid handler resumes with the original arguments.
+    null_field_handler_code[0..11].copy_from_slice(&[
+        0x48, 0x8b, 0x3b, 0x4c, 0x89, 0xee, 0x48, 0x85, 0xff, 0x75, 0x17,
+    ]);
+    // A null handler cannot service the field. Log its descriptor and skip through the original
+    // per-field loop instead of making a virtual call through address zero.
+    null_field_handler_code[11..19]
+        .copy_from_slice(&[0x48, 0x89, 0xdf, 0x4c, 0x89, 0xee, 0x48, 0xb8]);
+    null_field_handler_code[19..27].copy_from_slice(
+        &(report_null_guest_field_handler as *const () as usize as u64).to_le_bytes(),
+    );
+    null_field_handler_code[27..30].copy_from_slice(&[0xff, 0xd0, 0xe9]);
+    null_field_handler_code[30..34].copy_from_slice(&relative_x86_branch(
+        null_field_handler_helper.get() + 34,
+        NULL_FIELD_HANDLER_LOOP,
+    )?);
+    null_field_handler_code[34] = 0xe9;
+    null_field_handler_code[35..39].copy_from_slice(&relative_x86_branch(
+        null_field_handler_helper.get() + 39,
+        NULL_FIELD_HANDLER_SITE + STOLEN_BYTES as u64,
+    )?);
+    memory.write(null_field_handler_helper, &null_field_handler_code)?;
+    let mut null_field_handler_patch = [0x90_u8; STOLEN_BYTES];
+    null_field_handler_patch[0] = 0xe9;
+    null_field_handler_patch[1..5].copy_from_slice(&relative_x86_branch(
+        NULL_FIELD_HANDLER_SITE + 5,
+        null_field_handler_helper.get(),
+    )?);
+    memory.write(
+        GuestAddress::new(NULL_FIELD_HANDLER_SITE),
+        &null_field_handler_patch,
+    )?;
+
+    let stale_post_update_helper =
+        GuestAddress::new(helper.get() + STALE_POST_UPDATE_HELPER_OFFSET);
+    let mut stale_post_update_code = [0x90_u8; STALE_POST_UPDATE_HELPER_CODE_BYTES];
+    // Replay `mov rax,[rbx]; mov rdi,rbx`. The nested update immediately before this site can
+    // destroy the parent, so validate the reloaded vptr before the final virtual callback.
+    stale_post_update_code[0..11].copy_from_slice(&[
+        0x48, 0x8b, 0x03, 0x48, 0x89, 0xdf, 0x48, 0x85, 0xc0, 0x75, 0x14,
+    ]);
+    stale_post_update_code[11..16].copy_from_slice(&[0x48, 0x89, 0xdf, 0x48, 0xb8]);
+    stale_post_update_code[16..24].copy_from_slice(
+        &(report_stale_post_update_object as *const () as usize as u64).to_le_bytes(),
+    );
+    stale_post_update_code[24..27].copy_from_slice(&[0xff, 0xd0, 0xe9]);
+    stale_post_update_code[27..31].copy_from_slice(&relative_x86_branch(
+        stale_post_update_helper.get() + 31,
+        STALE_POST_UPDATE_SKIP,
+    )?);
+    stale_post_update_code[31] = 0xe9;
+    stale_post_update_code[32..36].copy_from_slice(&relative_x86_branch(
+        stale_post_update_helper.get() + 36,
+        STALE_POST_UPDATE_SITE + STOLEN_BYTES as u64,
+    )?);
+    memory.write(stale_post_update_helper, &stale_post_update_code)?;
+    let mut stale_post_update_patch = [0x90_u8; STOLEN_BYTES];
+    stale_post_update_patch[0] = 0xe9;
+    stale_post_update_patch[1..5].copy_from_slice(&relative_x86_branch(
+        STALE_POST_UPDATE_SITE + 5,
+        stale_post_update_helper.get(),
+    )?);
+    memory.write(
+        GuestAddress::new(STALE_POST_UPDATE_SITE),
+        &stale_post_update_patch,
+    )?;
+    eprintln!(
+        "[REMu][COMPAT] installed exact-signature Silent Hill guards PSO={ENTRY:#x} render-task={RENDER_TASK_SITE:#x} null-container={NULL_CONTAINER_SITE:#x} null-field-handler={NULL_FIELD_HANDLER_SITE:#x} post-update={STALE_POST_UPDATE_SITE:#x}"
+    );
+    Ok(true)
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn report_stale_post_update_object(object: u64) {
+    static REJECTIONS: AtomicU64 = AtomicU64::new(0);
+    let rejection = REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if rejection <= 8 || rejection.is_power_of_two() {
+        let mut bytes = [0_u8; 0x40];
+        let readable = object != 0 && ProcessGuestMemory.read(object, &mut bytes);
+        eprintln!(
+            "[REMu][COMPAT] skipped callback on object destroyed by nested update count={rejection} object={object:#x} readable={readable} bytes={bytes:02x?}"
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn report_null_guest_field_handler(field: u64, object: u64) {
+    static REJECTIONS: AtomicU64 = AtomicU64::new(0);
+    let rejection = REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if rejection <= 8 || rejection.is_power_of_two() {
+        let mut descriptor = [0_u8; 0x10];
+        let readable = field != 0 && ProcessGuestMemory.read(field, &mut descriptor);
+        eprintln!(
+            "[REMu][COMPAT] skipped null guest field handler count={rejection} field={field:#x} object={object:#x} readable={readable} descriptor={descriptor:02x?}"
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn report_null_guest_container_entry(list: u64, byte_offset: u64) {
+    static REJECTIONS: AtomicU64 = AtomicU64::new(0);
+    let rejection = REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if rejection <= 8 || rejection.is_power_of_two() {
+        eprintln!(
+            "[REMu][COMPAT] skipped null guest container entry count={rejection} list={list:#x} byte_offset={byte_offset:#x} index={}",
+            byte_offset / 8
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn report_stale_render_task(task: u64) {
+    static REJECTIONS: AtomicU64 = AtomicU64::new(0);
+    let rejection = REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if rejection <= 8 || rejection.is_power_of_two() {
+        let mut object = [0_u8; 0x20];
+        let readable = task != 0 && ProcessGuestMemory.read(task, &mut object);
+        eprintln!(
+            "[REMu][COMPAT] discarded stale RenderThread task count={rejection} task={task:#x} readable={readable} bytes={object:02x?}"
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn report_incomplete_graphics_pso_rejection(engine: u64, candidate: u64) {
+    static REJECTIONS: AtomicU64 = AtomicU64::new(0);
+    let rejection = REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if rejection <= 8 || rejection.is_power_of_two() {
+        let mut object = [0_u8; 0x80];
+        let readable = candidate != 0 && ProcessGuestMemory.read(candidate, &mut object);
+        let qword = |offset: usize| {
+            readable
+                .then(|| {
+                    u64::from_le_bytes(
+                        object[offset..offset + 8]
+                            .try_into()
+                            .expect("fixed graphics-PSO field fits"),
+                    )
+                })
+                .unwrap_or(0)
+        };
+        let dword = |offset: usize| {
+            readable
+                .then(|| {
+                    u32::from_le_bytes(
+                        object[offset..offset + 4]
+                            .try_into()
+                            .expect("fixed graphics-PSO field fits"),
+                    )
+                })
+                .unwrap_or(0)
+        };
+        let word = |offset: usize| {
+            readable
+                .then(|| {
+                    u16::from_le_bytes(
+                        object[offset..offset + 2]
+                            .try_into()
+                            .expect("fixed graphics-PSO field fits"),
+                    )
+                })
+                .unwrap_or(0)
+        };
+        let byte = |offset: usize| readable.then(|| object[offset]).unwrap_or(0);
+        eprintln!(
+            "[REMu][COMPAT] rejected incomplete graphics-PSO publication count={rejection} engine={engine:#x} candidate={candidate:#x} readable={readable} vptr={:#x} refs={:#x}/{:#x} flags={:#x} children=[{:#x},{:#x},{:#x}] data=[{:#x},{:#x},{:#x}] fields=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+            qword(0),
+            dword(8),
+            dword(0x0c),
+            byte(0x10),
+            qword(0x18),
+            qword(0x20),
+            qword(0x28),
+            qword(0x30),
+            qword(0x38),
+            qword(0x40),
+            word(0x60),
+            word(0x62),
+            dword(0x64),
+            dword(0x74),
+            dword(0x78),
+            byte(0x7c),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+const fn install_known_incomplete_graphics_pso_guard(
+    _memory: &mut GuestImage,
+) -> Result<bool, LinkError> {
+    Ok(false)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn relative_x86_branch(next_instruction: u64, destination: u64) -> Result<[u8; 4], LinkError> {
+    let displacement = i128::from(destination) - i128::from(next_instruction);
+    let displacement = i32::try_from(displacement).map_err(|_| LinkError::AddressOverflow)?;
+    Ok(displacement.to_le_bytes())
+}
+
 fn tls_dtv_entry_offset(module_id: u64) -> Option<u64> {
     if module_id == 0 {
         return None;
@@ -1655,7 +2049,63 @@ fn native_libc_symbol_name(nid: &str) -> Option<&'static std::ffi::CStr> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_pthread_self() -> u64 {
+    current_guest_thread_handle()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_pthread_get_specific(key: u64) -> u64 {
+    pthread_get_specific(low_u32(key))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_guest_mutex_lock(address: u64) -> u64 {
+    guest_mutex_lock(address, false)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_guest_mutex_unlock(address: u64) -> u64 {
+    guest_mutex_unlock(address)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_guest_rwlock_write_lock(address: u64) -> u64 {
+    guest_rwlock_lock(address, true, false)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_guest_rwlock_unlock(address: u64) -> u64 {
+    guest_rwlock_unlock(address)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_process_time_counter() -> u64 {
+    kernel_process_time(true)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn direct_runtime_import_target(nid: &str) -> Option<u64> {
+    Some(match nid {
+        // Unreal's archive/name parser calls these leaf TLS and synchronization operations
+        // millions of times during startup. They already use dedicated sharded/thread-local
+        // state and need neither the process dispatch lock nor a captured eight-XMM import frame.
+        "aI+OeCz8xrQ" | "EotR8a3ASf4" => direct_pthread_self as *const () as usize as u64,
+        "0-KXaS70xy4" | "eoht7mQOCmo" => direct_pthread_get_specific as *const () as usize as u64,
+        "9UK1vLZQft4" | "7H0iTOciTLo" => direct_guest_mutex_lock as *const () as usize as u64,
+        "tn3VlD0hG60" | "2Z+PpY6CaJg" => direct_guest_mutex_unlock as *const () as usize as u64,
+        "sIlRvQqsN2Y" => direct_guest_rwlock_write_lock as *const () as usize as u64,
+        "EgmLo6EWgso" => direct_guest_rwlock_unlock as *const () as usize as u64,
+        "EI-5-jlq2dE" => direct_pthread_self as *const () as usize as u64,
+        "fgxnMeTNUtY" => direct_process_time_counter as *const () as usize as u64,
+        _ => return None,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 fn native_import_target(nid: &str) -> Option<u64> {
+    if let Some(target) = direct_runtime_import_target(nid) {
+        return Some(target);
+    }
     let runtime = native_cxx_runtime()?;
     if let Some(name) = native_cxx_symbol_name(nid) {
         return runtime.cxxabi_symbol(name);
@@ -1749,11 +2199,50 @@ fn synthetic_data_import_target(nid: &str) -> Option<u64> {
 type RegisterFrame = unsafe extern "C" fn(*const libc::c_void);
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+type RegisterEhFrameSection = unsafe extern "C" fn(*const libc::c_void, usize);
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize, LinkError> {
     if image.unwind_fdes.is_empty() {
         return Ok(0);
     }
     let runtime = native_cxx_runtime().ok_or(LinkError::NativeCxxRuntimeUnavailable)?;
+    // Modern Apple libunwind can ingest a complete .eh_frame section in one call. Silent Hill's
+    // executable and bundled audio modules contain more than 450,000 FDEs; crossing the
+    // Rust/libunwind boundary once per FDE adds a large serial delay before guest entry even
+    // though libunwind immediately groups those records by section internally.
+    //
+    // LLVM added the explicit byte length to this entry point after the original one-argument
+    // ABI. Supplying it is backwards-compatible on x86-64 (the older implementation ignores RSI)
+    // and prevents a newer implementation from scanning section padding as another CIE.
+    if let Some(register_section_address) =
+        runtime.unwind_symbol(c"__unw_add_dynamic_eh_frame_section")
+    {
+        // SAFETY: dlsym returned Apple's libunwind section-registration entry point.
+        let register_section: RegisterEhFrameSection = unsafe {
+            std::mem::transmute(
+                usize::try_from(register_section_address)
+                    .expect("x86-64 unwind section registrar address fits usize"),
+            )
+        };
+        for module in &image.unwind_modules {
+            if module.eh_frame == 0 || module.eh_frame_size == 0 {
+                continue;
+            }
+            // SAFETY: every module range was validated while linking and remains mapped for the
+            // process lifetime. The complete section size is supplied for current libunwind.
+            unsafe {
+                register_section(
+                    usize::try_from(module.eh_frame)
+                        .expect("x86-64 guest .eh_frame address fits usize")
+                        as *const libc::c_void,
+                    usize::try_from(module.eh_frame_size)
+                        .expect("x86-64 guest .eh_frame size fits usize"),
+                );
+            }
+        }
+        return Ok(image.unwind_fdes.len());
+    }
     let register_address = runtime
         .unwind_symbol(c"__register_frame")
         .ok_or(LinkError::MissingNativeUnwindSymbol("__register_frame"))?;
@@ -2833,7 +3322,7 @@ struct ProbeDispatchState {
     pthread_condition_attributes: BTreeSet<u64>,
     pthread_keys: BTreeMap<u32, u64>,
     ampr_files: BTreeMap<u32, PathBuf>,
-    ampr_file_handles: BTreeMap<u32, std::fs::File>,
+    ampr_file_handles: BTreeMap<u32, Arc<std::fs::File>>,
     ampr_command_buffers: BTreeMap<u64, AmprCommandBufferState>,
     next_apr_submission_id: u32,
     apr_submissions: BTreeSet<u32>,
@@ -2881,6 +3370,8 @@ struct ProbeDispatchState {
     kernel_equeues: BTreeSet<u64>,
     kernel_event_registrations: BTreeMap<(u64, i16, u64), u64>,
     pending_events: VecDeque<KernelQueuedEvent>,
+    /// Accepted VideoOut flips awaiting retirement of their Metal presentation command.
+    pending_video_out_flips: VecDeque<PendingVideoOutFlip>,
     /// Backend completion sequence paired with the AGC queue identifier registered through
     /// `sceAgcDriverAddEqEvent` (graphics is 0, ACB queues use their owner ID).
     pending_agc_completions: VecDeque<(u64, u64)>,
@@ -2953,6 +3444,15 @@ struct AvPlayerInstance {
     video_buffer_stride: usize,
     next_video_buffer: usize,
     next_video_frame: u64,
+    /// Completed VideoOut flip and decoded-frame indices at the start of the current media-clock
+    /// segment. Native AVPlayer does not release every decoded frame merely because the guest
+    /// polls quickly; tying the clock to retired scanout work also keeps its three buffers from
+    /// being overwritten while the emulated GPU is still consuming them.
+    video_clock_origin: Option<(u64, u64)>,
+    /// Host media-clock segment established only after the guest has consumed its first decoded
+    /// frame. This prevents a long initial shader compile from seeking a short splash straight to
+    /// EOF, while still allowing later frames to catch up when emulation runs below movie FPS.
+    video_catch_up_origin: Option<(Instant, u64)>,
     audio_decoder: Option<Child>,
     audio_output: Option<ChildStdout>,
     raw_audio_frame: Vec<u8>,
@@ -2981,6 +3481,8 @@ impl AvPlayerInstance {
         self.elapsed = Duration::ZERO;
         self.end_of_stream = false;
         self.next_video_frame = 0;
+        self.video_clock_origin = None;
+        self.video_catch_up_origin = None;
         self.next_audio_frame = 0;
         self.next_video_buffer = 0;
         self.next_audio_buffer = 0;
@@ -3303,6 +3805,7 @@ struct VideoOutState {
     display_buffers: Vec<u64>,
     display_buffer_attributes: Vec<Option<VideoOutBufferAttributes>>,
     flip_events: BTreeMap<u64, u64>,
+    completed_flip_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3312,6 +3815,12 @@ struct VideoOutBufferAttributes {
     pitch: u32,
     pixel_format: u64,
     tiling_mode: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingVideoOutFlip {
+    completion: remu_gpu::GpuFlipCompletion,
+    handle: u32,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -3859,6 +4368,19 @@ const KERNEL_EVENT_FILTER_AMPR: i16 = -16;
 const KERNEL_EVENT_FILTER_VIDEO_OUT: i16 = -13;
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
+/// Serializes APR/AMPR file and command-buffer operations in guest-observable order.
+///
+/// A file read deliberately releases `PROBE_DISPATCH` while the host blocks in `pread` and while
+/// bytes are copied into guest memory. Holding this narrower lock across that gap prevents submit,
+/// reset, destruction, or file re-resolution from overtaking the transfer.
+static AMPR_IMPORT_ORDER: OnceLock<Mutex<()>> = OnceLock::new();
+/// Reusable host storage for ordered AMPR reads.
+///
+/// Silent Hill issues thousands of mostly 32–256 KiB reads while opening Unreal containers. AMPR
+/// operations are already serialized by `AMPR_IMPORT_ORDER`, so retaining one initialized buffer
+/// avoids an allocation and zero-fill for every request without increasing the observable
+/// concurrency or bypassing CPU write-watch faults during the final guest-memory copy.
+static AMPR_READ_STAGING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static KERNEL_EQUEUE_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 static AUDIO_OUT: OnceLock<Mutex<audio::AudioOutState>> = OnceLock::new();
 static AUDIO_OUT2: OnceLock<Mutex<AudioOut2State>> = OnceLock::new();
@@ -4925,6 +5447,10 @@ fn retire_detached_guest_thread(handle: u64) {
 
 #[cfg(target_arch = "x86_64")]
 fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits: usize) {
+    // Decode the installed title image before guest entry. Keeping PNG parsing on the runtime
+    // side means the GPU seam carries a validated, immutable RGBA image instead of a host path
+    // whose lifetime or casing the presenter would have to rediscover.
+    let system_splash = load_system_splash(game_root);
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = state
         .write()
@@ -5043,6 +5569,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.kernel_equeues.clear();
     state.kernel_event_registrations.clear();
     state.pending_events.clear();
+    state.pending_video_out_flips.clear();
     state.pending_agc_completions.clear();
     state.pending_agc_user_interrupts.clear();
     *KERNEL_FILES
@@ -5064,6 +5591,127 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = GuestSyncState::default();
     set_current_guest_thread_handle(main_thread);
+    drop(state);
+    publish_system_splash(system_splash);
+}
+
+/// Dumps selected linked guest ranges before any module initializer or process entry can mutate
+/// them. `REMU_TRACE_GUEST_CODE` accepts comma-separated `address:length` pairs; both fields may
+/// be decimal or `0x`-prefixed hexadecimal. The bytes are printed in one deterministic hexdump
+/// and, when `REMU_DUMP_GUEST_CODE_DIR` is set, also retained as raw binaries for disassembly.
+#[cfg(target_arch = "x86_64")]
+fn trace_linked_guest_code(image: &LinkedImage) {
+    const MAXIMUM_RANGE_BYTES: usize = 1024 * 1024;
+    const MAXIMUM_RANGE_COUNT: usize = 16;
+
+    let Ok(specifications) = std::env::var("REMU_TRACE_GUEST_CODE") else {
+        return;
+    };
+    let output_directory = std::env::var_os("REMU_DUMP_GUEST_CODE_DIR").map(PathBuf::from);
+    if let Some(directory) = &output_directory
+        && let Err(error) = std::fs::create_dir_all(directory)
+    {
+        eprintln!(
+            "[REMu][GUEST-CODE] cannot create output directory {}: {error}",
+            directory.display()
+        );
+    }
+    let mut total_bytes = 0_usize;
+    for specification in specifications
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .take(MAXIMUM_RANGE_COUNT)
+    {
+        let Some((address, length)) = specification.split_once(':') else {
+            eprintln!(
+                "[REMu][GUEST-CODE] invalid range {specification:?}; expected address:length"
+            );
+            continue;
+        };
+        let Some(address) = parse_guest_code_number(address) else {
+            eprintln!("[REMu][GUEST-CODE] invalid address {address:?}");
+            continue;
+        };
+        let Some(length) =
+            parse_guest_code_number(length).and_then(|value| usize::try_from(value).ok())
+        else {
+            eprintln!("[REMu][GUEST-CODE] invalid length {length:?}");
+            continue;
+        };
+        let Some(next_total) = total_bytes.checked_add(length) else {
+            eprintln!("[REMu][GUEST-CODE] rejected overflowing total range length");
+            continue;
+        };
+        if length == 0 || next_total > MAXIMUM_RANGE_BYTES {
+            eprintln!(
+                "[REMu][GUEST-CODE] rejected range address={address:#x} length={length:#x}; maximum total={MAXIMUM_RANGE_BYTES:#x}"
+            );
+            continue;
+        }
+        let Some(end) = address.checked_add(u64::try_from(length).unwrap_or(u64::MAX)) else {
+            eprintln!(
+                "[REMu][GUEST-CODE] rejected overflowing range address={address:#x} length={length:#x}"
+            );
+            continue;
+        };
+        let executable = image.memory.regions().iter().any(|region| {
+            region.flags & GUEST_EXECUTE != 0
+                && address >= region.start.get()
+                && region
+                    .start
+                    .get()
+                    .checked_add(region.memory_size)
+                    .is_some_and(|region_end| end <= region_end)
+        });
+        if !executable {
+            eprintln!(
+                "[REMu][GUEST-CODE] rejected non-executable range address={address:#x} length={length:#x}"
+            );
+            continue;
+        }
+        let mut bytes = vec![0_u8; length];
+        if let Err(error) = image.memory.read(GuestAddress::new(address), &mut bytes) {
+            eprintln!(
+                "[REMu][GUEST-CODE] unreadable range address={address:#x} length={length:#x}: {error}"
+            );
+            continue;
+        }
+        total_bytes = next_total;
+        eprintln!("[REMu][GUEST-CODE] begin address={address:#018x} length={length:#x}");
+        for (offset, chunk) in bytes.chunks(16).enumerate() {
+            let line_address = address + u64::try_from(offset * 16).unwrap_or(u64::MAX);
+            let encoded = chunk
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("[REMu][GUEST-CODE] {line_address:#018x}: {encoded}");
+        }
+        eprintln!("[REMu][GUEST-CODE] end address={address:#018x}");
+        if let Some(directory) = &output_directory {
+            let path = directory.join(format!("{address:016x}-{length:x}.bin"));
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => eprintln!("[REMu][GUEST-CODE] wrote {}", path.display()),
+                Err(error) => eprintln!(
+                    "[REMu][GUEST-CODE] cannot write {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_guest_code_number(value: &str) -> Option<u64> {
+    let value = value.trim();
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hexadecimal| u64::from_str_radix(hexadecimal, 16).ok(),
+        )
 }
 
 #[repr(C, align(16))]
@@ -5355,6 +6003,51 @@ extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImpor
     result
 }
 
+fn read_import_stack_arguments(frame: &ImportCallFrame) -> [u64; 6] {
+    std::array::from_fn(|argument| {
+        let offset = u64::try_from((argument + 1) * std::mem::size_of::<u64>())
+            .expect("fixed stack argument offset fits u64");
+        read_guest_u64(frame.guest_rsp.saturating_add(offset))
+    })
+}
+
+fn is_serialized_ampr_import(nid: &str) -> bool {
+    matches!(
+        nid,
+        // File resolution and metadata.
+        "gEpBkcwxUjw"
+            | "WT-5NKy42fw"
+            | "eYAh2vlCY-U"
+            | "QzB4O+bJQyA"
+            | "i3HWvW35jao"
+            | "w5fcCG+t31g"
+            | "VB-BtuIW8Xc"
+            | "C+Khtbbx2g8"
+            | "WvEu7yl3Ivg"
+            | "ApkYaHb8Sek"
+            // Submission and completion.
+            | "eE4Szl8sil8"
+            | "qvMUCyyaCSI"
+            | "ASoW5WE-UPo"
+            | "rqwFKI4PAiM"
+            | "bBfz7kMF2Ho"
+            // Command-buffer construction, recording, and destruction.
+            | "8aI7R7WaOlc"
+            | "a8uLzYY--tM"
+            | "N-FSPA4S3nI"
+            | "baQO9ez2gL4"
+            | "ULvXMDz56po"
+            | "tZDDEo2tE5k"
+            | "GnxKOHEawhk"
+            | "H896Pt-yB4I"
+            | "sSAUCCU1dv4"
+            | "vWU-odnS+fU"
+            | "GuchCTefuZw"
+            | "Qs1xtplKo0U"
+            | "mQ16-QdKv7k"
+    )
+}
+
 extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportReturn {
     if frame.is_null() {
         eprintln!("[REMu][IMPORT] null captured register frame");
@@ -5375,12 +6068,6 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     }
     deliver_pending_guest_exception_at_import(frame);
     let call_args = frame.integer_arguments;
-    let mut stack_args = [0_u64; 6];
-    for (argument, output) in stack_args.iter_mut().enumerate() {
-        let offset = u64::try_from((argument + 1) * std::mem::size_of::<u64>())
-            .expect("fixed stack argument offset fits u64");
-        *output = read_guest_u64(frame.guest_rsp.saturating_add(offset));
-    }
     let float_argument0 = low_xmm_f64(frame.xmm_arguments[0]);
     let index = frame.dispatch_index;
     let guest_return_address = frame.guest_return_address;
@@ -5571,6 +6258,10 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     ) {
         return ProbeImportReturn::integer(dispatch_audio_out_import(nid, call_args));
     }
+    // Most hot imports return above without consuming stack arguments. Reading them lazily avoids
+    // six guest-memory loads on every timer, synchronization, numeric, and audio call while
+    // preserving the complete ABI frame for the less common dispatch paths below.
+    let stack_args = read_import_stack_arguments(frame);
     if let Some(result) = dispatch_stateless_import(nid, call_args, stack_args) {
         return ProbeImportReturn::integer(result);
     }
@@ -5592,8 +6283,19 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         return ProbeImportReturn::integer(kernel_load_start_module(call_args));
     }
     if matches!(nid, "o3+RWnHViSg" | "JdksQu8pNdQ") {
-        prepare_av_player_video_buffers(call_args[0]);
+        prepare_av_player_video_buffers(call_args[0], nid == "JdksQu8pNdQ");
     }
+    if nid == "mQ16-QdKv7k" {
+        return ProbeImportReturn::integer(ampr_command_buffer_read_file_ordered(
+            call_args, stack_args,
+        ));
+    }
+    let _ampr_order = is_serialized_ampr_import(nid).then(|| {
+        AMPR_IMPORT_ORDER
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let trace_lock_stall =
         std::env::var_os("REMU_TRACE_DISPATCH_STALLS").is_some_and(|value| value == "1");
@@ -5615,6 +6317,11 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             );
         }
     }
+    // Flip completions are produced asynchronously by Metal. Refresh them at every stateful import
+    // boundary instead of only when the guest happens to poll an equeue; VideoOut pending queries
+    // and AVPlayer's completed-vblank clock otherwise observe arbitrarily stale state and can hold
+    // or skip visible frames. AGC submission completion remains equeue-owned.
+    refresh_completed_video_out_flips(&mut state);
     if nid == "H2e8t5ScQGc" {
         let callbacks = take_exit_callbacks(&mut state, Some(call_args[0]));
         drop(state);
@@ -9198,7 +9905,9 @@ fn dispatch_probe_import(
         "H896Pt-yB4I" => ampr_command_buffer_write_kernel_event_queue(arguments, state),
         "sSAUCCU1dv4" | "vWU-odnS+fU" => ampr_measure_command_size(),
         "GuchCTefuZw" | "Qs1xtplKo0U" => ampr_command_buffer_destructor(arguments, state),
-        "mQ16-QdKv7k" => ampr_command_buffer_read_file(arguments, stack_arguments, state),
+        "mQ16-QdKv7k" => {
+            unreachable!("AMPR file reads are routed before acquiring PROBE_DISPATCH")
+        }
         // AGC shader construction and VideoOut mutate caller-owned descriptors. Games consume the
         // resulting pointers and command data immediately, so successful no-ops are insufficient.
         "f3dg2CSgRKY" => agc_create_shader(arguments, state),
@@ -9762,6 +10471,7 @@ fn kernel_poll_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> Re
     if events == 0 || event_capacity == 0 {
         return Err(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
     }
+    refresh_completed_video_out_flips(state);
     refresh_completed_agc_submissions(state);
     let mut delivered = 0_u32;
     while delivered < event_capacity {
@@ -10159,9 +10869,177 @@ fn ult_initialize(runtime: u64, state: &mut ProbeDispatchState) -> u64 {
     }
 }
 
+const MAXIMUM_SYSTEM_SPLASH_PIXELS: usize = 64 * 1024 * 1024;
+
+fn load_system_splash(game_root: &Path) -> Result<(PathBuf, remu_gpu::GpuHostImage), String> {
+    let path = resolve_path_beneath(game_root, "sce_sys/pic0.png")
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            format!(
+                "installed title has no readable /sce_sys/pic0.png beneath {}",
+                game_root.display()
+            )
+        })?;
+    let file = std::fs::File::open(&path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let mut decoder = png::Decoder::new(BufReader::new(file));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let metadata = reader.info();
+    let pixel_count = usize::try_from(metadata.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(metadata.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .filter(|pixels| *pixels != 0 && *pixels <= MAXIMUM_SYSTEM_SPLASH_PIXELS)
+        .ok_or_else(|| {
+            format!(
+                "{} has unsupported splash dimensions {}x{}",
+                path.display(),
+                metadata.width,
+                metadata.height
+            )
+        })?;
+    let mut decoded = vec![0_u8; reader.output_buffer_size()];
+    let frame = reader
+        .next_frame(&mut decoded)
+        .map_err(|error| format!("could not decode {}: {error}", path.display()))?;
+    let decoded = &decoded[..frame.buffer_size()];
+    let mut rgba = Vec::with_capacity(
+        pixel_count
+            .checked_mul(4)
+            .ok_or_else(|| format!("{} splash byte size overflows", path.display()))?,
+    );
+    match frame.color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(decoded),
+        png::ColorType::Rgb => {
+            for pixel in decoded.chunks_exact(3) {
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], u8::MAX]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for pixel in decoded.chunks_exact(2) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for &value in decoded {
+                rgba.extend_from_slice(&[value, value, value, u8::MAX]);
+            }
+        }
+        png::ColorType::Indexed => {
+            return Err(format!(
+                "{} remained indexed after PNG expansion",
+                path.display()
+            ));
+        }
+    }
+    let image = remu_gpu::GpuHostImage::new(frame.width, frame.height, rgba)
+        .ok_or_else(|| format!("{} did not decode to complete RGBA8 pixels", path.display()))?;
+    Ok((path, image))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn publish_system_splash(splash: Result<(PathBuf, remu_gpu::GpuHostImage), String>) {
+    match splash {
+        Ok((path, image)) => {
+            let (width, height) = (image.width(), image.height());
+            if remu_gpu::emit_event(remu_gpu::GpuEvent::ShowHostSplash(image)) {
+                eprintln!(
+                    "[REMu][SYSTEM] showing installed splash {} ({width}x{height})",
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "[REMu][SYSTEM] presenter unavailable for {}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!("[REMu][SYSTEM] {error}"),
+    }
+}
+
 fn system_service_hide_splash(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.splash == SplashState::Hidden {
+        return 0;
+    }
     state.services.splash = SplashState::Hidden;
+    if !remu_gpu::emit_event(remu_gpu::GpuEvent::HideHostSplash) {
+        eprintln!("[REMu][SYSTEM] presenter unavailable while hiding system splash");
+    } else {
+        eprintln!("[REMu][SYSTEM] system splash hidden by guest");
+    }
     0
+}
+
+#[cfg(test)]
+mod system_splash_tests {
+    use super::{
+        GPU_EVENT_SINK_TEST, ProbeDispatchState, SplashState, load_system_splash,
+        system_service_hide_splash,
+    };
+
+    #[test]
+    fn installed_splash_loads_case_insensitively_as_rgba8() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "remu-system-splash-{}-{unique}",
+            std::process::id()
+        ));
+        let system = root.join("SCE_SYS");
+        std::fs::create_dir_all(&system).expect("create test system directory");
+        let path = system.join("PIC0.PNG");
+        let file = std::fs::File::create(&path).expect("create test splash");
+        let mut encoder = png::Encoder::new(file, 2, 1);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("write PNG header");
+        writer
+            .write_image_data(&[1, 2, 3, 4, 5, 6])
+            .expect("write PNG pixels");
+        drop(writer);
+
+        let (actual_path, image) = load_system_splash(&root).expect("load installed splash");
+        assert_eq!(
+            actual_path.canonicalize().expect("canonical actual splash"),
+            path.canonicalize().expect("canonical expected splash")
+        );
+        assert_eq!((image.width(), image.height()), (2, 1));
+        assert_eq!(image.rgba8(), &[1, 2, 3, 255, 4, 5, 6, 255]);
+        std::fs::remove_dir_all(&root).expect("remove test system directory");
+    }
+
+    #[test]
+    fn hide_splash_publishes_one_idempotent_presenter_event() {
+        let _event_guard = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remu_gpu::clear_event_sink();
+        let (sender, receiver) = remu_gpu::gpu_event_channel();
+        remu_gpu::install_event_sink(sender);
+        let mut state = ProbeDispatchState::default();
+
+        assert_eq!(system_service_hide_splash(&mut state), 0);
+        assert_eq!(state.services.splash, SplashState::Hidden);
+        assert_eq!(
+            receiver.recv().expect("hide event"),
+            remu_gpu::GpuEvent::HideHostSplash
+        );
+        assert_eq!(system_service_hide_splash(&mut state), 0);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        remu_gpu::clear_event_sink();
+    }
 }
 
 fn user_service_initialize(state: &mut ProbeDispatchState) -> u64 {
@@ -11406,8 +12284,25 @@ fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
         return u64::MAX;
     }
     if trace_agc_programs() {
+        let input_semantics_address = read_guest_u64(header + AGC_SHADER_INPUT_SEMANTICS_OFFSET);
+        let input_semantics_count = u32::from(read_guest_u16(
+            header + AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET,
+        ));
+        let output_semantics_address = read_guest_u64(header + AGC_SHADER_OUTPUT_SEMANTICS_OFFSET);
+        let output_semantics_count = u32::from(read_guest_u16(
+            header + AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET,
+        ));
+        let input_semantics = (0..input_semantics_count.min(32))
+            .filter(|_| input_semantics_address != 0)
+            .map(|index| read_guest_u32(input_semantics_address + u64::from(index) * 4))
+            .collect::<Vec<_>>();
+        let output_semantics = (0..output_semantics_count.min(32))
+            .filter(|_| output_semantics_address != 0)
+            .map(|index| read_guest_u32(output_semantics_address + u64::from(index) * 4))
+            .collect::<Vec<_>>();
         eprintln!(
-            "[REMu][AGC][SHADER] registered code={code:#x} header={header:#x} type={} user_data={:#x} specials={:#x}",
+            "[REMu][AGC][SHADER] registered code={code:#x} size={} header={header:#x} type={} user_data={:#x} specials={:#x} inputs={input_semantics_count}@{input_semantics_address:#x}/{input_semantics:x?} outputs={output_semantics_count}@{output_semantics_address:#x}/{output_semantics:x?}",
+            read_guest_u32(header + AGC_SHADER_SIZE_OFFSET),
             read_guest_u8(header + AGC_SHADER_TYPE_OFFSET),
             read_guest_u64(header + AGC_SHADER_USER_DATA_OFFSET),
             read_guest_u64(header + AGC_SHADER_SPECIALS_OFFSET),
@@ -11686,6 +12581,11 @@ fn agc_create_interpolant_mapping(arguments: [u64; 6]) -> u64 {
         for index in 0..32 {
             agc_write_interpolant_register(registers, index, index);
         }
+        if trace_agc_registers() {
+            eprintln!(
+                "[REMu][AGC][INTERPOLANTS] registers={registers:#x} gs_header={geometry_shader:#x} ps_header={pixel_shader:#x} inputs=0 identity=true"
+            );
+        }
         return 0;
     }
     let input_semantics = read_guest_u64(pixel_shader + AGC_SHADER_INPUT_SEMANTICS_OFFSET);
@@ -11700,6 +12600,7 @@ fn agc_create_interpolant_mapping(arguments: [u64; 6]) -> u64 {
         return u64::MAX;
     }
 
+    let mut traced_mappings = Vec::new();
     for index in 0..input_count {
         let pixel_semantic = read_guest_u32(input_semantics + u64::from(index) * 4);
         let semantic = pixel_semantic & 0xff;
@@ -11719,9 +12620,21 @@ fn agc_create_interpolant_mapping(arguments: [u64; 6]) -> u64 {
             },
         );
         agc_write_interpolant_register(registers, index, value);
+        if trace_agc_registers() {
+            traced_mappings.push((index, pixel_semantic, geometry_semantic, value));
+        }
     }
     for index in input_count..32 {
         agc_write_interpolant_register(registers, index, index);
+    }
+    if trace_agc_registers() {
+        eprintln!(
+            "[REMu][AGC][INTERPOLANTS] registers={registers:#x} gs_header={geometry_shader:#x} gs_code={:#x} gs_outputs={} ps_header={pixel_shader:#x} ps_code={:#x} ps_inputs={} mappings={traced_mappings:x?}",
+            read_guest_u64(geometry_shader + AGC_SHADER_CODE_OFFSET),
+            output_count,
+            read_guest_u64(pixel_shader + AGC_SHADER_CODE_OFFSET),
+            input_count,
+        );
     }
     0
 }
@@ -11865,10 +12778,46 @@ fn find_shader_register(registers: u64, count: u64, offset: u32, occurrence: u32
 fn agc_fuse_shader_halves(arguments: [u64; 6]) -> u64 {
     let (fused, front, back, scratch) = (arguments[0], arguments[1], arguments[2], arguments[3]);
     let Some(stage) = fused_shader_stage(front, back) else {
+        if trace_agc_programs() {
+            eprintln!(
+                "[REMu][AGC][FUSE] rejected fused={fused:#x} front={front:#x}/type={} back={back:#x}/type={} scratch={scratch:#x}",
+                if front == 0 {
+                    0
+                } else {
+                    read_guest_u8(front + SHADER_HEADER_TYPE_OFFSET)
+                },
+                if back == 0 {
+                    0
+                } else {
+                    read_guest_u8(back + SHADER_HEADER_TYPE_OFFSET)
+                },
+            );
+        }
         return GRAPHICS_ERROR_INVALID_SHADER_HALVES;
     };
     if fused == 0 {
         return GRAPHICS_ERROR_INVALID_SHADER_HALVES;
+    }
+    if trace_agc_programs() {
+        eprintln!(
+            "[REMu][AGC][FUSE] begin fused={fused:#x} scratch={scratch:#x} stage={stage} \
+             front={front:#x}/type={}/code={:#x}/size={}/sh={:#x}/regs={}/user={:#x}/specials={:#x} \
+             back={back:#x}/type={}/code={:#x}/size={}/sh={:#x}/regs={}/user={:#x}/specials={:#x}",
+            read_guest_u8(front + SHADER_HEADER_TYPE_OFFSET),
+            read_guest_u64(front + SHADER_HEADER_CODE_OFFSET),
+            read_guest_u32(front + AGC_SHADER_SIZE_OFFSET),
+            read_guest_u64(front + SHADER_HEADER_SH_REGISTERS_OFFSET),
+            read_guest_u8(front + SHADER_HEADER_NUM_SH_REGISTERS_OFFSET),
+            read_guest_u64(front + AGC_SHADER_USER_DATA_OFFSET),
+            read_guest_u64(front + AGC_SHADER_SPECIALS_OFFSET),
+            read_guest_u8(back + SHADER_HEADER_TYPE_OFFSET),
+            read_guest_u64(back + SHADER_HEADER_CODE_OFFSET),
+            read_guest_u32(back + AGC_SHADER_SIZE_OFFSET),
+            read_guest_u64(back + SHADER_HEADER_SH_REGISTERS_OFFSET),
+            read_guest_u8(back + SHADER_HEADER_NUM_SH_REGISTERS_OFFSET),
+            read_guest_u64(back + AGC_SHADER_USER_DATA_OFFSET),
+            read_guest_u64(back + AGC_SHADER_SPECIALS_OFFSET),
+        );
     }
     guest_memcpy(fused, back, SHADER_HEADER_SIZE);
     write_guest_u8(fused + SHADER_HEADER_TYPE_OFFSET, stage);
@@ -11933,6 +12882,18 @@ fn agc_fuse_shader_halves(arguments: [u64; 6]) -> u64 {
                 (previous & 0xffff_ff00) | (low_u32(code >> 40) & 0xff),
             );
         }
+    }
+    if trace_agc_programs() {
+        eprintln!(
+            "[REMu][AGC][FUSE] end fused={fused:#x}/type={}/code={:#x}/size={}/sh={:#x}/regs={}/user={:#x}/specials={:#x}",
+            read_guest_u8(fused + SHADER_HEADER_TYPE_OFFSET),
+            read_guest_u64(fused + SHADER_HEADER_CODE_OFFSET),
+            read_guest_u32(fused + AGC_SHADER_SIZE_OFFSET),
+            read_guest_u64(fused + SHADER_HEADER_SH_REGISTERS_OFFSET),
+            read_guest_u8(fused + SHADER_HEADER_NUM_SH_REGISTERS_OFFSET),
+            read_guest_u64(fused + AGC_SHADER_USER_DATA_OFFSET),
+            read_guest_u64(fused + AGC_SHADER_SPECIALS_OFFSET),
+        );
     }
     0
 }
@@ -12343,17 +13304,66 @@ fn flip_rate_override() -> Option<u64> {
     })
 }
 
+/// Maximum decoded GPU events the guest may run ahead of the presenter at a flip boundary.
+///
+/// A console flip queue is finite. Sleeping only for the nominal vblank interval lets a 60 Hz
+/// guest enqueue minutes of rendering when translation is temporarily slower than real time
+/// (notably during Unreal's first large scene). Intentional black transition frames then remain
+/// visible for the whole queued interval and audio advances far ahead of video. Keep a small
+/// amount of look-ahead for shader prefetch and queue overlap while applying backpressure before
+/// the next guest frame is produced. `0` remains an explicit diagnostic escape hatch.
+fn flip_gpu_event_backlog_limit() -> Option<usize> {
+    static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("REMU_FLIP_GPU_EVENT_BACKLOG")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(Some(64), |value| (value != 0).then_some(value))
+    })
+}
+
+/// Maximum accepted VideoOut flips allowed to wait for host presentation.
+///
+/// Three retains normal double/triple buffering while preventing movie and transition frames from
+/// advancing minutes ahead of a slow translator. `0` disables this diagnostic safety valve.
+fn flip_presentation_backlog_limit() -> Option<usize> {
+    static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("REMU_FLIP_PRESENT_BACKLOG")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(Some(3), |value| (value != 0).then_some(value))
+    })
+}
+
+fn effective_flip_interval_microseconds() -> u64 {
+    match flip_rate_override() {
+        Some(0) => 0,
+        Some(hertz) => 1_000_000 / hertz.max(1),
+        None => VIDEO_OUT_FLIP_INTERVAL.load(Ordering::Relaxed),
+    }
+}
+
+fn av_player_flip_interval_microseconds() -> u64 {
+    let effective = effective_flip_interval_microseconds();
+    if effective != 0 {
+        return effective;
+    }
+    // Disabling host sleep is a presentation/debug option, not permission for AVPlayer to drain
+    // a movie as quickly as its worker can poll. Retain the guest-selected nominal media clock.
+    VIDEO_OUT_FLIP_INTERVAL
+        .load(Ordering::Relaxed)
+        .max(DEFAULT_FLIP_INTERVAL_MICROSECONDS)
+}
+
 /// Holds the submitting thread until its flip is due.
 ///
 /// Without this the guest's frame loop is never gated: flips complete the instant they are
 /// submitted, so a title that advances simulation once per displayed frame runs as fast as the
 /// host can retire draws instead of at the rate it selected.
 fn pace_video_out_flip() {
-    let interval = match flip_rate_override() {
-        Some(0) => return,
-        Some(hertz) => 1_000_000 / hertz.max(1),
-        None => VIDEO_OUT_FLIP_INTERVAL.load(Ordering::Relaxed),
-    };
+    const MAX_BACKPRESSURE_WAIT: Duration = Duration::from_secs(5);
+    let interval = effective_flip_interval_microseconds();
     if interval == 0 {
         return;
     }
@@ -12371,6 +13381,58 @@ fn pace_video_out_flip() {
     let delay = due.saturating_duration_since(now);
     if !delay.is_zero() {
         std::thread::sleep(delay);
+    }
+    if let Some(backlog_limit) = flip_presentation_backlog_limit() {
+        let wait_started = Instant::now();
+        let mut logged = false;
+        while remu_gpu::gpu_flips_pending() > backlog_limit {
+            if !logged {
+                static PRESENT_BACKPRESSURE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let sequence = PRESENT_BACKPRESSURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][VIDEO] presentation backpressure sequence={sequence} queued={} target={backlog_limit}",
+                        remu_gpu::gpu_flips_pending(),
+                    );
+                }
+                logged = true;
+            }
+            if wait_started.elapsed() >= MAX_BACKPRESSURE_WAIT {
+                eprintln!(
+                    "[REMu][VIDEO] presentation backpressure made no progress for {} ms; continuing queued={} target={backlog_limit}",
+                    MAX_BACKPRESSURE_WAIT.as_millis(),
+                    remu_gpu::gpu_flips_pending(),
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    if let Some(backlog_limit) = flip_gpu_event_backlog_limit() {
+        let wait_started = Instant::now();
+        let mut logged = false;
+        while remu_gpu::gpu_work_items_pending() > backlog_limit {
+            if !logged {
+                static WORK_BACKPRESSURE_COUNT: AtomicU64 = AtomicU64::new(0);
+                let sequence = WORK_BACKPRESSURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][VIDEO] work backpressure sequence={sequence} queued={} target={backlog_limit}",
+                        remu_gpu::gpu_work_items_pending(),
+                    );
+                }
+                logged = true;
+            }
+            if wait_started.elapsed() >= MAX_BACKPRESSURE_WAIT {
+                eprintln!(
+                    "[REMu][VIDEO] work backpressure made no progress for {} ms; continuing queued={} target={backlog_limit}",
+                    MAX_BACKPRESSURE_WAIT.as_millis(),
+                    remu_gpu::gpu_work_items_pending(),
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -12390,7 +13452,7 @@ fn video_out_is_flip_pending(arguments: [u64; 6], state: &mut ProbeDispatchState
     if low_i32(arguments[0]) != 1 || !state.video_out.is_open {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
     }
-    0
+    u64::from(!state.pending_video_out_flips.is_empty())
 }
 
 fn video_out_submit_flip(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -12406,6 +13468,13 @@ fn video_out_submit_flip(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_INDEX);
     };
     if index >= state.video_out.display_buffers.len() {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_INDEX);
+    }
+    // Standalone VideoOut clients (including splash and movie presentation) submit flips
+    // directly instead of embedding a flip marker in an AGC command buffer. Publish the same
+    // presenter event used by the ordered AGC path before completing the guest-visible flip.
+    // Without it the guest advances and reuses the buffer while the host window never sees it.
+    if !agc_submit_ordered_video_out_flip(&state.video_out, 1, buffer_index, arguments[3]) {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_INDEX);
     }
     queue_video_out_flip(state, 1, buffer_index, arguments[3]);
@@ -12800,11 +13869,31 @@ fn ampr_get_file_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     0
 }
 
-fn ampr_command_buffer_read_file(
+fn ampr_command_buffer_read_file_ordered(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
+    let order = AMPR_IMPORT_ORDER.get_or_init(|| Mutex::new(()));
+    let dispatch = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
+    ampr_command_buffer_read_file_two_phase_with(
+        order,
+        dispatch,
+        arguments,
+        stack_arguments,
+        ampr_read_file_to_guest,
+    )
+}
+
+fn ampr_command_buffer_read_file_two_phase_with<F>(
+    order: &Mutex<()>,
+    dispatch: &RwLock<ProbeDispatchState>,
     arguments: [u64; 6],
     stack_arguments: [u64; 6],
-    state: &mut ProbeDispatchState,
-) -> u64 {
+    read_file: F,
+) -> u64
+where
+    F: FnOnce(&std::fs::File, u32, u64, u64, u64, usize) -> Result<usize, u64>,
+{
+    let _order = order
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let command_buffer = arguments[0];
     let file_id = low_u32(arguments[3]);
     let destination = arguments[4];
@@ -12813,109 +13902,88 @@ fn ampr_command_buffer_read_file(
     if command_buffer == 0 || (destination == 0 && size != 0) {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(host_path) = state.ampr_files.get(&file_id).cloned() else {
-        eprintln!(
-            "[REMu][AMPR] read rejected unknown file id={file_id:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x} stack={:#x},{:#x} known=[{}]",
-            arguments[0],
-            arguments[1],
-            arguments[2],
-            arguments[3],
-            arguments[4],
-            arguments[5],
-            stack_arguments[0],
-            stack_arguments[1],
-            state
-                .ampr_files
-                .keys()
-                .map(|id| format!("{id:#x}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    let (host_path, cached_file) = {
+        let state = dispatch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(host_path) = state.ampr_files.get(&file_id).cloned() else {
+            eprintln!(
+                "[REMu][AMPR] read rejected unknown file id={file_id:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x} stack={:#x},{:#x} known=[{}]",
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+                arguments[5],
+                stack_arguments[0],
+                stack_arguments[1],
+                state
+                    .ampr_files
+                    .keys()
+                    .map(|id| format!("{id:#x}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+        };
+        (host_path, state.ampr_file_handles.get(&file_id).cloned())
     };
     let Ok(capacity) = usize::try_from(size) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    if !state.ampr_file_handles.contains_key(&file_id) {
-        let file = match std::fs::File::open(&host_path) {
-            Ok(file) => file,
-            Err(error) => {
-                eprintln!(
-                    "[REMu][AMPR] read could not open id={file_id:#x} host={:?}: {error}",
-                    host_path.display()
-                );
-                return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-            }
-        };
-        state.ampr_file_handles.insert(file_id, file);
-    }
-    let file = state
-        .ampr_file_handles
-        .get(&file_id)
-        .expect("AMPR file handle was opened above");
-    let bytes_read = if capacity == 0 {
-        0
-    } else {
-        if !process_guest_range_has_read_access(destination, capacity) {
-            eprintln!(
-                "[REMu][AMPR] read rejected unmapped destination={destination:#x} size={size:#x}"
-            );
-            return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
-        }
-        // A watched guest page is host read-only. macOS pread(2) returns EFAULT instead of
-        // delivering the write-fault signal, and a concurrent resource upload can rearm the page
-        // between an eager mprotect and the syscall. Read into ordinary host storage, then copy
-        // with CPU stores so the write-watch handler dirties each page synchronously.
-        let mut staging = Vec::new();
-        if let Err(error) = staging.try_reserve_exact(capacity) {
-            eprintln!("[REMu][AMPR] could not stage read id={file_id:#x} size={size:#x}: {error}");
-            return sce_kernel_error(SCE_KERNEL_ERROR_OUT_OF_MEMORY);
-        }
-        staging.resize(capacity, 0_u8);
-        let mut total = 0_usize;
-        while total < staging.len() {
-            let Some(offset) = file_offset.checked_add(total as u64) else {
-                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-            };
-            let read = match file.read_at(&mut staging[total..], offset) {
-                Ok(read) => read,
+    let newly_opened = cached_file.is_none();
+    let file = match cached_file {
+        Some(file) => file,
+        None => {
+            let file = match std::fs::File::open(&host_path) {
+                Ok(file) => file,
                 Err(error) => {
                     eprintln!(
-                        "[REMu][AMPR] read failed id={file_id:#x} offset={offset:#x} \
-remaining={:#x} destination={:#x}: {error}",
-                        staging.len() - total,
-                        destination + total as u64
+                        "[REMu][AMPR] read could not open id={file_id:#x} host={:?}: {error}",
+                        host_path.display()
                     );
                     return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
                 }
             };
-            if read == 0 {
-                break;
-            }
-            total += read;
+            Arc::new(file)
         }
-        // SAFETY: the complete guest destination range was validated above. Ordinary CPU stores
-        // enter CpuWriteWatch's signal handler on protected pages before changing their bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(staging.as_ptr(), destination as *mut u8, total);
-        }
-        total
+    };
+
+    // The host read and watched guest-memory copy are the expensive operations. The narrower AMPR
+    // order lock remains held, but PROBE_DISPATCH is deliberately not: unrelated guest imports can
+    // continue while this thread blocks on storage or dirties destination pages.
+    let read_result = read_file(&file, file_id, destination, size, file_offset, capacity);
+
+    let mut state = dispatch
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if newly_opened {
+        state
+            .ampr_file_handles
+            .entry(file_id)
+            .or_insert_with(|| Arc::clone(&file));
+    }
+    let bytes_read = match read_result {
+        Ok(bytes_read) => bytes_read,
+        Err(error) => return error,
     };
     let Some(command) = state.ampr_command_buffers.get_mut(&command_buffer) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    if command.write_offset > command.size || 0x30 > command.size - command.write_offset {
+    if command.write_offset > command.size
+        || AMPR_COMMAND_RECORD_SIZE > command.size - command.write_offset
+    {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let record = command.buffer + command.write_offset;
-    guest_memset(record, 0, 0x30);
+    guest_memset(record, 0, AMPR_COMMAND_RECORD_SIZE);
     write_guest_u32(record, 1);
     write_guest_u32(record + 4, file_id);
     write_guest_u64(record + 8, destination);
     write_guest_u64(record + 0x10, size);
     write_guest_u64(record + 0x18, file_offset);
     write_guest_u64(record + 0x20, u64::try_from(bytes_read).unwrap_or(u64::MAX));
-    command.write_offset += 0x30;
+    command.write_offset += AMPR_COMMAND_RECORD_SIZE;
     command.command_count += 1;
     if trace_ampr_reads() {
         eprintln!(
@@ -12925,6 +13993,66 @@ remaining={:#x} destination={:#x}: {error}",
         );
     }
     0
+}
+
+fn ampr_read_file_to_guest(
+    file: &std::fs::File,
+    file_id: u32,
+    destination: u64,
+    size: u64,
+    file_offset: u64,
+    capacity: usize,
+) -> Result<usize, u64> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    if !process_guest_range_has_read_access(destination, capacity) {
+        eprintln!(
+            "[REMu][AMPR] read rejected unmapped destination={destination:#x} size={size:#x}"
+        );
+        return Err(sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT));
+    }
+    // A watched guest page is host read-only. macOS pread(2) returns EFAULT instead of delivering
+    // the write-fault signal, and a concurrent resource upload can rearm the page between an eager
+    // mprotect and the syscall. Read into ordinary host storage, then copy with CPU stores so the
+    // write-watch handler dirties each page synchronously.
+    let mut staging = AMPR_READ_STAGING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let additional = capacity.saturating_sub(staging.len());
+    if let Err(error) = staging.try_reserve(additional) {
+        eprintln!("[REMu][AMPR] could not stage read id={file_id:#x} size={size:#x}: {error}");
+        return Err(sce_kernel_error(SCE_KERNEL_ERROR_OUT_OF_MEMORY));
+    }
+    staging.resize(capacity, 0_u8);
+    let mut total = 0_usize;
+    while total < staging.len() {
+        let Some(offset) = file_offset.checked_add(total as u64) else {
+            return Err(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        };
+        let read = match file.read_at(&mut staging[total..], offset) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!(
+                    "[REMu][AMPR] read failed id={file_id:#x} offset={offset:#x} \
+remaining={:#x} destination={:#x}: {error}",
+                    staging.len() - total,
+                    destination.saturating_add(total as u64)
+                );
+                return Err(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        total += read;
+    }
+    // SAFETY: the complete guest destination range was validated above. Ordinary CPU stores enter
+    // CpuWriteWatch's signal handler on protected pages before changing their bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(staging.as_ptr(), destination as *mut u8, total);
+    }
+    Ok(total)
 }
 
 fn ampr_submit_command_buffer(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -13174,33 +14302,74 @@ fn queue_video_out_flip(
         return;
     };
     QUEUED_FLIPS.with(|queued| queued.set(queued.get().saturating_add(1)));
-    let event_data = 6 | ((flip_argument & 0x0000_ffff_ffff_ffff) << 16);
-    let registrations = state
-        .video_out
-        .flip_events
-        .iter()
-        .map(|(&equeue, &user_data)| (equeue, user_data))
-        .collect::<Vec<_>>();
-    for (equeue, user_data) in registrations {
-        queue_kernel_event(
-            state,
-            KernelQueuedEvent {
-                equeue,
-                ident: 6,
-                filter: -13,
-                flags: 0,
-                fflags: 0,
-                data: event_data,
-                user_data,
+    state
+        .pending_video_out_flips
+        .push_back(PendingVideoOutFlip {
+            completion: remu_gpu::GpuFlipCompletion {
+                address: display_address,
+                buffer_index,
+                flip_argument,
             },
-        );
-        if trace_logarithmic_sequence(state.agc_submission_count, 8) {
+            handle,
+        });
+}
+
+fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) {
+    let completed = remu_gpu::take_gpu_completed_flips();
+    if completed.is_empty() {
+        return;
+    }
+    let mut queued = false;
+    for completion in completed {
+        let Some(index) = state
+            .pending_video_out_flips
+            .iter()
+            .position(|pending| pending.completion == completion)
+        else {
             eprintln!(
-                "[REMu][VIDEO] queued flip handle={handle} index={buffer_index} address={display_address:#x} equeue={equeue:#x}"
+                "[REMu][VIDEO] ignored unmatched completed flip index={} address={:#x} argument={:#x}",
+                completion.buffer_index, completion.address, completion.flip_argument
             );
+            continue;
+        };
+        let pending = state
+            .pending_video_out_flips
+            .remove(index)
+            .expect("completed flip index was just found");
+        state.video_out.completed_flip_count =
+            state.video_out.completed_flip_count.saturating_add(1);
+        let event_data = 6 | ((pending.completion.flip_argument & 0x0000_ffff_ffff_ffff) << 16);
+        let registrations = state
+            .video_out
+            .flip_events
+            .iter()
+            .map(|(&equeue, &user_data)| (equeue, user_data))
+            .collect::<Vec<_>>();
+        for (equeue, user_data) in registrations {
+            queue_kernel_event(
+                state,
+                KernelQueuedEvent {
+                    equeue,
+                    ident: 6,
+                    filter: -13,
+                    flags: 0,
+                    fflags: 0,
+                    data: event_data,
+                    user_data,
+                },
+            );
+            queued = true;
+            if trace_logarithmic_sequence(state.agc_submission_count, 8) {
+                eprintln!(
+                    "[REMu][VIDEO] completed flip handle={} index={} address={:#x} equeue={equeue:#x}",
+                    pending.handle, pending.completion.buffer_index, pending.completion.address,
+                );
+            }
         }
     }
-    notify_kernel_equeue_waiters();
+    if queued {
+        notify_kernel_equeue_waiters();
+    }
 }
 
 fn queue_agc_event_write(state: &mut ProbeDispatchState, event_type: u32) {
@@ -13232,13 +14401,16 @@ fn request_agc_submission_completion(
     state: &mut ProbeDispatchState,
     queue_id: u64,
     mut events: Vec<remu_gpu::GpuEvent>,
-) {
+) -> bool {
     let sequence = state.agc_submission_count;
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
     if remu_gpu::emit_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
         state
             .pending_agc_completions
             .push_back((sequence, queue_id));
+        true
+    } else {
+        false
     }
 }
 
@@ -13246,15 +14418,18 @@ fn request_agc_compute_submission_completion(
     state: &mut ProbeDispatchState,
     owner: u64,
     mut events: Vec<remu_gpu::GpuEvent>,
-) {
+) -> bool {
     let sequence = state.agc_submission_count;
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
-    // Backend queue zero is reserved for graphics, while the guest-visible AGC queue identity is
-    // the owner itself. Offset only the backend identity and retain the owner for equeue routing.
+    // Backend queue zero is reserved for graphics. Compute completion is delivered exclusively
+    // through the driver-wide AGC user interrupt below; also routing it through the owner's
+    // graphics-filter event makes the guest retire the same ACB/RHI storage twice.
     let queue_id = owner.saturating_add(1);
     if remu_gpu::emit_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
-        state.pending_agc_completions.push_back((sequence, owner));
         state.pending_agc_user_interrupts.push_back(sequence);
+        true
+    } else {
+        false
     }
 }
 
@@ -13388,6 +14563,28 @@ fn agc_apply_submission_registers(
                 );
             }
             destination.insert(register, value);
+        }
+        if trace_agc_registers()
+            && opcode == AGC_IT_SET_CONTEXT_REG
+            && first_register < AGC_SPI_PS_INPUT_CNTL_0 + 32
+            && first_register.saturating_add(length - 2) > AGC_SPI_PS_INPUT_CNTL_0
+        {
+            let first = first_register.max(AGC_SPI_PS_INPUT_CNTL_0);
+            let last = first_register
+                .saturating_add(length - 2)
+                .min(AGC_SPI_PS_INPUT_CNTL_0 + 32);
+            let entries = (first..last)
+                .filter_map(|offset| {
+                    destination
+                        .get(&offset)
+                        .copied()
+                        .map(|value| (offset, value))
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[REMu][AGC][REG] pixel inputs direct packet={packet_address:#x} first={first_register:#x} count={} entries={entries:x?}",
+                length - 2,
+            );
         }
         if (trace_agc_registers() || trace_agc_programs())
             && opcode == AGC_IT_SET_SH_REG
@@ -13531,6 +14728,7 @@ fn agc_apply_indirect_register_table(
     }
     let mut traced_shader_registers = Vec::new();
     let mut traced_raw_registers = Vec::new();
+    let mut traced_pixel_inputs = Vec::new();
     for pair in bytes.chunks_exact(8) {
         let raw_offset = u32::from_le_bytes(pair[..4].try_into().expect("register offset dword"));
         if raw_offset == u32::MAX {
@@ -13562,6 +14760,12 @@ fn agc_apply_indirect_register_table(
         if trace_agc_programs() && opcode == AGC_IT_SET_SH_REG_INDIRECT && register_count <= 32 {
             traced_raw_registers.push((raw_offset, offset, value));
         }
+        if trace_agc_registers()
+            && opcode == AGC_IT_SET_CONTEXT_REG_INDIRECT
+            && (AGC_SPI_PS_INPUT_CNTL_0..AGC_SPI_PS_INPUT_CNTL_0 + 32).contains(&offset)
+        {
+            traced_pixel_inputs.push((raw_offset, offset, value));
+        }
         destination.insert(offset, value);
     }
     if !traced_shader_registers.is_empty() {
@@ -13572,6 +14776,11 @@ fn agc_apply_indirect_register_table(
     if !traced_raw_registers.is_empty() {
         eprintln!(
             "[REMu][AGC][REG] shader indirect raw table={registers_address:#x} count={register_count} entries={traced_raw_registers:x?}"
+        );
+    }
+    if !traced_pixel_inputs.is_empty() {
+        eprintln!(
+            "[REMu][AGC][REG] pixel inputs indirect table={registers_address:#x} count={register_count} entries={traced_pixel_inputs:x?}"
         );
     }
     Ok(())
@@ -13829,20 +15038,28 @@ fn agc_shader_snapshot(
         return Some(snapshot.clone());
     }
     let memory = ProcessGuestMemory;
-    let program = match shaders.code_sizes.get(&address).copied() {
+    let programs = match shaders.code_sizes.get(&address).copied() {
         Some(code_size) => usize::try_from(code_size)
             .map_err(|_| remu_shader::DecodeError::InvalidCodeSize { bytes: usize::MAX })
-            .and_then(|code_size| remu_shader::read_program_bounded(&memory, address, code_size)),
-        None => remu_shader::read_program(&memory, address),
+            .and_then(|code_size| {
+                let leading = remu_shader::read_program_bounded(&memory, address, code_size)?;
+                Ok(
+                    remu_shader::read_program_segments_bounded(&memory, address, code_size)
+                        .unwrap_or_else(|_| vec![leading]),
+                )
+            }),
+        None => remu_shader::read_program(&memory, address).map(|program| vec![program]),
     };
-    let program = match program {
-        Ok(program) => Arc::new(program),
+    let mut programs = match programs {
+        Ok(programs) => programs,
         Err(error) => {
             shaders.decode_failures.insert(address);
             eprintln!("[REMu][AGC][SHADER] decode failed at {address:#x}: {error}");
             return None;
         }
     };
+    let program = Arc::new(programs.remove(0));
+    let supplemental_programs: Arc<[remu_shader::Program]> = programs.into();
     let header_address = shaders.headers.get(&address).copied().unwrap_or_default();
     let metadata = (header_address != 0)
         .then(|| remu_shader::read_shader_metadata(&memory, header_address))
@@ -13853,6 +15070,37 @@ fn agc_shader_snapshot(
         .ok()
         .flatten()
         .map(Arc::new);
+    if !supplemental_programs.is_empty() {
+        static LOGGED_MERGED_PROGRAMS: AtomicUsize = AtomicUsize::new(0);
+        let sequence = LOGGED_MERGED_PROGRAMS.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence <= 64 || sequence.is_power_of_two() {
+            let segments = supplemental_programs
+                .iter()
+                .map(|program| {
+                    (
+                        program.address,
+                        program.instructions.len(),
+                        program
+                            .instructions
+                            .iter()
+                            .filter_map(|instruction| {
+                                let remu_shader::InstructionControl::Export(export) =
+                                    instruction.control.as_ref()?
+                                else {
+                                    return None;
+                                };
+                                Some((export.target, export.enable_mask, export.done))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[REMu][AGC][MERGED-PROGRAM] sequence={sequence} code={address:#x} leading_instructions={} supplemental={segments:x?}",
+                program.instructions.len(),
+            );
+        }
+    }
     if trace_agc_programs() {
         let specials = (header_address != 0)
             .then(|| agc_read_mapped_u64(header_address + AGC_SHADER_SPECIALS_OFFSET))
@@ -13878,13 +15126,35 @@ fn agc_shader_snapshot(
                 )
             })
             .collect::<Vec<_>>();
+        let supplemental = supplemental_programs
+            .iter()
+            .map(|program| {
+                (
+                    program.address,
+                    program.instructions.len(),
+                    program
+                        .instructions
+                        .iter()
+                        .filter_map(|instruction| {
+                            let remu_shader::InstructionControl::Export(export) =
+                                instruction.control.as_ref()?
+                            else {
+                                return None;
+                            };
+                            Some((export.target, export.enable_mask, export.done))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
         eprintln!(
-            "[REMu][AGC][SHADER] decoded code={address:#x} header={header_address:#x} user_data_range={user_data_range:x?} metadata={metadata:x?} prefix={prefix:x?}"
+            "[REMu][AGC][SHADER] decoded code={address:#x} header={header_address:#x} user_data_range={user_data_range:x?} metadata={metadata:x?} supplemental={supplemental:x?} prefix={prefix:x?}"
         );
     }
     let snapshot = remu_gpu::ShaderSnapshot {
         header_address,
         program,
+        supplemental_programs,
         metadata,
     };
     shaders.snapshots.insert(address, snapshot.clone());
@@ -14114,6 +15384,7 @@ fn agc_decode_compute_dispatch(
         },
         &mut graphics.shader_evaluation_cache,
     )
+    .and_then(snapshot_small_readonly_global_bindings)
     .map_err(|reason| AgcComputeDispatchError::ShaderEvaluation {
         address: shader_address,
         reason: format!("{reason}; {}", shader_control_flow_summary(&shader.program)),
@@ -14476,6 +15747,7 @@ fn agc_emit_draw(
         };
     if let Some(evaluation) = export_evaluation {
         draw.export_shader_evaluation = evaluation
+            .and_then(snapshot_small_readonly_global_bindings)
             .map_err(|error| {
                 if graphics
                     .failed_shader_evaluations
@@ -14509,6 +15781,7 @@ fn agc_emit_draw(
     }
     if let Some(evaluation) = pixel_evaluation {
         draw.pixel_shader_evaluation = evaluation
+            .and_then(snapshot_small_readonly_global_bindings)
             .map_err(|error| {
                 if graphics
                     .failed_shader_evaluations
@@ -14677,7 +15950,8 @@ fn agc_emit_draw(
 }
 
 fn shader_control_flow_summary(program: &remu_shader::Program) -> String {
-    let branches = program
+    const MAXIMUM_REPORTED_BRANCHES: usize = 32;
+    let all_branches = program
         .instructions
         .iter()
         .filter(|instruction| instruction.encoding == remu_shader::ShaderEncoding::Sopp)
@@ -14693,8 +15967,14 @@ fn shader_control_flow_summary(program: &remu_shader::Program) -> String {
             format!("{:#x}:{}->{target:#x}", instruction.pc, instruction.opcode)
         })
         .collect::<Vec<_>>();
+    let omitted = all_branches.len().saturating_sub(MAXIMUM_REPORTED_BRANCHES);
+    let branches = all_branches
+        .iter()
+        .take(MAXIMUM_REPORTED_BRANCHES)
+        .cloned()
+        .collect::<Vec<_>>();
     format!(
-        "instructions={} branches=[{}]",
+        "instructions={} branches=[{}] omitted={omitted}",
         program.instructions.len(),
         branches.join(",")
     )
@@ -14727,6 +16007,53 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
                 .join(",")
         })
     });
+    let export_lists = [&draw.export_shader, &draw.pixel_shader].map(|shader| {
+        shader.as_ref().map_or_else(String::new, |shader| {
+            shader
+                .program
+                .instructions
+                .iter()
+                .filter_map(|instruction| {
+                    let remu_shader::InstructionControl::Export(control) =
+                        instruction.control.as_ref()?
+                    else {
+                        return None;
+                    };
+                    Some(format!(
+                        "{:#x}:target={}/mask={:#x}/compressed={}/done={}/valid={}",
+                        instruction.pc,
+                        control.target,
+                        control.enable_mask,
+                        control.compressed,
+                        control.done,
+                        control.valid_mask,
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    });
+    let interpolation_lists = [&draw.export_shader, &draw.pixel_shader].map(|shader| {
+        shader.as_ref().map_or_else(String::new, |shader| {
+            shader
+                .program
+                .instructions
+                .iter()
+                .filter_map(|instruction| {
+                    let remu_shader::InstructionControl::Interpolation(control) =
+                        instruction.control.as_ref()?
+                    else {
+                        return None;
+                    };
+                    Some(format!(
+                        "{:#x}:attr={}/channel={}",
+                        instruction.pc, control.attribute, control.channel
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    });
     let export_user_data_base = export_user_data_register(draw);
     let evaluation_summaries = [
         trace_shader_evaluation(
@@ -14740,7 +16067,7 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
     ];
     let msl_summary = trace_msl_pair(draw, export_user_data_base);
     eprintln!(
-        "[REMu][AGC][SHADER] es={:#x} ps={:#x} es_user_base={export_user_data_base:#x} indexed={} count={} instances={} target={:#x} es_ir={}/{} ps_ir={}/{} es_eval={} ps_eval={} msl={} es_ops=[{}] ps_ops=[{}] es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
+        "[REMu][AGC][SHADER] es={:#x} ps={:#x} es_user_base={export_user_data_base:#x} indexed={} count={} instances={} target={:#x} es_ir={}/{} ps_ir={}/{} es_eval={} ps_eval={} msl={} es_ops=[{}] ps_ops=[{}] es_exports=[{}] ps_exports=[{}] es_interpolations=[{}] ps_interpolations=[{}] es_prefix={:x?} ps_prefix={:x?} cx={:x?} sh={:x?} uc={:x?}",
         draw.export_shader_address,
         draw.pixel_shader_address,
         draw.indexed,
@@ -14756,6 +16083,10 @@ fn trace_agc_shader_draw(draw: &remu_gpu::IndexedDraw) {
         msl_summary,
         opcode_lists[0],
         opcode_lists[1],
+        export_lists[0],
+        export_lists[1],
+        interpolation_lists[0],
+        interpolation_lists[1],
         draw.export_shader_prefix,
         draw.pixel_shader_prefix,
         draw.context_registers,
@@ -14826,6 +16157,42 @@ fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<[u32]>> {
             .collect::<Vec<_>>()
             .into(),
     )
+}
+
+fn snapshot_small_readonly_global_bindings(
+    evaluation: Arc<remu_shader::ShaderEvaluation>,
+) -> Result<Arc<remu_shader::ShaderEvaluation>, String> {
+    const SNAPSHOT_LIMIT: usize = 64 * 1024;
+
+    let requires_snapshot = evaluation.global_memory_bindings.iter().any(|binding| {
+        !binding.writable
+            && binding.data.is_empty()
+            && binding.byte_count <= SNAPSHOT_LIMIT
+            && binding.base_address >= 0x10_000
+    });
+    if !requires_snapshot {
+        return Ok(evaluation);
+    }
+
+    let mut snapshot = (*evaluation).clone();
+    for binding in &mut snapshot.global_memory_bindings {
+        if binding.writable
+            || !binding.data.is_empty()
+            || binding.byte_count > SNAPSHOT_LIMIT
+            || binding.base_address < 0x10_000
+        {
+            continue;
+        }
+        let mut data = vec![0_u8; binding.byte_count];
+        if !ProcessGuestMemory.read(binding.base_address, &mut data) {
+            return Err(format!(
+                "could not snapshot read-only global {:#x}/{} at packet submission",
+                binding.base_address, binding.byte_count
+            ));
+        }
+        binding.data = data;
+    }
+    Ok(Arc::new(snapshot))
 }
 
 fn evaluate_shader_snapshot(
@@ -15028,7 +16395,7 @@ fn trace_msl_pair(draw: &remu_gpu::IndexedDraw, export_user_data_base: u32) -> S
             })
         })
         .collect();
-    let pixel_options = remu_shader_metal::MetalCompileOptions::pixel(
+    let mut pixel_options = remu_shader_metal::MetalCompileOptions::pixel(
         pixel_outputs,
         draw.context_registers
             .iter()
@@ -15039,6 +16406,16 @@ fn trace_msl_pair(draw: &remu_gpu::IndexedDraw, export_user_data_base: u32) -> S
             .find(|register| register.offset == 0x1b4)
             .map_or(0, |register| register.value),
     );
+    pixel_options.pixel_input_controls = std::array::from_fn(|index| {
+        let offset = AGC_SPI_PS_INPUT_CNTL_0
+            + u32::try_from(index).expect("PS input-control index fits u32");
+        let value = draw
+            .context_registers
+            .iter()
+            .find(|register| register.offset == offset)
+            .map_or(offset - AGC_SPI_PS_INPUT_CNTL_0, |register| register.value);
+        remu_shader_metal::PixelInputControl::from_register(value)
+    });
     let pixel = match remu_shader_metal::compile_msl(
         &pixel_snapshot.program,
         &pixel_evaluation,
@@ -15103,8 +16480,11 @@ fn dump_shader_trace(
         draw.export_shader_address, draw.pixel_shader_address
     );
     let ir = format!(
-        "export={:#?}\n\npixel={:#?}\n",
-        export_snapshot.program.instructions, pixel_snapshot.program.instructions
+        "export={:#?}\n\nexport_supplemental={:#?}\n\npixel={:#?}\n\npixel_supplemental={:#?}\n",
+        export_snapshot.program.instructions,
+        export_snapshot.supplemental_programs,
+        pixel_snapshot.program.instructions,
+        pixel_snapshot.supplemental_programs,
     );
     for (suffix, contents) in [
         ("ir.txt", Some(ir.as_str())),
@@ -16354,16 +17734,19 @@ fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
             },
         )
     });
-    for (handle, buffer_index, flip_argument) in flips {
-        queue_video_out_flip(state, handle, buffer_index, flip_argument);
-    }
-    for event_type in event_writes {
-        queue_agc_event_write(state, event_type);
-    }
     match result {
         Ok(()) => {
             agc_command_abi::track_graphics_submission(command_address, dword_count);
-            request_agc_submission_completion(state, 0, gpu_events);
+            if !request_agc_submission_completion(state, 0, gpu_events) {
+                eprintln!("[REMu][AGC] rejected DCB submission: presenter is unavailable");
+                return u64::MAX;
+            }
+            for (handle, buffer_index, flip_argument) in flips {
+                queue_video_out_flip(state, handle, buffer_index, flip_argument);
+            }
+            for event_type in event_writes {
+                queue_agc_event_write(state, event_type);
+            }
             0
         }
         Err(error) => {
@@ -16401,16 +17784,21 @@ fn agc_driver_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
                     },
                 )
             });
-            for (handle, buffer_index, flip_argument) in flips {
-                queue_video_out_flip(state, handle, buffer_index, flip_argument);
-            }
-            for event_type in event_writes {
-                queue_agc_event_write(state, event_type);
-            }
             match result {
                 Ok(()) => {
                     agc_command_abi::track_graphics_submission(command_address, dword_count);
-                    request_agc_submission_completion(state, 0, gpu_events);
+                    if !request_agc_submission_completion(state, 0, gpu_events) {
+                        eprintln!(
+                            "[REMu][AGC] rejected DCB {index} in multi-submission: presenter is unavailable"
+                        );
+                        return u64::MAX;
+                    }
+                    for (handle, buffer_index, flip_argument) in flips {
+                        queue_video_out_flip(state, handle, buffer_index, flip_argument);
+                    }
+                    for event_type in event_writes {
+                        queue_agc_event_write(state, event_type);
+                    }
                 }
                 Err(error) => {
                     eprintln!("[REMu][AGC] rejected DCB {index} in multi-submission: {error}");
@@ -16506,12 +17894,6 @@ fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
             &mut event_writes,
         )
     });
-    for (handle, buffer_index, flip_argument) in flips {
-        queue_video_out_flip(state, handle, buffer_index, flip_argument);
-    }
-    for event_type in event_writes {
-        queue_agc_event_write(state, event_type);
-    }
     match result {
         Ok(()) => {
             // The native driver asks the compute backend to trigger an interrupt when the
@@ -16519,7 +17901,18 @@ fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
             // flush/completion point, so every accepted ACB needs one just like a DCB does.
             // Without it, the last compute batch remains open and the guest waits forever for
             // the queue completion before it can submit the next frame.
-            request_agc_compute_submission_completion(state, u64::from(owner), gpu_events);
+            if !request_agc_compute_submission_completion(state, u64::from(owner), gpu_events) {
+                eprintln!(
+                    "[REMu][AGC] rejected ACB submission for owner {owner}: presenter is unavailable"
+                );
+                return u64::MAX;
+            }
+            for (handle, buffer_index, flip_argument) in flips {
+                queue_video_out_flip(state, handle, buffer_index, flip_argument);
+            }
+            for event_type in event_writes {
+                queue_agc_event_write(state, event_type);
+            }
             0
         }
         Err(error) => {
@@ -16555,15 +17948,20 @@ fn agc_driver_submit_multi_acbs(arguments: [u64; 6], state: &mut ProbeDispatchSt
                 &mut event_writes,
             )
         });
-        for (handle, buffer_index, flip_argument) in flips {
-            queue_video_out_flip(state, handle, buffer_index, flip_argument);
-        }
-        for event_type in event_writes {
-            queue_agc_event_write(state, event_type);
-        }
         match result {
             Ok(()) => {
-                request_agc_compute_submission_completion(state, u64::from(owner), gpu_events)
+                if !request_agc_compute_submission_completion(state, u64::from(owner), gpu_events) {
+                    eprintln!(
+                        "[REMu][AGC] rejected ACB {index} for owner {owner}: presenter is unavailable"
+                    );
+                    return u64::MAX;
+                }
+                for (handle, buffer_index, flip_argument) in flips {
+                    queue_video_out_flip(state, handle, buffer_index, flip_argument);
+                }
+                for event_type in event_writes {
+                    queue_agc_event_write(state, event_type);
+                }
             }
             Err(error) => {
                 eprintln!(
@@ -19206,6 +20604,8 @@ fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64
             video_buffer_stride: 0,
             next_video_buffer: 0,
             next_video_frame: 0,
+            video_clock_origin: None,
+            video_catch_up_origin: None,
             audio_decoder: None,
             audio_output: None,
             raw_audio_frame: Vec::new(),
@@ -19273,7 +20673,7 @@ fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallback>) {
     }
 }
 
-fn prepare_av_player_video_buffers(handle: u64) {
+fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
     let Some(dispatch) = PROBE_DISPATCH.get() else {
         return;
     };
@@ -19291,7 +20691,7 @@ fn prepare_av_player_video_buffers(handle: u64) {
         {
             return;
         }
-        let Some((_, stride)) = av_player_nv12_layout(player.width, player.height) else {
+        let Some((_, stride)) = av_player_nv12_layout(player.width, player.height, extended) else {
             return;
         };
         (
@@ -19496,23 +20896,28 @@ fn av_player_finish_stream(player: &mut AvPlayerInstance) {
     }
 }
 
-fn av_player_nv12_layout(width: u32, height: u32) -> Option<(usize, usize)> {
+fn av_player_nv12_layout(width: u32, height: u32, extended: bool) -> Option<(usize, usize)> {
     let width = usize::try_from(width).ok()?;
     let height = usize::try_from(height).ok()?;
-    let row_pitch = width.checked_add(63)? & !63;
-    let aligned_height = height.checked_add(15)? & !15;
+    // The Gen5 extended ABI exposes a 256-byte-aligned pitch and the visible height. Legacy
+    // frame info has no explicit pitch and therefore uses its 16-pixel-aligned dimensions.
+    let (row_pitch, storage_height) = if extended {
+        (width.checked_add(255)? & !255, height)
+    } else {
+        (width.checked_add(15)? & !15, height.checked_add(15)? & !15)
+    };
     let frame_bytes = row_pitch
-        .checked_mul(aligned_height)?
+        .checked_mul(storage_height)?
         .checked_mul(3)?
         .checked_div(2)?;
     Some((row_pitch, frame_bytes))
 }
 
-fn av_player_ensure_video_buffers(player: &mut AvPlayerInstance) -> bool {
+fn av_player_ensure_video_buffers(player: &mut AvPlayerInstance, extended: bool) -> bool {
     if player.video_buffers[0] != 0 {
         return true;
     }
-    let Some((_, stride)) = av_player_nv12_layout(player.width, player.height) else {
+    let Some((_, stride)) = av_player_nv12_layout(player.width, player.height, extended) else {
         return false;
     };
     let Some(total) = stride
@@ -19553,10 +20958,12 @@ fn av_player_write_video_frame(
     timestamp_milliseconds: u64,
     extended: bool,
 ) -> bool {
-    if !av_player_ensure_video_buffers(player) {
+    if !av_player_ensure_video_buffers(player, extended) {
         return false;
     }
-    let Some((row_pitch, frame_bytes)) = av_player_nv12_layout(player.width, player.height) else {
+    let Some((row_pitch, frame_bytes)) =
+        av_player_nv12_layout(player.width, player.height, extended)
+    else {
         return false;
     };
     if player.video_buffer_stride < frame_bytes {
@@ -19564,8 +20971,11 @@ fn av_player_write_video_frame(
     }
     let width = usize::try_from(player.width).unwrap_or(0);
     let height = usize::try_from(player.height).unwrap_or(0);
-    let aligned_width = width.saturating_add(15) & !15;
-    let aligned_height = height.saturating_add(15) & !15;
+    let storage_height = if extended {
+        height
+    } else {
+        height.saturating_add(15) & !15
+    };
     let frame = if row_pitch == width {
         &player.raw_video_frame
     } else {
@@ -19578,7 +20988,7 @@ fn av_player_write_video_frame(
                 .copy_from_slice(&player.raw_video_frame[source..source + width]);
         }
         let source_chroma = width * height;
-        let destination_chroma = row_pitch * aligned_height;
+        let destination_chroma = row_pitch * storage_height;
         for row in 0..height.div_ceil(2) {
             let source = source_chroma + row * width;
             let destination = destination_chroma + row * row_pitch;
@@ -19591,35 +21001,134 @@ fn av_player_write_video_frame(
     player.next_video_buffer = (player.next_video_buffer + 1) % 3;
     // SAFETY: the destination is one complete slice of the dedicated three-frame allocation.
     unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), address as *mut u8, frame.len()) };
+    av_player_write_video_frame_info(
+        output,
+        address,
+        timestamp_milliseconds,
+        player.width,
+        player.height,
+        row_pitch,
+        player.frames_per_second,
+        extended,
+    );
+    true
+}
+
+fn av_player_write_video_frame_info(
+    output: u64,
+    address: u64,
+    timestamp_milliseconds: u64,
+    width: u32,
+    height: u32,
+    row_pitch: usize,
+    frames_per_second: f64,
+    extended: bool,
+) {
+    let visible_width = usize::try_from(width).unwrap_or(0);
+    let visible_height = usize::try_from(height).unwrap_or(0);
+    let output_width = if extended {
+        row_pitch
+    } else {
+        visible_width.saturating_add(15) & !15
+    };
+    let output_height = if extended {
+        visible_height
+    } else {
+        visible_height.saturating_add(15) & !15
+    };
     guest_memset(output, 0, if extended { 104 } else { 40 });
     write_guest_u64(output, address);
     write_guest_u64(output + 16, timestamp_milliseconds);
-    write_guest_u32(
-        output + 24,
-        u32::try_from(aligned_width).unwrap_or(player.width),
-    );
-    write_guest_u32(
-        output + 28,
-        u32::try_from(aligned_height).unwrap_or(player.height),
-    );
+    write_guest_u32(output + 24, u32::try_from(output_width).unwrap_or(width));
+    write_guest_u32(output + 28, u32::try_from(output_height).unwrap_or(height));
     write_guest_u32(output + 32, 1.0_f32.to_bits());
     if extended {
-        write_guest_u32(
-            output + 60,
-            u32::try_from(row_pitch).unwrap_or(player.width),
-        );
+        write_guest_u32(output + 60, u32::try_from(row_pitch).unwrap_or(width));
         write_guest_u8(output + 64, 8);
         write_guest_u8(output + 65, 8);
+        // Silent Hill consumes the PS4-compatible 104-byte Gen5 VideoFrameInfoEx prefix. Crop
+        // fields are left, right, top, bottom at +44/+48/+52/+56 respectively; writing padding
+        // into left/top shifts the visible image even though its final extent happens to match.
         write_guest_u32(
-            output + 44,
-            u32::try_from(row_pitch.saturating_sub(width)).unwrap_or(0),
+            output + 48,
+            u32::try_from(row_pitch.saturating_sub(visible_width)).unwrap_or(0),
         );
         write_guest_u32(
-            output + 52,
-            u32::try_from(aligned_height.saturating_sub(height)).unwrap_or(0),
+            output + 56,
+            u32::try_from(output_height.saturating_sub(visible_height)).unwrap_or(0),
         );
+        // Gen5 replaces the legacy integer frame-rate field with a double in the extended tail.
+        write_guest_u64(output + 0x48, frames_per_second.to_bits());
     }
-    true
+}
+
+fn av_player_video_frame_is_due(
+    video_clock_origin: &mut Option<(u64, u64)>,
+    next_video_frame: u64,
+    frames_per_second: f64,
+    completed_flip_count: u64,
+    flip_interval_microseconds: u64,
+) -> bool {
+    if flip_interval_microseconds == 0 {
+        return true;
+    }
+    let (origin_flip, origin_frame) =
+        *video_clock_origin.get_or_insert((completed_flip_count, next_video_frame));
+    let retired_flips = completed_flip_count.saturating_sub(origin_flip);
+    let frame_delta = next_video_frame.saturating_sub(origin_frame);
+    let frame_due_microseconds =
+        ((frame_delta as f64) * 1_000_000.0 / frames_per_second.max(1.0)).round() as u64;
+    // Select the video frame nearest the completed display vblank. The half-vblank tolerance
+    // gives a 29.97 fps movie the expected two-flip cadence on a nominal 60 Hz output.
+    let media_clock_microseconds = retired_flips
+        .saturating_mul(flip_interval_microseconds)
+        .saturating_add(flip_interval_microseconds / 2);
+    frame_due_microseconds <= media_clock_microseconds
+}
+
+fn av_player_video_catch_up_target(
+    origin: Option<(Instant, u64)>,
+    next_video_frame: u64,
+    frames_per_second: f64,
+    duration: Duration,
+    frame_bytes: usize,
+    now: Instant,
+) -> u64 {
+    let Some((origin_time, origin_frame)) = origin else {
+        // Always expose the first frame. Establishing the catch-up clock before this point made a
+        // slow first emulated draw skip an entire short movie without showing any splash frame.
+        return next_video_frame;
+    };
+    let elapsed_frames = (now.saturating_duration_since(origin_time).as_secs_f64()
+        * frames_per_second.max(1.0))
+    .floor() as u64;
+    let mut target = origin_frame.saturating_add(elapsed_frames);
+    if !duration.is_zero() {
+        let total_frames = (duration.as_secs_f64() * frames_per_second.max(1.0)).ceil() as u64;
+        target = target.min(total_frames.saturating_sub(1));
+    }
+
+    // Sequentially draining ffmpeg preserves decoder state and exact frame ordering. Bound the
+    // work by bytes as well as frames so a tiny UI movie can catch up promptly without one poll
+    // reading hundreds of MiB from a 4K stream.
+    const MAXIMUM_CATCH_UP_BYTES: usize = 64 * 1_024 * 1_024;
+    const MAXIMUM_CATCH_UP_FRAMES: u64 = 120;
+    let byte_limited_frames = if frame_bytes == 0 {
+        1
+    } else {
+        u64::try_from(MAXIMUM_CATCH_UP_BYTES / frame_bytes)
+            .unwrap_or(MAXIMUM_CATCH_UP_FRAMES)
+            .max(1)
+    };
+    let maximum_skip = byte_limited_frames.min(MAXIMUM_CATCH_UP_FRAMES);
+    target.min(next_video_frame.saturating_add(maximum_skip))
+}
+
+fn av_player_wall_clock_catch_up_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_AVPLAYER_WALL_CLOCK_CATCH_UP").is_some_and(|value| value == "1")
+    })
 }
 
 fn av_player_close(handle: u64, state: &mut ProbeDispatchState) -> u64 {
@@ -19654,6 +21163,8 @@ fn av_player_pause(handle: u64, state: &mut ProbeDispatchState) -> u64 {
         player.elapsed += started.elapsed();
     }
     player.paused = true;
+    player.video_clock_origin = None;
+    player.video_catch_up_origin = None;
     let callback = (player.event_callback, player.event_object);
     av_player_queue_event(callback.0, callback.1, 4, state);
     0
@@ -19668,6 +21179,8 @@ fn av_player_start(handle: u64, state: &mut ProbeDispatchState) -> u64 {
     }
     player.paused = false;
     player.end_of_stream = false;
+    player.video_clock_origin = None;
+    player.video_catch_up_origin = None;
     player.playing_since.get_or_insert_with(Instant::now);
     let callback = (player.event_callback, player.event_object);
     eprintln!("[REMu][AVPLAYER] started handle={handle:#x}");
@@ -19682,6 +21195,8 @@ fn av_player_jump_to_time(arguments: [u64; 6], state: &mut ProbeDispatchState) -
     player.stop_decoders();
     player.elapsed = Duration::from_millis(arguments[1]);
     player.next_video_frame = (player.elapsed.as_secs_f64() * player.frames_per_second) as u64;
+    player.video_clock_origin = None;
+    player.video_catch_up_origin = None;
     player.next_audio_frame = u64::try_from(player.elapsed.as_millis())
         .unwrap_or(u64::MAX)
         .saturating_mul(48_000)
@@ -19716,6 +21231,8 @@ fn av_player_get_video_data(
     extended: bool,
     state: &mut ProbeDispatchState,
 ) -> u64 {
+    let completed_flip_count = state.video_out.completed_flip_count;
+    let flip_interval_microseconds = av_player_flip_interval_microseconds();
     let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
         return 0;
     };
@@ -19727,9 +21244,49 @@ fn av_player_get_video_data(
     {
         return 0;
     }
-    // Delivery is intentionally frame-sequential. Using host wall time here made a slow first
-    // emulated frame discard an entire short movie while catching up, so the game received EOF
-    // without ever seeing its intro or splash frame.
+    if !av_player_video_frame_is_due(
+        &mut player.video_clock_origin,
+        player.next_video_frame,
+        player.frames_per_second,
+        completed_flip_count,
+        flip_interval_microseconds,
+    ) {
+        return 0;
+    }
+    // Completed VideoOut flips are the emulated media clock. Wall-clock catch-up is useful only
+    // when translation already sustains realtime; below that rate it discarded nearly every
+    // Silent Hill splash/movie frame while audio and guest time continued ahead. Keep it as an
+    // explicit diagnostic option rather than the correctness default.
+    let catch_up_target = if av_player_wall_clock_catch_up_enabled() {
+        av_player_video_catch_up_target(
+            player.video_catch_up_origin,
+            player.next_video_frame,
+            player.frames_per_second,
+            player.duration,
+            player.raw_video_frame.len(),
+            Instant::now(),
+        )
+    } else {
+        player.next_video_frame
+    };
+    let skipped_frames = catch_up_target.saturating_sub(player.next_video_frame);
+    for _ in 0..skipped_frames {
+        if !av_player_read_video_frame(player) {
+            av_player_finish_stream(player);
+            return 0;
+        }
+        player.next_video_frame = player.next_video_frame.saturating_add(1);
+    }
+    if skipped_frames != 0 {
+        // Re-anchor completed-flip pacing at the frame the wall clock selected. Otherwise the
+        // original frame delta would unnecessarily stall after a legitimate catch-up jump.
+        player.video_clock_origin = Some((completed_flip_count, player.next_video_frame));
+        eprintln!(
+            "[REMu][AVPLAYER] caught up {skipped_frames} frames to frame={} wall_ms={}",
+            player.next_video_frame,
+            player.playback_elapsed().as_millis()
+        );
+    }
     if !av_player_read_video_frame(player) {
         av_player_finish_stream(player);
         return 0;
@@ -19738,6 +21295,9 @@ fn av_player_get_video_data(
         .round() as u64;
     player.next_video_frame = player.next_video_frame.saturating_add(1);
     if av_player_write_video_frame(player, arguments[1], timestamp, extended) {
+        player
+            .video_catch_up_origin
+            .get_or_insert((Instant::now(), player.next_video_frame));
         if player.next_video_frame <= 4 || player.next_video_frame.is_power_of_two() {
             eprintln!(
                 "[REMu][AVPLAYER] video frame={} timestamp_ms={timestamp} extended={extended}",
@@ -19819,6 +21379,41 @@ fn av_player_validate_handle(handle: u64, state: &ProbeDispatchState) -> u64 {
     }
 }
 
+// Silent Hill's Gen5 Unreal media player consumes the same zero-based stream discriminator as
+// the public AvPlayer ABI: video=0, audio=1, timed text=2. Returning one-based values makes Unreal
+// classify its only video stream as audio and call GetAudioData forever, leaving the movie black.
+const AV_PLAYER_STREAM_TYPE_VIDEO: u32 = 0;
+const AV_PLAYER_STREAM_TYPE_AUDIO: u32 = 1;
+const AV_PLAYER_STREAM_INFO_SIZE: u64 = 32;
+
+fn av_player_write_stream_info(
+    output: u64,
+    stream_index: u64,
+    width: u32,
+    height: u32,
+    duration: Duration,
+) {
+    guest_memset(output, 0, AV_PLAYER_STREAM_INFO_SIZE);
+    let stream_type = if stream_index == 0 {
+        AV_PLAYER_STREAM_TYPE_VIDEO
+    } else {
+        AV_PLAYER_STREAM_TYPE_AUDIO
+    };
+    write_guest_u32(output, stream_type);
+    if stream_type == AV_PLAYER_STREAM_TYPE_VIDEO {
+        write_guest_u32(output + 8, width.saturating_add(15) & !15);
+        write_guest_u32(output + 12, height.saturating_add(15) & !15);
+        write_guest_u32(output + 16, ((width as f32) / (height as f32)).to_bits());
+    } else {
+        write_guest_u16(output + 8, 2);
+        write_guest_u32(output + 12, 48_000);
+    }
+    write_guest_u64(
+        output + 24,
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+    );
+}
+
 fn av_player_get_stream_info(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     let Some(player) = state.av_player.players.get(&arguments[0]) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
@@ -19830,26 +21425,22 @@ fn av_player_get_stream_info(arguments: [u64; 6], state: &ProbeDispatchState) ->
     {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     }
-    // Gen5's non-Ex stream-info structure is 32 bytes and omits the PS4 start-time tail.
-    // Silent Hill places exactly 32 bytes before its stack canary.
-    guest_memset(arguments[2], 0, 32);
-    // Gen5 stream kinds are one-based (video=1, audio=2, timed text=3). The PS4 ABI is
-    // zero-based; returning that layout made Unreal discard the only video stream as unknown.
-    write_guest_u32(arguments[2], low_u32(arguments[1]).saturating_add(1));
-    if arguments[1] == 0 {
-        write_guest_u32(arguments[2] + 8, player.width.saturating_add(15) & !15);
-        write_guest_u32(arguments[2] + 12, player.height.saturating_add(15) & !15);
-        write_guest_u32(
-            arguments[2] + 16,
-            ((player.width as f32) / (player.height as f32)).to_bits(),
-        );
-    } else {
-        write_guest_u16(arguments[2] + 8, 2);
-        write_guest_u32(arguments[2] + 12, 48_000);
-    }
-    write_guest_u64(
-        arguments[2] + 24,
-        u64::try_from(player.duration.as_millis()).unwrap_or(u64::MAX),
+    // Gen5's stream-info structure is 32 bytes and omits the PS4 start-time tail.
+    av_player_write_stream_info(
+        arguments[2],
+        arguments[1],
+        player.width,
+        player.height,
+        player.duration,
+    );
+    eprintln!(
+        "[REMu][AVPLAYER] stream info handle={:#x} index={} type={} {}x{} duration_ms={}",
+        arguments[0],
+        arguments[1],
+        if arguments[1] == 0 { "video" } else { "audio" },
+        player.width,
+        player.height,
+        player.duration.as_millis(),
     );
     0
 }
@@ -20918,6 +22509,134 @@ fn guest_fopen(path_address: u64, mode_address: u64, state: &ProbeDispatchState)
     file as usize as u64
 }
 
+const APP_PATH_CACHE_CAPACITY: usize = 65_536;
+
+#[derive(Debug, Default)]
+struct ImmutableDirectoryIndex {
+    exact: HashMap<String, PathBuf>,
+    folded: HashMap<String, PathBuf>,
+}
+
+impl ImmutableDirectoryIndex {
+    fn read(parent: &Path) -> Self {
+        let mut index = Self::default();
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return index;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            let path = entry.path();
+            index
+                .folded
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| path.clone());
+            index.exact.insert(name, path);
+        }
+        index
+    }
+
+    fn get(&self, component: &str) -> Option<PathBuf> {
+        self.exact
+            .get(component)
+            .or_else(|| self.folded.get(&component.to_ascii_lowercase()))
+            .cloned()
+    }
+
+    fn entry_count(&self) -> usize {
+        self.exact.len().saturating_add(self.folded.len())
+    }
+}
+
+#[derive(Debug, Default)]
+struct ImmutableAppPathCache {
+    roots: HashMap<PathBuf, HashMap<String, PathBuf>>,
+    directories: HashMap<PathBuf, ImmutableDirectoryIndex>,
+    entries: usize,
+}
+
+impl ImmutableAppPathCache {
+    fn get(&self, game_root: &Path, relative: &str) -> Option<PathBuf> {
+        self.roots.get(game_root)?.get(relative).cloned()
+    }
+
+    fn insert(&mut self, game_root: &Path, relative: &str, resolved: PathBuf) {
+        if self.entries >= APP_PATH_CACHE_CAPACITY {
+            self.roots.clear();
+            self.entries = 0;
+        }
+        let previous = self
+            .roots
+            .entry(game_root.to_owned())
+            .or_default()
+            .insert(relative.to_owned(), resolved);
+        if previous.is_none() {
+            self.entries += 1;
+        }
+    }
+
+    fn directory_entry(&self, parent: &Path, component: &str) -> Option<Option<PathBuf>> {
+        self.directories
+            .get(parent)
+            .map(|directory| directory.get(component))
+    }
+
+    fn insert_directory(&mut self, parent: PathBuf, directory: ImmutableDirectoryIndex) {
+        let new_entries = directory.entry_count();
+        if self.entries.saturating_add(new_entries) >= APP_PATH_CACHE_CAPACITY {
+            self.roots.clear();
+            self.directories.clear();
+            self.entries = 0;
+        }
+        if let Some(previous) = self.directories.insert(parent, directory) {
+            self.entries = self.entries.saturating_sub(previous.entry_count());
+        }
+        self.entries = self.entries.saturating_add(new_entries);
+    }
+}
+
+fn resolve_immutable_app_path(
+    root: &Path,
+    relative: &str,
+    cache: &RwLock<ImmutableAppPathCache>,
+) -> Option<PathBuf> {
+    let mut components: Vec<&str> = Vec::new();
+    for component in relative.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            component => components.push(component),
+        }
+    }
+
+    let mut host = root.to_owned();
+    for component in components {
+        let cached = cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .directory_entry(&host, component);
+        match cached {
+            Some(Some(matched)) => {
+                host = matched;
+            }
+            Some(None) => host.push(component),
+            None => {
+                let directory = ImmutableDirectoryIndex::read(&host);
+                let matched = directory.get(component);
+                cache
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert_directory(host.clone(), directory);
+                host = matched.unwrap_or_else(|| host.join(component));
+            }
+        }
+    }
+    Some(host)
+}
+
 fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<PathBuf> {
     let normalized = guest_path.replace('\\', "/");
     let relative = if let Some(path) = normalized.strip_prefix("/app0/") {
@@ -20931,7 +22650,26 @@ fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<PathBuf> {
     } else {
         normalized.as_str()
     };
-    resolve_path_beneath(game_root, relative)
+    // `/app0` is immutable for the lifetime of a title. Unreal repeatedly probes the same
+    // optional configuration and localization paths, and resolving each miss used to repeat an
+    // `exists` syscall for every component plus a `read_dir` scan for every case-insensitive
+    // fallback. Cache the resolved host spelling (including paths that ultimately do not exist)
+    // so subsequent stat/open calls perform only their authoritative final syscall.
+    static APP_PATH_CACHE: OnceLock<RwLock<ImmutableAppPathCache>> = OnceLock::new();
+    let cache = APP_PATH_CACHE.get_or_init(|| RwLock::new(ImmutableAppPathCache::default()));
+    if let Some(path) = cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(game_root, relative)
+    {
+        return Some(path);
+    }
+    let resolved = resolve_immutable_app_path(game_root, relative, cache)?;
+    let mut cache = cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(game_root, relative, resolved.clone());
+    Some(resolved)
 }
 
 /// Returns a host file that stands in for a guest path, if an overlay directory supplies one.
@@ -22013,11 +23751,21 @@ fn probe_entry(
         argument1: 0,
         argument2: 0,
     };
+    let unwind_registration_started = Instant::now();
     let registered_fdes = register_guest_unwind_frames(image)?;
     if registered_fdes != 0 {
-        eprintln!("[REMu][CXX] registered {registered_fdes} guest unwind records");
+        eprintln!(
+            "[REMu][CXX] registered {registered_fdes} guest unwind records from {} sections in {:.3}s",
+            image
+                .unwind_modules
+                .iter()
+                .filter(|module| module.eh_frame != 0 && module.eh_frame_size != 0)
+                .count(),
+            unwind_registration_started.elapsed().as_secs_f64(),
+        );
     }
     configure_probe_dispatch(image, game_root, maximum_import_hits);
+    trace_linked_guest_code(image);
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     invoke_guest_module_initializers(&image.module_initializers, 0, 0);
     if timeout_seconds != 0 {
@@ -22119,9 +23867,9 @@ fn terminate_probe(code: i32) -> ! {
 #[cfg(test)]
 mod platform_independent_tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock, mpsc};
     use std::time::{Duration, Instant};
 
     use super::AprResolveOutputs;
@@ -22168,8 +23916,8 @@ mod platform_independent_tests {
         save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
         save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
         system_service_param_get_int, take_exit_callbacks, tls_dtv_entry_offset,
-        unix_days_from_civil, video_out_open, write_guest_u8, write_guest_u16, write_guest_u32,
-        write_guest_u64, write_import_stub,
+        unix_days_from_civil, video_out_open, video_out_submit_flip, write_guest_u8,
+        write_guest_u16, write_guest_u32, write_guest_u64, write_import_stub,
     };
     use super::{
         AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET, AGC_SHADER_INPUT_SEMANTICS_OFFSET,
@@ -22242,6 +23990,17 @@ mod platform_independent_tests {
             0
         );
         context
+    }
+
+    fn create_ampr_test_file(contents: &[u8]) -> PathBuf {
+        static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "remu-ampr-read-{}-{sequence}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("create AMPR test file");
+        path
     }
 
     fn create_audio_out2_test_port(context: u64, port_type: u16, data_format: u32) -> u64 {
@@ -22764,7 +24523,7 @@ mod platform_independent_tests {
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            [(41, 0), (42, 32)]
+            [(41, 0)]
         );
         assert_eq!(
             state
@@ -22899,7 +24658,7 @@ mod platform_independent_tests {
     }
 
     #[test]
-    fn routes_completed_compute_submissions_to_the_owner_and_user_interrupt() {
+    fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
         let _serial = GPU_EVENT_SINK_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -22926,7 +24685,6 @@ mod platform_independent_tests {
             ),
             0
         );
-        state.pending_agc_completions.push_back((sequence, 0x20));
         state.pending_agc_user_interrupts.push_back(sequence);
         remu_gpu::record_gpu_submission_completed(sequence);
 
@@ -22934,25 +24692,19 @@ mod platform_independent_tests {
 
         assert!(state.pending_agc_completions.is_empty());
         assert!(state.pending_agc_user_interrupts.is_empty());
-        assert_eq!(state.pending_events.len(), 2);
-        let queue_event = state
-            .pending_events
-            .iter()
-            .find(|event| event.filter == super::KERNEL_EVENT_FILTER_GRAPHICS)
-            .expect("compute owner completion");
-        assert_eq!(queue_event.equeue, 2);
-        assert_eq!(queue_event.ident, 0x20);
-        assert_eq!(queue_event.fflags, 1);
-        assert_eq!(queue_event.user_data, 0xcafe_babe);
-        let user_event = state
-            .pending_events
-            .iter()
-            .find(|event| event.filter == super::KERNEL_EVENT_FILTER_USER)
-            .expect("AGC user interrupt");
+        assert_eq!(state.pending_events.len(), 1);
+        let user_event = state.pending_events.front().expect("AGC user interrupt");
         assert_eq!(user_event.equeue, 1);
         assert_eq!(user_event.ident, 0x1800);
         assert_eq!(user_event.fflags, 1);
         assert_eq!(user_event.user_data, 0xfeed_face);
+        assert!(
+            state
+                .pending_events
+                .iter()
+                .all(|event| event.filter != super::KERNEL_EVENT_FILTER_GRAPHICS),
+            "compute completion must not also wake the owner's graphics event"
+        );
     }
 
     fn compute_graphics_state(program_address: u64) -> (AgcGraphicsState, AgcShaderRegistry) {
@@ -22984,6 +24736,7 @@ mod platform_independent_tests {
             remu_gpu::ShaderSnapshot {
                 header_address: 0,
                 program: Arc::new(remu_shader::Program::new(program_address, Vec::new())),
+                supplemental_programs: Arc::from([]),
                 metadata: None,
             },
         );
@@ -23032,6 +24785,7 @@ mod platform_independent_tests {
             pixel_shader: Some(remu_gpu::ShaderSnapshot {
                 header_address: 0,
                 program: Arc::new(pixel_program),
+                supplemental_programs: Arc::from([]),
                 metadata: None,
             }),
             export_shader_evaluation: None,
@@ -23062,6 +24816,59 @@ mod platform_independent_tests {
             })],
             ..VideoOutState::default()
         }
+    }
+
+    #[test]
+    fn direct_video_out_submit_flip_reaches_the_presenter() {
+        let _event_guard = GPU_EVENT_SINK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let address = 0x0070_1234_5600_u64;
+        let mut state = ProbeDispatchState {
+            video_out: targetless_scanout_test_video(address),
+            ..ProbeDispatchState::default()
+        };
+        let (sender, receiver) = remu_gpu::gpu_event_channel();
+        remu_gpu::install_event_sink(sender);
+
+        let result = video_out_submit_flip([1, 0, 0, 0x1234, 0, 0], &mut state);
+        super::QUEUED_FLIPS.with(|queued| queued.set(0));
+
+        assert_eq!(result, 0);
+        assert_eq!(remu_gpu::gpu_flips_pending(), 1);
+        let remu_gpu::GpuEvent::Flip {
+            address: flipped_address,
+            buffer_index,
+            flip_argument,
+            width,
+            height,
+            ..
+        } = receiver.recv().expect("direct VideoOut flip event")
+        else {
+            panic!("direct VideoOut submission must emit a presenter flip");
+        };
+        assert_eq!(flipped_address, address);
+        assert_eq!(buffer_index, 0);
+        assert_eq!(flip_argument, 0x1234);
+        assert_eq!((width, height), (1_280, 720));
+        assert_eq!(
+            super::video_out_is_flip_pending([1, 0, 0, 0, 0, 0], &mut state),
+            1
+        );
+        remu_gpu::record_gpu_flip_completed(remu_gpu::GpuFlipCompletion {
+            address,
+            buffer_index,
+            flip_argument,
+        });
+        assert_eq!(remu_gpu::gpu_flips_pending(), 0);
+        super::refresh_completed_video_out_flips(&mut state);
+        assert_eq!(
+            super::video_out_is_flip_pending([1, 0, 0, 0, 0, 0], &mut state),
+            0
+        );
+        assert_eq!(state.video_out.completed_flip_count, 1);
+        assert!(receiver.try_recv().is_err());
+        remu_gpu::clear_event_sink();
     }
 
     fn targetless_scanout_test_shader_state(
@@ -23952,6 +25759,34 @@ mod platform_independent_tests {
         );
     }
 
+    #[test]
+    fn immutable_app_path_cache_reuses_borrowed_keys_without_growing_on_replacement() {
+        let mut cache = super::ImmutableAppPathCache::default();
+        let root = Path::new("/games/title");
+        cache.insert(
+            root,
+            "Content/Paks/game.pak",
+            root.join("content/paks/game.pak"),
+        );
+
+        assert_eq!(
+            cache.get(root, "Content/Paks/game.pak"),
+            Some(root.join("content/paks/game.pak"))
+        );
+        assert_eq!(cache.entries, 1);
+
+        cache.insert(
+            root,
+            "Content/Paks/game.pak",
+            root.join("CONTENT/PAKS/game.pak"),
+        );
+        assert_eq!(
+            cache.get(root, "Content/Paks/game.pak"),
+            Some(root.join("CONTENT/PAKS/game.pak"))
+        );
+        assert_eq!(cache.entries, 1);
+    }
+
     /// Engines address content relative to their binaries directory, so parent components inside
     /// the game root must resolve rather than be refused.
     /// Dumps are frequently stored with normalized names while titles request the original
@@ -24821,6 +26656,28 @@ mod platform_independent_tests {
         assert!(slot[18..].iter().all(|byte| *byte == 0));
     }
 
+    #[test]
+    fn import_stack_arguments_are_read_from_the_captured_guest_frame() {
+        let stack = [
+            0xfeed_face_cafe_beef_u64,
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+            0x55,
+            0x66,
+        ];
+        let frame = super::ImportCallFrame {
+            guest_rsp: stack.as_ptr().addr() as u64,
+            ..super::ImportCallFrame::default()
+        };
+
+        assert_eq!(
+            super::read_import_stack_arguments(&frame),
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
+    }
+
     #[cfg(all(unix, target_arch = "x86_64"))]
     #[test]
     fn import_trampoline_captures_the_complete_sysv_register_frame() {
@@ -25479,6 +27336,32 @@ mod platform_independent_tests {
     }
 
     #[test]
+    fn immutable_app_directory_index_resolves_case_once_for_sibling_paths() {
+        let temporary = TemporaryTestDirectory::new("app-directory-index");
+        let content = temporary.path.join("Content");
+        std::fs::create_dir(&content).unwrap();
+        std::fs::write(content.join("First.PAK"), []).unwrap();
+        std::fs::write(content.join("Second.UCAS"), []).unwrap();
+
+        let cache = std::sync::RwLock::new(super::ImmutableAppPathCache::default());
+        assert_eq!(
+            super::resolve_immutable_app_path(&temporary.path, "content/first.pak", &cache),
+            Some(content.join("First.PAK"))
+        );
+        assert_eq!(
+            super::resolve_immutable_app_path(&temporary.path, "CONTENT/second.ucas", &cache),
+            Some(content.join("Second.UCAS"))
+        );
+
+        let cache = cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(cache.directories.contains_key(&temporary.path));
+        assert!(cache.directories.contains_key(&content));
+        assert_eq!(cache.directories.len(), 2);
+    }
+
+    #[test]
     fn implements_seek_read_stat_and_truncate_on_one_guest_descriptor() {
         let temporary = TemporaryTestDirectory::new("file-abi");
         let path = temporary.path.join("payload.bin");
@@ -25601,6 +27484,278 @@ mod platform_independent_tests {
         assert_eq!(ids[0], AMPR_INVALID_FILE_ID);
         assert_eq!(sizes[0], 0);
         assert_eq!(error_index, 0);
+    }
+
+    #[test]
+    fn ampr_read_releases_process_dispatch_lock_while_copying_and_records_result() {
+        let path = create_ampr_test_file(b"host payload");
+        let file_id = 0x1234_5678;
+        let command_buffer = 0x5000;
+        let mut command_records = [0_u8; 0x60];
+        let mut destination = [0_u8; 4];
+        let mut state = ProbeDispatchState::default();
+        state.ampr_files.insert(file_id, path.clone());
+        state.ampr_command_buffers.insert(
+            command_buffer,
+            AmprCommandBufferState {
+                buffer: command_records.as_mut_ptr().addr() as u64,
+                size: command_records.len() as u64,
+                ..AmprCommandBufferState::default()
+            },
+        );
+        let dispatch = RwLock::new(state);
+        let order = Mutex::new(());
+        let destination_address = destination.as_mut_ptr().addr() as u64;
+
+        assert_eq!(
+            super::ampr_command_buffer_read_file_two_phase_with(
+                &order,
+                &dispatch,
+                [command_buffer, 0, 0, file_id.into(), destination_address, 4],
+                [7, 0, 0, 0, 0, 0],
+                |_, observed_file_id, observed_destination, size, offset, capacity| {
+                    let unrelated_state = dispatch
+                        .try_write()
+                        .expect("process dispatch lock must be released during AMPR I/O");
+                    drop(unrelated_state);
+                    assert_eq!(observed_file_id, file_id);
+                    assert_eq!(observed_destination, destination_address);
+                    assert_eq!((size, offset, capacity), (4, 7, 4));
+                    // SAFETY: `destination` remains live for the complete synchronous call.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            b"data".as_ptr(),
+                            observed_destination as *mut u8,
+                            4,
+                        );
+                    }
+                    Ok(4)
+                },
+            ),
+            0
+        );
+
+        assert_eq!(&destination, b"data");
+        let state = dispatch.read().unwrap();
+        let command = state.ampr_command_buffers.get(&command_buffer).unwrap();
+        assert_eq!(command.write_offset, super::AMPR_COMMAND_RECORD_SIZE);
+        assert_eq!(command.command_count, 1);
+        assert!(state.ampr_file_handles.contains_key(&file_id));
+        drop(state);
+        assert_eq!(
+            u32::from_le_bytes(command_records[0..4].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(command_records[4..8].try_into().unwrap()),
+            file_id
+        );
+        assert_eq!(
+            u64::from_le_bytes(command_records[0x18..0x20].try_into().unwrap()),
+            7
+        );
+        assert_eq!(
+            u64::from_le_bytes(command_records[0x20..0x28].try_into().unwrap()),
+            4
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ampr_host_read_honors_offset_and_short_end_of_file() {
+        let path = create_ampr_test_file(b"012345");
+        let file = std::fs::File::open(&path).unwrap();
+        let mut destination = [0xcc_u8; 8];
+        assert_eq!(
+            super::ampr_read_file_to_guest(
+                &file,
+                0x1234,
+                destination.as_mut_ptr().addr() as u64,
+                destination.len() as u64,
+                2,
+                destination.len(),
+            ),
+            Ok(4)
+        );
+        assert_eq!(&destination[..4], b"2345");
+        assert_eq!(&destination[4..], &[0xcc; 4]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn failed_ampr_read_keeps_command_buffer_unmodified() {
+        let path = create_ampr_test_file(b"host payload");
+        let file_id = 0x2468_1357;
+        let command_buffer = 0x5500;
+        let mut command_records = [0xa5_u8; 0x60];
+        let mut destination = [0_u8; 4];
+        let mut state = ProbeDispatchState::default();
+        state.ampr_files.insert(file_id, path.clone());
+        state.ampr_command_buffers.insert(
+            command_buffer,
+            AmprCommandBufferState {
+                buffer: command_records.as_mut_ptr().addr() as u64,
+                size: command_records.len() as u64,
+                ..AmprCommandBufferState::default()
+            },
+        );
+        let dispatch = RwLock::new(state);
+        let error = sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+
+        assert_eq!(
+            super::ampr_command_buffer_read_file_two_phase_with(
+                &Mutex::new(()),
+                &dispatch,
+                [
+                    command_buffer,
+                    0,
+                    0,
+                    file_id.into(),
+                    destination.as_mut_ptr().addr() as u64,
+                    destination.len() as u64,
+                ],
+                [0; 6],
+                |_, _, _, _, _, _| Err(error),
+            ),
+            error
+        );
+
+        let state = dispatch.read().unwrap();
+        let command = state.ampr_command_buffers.get(&command_buffer).unwrap();
+        assert_eq!(command.write_offset, 0);
+        assert_eq!(command.command_count, 0);
+        assert!(state.ampr_file_handles.contains_key(&file_id));
+        assert_eq!(command_records, [0xa5; 0x60]);
+        drop(state);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ampr_submit_cannot_overtake_an_in_flight_read() {
+        let path = create_ampr_test_file(b"host payload");
+        let file_id = 0x8765_4321;
+        let command_buffer = 0x6000;
+        let mut command_records = [0_u8; 0x60];
+        let mut destination = [0_u8; 4];
+        let mut state = ProbeDispatchState::default();
+        state.ampr_files.insert(file_id, path.clone());
+        state.ampr_command_buffers.insert(
+            command_buffer,
+            AmprCommandBufferState {
+                buffer: command_records.as_mut_ptr().addr() as u64,
+                size: command_records.len() as u64,
+                ..AmprCommandBufferState::default()
+            },
+        );
+        let dispatch = Arc::new(RwLock::new(state));
+        let order = Arc::new(Mutex::new(()));
+        let destination_address = destination.as_mut_ptr().addr() as u64;
+        let (read_entered_tx, read_entered_rx) = mpsc::channel();
+        let (release_read_tx, release_read_rx) = mpsc::channel();
+        let read_dispatch = Arc::clone(&dispatch);
+        let read_order = Arc::clone(&order);
+        let read = std::thread::spawn(move || {
+            super::ampr_command_buffer_read_file_two_phase_with(
+                &read_order,
+                &read_dispatch,
+                [command_buffer, 0, 0, file_id.into(), destination_address, 4],
+                [0; 6],
+                move |_, _, observed_destination, _, _, _| {
+                    read_entered_tx.send(()).unwrap();
+                    release_read_rx.recv().unwrap();
+                    // SAFETY: the owning test thread retains this destination until both workers
+                    // join, and the AMPR ordering lock prevents submission from observing it early.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            b"done".as_ptr(),
+                            observed_destination as *mut u8,
+                            4,
+                        );
+                    }
+                    Ok(4)
+                },
+            )
+        });
+        read_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("read reached unlocked I/O phase");
+
+        let submit_dispatch = Arc::clone(&dispatch);
+        let submit_order = Arc::clone(&order);
+        let (submit_started_tx, submit_started_rx) = mpsc::channel();
+        let (submit_done_tx, submit_done_rx) = mpsc::channel();
+        let submit = std::thread::spawn(move || {
+            submit_started_tx.send(()).unwrap();
+            let _order = submit_order.lock().unwrap();
+            let mut state = submit_dispatch.write().unwrap();
+            let result = ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state);
+            submit_done_tx.send(result).unwrap();
+        });
+        submit_started_rx.recv().unwrap();
+        assert!(
+            submit_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "submission overtook the blocked file read"
+        );
+
+        release_read_tx.send(()).unwrap();
+        assert_eq!(read.join().unwrap(), 0);
+        assert_eq!(
+            submit_done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            0
+        );
+        submit.join().unwrap();
+        assert_eq!(&destination, b"done");
+        let state = dispatch.read().unwrap();
+        assert_eq!(state.next_apr_submission_id, 1);
+        assert_eq!(
+            state
+                .ampr_command_buffers
+                .get(&command_buffer)
+                .unwrap()
+                .write_offset,
+            super::AMPR_COMMAND_RECORD_SIZE
+        );
+        drop(state);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ampr_ordering_classifier_covers_every_stateful_operation() {
+        for nid in [
+            "gEpBkcwxUjw",
+            "WT-5NKy42fw",
+            "eYAh2vlCY-U",
+            "QzB4O+bJQyA",
+            "i3HWvW35jao",
+            "w5fcCG+t31g",
+            "VB-BtuIW8Xc",
+            "C+Khtbbx2g8",
+            "WvEu7yl3Ivg",
+            "ApkYaHb8Sek",
+            "eE4Szl8sil8",
+            "qvMUCyyaCSI",
+            "ASoW5WE-UPo",
+            "rqwFKI4PAiM",
+            "bBfz7kMF2Ho",
+            "8aI7R7WaOlc",
+            "a8uLzYY--tM",
+            "N-FSPA4S3nI",
+            "baQO9ez2gL4",
+            "ULvXMDz56po",
+            "tZDDEo2tE5k",
+            "GnxKOHEawhk",
+            "H896Pt-yB4I",
+            "GuchCTefuZw",
+            "Qs1xtplKo0U",
+            "mQ16-QdKv7k",
+        ] {
+            assert!(
+                super::is_serialized_ampr_import(nid),
+                "{nid} bypassed AMPR ordering"
+            );
+        }
     }
 
     /// Registering interest must not announce a completion: the guest's listener resolves the
@@ -26289,6 +28444,207 @@ mod platform_independent_tests {
         assert_eq!(
             super::known_nid_name("HD1YKVU26-M"),
             Some("sceAvPlayerPostInit")
+        );
+    }
+
+    #[test]
+    fn av_player_gen5_stream_info_is_zero_based_and_exactly_32_bytes() {
+        let mut stream_info = [0xab_u8; 40];
+        super::av_player_write_stream_info(
+            stream_info.as_mut_ptr().addr() as u64,
+            0,
+            378,
+            150,
+            std::time::Duration::from_millis(9_109),
+        );
+
+        assert_eq!(
+            u32::from_ne_bytes(stream_info[0..4].try_into().unwrap()),
+            super::AV_PLAYER_STREAM_TYPE_VIDEO
+        );
+        assert_eq!(
+            u32::from_ne_bytes(stream_info[8..12].try_into().unwrap()),
+            384
+        );
+        assert_eq!(
+            u32::from_ne_bytes(stream_info[12..16].try_into().unwrap()),
+            160
+        );
+        assert_eq!(
+            u64::from_ne_bytes(stream_info[24..32].try_into().unwrap()),
+            9_109
+        );
+        assert_eq!(&stream_info[32..], &[0xab; 8]);
+
+        super::av_player_write_stream_info(
+            stream_info.as_mut_ptr().addr() as u64,
+            1,
+            378,
+            150,
+            std::time::Duration::from_millis(9_109),
+        );
+        assert_eq!(
+            u32::from_ne_bytes(stream_info[0..4].try_into().unwrap()),
+            super::AV_PLAYER_STREAM_TYPE_AUDIO
+        );
+    }
+
+    #[test]
+    fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
+        let mut frame_info = [0xab_u8; 112];
+        super::av_player_write_video_frame_info(
+            frame_info.as_mut_ptr().addr() as u64,
+            0x1234_5600,
+            4_238,
+            378,
+            150,
+            512,
+            29.97,
+            true,
+        );
+
+        assert_eq!(
+            u64::from_ne_bytes(frame_info[0..8].try_into().unwrap()),
+            0x1234_5600
+        );
+        assert_eq!(
+            u64::from_ne_bytes(frame_info[16..24].try_into().unwrap()),
+            4_238
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame_info[24..28].try_into().unwrap()),
+            512
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame_info[28..32].try_into().unwrap()),
+            150
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame_info[44..48].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame_info[48..52].try_into().unwrap()),
+            134
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame_info[52..56].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame_info[56..60].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame_info[60..64].try_into().unwrap()),
+            512
+        );
+        assert_eq!(&frame_info[64..67], &[8, 8, 0]);
+        assert_eq!(
+            f64::from_bits(u64::from_ne_bytes(
+                frame_info[0x48..0x50].try_into().unwrap()
+            )),
+            29.97
+        );
+        assert_eq!(&frame_info[104..], &[0xab; 8]);
+    }
+
+    #[test]
+    fn av_player_video_clock_releases_frames_from_completed_flips() {
+        let mut origin = None;
+        let interval = 1_000_000 / 60;
+
+        assert!(super::av_player_video_frame_is_due(
+            &mut origin,
+            0,
+            29.97,
+            100,
+            interval
+        ));
+        assert!(!super::av_player_video_frame_is_due(
+            &mut origin,
+            1,
+            29.97,
+            101,
+            interval
+        ));
+        assert!(super::av_player_video_frame_is_due(
+            &mut origin,
+            1,
+            29.97,
+            102,
+            interval
+        ));
+        assert!(!super::av_player_video_frame_is_due(
+            &mut origin,
+            2,
+            29.97,
+            102,
+            interval
+        ));
+        assert!(super::av_player_video_frame_is_due(
+            &mut origin,
+            2,
+            29.97,
+            104,
+            interval
+        ));
+    }
+
+    #[test]
+    fn av_player_video_catch_up_preserves_first_frame_then_tracks_wall_clock() {
+        let now = Instant::now();
+        assert_eq!(
+            super::av_player_video_catch_up_target(
+                None,
+                0,
+                29.97,
+                Duration::from_millis(9_109),
+                378 * 150 * 3 / 2,
+                now + Duration::from_secs(30),
+            ),
+            0
+        );
+
+        let origin = Some((now, 1));
+        assert_eq!(
+            super::av_player_video_catch_up_target(
+                origin,
+                1,
+                29.97,
+                Duration::from_millis(9_109),
+                378 * 150 * 3 / 2,
+                now + Duration::from_millis(550),
+            ),
+            17
+        );
+        assert_eq!(
+            super::av_player_video_catch_up_target(
+                origin,
+                200,
+                29.97,
+                Duration::from_millis(9_109),
+                378 * 150 * 3 / 2,
+                now + Duration::from_secs(30),
+            ),
+            272
+        );
+    }
+
+    #[test]
+    fn av_player_video_catch_up_bounds_large_frame_drains_by_bytes() {
+        let now = Instant::now();
+        let twelve_mibibyte_frame = 12 * 1_024 * 1_024;
+        assert_eq!(
+            super::av_player_video_catch_up_target(
+                Some((now, 1)),
+                1,
+                60.0,
+                Duration::from_secs(60),
+                twelve_mibibyte_frame,
+                now + Duration::from_secs(10),
+            ),
+            6
         );
     }
 
@@ -27907,7 +30263,7 @@ mod platform_independent_tests {
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            vec![(1, 7)]
+            vec![]
         );
         assert_eq!(
             state
@@ -28163,11 +30519,11 @@ mod tests {
     #[test]
     fn av_player_nv12_layout_matches_linear_gpu_texture_pitch() {
         assert_eq!(
-            super::av_player_nv12_layout(1_440, 1_080),
+            super::av_player_nv12_layout(1_440, 1_080, true),
             Some((1_536, 2_488_320))
         );
         assert_eq!(
-            super::av_player_nv12_layout(1_920, 1_080),
+            super::av_player_nv12_layout(1_920, 1_080, true),
             Some((2_048, 3_317_760))
         );
     }
