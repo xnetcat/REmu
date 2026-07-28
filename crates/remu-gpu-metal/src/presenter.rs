@@ -4019,36 +4019,6 @@ impl MetalPresenter {
             }
             retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
         }
-        // Some GFX10 image descriptors expose only the mip selected by one shader even though
-        // following passes reinterpret the same mode-27 allocation as a larger hierarchy. Metal
-        // cannot grow a texture after a compute/render pass has written it, so the compatibility
-        // path creates the complete hierarchy at first residency. This is temporarily switchable
-        // for differential profiling: Silent Hill currently needs at least one inferred hierarchy
-        // to advance past its warning screen, while indiscriminately inferring all of them causes
-        // expensive false-positive write-watch reloads.
-        if guessed_mode27_hierarchies_enabled() && descriptor.tile_mode == 27 {
-            let mip_level_count = complete_2d_mip_level_count(descriptor);
-            if mip_level_count > 1
-                && let Ok(layout) = mode27_mip_chain_layout(descriptor, mip_level_count)
-                && let Ok(byte_count) = u64::try_from(layout.byte_count)
-                && byte_count <= guessed_mode27_hierarchy_maximum_bytes()
-                && guest_shared_backing_alias_segments(descriptor.address, byte_count).is_some()
-            {
-                return ensure_mipmapped_resident_texture_in_map(
-                    device,
-                    DecodedImageDescriptor {
-                        guest: descriptor,
-                        destination_select: 0xfac,
-                        base_mip_level: 0,
-                        mip_level_count,
-                        texture_type: 9,
-                        layer_count: 1,
-                    },
-                    &mut self.resident_guest_textures,
-                    Mode27WorkOrigin::AutomaticPromotion,
-                );
-            }
-        }
         ensure_resident_texture_in_map(
             device,
             descriptor,
@@ -12167,25 +12137,6 @@ fn trace_video_target_compute_consumer(dispatch: &ComputeDispatch) {
         chain.as_deref().unwrap_or(""),
         outputs.join("; "),
     );
-}
-
-fn guessed_mode27_hierarchies_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_GUESS_MODE27_HIERARCHIES").is_none_or(|value| value != "0")
-    })
-}
-
-fn guessed_mode27_hierarchy_maximum_bytes() -> u64 {
-    const DEFAULT_MAXIMUM_MIB: u64 = 16;
-    static MAXIMUM_BYTES: OnceLock<u64> = OnceLock::new();
-    *MAXIMUM_BYTES.get_or_init(|| {
-        std::env::var("REMU_GUESS_MODE27_MAX_MIB")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MAXIMUM_MIB)
-            .saturating_mul(1024 * 1024)
-    })
 }
 
 fn capture_target_sample_textures() -> bool {
@@ -20567,6 +20518,56 @@ fragment int4 remu_format_sint() { return int4(-3); }
     }
 
     #[test]
+    fn a_single_level_descriptor_does_not_gain_an_inferred_mip_hierarchy() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        // A mode-27 allocation large enough to hold a six-level tail. The presenter must still
+        // create exactly the one level the descriptor declares: inferring the rest fabricates a
+        // resource the guest never asked for.
+        let allocation_size = 4 * GUEST_PAGE_SIZE;
+        let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("guest mip-tail mapping");
+        let guest = GuestTextureDescriptor {
+            address: address.get(),
+            width: 32,
+            height: 32,
+            pitch: 32,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RG16Uint,
+            bytes_per_pixel: 4,
+        };
+
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let resident = presenter
+            .ensure_resident_texture(&device, guest)
+            .expect("single-level residency");
+        assert_eq!(resident.mipmap_level_count(), 1);
+        assert_eq!(
+            presenter
+                .resident_guest_textures
+                .get(&guest)
+                .expect("resident recorded")
+                .mip_level_count,
+            1
+        );
+    }
+
+    #[test]
     fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
         use remu_memory::{
             GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -20613,9 +20614,15 @@ fragment int4 remu_format_sint() { return int4(-3); }
             texture_type: 9,
             layer_count: 1,
         };
-        let original = presenter
-            .ensure_resident_texture(&device, guest)
-            .expect("first single-level use reserves the complete mapped hierarchy");
+        // Residency comes from the hierarchy the guest declares. A single-level descriptor is
+        // never promoted into a larger one on the presenter's own initiative.
+        let original = super::ensure_mipmapped_resident_texture_in_map(
+            &device,
+            complete,
+            &mut presenter.resident_guest_textures,
+            super::Mode27WorkOrigin::StorageCreate,
+        )
+        .expect("declared complete mip hierarchy becomes resident");
         assert_eq!(original.mipmap_level_count(), 6);
 
         let complete_view = super::ensure_mipmapped_resident_texture_in_map(
