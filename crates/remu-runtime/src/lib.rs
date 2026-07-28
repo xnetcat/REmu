@@ -48,8 +48,10 @@ pub(crate) use guest_sync::{
     dispatch_guest_sync_import, guest_condition_destroy, guest_condition_init,
     guest_condition_notify, guest_condition_wait, guest_condition_wait_with_interrupt,
     guest_event_flag_wait, guest_mutex_destroy, guest_mutex_entry, guest_mutex_init,
-    guest_mutex_lock, guest_mutex_unlock, guest_pthread_once, guest_semaphore_wait,
+    guest_pthread_once, guest_semaphore_wait,
 };
+#[cfg(any(test, target_arch = "x86_64"))]
+pub(crate) use guest_sync::{GUEST_SYNC, GuestSyncState, guest_mutex_lock, guest_mutex_unlock};
 pub(crate) use guest_sync::{
     dispatch_guest_sync_import_at_import, guest_rwlock_destroy, guest_rwlock_init,
     guest_rwlock_lock, guest_rwlock_unlock, guest_sync, is_guest_sync_import,
@@ -64,6 +66,8 @@ use tls::{
     GUEST_TLS_PREFIX_SIZE, GUEST_TLS_TCB_SIZE, TLS_HELPER_REGION_SIZE, TlsImageInput,
     install_tls_support, tls_dtv_entry_offset,
 };
+#[cfg(target_arch = "x86_64")]
+use unwind::register_guest_unwind_frames;
 use unwind::{GuestUnwindModule, collect_unwind_fdes_at, guest_unwind_module};
 
 #[cfg(target_os = "macos")]

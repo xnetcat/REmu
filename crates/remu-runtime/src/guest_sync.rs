@@ -201,7 +201,7 @@ pub(crate) struct GuestEventFlagState {
     pub(crate) cancellation_generation: u64,
 }
 
-static GUEST_SYNC: OnceLock<(Mutex<GuestSyncState>, Condvar)> = OnceLock::new();
+pub(crate) static GUEST_SYNC: OnceLock<(Mutex<GuestSyncState>, Condvar)> = OnceLock::new();
 
 static EVENT_FLAG_WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

@@ -4,7 +4,9 @@ use remu_core::GuestAddress;
 use remu_loader::LoadedExecutable;
 use remu_memory::{GuestImage, MappingError};
 
-use crate::{LinkError, runtime_address_at};
+#[cfg(target_arch = "x86_64")]
+use crate::native_cxx_runtime;
+use crate::{LinkError, LinkedImage, runtime_address_at};
 
 const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 
