@@ -57,6 +57,23 @@ because it was locked to hardcoded addresses and byte signatures from one build 
 because suppressing the symptom removed the pressure to find the cause. The affected title is
 expected to fail at startup until the defect is fixed.
 
+### A run intermittently renders nothing
+
+Roughly every other launch of the working test title produces `FPS 0.0`, `Draw 0/s` and
+`Tex 1` for the whole run while audio continues at its normal rate, then exits on the
+diagnostic timer with no error. The next launch of the same binary renders normally.
+
+This is not caused by any recent change: it reproduces at `e57a6f1`, before the per-game
+fixes were removed and before any file was split. Audio running normally while no draw is
+ever submitted points at display or scanout setup losing a race during startup, not at the
+guest failing.
+
+Frame rate is also not stable across successful runs of one binary: 59.9, 61.9, 87.9,
+91.9, 106.0 and 119.9 FPS have all been observed at the same revision, depending on window
+and display state. Neither frame rate nor draw rate can therefore be used to detect a
+performance regression. There is no CPU-throughput benchmark in the tree, which is the gap
+to close before any performance claim can be made.
+
 ### The runtime test suite is order-dependent
 
 `cargo test -p remu-runtime --lib` fails intermittently, at roughly a one-in-three rate, in
