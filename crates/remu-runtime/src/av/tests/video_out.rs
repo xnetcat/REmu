@@ -1,0 +1,295 @@
+// Copyright (C) 2026 REmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+use super::*;
+
+#[test]
+fn closing_the_display_port_releases_its_buffers_and_refuses_a_second_close() {
+    let mut state = open_display();
+    assert_eq!(
+        dispatch("uquVH4-Du78", args(&[VIDEO_OUT_HANDLE]), &mut state),
+        Some(SUCCESS)
+    );
+    assert!(!state.video_out.is_open);
+    assert!(state.video_out.display_buffers.is_empty());
+    assert!(state.video_out.display_buffer_attributes.is_empty());
+    assert_eq!(
+        dispatch("uquVH4-Du78", args(&[VIDEO_OUT_HANDLE]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_HANDLE))
+    );
+}
+
+#[test]
+fn a_display_call_on_a_handle_no_port_owns_is_rejected() {
+    let mut state = open_display();
+    for nid in [
+        "uquVH4-Du78",
+        "N5KDtkIjjJ4",
+        "1FZBKy8HeNU",
+        "j6RaAUlaLv0",
+        "T4ucGB8CsnM",
+    ] {
+        assert_eq!(
+            dispatch(nid, args(&[2, 0]), &mut state),
+            Some(error(VIDEO_OUT_ERROR_INVALID_HANDLE)),
+            "{nid} accepted a handle no port owns"
+        );
+    }
+}
+
+#[test]
+fn unregistering_the_buffer_set_clears_it_once_and_refuses_an_unknown_set() {
+    let mut state = open_display();
+    assert_eq!(
+        dispatch("N5KDtkIjjJ4", args(&[VIDEO_OUT_HANDLE, 1]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_INDEX))
+    );
+    assert_eq!(
+        dispatch("N5KDtkIjjJ4", args(&[VIDEO_OUT_HANDLE, 0]), &mut state),
+        Some(SUCCESS)
+    );
+    assert!(state.video_out.display_buffers.is_empty());
+    assert_eq!(
+        dispatch("N5KDtkIjjJ4", args(&[VIDEO_OUT_HANDLE, 0]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_INDEX))
+    );
+}
+
+#[test]
+fn changing_the_buffer_attributes_retargets_every_registered_buffer() {
+    let mut state = open_display();
+    let attribute = buffer_attribute(VIDEO_OUT_TILING_MODE_LINEAR, 1920, 1080);
+    assert_eq!(
+        dispatch(
+            "HuViW4HnrOw",
+            args(&[VIDEO_OUT_HANDLE, 0, address(&attribute), 0]),
+            &mut state
+        ),
+        Some(SUCCESS)
+    );
+    assert_eq!(state.video_out.width, 1920);
+    assert_eq!(state.video_out.height, 1080);
+    assert_eq!(state.video_out.tiling_mode, VIDEO_OUT_TILING_MODE_LINEAR);
+    assert_eq!(state.video_out.pixel_format, 0x8000_0000_2200_0000);
+    assert_eq!(
+        state.video_out.display_buffer_attributes,
+        vec![
+            Some(VideoOutBufferAttributes {
+                width: 1920,
+                height: 1080,
+                pitch: 1920,
+                pixel_format: 0x8000_0000_2200_0000,
+                tiling_mode: VIDEO_OUT_TILING_MODE_LINEAR,
+            });
+            2
+        ]
+    );
+}
+
+#[test]
+fn a_malformed_buffer_attribute_change_is_rejected_rather_than_applied() {
+    let mut state = open_display();
+    let unusable_tiling = buffer_attribute(2, 1920, 1080);
+    let no_resolution = buffer_attribute(VIDEO_OUT_TILING_MODE_TILE, 0, 1080);
+    for (attribute, expected) in [
+        (
+            address(&unusable_tiling),
+            VIDEO_OUT_ERROR_INVALID_TILING_MODE,
+        ),
+        (address(&no_resolution), VIDEO_OUT_ERROR_INVALID_RESOLUTION),
+        (0, VIDEO_OUT_ERROR_INVALID_ADDRESS),
+    ] {
+        assert_eq!(
+            dispatch(
+                "HuViW4HnrOw",
+                args(&[VIDEO_OUT_HANDLE, 0, attribute, 0]),
+                &mut state
+            ),
+            Some(error(expected))
+        );
+    }
+    assert_eq!(state.video_out.width, 1280);
+    assert_eq!(
+        dispatch(
+            "HuViW4HnrOw",
+            args(&[VIDEO_OUT_HANDLE, 1, address(&no_resolution), 0]),
+            &mut state
+        ),
+        Some(error(VIDEO_OUT_ERROR_INVALID_INDEX))
+    );
+}
+
+#[test]
+fn the_vblank_status_reports_a_free_running_counter_in_its_documented_layout() {
+    let mut state = open_display();
+    let mut status = [0xff_u8; 0x28];
+    let status_address = address_mut(&mut status);
+    assert_eq!(
+        dispatch(
+            "1FZBKy8HeNU",
+            args(&[VIDEO_OUT_HANDLE, status_address]),
+            &mut state
+        ),
+        Some(SUCCESS)
+    );
+    let count = u64::from_le_bytes(status[..8].try_into().expect("the count is eight bytes"));
+    let process_time =
+        u64::from_le_bytes(status[8..16].try_into().expect("the time is eight bytes"));
+    assert!(
+        process_time <= kernel_process_time(false),
+        "the reported vblank must already have happened"
+    );
+    assert_eq!(status[16..24], [0; 8], "the reserved word must be cleared");
+    assert_eq!(
+        status[32..40],
+        [0; 8],
+        "flags, phase and padding must be zero"
+    );
+
+    assert_eq!(
+        dispatch("j6RaAUlaLv0", args(&[VIDEO_OUT_HANDLE]), &mut state),
+        Some(SUCCESS)
+    );
+    assert_eq!(
+        dispatch(
+            "1FZBKy8HeNU",
+            args(&[VIDEO_OUT_HANDLE, status_address]),
+            &mut state
+        ),
+        Some(SUCCESS)
+    );
+    let waited = u64::from_le_bytes(status[..8].try_into().expect("the count is eight bytes"));
+    assert!(
+        waited > count,
+        "a completed vblank wait must advance the counter: {count} then {waited}"
+    );
+    assert_eq!(
+        dispatch("1FZBKy8HeNU", args(&[VIDEO_OUT_HANDLE, 0]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_ADDRESS))
+    );
+}
+
+#[test]
+fn a_delivered_event_reports_the_display_event_it_carries() {
+    let mut state = open_display();
+    let mut event = [0_u8; KERNEL_EVENT_SIZE];
+    event[12..16].copy_from_slice(&1_u32.to_le_bytes());
+    assert_eq!(
+        dispatch("U2JJtSqNKZI", args(&[address(&event)]), &mut state),
+        Some(1)
+    );
+    event[12..16].copy_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(
+        dispatch("U2JJtSqNKZI", args(&[address(&event)]), &mut state),
+        Some(SUCCESS)
+    );
+    assert_eq!(
+        dispatch("U2JJtSqNKZI", args(&[0]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_ADDRESS))
+    );
+}
+
+#[test]
+fn output_options_are_cleared_and_a_null_options_block_is_rejected() {
+    let mut state = open_display();
+    let mut options = [0xff_u8; 0x40];
+    assert_eq!(
+        dispatch(
+            "+I4K03i3EL0",
+            args(&[address_mut(&mut options)]),
+            &mut state
+        ),
+        Some(SUCCESS)
+    );
+    assert_eq!(options, [0; 0x40]);
+    assert_eq!(
+        dispatch("+I4K03i3EL0", args(&[0]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_ADDRESS))
+    );
+}
+
+#[test]
+fn only_the_default_output_mode_is_reported_as_available() {
+    let mut state = open_display();
+    assert_eq!(
+        dispatch(
+            "Nv8c-Kb+DUM",
+            args(&[VIDEO_OUT_HANDLE, 1, 0, 0, 0]),
+            &mut state
+        ),
+        Some(VIDEO_OUT_TRUE)
+    );
+    assert_eq!(
+        dispatch(
+            "Nv8c-Kb+DUM",
+            args(&[VIDEO_OUT_HANDLE, 0xd000_000a, 0, 0, 0]),
+            &mut state
+        ),
+        Some(VIDEO_OUT_FALSE)
+    );
+    assert_eq!(
+        dispatch(
+            "Nv8c-Kb+DUM",
+            args(&[VIDEO_OUT_HANDLE, 1, 0, 8, 0]),
+            &mut state
+        ),
+        Some(error(VIDEO_OUT_ERROR_INVALID_VALUE))
+    );
+    assert_eq!(
+        dispatch(
+            "Nv8c-Kb+DUM",
+            args(&[VIDEO_OUT_HANDLE, 1, 0, 0, 1]),
+            &mut state
+        ),
+        Some(error(VIDEO_OUT_ERROR_INVALID_VALUE))
+    );
+}
+
+#[test]
+fn colour_adjustment_requires_the_declared_size_and_a_usable_gamma() {
+    let mut state = open_display();
+    let settings = [1.0_f32, 0.5, 2.0, f32::from_bits(0)];
+    let broken = [f32::NAN, 1.0, 1.0, 0.0];
+    assert_eq!(
+        dispatch(
+            "pv9CI5VC+R0",
+            args(&[VIDEO_OUT_HANDLE, address(&settings), 16]),
+            &mut state
+        ),
+        Some(SUCCESS)
+    );
+    assert_eq!(
+        dispatch(
+            "pv9CI5VC+R0",
+            args(&[VIDEO_OUT_HANDLE, address(&settings), 8]),
+            &mut state
+        ),
+        Some(error(VIDEO_OUT_ERROR_INVALID_VALUE))
+    );
+    assert_eq!(
+        dispatch(
+            "pv9CI5VC+R0",
+            args(&[VIDEO_OUT_HANDLE, address(&broken), 16]),
+            &mut state
+        ),
+        Some(error(VIDEO_OUT_ERROR_INVALID_VALUE))
+    );
+    assert_eq!(
+        dispatch("pv9CI5VC+R0", args(&[VIDEO_OUT_HANDLE, 0, 16]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_ADDRESS))
+    );
+}
+
+#[test]
+fn releasing_a_pegged_refresh_rate_needs_the_open_port() {
+    let mut state = open_display();
+    assert_eq!(
+        dispatch("T4ucGB8CsnM", args(&[VIDEO_OUT_HANDLE]), &mut state),
+        Some(SUCCESS)
+    );
+    state.video_out.is_open = false;
+    assert_eq!(
+        dispatch("T4ucGB8CsnM", args(&[VIDEO_OUT_HANDLE]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_HANDLE))
+    );
+}

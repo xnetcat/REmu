@@ -1,0 +1,336 @@
+// Copyright (C) 2026 REmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use remu_shader::GuestMemoryReader;
+
+use crate::{
+    AGC_R_WAIT_MEM_64, AgcSubmissionError, ProcessGuestMemory, low_u32, read_guest_u32,
+    read_guest_u64,
+};
+
+pub(crate) fn decode_agc_event_write(
+    packet_address: u64,
+    length: u32,
+) -> Result<Option<remu_gpu::GpuPipelineBarrier>, AgcSubmissionError> {
+    if length < 2 {
+        return Err(AgcSubmissionError::EventWritePacketLength { actual: length });
+    }
+    let control = read_guest_u32(packet_address + 4);
+    let event_type = control & 0x3f;
+    let event_index = (control >> 8) & 0xf;
+    if matches!(event_type, 0x07 | 0x0f | 0x10) {
+        return decode_agc_pipeline_barrier(packet_address, length).map(Some);
+    }
+    // EVENT_TYPE=0x39 is PIXEL_PIPE_STAT_DUMP. AMD assigns it EVENT_INDEX=1 (the
+    // ZPASS_DONE/PIXEL_PIPE_STAT group), and the two remaining packet dwords name the qword-aligned
+    // occlusion-counter destination. The attached RDNA2 ISA manual covers shader instructions,
+    // not PM4, but AMD's packet documentation and Linux's GFX10 `nvd.h` agree on this four-dword
+    // form. KytyPS5 deliberately accepts this event without synthesizing counters; do the same
+    // until Metal visibility-result buffers are wired into guest query memory. Rejecting it is
+    // worse than the documented no-result fallback because Unreal treats a refused DCB as fatal.
+    if event_type == 0x39 {
+        if event_index != 1 || length != 4 || control & !0x0000_0f3f != 0 {
+            return Err(AgcSubmissionError::UnsupportedEventWrite {
+                event_type,
+                event_index,
+                length,
+            });
+        }
+        let destination = read_guest_u64(packet_address + 8);
+        if destination == 0 || !destination.is_multiple_of(8) {
+            return Err(AgcSubmissionError::InvalidPixelPipeStatAddress(destination));
+        }
+        return Ok(None);
+    }
+    // Non-addressed Gen5 events use only EVENT_TYPE. EVENT_INDEX is reserved for the three
+    // partial-flush forms above and the addressed pixel-pipe dump handled above; these packets
+    // perform GPU cache actions and do not themselves signal a kernel graphics queue. The packet
+    // processor consumes the header-declared length: some native command streams pad these events
+    // to four dwords, and the unused payload does not change the event semantics.
+    if control & !0x3f != 0 {
+        return if event_index != 0 {
+            Err(AgcSubmissionError::UnsupportedEventWrite {
+                event_type,
+                event_index,
+                length,
+            })
+        } else {
+            Err(AgcSubmissionError::UnsupportedEventWriteControl(control))
+        };
+    }
+    Ok(None)
+}
+
+pub(super) fn decode_agc_memory_write(
+    packet_address: u64,
+    length: u32,
+    standard_packet: bool,
+) -> Option<remu_gpu::GpuMemoryWrite> {
+    if length < 5 {
+        return None;
+    }
+    let control = read_guest_u32(packet_address + 4);
+    let (destination, increment_address) = if standard_packet {
+        // GFX10 PKT3_WRITE_DATA: DST_SEL is 11:8 and ADDR_INCR=0 advances the address.
+        ((control >> 8) & 0x0f, control & (1 << 16) == 0)
+    } else {
+        // sceAgc's NOP wrapper stores four byte-sized fields: destination, cache policy,
+        // increment suppression and write confirmation.
+        (control & 0xff, (control >> 16) & 0xff == 0)
+    };
+    if !matches!(destination, 1 | 2 | 4 | 5) {
+        return None;
+    }
+    let address = read_guest_u64(packet_address + 8);
+    if address == 0 || !address.is_multiple_of(4) {
+        return None;
+    }
+    let values = (0..length - 4)
+        .map(|index| read_guest_u32(packet_address + 16 + u64::from(index) * 4))
+        .collect::<Vec<_>>();
+    static WRITE_DATA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let sequence = WRITE_DATA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 32 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][AGC][SYNC] write sequence={sequence} packet={packet_address:#x} standard={standard_packet} destination={destination} address={address:#x} dwords={} increment={increment_address} values={values:?}",
+            values.len()
+        );
+    }
+    Some(remu_gpu::GpuMemoryWrite {
+        address,
+        values,
+        increment_address,
+    })
+}
+
+pub(crate) fn decode_agc_dma_data(
+    packet_address: u64,
+    length: u32,
+    standard_packet: bool,
+) -> Option<remu_gpu::GpuMemoryCopy> {
+    let (source_address, destination_address, byte_count, source_selection, destination_selection) =
+        if standard_packet {
+            if length < 7 {
+                return None;
+            }
+            let control = read_guest_u32(packet_address + 4);
+            let command = read_guest_u32(packet_address + 24);
+            (
+                read_guest_u64(packet_address + 8),
+                read_guest_u64(packet_address + 16),
+                u64::from(command & 0x03ff_ffff),
+                ((control >> 29) & 0x3) | ((command >> 24) & 0x4) | ((command >> 25) & 0x8),
+                ((control >> 20) & 0x3) | ((command >> 25) & 0x4) | ((command >> 26) & 0x8),
+            )
+        } else {
+            if length < 8 {
+                return None;
+            }
+            let control = read_guest_u32(packet_address + 4);
+            (
+                read_guest_u64(packet_address + 24),
+                read_guest_u64(packet_address + 16),
+                u64::from(read_guest_u32(packet_address + 12)),
+                (control >> 16) & 0xff,
+                control & 0xff,
+            )
+        };
+    let source_is_memory = matches!(source_selection, 0 | 3);
+    let source_is_immediate = source_selection == 2;
+    if (!source_is_memory && !source_is_immediate)
+        || (source_is_memory && source_address < 0x10_000)
+        || destination_address < 0x10_000
+        || byte_count == 0
+        || byte_count > 512 * 1024 * 1024
+    {
+        return None;
+    }
+    Some(remu_gpu::GpuMemoryCopy {
+        source_address,
+        destination_address,
+        byte_count,
+        source_selection,
+        destination_selection,
+        cpu_applied: false,
+    })
+}
+
+pub(super) fn mirror_agc_cpu_memory_copy(copy: &remu_gpu::GpuMemoryCopy) -> bool {
+    const MAX_MIRRORED_COPY_BYTES: u64 = 1024 * 1024;
+    if !matches!(copy.source_selection, 0 | 3)
+        || !matches!(copy.destination_selection, 0 | 3)
+        || copy.byte_count > MAX_MIRRORED_COPY_BYTES
+    {
+        return false;
+    }
+    let Ok(byte_count) = usize::try_from(copy.byte_count) else {
+        return false;
+    };
+    if ProcessGuestMemory.readable_prefix_length(copy.source_address, byte_count)
+        != Some(byte_count)
+        || ProcessGuestMemory.readable_prefix_length(copy.destination_address, byte_count)
+            != Some(byte_count)
+    {
+        return false;
+    }
+    // SAFETY: both complete ranges were validated against the runtime's live guest mappings.
+    // `copy` provides memmove semantics. A destination protected by CpuWriteWatch is made
+    // writable by its fault handler and dirtied exactly as a guest CPU write would be.
+    unsafe {
+        std::ptr::copy(
+            copy.source_address as *const u8,
+            copy.destination_address as *mut u8,
+            byte_count,
+        );
+    }
+    true
+}
+
+pub(crate) fn decode_agc_memory_acquire(packet_address: u64) -> remu_gpu::GpuMemoryAcquire {
+    let coher_control = read_guest_u32(packet_address + 4);
+    let size_units = u64::from(read_guest_u32(packet_address + 8))
+        | (u64::from(read_guest_u32(packet_address + 12) & 0xff) << 32);
+    let base_units = u64::from(read_guest_u32(packet_address + 16))
+        | (u64::from(read_guest_u32(packet_address + 20) & 0x00ff_ffff) << 32);
+    remu_gpu::GpuMemoryAcquire {
+        engine: coher_control >> 31,
+        cb_db_control: coher_control & 0x7fff_ffff,
+        base_address: base_units << 8,
+        size_bytes: size_units << 8,
+        poll_interval: read_guest_u32(packet_address + 24) & 0xffff,
+        gcr_control: read_guest_u32(packet_address + 28) & 0x7_ffff,
+    }
+}
+
+pub(super) fn decode_agc_memory_release(
+    packet_address: u64,
+    standard_packet: bool,
+) -> Option<remu_gpu::GpuMemoryRelease> {
+    static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let control = read_guest_u32(packet_address + 8);
+    let address = read_guest_u64(packet_address + 12);
+    let data = read_guest_u64(packet_address + 20);
+    let data_selection = if standard_packet {
+        (control >> 29) & 0x7
+    } else {
+        (control >> 16) & 0xff
+    };
+    let value = match data_selection {
+        1 if address.is_multiple_of(4) => {
+            Some(remu_gpu::GpuMemoryReleaseValue::Immediate32(low_u32(data)))
+        }
+        2 if address.is_multiple_of(8) => Some(remu_gpu::GpuMemoryReleaseValue::Immediate64(data)),
+        3 | 4 if address.is_multiple_of(8) => Some(remu_gpu::GpuMemoryReleaseValue::Timestamp),
+        _ => None,
+    };
+    let trace = TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if trace <= 96 || trace.is_power_of_two() {
+        eprintln!(
+            "[REMu][AGC][SYNC] release packet={packet_address:#x} standard={standard_packet} control={control:#010x} selection={data_selection} address={address:#x} data={data:#x} emitted={}",
+            value.is_some() && address != 0
+        );
+    }
+    Some(remu_gpu::GpuMemoryRelease {
+        address,
+        value: value?,
+    })
+    .filter(|_| address != 0)
+}
+
+pub(crate) fn decode_agc_memory_wait(
+    packet_address: u64,
+    register: u32,
+    standard_packet: bool,
+) -> Option<remu_gpu::GpuMemoryWait> {
+    static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let is_64_bit = !standard_packet && register == AGC_R_WAIT_MEM_64;
+    let (address, reference, mask, control) = if standard_packet {
+        (
+            read_guest_u64(packet_address + 8),
+            u64::from(read_guest_u32(packet_address + 16)),
+            u64::from(read_guest_u32(packet_address + 20)),
+            read_guest_u32(packet_address + 4),
+        )
+    } else if is_64_bit {
+        (
+            read_guest_u64(packet_address + 4),
+            read_guest_u64(packet_address + 20),
+            read_guest_u64(packet_address + 12),
+            read_guest_u32(packet_address + 28),
+        )
+    } else {
+        (
+            read_guest_u64(packet_address + 4),
+            u64::from(read_guest_u32(packet_address + 16)),
+            u64::from(read_guest_u32(packet_address + 12)),
+            read_guest_u32(packet_address + 20),
+        )
+    };
+    let compare_function = control & 0x7;
+    let alignment = if is_64_bit { 8 } else { 4 };
+    let decoded = if address == 0 || !address.is_multiple_of(alignment) || compare_function == 7 {
+        None
+    } else {
+        Some(remu_gpu::GpuMemoryWait {
+            address,
+            reference,
+            mask,
+            compare_function,
+            is_64_bit,
+        })
+    };
+    let trace = TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if trace <= 64 || trace.is_power_of_two() {
+        let current = decoded.map(|wait| {
+            if wait.is_64_bit {
+                read_guest_u64(wait.address)
+            } else {
+                u64::from(read_guest_u32(wait.address))
+            }
+        });
+        eprintln!(
+            "[REMu][AGC][SYNC] wait packet={packet_address:#x} standard={standard_packet} bits={} control={control:#010x} compare={compare_function} address={address:#x} mask={mask:#x} reference={reference:#x} current={current:?} satisfied={:?}",
+            if is_64_bit { 64 } else { 32 },
+            current
+                .zip(decoded)
+                .map(|(value, wait)| wait.is_satisfied_by(value))
+        );
+    }
+    decoded
+}
+
+pub(crate) fn decode_agc_pipeline_barrier(
+    packet_address: u64,
+    length: u32,
+) -> Result<remu_gpu::GpuPipelineBarrier, AgcSubmissionError> {
+    if length < 2 {
+        return Err(AgcSubmissionError::EventWritePacketLength { actual: length });
+    }
+    let control = read_guest_u32(packet_address + 4);
+    let event_type = control & 0x3f;
+    let event_index = (control >> 8) & 0x7;
+    let wait_for = match event_type {
+        0x07 => remu_gpu::GpuPipelineStage::ComputeShader,
+        0x0f => remu_gpu::GpuPipelineStage::VertexShader,
+        0x10 => remu_gpu::GpuPipelineStage::PixelShader,
+        _ => {
+            return Err(AgcSubmissionError::UnsupportedEventWrite {
+                event_type,
+                event_index,
+                length,
+            });
+        }
+    };
+    if control & !0x0000_073f != 0 {
+        return Err(AgcSubmissionError::UnsupportedEventWriteControl(control));
+    }
+    if event_index != 4 {
+        return Err(AgcSubmissionError::PartialFlushEventIndex {
+            event_type,
+            actual: event_index,
+        });
+    }
+    Ok(remu_gpu::GpuPipelineBarrier { wait_for })
+}

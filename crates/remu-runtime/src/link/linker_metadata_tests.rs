@@ -1,7 +1,8 @@
 use remu_core::GuestAddress;
 use remu_loader::{DynamicInfo, Elf64Symbol, SceLibraryReference, SceModuleReference};
 
-use super::{ProcessSymbolKey, encode_sce_id, process_symbol_key, sce_symbol_nid};
+use super::{ProcessSymbolKey, encode_sce_id, process_symbol_key};
+use crate::sce_symbol_nid;
 
 #[test]
 fn encodes_sony_namespace_ids_in_the_dynamic_symbol_alphabet() {

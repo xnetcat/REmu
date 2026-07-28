@@ -1,0 +1,372 @@
+// Copyright (C) 2026 REmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+use super::{
+    CB_BLEND0_CONTROL, DecodedRasterState, DecodedRenderTarget, DepthTargetPipelineState,
+    GraphicsPipelineKey, GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_SU_SC_MODE_CNTL,
+    ProgramIdentity, RenderTargetPipelineState, common_render_target_array_length,
+    decode_depth_target, decode_render_targets, image_component_class, is_storage_image_opcode,
+    pixel_input_controls, program_embeds_global_base, programmed_viewport_has_negative_height,
+    register_value,
+};
+use metal::{
+    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
+    MTLPrimitiveType, MTLTriangleFillMode, MTLWinding,
+};
+use remu_gpu::IndexedDraw;
+use remu_shader::{ShaderEvaluation, image_is_comparison};
+use std::sync::Arc;
+
+pub(crate) fn metal_primitive_type(guest: u32) -> Result<MTLPrimitiveType, String> {
+    match guest {
+        1 => Ok(MTLPrimitiveType::Point),
+        2 => Ok(MTLPrimitiveType::Line),
+        3 => Ok(MTLPrimitiveType::LineStrip),
+        4 => Ok(MTLPrimitiveType::Triangle),
+        // GFX10's 2D rectangle and rectangle-list topologies consume three guest vertices but
+        // rasterize a complete four-corner rectangle. The observed AGC shaders derive the fourth
+        // corner from vertex ID, so invoking the translated vertex function once more preserves
+        // the native rectangle while using Metal's triangle-strip topology.
+        6 | 7 | 0x11 => Ok(MTLPrimitiveType::TriangleStrip),
+        5 => Err("triangle-fan topology requires explicit Metal index expansion".to_owned()),
+        _ => Err(format!("unknown guest primitive topology {guest:#x}")),
+    }
+}
+
+pub(crate) fn metal_primitive_topology_class(
+    guest: u32,
+) -> Result<MTLPrimitiveTopologyClass, String> {
+    match guest {
+        1 => Ok(MTLPrimitiveTopologyClass::Point),
+        2 | 3 => Ok(MTLPrimitiveTopologyClass::Line),
+        4 | 5 | 6 | 7 | 0x11 => Ok(MTLPrimitiveTopologyClass::Triangle),
+        _ => Err(format!("unknown guest primitive topology {guest:#x}")),
+    }
+}
+
+pub(crate) const fn metal_nonindexed_vertex_count(
+    guest_primitive_type: u32,
+    guest_count: u32,
+) -> u32 {
+    if matches!(guest_primitive_type, 7 | 0x11) && guest_count == 3 {
+        4
+    } else {
+        guest_count
+    }
+}
+
+pub(crate) fn decode_raster_state(draw: &IndexedDraw) -> Result<DecodedRasterState, String> {
+    // GFX10's reset value has FACE set and all culling/polygon-mode bits clear.
+    let control = register_value(&draw.context_registers, PA_SU_SC_MODE_CNTL).unwrap_or(1 << 2);
+    let cull_front = control & 1 != 0;
+    let cull_back = control & 2 != 0;
+    let cull_mode = match (cull_front, cull_back) {
+        (false, false) => MTLCullMode::None,
+        (true, false) => MTLCullMode::Front,
+        (false, true) => MTLCullMode::Back,
+        (true, true) => {
+            return Err(
+                "simultaneous front- and back-face culling has no exact Metal raster state"
+                    .to_owned(),
+            );
+        }
+    };
+    let mut front_winding = if control & (1 << 2) != 0 {
+        MTLWinding::Clockwise
+    } else {
+        MTLWinding::CounterClockwise
+    };
+    // Gen5 titles commonly program a negative viewport Y scale to account for the framebuffer's
+    // top-left origin. `decode_viewport` represents that transform with a positive Metal viewport
+    // (Metal rejects a negative height), which mirrors the projected triangle orientation. Keep
+    // guest front/back-face classification intact by applying the corresponding winding flip.
+    if programmed_viewport_has_negative_height(draw) {
+        front_winding = match front_winding {
+            MTLWinding::Clockwise => MTLWinding::CounterClockwise,
+            MTLWinding::CounterClockwise => MTLWinding::Clockwise,
+        };
+    }
+
+    let polygon_mode = (control >> 3) & 0x3;
+    let fill_mode = match polygon_mode {
+        0 => MTLTriangleFillMode::Fill,
+        1 => {
+            let front_type = (control >> 5) & 0x7;
+            let back_type = (control >> 8) & 0x7;
+            let visible_type = match cull_mode {
+                MTLCullMode::Front => back_type,
+                MTLCullMode::Back => front_type,
+                MTLCullMode::None if front_type == back_type => front_type,
+                MTLCullMode::None => {
+                    return Err(format!(
+                        "different front/back polygon modes ({front_type}/{back_type}) have no exact Metal raster state"
+                    ));
+                }
+            };
+            match visible_type {
+                1 => MTLTriangleFillMode::Lines,
+                2 => MTLTriangleFillMode::Fill,
+                0 => {
+                    return Err(
+                        "point polygon mode has no exact Metal triangle raster state".to_owned(),
+                    );
+                }
+                value => return Err(format!("reserved GFX10 polygon primitive type {value}")),
+            }
+        }
+        value => return Err(format!("reserved GFX10 polygon mode {value}")),
+    };
+
+    Ok(DecodedRasterState {
+        cull_mode,
+        front_winding,
+        fill_mode,
+    })
+}
+
+pub(crate) fn graphics_pipeline_key(draw: &IndexedDraw) -> Result<GraphicsPipelineKey, String> {
+    let targets = decode_render_targets(draw)?;
+    graphics_pipeline_key_from_targets(draw, &targets)
+}
+
+pub(crate) fn graphics_pipeline_key_from_targets(
+    draw: &IndexedDraw,
+    targets: &[DecodedRenderTarget],
+) -> Result<GraphicsPipelineKey, String> {
+    let depth = decode_depth_target(draw)?;
+    if targets.is_empty() && depth.is_none() {
+        return Err(
+            "draw has neither an enabled color target nor an active depth target".to_owned(),
+        );
+    }
+    let export_evaluation = draw
+        .export_shader_evaluation
+        .as_ref()
+        .ok_or("draw has no export resource evaluation")?;
+    let pixel_evaluation = draw
+        .pixel_shader_evaluation
+        .as_ref()
+        .ok_or("draw has no pixel resource evaluation")?;
+    let export_program = &draw
+        .export_shader
+        .as_ref()
+        .ok_or("draw has no decoded export shader")?
+        .program;
+    let pixel_program = &draw
+        .pixel_shader
+        .as_ref()
+        .ok_or("draw has no decoded pixel shader")?
+        .program;
+    let sample_count = targets
+        .first()
+        .map(|target| target.sample_count)
+        .or_else(|| depth.map(|depth| depth.sample_count))
+        .unwrap_or(1);
+    let render_target_array_length =
+        common_render_target_array_length(targets.iter().map(|target| target.layer_count));
+    if let Some(target) = targets
+        .iter()
+        .find(|target| target.sample_count != sample_count)
+    {
+        return Err(format!(
+            "color target {} uses {} samples while the render pass uses {sample_count}",
+            target.guest_slot, target.sample_count
+        ));
+    }
+    if let Some(depth) = depth
+        && depth.sample_count != sample_count
+    {
+        return Err(format!(
+            "depth target uses {} samples while color targets use {sample_count}",
+            depth.sample_count
+        ));
+    }
+    if render_target_array_length > 1 && depth.is_some() {
+        return Err(
+            "layered color rendering with a depth attachment is not implemented".to_owned(),
+        );
+    }
+    Ok(GraphicsPipelineKey {
+        export_shader_address: draw.export_shader_address,
+        pixel_shader_address: draw.pixel_shader_address,
+        export_program_identity: ProgramIdentity(Arc::clone(export_program)),
+        pixel_program_identity: ProgramIdentity(Arc::clone(pixel_program)),
+        export_resources: graphics_shader_resource_key(
+            export_evaluation,
+            program_embeds_global_base(export_program),
+        ),
+        pixel_resources: graphics_shader_resource_key(
+            pixel_evaluation,
+            program_embeds_global_base(pixel_program),
+        ),
+        pixel_input_controls: pixel_input_controls(&draw.context_registers),
+        targets: targets
+            .iter()
+            .map(|target| {
+                let control = register_value(
+                    &draw.context_registers,
+                    CB_BLEND0_CONTROL + target.guest_slot,
+                )
+                .unwrap_or(0x2001_0001);
+                Ok(RenderTargetPipelineState {
+                    guest_slot: target.guest_slot,
+                    pixel_format: target.texture.pixel_format,
+                    output_kind: target.output_kind,
+                    write_mask: target.write_mask,
+                    blend: decode_metal_blend_attachment(control).map_err(|error| {
+                        format!(
+                            "color target {} has invalid CB_BLEND_CONTROL={control:#010x}: {error}",
+                            target.guest_slot
+                        )
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        depth: depth.map(|depth| DepthTargetPipelineState {
+            pixel_format: depth.texture.pixel_format,
+        }),
+        sample_count,
+        render_target_array_length,
+        primitive_topology_class: metal_primitive_topology_class(draw.primitive_type)?,
+    })
+}
+
+pub(crate) fn graphics_shader_resource_key(
+    evaluation: &ShaderEvaluation,
+    _embeds_global_base: bool,
+) -> GraphicsShaderResourceKey {
+    let image_slots = evaluation.image_binding_slots();
+    GraphicsShaderResourceKey {
+        initial_scalar_count: evaluation.initial_scalar_registers.len(),
+        // Every lowering embeds the byte extent. Only GLOBAL instructions still embed a full
+        // guest base; descriptor-backed buffer instructions address the current dword-aligned
+        // Metal binding through the descriptor's dynamic low-bit bias.
+        global_bindings: evaluation
+            .global_memory_bindings
+            .iter()
+            .map(|binding| (binding.instruction_pcs.to_vec(), 0, 0, binding.writable))
+            .collect(),
+        // Image addresses, component selection, exact pixel formats, and sampler state are bound
+        // dynamically. Only the resource order, MSL component class, and access/interface shape
+        // alter the generated Metal function signature.
+        image_bindings: evaluation
+            .image_bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| {
+                (
+                    binding.pc,
+                    image_component_class(binding),
+                    is_storage_image_opcode(binding.opcode),
+                    image_is_comparison(binding.opcode),
+                    binding.control.dimension,
+                    binding
+                        .resource_descriptor
+                        .get(3)
+                        .map_or(0, |word| (word >> 28) & 0xf),
+                    image_slots.texture_slots[index],
+                    image_slots.sampler_slots[index],
+                )
+            })
+            .collect(),
+        vertex_inputs: evaluation
+            .vertex_inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.pc,
+                    input.location,
+                    input.component_count,
+                    input.data_format,
+                    input.number_format,
+                    input.stride,
+                    input.offset_bytes,
+                )
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn decode_metal_blend_attachment(
+    control: u32,
+) -> Result<MetalBlendAttachmentState, String> {
+    let disabled = MetalBlendAttachmentState {
+        enabled: false,
+        source_rgb: MTLBlendFactor::One,
+        destination_rgb: MTLBlendFactor::Zero,
+        rgb_operation: MTLBlendOperation::Add,
+        source_alpha: MTLBlendFactor::One,
+        destination_alpha: MTLBlendFactor::Zero,
+        alpha_operation: MTLBlendOperation::Add,
+    };
+    if control & (1 << 30) == 0 {
+        return Ok(disabled);
+    }
+
+    let source_rgb = metal_blend_factor(control & 0x1f)?;
+    let rgb_operation = metal_blend_operation((control >> 5) & 0x7)?;
+    let destination_rgb = metal_blend_factor((control >> 8) & 0x1f)?;
+    let separate_alpha = control & (1 << 29) != 0;
+    let (source_alpha, alpha_operation, destination_alpha) = if separate_alpha {
+        (
+            metal_blend_factor((control >> 16) & 0x1f)?,
+            metal_blend_operation((control >> 21) & 0x7)?,
+            metal_blend_factor((control >> 24) & 0x1f)?,
+        )
+    } else {
+        (source_rgb, rgb_operation, destination_rgb)
+    };
+    Ok(MetalBlendAttachmentState {
+        enabled: true,
+        source_rgb,
+        destination_rgb,
+        rgb_operation,
+        source_alpha,
+        destination_alpha,
+        alpha_operation,
+    })
+}
+
+pub(crate) fn metal_blend_factor(value: u32) -> Result<MTLBlendFactor, String> {
+    match value {
+        0 => Ok(MTLBlendFactor::Zero),
+        1 => Ok(MTLBlendFactor::One),
+        2 => Ok(MTLBlendFactor::SourceColor),
+        3 => Ok(MTLBlendFactor::OneMinusSourceColor),
+        4 => Ok(MTLBlendFactor::SourceAlpha),
+        5 => Ok(MTLBlendFactor::OneMinusSourceAlpha),
+        6 => Ok(MTLBlendFactor::DestinationAlpha),
+        7 => Ok(MTLBlendFactor::OneMinusDestinationAlpha),
+        8 => Ok(MTLBlendFactor::DestinationColor),
+        9 => Ok(MTLBlendFactor::OneMinusDestinationColor),
+        10 => Ok(MTLBlendFactor::SourceAlphaSaturated),
+        13 => Ok(MTLBlendFactor::BlendColor),
+        14 => Ok(MTLBlendFactor::OneMinusBlendColor),
+        19 => Ok(MTLBlendFactor::BlendAlpha),
+        20 => Ok(MTLBlendFactor::OneMinusBlendAlpha),
+        15..=18 => Err(format!(
+            "dual-source blend factor {value} requires a second pixel-shader color output"
+        )),
+        _ => Err(format!("unsupported blend factor {value}")),
+    }
+}
+
+pub(crate) fn metal_blend_operation(value: u32) -> Result<MTLBlendOperation, String> {
+    match value {
+        0 => Ok(MTLBlendOperation::Add),
+        1 => Ok(MTLBlendOperation::Subtract),
+        2 => Ok(MTLBlendOperation::Min),
+        3 => Ok(MTLBlendOperation::Max),
+        4 => Ok(MTLBlendOperation::ReverseSubtract),
+        _ => Err(format!("unsupported blend operation {value}")),
+    }
+}
+
+pub(crate) fn metal_color_write_mask(guest_mask: u32) -> MTLColorWriteMask {
+    // GFX10 CB_TARGET_MASK is R=1,G=2,B=4,A=8; MTLColorWriteMask uses the reverse bits.
+    let metal_mask = u64::from(guest_mask & 1 != 0) << 3
+        | u64::from(guest_mask & 2 != 0) << 2
+        | u64::from(guest_mask & 4 != 0) << 1
+        | u64::from(guest_mask & 8 != 0);
+    MTLColorWriteMask::from_bits_retain(metal_mask)
+}

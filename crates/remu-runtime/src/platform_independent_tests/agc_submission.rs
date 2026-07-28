@@ -1,0 +1,285 @@
+// Copyright (C) 2026 REmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+use std::sync::atomic::Ordering;
+
+use std::time::{Duration, Instant};
+
+use super::{
+    DEFAULT_FLIP_INTERVAL_MICROSECONDS, GPU_EVENT_SINK_TEST, ProbeDispatchState,
+    VIDEO_OUT_FLIP_INTERVAL, flip_interval_microseconds, pace_video_out_flip, read_guest_u16,
+    read_guest_u32, read_guest_u64, targetless_scanout_test_video, video_out_submit_flip,
+};
+
+#[test]
+fn agc_completion_tracking_requires_a_published_queue_submission() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remu_gpu::clear_event_sink();
+    let mut state = ProbeDispatchState {
+        agc_submission_count: 41,
+        ..ProbeDispatchState::default()
+    };
+
+    crate::request_agc_submission_completion(&mut state, 0, Vec::new());
+    crate::request_agc_compute_submission_completion(&mut state, 32, Vec::new());
+
+    assert!(state.pending_agc_completions.is_empty());
+    assert!(state.pending_agc_user_interrupts.is_empty());
+
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    crate::request_agc_submission_completion(&mut state, 0, Vec::new());
+    state.agc_submission_count = 42;
+    crate::request_agc_compute_submission_completion(&mut state, 32, Vec::new());
+    assert_eq!(
+        state
+            .pending_agc_completions
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        [(41, 0)]
+    );
+    assert_eq!(
+        state
+            .pending_agc_user_interrupts
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        [42]
+    );
+    assert!(matches!(
+        receiver.recv(),
+        Ok(remu_gpu::GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events,
+        }) if events == [remu_gpu::GpuEvent::SubmissionBoundary(41)]
+    ));
+    assert!(matches!(
+        receiver.recv(),
+        Ok(remu_gpu::GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events,
+        }) if events == [remu_gpu::GpuEvent::SubmissionBoundary(42)]
+    ));
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
+    let _serial = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let completed = remu_gpu::gpu_completed_submission_sequence();
+    let first = completed.saturating_add(1);
+    let second = first.saturating_add(1);
+    let mut state = ProbeDispatchState::default();
+    let mut equeue = 0_u64;
+    assert_eq!(
+        crate::dispatch_stateless_import(
+            "D0OdFMjp46I",
+            [(&raw mut equeue).addr() as u64, 0, 0, 0, 0, 0],
+            [0; 6],
+        ),
+        None,
+        "the stateful equeue creator must not be shadowed by a placeholder"
+    );
+    assert_eq!(
+        crate::kernel_create_equeue((&raw mut equeue).addr() as u64, &mut state),
+        0
+    );
+    assert_eq!(equeue, 1);
+    assert_eq!(
+        crate::agc_driver_add_eq_event([equeue, 0x1234, 0xfeed_face, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(
+        crate::agc_driver_add_eq_event([equeue, 0x20, 0xcafe_babe, 0, 0, 0], &mut state),
+        0
+    );
+    state
+        .pending_agc_completions
+        .extend([(first, 0x1234), (second, 0x1234)]);
+    remu_gpu::record_gpu_submission_completed(second);
+    remu_gpu::record_gpu_submission_completed(first);
+
+    let mut event = [0_u8; 0x40];
+    let mut count = 0_u32;
+    assert_eq!(
+        crate::kernel_poll_equeue(
+            [
+                equeue,
+                event.as_mut_ptr().addr() as u64,
+                2,
+                (&raw mut count).addr() as u64,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
+        Ok(1)
+    );
+    assert_eq!(count, 1);
+    assert_eq!(read_guest_u64(event.as_ptr().addr() as u64), 0x1234);
+    assert_eq!(
+        read_guest_u16(event.as_ptr().addr() as u64 + 8),
+        crate::KERNEL_EVENT_FILTER_GRAPHICS.cast_unsigned()
+    );
+    assert_eq!(read_guest_u32(event.as_ptr().addr() as u64 + 0x0c), 2);
+    assert_eq!(read_guest_u64(event.as_ptr().addr() as u64 + 0x10), 0x1234);
+    assert_eq!(
+        read_guest_u64(event.as_ptr().addr() as u64 + 0x18),
+        0xfeed_face
+    );
+    assert!(
+        state
+            .pending_events
+            .iter()
+            .all(|pending| pending.ident != 0x20),
+        "graphics completion must not wake an unrelated compute queue"
+    );
+    assert!(state.pending_agc_completions.is_empty());
+}
+
+#[test]
+fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
+    let _serial = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
+    let mut state = ProbeDispatchState::default();
+    state.kernel_equeues.extend([1, 2]);
+    assert_eq!(
+        crate::kernel_register_event(
+            &mut state,
+            1,
+            0x1800,
+            crate::KERNEL_EVENT_FILTER_USER,
+            0xfeed_face,
+        ),
+        0
+    );
+    assert_eq!(
+        crate::kernel_register_event(
+            &mut state,
+            2,
+            0x20,
+            crate::KERNEL_EVENT_FILTER_GRAPHICS,
+            0xcafe_babe,
+        ),
+        0
+    );
+    state.pending_agc_user_interrupts.push_back(sequence);
+    remu_gpu::record_gpu_submission_completed(sequence);
+
+    crate::refresh_completed_agc_submissions(&mut state);
+
+    assert!(state.pending_agc_completions.is_empty());
+    assert!(state.pending_agc_user_interrupts.is_empty());
+    assert_eq!(state.pending_events.len(), 1);
+    let user_event = state.pending_events.front().expect("AGC user interrupt");
+    assert_eq!(user_event.equeue, 1);
+    assert_eq!(user_event.ident, 0x1800);
+    assert_eq!(user_event.fflags, 1);
+    assert_eq!(user_event.user_data, 0xfeed_face);
+    assert!(
+        state
+            .pending_events
+            .iter()
+            .all(|event| event.filter != crate::KERNEL_EVENT_FILTER_GRAPHICS),
+        "compute completion must not also wake the owner's graphics event"
+    );
+}
+
+#[test]
+fn direct_video_out_submit_flip_reaches_the_presenter() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let address = 0x0070_1234_5600_u64;
+    let mut state = ProbeDispatchState {
+        video_out: targetless_scanout_test_video(address),
+        ..ProbeDispatchState::default()
+    };
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+
+    let result = video_out_submit_flip([1, 0, 0, 0x1234, 0, 0], &mut state);
+    crate::QUEUED_FLIPS.with(|queued| queued.set(0));
+
+    assert_eq!(result, 0);
+    assert_eq!(remu_gpu::gpu_flips_pending(), 1);
+    let remu_gpu::GpuEvent::Flip {
+        address: flipped_address,
+        buffer_index,
+        flip_argument,
+        width,
+        height,
+        ..
+    } = receiver.recv().expect("direct VideoOut flip event")
+    else {
+        panic!("direct VideoOut submission must emit a presenter flip");
+    };
+    assert_eq!(flipped_address, address);
+    assert_eq!(buffer_index, 0);
+    assert_eq!(flip_argument, 0x1234);
+    assert_eq!((width, height), (1_280, 720));
+    assert_eq!(
+        crate::video_out_is_flip_pending([1, 0, 0, 0, 0, 0], &mut state),
+        1
+    );
+    remu_gpu::record_gpu_flip_completed(remu_gpu::GpuFlipCompletion {
+        address,
+        buffer_index,
+        flip_argument,
+    });
+    assert_eq!(remu_gpu::gpu_flips_pending(), 0);
+    crate::refresh_completed_video_out_flips(&mut state);
+    assert_eq!(
+        crate::video_out_is_flip_pending([1, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(state.video_out.completed_flip_count, 1);
+    assert!(receiver.try_recv().is_err());
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn gpu_progress_telemetry_keeps_a_prefix_and_logarithmic_checkpoints() {
+    for sequence in 0..=8 {
+        assert!(crate::trace_logarithmic_sequence(sequence, 8));
+    }
+    assert!(!crate::trace_logarithmic_sequence(9, 8));
+    assert!(crate::trace_logarithmic_sequence(16, 8));
+    assert!(!crate::trace_logarithmic_sequence(17, 8));
+    assert!(crate::trace_logarithmic_sequence(1_u64 << 63, 8));
+}
+
+/// The selector chooses the display's hold time; an unrecognized value keeps the 60 Hz
+/// default rather than disabling pacing.
+#[test]
+fn flip_rate_selectors_map_to_display_intervals() {
+    assert_eq!(flip_interval_microseconds(0), 16_666);
+    assert_eq!(flip_interval_microseconds(1), 33_333);
+    assert_eq!(flip_interval_microseconds(2), 50_000);
+    assert_eq!(flip_interval_microseconds(7), 16_666);
+}
+
+/// Pacing must gate the guest's frame loop: submitting flips in a tight loop has to take at
+/// least the display interval per flip.
+#[test]
+fn paced_flips_are_held_for_the_display_interval() {
+    VIDEO_OUT_FLIP_INTERVAL.store(4_000, Ordering::Relaxed);
+    pace_video_out_flip();
+    let start = Instant::now();
+    for _ in 0..5 {
+        pace_video_out_flip();
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_micros(4_000 * 4),
+        "five paced flips returned in {elapsed:?}"
+    );
+    VIDEO_OUT_FLIP_INTERVAL.store(DEFAULT_FLIP_INTERVAL_MICROSECONDS, Ordering::Relaxed);
+}

@@ -1,0 +1,540 @@
+// Copyright (C) 2026 REmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+use super::{
+    EVENT_POLL_INTERVAL, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
+    MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS,
+    MetalPresenter, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED,
+    PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_DRAW_GATES, PresenterFlow, RESIDENT_DEPTH_SAMPLE_HITS,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, SAMPLED_ALIAS_WRITEBACK_BYTES,
+    SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
+    SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
+    SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
+    TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
+    presentation_drawable_size, process_resident_bytes, take_mode27_work_details,
+    take_texture_dirty_work_details, take_texture_snapshot_work_details,
+};
+use core_graphics_types::geometry::CGSize;
+use metal::{MTLPixelFormat, MetalLayer};
+use objc::runtime::{Object, YES};
+use objc::{msg_send, sel, sel_impl};
+use remu_gpu::{
+    GpuEvent, HostPadState, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
+    PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2,
+    PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
+};
+use std::ffi::OsStr;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::{ElementState, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::window::{Window, WindowId};
+
+impl MetalPresenter {
+    pub(crate) fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        let window = event_loop
+            .create_window(presenter_window_attributes())
+            .map_err(|error| format!("could not create the macOS window: {error}"))?;
+        self.initialize_window(window)
+    }
+
+    pub(crate) fn initialize_window(&mut self, window: Window) -> Result<(), String> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal presenter resources are unavailable")?;
+        let mut layer = MetalLayer::new();
+        layer.set_device(device);
+        // Guest render targets are linear (including the RGBA16F scanout used by Unity). An
+        // sRGB drawable applies the display transfer function while storing into the 8-bit
+        // swapchain. Presenting into BGRA8Unorm copied those linear values verbatim and crushed
+        // the entire lower end of the scene toward black.
+        layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm_sRGB);
+        // Presentation uses a fullscreen sampling pass so a high-resolution guest display buffer
+        // does not force an equally large host drawable. The layer remains framebuffer-only.
+        layer.set_framebuffer_only(true);
+        layer.set_presents_with_transaction(false);
+
+        // SAFETY: Winit owns a live NSView on the main thread. NSView retains the CAMetalLayer;
+        // this presenter also keeps its owning MetalLayer handle until the event loop exits.
+        unsafe {
+            let handle = window
+                .window_handle()
+                .map_err(|error| format!("could not get the AppKit window handle: {error}"))?;
+            let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+                return Err("winit did not create an AppKit window".to_owned());
+            };
+            let view = appkit.ns_view.as_ptr().cast::<Object>();
+            let _: () = msg_send![view, setWantsLayer: YES];
+            let _: () = msg_send![view, setLayer: layer.as_mut()];
+        }
+
+        let size = window.inner_size();
+        let (width, height) = presentation_drawable_size(
+            self.presentation_resolution,
+            size.width,
+            size.height,
+            window.scale_factor(),
+        );
+        layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
+        eprintln!(
+            "[REMu][METAL] presenter started on {} at {width}x{height} ({:?})",
+            device.name(),
+            self.presentation_resolution
+        );
+
+        // A CLI-launched AppKit process can become the active application before its first
+        // NSWindow is ordered onto the current Space. Explicitly order and focus the completed
+        // window so a running game cannot remain hidden behind the launching application.
+        window.set_visible(true);
+        window.focus_window();
+        self.window = Some(window);
+        self.layer = Some(layer);
+        Ok(())
+    }
+
+    pub(crate) fn update_window_title(&mut self) {
+        const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+        let elapsed = self.statistics.interval_started.elapsed();
+        if elapsed < UPDATE_INTERVAL {
+            return;
+        }
+        let seconds = elapsed.as_secs_f64();
+        let completed = self.statistics.completed_presents;
+        let flip_rate = f64::from(self.statistics.guest_flips) / seconds;
+        let present_rate = f64::from(completed) / seconds;
+        // The user-visible FPS is the rate of new guest frames, not redraws of the most recent
+        // drawable. Presentation can keep running while the guest is stalled on rendering, so
+        // reporting it as FPS hid the exact black-screen/audio-starvation condition this title is
+        // intended to diagnose.
+        let frame_milliseconds = if flip_rate > 0.0 {
+            1_000.0 / flip_rate
+        } else {
+            0.0
+        };
+        let draw_rate = f64::from(self.statistics.encoded_draws) / seconds;
+        let compute_rate = f64::from(self.statistics.encoded_compute_dispatches) / seconds;
+        let render_pass_rate = f64::from(self.statistics.encoded_render_passes) / seconds;
+        let presentation_latency_milliseconds = if completed == 0 {
+            0.0
+        } else {
+            self.statistics.presentation_queue_latency.as_secs_f64() * 1_000.0
+                / f64::from(completed)
+        };
+        let gpu_utilization =
+            (self.statistics.gpu_execution_time.as_secs_f64() * 100.0 / seconds).clamp(0.0, 100.0);
+        let guest_batch_rate = f64::from(self.statistics.submitted_guest_batches) / seconds;
+        let pipeline_barrier_rate =
+            f64::from(self.statistics.coalesced_pipeline_barriers) / seconds;
+        let resident_mib = process_resident_bytes().map(|bytes| bytes.div_ceil(1024 * 1024));
+        let audio_output = remu_gpu::audio_output_frames();
+        let interval_audio_output =
+            audio_output.saturating_sub(self.statistics.last_audio_output_frames);
+        let audio_output_rate = interval_audio_output as f64 / seconds;
+        let audio_underruns = remu_gpu::audio_underrun_frames();
+        let interval_underruns =
+            audio_underruns.saturating_sub(self.statistics.last_audio_underrun_frames);
+        let audio_underrun_percent = if interval_audio_output == 0 {
+            0.0
+        } else {
+            let output = u32::try_from(interval_audio_output).unwrap_or(u32::MAX);
+            let underruns = u32::try_from(interval_underruns).unwrap_or(u32::MAX);
+            f64::from(underruns) * 100.0 / f64::from(output)
+        };
+        let resident =
+            resident_mib.map_or_else(|| "RSS ?".to_owned(), |mib| format!("RSS {mib} MiB"));
+        let pending_gpu_events = remu_gpu::gpu_work_items_pending();
+        let pending_flips = remu_gpu::gpu_flips_pending();
+        let title = format!(
+            "REMu | FPS {flip_rate:.1} ({frame_milliseconds:.1} ms) | Present {present_rate:.1}/s | GPU {gpu_utilization:.0}% Lat {presentation_latency_milliseconds:.1} ms | {resident} | Draw {draw_rate:.0}/s RP {render_pass_rate:.0}/s CS {compute_rate:.0}/s | CB {guest_batch_rate:.0}/s PB {pipeline_barrier_rate:.0}/s ({}) | Q W{} P{} F{} | Tex {} | Pipe {}/{} | Audio {audio_output_rate:.0}/s U {audio_underrun_percent:.1}%",
+            self.committed_guest_batches.len(),
+            pending_gpu_events,
+            self.pending_presentations.len(),
+            pending_flips,
+            self.sampled_texture_cache.len(),
+            self.compiled_shader_pairs.len(),
+            self.compiling_shader_pairs.len(),
+        );
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(&title);
+        }
+        if self.statistics.last_logged.elapsed() >= Duration::from_secs(5) {
+            eprintln!("[REMu][PERF] {title}");
+            eprintln!(
+                "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s flip={:.0}/s capacity={:.0}/s sync={:.0}/s",
+                f64::from(self.statistics.render_pass_ends_for_compute) / seconds,
+                f64::from(self.statistics.render_pass_ends_for_target_change) / seconds,
+                f64::from(self.statistics.render_pass_ends_for_batch_flush) / seconds,
+                f64::from(self.statistics.batch_flushes_from_event_loop) / seconds,
+                f64::from(self.statistics.batch_flushes_for_guest_memory_write) / seconds,
+                f64::from(self.statistics.batch_flushes_for_blocked_wait) / seconds,
+                f64::from(self.statistics.batch_flushes_for_flip_snapshot) / seconds,
+                f64::from(self.statistics.batch_flushes_for_work_capacity) / seconds,
+                f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
+            );
+            let compile_enqueued = PIPELINE_COMPILE_ENQUEUED.swap(0, Ordering::Relaxed);
+            let compile_queue_full = PIPELINE_COMPILE_QUEUE_FULL.swap(0, Ordering::Relaxed);
+            let compile_completed = PIPELINE_COMPILE_COMPLETED.swap(0, Ordering::Relaxed);
+            let compile_failed = PIPELINE_COMPILE_FAILED.swap(0, Ordering::Relaxed);
+            let draw_gates = PIPELINE_DRAW_GATES.swap(0, Ordering::Relaxed);
+            let (pipeline_blocks, memory_blocks) = self.receiver.block_reason_counts();
+            eprintln!(
+                "[REMu][PERF-PIPELINE] ready={} active={} failed={} interval=enqueued:{compile_enqueued}/full:{compile_queue_full}/done:{compile_completed}/failed:{compile_failed}/gates:{draw_gates} blocked=pipeline:{pipeline_blocks}/memory:{memory_blocks}",
+                self.compiled_shader_pairs.len(),
+                self.compiling_shader_pairs.len(),
+                self.failed_shader_pairs.len(),
+            );
+            let queue_diagnostics = self.receiver.queue_diagnostics();
+            if !queue_diagnostics.is_empty() {
+                eprintln!("[REMu][PERF-QUEUES] {queue_diagnostics}");
+            }
+            let snapshot_count = TEXTURE_SNAPSHOT_COUNT.swap(0, Ordering::Relaxed);
+            let snapshot_bytes = TEXTURE_SNAPSHOT_BYTES.swap(0, Ordering::Relaxed);
+            let snapshot_nanoseconds = TEXTURE_SNAPSHOT_NANOSECONDS.swap(0, Ordering::Relaxed);
+            let decode_count = MODE27_DECODE_COUNT.swap(0, Ordering::Relaxed);
+            let decode_bytes = MODE27_DECODE_BYTES.swap(0, Ordering::Relaxed);
+            let decode_nanoseconds = MODE27_DECODE_NANOSECONDS.swap(0, Ordering::Relaxed);
+            let upload_count = MIP_UPLOAD_COUNT.swap(0, Ordering::Relaxed);
+            let upload_bytes = MIP_UPLOAD_BYTES.swap(0, Ordering::Relaxed);
+            let upload_nanoseconds = MIP_UPLOAD_NANOSECONDS.swap(0, Ordering::Relaxed);
+            eprintln!(
+                "[REMu][PERF-TEXTURE] snapshot={snapshot_count}/{:.1}MiB/{:.1}ms mode27={decode_count}/{:.1}MiB/{:.1}ms upload={upload_count}/{:.1}MiB/{:.1}ms",
+                snapshot_bytes as f64 / (1024.0 * 1024.0),
+                snapshot_nanoseconds as f64 / 1_000_000.0,
+                decode_bytes as f64 / (1024.0 * 1024.0),
+                decode_nanoseconds as f64 / 1_000_000.0,
+                upload_bytes as f64 / (1024.0 * 1024.0),
+                upload_nanoseconds as f64 / 1_000_000.0,
+            );
+            let cache_hits = SAMPLED_TEXTURE_CACHE_HITS.swap(0, Ordering::Relaxed);
+            let cache_misses = SAMPLED_TEXTURE_CACHE_MISSES.swap(0, Ordering::Relaxed);
+            let cache_dirty_reloads =
+                SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS.swap(0, Ordering::Relaxed);
+            let cache_acquire_invalidations =
+                SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS.swap(0, Ordering::Relaxed);
+            let cache_capacity_evictions =
+                SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS.swap(0, Ordering::Relaxed);
+            let resident_acquire_invalidations =
+                RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.swap(0, Ordering::Relaxed);
+            let depth_resident_hits = RESIDENT_DEPTH_SAMPLE_HITS.swap(0, Ordering::Relaxed);
+            let alias_writeback_count = SAMPLED_ALIAS_WRITEBACK_COUNT.swap(0, Ordering::Relaxed);
+            let alias_writeback_bytes = SAMPLED_ALIAS_WRITEBACK_BYTES.swap(0, Ordering::Relaxed);
+            let alias_writeback_nanoseconds =
+                SAMPLED_ALIAS_WRITEBACK_NANOSECONDS.swap(0, Ordering::Relaxed);
+            eprintln!(
+                "[REMu][PERF-TEXTURE-CACHE] resident={} watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms",
+                self.sampled_texture_cache.len(),
+                self.sampled_texture_write_watches.len(),
+                cache_hits,
+                cache_misses,
+                cache_dirty_reloads,
+                cache_acquire_invalidations,
+                resident_acquire_invalidations,
+                cache_capacity_evictions,
+                depth_resident_hits,
+                alias_writeback_count,
+                alias_writeback_bytes as f64 / (1024.0 * 1024.0),
+                alias_writeback_nanoseconds as f64 / 1_000_000.0,
+            );
+            let snapshot_details = take_texture_snapshot_work_details();
+            if !snapshot_details.is_empty() {
+                let top = snapshot_details
+                    .into_iter()
+                    .take(8)
+                    .map(|(key, aggregate)| {
+                        format!(
+                            "{:#x}/{:.1}MiB@L{}={}/{:.1}MiB/{:.1}ms",
+                            key.address,
+                            key.byte_count as f64 / (1024.0 * 1024.0),
+                            key.caller_line,
+                            aggregate.count,
+                            aggregate.bytes as f64 / (1024.0 * 1024.0),
+                            aggregate.nanoseconds as f64 / 1_000_000.0,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!("[REMu][PERF-SNAPSHOT-TOP] {top}");
+            }
+            let dirty_details = take_texture_dirty_work_details();
+            if !dirty_details.is_empty() {
+                let top = dirty_details
+                    .into_iter()
+                    .take(8)
+                    .map(|(key, aggregate)| {
+                        let dirty_percent = if aggregate.full_bytes == 0 {
+                            0.0
+                        } else {
+                            aggregate.dirty_bytes as f64 * 100.0
+                                / aggregate.full_bytes as f64
+                        };
+                        format!(
+                            "{:#x}/{:.1}MiB@L{}={}snap/{}clean/{}imprecise dirty={:.1}MiB({dirty_percent:.3}%)/{}pages",
+                            key.address,
+                            key.byte_count as f64 / (1024.0 * 1024.0),
+                            key.caller_line,
+                            aggregate.snapshots,
+                            aggregate.clean_snapshots,
+                            aggregate.imprecise_snapshots,
+                            aggregate.dirty_bytes as f64 / (1024.0 * 1024.0),
+                            aggregate.dirty_pages,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!("[REMu][PERF-TEXTURE-DIRTY-TOP] {top}");
+            }
+            let mode27_details = take_mode27_work_details();
+            if !mode27_details.is_empty() {
+                let top = mode27_details
+                    .into_iter()
+                    .take(8)
+                    .map(|(key, aggregate)| {
+                        format!(
+                            "{:?}@{:#x}/{}x{}/p{}/fmt{:?}/m{}={}/{:.1}MiB/{:.1}ms",
+                            key.origin,
+                            key.descriptor.address,
+                            key.descriptor.width,
+                            key.descriptor.height,
+                            key.descriptor.pitch,
+                            key.descriptor.pixel_format,
+                            key.mip_level_count,
+                            aggregate.count,
+                            aggregate.bytes as f64 / (1024.0 * 1024.0),
+                            aggregate.nanoseconds as f64 / 1_000_000.0,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!("[REMu][PERF-TEXTURE-TOP] {top}");
+            }
+            self.statistics.last_logged = Instant::now();
+        }
+        self.statistics.interval_started = Instant::now();
+        self.statistics.guest_flips = 0;
+        self.statistics.completed_presents = 0;
+        self.statistics.submitted_guest_batches = 0;
+        self.statistics.coalesced_pipeline_barriers = 0;
+        self.statistics.encoded_draws = 0;
+        self.statistics.encoded_compute_dispatches = 0;
+        self.statistics.encoded_render_passes = 0;
+        self.statistics.render_pass_ends_for_compute = 0;
+        self.statistics.render_pass_ends_for_target_change = 0;
+        self.statistics.render_pass_ends_for_batch_flush = 0;
+        self.statistics.batch_flushes_from_event_loop = 0;
+        self.statistics.batch_flushes_for_guest_memory_write = 0;
+        self.statistics.batch_flushes_for_blocked_wait = 0;
+        self.statistics.batch_flushes_for_flip_snapshot = 0;
+        self.statistics.batch_flushes_for_work_capacity = 0;
+        self.statistics.batch_flushes_for_cpu_synchronization = 0;
+        self.statistics.gpu_execution_time = Duration::ZERO;
+        self.statistics.presentation_queue_latency = Duration::ZERO;
+        self.statistics.last_audio_output_frames = audio_output;
+        self.statistics.last_audio_underrun_frames = audio_underruns;
+    }
+
+    pub(crate) fn update_keyboard_input(&mut self, code: KeyCode, state: ElementState) {
+        match state {
+            ElementState::Pressed => {
+                self.pressed_keys.insert(code);
+            }
+            ElementState::Released => {
+                self.pressed_keys.remove(&code);
+            }
+        }
+        self.publish_pad_state();
+    }
+
+    pub(crate) fn publish_pad_state(&self) {
+        let down = |code| self.pressed_keys.contains(&code);
+        let mut buttons = 0;
+        for (pressed, button) in [
+            (down(KeyCode::ArrowUp), PAD_BUTTON_UP),
+            (down(KeyCode::ArrowRight), PAD_BUTTON_RIGHT),
+            (down(KeyCode::ArrowDown), PAD_BUTTON_DOWN),
+            (down(KeyCode::ArrowLeft), PAD_BUTTON_LEFT),
+            (
+                down(KeyCode::Enter) || down(KeyCode::NumpadEnter) || down(KeyCode::KeyZ),
+                PAD_BUTTON_CROSS,
+            ),
+            (
+                down(KeyCode::Escape) || down(KeyCode::KeyX),
+                PAD_BUTTON_CIRCLE,
+            ),
+            (down(KeyCode::KeyC), PAD_BUTTON_SQUARE),
+            (down(KeyCode::KeyV), PAD_BUTTON_TRIANGLE),
+            (down(KeyCode::KeyQ), PAD_BUTTON_L1),
+            (down(KeyCode::KeyE), PAD_BUTTON_R1),
+            (down(KeyCode::KeyR), PAD_BUTTON_L2),
+            (down(KeyCode::KeyF), PAD_BUTTON_R2),
+            (
+                down(KeyCode::Tab) || down(KeyCode::Backspace),
+                PAD_BUTTON_OPTIONS,
+            ),
+        ] {
+            if pressed {
+                buttons |= button;
+            }
+        }
+        let axis = |negative, positive| match (down(negative), down(positive)) {
+            (true, false) => 0,
+            (false, true) => 255,
+            _ => 128,
+        };
+        set_host_pad_state(HostPadState {
+            buttons,
+            left_x: axis(KeyCode::KeyA, KeyCode::KeyD),
+            left_y: axis(KeyCode::KeyW, KeyCode::KeyS),
+            right_x: axis(KeyCode::KeyJ, KeyCode::KeyL),
+            right_y: axis(KeyCode::KeyI, KeyCode::KeyK),
+            l2: if down(KeyCode::KeyR) { 255 } else { 0 },
+            r2: if down(KeyCode::KeyF) { 255 } else { 0 },
+        });
+    }
+}
+
+pub(crate) fn headless_metal_value_is_enabled(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+pub(crate) fn headless_metal_requested() -> bool {
+    headless_metal_value_is_enabled(std::env::var_os("REMU_HEADLESS_METAL").as_deref())
+}
+
+pub(crate) fn presenter_window_attributes() -> winit::window::WindowAttributes {
+    Window::default_attributes()
+        .with_title("REmu")
+        .with_inner_size(LogicalSize::new(1280, 720))
+        .with_active(true)
+}
+
+impl ApplicationHandler for MetalPresenter {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() || self.startup_error.is_some() {
+            return;
+        }
+        if let Err(error) = self.initialize(event_loop) {
+            eprintln!("[REMu][METAL] {error}");
+            self.startup_error = Some(error);
+            event_loop.exit();
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => {
+                eprintln!("[REMu][METAL] window close requested by AppKit");
+                self.persist_render_pipeline_archive();
+                event_loop.exit();
+            }
+            WindowEvent::Focused(false) => {
+                self.pressed_keys.clear();
+                self.publish_pad_state();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.update_keyboard_input(code, event.state);
+                }
+            }
+            WindowEvent::Resized(size) => {
+                if size.width != 0
+                    && size.height != 0
+                    && let Some(layer) = self.layer.as_ref()
+                {
+                    let scale_factor = self.window.as_ref().map_or(1.0, Window::scale_factor);
+                    let (width, height) = presentation_drawable_size(
+                        self.presentation_resolution,
+                        size.width,
+                        size.height,
+                        scale_factor,
+                    );
+                    layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
+                    self.redraw_pending = true;
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let (Some(window), Some(layer)) = (self.window.as_ref(), self.layer.as_ref()) {
+                    let size = window.inner_size();
+                    let (width, height) = presentation_drawable_size(
+                        self.presentation_resolution,
+                        size.width,
+                        size.height,
+                        scale_factor,
+                    );
+                    layer.set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
+                    self.redraw_pending = true;
+                }
+            }
+            WindowEvent::RedrawRequested => self.render(),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.receive_events() == PresenterFlow::Shutdown {
+            event_loop.exit();
+            return;
+        }
+        if let Err(error) = self.flush_guest_command_batch(false, GuestBatchFlushReason::EventLoop)
+        {
+            eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
+        }
+        self.retire_completed_presentations();
+        self.update_window_title();
+        if self.redraw_pending
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+        }
+        // The std channel feeding guest GPU work cannot wake Winit directly. A short deadline
+        // keeps submission latency low without ControlFlow::Poll busy-spinning an otherwise idle
+        // process or continuously presenting identical drawables.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
+    }
+}
+
+pub(crate) fn run_headless_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
+    eprintln!("[REMu][METAL] starting headless Metal event loop");
+    let mut presenter = MetalPresenter::new(receiver)?;
+    eprintln!(
+        "[REMu][METAL] headless presenter started on {}",
+        presenter
+            .device
+            .as_ref()
+            .ok_or("Metal presenter resources are unavailable")?
+            .name()
+    );
+    loop {
+        let (flow, submission) = objc::rc::autoreleasepool(|| {
+            let flow = presenter.receive_events();
+            let submission = if flow == PresenterFlow::Continue {
+                presenter.flush_guest_command_batch(false, GuestBatchFlushReason::EventLoop)
+            } else {
+                Ok(())
+            };
+            (flow, submission)
+        });
+        submission.map_err(|error| format!("guest command batch submission failed: {error}"))?;
+        presenter.retire_completed_presentations();
+        // `render` performs pending-flip upload and translated-scanout capture before it checks
+        // for a CAMetalLayer. This keeps headless traces faithful through the last guest-visible
+        // image stage while intentionally omitting only the host window composite.
+        presenter.render();
+        presenter.update_window_title();
+        if flow == PresenterFlow::Shutdown {
+            eprintln!("[REMu][METAL] headless event loop stopped");
+            return Ok(());
+        }
+        std::thread::sleep(EVENT_POLL_INTERVAL);
+    }
+}
