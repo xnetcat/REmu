@@ -42,3 +42,10 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 module_name_repetitions = "allow"
+
+[profile.release]
+# Module boundaries must not cost performance. Without this, rustc partitions the crate
+# into 16 codegen units along module lines and will not inline across them, so splitting
+# a large file into topic modules can silently pessimise hot paths such as import
+# dispatch. ThinLTO restores cross-module inlining at a modest build-time cost.
+lto = "thin"
