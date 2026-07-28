@@ -413,7 +413,6 @@ impl LinkedImage {
         module_startup: &[bool],
     ) -> Result<Self, LinkError> {
         debug_assert_eq!(modules.len(), module_startup.len());
-        FMOD_CORE_SYSTEM_INITIALIZE_TARGET.store(0, Ordering::Release);
         let elf = executable.info.elf.as_ref().ok_or(LinkError::MissingElf)?;
         let dynamic = elf
             .dynamic
@@ -2007,16 +2006,6 @@ fn resolve_symbol_at(
         let key = process_symbol_key(dynamic, symbol)?;
         let nid = key.nid();
         if let Some(address) = process_exports.get(&key).copied() {
-            if nid == "+IB8LyiKvIE"
-                && std::env::var_os("REMU_TRACE_FMOD").is_some_and(|value| value == "1")
-            {
-                FMOD_CORE_SYSTEM_INITIALIZE_TARGET.store(
-                    usize::try_from(address)
-                        .expect("guest function address fits the native pointer width"),
-                    Ordering::Release,
-                );
-                return Ok(trace_fmod_core_system_initialize as *const () as usize as u64);
-            }
             return Ok(address);
         }
         if let Some(address) = native_import_target(nid) {
@@ -3998,8 +3987,6 @@ static NEXT_SSL_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static NEXT_HTTP_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static NEXT_NP_WEB_API2_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static DISPATCH_LOCK_STALL_LOGS: AtomicUsize = AtomicUsize::new(0);
-static FMOD_CORE_SYSTEM_INITIALIZE_TARGET: AtomicUsize = AtomicUsize::new(0);
-static FMOD_STUDIO_SYSTEM_INITIALIZE_TARGET: AtomicUsize = AtomicUsize::new(0);
 static GUEST_EXCEPTION_DELIVERY: OnceLock<Mutex<GuestExceptionDeliveryState>> = OnceLock::new();
 
 #[derive(Debug, Default)]
@@ -5140,7 +5127,6 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .get_or_init(|| Mutex::new(AudioOut2State::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = AudioOut2State::default();
-    FMOD_STUDIO_SYSTEM_INITIALIZE_TARGET.store(0, Ordering::Release);
     state.agc_primary_register_defaults = 0;
     state.agc_internal_register_defaults = 0;
     state.ctype_table = 0;
@@ -8575,61 +8561,6 @@ fn sce_symbol_nid(symbol: &str) -> String {
     nid
 }
 
-extern "C" fn trace_fmod_core_system_initialize(
-    system: u64,
-    maximum_channels: i32,
-    core_flags: u32,
-    extra_driver_data: u64,
-) -> i32 {
-    let target = FMOD_CORE_SYSTEM_INITIALIZE_TARGET.load(Ordering::Acquire);
-    if target == 0 {
-        return -1;
-    }
-    eprintln!(
-        "[REMu][FMOD] Core_System_Init system={system:#x} channels={maximum_channels} flags={core_flags:#x} extra={extra_driver_data:#x}"
-    );
-    type Initialize = unsafe extern "C" fn(u64, i32, u32, u64) -> i32;
-    // SAFETY: the linker records the mapped executable guest export with this exact FMOD C ABI
-    // before redirecting the Studio module's import relocation to this tracing wrapper.
-    let initialize: Initialize = unsafe { std::mem::transmute(target) };
-    // SAFETY: the wrapper forwards the caller's unmodified C ABI arguments to the recorded export.
-    let result = unsafe { initialize(system, maximum_channels, core_flags, extra_driver_data) };
-    eprintln!("[REMu][FMOD] Core_System_Init result={result} ({result:#x})");
-    result
-}
-
-extern "C" fn trace_fmod_studio_system_initialize(
-    system: u64,
-    maximum_channels: i32,
-    studio_flags: u32,
-    core_flags: u32,
-    extra_driver_data: u64,
-) -> i32 {
-    let target = FMOD_STUDIO_SYSTEM_INITIALIZE_TARGET.load(Ordering::Acquire);
-    if target == 0 {
-        return -1;
-    }
-    eprintln!(
-        "[REMu][FMOD] Studio_System_Initialize system={system:#x} channels={maximum_channels} studio_flags={studio_flags:#x} core_flags={core_flags:#x} extra={extra_driver_data:#x}"
-    );
-    type Initialize = unsafe extern "C" fn(u64, i32, u32, u32, u64) -> i32;
-    // SAFETY: dlsym records the mapped executable guest export with this exact FMOD C ABI before
-    // exposing the tracing wrapper to the caller. The guest image stays mapped for the process run.
-    let initialize: Initialize = unsafe { std::mem::transmute(target) };
-    // SAFETY: the wrapper forwards the caller's unmodified C ABI arguments to the recorded export.
-    let result = unsafe {
-        initialize(
-            system,
-            maximum_channels,
-            studio_flags,
-            core_flags,
-            extra_driver_data,
-        )
-    };
-    eprintln!("[REMu][FMOD] Studio_System_Initialize result={result} ({result:#x})");
-    result
-}
-
 fn kernel_dlsym(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     let Some(symbol) = read_guest_cstring(arguments[1]) else {
         return u64::MAX;
@@ -8650,21 +8581,11 @@ fn kernel_dlsym(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
         .and_then(|module| module.exports_by_nid.get(&nid))
         .copied()
         .unwrap_or_default();
-    let mut target = if hle_target != 0 {
+    let target = if hle_target != 0 {
         hle_target
     } else {
         guest_target
     };
-    if symbol == "FMOD_Studio_System_Initialize"
-        && target != 0
-        && std::env::var_os("REMU_TRACE_FMOD").is_some_and(|value| value == "1")
-    {
-        FMOD_STUDIO_SYSTEM_INITIALIZE_TARGET.store(
-            usize::try_from(target).expect("guest function address fits the native pointer width"),
-            Ordering::Release,
-        );
-        target = trace_fmod_studio_system_initialize as *const () as usize as u64;
-    }
     if arguments[2] == 0 || target == 0 {
         if arguments[2] != 0 {
             write_guest_u64(arguments[2], 0);
