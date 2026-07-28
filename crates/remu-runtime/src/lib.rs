@@ -20009,7 +20009,17 @@ fn av_player_probe_has_audio(path: &Path) -> bool {
         .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
 }
 
-fn av_player_remove_unreal_leading_dot_segments(path: &str) -> Option<&str> {
+/// Clamps a media source path at the application filesystem root.
+///
+/// AVPlayer resolves sources inside the mounted application filesystem, which has no parent above
+/// its root. A source beginning with `.` or `..` segments names a directory outside that root, so
+/// the segments are dropped and the remainder resolves from the root, matching how a sandboxed
+/// filesystem clamps an escape at its mount point. A bare filename left after one or more parent
+/// segments has no directory left to anchor it, so it is refused rather than silently becoming a
+/// root lookup.
+///
+/// A path with no leading dot segments is returned unchanged.
+fn av_player_clamp_leading_dot_segments(path: &str) -> Option<&str> {
     let mut normalized = path;
     let mut removed_parent = false;
     loop {
@@ -20022,14 +20032,11 @@ fn av_player_remove_unreal_leading_dot_segments(path: &str) -> Option<&str> {
             break;
         }
     }
-    // A bare filename after one or more parent segments has no project directory to anchor it.
-    // Refuse it instead of silently turning an attempted escape into an app0-root lookup.
     (!removed_parent || normalized.contains('/')).then_some(normalized)
 }
 
 fn av_player_resolve_source(game_root: &Path, source: &str) -> Option<PathBuf> {
     let mut normalized = source.trim().trim_end_matches('\0').replace('\\', "/");
-    let mut unreal_project_relative = normalized.starts_with("../") || normalized.starts_with("./");
     let scheme_length = if normalized
         .get(.."file://".len())
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
@@ -20045,16 +20052,10 @@ fn av_player_resolve_source(game_root: &Path, source: &str) -> Option<PathBuf> {
     };
     if let Some(scheme_length) = scheme_length {
         normalized = normalized[scheme_length..].to_owned();
-        // Unreal emits project-relative movies as `file://../../../Project/Content/...`.
-        // The leading dot segments describe its virtual binaries directory, which REmu does not
-        // expose as the AVPlayer base. Remove only that leading virtual prefix, then let the
-        // ordinary app0 resolver enforce containment and perform case-insensitive component
-        // lookup.
-        unreal_project_relative = true;
     }
-    if unreal_project_relative {
-        normalized = av_player_remove_unreal_leading_dot_segments(&normalized)?.to_owned();
-    }
+    // A `file:` source carries a filesystem-relative path once its scheme is stripped, so both
+    // forms reach the resolver already clamped to the application root.
+    let normalized = av_player_clamp_leading_dot_segments(&normalized)?.to_owned();
     resolve_guest_path(game_root, &normalized).or_else(|| {
         let media = normalized.find("Media/")?;
         resolve_guest_path(game_root, &format!("/app0/{}", &normalized[media..]))
@@ -25532,7 +25533,7 @@ mod platform_independent_tests {
     }
 
     #[test]
-    fn av_player_resolves_unreal_file_urls_inside_app0_case_insensitively() {
+    fn av_player_resolves_relative_file_urls_inside_app0_case_insensitively() {
         let root = std::env::temp_dir().join(format!("remu-avplayer-path-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let movie = root.join("shpc/content/movies/ui_titlemovie01.mp4");
@@ -25551,7 +25552,34 @@ mod platform_independent_tests {
     }
 
     #[test]
-    fn av_player_unreal_file_urls_cannot_collapse_to_a_root_filename() {
+    fn av_player_resolves_paths_without_dot_segments_unchanged() {
+        // The dot-segment clamp runs for every source, not only relative ones. A path that has no
+        // leading dot segments must reach the resolver exactly as the guest supplied it.
+        let root = std::env::temp_dir().join(format!("remu-avplayer-plain-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let movie = root.join("content/movies/intro.mp4");
+        std::fs::create_dir_all(movie.parent().unwrap()).unwrap();
+        std::fs::write(&movie, b"movie").unwrap();
+
+        for source in [
+            "/app0/Content/Movies/Intro.mp4",
+            "Content/Movies/Intro.mp4",
+            "file:///app0/Content/Movies/Intro.mp4",
+        ] {
+            let resolved = super::av_player_resolve_source(&root, source)
+                .unwrap_or_else(|| panic!("unresolved: {source}"));
+            assert_eq!(
+                std::fs::read(resolved).unwrap(),
+                b"movie",
+                "source: {source}"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn av_player_relative_paths_cannot_collapse_to_a_root_filename() {
         let root =
             std::env::temp_dir().join(format!("remu-avplayer-escape-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
