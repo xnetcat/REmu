@@ -246,11 +246,18 @@ crates/remu-shader-metal/src/
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace --no-fail-fast
+cargo test --workspace --no-fail-fast -- --test-threads=1
 cargo build --workspace --target x86_64-apple-darwin
 ```
 
-`cargo test --workspace --no-fail-fast` must report **725 passed, 3 failed**. The three failures
+`--test-threads=1` is mandatory. Without it the runtime suite fails intermittently at roughly a
+one-in-three rate, independent of any change, because 121 tests reach the import dispatcher without
+holding `GPU_EVENT_SINK_TEST` while `remu_gpu::install_event_sink` writes a process-global sink.
+Measured at the unmodified baseline: 4 failures in 12 parallel runs, 0 in 6 serial runs. This is
+recorded as an open defect in `docs/status.md`. A flaky suite cannot gate a refactor whose entire
+safety argument is "the tests still pass".
+
+The serial run must report **728 passed, 3 failed**. The three failures
 are environmental, not defects:
 
 ```
@@ -270,12 +277,12 @@ the new expected count is recorded in that commit's message.
 ### Clippy
 
 `cargo clippy --workspace --all-targets -- -D warnings` **fails on the baseline** and cannot be
-used as a pass/fail gate. Baseline per-crate warning counts at `e57a6f1`:
+used as a pass/fail gate. Baseline per-crate warning counts, measured at `e1c4f14` (the depth-sample commit raised `remu-gpu-metal` from 100 to 104; it is not attributable to the refactor):
 
 | Crate | lib | lib test (new) |
 | --- | ---: | ---: |
 | `remu-runtime` | 135 | 26 |
-| `remu-gpu-metal` | 100 | 45 |
+| `remu-gpu-metal` | 104 | 45 |
 | `remu-shader-metal` | 10 | 14 |
 | `remu-shader` | 7 | 6 |
 | `remu-gpu` | 4 | 0 |

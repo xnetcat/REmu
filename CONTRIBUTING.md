@@ -55,12 +55,20 @@ Run the full check suite before submitting changes:
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace
+cargo test --workspace -- --test-threads=1
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --target x86_64-apple-darwin
+cargo test --workspace --target x86_64-apple-darwin -- --test-threads=1
 cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
 python3 -m unittest scripts/tests/test_audit_import_coverage.py
 ```
+
+`--test-threads=1` is required until the order-dependent runtime suite recorded in
+[docs/status.md](docs/status.md) is fixed. Without it the runtime tests fail intermittently for
+reasons unrelated to the change under test, which makes the suite useless as a gate.
+
+Three `remu-shader-metal` tests compile generated MSL with Apple's `metal` tool and fail without
+it. Install it once with `xcodebuild -downloadComponent MetalToolchain`; they are the only tests
+that prove generated MSL actually compiles.
 
 The x86-64 target runs under Rosetta 2 on Apple Silicon and is the configuration that actually
 executes guest code, so both native and x86-64 checks matter.

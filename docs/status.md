@@ -24,6 +24,55 @@ Naming a NID is not implementing it. The audit deliberately separates the two, a
 claimed a NID while returning a fabricated success would be worse than no handler at all: it turns
 a loud gap into a silent one. Unimplemented imports are expected to stay visible in the log.
 
+## Open defects
+
+These are known failures with enough recorded state to be worked on. A defect is listed here
+rather than worked around; a title-specific patch that hides one is not an acceptable substitute.
+
+### Guest object storage goes stale mid-run
+
+A guest object's storage is observed zeroed while the guest still holds a live reference to it.
+Five distinct consumer sites were recorded faulting on the result, all in one Unreal-based title:
+
+- A graphics pipeline state object is stored and referenced, then its mandatory `+0x18` child
+  reads back as null before submission. The producing constructor guarantees that child is
+  non-null, so this is not an object that merely needs more construction time.
+- A queued render task reads back with a zero vtable pointer.
+- A container slot that the guest's own iteration treats as populated reads back null.
+- A per-field handler pointer reads back null at a virtual call site.
+- A parent object is destroyed by a nested update, after which the caller reloads its vtable
+  pointer and finds it zeroed.
+
+All five share one shape: memory the guest wrote and still owns does not read back with the value
+it wrote. That points at a REmu defect in memory lifetime, aliasing, write visibility, or an HLE
+call returning a value that makes the guest free storage early. It is not a guest defect, and the
+same five sites are the evidence for whichever of those turns out to be the cause.
+
+`scripts/lldb_allocator_map_watch.py` and `scripts/lldb_allocator_pop_watch.py` observe the
+allocator during this failure and are the current starting point.
+
+This was previously masked by a compatibility guard that patched the five consumer sites in the
+guest executable so they tested for the bad value and skipped their work. The guard was removed
+because it was locked to hardcoded addresses and byte signatures from one build of one title, and
+because suppressing the symptom removed the pressure to find the cause. The affected title is
+expected to fail at startup until the defect is fixed.
+
+### The runtime test suite is order-dependent
+
+`cargo test -p remu-runtime --lib` fails intermittently, at roughly a one-in-three rate, in
+`agc_driver::tests::a_graphics_submission_parses_its_stream_and_requests_a_completion_event`. It
+passes reliably with `--test-threads=1`.
+
+`remu_gpu::install_event_sink` writes a process-global sink. Tests that assert on emitted GPU
+events take `GPU_EVENT_SINK_TEST` to serialize, but 121 tests reach the import dispatcher without
+holding it, so an event emitted by one test can be delivered to another test's receiver.
+
+Until this is fixed, verification runs must pass `--test-threads=1`, which makes the suite
+deterministic. The fix is either to make every test that can emit take the guard, or to route test
+events through the existing thread-local capture instead of the process-global sink.
+
+## Subsystem table
+
 | Subsystem | Implemented | Next concrete gap |
 | --- | --- | --- |
 | CPU, loader, linker | x86-64 guest execution behind a native CPU backend under Rosetta; SELF/ELF mapping, observed relocations, AMD64 DTV slots, per-thread `__tls_get_addr`, TLS clone rebasing, and import trampolines with synthetic coverage. | Continue source-backed HLE import closure. The AArch64 translator stays deferred until a milestone requires it. |
