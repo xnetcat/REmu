@@ -3,7 +3,7 @@
 
 use super::{ComputePipelineKey, ProgramIdentity, image_component_class, register_value};
 #[cfg(test)]
-use super::pixel_input_controls;
+use crate::presenter::decode::pixel_input_controls;
 use remu_gpu::{ComputeDispatch, GpuRegister, IndexedDraw};
 use remu_shader::{
     InstructionControl, OperandKind, Program, ShaderEvaluation, image_is_comparison,
