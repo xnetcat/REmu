@@ -5,6 +5,7 @@ use super::{GuestTextureDescriptor, guest_texture_byte_count};
 use metal::MTLPixelFormat;
 use remu_memory::{GuestSharedMappingIdentity, guest_shared_mapping_identity};
 
+#[derive(Clone, Copy)]
 pub(crate) struct GuestTextureOverlapQuery {
     descriptor: GuestTextureDescriptor,
     byte_count: Option<u64>,
@@ -24,36 +25,34 @@ impl GuestTextureOverlapQuery {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn overlaps(&self, other: GuestTextureDescriptor) -> bool {
-        let Some(left_bytes) = self.byte_count else {
-            return false;
-        };
-        let Some(right_bytes) = guest_texture_byte_count(other) else {
+        self.overlaps_query(&Self::new(other))
+    }
+
+    /// Reports overlap with a descriptor whose physical identity was resolved previously.
+    ///
+    /// Sampled textures keep this query for their cache lifetime. Render-target invalidation can
+    /// therefore scan the cache without taking the process-global shared-mapping registry lock
+    /// once per entry. Keeping the admission-time identity also preserves the physical storage
+    /// represented by a cached texture if its original VA is later rebound.
+    pub(crate) fn overlaps_query(&self, other: &Self) -> bool {
+        let (Some(left_bytes), Some(right_bytes)) = (self.byte_count, other.byte_count) else {
             return false;
         };
         if guest_ranges_overlap(
             self.descriptor.address,
             left_bytes,
-            other.address,
+            other.descriptor.address,
             right_bytes,
         ) {
             return true;
         }
-        let Some(left_backing) = self.backing else {
+        let (Some(left_backing), Some(right_backing)) = (self.backing, other.backing) else {
             return remu_memory::guest_shared_backing_ranges_overlap(
                 self.descriptor.address,
                 left_bytes,
-                other.address,
-                right_bytes,
-            );
-        };
-        let Some(right_backing) =
-            remu_memory::guest_shared_backing_identity(other.address, right_bytes)
-        else {
-            return remu_memory::guest_shared_backing_ranges_overlap(
-                self.descriptor.address,
-                left_bytes,
-                other.address,
+                other.descriptor.address,
                 right_bytes,
             );
         };

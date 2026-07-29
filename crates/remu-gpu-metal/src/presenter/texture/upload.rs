@@ -596,6 +596,7 @@ pub(crate) fn upload_image_textures(
                         CachedSampledTexture {
                             texture: texture.clone(),
                             write_watch,
+                            overlap: super::GuestTextureOverlapQuery::new(descriptor.guest),
                             admission_id,
                         },
                     );

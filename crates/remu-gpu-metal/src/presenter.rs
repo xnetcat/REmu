@@ -754,6 +754,7 @@ struct DepthArrayResidentTexture {
 struct CachedSampledTexture {
     texture: Texture,
     write_watch: Arc<GuestTextureWriteWatch>,
+    overlap: GuestTextureOverlapQuery,
     admission_id: u64,
 }
 

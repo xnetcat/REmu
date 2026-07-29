@@ -1793,6 +1793,74 @@ fn shared_backing_aliases_reuse_identical_metal_storage() {
 }
 
 #[test]
+fn cached_overlap_identity_survives_original_virtual_address_rebinding() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).unwrap();
+    let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let replacement_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let original = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .unwrap();
+    let alias = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .unwrap();
+    let original_descriptor = GuestTextureDescriptor {
+        address: original.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let alias_descriptor = GuestTextureDescriptor {
+        address: alias.get(),
+        ..original_descriptor
+    };
+    let cached = GuestTextureOverlapQuery::new(original_descriptor);
+
+    memory.unmap(original, GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(original),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .unwrap();
+
+    let written_alias = GuestTextureOverlapQuery::new(alias_descriptor);
+    assert!(
+        !written_alias.overlaps(original_descriptor),
+        "resolving the cached descriptor again observes the replacement backing",
+    );
+    assert!(
+        written_alias.overlaps_query(&cached),
+        "the admission-time identity continues to name the cached physical storage",
+    );
+}
+
+#[test]
 fn persistent_target_removes_per_draw_full_surface_transfers() {
     let frame_bytes = 3_840_u64 * 2_160 * 4;
     let draws = 100_u64;

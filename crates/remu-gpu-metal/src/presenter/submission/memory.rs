@@ -231,7 +231,7 @@ impl MetalPresenter {
                 )
             })
         });
-        retire_sampled_textures_matching(&mut self.sampled_texture_cache, |key| {
+        retire_sampled_textures_matching(&mut self.sampled_texture_cache, |key, _| {
             guest_texture_byte_count(key.descriptor).is_some_and(|length| {
                 guest_ranges_overlap(
                     key.descriptor.address,

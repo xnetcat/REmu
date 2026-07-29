@@ -61,7 +61,7 @@ pub(crate) fn retire_sampled_texture(texture: CachedSampledTexture) {
 
 pub(crate) fn retire_sampled_textures_matching(
     cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
-    mut should_retire: impl FnMut(SampledTextureKey) -> bool,
+    mut should_retire: impl FnMut(SampledTextureKey, &CachedSampledTexture) -> bool,
 ) {
     // Dropping a write watch republishes the signal-handler's immutable page-owner snapshot.
     // Invalidating a render graph can evict hundreds of sampled aliases at once, so doing those
@@ -69,9 +69,8 @@ pub(crate) fn retire_sampled_textures_matching(
     // entries immediately for correctness, then let the existing reclaimer perform their costly
     // destruction away from the event-loop thread.
     let retired = cache
-        .keys()
-        .copied()
-        .filter(|key| should_retire(*key))
+        .iter()
+        .filter_map(|(key, cached)| should_retire(*key, cached).then_some(*key))
         .collect::<Vec<_>>();
     for key in retired {
         if let Some(texture) = cache.remove(&key) {
@@ -85,7 +84,7 @@ pub(crate) fn retire_overlapping_sampled_textures(
     descriptor: GuestTextureDescriptor,
 ) {
     let overlap = GuestTextureOverlapQuery::new(descriptor);
-    retire_sampled_textures_matching(cache, |key| overlap.overlaps(key.descriptor));
+    retire_sampled_textures_matching(cache, |_, cached| overlap.overlaps_query(&cached.overlap));
 }
 
 pub(crate) fn retire_sampled_textures_overlapping_writeback(
