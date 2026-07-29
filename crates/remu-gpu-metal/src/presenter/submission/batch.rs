@@ -13,6 +13,7 @@ use super::{
 use metal::foreign_types::ForeignType;
 use metal::{Buffer, CommandBuffer, Device, MTLCommandBufferStatus, MTLResourceOptions};
 use objc::{msg_send, sel, sel_impl};
+use remu_memory::read_guest_shared_backing;
 use remu_shader::ShaderEvaluation;
 use std::time::{Duration, Instant};
 
@@ -288,12 +289,12 @@ pub(crate) fn merge_guest_batch_result(
 }
 
 impl GuestCommandBatch {
-    pub(crate) fn upload_global_bytes(
+    fn reserve_global_upload(
         &mut self,
         device: &Device,
-        bytes: &[u8],
-    ) -> Result<(Buffer, u64), String> {
-        let byte_count = bytes.len().max(1);
+        byte_count: usize,
+    ) -> Result<(Buffer, usize), String> {
+        let byte_count = byte_count.max(1);
         let aligned_byte_count = byte_count
             .checked_add(GLOBAL_UPLOAD_ALIGNMENT - 1)
             .map(|value| value & !(GLOBAL_UPLOAD_ALIGNMENT - 1))
@@ -318,20 +319,61 @@ impl GuestCommandBatch {
             .last_mut()
             .expect("global upload chunk was created");
         let offset = chunk.used;
+        chunk.used = offset + aligned_byte_count;
+        Ok((chunk.buffer.clone(), offset))
+    }
+
+    pub(crate) fn upload_global_bytes(
+        &mut self,
+        device: &Device,
+        bytes: &[u8],
+    ) -> Result<(Buffer, u64), String> {
+        let (buffer, offset) = self.reserve_global_upload(device, bytes.len())?;
         if !bytes.is_empty() {
             // SAFETY: the shared Metal buffer is at least `aligned_byte_count` bytes beyond
             // `offset`, and the source slice remains live for the exact non-overlapping copy.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
-                    chunk.buffer.contents().cast::<u8>().add(offset),
+                    buffer.contents().cast::<u8>().add(offset),
                     bytes.len(),
                 );
             }
         }
-        chunk.used = offset + aligned_byte_count;
         Ok((
-            chunk.buffer.clone(),
+            buffer,
+            u64::try_from(offset).map_err(|_| "global upload offset does not fit Metal")?,
+        ))
+    }
+
+    /// Copies one live guest-physical range directly into this batch's shared upload arena.
+    ///
+    /// The fallback global-buffer path previously copied the same bytes twice: backing mmap to a
+    /// temporary `Vec`, then that `Vec` into Metal. Reading into the final arena keeps the same
+    /// validated backing semantics while removing the second full-range copy and allocation.
+    pub(crate) fn upload_guest_global_bytes(
+        &mut self,
+        device: &Device,
+        guest_address: u64,
+        byte_count: usize,
+    ) -> Result<(Buffer, u64), String> {
+        if byte_count == 0 {
+            return Err("guest global upload is empty".to_owned());
+        }
+        let (buffer, offset) = self.reserve_global_upload(device, byte_count)?;
+        // SAFETY: `reserve_global_upload` retained a shared Metal buffer with at least
+        // `byte_count` bytes at `offset`. The temporary slice is used only for this synchronous
+        // backing copy and cannot outlive or alias a second mutable arena reservation.
+        let destination = unsafe {
+            std::slice::from_raw_parts_mut(buffer.contents().cast::<u8>().add(offset), byte_count)
+        };
+        if !read_guest_shared_backing(guest_address, destination) {
+            return Err(format!(
+                "synchronized global binding {guest_address:#x}/{byte_count} has no readable guest backing"
+            ));
+        }
+        Ok((
+            buffer,
             u64::try_from(offset).map_err(|_| "global upload offset does not fit Metal")?,
         ))
     }

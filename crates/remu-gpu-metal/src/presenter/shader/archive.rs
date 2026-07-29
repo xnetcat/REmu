@@ -11,7 +11,7 @@ use metal::{
 };
 use sha1::{Digest, Sha1};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 impl MetalPresenter {
@@ -110,10 +110,16 @@ impl PersistentRenderPipelineArchive {
                     .map_err(|error| format!("Metal render pipeline: {error}"))?
             };
             if started.elapsed() >= SLOW_PIPELINE_ARCHIVE_ADMISSION {
-                let _writer = self
-                    .driver_lock
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Archive admission is cache maintenance, not a dependency of the pipeline that
+                // was just created. Four scene-load compiler workers can all miss together; if
+                // each waits for an exclusive archive mutation here, otherwise-ready pipelines
+                // remain withheld from the presenter for over a second. Admit opportunistically
+                // and let a later occurrence or clean shutdown persist skipped variants.
+                let _writer = match self.driver_lock.try_write() {
+                    Ok(writer) => writer,
+                    Err(TryLockError::WouldBlock) => return Ok(pipeline),
+                    Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                };
                 match self
                     .archive
                     .add_render_pipeline_functions_with_descriptor(&descriptor)

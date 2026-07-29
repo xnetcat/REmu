@@ -5,7 +5,8 @@ use crate::{
     ProbeDispatchState, VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE,
     VIDEO_OUT_ERROR_INVALID_INDEX, VIDEO_OUT_ERROR_INVALID_VALUE, VideoOutBufferAttributes,
     guest_memset, kernel_process_time, low_i32, low_u32, process_guest_range_is_readable,
-    read_guest_u32, read_guest_u64, sce_kernel_error, signed_i32_return, write_guest_u64,
+    publish_gpu_event, read_guest_u32, read_guest_u64, sce_kernel_error, signed_i32_return,
+    write_guest_u64,
 };
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -220,7 +221,7 @@ pub(super) fn apply_video_out_attributes(
         "[REMu][VIDEO] changed buffer attributes to {}x{} format={:#x} tiling={}",
         attributes.width, attributes.height, attributes.pixel_format, attributes.tiling_mode
     );
-    remu_gpu::emit_event(remu_gpu::GpuEvent::DisplayRegistered {
+    publish_gpu_event(remu_gpu::GpuEvent::DisplayRegistered {
         width: attributes.width,
         height: attributes.height,
         pitch: attributes.pitch,

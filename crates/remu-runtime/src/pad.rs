@@ -185,11 +185,7 @@ pub(crate) fn pad_read_state(arguments: [u64; 6], state: &ProbeDispatchState) ->
     }
     guest_memset(output, 0, 0x78);
     let host = remu_gpu::host_pad_state();
-    let buttons = if auto_cross_active() {
-        host.buttons | remu_gpu::PAD_BUTTON_CROSS
-    } else {
-        host.buttons
-    };
+    let buttons = host.buttons | auto_cross_buttons();
     let previous_buttons = LAST_LOGGED_BUTTONS.swap(buttons, Ordering::Relaxed);
     if previous_buttons != buttons {
         eprintln!("[REMu][PAD] buttons={buttons:#010x}");
@@ -230,11 +226,74 @@ pub(crate) fn pad_read(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     if result == 0 { 1 } else { result }
 }
 
-fn auto_cross_active() -> bool {
+#[derive(Default)]
+struct AutoCrossPulseState {
+    next_scheduled_pulse: usize,
+    active_until: Option<Instant>,
+    active_buttons: u32,
+    next_repeated_pulse: Option<Instant>,
+    next_button_is_square: bool,
+}
+
+impl AutoCrossPulseState {
+    fn begin_pulse(&mut self, now: Instant, hold: Duration) -> u32 {
+        self.active_buttons = if self.next_button_is_square {
+            remu_gpu::PAD_BUTTON_SQUARE
+        } else {
+            remu_gpu::PAD_BUTTON_CROSS
+        };
+        self.next_button_is_square = !self.next_button_is_square;
+        self.active_until = Some(now + hold);
+        self.active_buttons
+    }
+
+    fn buttons_at(
+        &mut self,
+        now: Instant,
+        start: Instant,
+        times: &[Duration],
+        hold: Duration,
+        repeat: Option<Duration>,
+    ) -> u32 {
+        if self
+            .active_until
+            .is_some_and(|active_until| now < active_until)
+        {
+            return self.active_buttons;
+        }
+        self.active_until = None;
+        self.active_buttons = 0;
+
+        let elapsed = now.saturating_duration_since(start);
+        if times
+            .get(self.next_scheduled_pulse)
+            .is_some_and(|scheduled| elapsed >= *scheduled)
+        {
+            self.next_scheduled_pulse += 1;
+            if self.next_scheduled_pulse == times.len() {
+                self.next_repeated_pulse = repeat.map(|period| now + period);
+            }
+            return self.begin_pulse(now, hold);
+        }
+
+        if self.next_scheduled_pulse == times.len()
+            && self
+                .next_repeated_pulse
+                .is_some_and(|scheduled| now >= scheduled)
+        {
+            self.next_repeated_pulse = repeat.map(|period| now + period);
+            return self.begin_pulse(now, hold);
+        }
+        0
+    }
+}
+
+fn auto_cross_buttons() -> u32 {
     static START: OnceLock<Instant> = OnceLock::new();
     static TIMES: OnceLock<Vec<Duration>> = OnceLock::new();
     static HOLD: OnceLock<Duration> = OnceLock::new();
-    static PULSE: OnceLock<Mutex<(usize, Option<Instant>)>> = OnceLock::new();
+    static REPEAT: OnceLock<Option<Duration>> = OnceLock::new();
+    static PULSE: OnceLock<Mutex<AutoCrossPulseState>> = OnceLock::new();
     let times = TIMES.get_or_init(|| {
         std::env::var("REMU_AUTO_CROSS")
             .unwrap_or_default()
@@ -245,7 +304,7 @@ fn auto_cross_active() -> bool {
             .collect()
     });
     if times.is_empty() {
-        return false;
+        return 0;
     }
     let hold = *HOLD.get_or_init(|| {
         std::env::var("REMU_AUTO_CROSS_HOLD_MS")
@@ -253,24 +312,122 @@ fn auto_cross_active() -> bool {
             .and_then(|value| value.parse::<u64>().ok())
             .map_or(Duration::from_millis(400), Duration::from_millis)
     });
+    let repeat = *REPEAT.get_or_init(|| {
+        let requested = std::env::var("REMU_AUTO_CROSS_REPEAT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Duration::from_millis(1_000), Duration::from_millis);
+        if requested.is_zero() {
+            None
+        } else {
+            // Always leave a release edge between pulses, even if a caller asks for a repeat
+            // period shorter than the configured hold.
+            Some(requested.max(hold + Duration::from_millis(50)))
+        }
+    });
     let start = *START.get_or_init(Instant::now);
     let now = Instant::now();
-    let elapsed = now.saturating_duration_since(start);
     let mut pulse = PULSE
-        .get_or_init(|| Mutex::new((0, None)))
+        .get_or_init(|| Mutex::new(AutoCrossPulseState::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if pulse.1.is_some_and(|active_until| now < active_until) {
-        return true;
+    pulse.buttons_at(now, start, times, hold, repeat)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AutoCrossPulseState;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn auto_cross_alternates_cross_and_square_with_release_edges() {
+        let start = Instant::now();
+        let hold = Duration::from_millis(100);
+        let repeat = Duration::from_millis(500);
+        let times = [Duration::from_secs(1)];
+        let mut state = AutoCrossPulseState::default();
+
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(999),
+                start,
+                &times,
+                hold,
+                Some(repeat),
+            ),
+            0
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_secs(1),
+                start,
+                &times,
+                hold,
+                Some(repeat),
+            ),
+            remu_gpu::PAD_BUTTON_CROSS
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(1_099),
+                start,
+                &times,
+                hold,
+                Some(repeat),
+            ),
+            remu_gpu::PAD_BUTTON_CROSS
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(1_100),
+                start,
+                &times,
+                hold,
+                Some(repeat),
+            ),
+            0
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(1_500),
+                start,
+                &times,
+                hold,
+                Some(repeat),
+            ),
+            remu_gpu::PAD_BUTTON_SQUARE
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(1_600),
+                start,
+                &times,
+                hold,
+                Some(repeat),
+            ),
+            0
+        );
     }
-    pulse.1 = None;
-    if times
-        .get(pulse.0)
-        .is_some_and(|scheduled| elapsed >= *scheduled)
-    {
-        pulse.0 += 1;
-        pulse.1 = Some(now + hold);
-        return true;
+
+    #[test]
+    fn zero_repeat_keeps_the_explicit_schedule_one_shot() {
+        let start = Instant::now();
+        let times = [Duration::ZERO];
+        let mut state = AutoCrossPulseState::default();
+
+        assert_ne!(
+            state.buttons_at(start, start, &times, Duration::from_millis(100), None,),
+            0
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_secs(1),
+                start,
+                &times,
+                Duration::from_millis(100),
+                None,
+            ),
+            0
+        );
     }
-    false
 }

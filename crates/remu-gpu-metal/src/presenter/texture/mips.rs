@@ -6,10 +6,11 @@ use super::super::completion::commit_and_settle;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, ResidentGuestTexture, WriteWatchRefresh,
-    compressed_texture_block_extent, decode_mode5_mip_chain_from_raw,
-    decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout, record_mode27_work_detail,
-    record_texture_work, refresh_resident_texture_write_watch, resident_texture_for_sample,
-    snapshot_watched_guest_range, watch_resident_texture,
+    compressed_texture_block_extent, copy_mode27_mip_level_to_linear,
+    decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
+    record_mode27_work_detail, record_texture_work, refresh_resident_texture_write_watch,
+    resident_texture_for_sample, snapshot_watched_guest_range, trace_resident_texture_removal,
+    watch_resident_texture,
 };
 use metal::{
     CommandQueue, Device, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
@@ -22,6 +23,7 @@ use std::time::Instant;
 
 pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     device: &Device,
+    queue: &CommandQueue,
     descriptor: DecodedImageDescriptor,
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     origin: Mode27WorkOrigin,
@@ -72,7 +74,30 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             descriptor.guest.address
         ));
     }
-    resident_guest_textures.remove(&descriptor.guest);
+    let clean_promotion = resident_guest_textures
+        .get(&descriptor.guest)
+        .is_some_and(|resident| {
+            resident.texture_type == 9
+                && resident.layer_count == 1
+                && resident.mip_level_count < underlying_mip_count
+        });
+    if clean_promotion {
+        let resident = resident_guest_textures
+            .remove(&descriptor.guest)
+            .expect("selected clean mip resident exists");
+        let promoted = promote_resident_mip_hierarchy(device, queue, descriptor, resident, origin)?;
+        resident_guest_textures.insert(descriptor.guest, promoted);
+        return resident_texture_for_sample(
+            resident_guest_textures
+                .get_mut(&descriptor.guest)
+                .expect("promoted clean mip resident exists"),
+            descriptor,
+        )
+        .ok_or_else(|| "promoted clean mip hierarchy cannot represent storage view".to_owned());
+    }
+    if let Some(resident) = resident_guest_textures.remove(&descriptor.guest) {
+        trace_resident_texture_removal("mip-hierarchy-replacement", &resident);
+    }
     let started = Instant::now();
     let layout = mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
     let write_watch = watch_resident_texture(
@@ -136,6 +161,7 @@ pub(crate) fn create_mipmapped_guest_texture(
         device,
         guest,
         &layout,
+        0,
         linear_levels,
         MTLTextureUsage::RenderTarget
             | MTLTextureUsage::ShaderRead
@@ -144,7 +170,7 @@ pub(crate) fn create_mipmapped_guest_texture(
     )
 }
 
-pub(crate) fn promote_gpu_written_resident_mip_hierarchy(
+pub(crate) fn promote_resident_mip_hierarchy(
     device: &Device,
     queue: &CommandQueue,
     descriptor: DecodedImageDescriptor,
@@ -163,7 +189,7 @@ pub(crate) fn promote_gpu_written_resident_mip_hierarchy(
         || resident.layer_count != 1
     {
         return Err(format!(
-            "GPU-written mip promotion requires a larger 2D mode-27 hierarchy, got old={}/{} new={underlying_mip_count} type={}/{} layers={}/{} tile={}",
+            "mip promotion requires a larger 2D mode-27 hierarchy, got old={}/{} new={underlying_mip_count} type={}/{} layers={}/{} tile={}",
             resident.mip_level_count,
             resident.texture.mipmap_level_count(),
             resident.texture_type,
@@ -184,20 +210,41 @@ pub(crate) fn promote_gpu_written_resident_mip_hierarchy(
     )?;
     let raw =
         snapshot_watched_guest_range(descriptor.guest.address, layout.byte_count, &write_watch)?;
-    let (_, linear_levels) =
-        decode_mode27_mip_chain_from_raw(descriptor.guest, underlying_mip_count, &raw)?;
-    let texture = create_mipmapped_guest_texture(
+    let first_new_level = resident.mip_level_count;
+    let mut linear_levels = Vec::with_capacity(
+        usize::try_from(underlying_mip_count - first_new_level)
+            .expect("validated mip delta fits usize"),
+    );
+    for level_index in first_new_level..underlying_mip_count {
+        let level = layout.levels
+            [usize::try_from(level_index).map_err(|_| "promoted mip index does not fit usize")?];
+        let byte_count = level
+            .width
+            .checked_mul(level.height)
+            .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
+            .ok_or("promoted mip linear size overflows")?;
+        let mut linear = vec![0; byte_count];
+        copy_mode27_mip_level_to_linear(&layout, level, &raw, &mut linear)?;
+        linear_levels.push(linear);
+    }
+    let texture = create_mipmapped_guest_texture_from_layout(
         device,
         descriptor.guest,
-        underlying_mip_count,
+        &layout,
+        usize::try_from(first_new_level).map_err(|_| "first promoted mip does not fit usize")?,
         &linear_levels,
+        MTLTextureUsage::RenderTarget
+            | MTLTextureUsage::ShaderRead
+            | MTLTextureUsage::ShaderWrite
+            | MTLTextureUsage::PixelFormatView,
     )?;
 
-    // Guest RAM is stale for levels previously written by Metal. Seed the new hierarchy from RAM
-    // for untouched levels, then copy every GPU-current level from the old resident. Callers flush
-    // ordered guest batches before entering this helper, so the copy observes all prior writes.
+    // Seed only newly declared levels from guest RAM, then preserve every existing logical level
+    // with a GPU-to-GPU copy. This is required for GPU-written residents because RAM is stale, and
+    // avoids repeatedly detiling and Apple-compressing the same clean levels while Unreal grows a
+    // hierarchy one mip at a time.
     let command_buffer = queue.new_command_buffer().to_owned();
-    command_buffer.set_label("REMu GPU-written mip hierarchy promotion");
+    command_buffer.set_label("REMu mip hierarchy promotion");
     let blit = command_buffer.new_blit_command_encoder();
     blit.set_label("REMu preserve GPU-current mip levels");
     let preserved_mip_count = resident.mip_level_count.min(underlying_mip_count);
@@ -261,14 +308,17 @@ fn create_mipmapped_guest_texture_from_layout(
     device: &Device,
     guest: GuestTextureDescriptor,
     layout: &GuestMipChainLayout,
+    first_level: usize,
     linear_levels: &[Vec<u8>],
     usage: MTLTextureUsage,
 ) -> Result<Texture, String> {
     let started = Instant::now();
-    if linear_levels.len() != layout.levels.len() {
+    let uploaded_level_end = first_level
+        .checked_add(linear_levels.len())
+        .ok_or("Metal mip upload range overflows")?;
+    if uploaded_level_end > layout.levels.len() {
         return Err(format!(
-            "Metal mip upload has {} levels, expected {}",
-            linear_levels.len(),
+            "Metal mip upload range {first_level}..{uploaded_level_end} exceeds {} levels",
             layout.levels.len()
         ));
     }
@@ -283,7 +333,8 @@ fn create_mipmapped_guest_texture_from_layout(
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(usage);
     let texture = device.new_texture(&descriptor);
-    for (level_index, (&level, linear)) in layout.levels.iter().zip(linear_levels).enumerate() {
+    for (level_index, linear) in (first_level..uploaded_level_end).zip(linear_levels) {
+        let level = layout.levels[level_index];
         let expected = level
             .width
             .checked_mul(level.height)

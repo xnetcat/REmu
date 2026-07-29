@@ -187,17 +187,30 @@ impl Compiler<'_> {
                 values.push(format!("{field}[{component}]"));
                 continue;
             }
-            let raw = if export.compressed {
-                let register = vector_operand(instruction.sources[component >> 1])?;
-                format!("(float)as_type<half2>(v[{register}])[{}]", component & 1)
-            } else {
-                let register = vector_operand(instruction.sources[component])?;
-                format!("as_type<float>(v[{register}])")
-            };
-            values.push(match output.kind {
-                PixelOutputKind::Float => raw,
-                PixelOutputKind::Uint => format!("(uint)({raw})"),
-                PixelOutputKind::Sint => format!("(int)({raw})"),
+            let register = vector_operand(
+                instruction.sources[if export.compressed {
+                    component >> 1
+                } else {
+                    component
+                }],
+            )?;
+            values.push(match (output.kind, export.compressed) {
+                (PixelOutputKind::Float, false) => format!("as_type<float>(v[{register}])"),
+                (PixelOutputKind::Float, true) => {
+                    format!("(float)as_type<half2>(v[{register}])[{}]", component & 1)
+                }
+                // Integer color exports carry integer component bits. Reinterpreting those bits
+                // as float first and then value-converting made every small ID/culling value a
+                // subnormal float which converted to zero. Unreal's GPU-driven passes rely on
+                // these integer render targets before the visible scene can be composed.
+                (PixelOutputKind::Uint, false) => format!("v[{register}]"),
+                (PixelOutputKind::Sint, false) => format!("as_type<int>(v[{register}])"),
+                (PixelOutputKind::Uint, true) => {
+                    format!("(uint)as_type<ushort2>(v[{register}])[{}]", component & 1)
+                }
+                (PixelOutputKind::Sint, true) => {
+                    format!("(int)as_type<short2>(v[{register}])[{}]", component & 1)
+                }
             });
         }
         let ty = match output.kind {

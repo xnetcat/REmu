@@ -428,7 +428,6 @@ struct ProbeDispatchState {
     agc_graphics: AgcGraphicsState,
     agc_compute_queues: BTreeMap<u32, AgcGraphicsState>,
     agc_shader_registry: AgcShaderRegistry,
-    agc_index_resources: BTreeMap<u64, u64>,
     next_equeue: u64,
     kernel_equeues: BTreeSet<u64>,
     kernel_event_registrations: BTreeMap<(u64, i16, u64), u64>,
@@ -983,6 +982,7 @@ static NEXT_SSL_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static NEXT_HTTP_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static NEXT_NP_WEB_API2_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static DISPATCH_LOCK_STALL_LOGS: AtomicUsize = AtomicUsize::new(0);
+static DISPATCH_LOCK_HOLD_LOGS: AtomicUsize = AtomicUsize::new(0);
 static GUEST_EXCEPTION_DELIVERY: OnceLock<Mutex<GuestExceptionDeliveryState>> = OnceLock::new();
 
 static GUEST_EXCEPTION_PENDING: AtomicBool = AtomicBool::new(false);
@@ -1405,7 +1405,6 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.agc_graphics = AgcGraphicsState::default();
     state.agc_compute_queues.clear();
     state.agc_shader_registry = AgcShaderRegistry::default();
-    state.agc_index_resources.clear();
     state.next_equeue = 1;
     state.kernel_equeues.clear();
     state.kernel_event_registrations.clear();
@@ -2318,8 +2317,31 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     // inside AddSourceEx lets Unity complete preparation and then overwrite that state when the
     // still-active AddSourceEx caller resumes.
     let av_player_callbacks = std::mem::take(&mut state.av_player.pending_callbacks);
+    let dispatch_started = trace_lock_stall.then(Instant::now);
+    begin_deferred_gpu_publication();
     let result = dispatch_probe_import(nid, call_args, stack_args, &mut state);
+    let gpu_publication = take_deferred_gpu_publication();
+    if let Some(dispatch_started) = dispatch_started {
+        let held = dispatch_started.elapsed();
+        if held >= Duration::from_millis(2)
+            && DISPATCH_LOCK_HOLD_LOGS.fetch_add(1, Ordering::Relaxed) < 64
+        {
+            eprintln!(
+                "[REMu][IMPORT][HOLD] held={:.3}ms nid={nid} name={} thread={:?} guest={:#x}",
+                held.as_secs_f64() * 1_000.0,
+                nid_display_name(nid).unwrap_or("unknown"),
+                std::thread::current().name().unwrap_or("unnamed"),
+                current_guest_thread_handle(),
+            );
+        }
+    }
     drop(state);
+    if !flush_deferred_gpu_publication(gpu_publication) {
+        eprintln!(
+            "[REMu][GPU] presenter became unavailable while publishing events from {}",
+            nid_display_name(nid).unwrap_or(nid)
+        );
+    }
     invoke_av_player_event_callbacks(av_player_callbacks);
     // Paced after the dispatch lock is released: the submitting thread waits for its own vblank,
     // exactly as it would on the console, without stalling other guest threads.
@@ -3215,6 +3237,7 @@ fn dispatch_stateless_import(
         "3KDcnM3lrcU" => agc_wait_reg_mem_patch_address(arguments),
         "0fWWK5uG9rQ" => agc_release_mem_patch_address(arguments),
         "57labkp+rSQ" => agc_dcb_acquire_mem(arguments, stack_arguments),
+        "l4fM9K-Lyks" => agc_dcb_set_index_buffer(arguments),
         "GIIW2J37e70" => agc_dcb_set_index_size(arguments),
         "B+aG9DUnTKA" => agc_dcb_draw_index_offset(arguments),
         "tSBxhAPyytQ" => agc_dcb_set_num_instances(arguments),
@@ -3662,7 +3685,6 @@ fn dispatch_probe_import(
         "3KDcnM3lrcU" => agc_wait_reg_mem_patch_address(arguments),
         "0fWWK5uG9rQ" => agc_release_mem_patch_address(arguments),
         "57labkp+rSQ" => agc_dcb_acquire_mem(arguments, stack_arguments),
-        "l4fM9K-Lyks" => agc_dcb_set_index_buffer(arguments, state),
         "GIIW2J37e70" => agc_dcb_set_index_size(arguments),
         "B+aG9DUnTKA" => agc_dcb_draw_index_offset(arguments),
         "tSBxhAPyytQ" => agc_dcb_set_num_instances(arguments),
@@ -4679,7 +4701,7 @@ fn publish_system_splash(splash: Result<(PathBuf, remu_gpu::GpuHostImage), Strin
     match splash {
         Ok((path, image)) => {
             let (width, height) = (image.width(), image.height());
-            if remu_gpu::emit_event(remu_gpu::GpuEvent::ShowHostSplash(image)) {
+            if publish_gpu_event(remu_gpu::GpuEvent::ShowHostSplash(image)) {
                 eprintln!(
                     "[REMu][SYSTEM] showing installed splash {} ({width}x{height})",
                     path.display()
@@ -4700,7 +4722,7 @@ fn system_service_hide_splash(state: &mut ProbeDispatchState) -> u64 {
         return 0;
     }
     state.services.splash = SplashState::Hidden;
-    if !remu_gpu::emit_event(remu_gpu::GpuEvent::HideHostSplash) {
+    if !publish_gpu_event(remu_gpu::GpuEvent::HideHostSplash) {
         eprintln!("[REMu][SYSTEM] presenter unavailable while hiding system splash");
     } else {
         eprintln!("[REMu][SYSTEM] system splash hidden by guest");
@@ -5243,6 +5265,96 @@ thread_local! {
     /// the backend instead of irreversibly flattening graphics and async-compute work.
     static AGC_GPU_EVENT_CAPTURE: RefCell<Option<Vec<remu_gpu::GpuEvent>>> =
         const { RefCell::new(None) };
+    /// GPU events prepared while the process-wide dispatch state is locked. The bounded backend
+    /// channel may block, so publication happens only after the state guard has been released.
+    static DEFERRED_GPU_PUBLICATION: RefCell<Option<DeferredGpuPublication>> =
+        const { RefCell::new(None) };
+}
+
+struct DeferredGpuPublication {
+    ticket: Option<u64>,
+    events: Vec<remu_gpu::GpuEvent>,
+}
+
+static GPU_PUBLICATION_TICKET: AtomicU64 = AtomicU64::new(0);
+static GPU_PUBLICATION_ORDER: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+
+fn begin_deferred_gpu_publication() {
+    DEFERRED_GPU_PUBLICATION.with_borrow_mut(|publication| {
+        assert!(
+            publication.is_none(),
+            "nested GPU publication capture would lose event ordering"
+        );
+        *publication = Some(DeferredGpuPublication {
+            ticket: None,
+            events: Vec::new(),
+        });
+    });
+}
+
+fn take_deferred_gpu_publication() -> DeferredGpuPublication {
+    DEFERRED_GPU_PUBLICATION.with_borrow_mut(|publication| {
+        publication
+            .take()
+            .expect("GPU publication capture exists after dispatch")
+    })
+}
+
+/// Publishes an event immediately unless the current import still owns the dispatch-state lock.
+///
+/// The first deferred event receives a process-order ticket while that lock is held. Publication
+/// then waits for the ticket after dropping the lock, preserving the old total ordering without
+/// making unrelated guest imports wait for a full presenter channel.
+fn publish_gpu_event(event: remu_gpu::GpuEvent) -> bool {
+    let mut event = Some(event);
+    let deferred = DEFERRED_GPU_PUBLICATION.with_borrow_mut(|publication| {
+        let Some(publication) = publication.as_mut() else {
+            return false;
+        };
+        publication
+            .ticket
+            .get_or_insert_with(|| GPU_PUBLICATION_TICKET.fetch_add(1, Ordering::Relaxed));
+        publication
+            .events
+            .push(event.take().expect("deferred GPU event exists"));
+        true
+    });
+    deferred || remu_gpu::emit_event(event.expect("immediate GPU event exists"))
+}
+
+fn flush_deferred_gpu_publication(publication: DeferredGpuPublication) -> bool {
+    let Some(ticket) = publication.ticket else {
+        debug_assert!(publication.events.is_empty());
+        return true;
+    };
+    let order = GPU_PUBLICATION_ORDER.get_or_init(|| (Mutex::new(0), Condvar::new()));
+    let mut next = order
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *next != ticket {
+        next = order
+            .1
+            .wait(next)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    // The ticket value prevents a later publisher from proceeding while this thread blocks in
+    // the bounded channel; the mutex itself need not remain locked.
+    drop(next);
+
+    let mut all_sent = true;
+    for event in publication.events {
+        all_sent &= remu_gpu::emit_event(event);
+    }
+
+    let mut next = order
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    debug_assert_eq!(*next, ticket);
+    *next = next.saturating_add(1);
+    order.1.notify_all();
+    all_sent
 }
 
 fn capture_agc_gpu_events<R>(operation: impl FnOnce() -> R) -> (R, Vec<remu_gpu::GpuEvent>) {
@@ -5273,7 +5385,7 @@ fn emit_agc_gpu_event(event: remu_gpu::GpuEvent) {
         }
     });
     if !captured {
-        remu_gpu::emit_event(event.expect("AGC event was not captured"));
+        publish_gpu_event(event.expect("AGC event was not captured"));
     }
 }
 

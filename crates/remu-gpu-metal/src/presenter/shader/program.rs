@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    ComputePipelineKey, ProgramIdentity, diagnostic_procedural_rectangle_fallback,
-    image_component_class, pixel_input_controls, register_value,
+    ComputePipelineKey, ProgramIdentity, image_component_class, pixel_input_controls,
+    register_value,
 };
 use remu_gpu::{ComputeDispatch, GpuRegister, IndexedDraw};
 use remu_shader::{InstructionControl, Program, ShaderEvaluation, image_is_comparison};
@@ -266,20 +266,18 @@ pub(crate) fn missing_vertex_parameter_exports(
 
 pub(crate) fn skip_incomplete_rectangle_draw(draw: &IndexedDraw) -> bool {
     // A non-default pixel interpolation has no defined source when the vertex/primitive stage
-    // exports no matching PARAM. Synthesizing zero varyings turns the trailing invalid RECTLIST
-    // packets in Silent Hill into full-screen black clears, erasing the correctly rendered
-    // composite immediately before every flip. Treat the invalid interface as a rejected draw,
-    // which preserves the last valid target contents. Keep an explicit diagnostic escape hatch
-    // for comparing the old zero-fill behavior.
+    // exports no matching PARAM. The architectural AGC rectangle stage is handled by the
+    // fixed-function equivalent emitted by compile_draw_shader_pair and must execute normally.
+    // Reject only genuinely unknown incomplete interfaces rather than zero-filling their
+    // varyings and allowing them to erase the current target.
     static ALLOW_INVALID: OnceLock<bool> = OnceLock::new();
     !*ALLOW_INVALID.get_or_init(|| {
         std::env::var_os("REMU_ALLOW_INCOMPLETE_RECTANGLES").is_some_and(|value| value == "1")
     }) && rectangle_draw_has_incomplete_interface(draw)
-        && !(diagnostic_procedural_rectangle_fallback()
-            && draw
-                .export_shader
-                .as_ref()
-                .is_some_and(|shader| procedural_rectangle_export_stage(&shader.program)))
+        && !draw
+            .export_shader
+            .as_ref()
+            .is_some_and(|shader| procedural_rectangle_export_stage(&shader.program))
 }
 
 /// Recognizes a fused GFX10 NGG export/geometry program that requires a Metal mesh stage.

@@ -14,10 +14,11 @@ use super::{
     SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, UploadedImageTexture, WriteWatchRefresh,
     canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled_at_z,
-    copy_tiled_to_linear_at_z, decode_image_descriptor, decode_mode5_mip_chain_from_raw,
-    decode_mode27_mip_chain_from_raw, fallback_image_descriptor, guest_frame_fingerprint,
-    guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
+    copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z, decode_image_descriptor,
+    decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, fallback_image_descriptor,
+    guest_frame_fingerprint, guest_ranges_overlap, guest_texture_byte_count,
+    guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, initial_depth_clear_for_target, is_storage_image_opcode,
     is_writable_image_opcode, mode5_mip_chain_layout, mode27_mip_chain_layout,
@@ -42,13 +43,14 @@ pub(crate) use self::depth_array::{depth_array_face_descriptor, depth_array_face
 pub(crate) use self::mips::{
     create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
     create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
-    promote_gpu_written_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
+    promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::residency::{create_guest_texture, ensure_resident_texture_in_map};
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_resident_textures_overlapping_writeback, retire_sampled_texture,
     retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
+    trace_resident_texture_removal,
 };
 #[cfg(test)]
 pub(crate) use self::sampled::{

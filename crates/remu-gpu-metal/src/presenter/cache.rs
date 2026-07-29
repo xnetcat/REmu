@@ -13,7 +13,7 @@ use metal::{
     Buffer, DepthStencilDescriptor, DepthStencilState, Device, Function, MTLCompareFunction,
     MTLResourceOptions, SamplerState,
 };
-use remu_memory::{guest_shared_mapping_identity, read_guest_shared_backing};
+use remu_memory::guest_shared_mapping_identity;
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -399,18 +399,11 @@ impl MetalPresenter {
         device: &Device,
         binding: &GlobalMemoryBinding,
     ) -> Result<UploadedGlobalBuffer, String> {
-        let mut bytes = vec![0; binding.byte_count];
-        if !read_guest_shared_backing(binding.base_address, &mut bytes) {
-            return Err(format!(
-                "synchronized global binding {:#x}/{} has no readable guest backing",
-                binding.base_address, binding.byte_count
-            ));
-        }
         let (buffer, offset) = self
             .open_guest_batch
             .as_mut()
             .ok_or("synchronized global upload has no open guest batch")?
-            .upload_global_bytes(device, &bytes)?;
+            .upload_guest_global_bytes(device, binding.base_address, binding.byte_count)?;
         Ok(UploadedGlobalBuffer {
             buffer,
             offset,

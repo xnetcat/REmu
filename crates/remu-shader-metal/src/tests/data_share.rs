@@ -210,7 +210,16 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     );
     assert!(shader.source.contains("remu_mesh.set_index("));
     assert!(shader.source.contains("remu_mesh.set_vertex("));
-    assert!(shader.source.contains("remu_mesh.set_primitive_count(64u)"));
+    assert!(
+        shader
+            .source
+            .contains("remu_mesh.set_primitive_count(remu_mesh_primitive_count)")
+    );
+    assert!(
+        shader
+            .source
+            .contains("if (remu_thread_index < remu_mesh_vertex_count) remu_mesh.set_vertex")
+    );
     #[cfg(target_os = "macos")]
     if let Some(compiler) = std::env::var_os("REMU_METAL_COMPILER") {
         let directory =

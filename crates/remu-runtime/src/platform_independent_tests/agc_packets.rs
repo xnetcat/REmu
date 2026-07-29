@@ -1,8 +1,6 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::BTreeMap;
-
 use super::{
     AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT,
     AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT, AgcGraphicsState,
@@ -127,7 +125,6 @@ fn emits_ordered_gen5_release_and_wait_label_operations() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::new(),
             video_out: &VideoOutState::default(),
             submission_count: &mut submission_count,
             flips: &mut Vec::new(),
@@ -200,7 +197,6 @@ fn executes_indirect_command_buffer_events_before_following_waits() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::new(),
             video_out: &VideoOutState::default(),
             submission_count: &mut submission_count,
             flips: &mut Vec::new(),
@@ -262,7 +258,6 @@ fn emits_ordered_standard_and_agc_write_data_operations() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::new(),
             video_out: &VideoOutState::default(),
             submission_count: &mut submission_count,
             flips: &mut Vec::new(),
@@ -363,7 +358,6 @@ fn decodes_partial_flush_events_without_inventing_completion_notifications() {
         },
         &mut graphics,
         &mut AgcShaderRegistry::default(),
-        &BTreeMap::new(),
         &VideoOutState::default(),
         &mut Vec::new(),
         &mut notifications,
@@ -398,7 +392,6 @@ fn decodes_partial_flush_events_without_inventing_completion_notifications() {
         },
         &mut graphics,
         &mut AgcShaderRegistry::default(),
-        &BTreeMap::new(),
         &VideoOutState::default(),
         &mut Vec::new(),
         &mut notifications,
@@ -504,7 +497,6 @@ fn skips_predicated_packets_when_boolean_predication_is_false() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::new(),
             video_out: &VideoOutState::default(),
             submission_count: &mut submission_count,
             flips: &mut Vec::new(),
@@ -545,7 +537,6 @@ fn cond_exec_skips_exactly_its_zero_guarded_dword_range() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::new(),
             video_out: &VideoOutState::default(),
             submission_count: &mut submission_count,
             flips: &mut Vec::new(),
@@ -594,7 +585,6 @@ fn native_gen5_branch_executes_only_the_selected_indirect_buffer() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::new(),
             video_out: &VideoOutState::default(),
             submission_count: &mut submission_count,
             flips: &mut Vec::new(),
@@ -642,7 +632,6 @@ fn unconditional_gen5_branch_does_not_read_its_queue_label() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::new(),
             video_out: &VideoOutState::default(),
             submission_count: &mut submission_count,
             flips: &mut Vec::new(),
@@ -713,7 +702,6 @@ fn clear_state_resets_complete_queue_state_without_discarding_residency() {
         },
         &mut graphics,
         &mut AgcShaderRegistry::default(),
-        &BTreeMap::new(),
         &VideoOutState::default(),
         &mut Vec::new(),
         &mut Vec::new(),
@@ -740,7 +728,6 @@ fn clear_state_rejects_non_native_layouts() {
     let invalid_control = [agc_pm4(2, crate::AGC_IT_CLEAR_STATE, 0), 0x10];
     let mut graphics = AgcGraphicsState::default();
     let mut shaders = AgcShaderRegistry::default();
-    let index_resources = BTreeMap::new();
     let video_out = VideoOutState::default();
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
@@ -756,7 +743,6 @@ fn clear_state_rejects_non_native_layouts() {
             },
             graphics,
             &mut shaders,
-            &index_resources,
             &video_out,
             &mut flips,
             &mut event_writes,

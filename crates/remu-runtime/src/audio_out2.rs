@@ -722,18 +722,33 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                 .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut backend_error = None;
             for (_, handle, _, _, buffer) in buffers {
-                match audio.output([handle, buffer.as_ptr() as u64, 0, 0, 0, 0]) {
+                match audio.output_realtime([handle, buffer.as_ptr() as u64, 0, 0, 0, 0]) {
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
-                            "[REMu][AUDIO2] context push={push} backend={handle} failed: {error:?}"
-                        );
-                        return audio_out_error(error);
+                        backend_error = Some((handle, error));
+                        break;
                     }
                 }
             }
             drop(audio);
+            if let Some((handle, error)) = backend_error {
+                // The console queue reservation and host submission form one operation. A host
+                // validation/allocation failure must not leak a queue slot and make later valid
+                // pushes report NOT_READY until the virtual device clock happens to drain it.
+                let mut state = AUDIO_OUT2
+                    .get_or_init(|| Mutex::new(AudioOut2State::default()))
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(context) = state.contexts.get_mut(&arguments[0]) {
+                    context.queued = context.queued.saturating_sub(1);
+                }
+                eprintln!(
+                    "[REMu][AUDIO2] context push={push} backend={handle} failed: {error:?}; released reserved queue slot"
+                );
+                return audio_out_error(error);
+            }
             0
         }
         _ => unreachable!("caller filters AudioOut2 imports"),

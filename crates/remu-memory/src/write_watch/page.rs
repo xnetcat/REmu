@@ -13,7 +13,7 @@ pub(super) fn protect_page(page_address: u64, read_only: bool) -> io::Result<()>
     protect_range(page_address, host_page_size_infallible(), read_only)
 }
 
-fn protect_range(address: u64, byte_count: u64, read_only: bool) -> io::Result<()> {
+pub(super) fn protect_range(address: u64, byte_count: u64, read_only: bool) -> io::Result<()> {
     let address = usize::try_from(address)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "page address does not fit"))?
         as *mut c_void;

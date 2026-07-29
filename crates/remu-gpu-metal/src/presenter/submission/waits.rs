@@ -126,8 +126,9 @@ impl MetalPresenter {
         if sequence <= 16 || sequence.is_power_of_two() {
             let value = read_guest_memory_wait_value(wait);
             let pending_value = self.pending_guest_memory_value(wait.address, wait.is_64_bit);
+            let queued_producers = self.receiver.describe_queued_wait_producers(wait);
             eprintln!(
-                "[REMu][METAL] suspended WAIT_REG_MEM sequence={sequence} address={:#x} value={value:#x} pending={pending_value:?} mask={:#x} reference={:#x} compare={}",
+                "[REMu][METAL] suspended WAIT_REG_MEM sequence={sequence} address={:#x} value={value:#x} pending={pending_value:?} mask={:#x} reference={:#x} compare={} producers=[{queued_producers}]",
                 wait.address, wait.mask, wait.reference, wait.compare_function
             );
         }

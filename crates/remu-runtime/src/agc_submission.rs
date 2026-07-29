@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
@@ -12,7 +11,8 @@ use crate::{
     VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_decode_compute_dispatch,
     agc_emit_draw, agc_emit_indexed_draw, agc_image_binding_address,
     agc_submit_ordered_video_out_flip, emit_agc_gpu_event, read_guest_u32, read_guest_u64,
-    trace_agc_programs, trace_agc_registers, trace_agc_shaders, trace_logarithmic_sequence,
+    trace_agc_programs, trace_agc_registers, trace_agc_shaders, trace_guest_sync,
+    trace_logarithmic_sequence,
 };
 mod decode;
 mod driver;
@@ -81,7 +81,6 @@ pub(crate) fn agc_handle_submission_packet(
     packet: AgcSubmissionPacket,
     graphics: &mut AgcGraphicsState,
     shaders: &mut AgcShaderRegistry,
-    index_resources: &BTreeMap<u64, u64>,
     video_out: &VideoOutState,
     flips: &mut Vec<(u32, u32, u64)>,
     event_writes: &mut Vec<u32>,
@@ -139,7 +138,8 @@ pub(crate) fn agc_handle_submission_packet(
         copy.cpu_applied = mirror_agc_cpu_memory_copy(&copy);
         static DMA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
         let sequence = DMA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if trace_agc_programs()
+        if trace_guest_sync()
+            || trace_agc_programs()
             || sequence <= 32
             || sequence.is_power_of_two()
             || graphics
@@ -192,10 +192,7 @@ pub(crate) fn agc_handle_submission_packet(
     if opcode == AGC_IT_INDEX_BASE && length >= 3 {
         graphics.index_buffer_address = u64::from(read_guest_u32(packet_address + 4))
             | (u64::from(read_guest_u32(packet_address + 8)) << 32);
-        graphics.index_resource_address = index_resources
-            .get(&graphics.index_buffer_address)
-            .copied()
-            .unwrap_or_default();
+        graphics.index_resource_address = graphics.index_buffer_address;
     }
     if opcode == AGC_IT_INDEX_BUFFER_SIZE && length >= 2 {
         graphics.index_buffer_count = read_guest_u32(packet_address + 4);
@@ -209,10 +206,7 @@ pub(crate) fn agc_handle_submission_packet(
     if opcode == AGC_IT_DRAW_INDEX_2 && length >= 6 {
         graphics.index_buffer_count = read_guest_u32(packet_address + 4);
         graphics.index_buffer_address = read_guest_u64(packet_address + 8);
-        graphics.index_resource_address = index_resources
-            .get(&graphics.index_buffer_address)
-            .copied()
-            .unwrap_or_default();
+        graphics.index_resource_address = graphics.index_buffer_address;
         agc_emit_draw(
             packet_address,
             graphics,

@@ -11,6 +11,7 @@ use super::{
     guest_texture_byte_count, guest_texture_descriptors_overlap, mode5_mip_chain_layout,
     mode27_mip_chain_layout, record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
+    trace_resident_texture_removal,
 };
 use metal::MTLTextureUsage;
 use remu_gpu::GpuMemoryAcquire;
@@ -18,7 +19,7 @@ use remu_memory::{
     CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_backing_alias_segments,
     guest_shared_mapping_identity, read_guest_shared_backing, write_guest_shared_backing,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -37,65 +38,46 @@ impl MetalPresenter {
             .ok_or("Metal device is unavailable")?
             .clone();
         let mut invalidated_multisample_descriptors = Vec::new();
-        let mut dirty_reprotected_residents = HashSet::new();
         let resident_descriptors = self
             .resident_guest_textures
             .keys()
             .copied()
             .collect::<Vec<_>>();
         for descriptor in resident_descriptors {
+            let Some((address, byte_count)) = self
+                .resident_guest_textures
+                .get(&descriptor)
+                .map(|resident| resident.write_watch.range())
+            else {
+                continue;
+            };
+            // ACQUIRE_MEM carries an exact cache-invalidation scope. Refreshing unrelated
+            // watches here caused every packet to walk the entire texture set, and could turn
+            // unrelated mapping reprotection into a whole-texture reload. A later use of an
+            // unrelated resource still refreshes its watch through the ordinary residency path.
+            if !acquire.overlaps(address, byte_count) {
+                continue;
+            }
             let refresh = refresh_resident_texture_write_watch(
                 self.resident_guest_textures
                     .get_mut(&descriptor)
                     .expect("collected resident texture exists"),
             )?;
-            match refresh {
-                WriteWatchRefresh::Renewed { was_dirty: true } => {
-                    dirty_reprotected_residents.insert(descriptor);
-                }
+            let was_dirty_before_renewal = match refresh {
+                WriteWatchRefresh::Renewed { was_dirty } => was_dirty,
                 WriteWatchRefresh::Replaced => {
-                    self.resident_guest_textures.remove(&descriptor);
-                }
-                WriteWatchRefresh::Active
-                | WriteWatchRefresh::Reprotecting
-                | WriteWatchRefresh::Renewed { was_dirty: false } => {}
-            }
-        }
-        let mut dirty_reprotected_sampled = HashSet::new();
-        let sampled_keys = self
-            .sampled_texture_cache
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        for key in sampled_keys {
-            let refresh = refresh_sampled_texture_write_watch(
-                key,
-                self.sampled_texture_cache
-                    .get_mut(&key)
-                    .expect("collected sampled texture exists"),
-                &mut self.sampled_texture_write_watches,
-            )?;
-            match refresh {
-                WriteWatchRefresh::Renewed { was_dirty: true } => {
-                    dirty_reprotected_sampled.insert(key);
-                }
-                WriteWatchRefresh::Replaced => {
-                    if let Some(retired) = self.sampled_texture_cache.remove(&key) {
-                        retire_sampled_texture(retired);
+                    if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                        trace_resident_texture_removal("acquire-mapping-replaced", &resident);
                     }
+                    continue;
                 }
-                WriteWatchRefresh::Active
-                | WriteWatchRefresh::Reprotecting
-                | WriteWatchRefresh::Renewed { was_dirty: false } => {}
-            }
-        }
-        let mut invalidated_resident_descriptors = Vec::new();
-        for resident in self.resident_guest_textures.values_mut() {
-            let (_, byte_count) = resident.write_watch.range();
-            if !acquire.overlaps(resident.descriptor.address, byte_count)
-                || (!resident.write_watch.is_dirty()
-                    && !dirty_reprotected_residents.contains(&resident.descriptor))
-            {
+                WriteWatchRefresh::Active | WriteWatchRefresh::Reprotecting => false,
+            };
+            let resident = self
+                .resident_guest_textures
+                .get_mut(&descriptor)
+                .expect("overlapping resident survived write-watch refresh");
+            if !resident.write_watch.is_dirty() && !was_dirty_before_renewal {
                 continue;
             }
             // When the CPU is already authoritative for the complete resident, an acquire only
@@ -105,8 +87,11 @@ impl MetalPresenter {
             // stable snapshot on demand. GPU-authored residents cannot take this path because
             // clean bytes may still exist only in Metal and must be merged by the writeback path.
             if !resident.gpu_written {
-                invalidated_resident_descriptors.push(resident.descriptor);
-                invalidated_multisample_descriptors.push(resident.descriptor);
+                invalidated_multisample_descriptors.push(descriptor);
+                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                    trace_resident_texture_removal("acquire-cpu-dirty", &resident);
+                }
+                RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let started = Instant::now();
@@ -164,36 +149,57 @@ impl MetalPresenter {
             resident.gpu_written = false;
             invalidated_multisample_descriptors.push(resident.descriptor);
         }
-        for descriptor in invalidated_resident_descriptors {
-            if self.resident_guest_textures.remove(&descriptor).is_some() {
-                RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         self.multisample_textures.retain(|key, _| {
             !invalidated_multisample_descriptors
                 .iter()
                 .any(|descriptor| guest_texture_descriptors_overlap(key.descriptor, *descriptor))
         });
 
-        let invalidated_sampled_keys = self
+        let sampled_keys = self
             .sampled_texture_cache
-            .iter()
-            .filter_map(|(key, cached)| {
-                let (_, byte_count) = cached.write_watch.range();
-                if !acquire.overlaps(key.descriptor.address, byte_count)
-                    || (!cached.write_watch.is_dirty() && !dirty_reprotected_sampled.contains(key))
-                {
-                    return None;
-                }
-                Some(*key)
-            })
+            .keys()
+            .copied()
             .collect::<Vec<_>>();
-        // ACQUIRE_MEM makes CPU-authored bytes authoritative, but it does not require eagerly
-        // materializing a new Metal texture. Evict the stale cache entry and let the ordinary
-        // upload path rebuild it from a stable watched snapshot only if a later shader actually
-        // samples it. This also coalesces repeated acquires before first use instead of decoding
-        // and uploading the same full texture after every packet.
-        for key in invalidated_sampled_keys {
+        for key in sampled_keys {
+            let Some((address, byte_count)) = self
+                .sampled_texture_cache
+                .get(&key)
+                .map(|cached| cached.write_watch.range())
+            else {
+                continue;
+            };
+            if !acquire.overlaps(address, byte_count) {
+                continue;
+            }
+            let refresh = refresh_sampled_texture_write_watch(
+                key,
+                self.sampled_texture_cache
+                    .get_mut(&key)
+                    .expect("overlapping sampled texture exists"),
+                &mut self.sampled_texture_write_watches,
+            )?;
+            let was_dirty_before_renewal = match refresh {
+                WriteWatchRefresh::Renewed { was_dirty } => was_dirty,
+                WriteWatchRefresh::Replaced => {
+                    if let Some(retired) = self.sampled_texture_cache.remove(&key) {
+                        retire_sampled_texture(retired);
+                    }
+                    continue;
+                }
+                WriteWatchRefresh::Active | WriteWatchRefresh::Reprotecting => false,
+            };
+            if !self
+                .sampled_texture_cache
+                .get(&key)
+                .is_some_and(|cached| cached.write_watch.is_dirty())
+                && !was_dirty_before_renewal
+            {
+                continue;
+            }
+            // ACQUIRE_MEM makes CPU-authored bytes authoritative, but it does not require eagerly
+            // materializing a new Metal texture. Evict the stale cache entry and let the ordinary
+            // upload path rebuild it from a stable watched snapshot only if a later shader
+            // actually samples it. This also coalesces repeated acquires before first use.
             if let Some(retired) = self.sampled_texture_cache.remove(&key) {
                 SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
                 retire_sampled_texture(retired);

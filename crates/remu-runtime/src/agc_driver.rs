@@ -288,7 +288,6 @@ fn submit_graphics(
             &mut AgcSubmissionContext {
                 graphics: &mut state.agc_graphics,
                 shaders: &mut state.agc_shader_registry,
-                index_resources: &state.agc_index_resources,
                 video_out: &state.video_out,
                 submission_count: &mut state.agc_submission_count,
                 flips: &mut flips,

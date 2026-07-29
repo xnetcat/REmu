@@ -6,7 +6,7 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
     echo "usage: $0 {SHORTCUT|/path/to/eboot.bin} [timeout-seconds]" >&2
     echo "  A non-path SHORTCUT resolves through the REMU_EBOOT_<SHORTCUT> environment" >&2
     echo "  variable, e.g. REMU_EBOOT_MYGAME=/path/to/eboot.bin $0 MYGAME" >&2
-    echo "  Runs stop after 600 seconds by default; pass 0 or set REMU_GAME_TIMEOUT_SECONDS=0" >&2
+    echo "  Runs stop after 60 seconds by default; pass 0 or set REMU_GAME_TIMEOUT_SECONDS=0" >&2
     echo "  to disable the watchdog." >&2
     exit 64
 fi
@@ -34,7 +34,7 @@ fi
 # Protect the shared Apple GPU and unified memory from an unattended wedged game. An explicit
 # second argument wins, then the environment override, and zero deliberately disables the
 # watchdog for an unbounded interactive session.
-timeout_seconds=${2:-${REMU_GAME_TIMEOUT_SECONDS:-600}}
+timeout_seconds=${2:-${REMU_GAME_TIMEOUT_SECONDS:-60}}
 if [ ! -f "$game_path" ]; then
     echo "error: game executable not found: $game_path" >&2
     exit 66
@@ -137,6 +137,9 @@ else
 fi
 
 # Interactive runs never inject controller input unless the caller explicitly supplies a schedule.
+# After its final scheduled pulse, the automation alternates Cross and Square once per second.
+# Separate button edges keep title UIs from rejecting the two-button chord. Set
+# REMU_AUTO_CROSS_REPEAT_MS=0 to keep an explicit schedule one-shot.
 auto_cross=${REMU_AUTO_CROSS:-}
 # Capturing a 4K PPM writes roughly 32 MiB per image and fingerprints the full frame on the
 # presenter thread. Keep it explicit so ordinary game runs measure the emulator rather than the

@@ -8,7 +8,35 @@ use super::{
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self};
+
+pub(crate) fn trace_resident_texture_removal(reason: &str, resident: &ResidentGuestTexture) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_TEXTURE_RESIDENCY").is_some()) {
+        return;
+    }
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 1_024 {
+        return;
+    }
+    let descriptor = resident.descriptor;
+    eprintln!(
+        "[REMu][METAL][RESIDENCY-REMOVE] reason={reason} texture={:#x}/{}x{}/p{}/{:?}/tile{}/type{}/layers{}/mips{}/gpu{}/v{} dirty={}",
+        descriptor.address,
+        descriptor.width,
+        descriptor.height,
+        descriptor.pitch,
+        descriptor.pixel_format,
+        descriptor.tile_mode,
+        resident.texture_type,
+        resident.layer_count,
+        resident.mip_level_count,
+        resident.gpu_written,
+        resident.content_version,
+        resident.write_watch.is_dirty(),
+    );
+}
 
 pub(crate) fn retire_sampled_texture(texture: CachedSampledTexture) {
     static RETIRER: OnceLock<mpsc::Sender<CachedSampledTexture>> = OnceLock::new();
@@ -96,7 +124,9 @@ pub(crate) fn retire_resident_textures_overlapping_writeback(
         })
         .collect::<Vec<_>>();
     for descriptor in retired {
-        cache.remove(&descriptor);
+        if let Some(resident) = cache.remove(&descriptor) {
+            trace_resident_texture_removal("overlapping-writeback", &resident);
+        }
     }
 }
 

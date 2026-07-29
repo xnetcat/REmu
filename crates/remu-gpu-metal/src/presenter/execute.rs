@@ -7,15 +7,16 @@ use super::{
     CompiledComputePipeline, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
     DEFAULT_CB_COLOR_CONTROL, DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
-    DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY,
-    GraphicsPipelineKey, GuestBatchFlushReason, GuestBatchWork, GuestRenderPassKey, GuestScissor,
-    GuestTextureDescriptor, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX,
-    NGG_MESH_INDEX_BUFFER_INDEX, NGG_MESH_THREADS, NGG_MESH_VERTICES_PER_GROUP,
-    OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    append_unique_global_writebacks, append_unique_guest_write_ranges, capture_guest_frame,
-    capture_target_sample_textures, collect_pending_global_writebacks,
-    collect_pending_guest_write_ranges, compile_metal_compute_library, compute_pipeline_key,
-    compute_program_can_split_wave64, consume_depth_metadata_clear, create_global_argument_buffer,
+    DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
+    DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
+    GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
+    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_INDEX_BUFFER_INDEX, NGG_MESH_THREADS,
+    NGG_MESH_VERTICES_PER_GROUP, OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0,
+    PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, append_unique_global_writebacks,
+    append_unique_guest_write_ranges, capture_guest_frame, capture_target_sample_textures,
+    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
+    compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
+    consume_depth_metadata_clear, create_global_argument_buffer,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
     decode_raster_state, decode_render_targets, decode_scissor, decode_viewport,
@@ -563,7 +564,12 @@ impl MetalPresenter {
                 && (targets.iter().any(|target| {
                     self.scanout_snapshot_textures
                         .contains_key(&target.texture.address)
-                }) || diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address))
+                }) || diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address)
+                    || diagnostic_dump_target_pixel_instruction_count().is_some_and(|count| {
+                        draw.pixel_shader
+                            .as_ref()
+                            .is_some_and(|shader| shader.program.instructions.len() == count)
+                    }))
             {
                 static DUMPED_SCANOUT_PAIRS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
                 let pair = (draw.export_shader_address, draw.pixel_shader_address);
@@ -842,7 +848,7 @@ impl MetalPresenter {
         let diagnostic_vertex_position_buffer = if diagnostic_capture_vertex_position() {
             if self.diagnostic_vertex_position_buffer.is_none() {
                 let byte_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
-                    .checked_mul(4)
+                    .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)
                     .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
                     .and_then(|bytes| u64::try_from(bytes).ok())
                     .ok_or("diagnostic vertex-position byte count overflow")?;
@@ -1193,6 +1199,9 @@ impl MetalPresenter {
                     .ok_or("NGG mesh draw requires captured indices")?;
                 let index_count =
                     u32::try_from(indices.len()).map_err(|_| "mesh index count exceeds u32")?;
+                let threadgroups_per_instance = u64::from(index_count)
+                    .div_ceil(NGG_MESH_VERTICES_PER_GROUP)
+                    .max(1);
                 let mesh_draw = [index_count, 0_u32, draw.base_vertex as u32];
                 encoder.set_mesh_buffer(NGG_MESH_INDEX_BUFFER_INDEX, Some(index_buffer), 0);
                 encoder.set_mesh_bytes(
@@ -1201,11 +1210,16 @@ impl MetalPresenter {
                         .expect("mesh draw metadata size fits u64"),
                     mesh_draw.as_ptr().cast::<c_void>(),
                 );
-                let threadgroups = u64::from(index_count)
-                    .div_ceil(NGG_MESH_VERTICES_PER_GROUP)
-                    .max(1);
+                static LOGGED_MESH_DRAWS: AtomicUsize = AtomicUsize::new(0);
+                let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+                if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={index_count} instances={} groups={threadgroups_per_instance}x1",
+                        draw.sequence, draw.instance_count,
+                    );
+                }
                 encoder.draw_mesh_threadgroups(
-                    MTLSize::new(threadgroups, 1, 1),
+                    MTLSize::new(threadgroups_per_instance, 1, 1),
                     MTLSize::new(1, 1, 1),
                     MTLSize::new(NGG_MESH_THREADS, 1, 1),
                 );
@@ -1816,8 +1830,8 @@ impl MetalPresenter {
                     .as_ref()
                     .and_then(|buffer| {
                         let indices = indexed_draw.as_ref()?.0.as_ref();
-                        let word_count =
-                            DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY.checked_mul(4)?;
+                        let word_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
+                            .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)?;
                         // SAFETY: the diagnostic buffer is allocated above with exactly this many
                         // shared u32 words and the completed command batch is waited before readback.
                         let words = unsafe {
@@ -1841,7 +1855,7 @@ impl MetalPresenter {
                                 .map(|index| {
                                     let base = usize::try_from(index)
                                         .expect("filtered diagnostic vertex index fits usize")
-                                        * 4;
+                                        * DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX;
                                     let raw = [
                                         words[base],
                                         words[base + 1],
@@ -1849,7 +1863,8 @@ impl MetalPresenter {
                                         words[base + 3],
                                     ];
                                     let value = raw.map(f32::from_bits);
-                                    (index, raw, value)
+                                    let registers = words[base + 4..base + 24].to_vec();
+                                    (index, raw, value, registers)
                                 })
                                 .collect::<Vec<_>>(),
                         )

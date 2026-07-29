@@ -30,8 +30,9 @@ pub(crate) use self::descriptors::{
 pub(crate) use self::mode5::encode_mode5_mip_chain_into_raw;
 pub(crate) use self::mode5::{decode_mode5_mip_chain_from_raw, mode5_mip_chain_layout};
 pub(crate) use self::mode27::{
-    decode_mode27_mip_chain_from_raw, encode_mode27_mip_chain_into_raw, mode27_block_byte_offsets,
-    mode27_mip_chain_layout, mode27_surface_z_xor,
+    copy_mode27_mip_level_to_linear, decode_mode27_mip_chain_from_raw,
+    encode_mode27_mip_chain_into_raw, mode27_block_byte_offsets, mode27_mip_chain_layout,
+    mode27_surface_z_xor,
 };
 #[cfg(test)]
 pub(crate) use self::mode27::{

@@ -581,11 +581,31 @@ impl Compiler<'_> {
                     let _ = writeln!(
                         source,
                         "    if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_vertex_id < 262144u) {{\n\
-                         \x20       uint remu_debug_base = remu_vertex_id * 4u;\n\
+                         \x20       uint remu_debug_base = remu_vertex_id * 24u;\n\
                          \x20       remu_debug_position[remu_debug_base + 0u] = as_type<uint>(remu_out.position.x);\n\
                          \x20       remu_debug_position[remu_debug_base + 1u] = as_type<uint>(remu_out.position.y);\n\
                          \x20       remu_debug_position[remu_debug_base + 2u] = as_type<uint>(remu_out.position.z);\n\
                          \x20       remu_debug_position[remu_debug_base + 3u] = as_type<uint>(remu_out.position.w);\n\
+                         \x20       remu_debug_position[remu_debug_base + 4u] = v[0];\n\
+                         \x20       remu_debug_position[remu_debug_base + 5u] = v[1];\n\
+                         \x20       remu_debug_position[remu_debug_base + 6u] = v[2];\n\
+                         \x20       remu_debug_position[remu_debug_base + 7u] = v[3];\n\
+                         \x20       remu_debug_position[remu_debug_base + 8u] = v[4];\n\
+                         \x20       remu_debug_position[remu_debug_base + 9u] = v[5];\n\
+                         \x20       remu_debug_position[remu_debug_base + 10u] = v[6];\n\
+                         \x20       remu_debug_position[remu_debug_base + 11u] = v[7];\n\
+                         \x20       remu_debug_position[remu_debug_base + 12u] = v[8];\n\
+                         \x20       remu_debug_position[remu_debug_base + 13u] = v[9];\n\
+                         \x20       remu_debug_position[remu_debug_base + 14u] = v[10];\n\
+                         \x20       remu_debug_position[remu_debug_base + 15u] = v[11];\n\
+                         \x20       remu_debug_position[remu_debug_base + 16u] = v[12];\n\
+                         \x20       remu_debug_position[remu_debug_base + 17u] = v[13];\n\
+                         \x20       remu_debug_position[remu_debug_base + 18u] = v[14];\n\
+                         \x20       remu_debug_position[remu_debug_base + 19u] = v[15];\n\
+                         \x20       remu_debug_position[remu_debug_base + 20u] = v[16];\n\
+                         \x20       remu_debug_position[remu_debug_base + 21u] = v[17];\n\
+                         \x20       remu_debug_position[remu_debug_base + 22u] = v[18];\n\
+                         \x20       remu_debug_position[remu_debug_base + 23u] = v[19];\n\
                          \x20   }}"
                     );
                 }
@@ -600,15 +620,17 @@ impl Compiler<'_> {
                 if self.options.render_target_array_length > 1 {
                     source.push_str(
                         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
-                         \x20   RemuPrimitiveOut remu_primitive_out = {};\n\
-                         \x20   uint remu_primitive_source_vertex = min(remu_thread_index * 3u, 63u);\n\
-                         \x20   remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];\n\
-                         \x20   remu_mesh.set_primitive(remu_thread_index, remu_primitive_out);\n",
+                         \x20   if (remu_thread_index < remu_mesh_primitive_count) {\n\
+                         \x20       RemuPrimitiveOut remu_primitive_out = {};\n\
+                         \x20       uint remu_primitive_source_vertex = remu_thread_index * 3u;\n\
+                         \x20       remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];\n\
+                         \x20       remu_mesh.set_primitive(remu_thread_index, remu_primitive_out);\n\
+                         \x20   }\n",
                     );
                 }
                 source.push_str(
-                    "    remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
-                     \x20   if (remu_thread_index == 0u) remu_mesh.set_primitive_count(64u);\n",
+                    "    if (remu_thread_index < remu_mesh_vertex_count) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
+                     \x20   if (remu_thread_index == 0u) remu_mesh.set_primitive_count(remu_mesh_primitive_count);\n",
                 );
             }
         }

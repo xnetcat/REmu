@@ -20,11 +20,10 @@ use super::{
     diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
     diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
     diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
-    diagnostic_procedural_rectangle_fallback, diagnostic_video_chain_selected_draw,
-    dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
-    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
-    image_component_class, metal_color_write_mask, pixel_input_controls, register_value,
-    video_target_binding_summary,
+    diagnostic_video_chain_selected_draw, dump_msl_instruction_filter_matches,
+    dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video,
+    evaluation_samples_layered_comparison, image_component_class, metal_color_write_mask,
+    pixel_input_controls, register_value, video_target_binding_summary,
 };
 mod archive;
 mod compile;
@@ -231,6 +230,10 @@ impl MetalPresenter {
         let pixel_msl =
             remu_shader_metal::compile_msl(&pixel.program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
+        let uses_procedural_rectangle_stage = !draw.indexed
+            && draw.index_count == 3
+            && matches!(draw.primitive_type, 7 | 0x11)
+            && procedural_rectangle_export_stage(&export.program);
         if key.render_target_array_length == 1 {
             let exported_parameters = vertex_parameter_export_mask(&export.program);
             let interpolated_attributes = pixel_interpolation_attribute_mask(&pixel.program);
@@ -280,8 +283,8 @@ impl MetalPresenter {
         vertex_options.vertex_output_control = key.vertex_output_control;
         vertex_options.diagnostic_force_visible_clip_depth =
             key.sample_count > 1 && diagnostic_force_visible_clip_depth();
-        vertex_options.diagnostic_force_vertex_pattern =
-            key.sample_count > 1 && diagnostic_force_msaa_vertex_pattern();
+        vertex_options.diagnostic_force_vertex_pattern = diagnostic_force_msaa_vertex_pattern()
+            && (key.sample_count > 1 || selected_diagnostic_shader);
         vertex_options.diagnostic_force_vertex_fetch_id = diagnostic_force_vertex_fetch_id()
             && (key.sample_count > 1 || selected_diagnostic_shader);
         vertex_options.diagnostic_capture_vertex_position = diagnostic_capture_vertex_position()
@@ -297,9 +300,7 @@ impl MetalPresenter {
                 pixel_msl.interpolated_attribute_count,
                 key.render_target_array_length,
             )
-        } else if diagnostic_procedural_rectangle_fallback()
-            && procedural_rectangle_export_stage(&export.program)
-        {
+        } else if uses_procedural_rectangle_stage {
             remu_shader_metal::compile_procedural_rectangle_vertex(
                 pixel_msl.interpolated_attribute_count,
             )

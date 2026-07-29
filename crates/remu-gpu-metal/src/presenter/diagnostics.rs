@@ -18,6 +18,8 @@ use std::sync::{Mutex, OnceLock};
 
 pub(super) const DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY: usize = 262_144;
 
+pub(super) const DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX: usize = 24;
+
 pub(super) const DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX: u64 = 30;
 
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_WIDTH: usize = 1_920;
@@ -971,11 +973,4 @@ pub(super) fn dump_msl_instruction_filter_matches(pixel_instruction_count: usize
         .to_string_lossy()
         .parse::<usize>()
         .is_ok_and(|filter| filter == pixel_instruction_count)
-}
-
-pub(super) fn diagnostic_procedural_rectangle_fallback() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_DIAGNOSTIC_PROCEDURAL_RECTANGLE").is_some_and(|value| value == "1")
-    })
 }

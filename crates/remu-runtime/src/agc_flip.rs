@@ -5,8 +5,8 @@ use crate::{
     QUEUED_FLIPS, VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE,
     VIDEO_OUT_ERROR_INVALID_INDEX, VideoOutBufferAttributes, VideoOutState,
     agc_allocate_command_dwords, agc_pm4, emit_agc_gpu_event, low_i32, low_u32,
-    notify_kernel_equeue_waiters, queue_kernel_event, read_guest_u32, read_guest_u64,
-    sce_kernel_error, trace_logarithmic_sequence, write_guest_u32,
+    notify_kernel_equeue_waiters, publish_gpu_event, queue_kernel_event, read_guest_u32,
+    read_guest_u64, sce_kernel_error, trace_logarithmic_sequence, write_guest_u32,
 };
 
 pub(crate) fn video_out_register_buffers2(
@@ -65,7 +65,7 @@ pub(crate) fn video_out_register_buffers2(
         state.video_out.tiling_mode,
         state.video_out.display_buffers
     );
-    remu_gpu::emit_event(remu_gpu::GpuEvent::DisplayRegistered {
+    publish_gpu_event(remu_gpu::GpuEvent::DisplayRegistered {
         width: state.video_out.width,
         height: state.video_out.height,
         pitch: state.video_out.width,
@@ -106,19 +106,15 @@ pub(crate) fn agc_dcb_set_flip(arguments: [u64; 6]) -> u64 {
     command
 }
 
-pub(crate) fn agc_dcb_set_index_buffer(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+pub(crate) fn agc_dcb_set_index_buffer(arguments: [u64; 6]) -> u64 {
     let Some(command) = agc_allocate_command_dwords(arguments[0], 5) else {
         return 0;
     };
-    // Gen5 takes the command buffer, index address, and element capacity. The index address is
-    // both the CPU-readable allocation and the GPU virtual address; keeping the identity mapping
-    // preserves the submission decoder's existing resource provenance without inventing a fourth
-    // ABI argument.
+    // Gen5 takes the command buffer, index address, and element capacity. The encoded index
+    // address is both the CPU-readable allocation and the GPU virtual address, so no process-wide
+    // resource registry is needed to recover it during submission parsing.
     let index_buffer_address = arguments[1];
     let index_count = low_u32(arguments[2]);
-    state
-        .agc_index_resources
-        .insert(index_buffer_address, index_buffer_address);
     write_guest_u32(command, agc_pm4(3, AGC_IT_INDEX_BASE, 0));
     write_guest_u32(command + 4, low_u32(index_buffer_address));
     write_guest_u32(command + 8, low_u32(index_buffer_address >> 32));
@@ -288,7 +284,7 @@ pub(crate) fn request_agc_submission_completion(
 ) -> bool {
     let sequence = state.agc_submission_count;
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
-    if remu_gpu::emit_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
+    if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
         state
             .pending_agc_completions
             .push_back((sequence, queue_id));
@@ -309,7 +305,7 @@ pub(crate) fn request_agc_compute_submission_completion(
     // through the driver-wide AGC user interrupt below; also routing it through the owner's
     // graphics-filter event makes the guest retire the same ACB/RHI storage twice.
     let queue_id = owner.saturating_add(1);
-    if remu_gpu::emit_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
+    if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
         state.pending_agc_user_interrupts.push_back(sequence);
         true
     } else {

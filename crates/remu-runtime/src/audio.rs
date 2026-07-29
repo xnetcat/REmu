@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -125,6 +126,32 @@ impl AudioMixer {
         };
         queue.frames.extend(frames);
         true
+    }
+
+    /// Appends a real-time stream while bounding host latency.
+    ///
+    /// AudioOut2 already models the console hardware queue before reaching the host mixer. If
+    /// CoreAudio falls behind, propagating this implementation queue's capacity as a guest BUSY
+    /// error creates a second, unrelated backpressure domain and can deadlock the title. Samples
+    /// beyond the host latency budget have already missed their presentation time, so retain the
+    /// newest frames and report how many stale frames were discarded.
+    fn push_realtime_bounded(
+        &mut self,
+        handle: i32,
+        frames: Vec<[f32; 2]>,
+        maximum: usize,
+    ) -> Option<usize> {
+        let queue = self.queues.get_mut(&handle)?;
+        let overflow = queue
+            .frames
+            .len()
+            .saturating_add(frames.len())
+            .saturating_sub(maximum);
+        let queued_drop = overflow.min(queue.frames.len());
+        queue.frames.drain(..queued_drop);
+        let incoming_drop = overflow.saturating_sub(queued_drop);
+        queue.frames.extend(frames.into_iter().skip(incoming_drop));
+        Some(overflow)
     }
 
     fn write_interleaved(&mut self, output: &mut [f32], channels: usize) {
@@ -454,15 +481,33 @@ impl AudioOutState {
     }
 
     pub(crate) fn output(&mut self, arguments: [u64; 6]) -> Result<Duration, AudioOutError> {
+        self.output_with_host_overflow_policy(arguments, HostOverflowPolicy::Reject)
+    }
+
+    /// Submits an AudioOut2 grain to the host sink.
+    ///
+    /// The AudioOut2 context queue has already accepted and paced this grain. Host callback
+    /// lateness must therefore not surface as a second console-facing BUSY condition.
+    pub(crate) fn output_realtime(
+        &mut self,
+        arguments: [u64; 6],
+    ) -> Result<Duration, AudioOutError> {
+        self.output_with_host_overflow_policy(arguments, HostOverflowPolicy::DiscardStale)
+    }
+
+    fn output_with_host_overflow_policy(
+        &mut self,
+        arguments: [u64; 6],
+        overflow_policy: HostOverflowPolicy,
+    ) -> Result<Duration, AudioOutError> {
         let handle = low_i32(arguments[0]);
         let source_address = arguments[1];
         let port = self
             .ports
             .get_mut(&handle)
             .ok_or(AudioOutError::InvalidPort)?;
-        let delay = port.output_deadline();
         if source_address == 0 {
-            return Ok(delay);
+            return Ok(port.output_deadline());
         }
         let byte_length = port
             .format
@@ -487,12 +532,44 @@ impl AudioOutState {
                 .map_or(0, |queue| queue.frames.len());
             let maximum =
                 usize::try_from(host.sample_rate).unwrap_or(48_000) * MAX_QUEUED_AUDIO_SECONDS;
-            if queued.saturating_add(resampled.len()) > maximum || !mixer.push(handle, resampled) {
-                return Err(AudioOutError::Busy);
+            match overflow_policy {
+                HostOverflowPolicy::Reject => {
+                    if queued.saturating_add(resampled.len()) > maximum
+                        || !mixer.push(handle, resampled)
+                    {
+                        return Err(AudioOutError::Busy);
+                    }
+                }
+                HostOverflowPolicy::DiscardStale => {
+                    let Some(discarded) = mixer.push_realtime_bounded(handle, resampled, maximum)
+                    else {
+                        return Err(AudioOutError::InvalidPort);
+                    };
+                    if discarded != 0 {
+                        static DISCARD_EVENTS: AtomicU64 = AtomicU64::new(0);
+                        static DISCARDED_FRAMES: AtomicU64 = AtomicU64::new(0);
+                        let event = DISCARD_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                        let discarded = u64::try_from(discarded).unwrap_or(u64::MAX);
+                        let total = DISCARDED_FRAMES
+                            .fetch_add(discarded, Ordering::Relaxed)
+                            .saturating_add(discarded);
+                        if event <= 8 || event.is_power_of_two() {
+                            eprintln!(
+                                "[REMu][AUDIO] host callback fell behind; discarded {discarded} stale frames from port {handle} (event={event}, total={total})"
+                            );
+                        }
+                    }
+                }
             }
         }
-        Ok(delay)
+        Ok(port.output_deadline())
     }
+}
+
+#[derive(Clone, Copy)]
+enum HostOverflowPolicy {
+    Reject,
+    DiscardStale,
 }
 
 fn decode_stereo_frames(source: &[u8], port: &AudioPort) -> Vec<[f32; 2]> {
@@ -758,6 +835,37 @@ mod tests {
             mixer.queues[&1].frames.len(),
             queued,
             "an underrun must rebuffer instead of emitting a partial callback"
+        );
+    }
+
+    #[test]
+    fn realtime_queue_retains_newest_frames_within_latency_budget() {
+        let mut mixer = AudioMixer::default();
+        mixer.add_port(1);
+        assert_eq!(
+            mixer.push_realtime_bounded(1, (0..6).map(|value| [value as f32, 0.0]).collect(), 4,),
+            Some(2)
+        );
+        assert_eq!(
+            mixer.queues[&1]
+                .frames
+                .iter()
+                .map(|frame| frame[0])
+                .collect::<Vec<_>>(),
+            [2.0, 3.0, 4.0, 5.0]
+        );
+
+        assert_eq!(
+            mixer.push_realtime_bounded(1, (6..9).map(|value| [value as f32, 0.0]).collect(), 4,),
+            Some(3)
+        );
+        assert_eq!(
+            mixer.queues[&1]
+                .frames
+                .iter()
+                .map(|frame| frame[0])
+                .collect::<Vec<_>>(),
+            [5.0, 6.0, 7.0, 8.0]
         );
     }
 }

@@ -10,13 +10,14 @@ use super::{
     decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
     guest_texture_byte_count, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_storage, initial_depth_clear_for_target,
-    mode27_mip_chain_layout, promote_gpu_written_resident_mip_hierarchy, record_mode27_work_detail,
+    mode27_mip_chain_layout, promote_resident_mip_hierarchy, record_mode27_work_detail,
     refresh_resident_texture_write_watch, resident_texture_for_sample,
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
     snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
-    snapshot_watched_sampled_texture_raw, texture_element_layout, watch_guest_texture,
-    watch_resident_texture, watch_sampled_texture, write_resident_texture_contents_to_guest,
+    snapshot_watched_sampled_texture_raw, texture_element_layout, trace_resident_texture_removal,
+    watch_guest_texture, watch_resident_texture, watch_sampled_texture,
+    write_resident_texture_contents_to_guest,
 };
 use metal::{
     Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
@@ -24,6 +25,8 @@ use metal::{
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 impl MetalPresenter {
@@ -62,7 +65,7 @@ impl MetalPresenter {
                     .resident_guest_textures
                     .remove(&descriptor.guest)
                     .expect("selected GPU-written resident exists");
-                let promoted = promote_gpu_written_resident_mip_hierarchy(
+                let promoted = promote_resident_mip_hierarchy(
                     device,
                     &queue,
                     descriptor,
@@ -83,6 +86,9 @@ impl MetalPresenter {
         }
         super::ensure_mipmapped_resident_texture_in_map(
             device,
+            self.command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?,
             descriptor,
             &mut self.resident_guest_textures,
             Mode27WorkOrigin::StorageCreate,
@@ -151,14 +157,38 @@ impl MetalPresenter {
             .map(|resident| (resident.content_version, resident.descriptor))
             .collect::<Vec<_>>();
         if !aliases.is_empty() {
-            self.wait_for_guest_command_batches()?;
-            self.multisample_textures
-                .retain(|key, _| !guest_texture_descriptors_overlap(key.descriptor, descriptor));
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
+            trace_residency_churn(
+                descriptor,
+                upload_guest_contents,
+                aliases.iter().filter_map(|(_, alias)| {
+                    self.resident_guest_textures.get(alias).map(|resident| {
+                        (
+                            resident.descriptor,
+                            resident.gpu_written,
+                            resident.content_version,
+                        )
+                    })
+                }),
+            );
+            let has_gpu_written_alias = aliases.iter().any(|(_, alias)| {
+                self.resident_guest_textures
+                    .get(alias)
+                    .is_some_and(|resident| resident.gpu_written)
+            });
+            let queue = if has_gpu_written_alias {
+                self.wait_for_guest_command_batches()?;
+                self.multisample_textures.retain(|key, _| {
+                    !guest_texture_descriptors_overlap(key.descriptor, descriptor)
+                });
+                Some(
+                    self.command_queue
+                        .as_ref()
+                        .ok_or("Metal command queue is unavailable")?
+                        .clone(),
+                )
+            } else {
+                None
+            };
             aliases.sort_by_key(|(version, _)| *version);
             for (_, alias) in aliases {
                 let refresh = refresh_resident_texture_write_watch(
@@ -166,17 +196,25 @@ impl MetalPresenter {
                         .get_mut(&alias)
                         .expect("collected resident alias exists"),
                 )?;
-                if refresh == WriteWatchRefresh::Reprotecting {
+                let gpu_written = self
+                    .resident_guest_textures
+                    .get(&alias)
+                    .is_some_and(|resident| resident.gpu_written);
+                if refresh == WriteWatchRefresh::Reprotecting && gpu_written {
                     return Err(format!(
                         "resident alias mapping {:#x} is being reprotected",
                         alias.address
                     ));
                 }
-                let resident = self
-                    .resident_guest_textures
-                    .remove(&alias)
-                    .expect("collected resident alias exists");
-                if refresh != WriteWatchRefresh::Replaced && resident.gpu_written {
+                if refresh == WriteWatchRefresh::Replaced {
+                    if let Some(resident) = self.resident_guest_textures.remove(&alias) {
+                        trace_resident_texture_removal("alias-mapping-replaced", &resident);
+                    }
+                } else if gpu_written {
+                    let resident = self
+                        .resident_guest_textures
+                        .remove(&alias)
+                        .expect("collected GPU-written resident alias exists");
                     let alias_ranges = resident.write_watch.alias_ranges();
                     retire_sampled_textures_overlapping_writeback(
                         &mut self.sampled_texture_cache,
@@ -192,10 +230,15 @@ impl MetalPresenter {
                         &mut self.multisample_textures,
                         &alias_ranges,
                     );
-                    write_resident_texture_contents_to_guest(device, &queue, &resident)?;
+                    write_resident_texture_contents_to_guest(
+                        device,
+                        queue
+                            .as_ref()
+                            .expect("GPU-written aliases acquired the command queue"),
+                        &resident,
+                    )?;
                 }
             }
-            retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
         }
         ensure_resident_texture_in_map(
             device,
@@ -263,7 +306,7 @@ impl MetalPresenter {
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
             };
-            let promoted = promote_gpu_written_resident_mip_hierarchy(
+            let promoted = promote_resident_mip_hierarchy(
                 device,
                 &queue,
                 descriptor,
@@ -791,14 +834,74 @@ impl MetalPresenter {
                     })
                     .map(|resident| resident.descriptor)
             });
-        if let Some(resident) = resident_descriptor
-            .and_then(|descriptor| self.resident_guest_textures.get_mut(&descriptor))
-        {
+        if let Some(resident_descriptor) = resident_descriptor {
+            // Multiple read-only interpretations of the same guest bytes may coexist. Creating a
+            // second clean view must not evict and immediately reconstruct the first one. Once a
+            // view is actually written, however, every other clean overlapping interpretation is
+            // stale and can be retired without a writeback.
+            let stale_aliases = self
+                .resident_guest_textures
+                .iter()
+                .filter_map(|(candidate, resident)| {
+                    (*candidate != resident_descriptor
+                        && !resident.gpu_written
+                        && guest_texture_descriptors_overlap(*candidate, descriptor))
+                    .then_some(*candidate)
+                })
+                .collect::<Vec<_>>();
+            for stale_alias in stale_aliases {
+                if let Some(resident) = self.resident_guest_textures.remove(&stale_alias) {
+                    trace_resident_texture_removal("gpu-write-invalidates-clean-alias", &resident);
+                }
+            }
+            let resident = self
+                .resident_guest_textures
+                .get_mut(&resident_descriptor)
+                .expect("selected resident survived clean-alias retirement");
             resident.gpu_written = true;
             resident.content_version = self.resident_content_version;
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
     }
+}
+
+fn trace_residency_churn(
+    descriptor: GuestTextureDescriptor,
+    upload_guest_contents: bool,
+    aliases: impl Iterator<Item = (GuestTextureDescriptor, bool, u64)>,
+) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_TEXTURE_RESIDENCY").is_some()) {
+        return;
+    }
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 512 {
+        return;
+    }
+    let aliases = aliases
+        .map(|(alias, gpu_written, version)| {
+            format!(
+                "{:#x}/{}x{}/p{}/{:?}/tile{}/gpu{gpu_written}/v{version}",
+                alias.address,
+                alias.width,
+                alias.height,
+                alias.pitch,
+                alias.pixel_format,
+                alias.tile_mode,
+            )
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "[REMu][METAL][RESIDENCY-CHURN] target={:#x}/{}x{}/p{}/{:?}/tile{} upload={} aliases=[{}]",
+        descriptor.address,
+        descriptor.width,
+        descriptor.height,
+        descriptor.pitch,
+        descriptor.pixel_format,
+        descriptor.tile_mode,
+        upload_guest_contents,
+        aliases.join(", "),
+    );
 }
 
 pub(crate) fn ensure_resident_texture_in_map(

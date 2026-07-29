@@ -16,8 +16,8 @@ use super::{
     retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, skip_incomplete_rectangle_draw,
-    trace_video_target_compute_consumer, trace_video_target_draw_consumer,
-    write_resident_texture_contents_to_guest,
+    trace_resident_texture_removal, trace_video_target_compute_consumer,
+    trace_video_target_draw_consumer, write_resident_texture_contents_to_guest,
 };
 use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};

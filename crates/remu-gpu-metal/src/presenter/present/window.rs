@@ -552,10 +552,17 @@ impl ApplicationHandler for MetalPresenter {
         {
             window.request_redraw();
         }
-        // The std channel feeding guest GPU work cannot wake Winit directly. A short deadline
-        // keeps submission latency low without ControlFlow::Poll busy-spinning an otherwise idle
-        // process or continuously presenting identical drawables.
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
+        // Keep draining runnable guest work without depending on AppKit's timer precision.
+        // macOS coalesces the nominal one-millisecond WaitUntil to roughly a display tick under
+        // load; combined with GPU_EVENTS_PER_TICK, that imposed a hard command-throughput ceiling
+        // while the presenter thread spent most of its time asleep. Dependency-blocked and empty
+        // queues still take the timed idle path, so a static screen does not busy-spin.
+        if self.receiver.has_runnable_events() {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
+        }
     }
 }
 

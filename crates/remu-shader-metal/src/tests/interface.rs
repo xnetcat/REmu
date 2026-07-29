@@ -7,6 +7,78 @@
 use super::*;
 use remu_shader::ExportControl;
 
+fn compile_pixel_export(kind: PixelOutputKind, compressed: bool) -> MetalShader {
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Exp,
+        opcode: Opcode::Known("Exp"),
+        words: vec![0, 0],
+        sources: if compressed {
+            vec![
+                Operand::vector(0),
+                Operand::vector(1),
+                Operand::vector(0),
+                Operand::vector(1),
+            ]
+        } else {
+            (0..4).map(Operand::vector).collect()
+        },
+        destinations: Vec::new(),
+        control: Some(InstructionControl::Export(ExportControl {
+            target: 0,
+            enable_mask: 0x0f,
+            compressed,
+            done: true,
+            valid_mask: true,
+        })),
+    };
+    let options = MetalCompileOptions::pixel(
+        vec![PixelOutputBinding {
+            guest_slot: 0,
+            host_location: 0,
+            kind,
+        }],
+        0,
+        0,
+    );
+    compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &empty_evaluation(),
+        &options,
+    )
+    .expect("pixel export should lower")
+}
+
+#[test]
+fn preserves_integer_mrt_export_bits_without_float_conversion() {
+    let unsigned = compile_pixel_export(PixelOutputKind::Uint, false);
+    assert!(
+        unsigned
+            .source
+            .contains("remu_out.mrt0 = uint4(remu_v_0, remu_v_1, remu_v_2, remu_v_3);")
+    );
+    assert!(!unsigned.source.contains("(uint)(as_type<float>"));
+
+    let signed = compile_pixel_export(PixelOutputKind::Sint, false);
+    assert!(signed.source.contains(
+        "remu_out.mrt0 = int4(as_type<int>(remu_v_0), as_type<int>(remu_v_1), as_type<int>(remu_v_2), as_type<int>(remu_v_3));"
+    ));
+    assert!(!signed.source.contains("(int)(as_type<float>"));
+}
+
+#[test]
+fn unpacks_compressed_integer_mrt_exports_as_integer_halves() {
+    let unsigned = compile_pixel_export(PixelOutputKind::Uint, true);
+    assert!(unsigned.source.contains(
+        "remu_out.mrt0 = uint4((uint)as_type<ushort2>(remu_v_0)[0], (uint)as_type<ushort2>(remu_v_0)[1], (uint)as_type<ushort2>(remu_v_1)[0], (uint)as_type<ushort2>(remu_v_1)[1]);"
+    ));
+
+    let signed = compile_pixel_export(PixelOutputKind::Sint, true);
+    assert!(signed.source.contains(
+        "remu_out.mrt0 = int4((int)as_type<short2>(remu_v_0)[0], (int)as_type<short2>(remu_v_0)[1], (int)as_type<short2>(remu_v_1)[0], (int)as_type<short2>(remu_v_1)[1]);"
+    ));
+}
+
 #[test]
 fn maps_packed_secondary_position_exports_to_metal_clip_distances() {
     let export = |pc, target| Instruction {

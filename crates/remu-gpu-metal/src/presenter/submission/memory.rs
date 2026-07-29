@@ -8,7 +8,8 @@ use super::{
     record_diagnostic_memory_copy, refresh_resident_texture_write_watch,
     retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
-    retire_sampled_textures_overlapping_writeback, write_resident_texture_contents_to_guest,
+    retire_sampled_textures_overlapping_writeback, trace_resident_texture_removal,
+    write_resident_texture_contents_to_guest,
 };
 use remu_gpu::{
     GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
@@ -131,7 +132,12 @@ impl MetalPresenter {
                             .expect("collected DMA source texture exists"),
                     )?;
                     if refresh == WriteWatchRefresh::Replaced {
-                        self.resident_guest_textures.remove(&descriptor);
+                        if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                            trace_resident_texture_removal(
+                                "dma-source-mapping-replaced",
+                                &resident,
+                            );
+                        }
                         continue;
                     }
                     if refresh == WriteWatchRefresh::Reprotecting {
@@ -205,7 +211,9 @@ impl MetalPresenter {
             })
             .collect::<Vec<_>>();
         for descriptor in destination_descriptors {
-            self.resident_guest_textures.remove(&descriptor);
+            if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                trace_resident_texture_removal("dma-destination-write", &resident);
+            }
         }
         self.multisample_textures.retain(|key, _| {
             guest_texture_byte_count(key.descriptor).is_none_or(|length| {

@@ -947,6 +947,64 @@ fn a_single_level_descriptor_does_not_gain_an_inferred_mip_hierarchy() {
 }
 
 #[test]
+fn clean_overlapping_render_views_coexist_until_one_is_written() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest texture mapping");
+    let first = GuestTextureDescriptor {
+        address: address.get(),
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::R32Float,
+        bytes_per_pixel: 4,
+    };
+    let second = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::RGBA16Unorm,
+        bytes_per_pixel: 8,
+        ..first
+    };
+    assert!(guest_texture_descriptors_overlap(first, second));
+    assert!(!guest_texture_descriptors_share_storage(first, second));
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, first)
+        .expect("first clean view");
+    presenter
+        .ensure_resident_texture(&device, second)
+        .expect("second clean view");
+    assert!(presenter.resident_guest_textures.contains_key(&first));
+    assert!(presenter.resident_guest_textures.contains_key(&second));
+
+    presenter.mark_resident_texture_written(second);
+    assert!(!presenter.resident_guest_textures.contains_key(&first));
+    assert!(
+        presenter
+            .resident_guest_textures
+            .get(&second)
+            .is_some_and(|resident| resident.gpu_written)
+    );
+}
+
+#[test]
 fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -985,6 +1043,11 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
     let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
     let complete = super::DecodedImageDescriptor {
         guest,
         destination_select: 0x22c,
@@ -997,6 +1060,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     // never promoted into a larger one on the presenter's own initiative.
     let original = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        &queue,
         complete,
         &mut presenter.resident_guest_textures,
         super::Mode27WorkOrigin::StorageCreate,
@@ -1006,6 +1070,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
 
     let complete_view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        &queue,
         complete,
         &mut presenter.resident_guest_textures,
         super::Mode27WorkOrigin::StorageCreate,
@@ -1031,6 +1096,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     };
     let view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        &queue,
         sampled,
         &mut presenter.resident_guest_textures,
         super::Mode27WorkOrigin::StorageCreate,

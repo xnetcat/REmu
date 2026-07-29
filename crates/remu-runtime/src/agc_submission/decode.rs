@@ -7,7 +7,7 @@ use remu_shader::GuestMemoryReader;
 
 use crate::{
     AGC_R_WAIT_MEM_64, AgcSubmissionError, ProcessGuestMemory, low_u32, read_guest_u32,
-    read_guest_u64,
+    read_guest_u64, trace_guest_sync,
 };
 
 pub(crate) fn decode_agc_event_write(
@@ -226,7 +226,7 @@ pub(super) fn decode_agc_memory_release(
         _ => None,
     };
     let trace = TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if trace <= 96 || trace.is_power_of_two() {
+    if trace_guest_sync() || trace <= 96 || trace.is_power_of_two() {
         eprintln!(
             "[REMu][AGC][SYNC] release packet={packet_address:#x} standard={standard_packet} control={control:#010x} selection={data_selection} address={address:#x} data={data:#x} emitted={}",
             value.is_some() && address != 0
@@ -282,7 +282,7 @@ pub(crate) fn decode_agc_memory_wait(
         })
     };
     let trace = TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if trace <= 64 || trace.is_power_of_two() {
+    if trace_guest_sync() || trace <= 64 || trace.is_power_of_two() {
         let current = decoded.map(|wait| {
             if wait.is_64_bit {
                 read_guest_u64(wait.address)

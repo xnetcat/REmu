@@ -200,7 +200,6 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut indices = [0_u16, 1, 2, 2, 3, 0];
     let index_address = indices.as_ptr().addr() as u64;
-    let index_resource = 0x0070_1234_5600_u64;
     let commands = [
         agc_pm4(6, crate::AGC_IT_DRAW_INDEX_2, 0),
         6,
@@ -221,7 +220,6 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::from([(index_address, index_resource)]),
             video_out: &VideoOutState::default(),
             submission_count: &mut submission_count,
             flips: &mut Vec::new(),
@@ -236,7 +234,7 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
     };
     assert!(draw.indexed);
     assert_eq!(draw.index_buffer_address, index_address);
-    assert_eq!(draw.index_resource_address, index_resource);
+    assert_eq!(draw.index_resource_address, index_address);
     assert_eq!(draw.index_buffer_count, 6);
     assert_eq!(draw.index_offset, 0);
     assert_eq!(draw.base_vertex, 0);
@@ -422,7 +420,6 @@ fn constant_targetless_draw_does_not_overwrite_ordered_scanout() {
         &mut crate::AgcSubmissionContext {
             graphics: &mut graphics,
             shaders: &mut shaders,
-            index_resources: &BTreeMap::new(),
             video_out: &video_out,
             submission_count: &mut submission_count,
             flips: &mut flips,
@@ -596,7 +593,6 @@ fn accepts_zero_extent_indirect_compute_without_emitting_gpu_work() {
             },
             &mut graphics,
             &mut shaders,
-            &BTreeMap::new(),
             &VideoOutState::default(),
             &mut flips,
             &mut event_writes,
@@ -749,11 +745,8 @@ fn builds_the_three_argument_gen5_index_buffer_packets() {
     write_guest_u64(command_buffer_address + 0x18, commands_address + 64);
     write_guest_u32(command_buffer_address + 0x30, 0);
 
-    let mut state = ProbeDispatchState::default();
-    let command = agc_dcb_set_index_buffer(
-        [command_buffer_address, index_buffer_address, 16, 0, 0, 0],
-        &mut state,
-    );
+    let command =
+        agc_dcb_set_index_buffer([command_buffer_address, index_buffer_address, 16, 0, 0, 0]);
 
     assert_eq!(command, commands_address);
     assert_eq!(commands[0], agc_pm4(3, AGC_IT_INDEX_BASE, 0));
@@ -764,10 +757,6 @@ fn builds_the_three_argument_gen5_index_buffer_packets() {
     assert_eq!(
         read_guest_u64(command_buffer_address + 0x10),
         commands_address + 20
-    );
-    assert_eq!(
-        state.agc_index_resources.get(&index_buffer_address),
-        Some(&index_buffer_address)
     );
 }
 

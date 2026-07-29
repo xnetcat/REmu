@@ -20,7 +20,6 @@ use super::{
 pub(crate) struct AgcSubmissionContext<'a> {
     pub(crate) graphics: &'a mut AgcGraphicsState,
     pub(crate) shaders: &'a mut AgcShaderRegistry,
-    pub(crate) index_resources: &'a BTreeMap<u64, u64>,
     pub(crate) video_out: &'a VideoOutState,
     pub(crate) submission_count: &'a mut u64,
     pub(crate) flips: &'a mut Vec<(u32, u32, u64)>,
@@ -278,7 +277,6 @@ pub(super) fn agc_parse_command_stream(
             packet,
             context.graphics,
             context.shaders,
-            context.index_resources,
             context.video_out,
             context.flips,
             context.event_writes,

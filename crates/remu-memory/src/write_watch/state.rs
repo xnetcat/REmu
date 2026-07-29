@@ -8,7 +8,9 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size_infallible, protect_page};
+use super::page::{
+    HOST_PAGE_SIZE, align_down, align_up, host_page_size_infallible, protect_page, protect_range,
+};
 use super::snapshot::publish_snapshot;
 
 #[derive(Debug)]
@@ -212,8 +214,73 @@ pub(super) fn restore_unowned_pages(range: &WatchedRange, state: &WatchState) {
     if !range.precise_tracking {
         return;
     }
-    for page in &range.pages {
-        restore_page_if_unowned(page.address, state);
+    let Some(first_page) = range.pages.first() else {
+        return;
+    };
+    let Some(last_page) = range.pages.last() else {
+        return;
+    };
+    let page_size = host_page_size_infallible();
+    let retired_start = first_page.address;
+    let retired_end = last_page.address.saturating_add(page_size);
+
+    // Teardown used to ask every remaining watch about every page in the retiring range. A large
+    // render allocation therefore cost O(retired pages * all watched pages), and Silent Hill
+    // spent most of its presenter time here after an alias writeback. Build the ownership bitmap
+    // once by intersecting each remaining contiguous watch with this range instead.
+    let mut owned = vec![false; range.pages.len()];
+    for candidate in state.ranges.values().filter(|range| range.precise_tracking) {
+        let Some(candidate_first) = candidate.pages.first() else {
+            continue;
+        };
+        let Some(candidate_last) = candidate.pages.last() else {
+            continue;
+        };
+        let candidate_start = candidate_first.address;
+        let candidate_end = candidate_last.address.saturating_add(page_size);
+        let overlap_start = retired_start.max(candidate_start);
+        let overlap_end = retired_end.min(candidate_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let retired_index =
+            usize::try_from((overlap_start - retired_start) / page_size).unwrap_or(usize::MAX);
+        let candidate_index =
+            usize::try_from((overlap_start - candidate_start) / page_size).unwrap_or(usize::MAX);
+        let overlap_pages = usize::try_from((overlap_end - overlap_start) / page_size).unwrap_or(0);
+        if retired_index == usize::MAX
+            || candidate_index == usize::MAX
+            || retired_index.saturating_add(overlap_pages) > owned.len()
+            || candidate_index.saturating_add(overlap_pages) > candidate.pages.len()
+        {
+            continue;
+        }
+        for offset in 0..overlap_pages {
+            if candidate.pages[candidate_index + offset]
+                .armed
+                .load(Ordering::Acquire)
+            {
+                owned[retired_index + offset] = true;
+            }
+        }
+    }
+
+    // One mprotect accepts a complete contiguous interval. Coalescing adjacent unowned pages
+    // avoids thousands of host syscalls when a large texture has no other live aliases.
+    let mut index = 0;
+    while index < owned.len() {
+        if owned[index] {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < owned.len() && !owned[index] {
+            index += 1;
+        }
+        let address = retired_start.saturating_add(start as u64 * page_size);
+        let byte_count = (index - start) as u64 * page_size;
+        let _ = protect_range(address, byte_count, false);
     }
 }
 

@@ -762,6 +762,60 @@ fn ordered_ingress_stops_at_the_decoded_event_backpressure_limit() {
 }
 
 #[test]
+fn ordered_receiver_reports_only_dependency_runnable_work() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let wait = GpuMemoryWait {
+        address: 0x4000,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    assert!(!ordered.has_runnable_events());
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("queue memory wait");
+    ordered.ingest(1);
+    assert!(ordered.has_runnable_events());
+
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            source
+        }
+        other => panic!("expected memory wait, got {other:?}"),
+    };
+    ordered.block_event(
+        source,
+        GpuEvent::MemoryWait(wait),
+        QueueBlockReason::GuestMemoryWait,
+    );
+    assert!(!ordered.has_runnable_events());
+
+    ordered.retry_guest_memory_waits();
+    assert!(ordered.has_runnable_events());
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            source
+        }
+        other => panic!("expected retried memory wait, got {other:?}"),
+    };
+    ordered.finish_event(source);
+    assert!(!ordered.has_runnable_events());
+}
+
+#[test]
 fn suspended_memory_wait_keeps_same_queue_tail_behind_it() {
     let (sender, receiver) = gpu_event_channel();
     let mut ordered = OrderedGpuEventReceiver::new(receiver);

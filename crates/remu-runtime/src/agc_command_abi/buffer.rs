@@ -425,7 +425,9 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
     // begins at a constructor-recorded address and ends exactly at the submitted tail. Ranges
     // parsed by an explicit branch or earlier submission are retired separately, preventing a
     // valid-looking old stream from being selected a second time.
-    let prefix_start = candidates.into_iter().find(|&start| {
+    let candidate_count = candidates.len();
+    let closest_candidates = candidates.iter().rev().take(8).copied().collect::<Vec<_>>();
+    let prefix_start = candidates.iter().copied().find(|&start| {
         // A successful explicit submission is an execution boundary. Constructor anchors left
         // before it may still point into perfectly valid recycled PM4, but joining across that
         // boundary executes the already-submitted stream again. This was visible in Silent Hill
@@ -439,6 +441,12 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
     let dword_count = u32::try_from((command_address - prefix_start) / 4).ok()?;
     if dword_count == 0 {
         return None;
+    }
+    if dword_count >= 4_096 {
+        eprintln!(
+            "[REMu][AGC][PREFIX] reconstructed={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={:#x} generation={} candidates={candidate_count} closest={closest_candidates:#x?}",
+            owner.0, owner.1,
+        );
     }
     allocations.retain(|allocation| {
         allocation.descriptor != owner.0

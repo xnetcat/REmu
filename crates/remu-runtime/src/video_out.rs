@@ -100,24 +100,6 @@ fn flip_rate_override() -> Option<u64> {
     })
 }
 
-/// Maximum decoded GPU events the guest may run ahead of the presenter at a flip boundary.
-///
-/// A console flip queue is finite. Sleeping only for the nominal vblank interval lets a 60 Hz
-/// guest enqueue minutes of rendering when translation is temporarily slower than real time
-/// (notably during Unreal's first large scene). Intentional black transition frames then remain
-/// visible for the whole queued interval and audio advances far ahead of video. Keep a small
-/// amount of look-ahead for shader prefetch and queue overlap while applying backpressure before
-/// the next guest frame is produced. `0` remains an explicit diagnostic escape hatch.
-fn flip_gpu_event_backlog_limit() -> Option<usize> {
-    static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        std::env::var("REMU_FLIP_GPU_EVENT_BACKLOG")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map_or(Some(64), |value| (value != 0).then_some(value))
-    })
-}
-
 /// Maximum accepted VideoOut flips allowed to wait for host presentation.
 ///
 /// Three retains normal double/triple buffering while preventing movie and transition frames from
@@ -140,13 +122,46 @@ fn effective_flip_interval_microseconds() -> u64 {
     }
 }
 
+/// Tracks whether a backlogged presenter is making net progress.
+///
+/// A single Metal command buffer can legitimately take several seconds while a large scene is
+/// being compiled and uploaded. An absolute timeout lets the guest resume after that interval
+/// even when the presenter is draining normally, which immediately rebuilds the queue and lets
+/// movie/audio state run ahead of the visible frame. Only a new low-water mark resets the stall
+/// timer; queue churn above that mark is not progress toward the configured limit.
+struct BackpressureProgress {
+    lowest_pending: usize,
+    last_progress: Instant,
+}
+
+impl BackpressureProgress {
+    fn new(pending: usize, now: Instant) -> Self {
+        Self {
+            lowest_pending: pending,
+            last_progress: now,
+        }
+    }
+
+    fn stalled(&mut self, pending: usize, now: Instant, timeout: Duration) -> bool {
+        if pending < self.lowest_pending {
+            self.lowest_pending = pending;
+            self.last_progress = now;
+        }
+        now.saturating_duration_since(self.last_progress) >= timeout
+    }
+}
+
 /// Holds the submitting thread until its flip is due.
 ///
 /// Without this the guest's frame loop is never gated: flips complete the instant they are
 /// submitted, so a title that advances simulation once per displayed frame runs as fast as the
 /// host can retire draws instead of at the rate it selected.
 pub(crate) fn pace_video_out_flip() {
-    const MAX_BACKPRESSURE_WAIT: Duration = Duration::from_secs(5);
+    // An accepted flip only depends on work already submitted before it, so this finite queue is
+    // safe to pace. Do not apply the same policy to the aggregate GPU-event count: an async queue
+    // may legally wait for a label written by a later graphics submission, and pausing the guest
+    // before that producer is submitted creates a host-only dependency cycle.
+    const MAX_BACKPRESSURE_STALL: Duration = Duration::from_secs(5);
     let interval = effective_flip_interval_microseconds();
     if interval == 0 {
         return;
@@ -167,7 +182,7 @@ pub(crate) fn pace_video_out_flip() {
         std::thread::sleep(delay);
     }
     if let Some(backlog_limit) = flip_presentation_backlog_limit() {
-        let wait_started = Instant::now();
+        let mut progress = BackpressureProgress::new(remu_gpu::gpu_flips_pending(), Instant::now());
         let mut logged = false;
         while remu_gpu::gpu_flips_pending() > backlog_limit {
             if !logged {
@@ -181,37 +196,12 @@ pub(crate) fn pace_video_out_flip() {
                 }
                 logged = true;
             }
-            if wait_started.elapsed() >= MAX_BACKPRESSURE_WAIT {
+            let pending = remu_gpu::gpu_flips_pending();
+            if progress.stalled(pending, Instant::now(), MAX_BACKPRESSURE_STALL) {
                 eprintln!(
                     "[REMu][VIDEO] presentation backpressure made no progress for {} ms; continuing queued={} target={backlog_limit}",
-                    MAX_BACKPRESSURE_WAIT.as_millis(),
-                    remu_gpu::gpu_flips_pending(),
-                );
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-    if let Some(backlog_limit) = flip_gpu_event_backlog_limit() {
-        let wait_started = Instant::now();
-        let mut logged = false;
-        while remu_gpu::gpu_work_items_pending() > backlog_limit {
-            if !logged {
-                static WORK_BACKPRESSURE_COUNT: AtomicU64 = AtomicU64::new(0);
-                let sequence = WORK_BACKPRESSURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if sequence <= 16 || sequence.is_power_of_two() {
-                    eprintln!(
-                        "[REMu][VIDEO] work backpressure sequence={sequence} queued={} target={backlog_limit}",
-                        remu_gpu::gpu_work_items_pending(),
-                    );
-                }
-                logged = true;
-            }
-            if wait_started.elapsed() >= MAX_BACKPRESSURE_WAIT {
-                eprintln!(
-                    "[REMu][VIDEO] work backpressure made no progress for {} ms; continuing queued={} target={backlog_limit}",
-                    MAX_BACKPRESSURE_WAIT.as_millis(),
-                    remu_gpu::gpu_work_items_pending(),
+                    MAX_BACKPRESSURE_STALL.as_millis(),
+                    pending,
                 );
                 break;
             }
@@ -266,4 +256,33 @@ pub(crate) fn video_out_submit_flip(arguments: [u64; 6], state: &mut ProbeDispat
     }
     queue_video_out_flip(state, 1, buffer_index, arguments[3]);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackpressureProgress;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn backpressure_stall_timer_resets_at_each_low_water_mark() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut progress = BackpressureProgress::new(500, start);
+
+        assert!(!progress.stalled(400, start + Duration::from_secs(4), timeout));
+        assert!(!progress.stalled(350, start + Duration::from_secs(8), timeout));
+        assert!(!progress.stalled(350, start + Duration::from_secs(12), timeout));
+        assert!(progress.stalled(350, start + Duration::from_secs(13), timeout));
+    }
+
+    #[test]
+    fn backpressure_queue_churn_does_not_count_as_progress() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut progress = BackpressureProgress::new(100, start);
+
+        assert!(!progress.stalled(120, start + Duration::from_secs(2), timeout));
+        assert!(!progress.stalled(100, start + Duration::from_secs(4), timeout));
+        assert!(progress.stalled(110, start + Duration::from_secs(5), timeout));
+    }
 }

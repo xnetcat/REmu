@@ -5,7 +5,7 @@ use super::{
     GPU_EVENTS_PER_TICK, GraphicsPipelineKey, OrderedEventPoll, OrderedEventSource,
     OrderedGpuEventReceiver, QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
 };
-use remu_gpu::{GpuEvent, IndexedDraw};
+use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, IndexedDraw};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -260,6 +260,27 @@ impl OrderedGpuEventReceiver {
         )
     }
 
+    /// Returns whether an already-ingested event can make progress without an external producer.
+    ///
+    /// The windowed presenter uses this to keep AppKit's event loop active while guest GPU work
+    /// is runnable. A short `WaitUntil` deadline is heavily coalesced by macOS and otherwise turns
+    /// `GPU_EVENTS_PER_TICK` into an unintended throughput ceiling. Dependency-blocked queues do
+    /// not count as runnable, so a guest waiting on a CPU write or shader compilation still lets
+    /// the application sleep.
+    pub(crate) fn has_runnable_events(&self) -> bool {
+        if self.host_block.is_none() && !self.host_events.is_empty() {
+            return true;
+        }
+        self.queue_order.iter().any(|queue_id| {
+            !self.blocked_queues.contains_key(queue_id)
+                && self.submissions.get(queue_id).is_some_and(|submissions| {
+                    submissions
+                        .iter()
+                        .any(|submission| !submission.events.is_empty())
+                })
+        })
+    }
+
     pub(crate) fn block_reason_counts(&self) -> (usize, usize) {
         let mut pipeline = 0;
         let mut memory = 0;
@@ -332,5 +353,132 @@ impl OrderedGpuEventReceiver {
             })
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    /// Describes already-ingested packets which can write the label watched by `wait`.
+    ///
+    /// This is diagnostic only: queue-local ordering must still be preserved. It distinguishes a
+    /// missing producer from a producer trapped behind another blocked queue front, which look
+    /// identical when only the live label value is logged.
+    pub(crate) fn describe_queued_wait_producers(&self, wait: GpuMemoryWait) -> String {
+        let wait_bytes = if wait.is_64_bit { 8 } else { 4 };
+        let wait_end = wait.address.saturating_add(wait_bytes);
+        let overlaps_wait = |address: u64, byte_count: u64| {
+            address < wait_end && wait.address < address.saturating_add(byte_count)
+        };
+        let binding_overlaps = |base_address: u64, byte_count: usize, writable: bool| {
+            writable
+                && u64::try_from(byte_count)
+                    .is_ok_and(|byte_count| overlaps_wait(base_address, byte_count))
+        };
+        let mut producers = Vec::new();
+
+        for queue_id in &self.queue_order {
+            let Some(submissions) = self.submissions.get(queue_id) else {
+                continue;
+            };
+            for (submission_index, submission) in submissions.iter().enumerate() {
+                for (event_index, event) in submission.events.iter().enumerate() {
+                    let description = match event {
+                        GpuEvent::MemoryRelease(release) => {
+                            let (byte_count, value) = match release.value {
+                                GpuMemoryReleaseValue::Immediate32(value) => {
+                                    (4, format!("{value:#x}"))
+                                }
+                                GpuMemoryReleaseValue::Immediate64(value) => {
+                                    (8, format!("{value:#x}"))
+                                }
+                                GpuMemoryReleaseValue::Timestamp => (8, "timestamp".to_owned()),
+                            };
+                            overlaps_wait(release.address, byte_count)
+                                .then(|| format!("release@{:#x}={value}", release.address))
+                        }
+                        GpuEvent::MemoryWrite(write) => {
+                            let byte_count = if write.increment_address {
+                                u64::try_from(write.values.len())
+                                    .unwrap_or(u64::MAX / 4)
+                                    .saturating_mul(4)
+                            } else {
+                                4
+                            };
+                            overlaps_wait(write.address, byte_count).then(|| {
+                                format!(
+                                    "write@{:#x}/dwords:{}/increment:{}",
+                                    write.address,
+                                    write.values.len(),
+                                    write.increment_address
+                                )
+                            })
+                        }
+                        GpuEvent::MemoryCopy(copy) => {
+                            overlaps_wait(copy.destination_address, copy.byte_count).then(|| {
+                                format!(
+                                    "dma@{:#x}/bytes:{:#x}",
+                                    copy.destination_address, copy.byte_count
+                                )
+                            })
+                        }
+                        GpuEvent::ComputeDispatch(dispatch) => dispatch
+                            .shader_evaluation
+                            .as_ref()
+                            .and_then(|evaluation| {
+                                evaluation.global_memory_bindings.iter().find(|binding| {
+                                    binding_overlaps(
+                                        binding.base_address,
+                                        binding.byte_count,
+                                        binding.writable,
+                                    )
+                                })
+                            })
+                            .map(|binding| {
+                                format!(
+                                    "compute:{}/cs:{:#x}/global:{:#x}+{:#x}",
+                                    dispatch.sequence,
+                                    dispatch.shader_address,
+                                    binding.base_address,
+                                    binding.byte_count
+                                )
+                            }),
+                        GpuEvent::IndexedDraw(draw) => draw
+                            .export_shader_evaluation
+                            .iter()
+                            .chain(draw.pixel_shader_evaluation.iter())
+                            .flat_map(|evaluation| &evaluation.global_memory_bindings)
+                            .find(|binding| {
+                                binding_overlaps(
+                                    binding.base_address,
+                                    binding.byte_count,
+                                    binding.writable,
+                                )
+                            })
+                            .map(|binding| {
+                                format!(
+                                    "draw:{}/es:{:#x}/ps:{:#x}/global:{:#x}+{:#x}",
+                                    draw.sequence,
+                                    draw.export_shader_address,
+                                    draw.pixel_shader_address,
+                                    binding.base_address,
+                                    binding.byte_count
+                                )
+                            }),
+                        _ => None,
+                    };
+                    if let Some(description) = description {
+                        producers.push(format!(
+                            "q{queue_id}/s{submission_index}/e{event_index}:{description}"
+                        ));
+                        if producers.len() == 16 {
+                            return producers.join(",");
+                        }
+                    }
+                }
+            }
+        }
+
+        if producers.is_empty() {
+            "none-ingested".to_owned()
+        } else {
+            producers.join(",")
+        }
     }
 }

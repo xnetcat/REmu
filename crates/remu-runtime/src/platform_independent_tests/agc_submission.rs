@@ -12,6 +12,29 @@ use super::{
 };
 
 #[test]
+fn gpu_publication_waits_until_the_dispatch_state_can_be_released() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+
+    crate::begin_deferred_gpu_publication();
+    assert!(crate::publish_gpu_event(remu_gpu::GpuEvent::Shutdown));
+    assert!(
+        receiver.try_recv().is_err(),
+        "event must not enter the bounded backend channel while dispatch state is locked"
+    );
+
+    let publication = crate::take_deferred_gpu_publication();
+    assert!(crate::flush_deferred_gpu_publication(publication));
+    assert!(matches!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown)));
+    remu_gpu::record_gpu_event_consumed();
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
 fn agc_completion_tracking_requires_a_published_queue_submission() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()

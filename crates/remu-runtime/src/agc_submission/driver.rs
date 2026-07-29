@@ -41,7 +41,6 @@ pub(crate) fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispat
             &mut AgcSubmissionContext {
                 graphics: &mut state.agc_graphics,
                 shaders: &mut state.agc_shader_registry,
-                index_resources: &state.agc_index_resources,
                 video_out: &state.video_out,
                 submission_count: &mut state.agc_submission_count,
                 flips: &mut flips,
@@ -94,7 +93,6 @@ pub(crate) fn agc_driver_submit_multi_dcbs(
                     &mut AgcSubmissionContext {
                         graphics: &mut state.agc_graphics,
                         shaders: &mut state.agc_shader_registry,
-                        index_resources: &state.agc_index_resources,
                         video_out: &state.video_out,
                         submission_count: &mut state.agc_submission_count,
                         flips: &mut flips,
@@ -167,7 +165,6 @@ pub(super) fn agc_submit_compute_commands(
         &mut AgcSubmissionContext {
             graphics,
             shaders: &mut state.agc_shader_registry,
-            index_resources: &state.agc_index_resources,
             video_out: &state.video_out,
             submission_count: &mut state.agc_submission_count,
             flips,
