@@ -11,8 +11,8 @@ use super::{
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    presentation_drawable_size, process_resident_bytes, take_mode27_work_details,
-    take_texture_dirty_work_details, take_texture_snapshot_work_details,
+    describe_guest_batch, presentation_drawable_size, process_resident_bytes,
+    take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
 use core_graphics_types::geometry::CGSize;
 use metal::{MTLPixelFormat, MetalLayer};
@@ -210,6 +210,22 @@ impl MetalPresenter {
             let queue_diagnostics = self.receiver.queue_diagnostics();
             if !queue_diagnostics.is_empty() {
                 eprintln!("[REMu][PERF-QUEUES] {queue_diagnostics}");
+            }
+            if !self.committed_guest_batches.is_empty() {
+                let batches = self
+                    .committed_guest_batches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, batch)| {
+                        format!(
+                            "{index}:{:?}:[{}]",
+                            batch.command_buffer.status(),
+                            describe_guest_batch(&batch.work),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!("[REMu][PERF-BATCHES] {batches}");
             }
             if !self.dropped_draw_executions.is_empty()
                 || !self.dropped_compute_executions.is_empty()

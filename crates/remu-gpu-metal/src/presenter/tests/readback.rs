@@ -115,6 +115,24 @@ fn capture_decodes_packed_rg11b10_float_channels() {
 }
 
 #[test]
+fn capture_decodes_packed_rgb10a2_unorm_channels() {
+    let packed = 1023_u32 | (512_u32 << 10) | (256_u32 << 20) | (2_u32 << 30);
+    let descriptor = GuestTextureDescriptor {
+        address: 0x1_0000,
+        width: 1,
+        height: 1,
+        pitch: 1,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGB10A2Unorm,
+        bytes_per_pixel: 4,
+    };
+    assert_eq!(
+        native_texture_capture_to_bgra(&packed.to_le_bytes(), descriptor),
+        Some(vec![137, 188, 255, 170]),
+    );
+}
+
+#[test]
 fn private_render_target_readback_uses_owned_staging_resources() {
     let device = Device::system_default().expect("Metal device");
     let queue = device.new_command_queue();

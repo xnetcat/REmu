@@ -428,6 +428,12 @@ pub(crate) fn refresh_resident_texture_write_watch(
                 resident.layer_count,
                 resident.mip_level_count,
             )?;
+            if resident.gpu_written && !was_dirty {
+                // Reprotection replaced the watch objects but not the shared backing. Preserve
+                // the ownership boundary in the new generation domain when no CPU store was
+                // observed during the transition.
+                resident.note_gpu_write();
+            }
             Ok(WriteWatchRefresh::Renewed { was_dirty })
         }
         Some(CpuWriteWatchRetirement::Replaced) => Ok(WriteWatchRefresh::Replaced),

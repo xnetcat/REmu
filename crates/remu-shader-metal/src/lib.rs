@@ -363,6 +363,8 @@ pub fn compile_msl(
 /// layered volume generation. Prospero runs the export half through LDS and transfers to a
 /// geometry half with `S_SETPC`; Metal has neither graphics-stage LDS nor geometry shaders, so the
 /// equivalent four-vertex strip is emitted directly and each instance is routed to one layer.
+/// Metal's render-target rows run opposite to the guest rectangle's interpolated Y coordinate,
+/// so the synthesized parameter reverses Y while preserving the strip's position and winding.
 #[must_use]
 pub fn compile_layered_rectangle_vertex(
     interpolated_attribute_count: u32,
@@ -405,7 +407,7 @@ pub fn compile_layered_rectangle_vertex(
     for location in 0..interpolated_attribute_count {
         let _ = writeln!(
             source,
-            "    remu_out.param{location} = float4(remu_uv, remu_layer, 1.0f);"
+            "    remu_out.param{location} = float4(remu_uv.x, 1.0f - remu_uv.y, remu_layer, 1.0f);"
         );
     }
     source.push_str("    return remu_out;\n}\n");

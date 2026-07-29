@@ -15,8 +15,9 @@ use super::{
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
     ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
     DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestTextureDescriptor,
-    MetalPresenter, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
-    append_depth_target_registers, common_render_target_array_length, consume_depth_metadata_clear,
+    MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0,
+    append_color_target_registers, append_depth_target_registers,
+    common_render_target_array_length, consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
     decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
@@ -24,8 +25,8 @@ use super::{
     guest_texture_byte_count, guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
-    metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, read_draw_indices,
-    read_texture_array_linear, read_texture_linear, rearm_depth_metadata_clear,
+    metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, prepare_ngg_meshlets,
+    read_draw_indices, read_texture_array_linear, read_texture_linear, rearm_depth_metadata_clear,
     render_target_fast_clear_color,
 };
 
@@ -1259,6 +1260,45 @@ fn maps_legacy_and_gen5_triangle_list_codes_to_metal_triangles() {
         metal_primitive_topology_class(7),
         Ok(MTLPrimitiveTopologyClass::Triangle)
     );
+}
+
+#[test]
+fn packs_ngg_meshlets_with_shared_vertex_indices() {
+    let prepared = prepare_ngg_meshlets(&[10, 11, 12, 12, 11, 13]);
+    assert_eq!(prepared.group_count, 1);
+    assert_eq!(prepared.vertex_references, 4);
+    assert_eq!(prepared.primitive_count, 2);
+    assert_eq!(prepared.words.len(), NGG_MESHLET_WORDS_PER_GROUP);
+    assert_eq!(prepared.words[0], 4 | (2 << 8));
+    assert_eq!(prepared.words[1], 0);
+    assert_eq!(&prepared.words[2..6], &[10, 11, 12, 13]);
+    assert_eq!(prepared.words[66], 1 << 10 | 2 << 20);
+    assert_eq!(prepared.words[67], 2 | 1 << 10 | 3 << 20);
+}
+
+#[test]
+fn splits_ngg_meshlets_at_the_architectural_vertex_limit() {
+    let indices = (0_u32..66).collect::<Vec<_>>();
+    let prepared = prepare_ngg_meshlets(&indices);
+    assert_eq!(prepared.group_count, 2);
+    assert_eq!(prepared.vertex_references, 66);
+    assert_eq!(prepared.primitive_count, 22);
+    assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP], 3 | (1 << 8));
+    assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP + 1], 21);
+}
+
+#[test]
+fn packs_up_to_sixty_four_ngg_primitives_per_meshlet() {
+    let mut indices = Vec::new();
+    for primitive in 0_u32..65 {
+        indices.extend_from_slice(&[0, 1, 2 + primitive % 62]);
+    }
+    let prepared = prepare_ngg_meshlets(&indices);
+    assert_eq!(prepared.group_count, 2);
+    assert_eq!(prepared.primitive_count, 65);
+    assert_eq!(prepared.words[0] >> 8, 64);
+    assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP] >> 8, 1);
+    assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP + 1], 64);
 }
 
 #[test]

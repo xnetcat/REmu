@@ -15,7 +15,115 @@ use metal::{
 };
 use remu_gpu::IndexedDraw;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+pub(crate) const NGG_MESHLET_WORDS_PER_GROUP: usize = 130;
+const NGG_MESHLET_MAX_VERTICES: usize = 64;
+const NGG_MESHLET_MAX_PRIMITIVES: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedNggMeshlets {
+    pub(crate) words: Arc<[u32]>,
+    pub(crate) group_count: u64,
+    pub(crate) vertex_references: usize,
+    pub(crate) primitive_count: usize,
+}
+
+/// Builds the GFX10 NGG workgroups consumed by a merged export/geometry shader.
+///
+/// The native ABI supplies up to 64 unique vertex IDs and 64 packed triangle records to each
+/// wave. Treating every three source indices as three new vertices restricts a wave to only 21
+/// triangles, repeats vertex work, and can expand a large Unreal draw into thousands of Metal
+/// mesh threadgroups. Preserve index reuse by greedily packing consecutive triangles until
+/// either architectural limit is reached.
+pub(crate) fn prepare_ngg_meshlets(indices: &[u32]) -> PreparedNggMeshlets {
+    let primitive_count = indices.len() / 3;
+    let mut words = Vec::new();
+    let mut vertices = Vec::<u32>::with_capacity(NGG_MESHLET_MAX_VERTICES);
+    let mut vertex_slots = HashMap::<u32, u32>::with_capacity(NGG_MESHLET_MAX_VERTICES);
+    let mut primitives = Vec::<u32>::with_capacity(NGG_MESHLET_MAX_PRIMITIVES);
+    let mut first_primitive = 0_usize;
+
+    let flush = |words: &mut Vec<u32>,
+                 vertices: &mut Vec<u32>,
+                 vertex_slots: &mut HashMap<u32, u32>,
+                 primitives: &mut Vec<u32>,
+                 first_primitive: usize| {
+        if primitives.is_empty() {
+            return;
+        }
+        let vertex_count = u32::try_from(vertices.len()).expect("NGG vertex count fits u32");
+        let primitive_count =
+            u32::try_from(primitives.len()).expect("NGG primitive count fits u32");
+        words.push(vertex_count | (primitive_count << 8));
+        words.push(u32::try_from(first_primitive).expect("NGG primitive ID fits u32"));
+        words.extend(vertices.iter().copied());
+        words.resize(words.len() + NGG_MESHLET_MAX_VERTICES - vertices.len(), 0);
+        words.extend(primitives.iter().copied());
+        words.resize(
+            words.len() + NGG_MESHLET_MAX_PRIMITIVES - primitives.len(),
+            0x8000_0000,
+        );
+        vertices.clear();
+        vertex_slots.clear();
+        primitives.clear();
+    };
+
+    for (primitive, triangle) in indices.chunks_exact(3).enumerate() {
+        let additional_vertices = triangle
+            .iter()
+            .enumerate()
+            .filter(|(component, index)| {
+                !vertex_slots.contains_key(index) && !triangle[..*component].contains(index)
+            })
+            .count();
+        if !primitives.is_empty()
+            && (primitives.len() == NGG_MESHLET_MAX_PRIMITIVES
+                || vertices.len() + additional_vertices > NGG_MESHLET_MAX_VERTICES)
+        {
+            flush(
+                &mut words,
+                &mut vertices,
+                &mut vertex_slots,
+                &mut primitives,
+                first_primitive,
+            );
+            first_primitive = primitive;
+        }
+
+        let mut local = [0_u32; 3];
+        for (component, &index) in triangle.iter().enumerate() {
+            local[component] = *vertex_slots.entry(index).or_insert_with(|| {
+                let slot = u32::try_from(vertices.len()).expect("NGG vertex slot fits u32");
+                vertices.push(index);
+                slot
+            });
+        }
+        primitives.push(local[0] | (local[1] << 10) | (local[2] << 20));
+    }
+    flush(
+        &mut words,
+        &mut vertices,
+        &mut vertex_slots,
+        &mut primitives,
+        first_primitive,
+    );
+
+    // Count all packed vertex records rather than only the final workgroup.
+    let vertex_references = words
+        .chunks_exact(NGG_MESHLET_WORDS_PER_GROUP)
+        .map(|group| usize::try_from(group[0] & 0xff).expect("vertex count fits usize"))
+        .sum();
+    let group_count = u64::try_from(words.len() / NGG_MESHLET_WORDS_PER_GROUP)
+        .expect("NGG meshlet group count fits u64");
+    PreparedNggMeshlets {
+        words: words.into(),
+        group_count,
+        vertex_references,
+        primitive_count,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ColorOperationMode {

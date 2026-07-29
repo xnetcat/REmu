@@ -14,6 +14,9 @@ pub(crate) enum ControlFlowLowering {
     /// Instruction indices in their exact execution order. This includes forward or backward
     /// unconditional branches, provided the resulting path is acyclic.
     Direct(Vec<usize>),
+    /// Conditional control flow whose every encoded edge moves forward. Each basic block can be
+    /// considered once in guest-PC order, without a per-invocation loop or switch dispatcher.
+    Forward,
     /// Conditional control flow or a cycle still requires the bounded architectural PC machine.
     Dispatcher,
 }
@@ -110,6 +113,11 @@ pub(crate) fn analyze_control_flow(
         }
     }
 
+    let forward_only = program
+        .instructions
+        .iter()
+        .filter(|instruction| is_scalar_branch(instruction.opcode))
+        .all(|instruction| branch_target(instruction).is_ok_and(|target| target > instruction.pc));
     let mut path = Vec::new();
     let mut visited = BTreeSet::new();
     let mut index = 0_usize;
@@ -125,7 +133,11 @@ pub(crate) fn analyze_control_flow(
                 index = instruction_by_pc[&target];
             }
             Some(name) if name.starts_with("SCbranch") => {
-                return Ok(ControlFlowLowering::Dispatcher);
+                return Ok(if forward_only {
+                    ControlFlowLowering::Forward
+                } else {
+                    ControlFlowLowering::Dispatcher
+                });
             }
             _ => {
                 index += 1;

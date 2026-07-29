@@ -301,7 +301,7 @@ pub(crate) use shader_cache::{
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 pub(crate) use shader_cache::{canonical_vertex_record_count, shader_evaluation_user_data_key};
 pub(crate) use shader_eval::{
-    draw_required_vertex_record_count, evaluate_draw_shader_requests_parallel,
+    draw_required_vertex_record_count, dump_draw_shader_ir, evaluate_draw_shader_requests_parallel,
     evaluate_shader_register_snapshot_cached, export_user_data_register,
     shader_control_flow_summary, shader_evaluation_worker_request, snapshot_draw_indices,
     snapshot_small_readonly_global_bindings, trace_agc_shader_draw,
@@ -383,7 +383,7 @@ struct ProbeDispatchState {
     pthread_attributes: BTreeMap<u64, PthreadAttrObject>,
     pthread_mutex_attributes: BTreeMap<u64, PthreadMutexAttrObject>,
     pthread_condition_attributes: BTreeSet<u64>,
-    pthread_keys: BTreeMap<u32, u64>,
+    pthread_keys: BTreeMap<u32, PthreadKeyState>,
     ampr_files: BTreeMap<u32, PathBuf>,
     ampr_file_handles: BTreeMap<u32, Arc<std::fs::File>>,
     ampr_command_buffers: BTreeMap<u64, AmprCommandBufferState>,
@@ -780,6 +780,12 @@ struct PthreadThreadObject {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PthreadKeyState {
+    destructor: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GuestExitCallback {
     function: u64,
     argument: Option<u64>,
@@ -1064,11 +1070,18 @@ thread_local! {
     static CURRENT_GUEST_THREAD_POINTER: Cell<u64> = const { Cell::new(0) };
     static CURRENT_GUEST_THREAD_HANDLE: Cell<u64> = const { Cell::new(0) };
     static CURRENT_GUEST_THREAD_EXIT_CONTEXT: Cell<*mut GuestThreadExitContext> = const { Cell::new(std::ptr::null_mut()) };
-    static GUEST_PTHREAD_SPECIFIC: RefCell<BTreeMap<u32, u64>> = const { RefCell::new(BTreeMap::new()) };
+    static GUEST_PTHREAD_SPECIFIC: RefCell<BTreeMap<u32, (u64, u64)>> = const { RefCell::new(BTreeMap::new()) };
     static IMPORT_TELEMETRY_CACHE: RefCell<Option<(usize, Arc<ImportTelemetry>)>> = const { RefCell::new(None) };
     static PROCESS_TIME_CALLSITES: RefCell<[(u64, u64); 8]> = const { RefCell::new([(0, 0); 8]) };
     #[cfg(target_os = "macos")]
     static KERNEL_MEMORY_READABLE_RANGES_CACHE: RefCell<Option<(usize, Arc<[(u64, u64)]>)>> = const { RefCell::new(None) };
+}
+
+static PTHREAD_KEY_GENERATIONS: OnceLock<RwLock<[u64; 256]>> = OnceLock::new();
+static NEXT_PTHREAD_KEY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn pthread_key_generations() -> &'static RwLock<[u64; 256]> {
+    PTHREAD_KEY_GENERATIONS.get_or_init(|| RwLock::new([0; 256]))
 }
 
 #[cfg(target_os = "macos")]
@@ -1344,6 +1357,9 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     }
     state.pthread_condition_attributes.clear();
     state.pthread_keys.clear();
+    *pthread_key_generations()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = [0; 256];
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
     state.exit_callbacks.clear();
     state.process_param_address = image.process_param.map_or(0, GuestAddress::get);
@@ -1419,6 +1435,12 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.ampr_files.clear();
     state.ampr_file_handles.clear();
     state.save_root = save_data_root(game_root);
+    if let Err(error) = std::fs::create_dir_all(state.save_root.join("download0")) {
+        eprintln!(
+            "[REMu][VFS] could not create persistent /download0 backing under {}: {error}",
+            state.save_root.display()
+        );
+    }
     state.save_data_initialized = false;
     state.save_mounts.clear();
     state.next_save_transaction_resource = 1;

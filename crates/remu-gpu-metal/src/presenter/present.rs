@@ -22,12 +22,12 @@ use super::{
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     WriteWatchRefresh, capture_interval, compile_metal_library_with_tools,
     completed_command_buffer_gpu_duration, decode_guest_texture_linear_from_raw,
-    diagnostic_scanout_writer, diagnostic_texture_writer, process_resident_bytes,
-    raw_video_out_texture_descriptor, read_texture_linear, refresh_resident_texture_write_watch,
-    retire_multisample_textures_overlapping_writeback,
+    describe_guest_batch, diagnostic_scanout_writer, diagnostic_texture_writer,
+    process_resident_bytes, raw_video_out_texture_descriptor, read_texture_linear,
+    refresh_resident_texture_write_watch, retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
     snapshot_guest_texture_raw, take_mode27_work_details, take_texture_dirty_work_details,
-    take_texture_snapshot_work_details, trace_scanout_writes,
+    take_texture_snapshot_work_details, trace_resident_texture_removal, trace_scanout_writes,
     write_resident_texture_contents_to_guest,
 };
 mod scanout;

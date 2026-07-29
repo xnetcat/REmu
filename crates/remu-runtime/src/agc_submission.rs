@@ -261,7 +261,7 @@ pub(crate) fn agc_handle_submission_packet(
                     packet_address,
                     source,
                 })?;
-        if trace_logarithmic_sequence(dispatch.sequence, 8) {
+        if trace_agc_programs() || trace_logarithmic_sequence(dispatch.sequence, 8) {
             eprintln!(
                 "[REMu][AGC] compute={} source={:?} grid={:?} base={:?} local={:?} wave={} cs={:#x}",
                 dispatch.sequence,

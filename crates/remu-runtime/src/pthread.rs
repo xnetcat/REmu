@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 use crate::{
-    GUEST_PTHREAD_SPECIFIC, MACOS_GUEST_PAGE_ALIGNMENT, PROBE_DISPATCH, ProbeDispatchState,
-    PthreadAttrObject, PthreadAttrState, PthreadMutexAttrObject, PthreadMutexAttrState,
-    SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TRY_AGAIN,
-    current_guest_thread_handle, guest_calloc, guest_free, low_i32, low_u32, read_guest_cstring,
+    GUEST_PTHREAD_SPECIFIC, MACOS_GUEST_PAGE_ALIGNMENT, NEXT_PTHREAD_KEY_GENERATION,
+    PROBE_DISPATCH, ProbeDispatchState, PthreadAttrObject, PthreadAttrState, PthreadKeyState,
+    PthreadMutexAttrObject, PthreadMutexAttrState, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+    SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TRY_AGAIN, current_guest_thread_handle,
+    guest_calloc, guest_free, low_i32, low_u32, pthread_key_generations, read_guest_cstring,
     read_guest_u32, sce_kernel_error, write_guest_u32, write_guest_u64,
 };
 
@@ -445,7 +447,19 @@ pub(crate) fn pthread_key_create(arguments: [u64; 6], state: &mut ProbeDispatchS
     let Some(key) = (0..MAX_KEYS).find(|key| !state.pthread_keys.contains_key(key)) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
     };
-    state.pthread_keys.insert(key, arguments[1]);
+    let generation = NEXT_PTHREAD_KEY_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1);
+    state.pthread_keys.insert(
+        key,
+        PthreadKeyState {
+            destructor: arguments[1],
+            generation,
+        },
+    );
+    pthread_key_generations()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[key as usize] = generation;
     write_guest_u32(arguments[0], key);
     0
 }
@@ -454,6 +468,9 @@ pub(crate) fn pthread_key_delete(key: u32, state: &mut ProbeDispatchState) -> u6
     if state.pthread_keys.remove(&key).is_none() {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    pthread_key_generations()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[key as usize] = 0;
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
         values.remove(&key);
     });
@@ -462,17 +479,32 @@ pub(crate) fn pthread_key_delete(key: u32, state: &mut ProbeDispatchState) -> u6
 
 pub(crate) fn pthread_set_specific(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     let key = low_u32(arguments[0]);
-    if !state.pthread_keys.contains_key(&key) {
+    let Some(key_state) = state.pthread_keys.get(&key) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
+    };
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
-        values.insert(key, arguments[1]);
+        values.insert(key, (key_state.generation, arguments[1]));
     });
     0
 }
 
 pub(crate) fn pthread_get_specific(key: u32) -> u64 {
-    GUEST_PTHREAD_SPECIFIC.with_borrow(|values| values.get(&key).copied().unwrap_or(0))
+    let Some(&generation) = pthread_key_generations()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key as usize)
+    else {
+        return 0;
+    };
+    if generation == 0 {
+        return 0;
+    }
+    GUEST_PTHREAD_SPECIFIC.with_borrow(|values| {
+        values
+            .get(&key)
+            .filter(|(stored_generation, _)| *stored_generation == generation)
+            .map_or(0, |(_, value)| *value)
+    })
 }
 
 pub(crate) fn take_current_thread_specific_destructors(
@@ -482,14 +514,14 @@ pub(crate) fn take_current_thread_specific_destructors(
         state
             .pthread_keys
             .iter()
-            .filter_map(|(&key, &destructor)| {
-                let value = values.get_mut(&key)?;
-                if destructor == 0 || *value == 0 {
+            .filter_map(|(&key, &key_state)| {
+                let (generation, value) = values.get_mut(&key)?;
+                if *generation != key_state.generation || key_state.destructor == 0 || *value == 0 {
                     return None;
                 }
                 let argument = *value;
                 *value = 0;
-                Some((destructor, argument))
+                Some((key_state.destructor, argument))
             })
             .collect()
     })

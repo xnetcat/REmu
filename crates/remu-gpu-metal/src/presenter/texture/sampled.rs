@@ -14,7 +14,8 @@ use super::{
     resident_is_depth_array_face, retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
     sampled_alias_descriptor, texture_element_layout, trace_image_descriptors,
-    trace_target_sampling, write_resident_texture_contents_to_guest,
+    trace_resident_texture_removal, trace_target_sampling,
+    write_resident_texture_contents_to_guest,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -185,7 +186,9 @@ impl MetalPresenter {
                     .expect("collected sampled alias exists"),
             )?;
             if refresh == WriteWatchRefresh::Replaced {
-                self.resident_guest_textures.remove(&descriptor);
+                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                    trace_resident_texture_removal("sampled-alias-mapping-replaced", &resident);
+                }
                 continue;
             }
             if refresh == WriteWatchRefresh::Reprotecting {
@@ -193,6 +196,19 @@ impl MetalPresenter {
                     "sampled alias mapping {:#x} is being reprotected",
                     descriptor.address
                 ));
+            }
+            if self
+                .resident_guest_textures
+                .get(&descriptor)
+                .is_some_and(|resident| resident.cpu_write_obsoletes_gpu_writeback(refresh))
+            {
+                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                    // The CPU has repurposed this physical heap range since the render that
+                    // produced `resident`. Keep the newer bytes authoritative so the following
+                    // upload observes the guest's command/resource contents.
+                    trace_resident_texture_removal("cpu-reused-sampled-alias", &resident);
+                }
+                continue;
             }
             let (alias_ranges, content_version) = {
                 let resident = self

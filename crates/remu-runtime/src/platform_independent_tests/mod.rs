@@ -45,13 +45,14 @@ use super::{
     low_f32, low_u32, pace_video_out_flip, pthread_attr_get_affinity, pthread_attr_get_stack,
     pthread_attr_set_affinity, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
     pthread_attr_set_stack_size, read_guest_u16, read_guest_u32, read_guest_u64,
-    resolve_guest_path, rtc_get_current_clock_local_time, rtc_get_current_tick, rtc_get_tick,
-    rtc_set_tick, sanitize_save_segment, save_data_commit, save_data_create_transaction_resource,
-    save_data_dir_name_search, save_data_mount3, save_data_pattern_matches, save_data_prepare,
-    save_data_save_icon, save_data_set_param, save_data_umount2, sce_kernel_error,
-    set_current_guest_thread_pointer, system_service_param_get_int, take_exit_callbacks,
-    tls_dtv_entry_offset, unix_days_from_civil, video_out_open, video_out_submit_flip,
-    write_guest_u8, write_guest_u16, write_guest_u32, write_guest_u64, write_import_stub,
+    resolve_guest_path, resolve_probe_guest_path, rtc_get_current_clock_local_time,
+    rtc_get_current_tick, rtc_get_tick, rtc_set_tick, sanitize_save_segment, save_data_commit,
+    save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
+    save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
+    save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
+    system_service_param_get_int, take_exit_callbacks, tls_dtv_entry_offset, unix_days_from_civil,
+    video_out_open, video_out_submit_flip, write_guest_u8, write_guest_u16, write_guest_u32,
+    write_guest_u64, write_import_stub,
 };
 mod agc_draw;
 mod agc_packets;

@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedGlobalBuffer, CachedSamplerArguments, DecodedDepthTarget, GlobalBufferCacheKey,
-    GuestCommandBatch, MetalPresenter, PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY,
-    SamplerArgumentCacheKey, UploadedGlobalBuffer, canonical_sampler_bindings,
-    create_sampler_argument_buffer, guest_batch_writes_overlap, guest_global_buffer_view,
-    guest_physical_ranges_overlap, metal_buffer_with_bytes,
+    CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
+    GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, PendingGlobalWriteback,
+    SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey, UploadedGlobalBuffer,
+    canonical_sampler_bindings, create_sampler_argument_buffer, guest_batch_writes_overlap,
+    guest_global_buffer_view, guest_physical_ranges_overlap, metal_buffer_with_bytes,
+    prepare_ngg_meshlets,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -461,6 +462,41 @@ impl MetalPresenter {
             .insert(indices.to_vec(), buffer.clone());
         Ok(buffer)
     }
+
+    pub(super) fn cached_ngg_meshlets(
+        &mut self,
+        device: &Device,
+        indices: &[u32],
+    ) -> Result<CachedNggMeshlets, String> {
+        if let Some(cached) = self.ngg_meshlet_cache.get(indices) {
+            return Ok(cached.clone());
+        }
+        let prepared = prepare_ngg_meshlets(indices);
+        if prepared.group_count == 0 {
+            return Err("NGG triangle draw contains no complete primitive".to_owned());
+        }
+        let byte_count = prepared
+            .words
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or("NGG meshlet byte count overflow")?;
+        // SAFETY: u32 has no invalid bit patterns and Metal copies this exact live slice before
+        // returning from metal_buffer_with_bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(prepared.words.as_ptr().cast::<u8>(), byte_count) };
+        let cached = CachedNggMeshlets {
+            buffer: metal_buffer_with_bytes(device, bytes)?,
+            group_count: prepared.group_count,
+            vertex_references: prepared.vertex_references,
+            primitive_count: prepared.primitive_count,
+        };
+        if self.ngg_meshlet_cache.len() >= NGG_MESHLET_CACHE_CAPACITY {
+            self.ngg_meshlet_cache.clear();
+        }
+        self.ngg_meshlet_cache
+            .insert(indices.to_vec(), cached.clone());
+        Ok(cached)
+    }
 }
 
 fn queued_global_read_source_in_batch(
@@ -553,3 +589,5 @@ pub(super) const GUEST_GLOBAL_BUFFER_CACHE_BYTE_CAPACITY: u64 = 512 * 1024 * 102
 pub(super) const GUEST_GLOBAL_BUFFER_MAX_ZERO_COPY_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) const INDEX_BUFFER_CACHE_CAPACITY: usize = 256;
+
+pub(super) const NGG_MESHLET_CACHE_CAPACITY: usize = 64;

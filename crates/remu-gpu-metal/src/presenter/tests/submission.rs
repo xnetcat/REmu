@@ -10,6 +10,9 @@ use remu_gpu::{
     GpuEvent, GpuMemoryAcquire, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
     GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
 };
+use remu_memory::{
+    CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestProtection,
+};
 use remu_shader::{GlobalMemoryBinding, Program};
 use std::time::Duration;
 
@@ -192,6 +195,9 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
             offset: 32,
             guest_address: 0x12_0000,
             byte_count: 64,
+            mapping_identity: None,
+            write_watch: None,
+            original_bytes: vec![0; 64],
         });
     let binding = GlobalMemoryBinding {
         scalar_address: 4,
@@ -489,9 +495,129 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         offset: second_offset,
         guest_address,
         byte_count: destination.len(),
+        mapping_identity: None,
+        write_watch: None,
+        original_bytes: vec![0; destination.len()],
     }])
     .expect("sliced global writeback");
     assert_eq!(destination, [9, 8, 7, 6]);
+}
+
+#[test]
+fn global_writeback_preserves_cpu_bytes_the_gpu_did_not_change() {
+    let device = Device::system_default().expect("Metal device");
+    let buffer = device.new_buffer_with_data(
+        [1_u8, 9, 3, 8].as_ptr().cast(),
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let mut destination = [7_u8; 4];
+    let guest_address =
+        u64::try_from(destination.as_mut_ptr() as usize).expect("host pointer fits u64");
+
+    write_back_pending_globals(&[PendingGlobalWriteback {
+        buffer,
+        offset: 0,
+        guest_address,
+        byte_count: destination.len(),
+        mapping_identity: None,
+        write_watch: None,
+        original_bytes: vec![1, 2, 3, 4],
+    }])
+    .expect("changed global bytes write back");
+
+    assert_eq!(destination, [7, 9, 7, 8]);
+}
+
+#[test]
+fn anonymous_global_writeback_rejects_replaced_guest_mapping() {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
+    let address = address_space
+        .map_anonymous(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .expect("anonymous guest mapping");
+    let guest_address = address.get();
+    let watch = unsafe { CpuWriteWatch::new(guest_address, GUEST_PAGE_SIZE) }
+        .expect("anonymous mapping write watch");
+
+    let device = Device::system_default().expect("Metal device");
+    let buffer = device.new_buffer_with_data(
+        [5_u8, 6, 7, 8].as_ptr().cast(),
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let pending = PendingGlobalWriteback {
+        buffer,
+        offset: 0,
+        guest_address,
+        byte_count: 4,
+        mapping_identity: None,
+        write_watch: Some(watch),
+        original_bytes: vec![0; 4],
+    };
+
+    address_space
+        .unmap(address, GUEST_PAGE_SIZE)
+        .expect("unmap watched guest allocation");
+    address_space
+        .map_anonymous(
+            GuestMapPlacement::Fixed(address),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .expect("replacement guest mapping");
+
+    let error = write_back_pending_globals(&[pending])
+        .expect_err("writeback must reject the replacement mapping");
+    assert!(error.contains("mapping changed before completion"));
+    let replacement = unsafe { std::slice::from_raw_parts(guest_address as *const u8, 4) }.to_vec();
+    assert_eq!(replacement, [0, 0, 0, 0]);
+}
+
+#[test]
+fn anonymous_global_writeback_updates_the_pinned_guest_mapping() {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
+    let address = address_space
+        .map_anonymous(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .expect("anonymous guest mapping");
+    let guest_address = address.get();
+    unsafe {
+        std::ptr::copy_nonoverlapping([1_u8, 2, 3, 4].as_ptr(), guest_address as *mut u8, 4);
+    }
+    let watch = unsafe { CpuWriteWatch::new(guest_address, GUEST_PAGE_SIZE) }
+        .expect("anonymous mapping write watch");
+
+    let device = Device::system_default().expect("Metal device");
+    let buffer = device.new_buffer_with_data(
+        [1_u8, 9, 3, 8].as_ptr().cast(),
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+    write_back_pending_globals(&[PendingGlobalWriteback {
+        buffer,
+        offset: 0,
+        guest_address,
+        byte_count: 4,
+        mapping_identity: None,
+        write_watch: Some(watch),
+        original_bytes: vec![1, 2, 3, 4],
+    }])
+    .expect("pinned anonymous writeback");
+
+    let destination = unsafe { std::slice::from_raw_parts(guest_address as *const u8, 4) }.to_vec();
+    assert_eq!(destination, [1, 9, 3, 8]);
 }
 
 #[test]

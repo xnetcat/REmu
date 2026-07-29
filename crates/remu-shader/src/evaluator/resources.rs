@@ -261,19 +261,22 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             _ => return Err(invalid(instruction, "scalar-memory base register pair")),
         };
         let is_buffer = instruction.opcode.starts_with("SBufferLoad");
-        let descriptor = is_buffer.then(|| decode_buffer_descriptor(registers, scalar_base));
-        let descriptor = descriptor.transpose().map_err(|()| {
-            let [words0, words1, words2, words3] =
-                buffer_descriptor_words(registers, scalar_base).unwrap_or_default();
-            EvaluationError::InvalidBufferDescriptor {
-                pc: instruction.pc,
-                register: scalar_base,
-                words0,
-                words1,
-                words2,
-                words3,
-            }
-        })?;
+        let descriptor = is_buffer.then(|| {
+            decode_buffer_descriptor(registers, scalar_base).unwrap_or(BufferDescriptor {
+                // Material tables can leave a noncanonical sentinel in an inactive resource
+                // slot. GFX10 scalar-buffer reads observe that slot through the descriptor's OOB
+                // behavior and return zero; rejecting the complete shader here incorrectly turns
+                // an unused material permutation into a dropped draw. Keep vector stores and
+                // atomics strict in `resolve_buffer_memory`.
+                base_address: 0,
+                stride: 0,
+                swizzle_enabled: false,
+                record_count: 0,
+                size_bytes: 0,
+                number_format: 0,
+                data_format: 0,
+            })
+        });
         let base_address = descriptor.map_or_else(
             || read_scalar_pair(registers, scalar_base).unwrap_or_default(),
             |descriptor| descriptor.base_address,

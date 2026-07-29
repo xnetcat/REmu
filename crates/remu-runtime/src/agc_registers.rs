@@ -588,9 +588,13 @@ pub(crate) enum AgcSubmissionError {
         packet_type: u32,
         header: u32,
     },
-    #[error("PM4 packet at dword {dword} declares {length} dwords with {remaining} remaining")]
+    #[error(
+        "PM4 packet at dword {dword} ({address:#x}, header {header:#010x}) declares {length} dwords with {remaining} remaining"
+    )]
     InvalidPacketLength {
         dword: u32,
+        address: u64,
+        header: u32,
         length: u32,
         remaining: u32,
     },

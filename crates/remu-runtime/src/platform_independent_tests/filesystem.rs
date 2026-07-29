@@ -12,11 +12,11 @@ use super::{
     TemporaryTestDirectory, ampr_resolve_file_paths, ampr_resolve_paths_core,
     discover_runtime_module_paths, guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_lseek,
     guest_kernel_read, guest_posix_file_result, join_guest_path, kernel_stat_payload,
-    read_guest_u32, resolve_guest_path, sanitize_save_segment, save_data_commit,
-    save_data_create_transaction_resource, save_data_dir_name_search, save_data_mount3,
-    save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
-    save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer, write_guest_u32,
-    write_guest_u64,
+    read_guest_u32, resolve_guest_path, resolve_probe_guest_path, sanitize_save_segment,
+    save_data_commit, save_data_create_transaction_resource, save_data_dir_name_search,
+    save_data_mount3, save_data_pattern_matches, save_data_prepare, save_data_save_icon,
+    save_data_set_param, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
+    write_guest_u32, write_guest_u64,
 };
 
 #[test]
@@ -52,6 +52,30 @@ fn resolves_duplicate_console_path_separators() {
     assert_eq!(
         resolve_guest_path(Path::new("/games/title"), "/app0//shaders/presenter.vert"),
         Some(Path::new("/games/title/shaders/presenter.vert").to_owned())
+    );
+}
+
+#[test]
+fn resolves_persistent_download_mount_without_allowing_escape() {
+    let temporary = TemporaryTestDirectory::new("download0-mount");
+    let state = ProbeDispatchState {
+        save_root: temporary.path.clone(),
+        ..ProbeDispatchState::default()
+    };
+    let root = temporary.path.join("download0");
+    std::fs::create_dir_all(&root).unwrap();
+
+    assert_eq!(
+        resolve_probe_guest_path(&state, "/download0"),
+        Some((root.clone(), true))
+    );
+    assert_eq!(
+        resolve_probe_guest_path(&state, "/download0/shpc/saved/ps5/cache.bin"),
+        Some((root.join("shpc/saved/ps5/cache.bin"), true))
+    );
+    assert_eq!(
+        resolve_probe_guest_path(&state, "/download0/../../outside"),
+        None
     );
 }
 

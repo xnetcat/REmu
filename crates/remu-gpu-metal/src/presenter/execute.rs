@@ -10,13 +10,12 @@ use super::{
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
-    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_INDEX_BUFFER_INDEX, NGG_MESH_THREADS,
-    NGG_MESH_VERTICES_PER_GROUP, OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0,
-    PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, append_unique_global_writebacks,
-    append_unique_guest_write_ranges, capture_guest_frame, capture_target_sample_textures,
-    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
-    consume_depth_metadata_clear, create_global_argument_buffer,
+    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_THREADS, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
+    PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
+    append_unique_global_writebacks, append_unique_guest_write_ranges, capture_guest_frame,
+    capture_target_sample_textures, collect_pending_global_writebacks,
+    collect_pending_guest_write_ranges, compile_metal_compute_library, compute_pipeline_key,
+    compute_program_can_split_wave64, consume_depth_metadata_clear, create_global_argument_buffer,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
     decode_raster_state, decode_render_targets, decode_scissor, decode_viewport,
@@ -656,6 +655,14 @@ impl MetalPresenter {
         } else {
             None
         };
+        let ngg_meshlets = if uses_mesh_stage {
+            let (indices, _) = indexed_draw
+                .as_ref()
+                .ok_or("NGG mesh draw requires captured indices")?;
+            Some(self.cached_ngg_meshlets(&device, indices.as_ref())?)
+        } else {
+            None
+        };
         let scissor = decode_scissor(draw, render_width, render_height)?;
         let diagnostic_force_triangle = diagnostic_disable_combined_raster
             && diagnostic_complex_msaa_raster
@@ -1194,16 +1201,14 @@ impl MetalPresenter {
             }
 
             if uses_mesh_stage {
-                let (indices, index_buffer) = indexed_draw
+                let (indices, _) = indexed_draw
                     .as_ref()
                     .ok_or("NGG mesh draw requires captured indices")?;
-                let index_count =
-                    u32::try_from(indices.len()).map_err(|_| "mesh index count exceeds u32")?;
-                let threadgroups_per_instance = u64::from(index_count)
-                    .div_ceil(NGG_MESH_VERTICES_PER_GROUP)
-                    .max(1);
-                let mesh_draw = [index_count, 0_u32, draw.base_vertex as u32];
-                encoder.set_mesh_buffer(NGG_MESH_INDEX_BUFFER_INDEX, Some(index_buffer), 0);
+                let meshlets = ngg_meshlets
+                    .as_ref()
+                    .expect("NGG meshlets were prepared before opening the render pass");
+                let mesh_draw = [0_u32, 0_u32, draw.base_vertex as u32];
+                encoder.set_mesh_buffer(NGG_MESHLET_BUFFER_INDEX, Some(&meshlets.buffer), 0);
                 encoder.set_mesh_bytes(
                     NGG_MESH_DRAW_BUFFER_INDEX,
                     u64::try_from(std::mem::size_of_val(&mesh_draw))
@@ -1214,12 +1219,17 @@ impl MetalPresenter {
                 let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
                 if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
                     eprintln!(
-                        "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={index_count} instances={} groups={threadgroups_per_instance}x1",
-                        draw.sequence, draw.instance_count,
+                        "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} primitives={} packed_vertices={} instances={} groups={}x1",
+                        draw.sequence,
+                        indices.len(),
+                        meshlets.primitive_count,
+                        meshlets.vertex_references,
+                        draw.instance_count,
+                        meshlets.group_count,
                     );
                 }
                 encoder.draw_mesh_threadgroups(
-                    MTLSize::new(threadgroups_per_instance, 1, 1),
+                    MTLSize::new(meshlets.group_count, 1, 1),
                     MTLSize::new(1, 1, 1),
                     MTLSize::new(NGG_MESH_THREADS, 1, 1),
                 );
@@ -1473,7 +1483,15 @@ impl MetalPresenter {
                     .as_ref()
                     .ok_or("Metal command queue is unavailable")?
                     .clone();
-                let bytes = read_texture_linear(&device, &queue, &texture, descriptor)?;
+                let bytes = match texture.texture_type() {
+                    MTLTextureType::D3 => {
+                        read_texture_volume_linear(&device, &queue, &texture, descriptor)?
+                    }
+                    MTLTextureType::D2Array => {
+                        read_texture_array_linear(&device, &queue, &texture, descriptor)?
+                    }
+                    _ => read_texture_linear(&device, &queue, &texture, descriptor)?,
+                };
                 let nonzero = bytes.iter().filter(|&&value| value != 0).count();
                 let fingerprint = guest_frame_fingerprint(&bytes);
                 let sampled_summaries = pixel_evaluation

@@ -216,17 +216,22 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
-            ControlFlowLowering::Dispatcher => {
+            ControlFlowLowering::Forward | ControlFlowLowering::Dispatcher => {
                 // Dispatch whole basic blocks instead of one instruction per switch iteration.
                 // The architectural PC only has to be materialized at control-flow boundaries;
                 // straight-line instructions inside a block execute in their original order.
                 // Large Unity pixel shaders contain hundreds of instructions but only a handful
                 // of branches, so this avoids hundreds of divergent switch operations per pixel
                 // without changing branch, loop, or EXEC/VCC semantics.
+                let forward = matches!(self.control_flow, ControlFlowLowering::Forward);
                 for block in dispatcher_basic_blocks(self.program) {
                     let first = &self.program.instructions[block.start];
-                    let block_instruction_count = block.len();
-                    self.line(2, &format!("case {}u: {{", first.pc));
+                    let block_instruction_count = (!forward).then_some(block.len());
+                    if forward {
+                        self.line(2, &format!("if (active && pc == {}u) {{", first.pc));
+                    } else {
+                        self.line(2, &format!("case {}u: {{", first.pc));
+                    }
                     let last = block.end - 1;
                     for index in block {
                         let instruction = &self.program.instructions[index];
@@ -241,8 +246,10 @@ impl<'a> Compiler<'a> {
                             });
                         }
                     }
-                    self.line(3, &format!("steps += {block_instruction_count}u;"));
-                    self.line(3, "break;");
+                    if let Some(block_instruction_count) = block_instruction_count {
+                        self.line(3, &format!("steps += {block_instruction_count}u;"));
+                        self.line(3, "break;");
+                    }
                     self.line(2, "}");
                 }
             }

@@ -267,6 +267,44 @@ fn scalar_buffer_loads_do_not_require_the_complete_descriptor_range_to_be_mapped
 }
 
 #[test]
+fn noncanonical_scalar_buffer_sentinels_read_as_zero() {
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Smem,
+                "SBufferLoadDwordx2",
+                vec![Operand::scalar(0)],
+                vec![Operand::scalar(4), Operand::scalar(5)],
+                Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                    destination_count: 2,
+                    immediate_offset_bytes: 2_064,
+                    dynamic_offset_register: None,
+                })),
+            ),
+            end(8),
+        ],
+        vec![0xda1e_d51e, 0xdc1e_db1e, 0xdc1e_dd1e, 0xde1e_db1e],
+    );
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("a noncanonical read-only scalar resource must not discard the shader");
+
+    assert_eq!(evaluation.scalar_registers[4], 0);
+    assert_eq!(evaluation.scalar_registers[5], 0);
+    assert_eq!(evaluation.global_memory_bindings.len(), 1);
+    assert_eq!(evaluation.global_memory_bindings[0].scalar_address, 0);
+    assert_eq!(evaluation.global_memory_bindings[0].base_address, 0);
+    assert_eq!(evaluation.global_memory_bindings[0].byte_count, 4);
+    assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
+    assert!(!evaluation.global_memory_bindings[0].writable);
+}
+
+#[test]
 fn grows_shared_scalar_binding_to_the_largest_observed_load() {
     let mut memory = TestMemory::default();
     memory.write(0x2000, &[0; 68]);

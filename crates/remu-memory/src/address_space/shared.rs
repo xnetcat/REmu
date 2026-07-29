@@ -332,6 +332,31 @@ pub fn write_guest_shared_backing(address: u64, source: &[u8]) -> bool {
     backing.write_all_at(offset, source)
 }
 
+/// Copies bytes only while the guest range still names the expected physical backing.
+///
+/// Mapping validation and the backing write share the registry lock, so an unmap/remap cannot
+/// replace the guest VA between the identity check and the transfer.
+pub fn write_guest_shared_backing_if_identity(
+    address: u64,
+    expected: GuestSharedMappingIdentity,
+    source: &[u8],
+) -> bool {
+    let Ok(byte_count) = u64::try_from(source.len()) else {
+        return false;
+    };
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, byte_count)
+    else {
+        return false;
+    };
+    if backing.id() != expected.backing_id || offset != expected.backing_offset {
+        return false;
+    }
+    backing.write_all_at(offset, source)
+}
+
 pub(super) fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
     let Some(end) = address.checked_add(byte_count) else {
         return;

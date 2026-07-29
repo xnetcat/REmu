@@ -13,7 +13,10 @@ use super::{
 use metal::foreign_types::ForeignType;
 use metal::{Buffer, CommandBuffer, Device, MTLCommandBufferStatus, MTLResourceOptions};
 use objc::{msg_send, sel, sel_impl};
-use remu_memory::read_guest_shared_backing;
+use remu_memory::{
+    CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_mapping_identity,
+    read_guest_shared_backing, write_guest_shared_backing_if_identity,
+};
 use remu_shader::ShaderEvaluation;
 use std::time::{Duration, Instant};
 
@@ -457,11 +460,56 @@ pub(crate) fn collect_pending_global_writebacks(
         }) {
             continue;
         }
+        let byte_count = u64::try_from(binding.byte_count)
+            .map_err(|_| "writable global buffer byte count does not fit u64")?;
+        let mapping_identity = guest_shared_mapping_identity(binding.base_address, byte_count);
+        let write_watch = if mapping_identity.is_some() {
+            None
+        } else {
+            // SAFETY: shader evaluation accepted this exact range as a live readable/writable
+            // guest binding. Guest mappings are 16 KiB aligned, so its outward-aligned host pages
+            // cannot straddle an unrelated reservation. Address-space replacement and protection
+            // retire this watch before mutating those pages.
+            Some(unsafe { CpuWriteWatch::new(binding.base_address, byte_count) }.map_err(
+                |error| {
+                    format!(
+                        "could not pin copied writable global buffer address={:#x} bytes={}: {error}",
+                        binding.base_address, binding.byte_count
+                    )
+                },
+            )?)
+        };
+        let offset = usize::try_from(buffer.offset)
+            .map_err(|_| "writable global buffer offset does not fit usize")?;
+        let end = offset
+            .checked_add(binding.byte_count)
+            .ok_or("writable global buffer range overflow")?;
+        if u64::try_from(end).map_or(true, |end| end > buffer.buffer.length()) {
+            return Err(format!(
+                "writable global buffer range exceeds Metal buffer offset={} bytes={} length={}",
+                buffer.offset,
+                binding.byte_count,
+                buffer.buffer.length()
+            ));
+        }
+        // This shared upload still contains the packet-time input because the owning command
+        // buffer has not been committed. Preserve it so completion can publish only bytes that
+        // the GPU actually changed, instead of restoring an entire stale CPU snapshot.
+        let original_bytes = unsafe {
+            std::slice::from_raw_parts(
+                buffer.buffer.contents().cast::<u8>().add(offset),
+                binding.byte_count,
+            )
+        }
+        .to_vec();
         pending.push(PendingGlobalWriteback {
             buffer: buffer.buffer.clone(),
             offset: buffer.offset,
             guest_address: binding.base_address,
             byte_count: binding.byte_count,
+            mapping_identity,
+            write_watch,
+            original_bytes,
         });
     }
     Ok(())
@@ -525,18 +573,148 @@ pub(crate) fn append_unique_guest_write_ranges(
 
 pub(crate) fn write_back_pending_globals(pending: &[PendingGlobalWriteback]) -> Result<(), String> {
     for writeback in pending {
-        let destination = usize::try_from(writeback.guest_address)
-            .map_err(|_| "writable global buffer address does not fit usize")?;
-        // SAFETY: Shader evaluation captured this live writable guest binding, and the completed
-        // command buffer owns a Metal buffer of the same exact byte length.
+        if writeback.original_bytes.len() != writeback.byte_count {
+            return Err(format!(
+                "writable global buffer snapshot length mismatch bytes={} snapshot={}",
+                writeback.byte_count,
+                writeback.original_bytes.len()
+            ));
+        }
+        let offset = usize::try_from(writeback.offset)
+            .map_err(|_| "writable global buffer offset does not fit usize")?;
+        let end = offset
+            .checked_add(writeback.byte_count)
+            .ok_or("writable global buffer range overflow")?;
+        if u64::try_from(end).map_or(true, |end| end > writeback.buffer.length()) {
+            return Err(format!(
+                "writable global buffer range exceeds Metal buffer offset={} bytes={} length={}",
+                writeback.offset,
+                writeback.byte_count,
+                writeback.buffer.length()
+            ));
+        }
+        if let Some(expected) = writeback.mapping_identity {
+            let byte_count = u64::try_from(writeback.byte_count)
+                .map_err(|_| "writable global buffer byte count does not fit u64")?;
+            let current = guest_shared_mapping_identity(writeback.guest_address, byte_count);
+            if current != Some(expected) {
+                return Err(format!(
+                    "writable global buffer mapping changed before completion address={:#x} bytes={} expected={expected:?} current={current:?}",
+                    writeback.guest_address, writeback.byte_count
+                ));
+            }
+        }
+        let current_bytes = unsafe {
+            std::slice::from_raw_parts(
+                writeback.buffer.contents().cast::<u8>().add(offset),
+                writeback.byte_count,
+            )
+        };
+        if writeback.mapping_identity.is_some() {
+            write_changed_global_ranges(writeback, current_bytes)?;
+        } else if let Some(write_watch) = writeback.write_watch.as_ref() {
+            write_watch
+                .with_live_mapping(|| write_changed_global_ranges_direct(writeback, current_bytes))
+                .map_err(|error| {
+                    format!(
+                        "copied writable global mapping changed before completion address={:#x} bytes={}: {error}",
+                        writeback.guest_address, writeback.byte_count
+                    )
+                })??;
+        } else {
+            #[cfg(test)]
+            write_changed_global_ranges_direct(writeback, current_bytes)?;
+            #[cfg(not(test))]
+            return Err(format!(
+                "writable global buffer has neither backing identity nor mapping watch address={:#x} bytes={}",
+                writeback.guest_address, writeback.byte_count
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_changed_global_ranges(
+    writeback: &PendingGlobalWriteback,
+    current_bytes: &[u8],
+) -> Result<(), String> {
+    let mut cursor = 0;
+    while cursor < current_bytes.len() {
+        while cursor < current_bytes.len()
+            && current_bytes[cursor] == writeback.original_bytes[cursor]
+        {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < current_bytes.len()
+            && current_bytes[cursor] != writeback.original_bytes[cursor]
+        {
+            cursor += 1;
+        }
+        if start == cursor {
+            continue;
+        }
+        let address = writeback
+            .guest_address
+            .checked_add(
+                u64::try_from(start)
+                    .map_err(|_| "writable global buffer changed offset does not fit u64")?,
+            )
+            .ok_or("writable global buffer changed address overflow")?;
+        let expected = writeback
+            .mapping_identity
+            .expect("shared writeback path has a mapping identity");
+        let backing_offset = expected
+            .backing_offset
+            .checked_add(
+                u64::try_from(start)
+                    .map_err(|_| "writable global buffer backing offset does not fit u64")?,
+            )
+            .ok_or("writable global buffer backing offset overflow")?;
+        let expected = GuestSharedMappingIdentity {
+            backing_id: expected.backing_id,
+            backing_offset,
+        };
+        if !write_guest_shared_backing_if_identity(address, expected, &current_bytes[start..cursor])
+        {
+            return Err(format!(
+                "writable global buffer backing changed during completion address={address:#x} bytes={}",
+                cursor - start
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_changed_global_ranges_direct(
+    writeback: &PendingGlobalWriteback,
+    current_bytes: &[u8],
+) -> Result<(), String> {
+    let destination = usize::try_from(writeback.guest_address)
+        .map_err(|_| "writable global buffer address does not fit usize")?;
+    let mut cursor = 0;
+    while cursor < current_bytes.len() {
+        while cursor < current_bytes.len()
+            && current_bytes[cursor] == writeback.original_bytes[cursor]
+        {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < current_bytes.len()
+            && current_bytes[cursor] != writeback.original_bytes[cursor]
+        {
+            cursor += 1;
+        }
+        if start == cursor {
+            continue;
+        }
+        // SAFETY: Production holds the mapping's CpuWriteWatch registry lock across this copy.
+        // Unit tests keep their local destination allocation alive for the duration of the call.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                writeback.buffer.contents().cast::<u8>().add(
-                    usize::try_from(writeback.offset)
-                        .map_err(|_| "writable global buffer offset does not fit usize")?,
-                ),
-                destination as *mut u8,
-                writeback.byte_count,
+                current_bytes[start..cursor].as_ptr(),
+                (destination as *mut u8).add(start),
+                cursor - start,
             );
         }
     }

@@ -247,7 +247,7 @@ fn builds_fused_es_gs_rectangle_equivalent_for_volume_generation() {
     assert!(
         shader
             .source
-            .contains("remu_out.param1 = float4(remu_uv, remu_layer, 1.0f);")
+            .contains("remu_out.param1 = float4(remu_uv.x, 1.0f - remu_uv.y, remu_layer, 1.0f);")
     );
 }
 

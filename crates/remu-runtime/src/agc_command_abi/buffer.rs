@@ -271,6 +271,23 @@ pub(super) fn register_graphics_continuation(
         return;
     }
 
+    for (name, start, end) in [
+        ("then", then_address, then_end),
+        ("else", else_address, else_end),
+    ] {
+        if start == 0 || end == 0 {
+            continue;
+        }
+        let valid_end = scan_valid_command_stream_end(start, end);
+        if valid_end != end {
+            let offset = valid_end.saturating_sub(start) / 4;
+            let header = (valid_end < end).then(|| read_u32(valid_end));
+            eprintln!(
+                "[REMu][AGC][BRANCH-BUILD] invalid {name} target packet={packet:#x} range={start:#x}..{end:#x} valid_end={valid_end:#x} dword={offset} header={header:#010x?}"
+            );
+        }
+    }
+
     CONSUMED_GRAPHICS_CONTINUATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

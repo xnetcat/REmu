@@ -11,10 +11,10 @@ use crate::{
     AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory, ShaderEvaluationWorkers,
     VideoOutState, agc_color_target_state, agc_has_active_depth_state, agc_program_address,
     agc_register_snapshot, agc_shader_prefix_snapshot, agc_shader_snapshot,
-    agc_video_out_target_for_address, draw_required_vertex_record_count, emit_agc_gpu_event,
-    evaluate_draw_shader_requests_parallel, evaluate_shader_register_snapshot_cached,
-    export_user_data_register, read_guest_u32, shader_control_flow_summary,
-    shader_evaluation_worker_request, snapshot_draw_indices,
+    agc_video_out_target_for_address, draw_required_vertex_record_count, dump_draw_shader_ir,
+    emit_agc_gpu_event, evaluate_draw_shader_requests_parallel,
+    evaluate_shader_register_snapshot_cached, export_user_data_register, read_guest_u32,
+    shader_control_flow_summary, shader_evaluation_worker_request, snapshot_draw_indices,
     snapshot_small_readonly_global_bindings, trace_agc_draws, trace_agc_programs,
     trace_agc_shader_draw, trace_agc_shaders, trace_agc_target_address, trace_logarithmic_sequence,
 };
@@ -502,6 +502,7 @@ pub(crate) fn agc_emit_draw(
                     .failed_shader_evaluations
                     .insert((0, draw.export_shader_address))
                 {
+                    dump_draw_shader_ir(&draw);
                     let resource2_register = export_user_data_base.saturating_sub(1);
                     let resource2 = graphics.shader_registers.get(&resource2_register).copied();
                     let user_sgpr_count =
@@ -536,6 +537,7 @@ pub(crate) fn agc_emit_draw(
                     .failed_shader_evaluations
                     .insert((1, draw.pixel_shader_address))
                 {
+                    dump_draw_shader_ir(&draw);
                     let control_flow = draw.pixel_shader.as_ref().map_or_else(
                         || "missing shader".to_owned(),
                         |snapshot| shader_control_flow_summary(&snapshot.program),

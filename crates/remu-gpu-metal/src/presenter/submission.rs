@@ -32,7 +32,8 @@ pub(crate) use self::batch::write_back_pending_globals;
 pub(crate) use self::batch::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    completed_command_buffer_gpu_duration, guest_batch_writes_overlap, merge_guest_batch_result,
+    completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
+    merge_guest_batch_result,
 };
 #[cfg(test)]
 pub(crate) use self::memory::apply_pending_guest_memory_writes;

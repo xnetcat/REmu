@@ -75,6 +75,7 @@ pub(crate) fn is_guest_sync_import(nid: &str) -> bool {
             | "2MOy+rUfuhQ"
             | "Op8TBGY5KHg"
             | "14bOACANTBo"
+            | "Z4QosVuAsA0"
             | "188x57JYp0g"
             | "R1Jvn8bSCW8"
             | "Zxa0VhQVTsk"

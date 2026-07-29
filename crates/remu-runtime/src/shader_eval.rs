@@ -601,6 +601,13 @@ fn dump_shader_trace(
     }
 }
 
+pub(crate) fn dump_draw_shader_ir(draw: &remu_gpu::IndexedDraw) {
+    let (Some(export), Some(pixel)) = (&draw.export_shader, &draw.pixel_shader) else {
+        return;
+    };
+    dump_shader_trace(draw, export, pixel, None, None);
+}
+
 fn trace_shader_evaluation(
     draw: &remu_gpu::IndexedDraw,
     snapshot: Option<&remu_gpu::ShaderSnapshot>,

@@ -25,9 +25,12 @@ pub(crate) use self::pipeline::{
     ColorOperationMode, decode_color_operation_mode, decode_metal_blend_attachment,
     decode_raster_state, graphics_pipeline_key, metal_color_write_mask,
     metal_nonindexed_vertex_count, metal_primitive_type, prepare_indexed_primitive,
+    prepare_ngg_meshlets,
 };
 #[cfg(test)]
-pub(crate) use self::pipeline::{graphics_shader_resource_key, metal_primitive_topology_class};
+pub(crate) use self::pipeline::{
+    NGG_MESHLET_WORDS_PER_GROUP, graphics_shader_resource_key, metal_primitive_topology_class,
+};
 #[cfg(test)]
 pub(crate) use self::scanout::{
     VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,

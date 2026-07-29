@@ -147,6 +147,8 @@ pub(super) fn agc_parse_command_stream(
         if length > remaining {
             return Err(AgcSubmissionError::InvalidPacketLength {
                 dword: offset,
+                address: packet_address,
+                header,
                 length,
                 remaining,
             });

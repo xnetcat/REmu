@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Whole-program regression tests: unsupported opcode reporting and the
-//! byte-identical Metal source digests for the direct and dispatcher paths.
+//! byte-identical Metal source digests for the direct and forward-control-flow paths.
 
 use super::*;
 
@@ -34,7 +34,7 @@ fn rejects_raw_opcodes_instead_of_emitting_placeholder_code() {
 
 const DIRECT_SOURCE_DIGEST: u64 = 0xfdb5_3279_d8e0_bd9f;
 
-const DISPATCHER_SOURCE_DIGEST: u64 = 0x049b_d3d1_c39b_d2da;
+const FORWARD_SOURCE_DIGEST: u64 = 0x9e0f_43b3_c561_81a4;
 
 fn source_digest(source: &str) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -106,7 +106,7 @@ fn direct_reference_program() -> Program {
     )
 }
 
-fn dispatcher_reference_program() -> Program {
+fn forward_reference_program() -> Program {
     Program::new(
         0x2000,
         vec![
@@ -276,15 +276,15 @@ fn a_shader_that_lowers_today_still_emits_byte_identical_metal_source() {
         &MetalCompileOptions::compute(0),
     )
     .expect("direct reference program should lower");
-    let dispatcher = compile_msl(
-        &dispatcher_reference_program(),
+    let forward = compile_msl(
+        &forward_reference_program(),
         &empty_evaluation(),
         &MetalCompileOptions::compute(0),
     )
-    .expect("dispatcher reference program should lower");
+    .expect("forward-control-flow reference program should lower");
 
     assert!(direct.register_footprint.direct_control_flow);
-    assert!(!dispatcher.register_footprint.direct_control_flow);
+    assert!(!forward.register_footprint.direct_control_flow);
     assert_eq!(
         source_digest(&direct.source),
         DIRECT_SOURCE_DIGEST,
@@ -292,9 +292,9 @@ fn a_shader_that_lowers_today_still_emits_byte_identical_metal_source() {
         direct.source
     );
     assert_eq!(
-        source_digest(&dispatcher.source),
-        DISPATCHER_SOURCE_DIGEST,
-        "dispatcher lowering emitted different MSL:\n{}",
-        dispatcher.source
+        source_digest(&forward.source),
+        FORWARD_SOURCE_DIGEST,
+        "forward-control-flow lowering emitted different MSL:\n{}",
+        forward.source
     );
 }

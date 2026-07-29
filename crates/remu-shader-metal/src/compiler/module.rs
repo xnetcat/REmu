@@ -261,7 +261,7 @@ impl Compiler<'_> {
                 parameters.push(format!(
                     "mesh<RemuVsOut, {primitive_type}, 64, 64, topology::triangle> remu_mesh"
                 ));
-                parameters.push("const device uint* remu_indices [[buffer(29)]]".to_owned());
+                parameters.push("const device uint* remu_meshlets [[buffer(29)]]".to_owned());
                 parameters.push("constant uint* remu_draw [[buffer(30)]]".to_owned());
                 parameters
                     .push("uint3 remu_local_id [[thread_position_in_threadgroup]]".to_owned());
@@ -345,8 +345,15 @@ impl Compiler<'_> {
                 source.push_str("    threadgroup uint remu_readlane_values[1024];\n");
             }
         }
-        if matches!(self.control_flow, ControlFlowLowering::Dispatcher) {
-            source.push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
+        match self.control_flow {
+            ControlFlowLowering::Forward => {
+                source.push_str("    uint pc = 0u;\n    bool active = true;\n");
+            }
+            ControlFlowLowering::Dispatcher => {
+                source
+                    .push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
+            }
+            ControlFlowLowering::Direct(_) => {}
         }
         if matches!(
             self.options.stage,
@@ -417,13 +424,12 @@ impl Compiler<'_> {
                 source.push_str(
                     "    RemuVsOut remu_out = {};\n\
                      \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 1.0f);\n\
-                     \x20   uint remu_mesh_vertex_base = remu_group_id.x * 63u;\n\
-                     \x20   uint remu_mesh_remaining = remu_draw[0] - min(remu_draw[0], remu_mesh_vertex_base);\n\
-                     \x20   uint remu_mesh_vertex_count = min(remu_mesh_remaining, 63u);\n\
-                     \x20   uint remu_mesh_primitive_count = remu_mesh_vertex_count / 3u;\n\
-                     \x20   uint remu_mesh_primitive_vertex = remu_thread_index * 3u;\n\
-                     \x20   uint remu_mesh_primitive = remu_mesh_primitive_vertex | ((remu_mesh_primitive_vertex + 1u) << 10u) | ((remu_mesh_primitive_vertex + 2u) << 20u);\n\
-                     \x20   if (remu_thread_index >= remu_mesh_primitive_count) remu_mesh_primitive = 0x80000000u;\n\
+                     \x20   uint remu_meshlet_base = remu_group_id.x * 130u;\n\
+                     \x20   uint remu_mesh_counts = remu_meshlets[remu_meshlet_base + 0u];\n\
+                     \x20   uint remu_mesh_primitive_base = remu_meshlets[remu_meshlet_base + 1u];\n\
+                     \x20   uint remu_mesh_vertex_count = remu_mesh_counts & 0xffu;\n\
+                     \x20   uint remu_mesh_primitive_count = (remu_mesh_counts >> 8u) & 0xffu;\n\
+                     \x20   uint remu_mesh_primitive = remu_meshlets[remu_meshlet_base + 66u + remu_thread_index];\n\
                      \x20   remu_mesh.set_index(remu_thread_index * 3u + 0u, 0u);\n\
                      \x20   remu_mesh.set_index(remu_thread_index * 3u + 1u, 0u);\n\
                      \x20   remu_mesh.set_index(remu_thread_index * 3u + 2u, 0u);\n",
@@ -436,22 +442,20 @@ impl Compiler<'_> {
                     );
                 }
                 if contains_register_reference(&self.body, 's', 3) {
-                    source.push_str(
-                        "    s[3] = remu_mesh_vertex_count | (remu_mesh_primitive_count << 8u);\n",
-                    );
+                    source.push_str("    s[3] = remu_mesh_counts;\n");
                 }
                 if contains_register_reference(&self.body, 'v', 0) {
                     source.push_str("    v[0] = remu_mesh_primitive;\n");
                 }
                 if contains_register_reference(&self.body, 'v', 1) {
-                    source.push_str("    v[1] = remu_group_id.x * 21u + remu_thread_index;\n");
+                    source.push_str("    v[1] = remu_mesh_primitive_base + remu_thread_index;\n");
                 }
                 if contains_register_reference(&self.body, 'v', 2) {
                     source.push_str("    v[2] = 0u;\n");
                 }
                 if contains_register_reference(&self.body, 'v', 5) {
                     source.push_str(
-                        "    v[5] = remu_thread_index < remu_mesh_vertex_count ? remu_indices[remu_mesh_vertex_base + remu_thread_index] + remu_draw[2] : 0u;\n",
+                        "    v[5] = remu_thread_index < remu_mesh_vertex_count ? remu_meshlets[remu_meshlet_base + 2u + remu_thread_index] + remu_draw[2] : 0u;\n",
                     );
                 }
                 if contains_register_reference(&self.body, 'v', 8) {
@@ -477,6 +481,7 @@ impl Compiler<'_> {
         }
         match self.control_flow {
             ControlFlowLowering::Direct(_) => source.push_str(&self.body),
+            ControlFlowLowering::Forward => source.push_str(&self.body),
             ControlFlowLowering::Dispatcher => {
                 source.push_str("    while (active) {\n        switch (pc) {\n");
                 source.push_str(&self.body);
@@ -622,7 +627,7 @@ impl Compiler<'_> {
                         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
                          \x20   if (remu_thread_index < remu_mesh_primitive_count) {\n\
                          \x20       RemuPrimitiveOut remu_primitive_out = {};\n\
-                         \x20       uint remu_primitive_source_vertex = remu_thread_index * 3u;\n\
+                         \x20       uint remu_primitive_source_vertex = remu_mesh_primitive & 0x1ffu;\n\
                          \x20       remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];\n\
                          \x20       remu_mesh.set_primitive(remu_thread_index, remu_primitive_out);\n\
                          \x20   }\n",

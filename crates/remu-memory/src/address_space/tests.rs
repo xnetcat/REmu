@@ -314,6 +314,51 @@ fn private_backing_write_is_coherent_without_falsely_dirtying_cpu_watches() {
 }
 
 #[test]
+fn identity_guarded_backing_write_rejects_reused_guest_address() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let first_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &first_backing,
+            0,
+        )
+        .unwrap();
+    let first_identity = guest_shared_mapping_identity(mapped.get(), GUEST_PAGE_SIZE)
+        .expect("first mapping identity");
+    assert!(write_guest_shared_backing_if_identity(
+        mapped.get(),
+        first_identity,
+        b"first"
+    ));
+
+    memory.unmap(mapped, GUEST_PAGE_SIZE).unwrap();
+    let replacement_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(mapped),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .unwrap();
+
+    assert!(!write_guest_shared_backing_if_identity(
+        mapped.get(),
+        first_identity,
+        b"stale"
+    ));
+    let mut replacement = [0_u8; 5];
+    memory.read(mapped, &mut replacement).unwrap();
+    assert_eq!(replacement, [0; 5]);
+}
+
+#[test]
 fn replacing_shared_pages_removes_their_backing_identity() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();

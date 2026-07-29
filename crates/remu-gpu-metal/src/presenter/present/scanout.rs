@@ -9,7 +9,8 @@ use super::{
     read_texture_linear, refresh_resident_texture_write_watch,
     retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
-    snapshot_guest_texture_raw, trace_scanout_writes, write_resident_texture_contents_to_guest,
+    snapshot_guest_texture_raw, trace_resident_texture_removal, trace_scanout_writes,
+    write_resident_texture_contents_to_guest,
 };
 use metal::{
     MTLCommandBufferStatus, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode,
@@ -182,13 +183,24 @@ impl MetalPresenter {
             .resident_guest_textures
             .get_mut(&descriptor)
             .expect("selected resident texture exists");
-        match refresh_resident_texture_write_watch(resident)? {
+        let refresh = refresh_resident_texture_write_watch(resident)?;
+        match refresh {
             WriteWatchRefresh::Replaced => {
                 self.resident_guest_textures.remove(&descriptor);
                 return Ok(());
             }
             WriteWatchRefresh::Reprotecting => return Ok(()),
             WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {}
+        }
+        if self
+            .resident_guest_textures
+            .get(&descriptor)
+            .is_some_and(|resident| resident.cpu_write_obsoletes_gpu_writeback(refresh))
+        {
+            if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                trace_resident_texture_removal("cpu-reused-scanout", &resident);
+            }
+            return Ok(());
         }
         let (alias_ranges, content_version) = {
             let resident = self

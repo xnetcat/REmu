@@ -42,7 +42,7 @@ use self::decode::{
     decode_render_targets, decode_scissor, decode_viewport, fallback_image_descriptor,
     graphics_pipeline_key, image_component_class, initial_depth_clear_for_target,
     initial_render_target_clear_color, metal_color_write_mask, metal_nonindexed_vertex_count,
-    metal_primitive_type, pixel_input_controls, prepare_indexed_primitive,
+    metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, prepare_ngg_meshlets,
     raw_video_out_texture_descriptor, read_draw_indices, register_value,
     render_target_fast_clear_color, sampled_alias_descriptor,
 };
@@ -51,11 +51,11 @@ use self::decode::{
     CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_BASE, CB_COLOR0_BASE_EXT,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, DB_DEPTH_CLEAR,
     DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
-    DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE,
-    VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length,
-    decode_fast_clear_color, decode_render_targets_from_registers, decode_scanout_target,
-    graphics_shader_resource_key, initial_depth_clear_value, metal_primitive_topology_class,
-    raw_video_out_layout_is_linear,
+    DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, NGG_MESHLET_WORDS_PER_GROUP, SPI_PS_INPUT_CNTL_0,
+    VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
+    common_render_target_array_length, decode_fast_clear_color,
+    decode_render_targets_from_registers, decode_scanout_target, graphics_shader_resource_key,
+    initial_depth_clear_value, metal_primitive_topology_class, raw_video_out_layout_is_linear,
 };
 #[cfg(test)]
 use self::diagnostics::parse_diagnostic_hex_address;
@@ -142,7 +142,7 @@ use self::stats::{
 use self::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    completed_command_buffer_gpu_duration, guest_batch_writes_overlap,
+    completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
 };
 #[cfg(test)]
 use self::submission::{apply_pending_guest_memory_writes, write_back_pending_globals};
@@ -220,11 +220,10 @@ const SAMPLED_TEXTURE_CACHE_CAPACITY: usize = 2_048;
 const DEFAULT_SAMPLED_TEXTURE_CACHE_MIB: u64 = 1_536;
 const DEFAULT_SHADER_COMPILER_WORKER_COUNT: usize = 4;
 const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
-const NGG_MESH_INDEX_BUFFER_INDEX: u64 = 29;
+const NGG_MESHLET_BUFFER_INDEX: u64 = 29;
 const NGG_MESH_DRAW_BUFFER_INDEX: u64 = 30;
 const NGG_MESH_LDS_BYTES: u32 = 16 * 1024;
 const NGG_MESH_THREADS: u64 = 64;
-const NGG_MESH_VERTICES_PER_GROUP: u64 = 63;
 
 fn sampled_texture_cache_byte_capacity() -> Option<u64> {
     static CAPACITY: OnceLock<Option<u64>> = OnceLock::new();
@@ -708,6 +707,24 @@ struct ResidentGuestTexture {
     write_watch: GuestTextureWriteWatch,
     gpu_written: bool,
     content_version: u64,
+    /// CPU-write generations observed when Metal most recently became authoritative.
+    ///
+    /// Guest heaps routinely reuse image allocations as indirect command buffers. A plain dirty
+    /// bit cannot distinguish a later guest write from the presenter's own earlier readback,
+    /// because both touch the same watched host pages. The monotonically increasing generations
+    /// establish the ownership boundary at the actual GPU write.
+    gpu_write_watch_generations: Vec<u64>,
+}
+
+impl ResidentGuestTexture {
+    fn note_gpu_write(&mut self) {
+        self.gpu_write_watch_generations = self.write_watch.generations();
+    }
+
+    fn cpu_write_obsoletes_gpu_writeback(&self, refresh: WriteWatchRefresh) -> bool {
+        matches!(refresh, WriteWatchRefresh::Renewed { was_dirty: true })
+            || self.write_watch.generations() != self.gpu_write_watch_generations
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -776,6 +793,9 @@ struct PendingGlobalWriteback {
     offset: u64,
     guest_address: u64,
     byte_count: usize,
+    mapping_identity: Option<GuestSharedMappingIdentity>,
+    write_watch: Option<CpuWriteWatch>,
+    original_bytes: Vec<u8>,
 }
 
 struct PendingPresentation {
@@ -904,6 +924,14 @@ struct OpenGuestRenderPass {
     encoder: RenderCommandEncoder,
 }
 
+#[derive(Clone)]
+struct CachedNggMeshlets {
+    buffer: Buffer,
+    group_count: u64,
+    vertex_references: usize,
+    primitive_count: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DecodedImageDescriptor {
     guest: GuestTextureDescriptor,
@@ -985,6 +1013,7 @@ struct MetalPresenter {
     guest_global_buffer_cache_bytes: u64,
     global_buffer_cache_bytes: usize,
     index_buffer_cache: HashMap<Vec<u32>, Buffer>,
+    ngg_meshlet_cache: HashMap<Vec<u32>, CachedNggMeshlets>,
     diagnostic_vertex_position_buffer: Option<Buffer>,
     diagnostic_pixel_output_buffer: Option<Buffer>,
     resident_content_version: u64,
@@ -1135,6 +1164,7 @@ impl MetalPresenter {
             guest_global_buffer_cache_bytes: 0,
             global_buffer_cache_bytes: 0,
             index_buffer_cache: HashMap::new(),
+            ngg_meshlet_cache: HashMap::new(),
             diagnostic_vertex_position_buffer: None,
             diagnostic_pixel_output_buffer: None,
             resident_content_version: 0,

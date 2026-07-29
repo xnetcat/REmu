@@ -1,8 +1,8 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Control-flow lowering tests: straight-line direct emission, the basic-block
-//! dispatcher, branch validation and codegen footprint bounds.
+//! Control-flow lowering tests: straight-line direct emission, forward-only basic-block chains,
+//! the bounded loop dispatcher, branch validation and codegen footprint bounds.
 
 use super::*;
 
@@ -111,7 +111,7 @@ fn resolves_acyclic_unconditional_branches_without_lowering_dead_instructions() 
 }
 
 #[test]
-fn conditional_control_flow_keeps_exact_dispatcher_but_not_register_arrays() {
+fn forward_conditional_control_flow_avoids_the_loop_dispatcher_and_register_arrays() {
     let program = Program::new(
         0x1000,
         vec![
@@ -149,17 +149,18 @@ fn conditional_control_flow_keeps_exact_dispatcher_but_not_register_arrays() {
         &empty_evaluation(),
         &MetalCompileOptions::compute(0),
     )
-    .expect("conditional program should retain dispatcher");
+    .expect("forward conditional program should lower");
 
     assert!(!shader.register_footprint.direct_control_flow);
-    assert!(shader.source.contains("while (active)"));
-    assert!(shader.source.contains("switch (pc)"));
+    assert!(shader.source.contains("if (active && pc == 0u)"));
+    assert!(!shader.source.contains("while (active)"));
+    assert!(!shader.source.contains("switch (pc)"));
     assert!(!shader.source.contains("uint s[128]"));
     assert!(!shader.source.contains("uint v[256]"));
 }
 
 #[test]
-fn dispatcher_switches_once_per_basic_block_instead_of_once_per_instruction() {
+fn forward_chain_checks_once_per_basic_block_instead_of_once_per_instruction() {
     let program = Program::new(
         0x1000,
         vec![
@@ -229,12 +230,69 @@ fn dispatcher_switches_once_per_basic_block_instead_of_once_per_instruction() {
     .expect("conditional blocks should lower");
 
     for pc in [0, 4, 16, 20] {
-        assert!(shader.source.contains(&format!("case {pc}u")));
+        assert!(
+            shader
+                .source
+                .contains(&format!("if (active && pc == {pc}u)"))
+        );
     }
     for pc in [8, 12] {
-        assert!(!shader.source.contains(&format!("case {pc}u")));
+        assert!(
+            !shader
+                .source
+                .contains(&format!("if (active && pc == {pc}u)"))
+        );
     }
-    assert_eq!(shader.source.matches("case ").count(), 4);
+    assert_eq!(shader.source.matches("if (active && pc == ").count(), 4);
+    assert!(!shader.source.contains("while (active)"));
+}
+
+#[test]
+fn backward_conditional_control_flow_keeps_the_bounded_dispatcher() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(2)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SCbranchScc1"),
+                // PC 4 + 4-byte instruction - two dwords = PC 0.
+                words: vec![0xfffe],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("backward conditional program should retain dispatcher");
+
+    assert!(!shader.register_footprint.direct_control_flow);
+    assert!(shader.source.contains("while (active)"));
+    assert!(shader.source.contains("switch (pc)"));
+    assert!(shader.source.contains("if (steps >= 16384u)"));
 }
 
 #[test]

@@ -502,6 +502,18 @@ fn pthread_keys_reuse_deleted_slots_and_clear_values_before_destructors() {
         0
     );
     assert_eq!(replacement_key, first_key);
+    let replacement_generation = state.pthread_keys[&replacement_key].generation;
+    crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
+        values.insert(
+            replacement_key,
+            (replacement_generation.saturating_sub(1), 0xdead_beef),
+        );
+    });
+    assert_eq!(
+        crate::pthread_get_specific(replacement_key),
+        0,
+        "a value left on another thread under the deleted generation must stay invisible"
+    );
     assert!(
         crate::take_current_thread_specific_destructors(&state).is_empty(),
         "a reused key must not inherit the deleted key's thread-specific value"

@@ -412,6 +412,13 @@ pub(crate) fn resolve_probe_guest_path(
     if let Some(overlaid) = overlay_guest_path(&normalized) {
         return Some((overlaid, false));
     }
+    let download_root = state.save_root.join("download0");
+    if normalized == "/download0" {
+        return Some((download_root, true));
+    }
+    if let Some(relative) = normalized.strip_prefix("/download0/") {
+        return resolve_path_beneath(&download_root, relative).map(|path| (path, true));
+    }
     for (mount_point, mounted) in &state.save_mounts {
         if normalized == *mount_point {
             return Some((mounted.path.clone(), !mounted.read_only));
