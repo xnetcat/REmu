@@ -1,7 +1,11 @@
 use crate::{
-    ImportCallFrame, PthreadMutexAttrState, deliver_pending_guest_exception_at_import, low_u32,
-    posix_pthread_result, relative_microseconds_until,
+    ImportCallFrame, PthreadMutexAttrState, current_guest_thread_handle, current_guest_thread_name,
+    deliver_pending_guest_exception_at_import, low_u32, posix_pthread_result, read_guest_u64,
+    relative_microseconds_until, trace_guest_sync,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 mod condition;
 mod event_flag;
 mod mutex;
@@ -41,6 +45,99 @@ use self::state::{
     EVENT_FLAG_SET_SEQUENCE, EVENT_FLAG_WAIT_SEQUENCE, GuestMutexEntry, GuestMutexState,
     GuestRwlockState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard, guest_mutex_shards,
 };
+
+static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct TimedConditionTrace {
+    sequence: u64,
+    started: Instant,
+    condition: u64,
+    waiters_before: usize,
+    notifies_before: u64,
+    timeouts_before: u64,
+}
+
+fn condition_trace_stats(condition: u64) -> (usize, u64, u64) {
+    let sync = guest_sync();
+    let state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+        .conditions
+        .get(&condition)
+        .map_or((0, 0, 0), |condition| {
+            (
+                condition.waiters.len(),
+                condition.notifies,
+                condition.timeouts,
+            )
+        })
+}
+
+fn begin_main_timed_condition_trace(
+    frame: Option<&ImportCallFrame>,
+    condition: u64,
+    mutex: u64,
+    deadline: u64,
+    timeout_usec: u64,
+) -> Option<TimedConditionTrace> {
+    if !trace_guest_sync() {
+        return None;
+    }
+    let thread_name = current_guest_thread_name();
+    if thread_name != "main" && !thread_name.contains("GameThread") {
+        return None;
+    }
+    let sequence = MAIN_TIMED_CONDITION_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence > 32 && !sequence.is_power_of_two() && timeout_usec < 10_000 {
+        return None;
+    }
+    let (deadline_seconds, deadline_nanoseconds) = if deadline == 0 {
+        (0, 0)
+    } else {
+        (
+            i64::from_ne_bytes(read_guest_u64(deadline).to_ne_bytes()),
+            i64::from_ne_bytes(read_guest_u64(deadline + 8).to_ne_bytes()),
+        )
+    };
+    let (waiters_before, notifies_before, timeouts_before) = condition_trace_stats(condition);
+    eprintln!(
+        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={:#x} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
+        current_guest_thread_handle(),
+        frame.map_or(0, |frame| frame.guest_return_address),
+        frame.map_or(0, |frame| frame.guest_rsp),
+        (0..1_000_000_000).contains(&deadline_nanoseconds),
+    );
+    Some(TimedConditionTrace {
+        sequence,
+        started: Instant::now(),
+        condition,
+        waiters_before,
+        notifies_before,
+        timeouts_before,
+    })
+}
+
+fn finish_main_timed_condition_trace(trace: Option<TimedConditionTrace>, result: u64) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let (waiters_after, notifies_after, timeouts_after) = condition_trace_stats(trace.condition);
+    eprintln!(
+        "[REMu][COND][TIMED] exit sequence={} result={result:#x} elapsed_us={} condition={:#x} waiters={}->{} notifies={}->{} timeouts={}->{}",
+        trace.sequence,
+        trace.started.elapsed().as_micros(),
+        trace.condition,
+        trace.waiters_before,
+        waiters_after,
+        trace.notifies_before,
+        notifies_after,
+        trace.timeouts_before,
+        timeouts_after,
+    );
+}
 
 pub(crate) fn is_guest_sync_import(nid: &str) -> bool {
     matches!(
@@ -153,16 +250,28 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         ),
         // The POSIX form takes an absolute deadline as a timespec; the console form takes a
         // relative microsecond count. Convert against the same realtime clock the deadline names.
-        "27bAgiJmOh0" => posix_pthread_result(guest_condition_wait_with_interrupt(
-            arguments[0],
-            arguments[1],
-            Some(relative_microseconds_until(arguments[2])),
-            || {
-                if let Some(frame) = frame {
-                    deliver_pending_guest_exception_at_import(frame);
-                }
-            },
-        )),
+        "27bAgiJmOh0" => {
+            let timeout_usec = relative_microseconds_until(arguments[2]);
+            let trace = begin_main_timed_condition_trace(
+                frame,
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                timeout_usec,
+            );
+            let result = posix_pthread_result(guest_condition_wait_with_interrupt(
+                arguments[0],
+                arguments[1],
+                Some(timeout_usec),
+                || {
+                    if let Some(frame) = frame {
+                        deliver_pending_guest_exception_at_import(frame);
+                    }
+                },
+            ));
+            finish_main_timed_condition_trace(trace, result);
+            result
+        }
         "kDh-NfxgMtE" => guest_condition_notify(arguments[0], false),
         "2MOy+rUfuhQ" => posix_pthread_result(guest_condition_notify(arguments[0], false)),
         "JGgj7Uvrl+A" => guest_condition_notify(arguments[0], true),
