@@ -8,6 +8,14 @@ use super::*;
 use remu_shader::ExportControl;
 
 fn compile_pixel_export(kind: PixelOutputKind, compressed: bool) -> MetalShader {
+    compile_pixel_export_mask(kind, compressed, 0x0f)
+}
+
+fn compile_pixel_export_mask(
+    kind: PixelOutputKind,
+    compressed: bool,
+    enable_mask: u32,
+) -> MetalShader {
     let instruction = Instruction {
         pc: 0,
         encoding: ShaderEncoding::Exp,
@@ -26,7 +34,7 @@ fn compile_pixel_export(kind: PixelOutputKind, compressed: bool) -> MetalShader 
         destinations: Vec::new(),
         control: Some(InstructionControl::Export(ExportControl {
             target: 0,
-            enable_mask: 0x0f,
+            enable_mask,
             compressed,
             done: true,
             valid_mask: true,
@@ -47,6 +55,29 @@ fn compile_pixel_export(kind: PixelOutputKind, compressed: bool) -> MetalShader 
         &options,
     )
     .expect("pixel export should lower")
+}
+
+#[test]
+fn masked_pixel_export_components_use_gfx_blend_defaults() {
+    let float = compile_pixel_export_mask(PixelOutputKind::Float, false, 0x07);
+    assert!(
+        float
+            .source
+            .contains("remu_out.mrt0 = float4(0.0f, 0.0f, 0.0f, 1.0f);")
+    );
+    assert!(float.source.contains(
+        "remu_out.mrt0 = float4(as_type<float>(remu_v_0), as_type<float>(remu_v_1), as_type<float>(remu_v_2), remu_out.mrt0[3]);"
+    ));
+
+    let unsigned = compile_pixel_export_mask(PixelOutputKind::Uint, false, 0x07);
+    assert!(
+        unsigned
+            .source
+            .contains("remu_out.mrt0 = uint4(0u, 0u, 0u, 1u);")
+    );
+
+    let signed = compile_pixel_export_mask(PixelOutputKind::Sint, false, 0x07);
+    assert!(signed.source.contains("remu_out.mrt0 = int4(0, 0, 0, 1);"));
 }
 
 #[test]
