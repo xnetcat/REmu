@@ -1,7 +1,7 @@
 use crate::{
     ImportCallFrame, PthreadMutexAttrState, current_guest_thread_handle, current_guest_thread_name,
-    deliver_pending_guest_exception_at_import, low_u32, posix_pthread_result, read_guest_u64,
-    relative_microseconds_until, trace_guest_sync,
+    deliver_pending_guest_exception_at_import, kernel_process_time, low_u32, posix_pthread_result,
+    read_guest_u32, read_guest_u64, relative_microseconds_until, trace_guest_sync,
 };
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,11 +170,26 @@ fn begin_main_timed_condition_trace(
             read_guest_u64(event_caller_rbp.saturating_add(8)),
         )
     };
+    let (clock_start_bits, clock_target_bits) = if event_caller_rbp < 0x78 {
+        (0, 0)
+    } else {
+        (
+            read_guest_u64(event_caller_rbp - 0x78),
+            read_guest_u64(event_caller_rbp - 0x70),
+        )
+    };
+    let limiter_wait_millis = read_guest_u32(0x807_b26_f74);
+    let limiter_target_millis = read_guest_u32(0x807_b26_f78);
+    let process_counter = kernel_process_time(true);
     let (waiters_before, notifies_before, timeouts_before) = condition_trace_stats(condition);
     eprintln!(
-        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} parent={parent_return:#x}/rbp:{parent_rbp:#x} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
+        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} parent={parent_return:#x}/rbp:{parent_rbp:#x} limiter_start={:#018x}/{:.9} limiter_target={:#018x}/{:.9} limiter_globals={limiter_wait_millis}/{limiter_target_millis} process_counter={process_counter} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
         current_guest_thread_handle(),
         frame.map_or(0, |frame| frame.guest_return_address),
+        clock_start_bits,
+        f64::from_bits(clock_start_bits),
+        clock_target_bits,
+        f64::from_bits(clock_target_bits),
         (0..1_000_000_000).contains(&deadline_nanoseconds),
     );
     Some(TimedConditionTrace {
