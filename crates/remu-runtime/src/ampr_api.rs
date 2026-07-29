@@ -1,16 +1,76 @@
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{
-    AMPR_IMPORT_ORDER, AMPR_READ_STAGING, AmprCommandBufferState, AmprCompletion,
-    KERNEL_EVENT_FILTER_AMPR, KernelQueuedEvent, PROBE_DISPATCH, ProbeDispatchState,
-    SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NO_SPACE,
-    SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY, current_guest_thread_name,
-    guest_memset, kernel_stat_payload_from_metadata, low_u32, notify_kernel_equeue_waiters,
-    process_guest_range_has_read_access, queue_kernel_event, read_guest_cstring, read_guest_u64,
-    resolve_probe_guest_path, sce_kernel_error, trace_ampr_reads, write_guest_u32, write_guest_u64,
+    AMPR_COMMAND_ORDER, AMPR_READ_STAGING_POOL, AmprCommandBufferState, AmprCompletion,
+    AmprReadCommand, KERNEL_EVENT_FILTER_AMPR, KernelQueuedEvent, PROBE_DISPATCH,
+    ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
+    SCE_KERNEL_ERROR_NO_SPACE, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
+    current_guest_thread_name, guest_memset, kernel_stat_payload_from_metadata, low_u32,
+    notify_kernel_equeue_waiters, process_guest_range_has_read_access, queue_kernel_event,
+    read_guest_cstring, read_guest_u64, resolve_probe_guest_path, sce_kernel_error,
+    trace_ampr_reads, write_guest_u32, write_guest_u64,
 };
+
+const AMPR_ORDER_LOCK_COUNT: usize = 64;
+const AMPR_STAGING_POOL_LIMIT: usize = 4;
+const AMPR_MAX_RETAINED_STAGING_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) fn ampr_command_order(command_buffer: u64) -> &'static Mutex<()> {
+    let locks = AMPR_COMMAND_ORDER
+        .get_or_init(|| (0..AMPR_ORDER_LOCK_COUNT).map(|_| Mutex::new(())).collect());
+    let index = usize::try_from(command_buffer >> 4).unwrap_or(0) % locks.len();
+    &locks[index]
+}
+
+fn ampr_destination_has_write_access(
+    state: &ProbeDispatchState,
+    address: u64,
+    length: usize,
+) -> bool {
+    if length == 0 {
+        return true;
+    }
+    let Ok(length_u64) = u64::try_from(length) else {
+        return false;
+    };
+    let Some(end) = address.checked_add(length_u64) else {
+        return false;
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(memory) = state.kernel_memory.as_ref() {
+        let start = remu_core::GuestAddress::new(address);
+        if memory.contains_virtual_address(start) {
+            let mut cursor = address;
+            while cursor < end {
+                let Some(mapping) = memory.query(remu_core::GuestAddress::new(cursor), false)
+                else {
+                    return false;
+                };
+                let mapping_start = mapping.address.get();
+                let Some(mapping_end) = mapping_start.checked_add(mapping.size) else {
+                    return false;
+                };
+                // Gen5 CPU_READ_WRITE is bit 1; CPU_WRITE is bit 5. GPU-only mappings must not
+                // become host I/O destinations merely because their pages are readable.
+                if mapping_start > cursor
+                    || mapping_end <= cursor
+                    || mapping.protection & (0x02 | 0x20) == 0
+                {
+                    return false;
+                }
+                cursor = mapping_end.min(end);
+            }
+            return true;
+        }
+    }
+    // Unit tests and process-image allocations are not owned by KernelMemory. Their host mapping
+    // is the only authoritative range information available here; watched writable pages may be
+    // host-read-only, so deliberately test readability rather than attempting a write.
+    process_guest_range_has_read_access(address, length)
+}
 
 pub(crate) fn ampr_command_buffer_constructor(
     arguments: [u64; 6],
@@ -228,6 +288,8 @@ pub(crate) fn ampr_command_buffer_reset(
         });
     entry.write_offset = 0;
     entry.command_count = 0;
+    entry.pending_reads.clear();
+    entry.pending_completions.clear();
     0
 }
 
@@ -425,30 +487,23 @@ pub(crate) fn ampr_command_buffer_read_file_ordered(
     arguments: [u64; 6],
     stack_arguments: [u64; 6],
 ) -> u64 {
-    let order = AMPR_IMPORT_ORDER.get_or_init(|| Mutex::new(()));
-    let dispatch = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-    ampr_command_buffer_read_file_two_phase_with(
-        order,
-        dispatch,
-        arguments,
-        stack_arguments,
-        ampr_read_file_to_guest,
-    )
-}
-
-pub(crate) fn ampr_command_buffer_read_file_two_phase_with<F>(
-    order: &Mutex<()>,
-    dispatch: &RwLock<ProbeDispatchState>,
-    arguments: [u64; 6],
-    stack_arguments: [u64; 6],
-    read_file: F,
-) -> u64
-where
-    F: FnOnce(&std::fs::File, u32, u64, u64, u64, usize) -> Result<usize, u64>,
-{
+    let command_buffer = arguments[0];
+    let order = ampr_command_order(command_buffer);
     let _order = order
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dispatch = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
+    let mut state = dispatch
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ampr_command_buffer_record_read(arguments, stack_arguments, &mut state)
+}
+
+pub(crate) fn ampr_command_buffer_record_read(
+    arguments: [u64; 6],
+    stack_arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
     let command_buffer = arguments[0];
     let file_id = low_u32(arguments[3]);
     let destination = arguments[4];
@@ -457,71 +512,35 @@ where
     if command_buffer == 0 || (destination == 0 && size != 0) {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let (host_path, cached_file) = {
-        let state = dispatch
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(host_path) = state.ampr_files.get(&file_id).cloned() else {
-            eprintln!(
-                "[REMu][AMPR] read rejected unknown file id={file_id:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x} stack={:#x},{:#x} known=[{}]",
-                arguments[0],
-                arguments[1],
-                arguments[2],
-                arguments[3],
-                arguments[4],
-                arguments[5],
-                stack_arguments[0],
-                stack_arguments[1],
-                state
-                    .ampr_files
-                    .keys()
-                    .map(|id| format!("{id:#x}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-        };
-        (host_path, state.ampr_file_handles.get(&file_id).cloned())
-    };
     let Ok(capacity) = usize::try_from(size) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    let newly_opened = cached_file.is_none();
-    let file = match cached_file {
-        Some(file) => file,
-        None => {
-            let file = match std::fs::File::open(&host_path) {
-                Ok(file) => file,
-                Err(error) => {
-                    eprintln!(
-                        "[REMu][AMPR] read could not open id={file_id:#x} host={:?}: {error}",
-                        host_path.display()
-                    );
-                    return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-                }
-            };
-            Arc::new(file)
-        }
-    };
-
-    // The host read and watched guest-memory copy are the expensive operations. The narrower AMPR
-    // order lock remains held, but PROBE_DISPATCH is deliberately not: unrelated guest imports can
-    // continue while this thread blocks on storage or dirties destination pages.
-    let read_result = read_file(&file, file_id, destination, size, file_offset, capacity);
-
-    let mut state = dispatch
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if newly_opened {
-        state
-            .ampr_file_handles
-            .entry(file_id)
-            .or_insert_with(|| Arc::clone(&file));
+    if !state.ampr_files.contains_key(&file_id) {
+        eprintln!(
+            "[REMu][AMPR] read rejected unknown file id={file_id:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x} stack={:#x},{:#x} known=[{}]",
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+            stack_arguments[0],
+            stack_arguments[1],
+            state
+                .ampr_files
+                .keys()
+                .map(|id| format!("{id:#x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
-    let bytes_read = match read_result {
-        Ok(bytes_read) => bytes_read,
-        Err(error) => return error,
-    };
+    if !ampr_destination_has_write_access(state, destination, capacity) {
+        eprintln!(
+            "[REMu][AMPR] read rejected unmapped destination={destination:#x} size={size:#x}"
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    }
     let Some(command) = state.ampr_command_buffers.get_mut(&command_buffer) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
@@ -537,13 +556,21 @@ where
     write_guest_u64(record + 8, destination);
     write_guest_u64(record + 0x10, size);
     write_guest_u64(record + 0x18, file_offset);
-    write_guest_u64(record + 0x20, u64::try_from(bytes_read).unwrap_or(u64::MAX));
+    // The transfer has not run yet. Submission overwrites this diagnostic/result field with the
+    // number of bytes actually copied.
+    write_guest_u64(record + 0x20, 0);
+    command.pending_reads.push(AmprReadCommand {
+        file_id,
+        destination,
+        size,
+        file_offset,
+        record_offset: command.write_offset,
+    });
     command.write_offset += AMPR_COMMAND_RECORD_SIZE;
     command.command_count += 1;
     if trace_ampr_reads() {
         eprintln!(
-            "[REMu][AMPR] read id={file_id:#x} offset={file_offset:#x} requested={size:#x} read={:#x} destination={destination:#x} staged=true thread={:?}",
-            bytes_read,
+            "[REMu][AMPR] record read id={file_id:#x} offset={file_offset:#x} requested={size:#x} destination={destination:#x} thread={:?}",
             current_guest_thread_name()
         );
     }
@@ -571,9 +598,11 @@ pub(crate) fn ampr_read_file_to_guest(
     // the write-fault signal, and a concurrent resource upload can rearm the page between an eager
     // mprotect and the syscall. Read into ordinary host storage, then copy with CPU stores so the
     // write-watch handler dirties each page synchronously.
-    let mut staging = AMPR_READ_STAGING
+    let mut staging = AMPR_READ_STAGING_POOL
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+        .unwrap_or_default();
     let additional = capacity.saturating_sub(staging.len());
     if let Err(error) = staging.try_reserve(additional) {
         eprintln!("[REMu][AMPR] could not stage read id={file_id:#x} size={size:#x}: {error}");
@@ -607,7 +636,139 @@ remaining={:#x} destination={:#x}: {error}",
     unsafe {
         std::ptr::copy_nonoverlapping(staging.as_ptr(), destination as *mut u8, total);
     }
+    if staging.capacity() <= AMPR_MAX_RETAINED_STAGING_BYTES {
+        staging.clear();
+        let mut pool = AMPR_READ_STAGING_POOL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.len() < AMPR_STAGING_POOL_LIMIT {
+            pool.push(staging);
+        }
+    }
     Ok(total)
+}
+
+pub(crate) fn ampr_submit_command_buffer_ordered(arguments: [u64; 6]) -> u64 {
+    let order = ampr_command_order(arguments[0]);
+    let dispatch = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
+    ampr_submit_command_buffer_two_phase_with(order, dispatch, arguments, ampr_read_file_to_guest)
+}
+
+pub(crate) fn ampr_submit_command_buffer_two_phase_with<F>(
+    order: &Mutex<()>,
+    dispatch: &RwLock<ProbeDispatchState>,
+    arguments: [u64; 6],
+    mut read_file: F,
+) -> u64
+where
+    F: FnMut(&std::fs::File, u32, u64, u64, u64, usize) -> Result<usize, u64>,
+{
+    let _order = order
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let command_buffer = arguments[0];
+    let (reads, paths) = {
+        let state = dispatch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(command) = state.ampr_command_buffers.get(&command_buffer) else {
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        };
+        let mut paths = BTreeMap::new();
+        for read in &command.pending_reads {
+            let Ok(capacity) = usize::try_from(read.size) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            // A reusable APR program may outlive or reprotect its original destination. Validate
+            // the entire current mapping on every submission rather than trusting record time.
+            if !ampr_destination_has_write_access(&state, read.destination, capacity) {
+                return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+            }
+            let Some(path) = state.ampr_files.get(&read.file_id).cloned() else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+            };
+            paths
+                .entry(read.file_id)
+                .or_insert_with(|| (path, state.ampr_file_handles.get(&read.file_id).cloned()));
+        }
+        (command.pending_reads.clone(), paths)
+    };
+
+    let mut files = BTreeMap::<u32, Arc<std::fs::File>>::new();
+    for (file_id, (path, cached)) in paths {
+        let file = match cached {
+            Some(file) => file,
+            None => match std::fs::File::open(&path) {
+                Ok(file) => Arc::new(file),
+                Err(error) => {
+                    eprintln!(
+                        "[REMu][AMPR] submit could not open id={file_id:#x} host={:?}: {error}",
+                        path.display()
+                    );
+                    return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+                }
+            },
+        };
+        files.insert(file_id, file);
+    }
+
+    // Execute the reusable program in record order. Neither host storage latency nor watched
+    // guest-memory faults retain the process dispatch lock, so unrelated guest services and APR
+    // buffers continue making progress.
+    let mut completed_reads = Vec::with_capacity(reads.len());
+    for read in reads {
+        let Ok(capacity) = usize::try_from(read.size) else {
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        };
+        {
+            let state = dispatch
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Opening another file, or an earlier command, may have allowed the guest to change
+            // this reusable destination. Revalidate directly before this command's I/O.
+            if !ampr_destination_has_write_access(&state, read.destination, capacity) {
+                return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+            }
+        }
+        let Some(file) = files.get(&read.file_id) else {
+            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+        };
+        let bytes_read = match read_file(
+            file,
+            read.file_id,
+            read.destination,
+            read.size,
+            read.file_offset,
+            capacity,
+        ) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => return error,
+        };
+        completed_reads.push((read.record_offset, bytes_read));
+    }
+
+    let mut state = dispatch
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (file_id, file) in files {
+        state.ampr_file_handles.entry(file_id).or_insert(file);
+    }
+    let Some(command) = state.ampr_command_buffers.get(&command_buffer) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    for (record_offset, bytes_read) in completed_reads {
+        let Some(result_offset) = record_offset.checked_add(0x20) else {
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        };
+        if result_offset > command.size || 8 > command.size - result_offset {
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        }
+        write_guest_u64(
+            command.buffer + result_offset,
+            u64::try_from(bytes_read).unwrap_or(u64::MAX),
+        );
+    }
+    ampr_submit_command_buffer(arguments, &mut state)
 }
 
 pub(crate) fn ampr_submit_command_buffer(
@@ -620,12 +781,12 @@ pub(crate) fn ampr_submit_command_buffer(
     state.next_apr_submission_id = state.next_apr_submission_id.wrapping_add(1).max(1);
     let id = state.next_apr_submission_id;
     state.apr_submissions.insert(id);
-    // The buffer's transfers were performed as they were recorded, so its completions become
-    // observable now, in recorded order.
+    // A command buffer is a reusable program. Every submission repeats its completion commands
+    // after the transfer pass above, until the guest resets or destroys the program.
     let completions = state
         .ampr_command_buffers
-        .get_mut(&arguments[0])
-        .map(|command| std::mem::take(&mut command.pending_completions))
+        .get(&arguments[0])
+        .map(|command| command.pending_completions.clone())
         .unwrap_or_default();
     let announced = !completions.is_empty();
     if trace_ampr_reads() {

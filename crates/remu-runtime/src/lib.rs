@@ -136,13 +136,14 @@ pub(crate) use ampr_api::{
     ampr_command_buffer_destructor, ampr_command_buffer_get_current_offset,
     ampr_command_buffer_get_size, ampr_command_buffer_read_file_ordered, ampr_command_buffer_reset,
     ampr_command_buffer_set_buffer, ampr_command_buffer_write_kernel_event_queue,
-    ampr_get_file_size, ampr_get_file_stat, ampr_measure_command_size, ampr_resolve_file_paths,
-    ampr_resolve_paths_core, ampr_submit_command_buffer, ampr_wait_command_buffer,
+    ampr_command_order, ampr_get_file_size, ampr_get_file_stat, ampr_measure_command_size,
+    ampr_resolve_file_paths, ampr_resolve_paths_core, ampr_submit_command_buffer,
+    ampr_submit_command_buffer_ordered, ampr_wait_command_buffer,
 };
 #[cfg(test)]
 pub(crate) use ampr_api::{
-    AMPR_INVALID_FILE_ID, ampr_command_buffer_read_file_two_phase_with, ampr_read_file_to_guest,
-    join_guest_path,
+    AMPR_INVALID_FILE_ID, ampr_command_buffer_record_read, ampr_read_file_to_guest,
+    ampr_submit_command_buffer_two_phase_with, join_guest_path,
 };
 pub(crate) use audio_out2::dispatch_audio_out2_import;
 #[cfg(test)]
@@ -770,8 +771,20 @@ struct AmprCommandBufferState {
     size: u64,
     write_offset: u64,
     command_count: u64,
+    /// File transfers recorded into this reusable command program.
+    pending_reads: Vec<AmprReadCommand>,
     /// Queue completions recorded into this buffer, announced when it is submitted.
     pending_completions: Vec<AmprCompletion>,
+}
+
+/// One deferred APR file transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmprReadCommand {
+    file_id: u32,
+    destination: u64,
+    size: u64,
+    file_offset: u64,
+    record_offset: u64,
 }
 
 /// One recorded request to signal an event queue when a command buffer completes.
@@ -982,14 +995,13 @@ static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
 /// A file read deliberately releases `PROBE_DISPATCH` while the host blocks in `pread` and while
 /// bytes are copied into guest memory. Holding this narrower lock across that gap prevents submit,
 /// reset, destruction, or file re-resolution from overtaking the transfer.
-static AMPR_IMPORT_ORDER: OnceLock<Mutex<()>> = OnceLock::new();
-/// Reusable host storage for ordered AMPR reads.
-///
-/// Silent Hill issues thousands of mostly 32–256 KiB reads while opening Unreal containers. AMPR
-/// operations are already serialized by `AMPR_IMPORT_ORDER`, so retaining one initialized buffer
-/// avoids an allocation and zero-fill for every request without increasing the observable
-/// concurrency or bypassing CPU write-watch faults during the final guest-memory copy.
-static AMPR_READ_STAGING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// A small fixed lock table preserves program order for each APR command buffer without forcing
+/// unrelated streaming queues through one process-wide storage lock. A collision only reduces
+/// concurrency; it cannot change guest-visible ordering.
+static AMPR_COMMAND_ORDER: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+/// Reusable host storage for APR reads. The pool lock is held only while borrowing or returning a
+/// vector, never during host I/O or watched guest-memory copies.
+static AMPR_READ_STAGING_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static KERNEL_EQUEUE_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 static AUDIO_OUT: OnceLock<Mutex<audio::AudioOutState>> = OnceLock::new();
 static AUDIO_OUT2: OnceLock<Mutex<AudioOut2State>> = OnceLock::new();
@@ -1919,7 +1931,23 @@ fn is_serialized_ampr_import(nid: &str) -> bool {
             | "GuchCTefuZw"
             | "Qs1xtplKo0U"
             | "mQ16-QdKv7k"
+            // APR program builders implemented by the Ampr namespace.
+            | "YPxkUDhgoNI"
+            | "tNn5WBkta60"
+            | "pFQ9UHpO52s"
+            | "GmOguNIsuKk"
+            | "4UkZbYKVF7c"
+            | "4quckD2y7Pg"
+            | "sWbST0oQKsc"
+            | "dXPaz65HNmk"
+            | "f12ObAMEi9A"
+            | "mv0O8Zg0woU"
+            | "o67gODLFpls"
     )
+}
+
+fn is_ordered_ampr_submit_import(nid: &str) -> bool {
+    matches!(nid, "eE4Szl8sil8" | "qvMUCyyaCSI" | "ASoW5WE-UPo")
 }
 
 extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportReturn {
@@ -2164,9 +2192,11 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             call_args, stack_args,
         ));
     }
+    if is_ordered_ampr_submit_import(nid) {
+        return ProbeImportReturn::integer(ampr_submit_command_buffer_ordered(call_args));
+    }
     let _ampr_order = is_serialized_ampr_import(nid).then(|| {
-        AMPR_IMPORT_ORDER
-            .get_or_init(|| Mutex::new(()))
+        ampr_command_order(call_args[0])
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });

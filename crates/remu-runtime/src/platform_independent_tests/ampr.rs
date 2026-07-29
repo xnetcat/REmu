@@ -11,12 +11,12 @@ use super::{
 };
 
 #[test]
-fn ampr_read_releases_process_dispatch_lock_while_copying_and_records_result() {
+fn ampr_read_records_a_deferred_transfer_without_touching_the_destination() {
     let path = create_ampr_test_file(b"host payload");
     let file_id = 0x1234_5678;
     let command_buffer = 0x5000;
     let mut command_records = [0_u8; 0x60];
-    let mut destination = [0_u8; 4];
+    let mut destination = *b"live";
     let mut state = ProbeDispatchState::default();
     state.ampr_files.insert(file_id, path.clone());
     state.ampr_command_buffers.insert(
@@ -27,45 +27,23 @@ fn ampr_read_releases_process_dispatch_lock_while_copying_and_records_result() {
             ..AmprCommandBufferState::default()
         },
     );
-    let dispatch = RwLock::new(state);
-    let order = Mutex::new(());
     let destination_address = destination.as_mut_ptr().addr() as u64;
 
     assert_eq!(
-        crate::ampr_command_buffer_read_file_two_phase_with(
-            &order,
-            &dispatch,
+        crate::ampr_command_buffer_record_read(
             [command_buffer, 0, 0, file_id.into(), destination_address, 4],
             [7, 0, 0, 0, 0, 0],
-            |_, observed_file_id, observed_destination, size, offset, capacity| {
-                let unrelated_state = dispatch
-                    .try_write()
-                    .expect("process dispatch lock must be released during AMPR I/O");
-                drop(unrelated_state);
-                assert_eq!(observed_file_id, file_id);
-                assert_eq!(observed_destination, destination_address);
-                assert_eq!((size, offset, capacity), (4, 7, 4));
-                // SAFETY: `destination` remains live for the complete synchronous call.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        b"data".as_ptr(),
-                        observed_destination as *mut u8,
-                        4,
-                    );
-                }
-                Ok(4)
-            },
+            &mut state,
         ),
         0
     );
 
-    assert_eq!(&destination, b"data");
-    let state = dispatch.read().unwrap();
+    assert_eq!(&destination, b"live");
     let command = state.ampr_command_buffers.get(&command_buffer).unwrap();
     assert_eq!(command.write_offset, crate::AMPR_COMMAND_RECORD_SIZE);
     assert_eq!(command.command_count, 1);
-    assert!(state.ampr_file_handles.contains_key(&file_id));
-    drop(state);
+    assert_eq!(command.pending_reads.len(), 1);
+    assert!(state.ampr_file_handles.is_empty());
     assert_eq!(
         u32::from_le_bytes(command_records[0..4].try_into().unwrap()),
         1
@@ -80,7 +58,7 @@ fn ampr_read_releases_process_dispatch_lock_while_copying_and_records_result() {
     );
     assert_eq!(
         u64::from_le_bytes(command_records[0x20..0x28].try_into().unwrap()),
-        4
+        0
     );
     std::fs::remove_file(path).ok();
 }
@@ -107,14 +85,12 @@ fn ampr_host_read_honors_offset_and_short_end_of_file() {
 }
 
 #[test]
-fn failed_ampr_read_keeps_command_buffer_unmodified() {
-    let path = create_ampr_test_file(b"host payload");
-    let file_id = 0x2468_1357;
+fn missing_ampr_file_is_rejected_before_recording() {
+    let file_id = 0x2468_1357_u32;
     let command_buffer = 0x5500;
     let mut command_records = [0xa5_u8; 0x60];
     let mut destination = [0_u8; 4];
     let mut state = ProbeDispatchState::default();
-    state.ampr_files.insert(file_id, path.clone());
     state.ampr_command_buffers.insert(
         command_buffer,
         AmprCommandBufferState {
@@ -123,13 +99,9 @@ fn failed_ampr_read_keeps_command_buffer_unmodified() {
             ..AmprCommandBufferState::default()
         },
     );
-    let dispatch = RwLock::new(state);
-    let error = sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
 
     assert_eq!(
-        crate::ampr_command_buffer_read_file_two_phase_with(
-            &Mutex::new(()),
-            &dispatch,
+        crate::ampr_command_buffer_record_read(
             [
                 command_buffer,
                 0,
@@ -139,28 +111,25 @@ fn failed_ampr_read_keeps_command_buffer_unmodified() {
                 destination.len() as u64,
             ],
             [0; 6],
-            |_, _, _, _, _, _| Err(error),
+            &mut state,
         ),
-        error
+        sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
     );
 
-    let state = dispatch.read().unwrap();
     let command = state.ampr_command_buffers.get(&command_buffer).unwrap();
     assert_eq!(command.write_offset, 0);
     assert_eq!(command.command_count, 0);
-    assert!(state.ampr_file_handles.contains_key(&file_id));
     assert_eq!(command_records, [0xa5; 0x60]);
-    drop(state);
-    std::fs::remove_file(path).ok();
 }
 
 #[test]
-fn ampr_submit_cannot_overtake_an_in_flight_read() {
-    let path = create_ampr_test_file(b"host payload");
+fn ampr_submit_runs_reads_in_order_outside_dispatch_and_reuses_the_program() {
+    let path = create_ampr_test_file(b"01234567");
     let file_id = 0x8765_4321;
     let command_buffer = 0x6000;
-    let mut command_records = [0_u8; 0x60];
-    let mut destination = [0_u8; 4];
+    let mut command_records = [0_u8; 0x90];
+    let mut first = [0_u8; 4];
+    let mut second = [0_u8; 4];
     let mut state = ProbeDispatchState::default();
     state.ampr_files.insert(file_id, path.clone());
     state.ampr_command_buffers.insert(
@@ -171,75 +140,90 @@ fn ampr_submit_cannot_overtake_an_in_flight_read() {
             ..AmprCommandBufferState::default()
         },
     );
-    let dispatch = Arc::new(RwLock::new(state));
-    let order = Arc::new(Mutex::new(()));
-    let destination_address = destination.as_mut_ptr().addr() as u64;
-    let (read_entered_tx, read_entered_rx) = mpsc::channel();
-    let (release_read_tx, release_read_rx) = mpsc::channel();
-    let read_dispatch = Arc::clone(&dispatch);
-    let read_order = Arc::clone(&order);
-    let read = std::thread::spawn(move || {
-        crate::ampr_command_buffer_read_file_two_phase_with(
-            &read_order,
-            &read_dispatch,
-            [command_buffer, 0, 0, file_id.into(), destination_address, 4],
-            [0; 6],
-            move |_, _, observed_destination, _, _, _| {
-                read_entered_tx.send(()).unwrap();
-                release_read_rx.recv().unwrap();
-                // SAFETY: the owning test thread retains this destination until both workers
-                // join, and the AMPR ordering lock prevents submission from observing it early.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        b"done".as_ptr(),
-                        observed_destination as *mut u8,
-                        4,
-                    );
-                }
-                Ok(4)
-            },
-        )
-    });
-    read_entered_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("read reached unlocked I/O phase");
-
-    let submit_dispatch = Arc::clone(&dispatch);
-    let submit_order = Arc::clone(&order);
-    let (submit_started_tx, submit_started_rx) = mpsc::channel();
-    let (submit_done_tx, submit_done_rx) = mpsc::channel();
-    let submit = std::thread::spawn(move || {
-        submit_started_tx.send(()).unwrap();
-        let _order = submit_order.lock().unwrap();
-        let mut state = submit_dispatch.write().unwrap();
-        let result = ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state);
-        submit_done_tx.send(result).unwrap();
-    });
-    submit_started_rx.recv().unwrap();
-    assert!(
-        submit_done_rx
-            .recv_timeout(Duration::from_millis(50))
-            .is_err(),
-        "submission overtook the blocked file read"
-    );
-
-    release_read_tx.send(()).unwrap();
-    assert_eq!(read.join().unwrap(), 0);
     assert_eq!(
-        submit_done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        crate::ampr_command_buffer_record_read(
+            [
+                command_buffer,
+                0,
+                0,
+                file_id.into(),
+                first.as_mut_ptr().addr() as u64,
+                4,
+            ],
+            [0; 6],
+            &mut state,
+        ),
         0
     );
-    submit.join().unwrap();
-    assert_eq!(&destination, b"done");
+    assert_eq!(
+        crate::ampr_command_buffer_record_read(
+            [
+                command_buffer,
+                0,
+                0,
+                file_id.into(),
+                second.as_mut_ptr().addr() as u64,
+                4,
+            ],
+            [4, 0, 0, 0, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+    let dispatch = RwLock::new(state);
+    let order = Mutex::new(());
+    let mut observed_offsets = Vec::new();
+    assert_eq!(
+        crate::ampr_submit_command_buffer_two_phase_with(
+            &order,
+            &dispatch,
+            [command_buffer, 0, 0, 0, 0, 0],
+            |file, id, destination, size, offset, capacity| {
+                let unrelated = dispatch
+                    .try_write()
+                    .expect("submit I/O retained the process dispatch lock");
+                drop(unrelated);
+                observed_offsets.push(offset);
+                crate::ampr_read_file_to_guest(file, id, destination, size, offset, capacity)
+            },
+        ),
+        0
+    );
+    assert_eq!(observed_offsets, [0, 4]);
+    assert_eq!(&first, b"0123");
+    assert_eq!(&second, b"4567");
+    assert_eq!(
+        u64::from_le_bytes(command_records[0x20..0x28].try_into().unwrap()),
+        4
+    );
+    assert_eq!(
+        u64::from_le_bytes(command_records[0x50..0x58].try_into().unwrap()),
+        4
+    );
+
+    std::fs::write(&path, b"abcdefgh").unwrap();
+    first.fill(0);
+    second.fill(0);
+    assert_eq!(
+        crate::ampr_submit_command_buffer_two_phase_with(
+            &order,
+            &dispatch,
+            [command_buffer, 0, 0, 0, 0, 0],
+            crate::ampr_read_file_to_guest,
+        ),
+        0
+    );
+    assert_eq!(&first, b"abcd");
+    assert_eq!(&second, b"efgh");
     let state = dispatch.read().unwrap();
-    assert_eq!(state.next_apr_submission_id, 1);
+    assert_eq!(state.next_apr_submission_id, 2);
     assert_eq!(
         state
             .ampr_command_buffers
             .get(&command_buffer)
             .unwrap()
             .write_offset,
-        crate::AMPR_COMMAND_RECORD_SIZE
+        crate::AMPR_COMMAND_RECORD_SIZE * 2
     );
     drop(state);
     std::fs::remove_file(path).ok();
@@ -274,11 +258,147 @@ fn ampr_ordering_classifier_covers_every_stateful_operation() {
         "GuchCTefuZw",
         "Qs1xtplKo0U",
         "mQ16-QdKv7k",
+        "YPxkUDhgoNI",
+        "tNn5WBkta60",
+        "pFQ9UHpO52s",
+        "GmOguNIsuKk",
+        "4UkZbYKVF7c",
+        "4quckD2y7Pg",
+        "sWbST0oQKsc",
+        "dXPaz65HNmk",
+        "f12ObAMEi9A",
+        "mv0O8Zg0woU",
+        "o67gODLFpls",
     ] {
         assert!(
             crate::is_serialized_ampr_import(nid),
             "{nid} bypassed AMPR ordering"
         );
+    }
+    for nid in ["eE4Szl8sil8", "qvMUCyyaCSI", "ASoW5WE-UPo"] {
+        assert!(
+            crate::is_ordered_ampr_submit_import(nid),
+            "{nid} bypassed deferred APR execution"
+        );
+    }
+}
+
+#[test]
+fn ampr_submit_preserves_result_and_submission_id_outputs() {
+    let command_buffer = 0x6800;
+    let mut command_records = [0_u8; 0x30];
+    let mut result = u64::MAX;
+    let mut submission_id = u32::MAX;
+    let mut state = ProbeDispatchState::default();
+    state.ampr_command_buffers.insert(
+        command_buffer,
+        AmprCommandBufferState {
+            buffer: command_records.as_mut_ptr().addr() as u64,
+            size: command_records.len() as u64,
+            ..AmprCommandBufferState::default()
+        },
+    );
+    let dispatch = RwLock::new(state);
+    let order = Mutex::new(());
+
+    assert_eq!(
+        crate::ampr_submit_command_buffer_two_phase_with(
+            &order,
+            &dispatch,
+            [
+                command_buffer,
+                6,
+                (&mut result as *mut u64).addr() as u64,
+                (&mut submission_id as *mut u32).addr() as u64,
+                0,
+                0,
+            ],
+            |_, _, _, _, _, _| unreachable!("empty command buffer performed I/O"),
+        ),
+        0
+    );
+    assert_eq!(result, 0);
+    assert_eq!(submission_id, 1);
+}
+
+#[test]
+fn ampr_reset_and_destroy_wait_for_the_same_buffer_submission_order() {
+    let command_buffer = 0x6a00;
+    let mut command_records = [0_u8; 0x30];
+    let state = Arc::new(RwLock::new(ProbeDispatchState::default()));
+    state.write().unwrap().ampr_command_buffers.insert(
+        command_buffer,
+        AmprCommandBufferState {
+            buffer: command_records.as_mut_ptr().addr() as u64,
+            size: command_records.len() as u64,
+            command_count: 1,
+            write_offset: crate::AMPR_COMMAND_RECORD_SIZE,
+            ..AmprCommandBufferState::default()
+        },
+    );
+
+    for destroy in [false, true] {
+        if !state
+            .read()
+            .unwrap()
+            .ampr_command_buffers
+            .contains_key(&command_buffer)
+        {
+            state.write().unwrap().ampr_command_buffers.insert(
+                command_buffer,
+                AmprCommandBufferState {
+                    buffer: command_records.as_mut_ptr().addr() as u64,
+                    size: command_records.len() as u64,
+                    command_count: 1,
+                    write_offset: crate::AMPR_COMMAND_RECORD_SIZE,
+                    ..AmprCommandBufferState::default()
+                },
+            );
+        }
+        let order = crate::ampr_command_order(command_buffer);
+        let guard = order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let worker_state = Arc::clone(&state);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _ordered = crate::ampr_command_order(command_buffer)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let result = if destroy {
+                crate::ampr_command_buffer_destructor(
+                    [command_buffer, 0, 0, 0, 0, 0],
+                    &mut worker_state.write().unwrap(),
+                )
+            } else {
+                crate::ampr_command_buffer_reset(
+                    [command_buffer, 0, 0, 0, 0, 0],
+                    &mut worker_state.write().unwrap(),
+                )
+            };
+            finished_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "buffer mutation raced the active submission order"
+        );
+        drop(guard);
+        assert_eq!(finished_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+        worker.join().unwrap();
+
+        let state = state.read().unwrap();
+        if destroy {
+            assert!(!state.ampr_command_buffers.contains_key(&command_buffer));
+        } else {
+            let command = state.ampr_command_buffers.get(&command_buffer).unwrap();
+            assert_eq!(command.write_offset, 0);
+            assert_eq!(command.command_count, 0);
+            assert!(command.pending_reads.is_empty());
+            assert!(command.pending_completions.is_empty());
+        }
     }
 }
 
@@ -330,4 +450,15 @@ fn ampr_completions_are_announced_by_submission_not_registration() {
     assert_eq!(event.equeue, equeue);
     assert_eq!(event.ident, 0x7502);
     assert_eq!(event.user_data, 0xabc);
+    state.pending_events.pop_front();
+
+    assert_eq!(
+        ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(
+        state.pending_events.len(),
+        1,
+        "reusing the command buffer lost its completion command"
+    );
 }
