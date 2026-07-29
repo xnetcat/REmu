@@ -247,7 +247,7 @@ pub(super) fn write_guest_texture_linear(
 ) -> Result<(), String> {
     let byte_count = guest_texture_byte_count(descriptor)
         .ok_or("guest texture byte count overflows the host address space")?;
-    if descriptor.address < 0x10_000 || byte_count > 128 * 1024 * 1024 {
+    if descriptor.address < 0x10_000 {
         return Err(format!(
             "invalid guest texture range address={:#x} bytes={byte_count}",
             descriptor.address

@@ -532,7 +532,12 @@ pub(crate) fn guest_texture_raw_range(
 ) -> Result<(usize, usize), String> {
     let byte_count = guest_texture_byte_count(descriptor)
         .ok_or("guest texture byte count overflows the host address space")?;
-    if descriptor.address < 0x10_000 || byte_count > 128 * 1024 * 1024 {
+    // Size is constrained by the decoded image dimensions and checked arithmetic above. Do not
+    // impose an unrelated host staging limit here: RDNA2 explicitly permits pitch to exceed the
+    // visible width, and large HDR/storage surfaces can legitimately exceed 128 MiB. Production
+    // callers validate complete live shared-backing coverage before dereferencing or allocating
+    // for this range (through GuestTextureWriteWatch or read_guest_shared_backing).
+    if descriptor.address < 0x10_000 {
         return Err(format!(
             "invalid guest texture range address={:#x} bytes={byte_count}",
             descriptor.address

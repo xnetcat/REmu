@@ -14,7 +14,7 @@ use super::{
     WriteWatchRefresh, apply_image_destination_select, comparison_depth32_upload,
     create_sampled_guest_texture, decode_image_descriptor, depth_array_face_descriptor,
     depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
-    guest_texture_byte_count, guest_texture_descriptors_overlap,
+    guest_texture_byte_count, guest_texture_descriptors_overlap, guest_texture_raw_range,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_storage, guest_texture_raw_matches,
@@ -25,6 +25,38 @@ use super::{
     storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
     write_watched_guest_texture_linear,
 };
+
+#[test]
+fn accepts_large_rdna2_storage_ranges_when_descriptor_math_is_valid() {
+    // Observed Silent Hill transition surfaces use a pitch larger than their visible width.
+    // RDNA2 encodes pitch-1 in the depth/pitch fields for 2D resources when pitch > width; the
+    // resulting physical span can legitimately exceed the old 128 MiB host-staging threshold.
+    let descriptor = GuestTextureDescriptor {
+        address: 0x80_d9e4_0000,
+        width: 3_840,
+        height: 4_160,
+        pitch: 8_192,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA16Float,
+        bytes_per_pixel: 8,
+    };
+    assert_eq!(
+        guest_texture_byte_count(descriptor),
+        Some(0x1040_0000)
+    );
+    assert_eq!(
+        guest_texture_raw_range(descriptor),
+        Ok((0x80_d9e4_0000, 0x1040_0000))
+    );
+    let error = match watch_guest_texture(descriptor) {
+        Ok(_) => panic!("unmapped storage range unexpectedly acquired a write watch"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("no complete live shared backing"),
+        "unexpected validation error: {error}"
+    );
+}
 
 #[test]
 fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory() {
