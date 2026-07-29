@@ -1,7 +1,8 @@
 use crate::{
     ImportCallFrame, PthreadMutexAttrState, current_guest_thread_handle, current_guest_thread_name,
     deliver_pending_guest_exception_at_import, kernel_process_time, low_u32, posix_pthread_result,
-    read_guest_u32, read_guest_u64, relative_microseconds_until, trace_guest_sync,
+    relative_microseconds_until, trace_guest_sync, try_read_process_guest_u32,
+    try_read_process_guest_u64,
 };
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,6 +52,14 @@ use self::state::{
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MAIN_CONDITION_NOTIFY_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn trace_read_guest_u32(address: u64) -> u32 {
+    try_read_process_guest_u32(address).unwrap_or(0)
+}
+
+fn trace_read_guest_u64(address: u64) -> u64 {
+    try_read_process_guest_u64(address).unwrap_or(0)
+}
+
 fn traced_main_conditions() -> &'static Mutex<BTreeSet<u64>> {
     static CONDITIONS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
     CONDITIONS.get_or_init(|| Mutex::new(BTreeSet::new()))
@@ -72,7 +81,7 @@ fn trace_main_condition_notify(frame: Option<&ImportCallFrame>, condition: u64, 
         [0; 6]
     } else {
         std::array::from_fn(|index| {
-            read_guest_u64(
+            trace_read_guest_u64(
                 guest_rsp.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(8)),
             )
         })
@@ -145,8 +154,8 @@ fn begin_main_timed_condition_trace(
         (0, 0)
     } else {
         (
-            i64::from_ne_bytes(read_guest_u64(deadline).to_ne_bytes()),
-            i64::from_ne_bytes(read_guest_u64(deadline + 8).to_ne_bytes()),
+            i64::from_ne_bytes(trace_read_guest_u64(deadline).to_ne_bytes()),
+            i64::from_ne_bytes(trace_read_guest_u64(deadline + 8).to_ne_bytes()),
         )
     };
     let guest_rsp = frame.map_or(0, |frame| frame.guest_rsp);
@@ -158,55 +167,55 @@ fn begin_main_timed_condition_trace(
         (0, 0)
     } else {
         (
-            read_guest_u64(guest_rsp.saturating_add(0x88)),
-            read_guest_u64(guest_rsp.saturating_add(0x90)),
+            trace_read_guest_u64(guest_rsp.saturating_add(0x88)),
+            trace_read_guest_u64(guest_rsp.saturating_add(0x90)),
         )
     };
     let (parent_rbp, parent_return) = if event_caller_rbp == 0 {
         (0, 0)
     } else {
         (
-            read_guest_u64(event_caller_rbp),
-            read_guest_u64(event_caller_rbp.saturating_add(8)),
+            trace_read_guest_u64(event_caller_rbp),
+            trace_read_guest_u64(event_caller_rbp.saturating_add(8)),
         )
     };
     let (grandparent_rbp, grandparent_return) = if parent_rbp == 0 {
         (0, 0)
     } else {
         (
-            read_guest_u64(parent_rbp),
-            read_guest_u64(parent_rbp.saturating_add(8)),
+            trace_read_guest_u64(parent_rbp),
+            trace_read_guest_u64(parent_rbp.saturating_add(8)),
         )
     };
     let (great_grandparent_rbp, great_grandparent_return) = if grandparent_rbp == 0 {
         (0, 0)
     } else {
         (
-            read_guest_u64(grandparent_rbp),
-            read_guest_u64(grandparent_rbp.saturating_add(8)),
+            trace_read_guest_u64(grandparent_rbp),
+            trace_read_guest_u64(grandparent_rbp.saturating_add(8)),
         )
     };
     let (clock_start_bits, clock_target_bits) = if event_caller_rbp < 0x78 {
         (0, 0)
     } else {
         (
-            read_guest_u64(event_caller_rbp - 0x78),
-            read_guest_u64(event_caller_rbp - 0x70),
+            trace_read_guest_u64(event_caller_rbp - 0x78),
+            trace_read_guest_u64(event_caller_rbp - 0x70),
         )
     };
-    let limiter_wait_millis = read_guest_u32(0x807_b26_f74);
-    let limiter_target_millis = read_guest_u32(0x807_b26_f78);
+    let limiter_wait_millis = trace_read_guest_u32(0x807_b26_f74);
+    let limiter_target_millis = trace_read_guest_u32(0x807_b26_f78);
     let process_counter = kernel_process_time(true);
     let named_thread = 0x807_b39_d68;
     let named_queue_index = i64::from(i32::from_ne_bytes(
-        read_guest_u32(named_thread + 0x20).to_ne_bytes(),
+        trace_read_guest_u32(named_thread + 0x20).to_ne_bytes(),
     ));
     let named_queue = named_thread.wrapping_add_signed(named_queue_index.saturating_mul(16));
-    let named_queue_state = read_guest_u64(named_queue);
+    let named_queue_state = trace_read_guest_u64(named_queue);
     let named_queue_flags = if named_queue_state == 0 {
         0
     } else {
-        read_guest_u64(named_queue_state.saturating_add(0x10))
+        trace_read_guest_u64(named_queue_state.saturating_add(0x10))
     };
     // FTaskGraphInterface::WaitUntilTaskCompletes passes an FGraphEventRef wrapper to
     // GameThreadWaitForTask.  This title's fixed frame stores the referenced event at rbp-0x60
@@ -216,24 +225,24 @@ fn begin_main_timed_condition_trace(
     let target_graph_event = if event_caller_rbp < 0x60 {
         0
     } else {
-        read_guest_u64(event_caller_rbp - 0x60)
+        trace_read_guest_u64(event_caller_rbp - 0x60)
     };
     let target_graph_event_words = if target_graph_event == 0 {
         [0; 12]
     } else {
         std::array::from_fn(|index| {
-            read_guest_u64(
+            trace_read_guest_u64(
                 target_graph_event
                     .saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(8)),
             )
         })
     };
-    let render_named_thread = read_guest_u32(0x807_b20_9d0);
+    let render_named_thread = trace_read_guest_u32(0x807_b20_9d0);
     let parent_locals = if parent_rbp < 0x80 {
         [0; 16]
     } else {
         std::array::from_fn(|index| {
-            read_guest_u64(
+            trace_read_guest_u64(
                 parent_rbp
                     .saturating_sub(0x80)
                     .saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(8)),

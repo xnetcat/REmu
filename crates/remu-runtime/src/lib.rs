@@ -5795,6 +5795,13 @@ pub(crate) fn try_read_process_guest_u32(address: u64) -> Option<u32> {
         .then(|| u32::from_le_bytes(bytes))
 }
 
+pub(crate) fn try_read_process_guest_u64(address: u64) -> Option<u64> {
+    let mut bytes = [0_u8; 8];
+    ProcessGuestMemory
+        .read(address, &mut bytes)
+        .then(|| u64::from_le_bytes(bytes))
+}
+
 pub(crate) fn process_guest_range_is_readable(address: u64, length: usize) -> bool {
     let mut bytes = vec![0_u8; length];
     ProcessGuestMemory.read(address, &mut bytes)
