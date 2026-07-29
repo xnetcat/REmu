@@ -233,8 +233,9 @@ impl MetalPresenter {
                     .is_some_and(|resident| resident.gpu_written);
                 let cpu_write_obsoletes_writeback = self
                     .resident_guest_textures
-                    .get(&alias)
-                    .is_some_and(|resident| resident.cpu_write_obsoletes_gpu_writeback(refresh));
+                    .get_mut(&alias)
+                    .expect("refreshed resident alias exists")
+                    .cpu_write_obsoletes_gpu_writeback(refresh)?;
                 if refresh == WriteWatchRefresh::Reprotecting && gpu_written {
                     return Err(format!(
                         "resident alias mapping {:#x} is being reprotected",
@@ -685,12 +686,12 @@ impl MetalPresenter {
                         .get_mut(&alias)
                         .expect("collected layered-depth alias exists"),
                 )?;
-                let resident = self
+                let mut resident = self
                     .resident_guest_textures
                     .remove(&alias)
                     .expect("collected layered-depth alias exists");
                 if refresh != WriteWatchRefresh::Replaced
-                    && !resident.cpu_write_obsoletes_gpu_writeback(refresh)
+                    && !resident.cpu_write_obsoletes_gpu_writeback(refresh)?
                 {
                     let alias_ranges = resident.write_watch.alias_ranges();
                     retire_sampled_textures_overlapping_writeback(

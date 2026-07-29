@@ -17,6 +17,14 @@ pub(super) static TEXTURE_SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static TEXTURE_SNAPSHOT_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
 
+pub(super) static TEXTURE_DIRTY_VALIDATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub(super) static TEXTURE_DIRTY_VALIDATION_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(super) static TEXTURE_DIRTY_VALIDATION_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) static TEXTURE_DIRTY_VALIDATION_UNCHANGED: AtomicU64 = AtomicU64::new(0);
+
 pub(super) static MODE27_DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static MODE27_DECODE_BYTES: AtomicU64 = AtomicU64::new(0);

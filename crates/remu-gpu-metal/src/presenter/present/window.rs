@@ -10,6 +10,8 @@ use super::{
     SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
+    TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+    TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     describe_guest_batch, presentation_drawable_size, process_resident_bytes,
     take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
@@ -266,6 +268,12 @@ impl MetalPresenter {
             let snapshot_count = TEXTURE_SNAPSHOT_COUNT.swap(0, Ordering::Relaxed);
             let snapshot_bytes = TEXTURE_SNAPSHOT_BYTES.swap(0, Ordering::Relaxed);
             let snapshot_nanoseconds = TEXTURE_SNAPSHOT_NANOSECONDS.swap(0, Ordering::Relaxed);
+            let dirty_validation_count = TEXTURE_DIRTY_VALIDATION_COUNT.swap(0, Ordering::Relaxed);
+            let dirty_validation_bytes = TEXTURE_DIRTY_VALIDATION_BYTES.swap(0, Ordering::Relaxed);
+            let dirty_validation_nanoseconds =
+                TEXTURE_DIRTY_VALIDATION_NANOSECONDS.swap(0, Ordering::Relaxed);
+            let dirty_validation_unchanged =
+                TEXTURE_DIRTY_VALIDATION_UNCHANGED.swap(0, Ordering::Relaxed);
             let decode_count = MODE27_DECODE_COUNT.swap(0, Ordering::Relaxed);
             let decode_bytes = MODE27_DECODE_BYTES.swap(0, Ordering::Relaxed);
             let decode_nanoseconds = MODE27_DECODE_NANOSECONDS.swap(0, Ordering::Relaxed);
@@ -273,9 +281,11 @@ impl MetalPresenter {
             let upload_bytes = MIP_UPLOAD_BYTES.swap(0, Ordering::Relaxed);
             let upload_nanoseconds = MIP_UPLOAD_NANOSECONDS.swap(0, Ordering::Relaxed);
             eprintln!(
-                "[REMu][PERF-TEXTURE] snapshot={snapshot_count}/{:.1}MiB/{:.1}ms mode27={decode_count}/{:.1}MiB/{:.1}ms upload={upload_count}/{:.1}MiB/{:.1}ms",
+                "[REMu][PERF-TEXTURE] snapshot={snapshot_count}/{:.1}MiB/{:.1}ms dirty_validate={dirty_validation_count}/{:.1}MiB/{:.1}ms/{dirty_validation_unchanged}clean mode27={decode_count}/{:.1}MiB/{:.1}ms upload={upload_count}/{:.1}MiB/{:.1}ms",
                 snapshot_bytes as f64 / (1024.0 * 1024.0),
                 snapshot_nanoseconds as f64 / 1_000_000.0,
+                dirty_validation_bytes as f64 / (1024.0 * 1024.0),
+                dirty_validation_nanoseconds as f64 / 1_000_000.0,
                 decode_bytes as f64 / (1024.0 * 1024.0),
                 decode_nanoseconds as f64 / 1_000_000.0,
                 upload_bytes as f64 / (1024.0 * 1024.0),

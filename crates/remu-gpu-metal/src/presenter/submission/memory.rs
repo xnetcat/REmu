@@ -147,8 +147,9 @@ impl MetalPresenter {
                     }
                     if self
                         .resident_guest_textures
-                        .get(&descriptor)
-                        .is_some_and(|resident| resident.cpu_write_obsoletes_gpu_writeback(refresh))
+                        .get_mut(&descriptor)
+                        .expect("refreshed DMA source texture exists")
+                        .cpu_write_obsoletes_gpu_writeback(refresh)?
                     {
                         if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
                             trace_resident_texture_removal("cpu-reused-dma-source", &resident);

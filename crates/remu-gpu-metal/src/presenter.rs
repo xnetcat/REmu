@@ -136,11 +136,12 @@ use self::stats::{
     SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
-    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, TEXTURE_SNAPSHOT_BYTES,
-    TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS, process_resident_bytes,
-    record_mode27_work_detail, record_texture_dirty_work_detail,
-    record_texture_snapshot_work_detail, record_texture_work, take_mode27_work_details,
-    take_texture_dirty_work_details, take_texture_snapshot_work_details,
+    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, TEXTURE_DIRTY_VALIDATION_BYTES,
+    TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
+    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
+    TEXTURE_SNAPSHOT_NANOSECONDS, process_resident_bytes, record_mode27_work_detail,
+    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
+    take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
 use self::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
@@ -726,9 +727,24 @@ impl ResidentGuestTexture {
         self.gpu_write_watch_generations = self.write_watch.generations();
     }
 
-    fn cpu_write_obsoletes_gpu_writeback(&self, refresh: WriteWatchRefresh) -> bool {
-        matches!(refresh, WriteWatchRefresh::Renewed { was_dirty: true })
-            || self.write_watch.generations() != self.gpu_write_watch_generations
+    fn cpu_write_obsoletes_gpu_writeback(
+        &mut self,
+        refresh: WriteWatchRefresh,
+    ) -> Result<bool, String> {
+        let possibly_changed = matches!(refresh, WriteWatchRefresh::Renewed { was_dirty: true })
+            || self.write_watch.is_dirty()
+            || self.write_watch.generations() != self.gpu_write_watch_generations;
+        if !possibly_changed {
+            return Ok(false);
+        }
+        if self.write_watch.content_has_changed()? {
+            return Ok(true);
+        }
+        // False-positive page dirtiness and permission-only watch renewal do not transfer
+        // ownership back to the CPU. Keep the GPU-current image and establish its boundary in the
+        // current watch generation domain.
+        self.note_gpu_write();
+        Ok(false)
     }
 }
 
@@ -771,7 +787,24 @@ struct CachedSampledTexture {
 struct GuestTextureWriteWatch {
     address: u64,
     byte_count: u64,
-    ranges: Vec<CpuWriteWatch>,
+    ranges: Vec<GuestTextureWatchRange>,
+    content_state: Arc<Mutex<GuestTextureContentState>>,
+}
+
+struct GuestTextureWatchRange {
+    watch: CpuWriteWatch,
+    /// Address in the canonical GPU-physical resource corresponding to `watch.range().0`.
+    ///
+    /// One physical allocation can have several disjoint CPU aliases. Dirty faults arrive in
+    /// the alias address space, while snapshots and fingerprints use the resource's canonical
+    /// address. Retaining this translation keeps dirty-page validation coherent across aliases.
+    canonical_address: u64,
+}
+
+struct GuestTextureContentState {
+    chunk_fingerprints: Vec<u64>,
+    initialized_chunks: Vec<bool>,
+    pending_dirty_ranges: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

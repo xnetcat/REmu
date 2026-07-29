@@ -505,7 +505,13 @@ pub(crate) fn upload_image_textures(
                         cached,
                         sampled_texture_write_watches,
                     )?;
-                    sampled_texture_cache_needs_reload(refresh, cached.write_watch.is_dirty())
+                    let content_changed = match refresh {
+                        WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {
+                            cached.write_watch.content_has_changed()?
+                        }
+                        WriteWatchRefresh::Reprotecting | WriteWatchRefresh::Replaced => false,
+                    };
+                    sampled_texture_cache_needs_reload(refresh, content_changed)
                 } else {
                     false
                 };

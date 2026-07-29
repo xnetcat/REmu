@@ -199,8 +199,9 @@ impl MetalPresenter {
             }
             if self
                 .resident_guest_textures
-                .get(&descriptor)
-                .is_some_and(|resident| resident.cpu_write_obsoletes_gpu_writeback(refresh))
+                .get_mut(&descriptor)
+                .expect("refreshed sampled alias exists")
+                .cpu_write_obsoletes_gpu_writeback(refresh)?
             {
                 if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
                     // The CPU has repurposed this physical heap range since the render that
@@ -490,12 +491,12 @@ pub(crate) fn resident_depth_sample_is_eligible(
 
 pub(crate) fn sampled_texture_cache_needs_reload(
     refresh: WriteWatchRefresh,
-    active_watch_is_dirty: bool,
+    content_changed: bool,
 ) -> bool {
     match refresh {
-        WriteWatchRefresh::Active => active_watch_is_dirty,
-        WriteWatchRefresh::Renewed { was_dirty: true } | WriteWatchRefresh::Replaced => true,
-        WriteWatchRefresh::Reprotecting | WriteWatchRefresh::Renewed { was_dirty: false } => false,
+        WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => content_changed,
+        WriteWatchRefresh::Replaced => true,
+        WriteWatchRefresh::Reprotecting => false,
     }
 }
 
