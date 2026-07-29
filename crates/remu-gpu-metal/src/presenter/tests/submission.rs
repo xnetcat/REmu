@@ -11,6 +11,7 @@ use remu_gpu::{
     GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
 };
 use remu_shader::{GlobalMemoryBinding, Program};
+use std::time::Duration;
 
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason,
@@ -401,6 +402,62 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
 }
 
 #[test]
+fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let device = presenter.device.as_ref().expect("Metal device");
+    let event = device.new_shared_event();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    command_buffer.encode_wait_for_event(&event, 1);
+    command_buffer.commit();
+
+    let mut completion_label = 0_u32;
+    let completion_address =
+        u64::try_from((&raw mut completion_label) as usize).expect("test label address fits u64");
+    presenter
+        .committed_guest_batches
+        .push_back(GuestCommandBatch {
+            command_buffer,
+            work: Vec::new(),
+            global_upload_chunks: Vec::new(),
+            global_writebacks: Vec::new(),
+            guest_write_ranges: Vec::new(),
+            memory_writes: vec![PendingGuestMemoryWrite::Release(GpuMemoryRelease {
+                address: completion_address,
+                value: GpuMemoryReleaseValue::Immediate32(9),
+            })],
+            render_pass: None,
+            completion_sequences: Vec::new(),
+        });
+
+    let error = presenter
+        .wait_for_guest_command_batches_within(Duration::from_millis(200))
+        .expect_err("the unsignaled Metal event must exhaust the bounded wait");
+    assert!(error.contains("did not complete"));
+    assert_eq!(
+        presenter.committed_guest_batches.len(),
+        1,
+        "a timeout must retain the still-running command buffer"
+    );
+    assert_eq!(
+        completion_label, 0,
+        "a timeout must not publish ordered guest completion effects"
+    );
+
+    event.set_signaled_value(1);
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("the retained batch retires after Metal completes it");
+    assert!(presenter.committed_guest_batches.is_empty());
+    assert_eq!(completion_label, 9);
+}
+
+#[test]
 fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
     let device = Device::system_default().expect("Metal device");
     let queue = device.new_command_queue();
@@ -502,6 +559,8 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
             image_bindings: Vec::new(),
             vertex_inputs: Vec::new(),
         },
+        export_allocated_vector_register_count: 256,
+        pixel_allocated_vector_register_count: 256,
         vertex_output_control: 0,
         pixel_input_controls: std::array::from_fn(|index| {
             u32::try_from(index).expect("PS input index fits u32")

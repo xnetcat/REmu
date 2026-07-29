@@ -155,8 +155,8 @@ pub(crate) use audio_out2_abi::{
     SceAudioOut2Pcm, SceAudioOut2PortParam, SceAudioOut2PortState, audio_out2_queue_wait_duration,
     audio_out2_update_context_queue, decode_audio_out2_attribute, decode_audio_out2_channel_format,
     read_audio_out2_context_param, read_audio_out2_port_param, trace_audio_out2_context_memory,
-    trace_audio_out2_mastering_memory, trace_audio_out2_memory, write_audio_out2_context_param,
-    write_audio_out2_port_state,
+    trace_audio_out2_mastering_memory, trace_audio_out2_memory, trace_audio_out2_pcm,
+    write_audio_out2_context_param, write_audio_out2_port_state,
 };
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 pub(crate) use av_player::av_player_nv12_layout;
@@ -185,6 +185,7 @@ pub(crate) use dialog::{
     common_dialog_initialize, message_dialog_close, message_dialog_get_result,
     message_dialog_get_status, message_dialog_initialize, message_dialog_open,
     message_dialog_terminate, message_dialog_update_status, save_data_dialog_initialize,
+    save_data_dialog_terminate,
 };
 #[cfg(any(test, not(unix)))]
 pub(crate) use guest_files::kernel_stat_payload;
@@ -3766,6 +3767,7 @@ fn dispatch_probe_import(
         "hZIg1EWGsHM" => ult_initialize(arguments[0], state),
         "uoUpLGNkygk" => common_dialog_initialize(state),
         "s9e3+YpRnzw" => save_data_dialog_initialize(state),
+        "YuH2FA7azqQ" => save_data_dialog_terminate(state),
         "ERKzksauAJA" => state
             .services
             .save_data_dialog_status

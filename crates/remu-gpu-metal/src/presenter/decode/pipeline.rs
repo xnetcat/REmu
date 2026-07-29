@@ -6,8 +6,8 @@ use super::{
     GraphicsPipelineKey, GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL,
     PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
-    image_component_class, is_storage_image_opcode, pixel_input_controls,
-    program_embeds_global_base, register_value,
+    graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
+    pixel_input_controls, program_embeds_global_base, register_value,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
@@ -261,8 +261,12 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         .map(|target| target.sample_count)
         .or_else(|| depth.map(|depth| depth.sample_count))
         .unwrap_or(1);
-    let render_target_array_length =
-        common_render_target_array_length(targets.iter().map(|target| target.layer_count));
+    let render_target_array_length = common_render_target_array_length(
+        targets
+            .iter()
+            .map(|target| target.layer_count)
+            .chain(depth.into_iter().map(|depth| depth.layer_count)),
+    );
     if let Some(target) = targets
         .iter()
         .find(|target| target.sample_count != sample_count)
@@ -280,11 +284,14 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             depth.sample_count
         ));
     }
-    if render_target_array_length > 1 && depth.is_some() {
-        return Err(
-            "layered color rendering with a depth attachment is not implemented".to_owned(),
-        );
-    }
+    let export_user_data_register = [0x08c, 0x0cc, 0x04c]
+        .into_iter()
+        .find(|base| {
+            draw.shader_registers
+                .iter()
+                .any(|register| register.offset == base - 1)
+        })
+        .unwrap_or(0x0cc);
     Ok(GraphicsPipelineKey {
         export_shader_address: draw.export_shader_address,
         pixel_shader_address: draw.pixel_shader_address,
@@ -297,6 +304,14 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         pixel_resources: graphics_shader_resource_key(
             pixel_evaluation,
             program_embeds_global_base(pixel_program),
+        ),
+        export_allocated_vector_register_count: graphics_allocated_vector_register_count(
+            &draw.shader_registers,
+            export_user_data_register,
+        ),
+        pixel_allocated_vector_register_count: graphics_allocated_vector_register_count(
+            &draw.shader_registers,
+            0x00c,
         ),
         vertex_output_control: register_value(&draw.context_registers, PA_CL_VS_OUT_CNTL)
             .unwrap_or_default(),

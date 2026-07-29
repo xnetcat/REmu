@@ -15,8 +15,9 @@ use metal::{
     RenderCommandEncoder, RenderPipelineState, SamplerState, Texture,
 };
 use remu_gpu::{GpuEvent, GpuMemoryRelease, GpuMemoryWrite, IndexedDraw};
-use remu_memory::CpuWriteWatch;
+use remu_memory::{CpuWriteWatch, GuestSharedMappingIdentity};
 mod cache;
+mod completion;
 mod decode;
 mod diagnostics;
 mod execute;
@@ -114,12 +115,12 @@ use self::sampler::{
     metal_buffer_with_bytes, sampled_image_bindings, sampler_uses_normalized_coordinates,
 };
 use self::shader::{
-    SHADER_COMPILE_QUEUE_CAPACITY, SHADER_COMPILER_WORKER_COUNT, compile_metal_compute_library,
-    compile_metal_library_with_tools, compute_pipeline_key, compute_program_can_split_wave64,
-    dump_compute_shader_msl, dump_shader_pair_msl, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, pixel_scalars, program_embeds_global_base,
-    shader_scalar_metadata_for_registers, skip_incomplete_rectangle_draw,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    SHADER_COMPILE_QUEUE_CAPACITY, compile_metal_compute_library, compile_metal_library_with_tools,
+    compute_pipeline_key, compute_program_can_split_wave64, dump_compute_shader_msl,
+    dump_shader_pair_msl, graphics_allocated_vector_register_count,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    pixel_scalars, program_embeds_global_base, shader_scalar_metadata_for_registers,
+    skip_incomplete_rectangle_draw, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
@@ -155,19 +156,20 @@ use self::texture::{
     guest_texture_raw_matches, image_destination_select_is_native, new_color_alias_texture_view,
     new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
     sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_raw_range,
-    snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
-    storage_image_requires_mip_hierarchy, watch_guest_texture, write_guest_texture_linear,
+    snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw, watch_guest_texture,
+    write_guest_texture_linear,
 };
 use self::texture::{
     decode_guest_texture_linear_from_raw, refresh_resident_texture_write_watch,
     resident_color_view_sample_is_eligible, retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
-    snapshot_watched_guest_range, upload_image_textures, write_watched_guest_range,
+    snapshot_watched_guest_range, storage_image_requires_mip_hierarchy, upload_image_textures,
+    write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
     write_watched_guest_texture_linear,
 };
 use self::tiling::{
-    GuestTextureOverlapQuery, copy_linear_to_tiled, copy_tiled_to_linear_at_z,
+    GuestTextureOverlapQuery, copy_linear_to_tiled_at_z, copy_tiled_to_linear_at_z,
     decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, effective_linear_pitch,
     encode_mode27_mip_chain_into_raw, guest_physical_ranges_overlap, guest_ranges_overlap,
     guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
@@ -200,17 +202,51 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const GPU_EVENTS_PER_TICK: usize = 512;
 // Unity can introduce dozens of distinct 200-400 KiB pixel programs at a scene boundary. Four
 // workers let the ordered GPU queue grow by several thousand events while Apple's compiler is
-// busy, which in turn withholds real guest flips and starves the guest audio producers. Current
-// Apple silicon has enough performance cores for eight independent offline compiler processes
-// without making pipeline construction on the presenter thread synchronous.
-const GUEST_BATCH_WORK_CAPACITY: usize = 256;
+// busy, which in turn withholds real guest flips and starves the guest audio producers. Each
+// offline compiler is a separate memory-heavy process, so eight workers can amplify a large UE
+// transition into system-wide pressure even when REmu's own RSS still looks reasonable.
+/// Keep individual Metal submissions short enough for the shared Apple GPU to return regularly
+/// to WindowServer. Unreal transition scenes can otherwise put hundreds of full-resolution draws
+/// in one command buffer and monopolize the device for seconds.
+const GUEST_BATCH_WORK_CAPACITY: usize = 32;
+
+/// Maximum number of committed guest batches allowed ahead of the host GPU.
+///
+/// Each batch retains its transient uploads, render targets, and writeback resources until Metal
+/// completes it. Bounding the queue prevents a stalled or simply overloaded game from growing
+/// unified-memory use indefinitely and making the whole system unresponsive.
+const MAX_COMMITTED_GUEST_BATCHES: usize = 3;
 const SAMPLED_TEXTURE_CACHE_CAPACITY: usize = 2_048;
+const DEFAULT_SAMPLED_TEXTURE_CACHE_MIB: u64 = 1_536;
+const DEFAULT_SHADER_COMPILER_WORKER_COUNT: usize = 4;
 const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
 const NGG_MESH_INDEX_BUFFER_INDEX: u64 = 29;
 const NGG_MESH_DRAW_BUFFER_INDEX: u64 = 30;
 const NGG_MESH_LDS_BYTES: u32 = 16 * 1024;
 const NGG_MESH_THREADS: u64 = 64;
 const NGG_MESH_VERTICES_PER_GROUP: u64 = 63;
+
+fn sampled_texture_cache_byte_capacity() -> Option<u64> {
+    static CAPACITY: OnceLock<Option<u64>> = OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        let capacity_mib = std::env::var("REMU_SAMPLED_TEXTURE_CACHE_MIB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SAMPLED_TEXTURE_CACHE_MIB);
+        (capacity_mib != 0).then(|| capacity_mib.saturating_mul(1024 * 1024))
+    })
+}
+
+fn shader_compiler_worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("REMU_SHADER_COMPILER_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SHADER_COMPILER_WORKER_COUNT)
+            .clamp(1, 8)
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PresenterFlow {
@@ -389,6 +425,8 @@ struct GraphicsPipelineKey {
     pixel_program_identity: ProgramIdentity,
     export_resources: GraphicsShaderResourceKey,
     pixel_resources: GraphicsShaderResourceKey,
+    export_allocated_vector_register_count: u32,
+    pixel_allocated_vector_register_count: u32,
     vertex_output_control: u32,
     pixel_input_controls: [u32; 32],
     targets: Vec<RenderTargetPipelineState>,
@@ -433,6 +471,7 @@ struct DiagnosticScanoutWriter {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DecodedDepthTarget {
     texture: GuestTextureDescriptor,
+    layer_count: u32,
     htile_address: Option<u64>,
     compare: MTLCompareFunction,
     test_enabled: bool,
@@ -556,6 +595,7 @@ struct ComputePipelineKey {
     program_identity: ProgramIdentity,
     lds_size_bytes: u32,
     wave_lane_count: u32,
+    allocated_vector_register_count: u32,
     compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
     initial_scalar_count: usize,
     global_bindings: Vec<(Vec<u32>, u64, usize, bool)>,
@@ -856,7 +896,7 @@ struct GuestMemoryWaitTracker {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GuestRenderPassKey {
     targets: Vec<(GuestTextureDescriptor, u32, bool, u32, u32, u32, u32, u32)>,
-    depth: Option<(GuestTextureDescriptor, u32, Option<u32>, Option<u64>)>,
+    depth: Option<(GuestTextureDescriptor, u32, u32, Option<u32>, Option<u64>)>,
 }
 
 struct OpenGuestRenderPass {
@@ -941,7 +981,8 @@ struct MetalPresenter {
     depth_stencil_cache: HashMap<(u64, bool), DepthStencilState>,
     global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
     transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
-    guest_global_buffer_cache: HashMap<(u64, usize), Buffer>,
+    guest_global_buffer_cache: HashMap<(u64, usize, GuestSharedMappingIdentity), Buffer>,
+    guest_global_buffer_cache_bytes: u64,
     global_buffer_cache_bytes: usize,
     index_buffer_cache: HashMap<Vec<u32>, Buffer>,
     diagnostic_vertex_position_buffer: Option<Buffer>,
@@ -994,7 +1035,15 @@ impl MetalPresenter {
         } else {
             None
         };
-        for worker in 0..SHADER_COMPILER_WORKER_COUNT {
+        let shader_compiler_workers = shader_compiler_worker_count();
+        eprintln!(
+            "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB",
+            SAMPLED_TEXTURE_CACHE_CAPACITY,
+            sampled_texture_cache_byte_capacity()
+                .map(|bytes| bytes / (1024 * 1024))
+                .unwrap_or(0),
+        );
+        for worker in 0..shader_compiler_workers {
             let compiler_device = device.clone();
             let shader_compile_requests = Arc::clone(&shader_compile_requests);
             let shader_compile_results = shader_compile_results.clone();
@@ -1083,6 +1132,7 @@ impl MetalPresenter {
             global_buffer_cache: HashMap::new(),
             transient_global_buffer_cache: HashMap::new(),
             guest_global_buffer_cache: HashMap::new(),
+            guest_global_buffer_cache_bytes: 0,
             global_buffer_cache_bytes: 0,
             index_buffer_cache: HashMap::new(),
             diagnostic_vertex_position_buffer: None,

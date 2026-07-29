@@ -11,8 +11,9 @@ use super::{
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
     read_texture_linear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
     record_diagnostic_texture_writer, resident_color_view_sample_is_eligible,
-    sampled_image_bindings, shader_scalar_metadata_for_registers, trace_target_sampling,
-    upload_image_textures, validate_compute_launch_for_metal, wave64_split_blockers,
+    sampled_image_bindings, shader_scalar_metadata_for_registers,
+    storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
+    validate_compute_launch_for_metal, wave64_split_blockers,
 };
 use metal::{MTLResourceUsage, MTLSize};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
@@ -66,10 +67,12 @@ impl MetalPresenter {
         }
         if !self.compiled_compute_pipelines.contains_key(&pipeline_key) {
             let compiled = (|| {
-                let options = remu_shader_metal::MetalCompileOptions::compute_wave(
+                let mut options = remu_shader_metal::MetalCompileOptions::compute_wave(
                     dispatch.launch.lds_size_bytes,
                     dispatch.launch.wave_lane_count,
                 );
+                options.allocated_vector_register_count =
+                    pipeline_key.allocated_vector_register_count;
                 let lowering_started = Instant::now();
                 let lowered =
                     remu_shader_metal::compile_msl(&snapshot.program, evaluation, &options)
@@ -228,13 +231,15 @@ impl MetalPresenter {
                     }
                 }
             }
-            if descriptor.texture_type == 9
-                && storage_image_requires_exact_preacquire(
+            if descriptor.texture_type == 9 {
+                if storage_image_requires_mip_hierarchy(binding, descriptor) {
+                    self.ensure_mipmapped_storage_texture(&device, descriptor)?;
+                } else if storage_image_requires_exact_preacquire(
                     binding.opcode,
                     has_component_reordered_resident,
-                )
-            {
-                self.ensure_resident_texture(&device, descriptor.guest)?;
+                ) {
+                    self.ensure_resident_texture(&device, descriptor.guest)?;
+                }
             }
         }
         self.synchronize_sampled_aliases(&[evaluation])?;

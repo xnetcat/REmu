@@ -1,31 +1,94 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::completion::commit_and_settle;
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
     MultisampleTextureKey, ResidentGuestTexture, ScanoutSnapshotTexture, WriteWatchRefresh,
     create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
     decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage,
-    initial_depth_clear_for_target, mode27_mip_chain_layout, record_mode27_work_detail,
-    refresh_resident_texture_write_watch, retire_multisample_textures_overlapping_writeback,
-    retire_overlapping_sampled_textures, retire_resident_textures_overlapping_writeback,
-    retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
-    snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw,
-    texture_element_layout, watch_guest_texture, watch_resident_texture, watch_sampled_texture,
-    write_resident_texture_contents_to_guest,
+    guest_texture_byte_count, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_storage, initial_depth_clear_for_target,
+    mode27_mip_chain_layout, promote_gpu_written_resident_mip_hierarchy, record_mode27_work_detail,
+    refresh_resident_texture_write_watch, resident_texture_for_sample,
+    retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
+    retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
+    snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
+    snapshot_watched_sampled_texture_raw, texture_element_layout, watch_guest_texture,
+    watch_resident_texture, watch_sampled_texture, write_resident_texture_contents_to_guest,
 };
 use metal::{
-    Device, MTLCommandBufferStatus, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor, Texture,
-    TextureDescriptor,
+    Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
+    MTLTextureType, MTLTextureUsage, RenderPassDescriptor, Texture, TextureDescriptor,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::time::Instant;
 
 impl MetalPresenter {
+    pub(crate) fn ensure_mipmapped_storage_texture(
+        &mut self,
+        device: &Device,
+        descriptor: DecodedImageDescriptor,
+    ) -> Result<Texture, String> {
+        let underlying_mip_count = descriptor
+            .base_mip_level
+            .checked_add(descriptor.mip_level_count)
+            .ok_or("storage-image mip range overflows")?;
+        let needs_gpu_promotion = self
+            .resident_guest_textures
+            .get(&descriptor.guest)
+            .is_some_and(|resident| {
+                resident.gpu_written
+                    && resident.texture_type == 9
+                    && resident.layer_count == 1
+                    && resident.mip_level_count < underlying_mip_count
+            });
+        if needs_gpu_promotion {
+            self.wait_for_guest_command_batches()?;
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
+            let refresh = refresh_resident_texture_write_watch(
+                self.resident_guest_textures
+                    .get_mut(&descriptor.guest)
+                    .expect("selected GPU-written resident exists"),
+            )?;
+            if refresh != WriteWatchRefresh::Replaced {
+                let resident = self
+                    .resident_guest_textures
+                    .remove(&descriptor.guest)
+                    .expect("selected GPU-written resident exists");
+                let promoted = promote_gpu_written_resident_mip_hierarchy(
+                    device,
+                    &queue,
+                    descriptor,
+                    resident,
+                    Mode27WorkOrigin::StorageCreate,
+                )?;
+                self.resident_guest_textures
+                    .insert(descriptor.guest, promoted);
+                return resident_texture_for_sample(
+                    self.resident_guest_textures
+                        .get_mut(&descriptor.guest)
+                        .expect("promoted storage hierarchy exists"),
+                    descriptor,
+                )
+                .ok_or_else(|| "promoted storage hierarchy cannot represent view".to_owned());
+            }
+            self.resident_guest_textures.remove(&descriptor.guest);
+        }
+        super::ensure_mipmapped_resident_texture_in_map(
+            device,
+            descriptor,
+            &mut self.resident_guest_textures,
+            Mode27WorkOrigin::StorageCreate,
+        )
+    }
+
     pub(crate) fn ensure_resident_texture(
         &mut self,
         device: &Device,
@@ -181,10 +244,36 @@ impl MetalPresenter {
             .get(&target.texture)
             .is_some_and(|resident| resident.gpu_written)
         {
-            return Err(format!(
-                "cannot reinterpret GPU-written target {:#x} as a {}-level hierarchy",
-                target.texture.address, target.mip_level_count
-            ));
+            self.wait_for_guest_command_batches()?;
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
+            retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
+            let resident = self
+                .resident_guest_textures
+                .remove(&target.texture)
+                .expect("selected GPU-written target exists");
+            let descriptor = DecodedImageDescriptor {
+                guest: target.texture,
+                destination_select: 0,
+                base_mip_level: 0,
+                mip_level_count: target.mip_level_count,
+                texture_type: target.texture_type,
+                layer_count: target.layer_count,
+            };
+            let promoted = promote_gpu_written_resident_mip_hierarchy(
+                device,
+                &queue,
+                descriptor,
+                resident,
+                Mode27WorkOrigin::RenderTargetCreate,
+            )?;
+            let texture = promoted.texture.clone();
+            self.resident_guest_textures
+                .insert(target.texture, promoted);
+            return Ok(texture);
         }
         self.resident_guest_textures.remove(&target.texture);
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
@@ -335,7 +424,11 @@ impl MetalPresenter {
         minimum_width: u32,
         minimum_height: u32,
     ) -> Result<Texture, String> {
-        let texture = self.ensure_resident_texture(device, depth.texture)?;
+        let texture = if depth.layer_count == 1 {
+            self.ensure_resident_texture(device, depth.texture)?
+        } else {
+            self.ensure_layered_depth_render_target_texture(device, depth)?
+        };
         let host_width = depth.texture.width.max(minimum_width);
         let host_height = depth.texture.height.max(minimum_height);
         if texture.width() >= u64::from(host_width) && texture.height() >= u64::from(host_height) {
@@ -346,9 +439,8 @@ impl MetalPresenter {
         // console expands the fast-cleared depth allocation to the active framebuffer extent;
         // Metal instead requires every attachment to cover the explicit render-pass extent.
         // Promote the host depth image, initialize the extra area to a comparison-neutral value,
-        // and preserve the guest-declared portion. This is the same strategy used by SharpEmu's
-        // working Metal backend and prevents menus/scenes from being clipped to the small DB
-        // metadata extent.
+        // and preserve the guest-declared portion. This prevents menus and scenes from being
+        // clipped to the small DB metadata extent.
         self.wait_for_guest_command_batches()?;
         let queue = self
             .command_queue
@@ -356,10 +448,17 @@ impl MetalPresenter {
             .ok_or("Metal command queue is unavailable")?
             .clone();
         let metal_descriptor = TextureDescriptor::new();
-        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_texture_type(if depth.layer_count == 1 {
+            MTLTextureType::D2
+        } else {
+            MTLTextureType::D2Array
+        });
         metal_descriptor.set_pixel_format(depth.texture.pixel_format);
         metal_descriptor.set_width(u64::from(host_width));
         metal_descriptor.set_height(u64::from(host_height));
+        if depth.layer_count > 1 {
+            metal_descriptor.set_array_length(u64::from(depth.layer_count));
+        }
         metal_descriptor.set_storage_mode(MTLStorageMode::Shared);
         metal_descriptor.set_usage(
             MTLTextureUsage::RenderTarget
@@ -368,8 +467,8 @@ impl MetalPresenter {
         );
         let promoted = device.new_texture(&metal_descriptor);
         promoted.set_label(&format!(
-            "REMu promoted depth image {:#x} {}x{}",
-            depth.texture.address, host_width, host_height
+            "REMu promoted {}-layer depth image {:#x} {}x{}",
+            depth.layer_count, depth.texture.address, host_width, host_height
         ));
 
         let command_buffer = queue.new_command_buffer().to_owned();
@@ -377,10 +476,14 @@ impl MetalPresenter {
         let pass = RenderPassDescriptor::new();
         pass.set_render_target_width(u64::from(host_width));
         pass.set_render_target_height(u64::from(host_height));
+        pass.set_render_target_array_length(u64::from(depth.layer_count));
         let attachment = pass
             .depth_attachment()
             .ok_or("Metal render pass has no depth attachment")?;
         attachment.set_texture(Some(&promoted));
+        if depth.layer_count > 1 {
+            attachment.set_slice(0);
+        }
         attachment.set_load_action(MTLLoadAction::Clear);
         attachment.set_store_action(MTLStoreAction::Store);
         attachment.set_clear_depth(initial_depth_clear_for_target(depth));
@@ -388,30 +491,25 @@ impl MetalPresenter {
         encoder.end_encoding();
 
         let blit = command_buffer.new_blit_command_encoder();
-        blit.copy_from_texture(
-            &texture,
-            0,
-            0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-            MTLSize::new(
-                texture.width().min(u64::from(host_width)),
-                texture.height().min(u64::from(host_height)),
-                1,
-            ),
-            &promoted,
-            0,
-            0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-        );
-        blit.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        if command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "depth-target promotion ended in {:?}",
-                command_buffer.status()
-            ));
+        for layer in 0..depth.layer_count {
+            blit.copy_from_texture(
+                &texture,
+                u64::from(layer),
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize::new(
+                    texture.width().min(u64::from(host_width)),
+                    texture.height().min(u64::from(host_height)),
+                    1,
+                ),
+                &promoted,
+                u64::from(layer),
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+            );
         }
+        blit.end_encoding();
+        commit_and_settle(&command_buffer, "depth-target promotion")?;
 
         let resident_descriptor = self
             .resident_guest_textures
@@ -433,6 +531,117 @@ impl MetalPresenter {
         resident.texture = promoted.clone();
         resident.component_reorder_view = None;
         Ok(promoted)
+    }
+
+    fn ensure_layered_depth_render_target_texture(
+        &mut self,
+        device: &Device,
+        depth: DecodedDepthTarget,
+    ) -> Result<Texture, String> {
+        if depth.layer_count <= 1 || depth.sample_count != 1 {
+            return Err(format!(
+                "layered depth target requires multiple single-sample slices, got layers={} samples={}",
+                depth.layer_count, depth.sample_count
+            ));
+        }
+        const DEPTH_ARRAY_TEXTURE_TYPE: u32 = 13;
+        if let Some(resident) =
+            self.resident_guest_textures
+                .get_mut(&depth.texture)
+                .filter(|resident| {
+                    resident.texture_type == DEPTH_ARRAY_TEXTURE_TYPE
+                        && resident.layer_count == depth.layer_count
+                        && resident.mip_level_count == 1
+                })
+        {
+            match refresh_resident_texture_write_watch(resident)? {
+                WriteWatchRefresh::Active
+                | WriteWatchRefresh::Reprotecting
+                | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
+                WriteWatchRefresh::Replaced => {}
+            }
+        }
+
+        let face_bytes = guest_texture_byte_count(depth.texture)
+            .ok_or("layered depth target face byte count overflows")?;
+        let array_bytes = face_bytes
+            .checked_mul(u64::from(depth.layer_count))
+            .ok_or("layered depth target byte count overflows")?;
+        let aliases = self
+            .resident_guest_textures
+            .values()
+            .filter(|resident| {
+                resident.gpu_written
+                    && resident
+                        .write_watch
+                        .overlaps_alias_range(depth.texture.address, array_bytes)
+            })
+            .map(|resident| resident.descriptor)
+            .collect::<Vec<_>>();
+        if !aliases.is_empty() {
+            self.wait_for_guest_command_batches()?;
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
+            for alias in aliases {
+                let refresh = refresh_resident_texture_write_watch(
+                    self.resident_guest_textures
+                        .get_mut(&alias)
+                        .expect("collected layered-depth alias exists"),
+                )?;
+                let resident = self
+                    .resident_guest_textures
+                    .remove(&alias)
+                    .expect("collected layered-depth alias exists");
+                if refresh != WriteWatchRefresh::Replaced {
+                    let alias_ranges = resident.write_watch.alias_ranges();
+                    retire_sampled_textures_overlapping_writeback(
+                        &mut self.sampled_texture_cache,
+                        &alias_ranges,
+                    );
+                    write_resident_texture_contents_to_guest(device, &queue, &resident)?;
+                }
+            }
+        }
+        self.resident_guest_textures.remove(&depth.texture);
+
+        let descriptor = DecodedImageDescriptor {
+            guest: depth.texture,
+            destination_select: 0,
+            base_mip_level: 0,
+            mip_level_count: 1,
+            texture_type: DEPTH_ARRAY_TEXTURE_TYPE,
+            layer_count: depth.layer_count,
+        };
+        let write_watch = watch_sampled_texture(descriptor)?;
+        retire_sampled_textures_overlapping_writeback(
+            &mut self.sampled_texture_cache,
+            &write_watch.alias_ranges(),
+        );
+        let raw = snapshot_watched_sampled_texture_raw(descriptor, &write_watch)?;
+        let linear = decode_sampled_texture_linear_from_raw(descriptor, &raw)?;
+        let texture = create_layered_depth_render_target_texture(device, descriptor, &linear)?;
+        texture.set_label(&format!(
+            "REMu {}-layer guest depth image {:#x}",
+            depth.layer_count, depth.texture.address
+        ));
+        self.resident_guest_textures.insert(
+            depth.texture,
+            ResidentGuestTexture {
+                texture: texture.clone(),
+                component_reorder_view: None,
+                descriptor: depth.texture,
+                texture_type: DEPTH_ARRAY_TEXTURE_TYPE,
+                layer_count: depth.layer_count,
+                mip_level_count: 1,
+                write_watch,
+                gpu_written: false,
+                content_version: 0,
+            },
+        );
+        Ok(texture)
     }
 
     pub(crate) fn ensure_direct_scanout_texture(
@@ -761,5 +970,71 @@ pub(crate) fn create_layered_render_target_texture(
         u64::try_from(bytes_per_row).expect("validated row size fits u64"),
         u64::try_from(bytes_per_image).expect("validated image size fits u64"),
     );
+    Ok(texture)
+}
+
+fn create_layered_depth_render_target_texture(
+    device: &Device,
+    descriptor: DecodedImageDescriptor,
+    linear: &[u8],
+) -> Result<Texture, String> {
+    if descriptor.texture_type != 13 || descriptor.layer_count <= 1 {
+        return Err(format!(
+            "layered depth target requires a 2D array, got type={} layers={}",
+            descriptor.texture_type, descriptor.layer_count
+        ));
+    }
+    let (elements_wide, elements_high, _, bytes_per_element) =
+        texture_element_layout(descriptor.guest)?;
+    let bytes_per_row = elements_wide
+        .checked_mul(bytes_per_element)
+        .ok_or("layered depth row size overflows")?;
+    let bytes_per_image = bytes_per_row
+        .checked_mul(elements_high)
+        .ok_or("layered depth image size overflows")?;
+    let required = bytes_per_image
+        .checked_mul(
+            usize::try_from(descriptor.layer_count)
+                .map_err(|_| "layered depth layer count does not fit usize")?,
+        )
+        .ok_or("layered depth byte count overflows")?;
+    if linear.len() != required {
+        return Err(format!(
+            "invalid layered depth upload {}x{}x{} format {:?} with {} bytes (expected {required})",
+            descriptor.guest.width,
+            descriptor.guest.height,
+            descriptor.layer_count,
+            descriptor.guest.pixel_format,
+            linear.len()
+        ));
+    }
+    let metal_descriptor = TextureDescriptor::new();
+    metal_descriptor.set_texture_type(MTLTextureType::D2Array);
+    metal_descriptor.set_pixel_format(descriptor.guest.pixel_format);
+    metal_descriptor.set_width(u64::from(descriptor.guest.width));
+    metal_descriptor.set_height(u64::from(descriptor.guest.height));
+    metal_descriptor.set_array_length(u64::from(descriptor.layer_count));
+    metal_descriptor.set_storage_mode(MTLStorageMode::Shared);
+    metal_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&metal_descriptor);
+    for layer in 0..descriptor.layer_count {
+        let offset = usize::try_from(layer)
+            .expect("validated depth layer fits usize")
+            .checked_mul(bytes_per_image)
+            .expect("validated depth layer offset fits usize");
+        texture.replace_region_in_slice(
+            MTLRegion::new_2d(
+                0,
+                0,
+                u64::from(descriptor.guest.width),
+                u64::from(descriptor.guest.height),
+            ),
+            0,
+            u64::from(layer),
+            linear[offset..].as_ptr().cast::<c_void>(),
+            u64::try_from(bytes_per_row).expect("validated depth row size fits u64"),
+            u64::try_from(bytes_per_image).expect("validated depth image size fits u64"),
+        );
+    }
     Ok(texture)
 }

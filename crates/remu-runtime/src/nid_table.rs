@@ -358,6 +358,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "uoUpLGNkygk" => "sceCommonDialogInitialize",
         "ERKzksauAJA" => "sceSaveDataDialogGetStatus",
         "s9e3+YpRnzw" => "sceSaveDataDialogInitialize",
+        "YuH2FA7azqQ" => "sceSaveDataDialogTerminate",
         "sjaobBgqeB4" => "sceNpUniversalDataSystemInitialize",
         "47UAEuQl+iI" => "sceNpUniversalDataSystemTerminate",
         "5zBnau1uIEo" => "sceNpUniversalDataSystemCreateContext",

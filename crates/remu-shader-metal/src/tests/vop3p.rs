@@ -416,6 +416,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 diagnostic_force_pixel_color: false,
                 lds_size_bytes: 0,
                 wave_lane_count: 32,
+                allocated_vector_register_count: 256,
             },
             MetalShaderStage::Mesh => MetalCompileOptions::mesh(0, 16 * 1024),
         };

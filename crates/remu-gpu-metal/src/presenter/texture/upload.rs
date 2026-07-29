@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::sampled_texture_cache_byte_capacity;
 use super::{
     CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
     GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
@@ -554,7 +555,20 @@ pub(crate) fn upload_image_textures(
                         "REMu sampled guest image {:#x}",
                         descriptor.guest.address
                     ));
-                    while sampled_texture_cache.len() >= SAMPLED_TEXTURE_CACHE_CAPACITY {
+                    let incoming_bytes = write_watch.range().1;
+                    let byte_capacity = sampled_texture_cache_byte_capacity();
+                    let mut cached_bytes = sampled_texture_cache.values().fold(
+                        0_u64,
+                        |total, cached| {
+                            total.saturating_add(cached.write_watch.range().1)
+                        },
+                    );
+                    while !sampled_texture_cache.is_empty()
+                        && (sampled_texture_cache.len() >= SAMPLED_TEXTURE_CACHE_CAPACITY
+                            || byte_capacity.is_some_and(|capacity| {
+                                cached_bytes.saturating_add(incoming_bytes) > capacity
+                            }))
+                    {
                         let Some((old_key, admission_id)) =
                             sampled_texture_admission_order.pop_front()
                         else {
@@ -565,6 +579,8 @@ pub(crate) fn upload_image_textures(
                             .is_some_and(|cached| cached.admission_id == admission_id);
                         if is_current {
                             if let Some(retired) = sampled_texture_cache.remove(&old_key) {
+                                cached_bytes =
+                                    cached_bytes.saturating_sub(retired.write_watch.range().1);
                                 SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS
                                     .fetch_add(1, Ordering::Relaxed);
                                 retire_sampled_texture(retired);

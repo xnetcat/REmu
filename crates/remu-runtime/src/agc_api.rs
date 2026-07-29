@@ -260,7 +260,12 @@ pub(crate) fn agc_allocate_command_dwords(command_buffer: u64, size_dwords: u32)
         command_buffer + AGC_COMMAND_BUFFER_CURSOR_UP_OFFSET,
         next_cursor,
     );
-    agc_command_abi::track_graphics_allocation(cursor_up, size_dwords);
+    agc_command_abi::track_graphics_command_allocation(
+        command_buffer,
+        cursor_up,
+        size_dwords,
+        false,
+    );
     Some(cursor_up)
 }
 

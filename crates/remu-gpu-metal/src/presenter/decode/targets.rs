@@ -585,7 +585,7 @@ pub(crate) fn decode_depth_target(
     let format = match z_info & 0x3 {
         // The AGC register defaults leave the high metadata bit set while the format is zero.
         // Unreal can carry that default into a color-only composite even with Z_ENABLE still
-        // latched. SharpEmu treats guest format zero as no depth surface.
+        // latched. Format zero does not describe a depth surface.
         0 => return Ok(None),
         1 => (MTLPixelFormat::Depth16Unorm, 2),
         3 => (MTLPixelFormat::Depth32Float, 4),
@@ -618,19 +618,18 @@ pub(crate) fn decode_depth_target(
         .checked_add(1)
         .ok_or("depth-target height overflows")?;
     let encoded_view = register_value(&draw.context_registers, DB_DEPTH_VIEW).unwrap_or_default();
-    let slice_start = encoded_view & 0x1fff;
-    let slice_max = (encoded_view >> 13) & 0x1fff;
+    // GFX10 DB_DEPTH_VIEW leaves two reserved bits between its 11-bit slice fields. Keep the
+    // field widths exact: accepting the reserved bits as part of either index can turn harmless
+    // view flags into an enormous guest allocation.
+    let slice_start = encoded_view & 0x7ff;
+    let slice_max = (encoded_view >> 13) & 0x7ff;
     let mip_level = (encoded_view >> 26) & 0xf;
     if slice_start > slice_max {
         return Err(format!(
             "depth target has invalid slice range {slice_start}..={slice_max} in DB_DEPTH_VIEW={encoded_view:#010x}"
         ));
     }
-    if slice_start != slice_max {
-        return Err(format!(
-            "layered depth rendering is unsupported for slice range {slice_start}..={slice_max} in DB_DEPTH_VIEW={encoded_view:#010x}"
-        ));
-    }
+    let layer_count = slice_max - slice_start + 1;
     if mip_level != 0 {
         return Err(format!(
             "depth target mip level {mip_level} is unsupported in DB_DEPTH_VIEW={encoded_view:#010x}"
@@ -734,7 +733,7 @@ pub(crate) fn decode_depth_target(
             let encoded_slice = register_value(&draw.context_registers, DB_DEPTH_SLICE);
             let bytes = guest_texture_byte_count(texture);
             eprintln!(
-                "[REMu][METAL][DEPTH] draw={} es={:#x} ps={:#x} instances={} address={address:#x} base={base_address:#x} read={read_address:#x} write={write_address:#x} extent={width}x{height} pitch={pitch} format={:?} samples={sample_count} guest_tile={tile_mode} z_info={z_info:#010x} tile_index={depth_tile_mode_index} control={control:#010x} render_control={render_control:#010x} size_xy={size:#010x} depth_view={encoded_view:#010x} slice={slice_start} depth_size={encoded_size:08x?} depth_slice={encoded_slice:08x?} bytes={bytes:x?}",
+                "[REMu][METAL][DEPTH] draw={} es={:#x} ps={:#x} instances={} address={address:#x} base={base_address:#x} read={read_address:#x} write={write_address:#x} extent={width}x{height} pitch={pitch} format={:?} samples={sample_count} guest_tile={tile_mode} z_info={z_info:#010x} tile_index={depth_tile_mode_index} control={control:#010x} render_control={render_control:#010x} size_xy={size:#010x} depth_view={encoded_view:#010x} slices={slice_start}..={slice_max} layers={layer_count} depth_size={encoded_size:08x?} depth_slice={encoded_slice:08x?} bytes={bytes:x?}",
                 draw.sequence,
                 draw.export_shader_address,
                 draw.pixel_shader_address,
@@ -745,6 +744,7 @@ pub(crate) fn decode_depth_target(
     }
     Ok(Some(DecodedDepthTarget {
         texture,
+        layer_count,
         htile_address,
         compare,
         test_enabled: depth_enabled,

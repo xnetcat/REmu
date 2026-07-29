@@ -125,8 +125,8 @@ pub struct MetalCompileOptions {
     /// vector or either clip/cull-distance vector depending on this register. Keeping the raw
     /// value in the compile options makes that mapping part of the generated Metal interface.
     pub vertex_output_control: u32,
-    /// Number of active color-target layers. Gen5 volume draws route each guest instance to the
-    /// corresponding layer.
+    /// Number of active color/depth target layers. A guest misc position export selects the
+    /// layer; procedural volume draws fall back to their instance index.
     pub render_target_array_length: u32,
     pub pixel_outputs: Vec<PixelOutputBinding>,
     pub pixel_input_enable: u32,
@@ -155,6 +155,12 @@ pub struct MetalCompileOptions {
     /// Architectural lanes per guest compute wave. Apple executes SIMD32; wave64 shaders whose
     /// cross-lane operations are split-safe use this to place ballot masks in the correct half.
     pub wave_lane_count: u32,
+    /// Number of vector registers allocated by the guest stage's `PGM_RSRC1` state.
+    ///
+    /// Relative vector moves address `VGPR[base + M0]`. Metal does not allow the backend's
+    /// scalarized per-register locals to retain a dynamic subscript, so lowering expands the
+    /// selection only across this architectural allocation.
+    pub allocated_vector_register_count: u32,
 }
 
 impl MetalCompileOptions {
@@ -177,6 +183,7 @@ impl MetalCompileOptions {
             diagnostic_force_pixel_color: false,
             lds_size_bytes: 0,
             wave_lane_count: 32,
+            allocated_vector_register_count: VECTOR_REGISTER_COUNT,
         }
     }
 
@@ -203,6 +210,7 @@ impl MetalCompileOptions {
             diagnostic_force_pixel_color: false,
             lds_size_bytes: 0,
             wave_lane_count: 32,
+            allocated_vector_register_count: VECTOR_REGISTER_COUNT,
         }
     }
 
@@ -225,6 +233,7 @@ impl MetalCompileOptions {
             diagnostic_force_pixel_color: false,
             lds_size_bytes,
             wave_lane_count: 32,
+            allocated_vector_register_count: VECTOR_REGISTER_COUNT,
         }
     }
 
@@ -247,6 +256,7 @@ impl MetalCompileOptions {
             diagnostic_force_pixel_color: false,
             lds_size_bytes,
             wave_lane_count,
+            allocated_vector_register_count: VECTOR_REGISTER_COUNT,
         }
     }
 
@@ -274,6 +284,7 @@ impl MetalCompileOptions {
             diagnostic_force_pixel_color: false,
             lds_size_bytes,
             wave_lane_count: 64,
+            allocated_vector_register_count: VECTOR_REGISTER_COUNT,
         }
     }
 }

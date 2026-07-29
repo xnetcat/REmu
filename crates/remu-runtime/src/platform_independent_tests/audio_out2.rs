@@ -1,7 +1,12 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::{
+    AudioOut2ContextState, audio_out2_grain_duration, audio_out2_queue_wait_duration,
+    audio_out2_update_context_queue,
+};
 
 use super::{
     AUDIO_OUT2_CONTEXT_MEMORY_BASE_SIZE, AUDIO_OUT2_CONTEXT_MEMORY_QUEUE_STRIDE,
@@ -429,6 +434,53 @@ fn audio_out2_context_push_reserves_and_drains_hardware_queue_slots() {
     context_state.last_queue_update -= crate::audio_out2_grain_duration(context_state.grain_frames);
     crate::audio_out2_update_context_queue(context_state, Instant::now());
     assert_eq!(context_state.queued, AUDIO_OUT2_DEFAULT_QUEUE_DEPTH - 1);
+}
+
+#[test]
+fn audio_out2_queue_preserves_short_lateness_as_catch_up_credit() {
+    let now = Instant::now();
+    let grain_duration = audio_out2_grain_duration(AUDIO_OUT2_DEFAULT_GRAIN_FRAMES);
+    let mut context = AudioOut2ContextState {
+        queue_depth: AUDIO_OUT2_DEFAULT_QUEUE_DEPTH,
+        grain_frames: AUDIO_OUT2_DEFAULT_GRAIN_FRAMES,
+        queued: 1,
+        last_queue_update: now - grain_duration - grain_duration / 2,
+        memory_address: 0,
+        memory_size: 0,
+    };
+
+    audio_out2_update_context_queue(&mut context, now);
+
+    assert_eq!(context.queued, 0);
+    assert_eq!(
+        audio_out2_queue_wait_duration(&context, now),
+        grain_duration / 2
+    );
+}
+
+#[test]
+fn audio_out2_queue_reanchors_after_a_real_idle_period() {
+    let now = Instant::now();
+    let grain_duration = audio_out2_grain_duration(AUDIO_OUT2_DEFAULT_GRAIN_FRAMES);
+    let mut context = AudioOut2ContextState {
+        queue_depth: AUDIO_OUT2_DEFAULT_QUEUE_DEPTH,
+        grain_frames: AUDIO_OUT2_DEFAULT_GRAIN_FRAMES,
+        queued: 0,
+        last_queue_update: now
+            - grain_duration
+                .checked_mul(AUDIO_OUT2_DEFAULT_QUEUE_DEPTH + 1)
+                .unwrap_or(Duration::MAX),
+        memory_address: 0,
+        memory_size: 0,
+    };
+
+    audio_out2_update_context_queue(&mut context, now);
+
+    assert_eq!(context.last_queue_update, now);
+    assert_eq!(
+        audio_out2_queue_wait_duration(&context, now),
+        grain_duration
+    );
 }
 
 #[test]

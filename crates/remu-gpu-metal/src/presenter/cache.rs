@@ -13,7 +13,7 @@ use metal::{
     Buffer, DepthStencilDescriptor, DepthStencilState, Device, Function, MTLCompareFunction,
     MTLResourceOptions, SamplerState,
 };
-use remu_memory::read_guest_shared_backing;
+use remu_memory::{guest_shared_mapping_identity, read_guest_shared_backing};
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -174,13 +174,23 @@ impl MetalPresenter {
             }
             QueuedGlobalReadSource::GuestMemory => {
                 trace_global_coherence(binding, "forwarded-guest-memory");
-                self.upload_identity_global_buffer(device, binding)?
-                    .ok_or_else(|| {
-                        format!(
-                            "queued global writer at {:#x}/{} has no identity-mapped view",
-                            binding.base_address, binding.byte_count
-                        )
-                    })
+                if let Some(uploaded) = self.upload_identity_global_buffer(device, binding)? {
+                    return Ok(uploaded);
+                }
+                // A queued producer may outlive the exact virtual mapping used when its work was
+                // recorded. Metal's bytes-no-copy API does not reject a partially unmapped range
+                // synchronously on every macOS version; the command buffer can instead remain
+                // scheduled forever after IOGPUResource creation fails. Drain the producer and
+                // take a validated backing copy when a complete identity view is unavailable.
+                trace_global_coherence(binding, "forwarded-copy-fallback");
+                let queue = self
+                    .command_queue
+                    .as_ref()
+                    .ok_or("Metal command queue is unavailable")?
+                    .clone();
+                self.wait_for_guest_command_batches()?;
+                self.ensure_open_guest_batch(&queue);
+                self.upload_fresh_global_buffer(device, binding)
             }
             QueuedGlobalReadSource::Synchronize => {
                 unreachable!("synchronizing global sources are handled before upload")
@@ -204,10 +214,11 @@ impl MetalPresenter {
             return Ok(uploaded);
         }
         if binding.data.len() != binding.byte_count {
-            return Err(format!(
-                "global binding {:#x}/{} is neither identity-mapped nor captured",
-                binding.base_address, binding.byte_count
-            ));
+            // Large bindings are deliberately not always captured in the packet. If page
+            // alignment crosses an unmapped edge, use the physical-backing registry to copy the
+            // exact requested range rather than asking Metal to pin the invalid aligned span.
+            trace_global_coherence(binding, "packet-copy-fallback");
+            return self.upload_fresh_global_buffer(device, binding);
         }
         let key = GlobalBufferCacheKey {
             base_address: binding.base_address,
@@ -317,20 +328,53 @@ impl MetalPresenter {
         else {
             return Ok(None);
         };
-        let key = (page_address, page_byte_count);
+        let page_byte_count_u64 = u64::try_from(page_byte_count)
+            .map_err(|_| "page-aligned guest global size does not fit u64")?;
+        if page_byte_count_u64 > GUEST_GLOBAL_BUFFER_MAX_ZERO_COPY_BYTES {
+            return Ok(None);
+        }
+        // `new_buffer_with_bytes_no_copy` needs every page in the outward-aligned host range.
+        // Validating only the shader's interior binding left the first/last page able to cross a
+        // retired mapping, which macOS reports as IOGPUSysMemory::memoryDescriptorWithClientBuffer
+        // failure and can leave waitUntilCompleted blocked indefinitely.
+        let Some(mapping_identity) =
+            guest_shared_mapping_identity(page_address, page_byte_count_u64)
+        else {
+            return Ok(None);
+        };
+        let key = (page_address, page_byte_count, mapping_identity);
         let buffer = if let Some(buffer) = self.guest_global_buffer_cache.get(&key) {
             buffer.clone()
         } else {
-            if self.guest_global_buffer_cache.len() >= GUEST_GLOBAL_BUFFER_CACHE_CAPACITY {
+            // Drop a cached view when the same VA is rebound to a different physical allocation.
+            // In-flight command batches retain their own Buffer clones until completion.
+            let mut retired_bytes = 0_u64;
+            self.guest_global_buffer_cache
+                .retain(|(cached_address, cached_bytes, _), buffer| {
+                    let retain =
+                        *cached_address != page_address || *cached_bytes != page_byte_count;
+                    if !retain {
+                        retired_bytes = retired_bytes.saturating_add(buffer.length());
+                    }
+                    retain
+                });
+            self.guest_global_buffer_cache_bytes = self
+                .guest_global_buffer_cache_bytes
+                .saturating_sub(retired_bytes);
+            if self.guest_global_buffer_cache.len() >= GUEST_GLOBAL_BUFFER_CACHE_CAPACITY
+                || self
+                    .guest_global_buffer_cache_bytes
+                    .saturating_add(page_byte_count_u64)
+                    > GUEST_GLOBAL_BUFFER_CACHE_BYTE_CAPACITY
+            {
                 self.guest_global_buffer_cache.clear();
+                self.guest_global_buffer_cache_bytes = 0;
             }
-            let length = u64::try_from(page_byte_count)
-                .map_err(|_| "page-aligned guest global size does not fit Metal")?;
             let buffer = device.new_buffer_with_bytes_no_copy(
                 usize::try_from(page_address)
                     .map_err(|_| "guest global address does not fit the host pointer")?
                     as *const c_void,
-                length,
+                page_byte_count_u64,
                 MTLResourceOptions::StorageModeShared,
                 None,
             );
@@ -338,6 +382,9 @@ impl MetalPresenter {
                 "REMu zero-copy guest global {page_address:#x}/{page_byte_count}"
             ));
             self.guest_global_buffer_cache.insert(key, buffer.clone());
+            self.guest_global_buffer_cache_bytes = self
+                .guest_global_buffer_cache_bytes
+                .saturating_add(page_byte_count_u64);
             buffer
         };
         Ok(Some(UploadedGlobalBuffer {
@@ -506,6 +553,10 @@ pub(super) const GLOBAL_UPLOAD_CHUNK_BYTE_COUNT: usize = 2 * 1024 * 1024;
 
 pub(super) const GLOBAL_UPLOAD_ALIGNMENT: usize = 256;
 
-pub(super) const GUEST_GLOBAL_BUFFER_CACHE_CAPACITY: usize = 4_096;
+pub(super) const GUEST_GLOBAL_BUFFER_CACHE_CAPACITY: usize = 1_024;
+
+pub(super) const GUEST_GLOBAL_BUFFER_CACHE_BYTE_CAPACITY: u64 = 512 * 1024 * 1024;
+
+pub(super) const GUEST_GLOBAL_BUFFER_MAX_ZERO_COPY_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) const INDEX_BUFFER_CACHE_CAPACITY: usize = 256;

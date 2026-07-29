@@ -9,8 +9,8 @@ use std::fmt::Write as _;
 
 use remu_shader::PixelOutputKind;
 
-use crate::Compiler;
 use crate::compiler::module::contains_register_reference;
+use crate::{Compiler, MetalShaderStage};
 
 pub(crate) const fn vertex_clip_distance_mask(control: u32) -> u32 {
     let low = if control & (1 << 22) != 0 {
@@ -94,7 +94,9 @@ impl Compiler<'_> {
             // primitive when only one of its vertices is outside the cull plane.
             source.push_str("    float clip_distances [[clip_distance]] [8];\n");
         }
-        if self.options.render_target_array_length > 1 {
+        if self.options.render_target_array_length > 1
+            && self.options.stage != MetalShaderStage::Mesh
+        {
             source.push_str("    uint render_target_array_index [[render_target_array_index]];\n");
         }
         for location in &self.vertex_outputs {
@@ -104,6 +106,18 @@ impl Compiler<'_> {
             );
         }
         source.push_str("};\n\n");
+        if self.options.render_target_array_length > 1
+            && self.options.stage == MetalShaderStage::Mesh
+        {
+            // Metal mesh shaders route the target slice per primitive. Declaring this semantic
+            // on the mesh vertex type is rejected by Apple's compiler even though the same
+            // semantic belongs to an ordinary vertex-stage output.
+            source.push_str(
+                "struct RemuPrimitiveOut {\n\
+                 \x20   uint render_target_array_index [[render_target_array_index]];\n\
+                 };\n\n",
+            );
+        }
     }
 
     pub(crate) fn emit_pixel_interface(&self, source: &mut String) {

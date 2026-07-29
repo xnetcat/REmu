@@ -7,7 +7,7 @@ use remu_core::GuestAddress;
 #[cfg(test)]
 use remu_memory::GUEST_PAGE_SIZE;
 use remu_memory::{
-    AddressSpaceError, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
+    AddressSpaceError, CpuWriteWatch, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
     GuestPhysicalBacking, GuestProtection, GuestSharedMapOptions, GuestVmaInfo, GuestVmaState,
 };
 use thiserror::Error;
@@ -359,7 +359,51 @@ impl KernelMemory {
         // Physical allocation ownership and virtual alias lifetime are separate in the kernel
         // ABI. Unity releases the direct range first and then explicitly munmaps its virtual view;
         // tearing the alias down here makes that legal sequence fault before sceKernelMunmap.
-        self.direct_memory.release(start, size)
+        let alias_ranges = self.direct_alias_ranges(start, size)?;
+        let released = self.direct_memory.release(start, size)?;
+        if released {
+            // A virtual alias may legally outlive physical ownership. It must not, however, keep
+            // a GPU resident alive after the same direct-memory pages are returned to the guest
+            // allocator. Otherwise a delayed texture readback can publish the old allocation
+            // through that alias after the physical range has been reused for ordinary objects.
+            //
+            // Retiring watches preserves every virtual mapping while making resident/sample
+            // caches observe `Replaced` before they can read back into the recycled backing.
+            for (address, byte_count) in alias_ranges {
+                CpuWriteWatch::retire_overlapping(address, byte_count);
+            }
+        }
+        Ok(released)
+    }
+
+    fn direct_alias_ranges(
+        &self,
+        start: u64,
+        size: u64,
+    ) -> Result<Vec<(u64, u64)>, KernelMemoryError> {
+        let end = start
+            .checked_add(size)
+            .ok_or(KernelMemoryError::DirectMemoryOverflow { start, size })?;
+        let backing_id = self.direct_memory.backing.id();
+        Ok(self
+            .virtual_memory
+            .vmas()
+            .into_iter()
+            .filter(|mapping| {
+                mapping.state == GuestVmaState::Shared && mapping.backing_id == Some(backing_id)
+            })
+            .filter_map(|mapping| {
+                let mapping_physical_end = mapping.backing_offset.checked_add(mapping.size)?;
+                let intersection_start = mapping.backing_offset.max(start);
+                let intersection_end = mapping_physical_end.min(end);
+                (intersection_start < intersection_end).then(|| {
+                    (
+                        mapping.start.get() + (intersection_start - mapping.backing_offset),
+                        intersection_end - intersection_start,
+                    )
+                })
+            })
+            .collect())
     }
 
     #[cfg(test)]
@@ -881,12 +925,34 @@ mod tests {
                 0,
             )
             .unwrap();
+        // SAFETY: both direct aliases remain mapped until the explicit unmap below.
+        let first_watch = unsafe {
+            CpuWriteWatch::new(page(first, 1).get(), GUEST_PAGE_SIZE).expect("first alias watch")
+        };
+        // SAFETY: see first_watch.
+        let second_watch = unsafe {
+            CpuWriteWatch::new(page(second, 1).get(), GUEST_PAGE_SIZE).expect("second alias watch")
+        };
+        // SAFETY: the adjacent direct page also remains mapped throughout the assertion.
+        let unreleased_watch = unsafe {
+            CpuWriteWatch::new(page(first, 2).get(), GUEST_PAGE_SIZE)
+                .expect("unreleased-page watch")
+        };
 
         assert!(
             memory
                 .release_direct(GUEST_PAGE_SIZE, GUEST_PAGE_SIZE)
                 .unwrap()
         );
+        assert_eq!(
+            first_watch.retirement(),
+            Some(remu_memory::CpuWriteWatchRetirement::Replaced)
+        );
+        assert_eq!(
+            second_watch.retirement(),
+            Some(remu_memory::CpuWriteWatchRetirement::Replaced)
+        );
+        assert_eq!(unreleased_watch.retirement(), None);
         for alias in [first, second] {
             assert!(memory.query(alias, false).is_some());
             assert!(memory.query(page(alias, 1), false).is_some());

@@ -61,6 +61,9 @@ impl Compiler<'_> {
         instruction: &Instruction,
         export: &ExportControl,
     ) -> Result<(), String> {
+        if export.target == 13 && self.options.vertex_output_control & (1 << 21) != 0 {
+            return self.emit_vertex_misc_export(instruction, export);
+        }
         if (13..=15).contains(&export.target) {
             return self.emit_vertex_distance_export(instruction, export);
         }
@@ -79,6 +82,40 @@ impl Compiler<'_> {
             &format!(
                 "if (exec) remu_out.{field} = float4({}, {}, {}, {});",
                 values[0], values[1], values[2], values[3]
+            ),
+        );
+        Ok(())
+    }
+
+    fn emit_vertex_misc_export(
+        &mut self,
+        instruction: &Instruction,
+        export: &ExportControl,
+    ) -> Result<(), String> {
+        // PA_CL_VS_OUT_CNTL maps POS1.z to the render-target index when the misc vector and
+        // USE_VTX_RENDER_TARGET_INDX are enabled. USE_VTX_KILL_FLAG takes precedence over the
+        // same component. The register payload is a raw integer carried through an EXP float
+        // operand, so preserve its bits rather than numerically converting the float.
+        let control = self.options.vertex_output_control;
+        let exports_render_target_index = control & (1 << 18) != 0 && control & (1 << 20) == 0;
+        if !exports_render_target_index
+            || export.enable_mask & (1 << 2) == 0
+            || self.options.render_target_array_length <= 1
+        {
+            return Ok(());
+        }
+        let values = self.export_float_values(instruction, export)?;
+        let maximum_layer = self.options.render_target_array_length - 1;
+        let destination = match self.options.stage {
+            MetalShaderStage::Vertex => "remu_out.render_target_array_index",
+            MetalShaderStage::Mesh => "remu_mesh_render_target_indices[remu_thread_index]",
+            _ => return Ok(()),
+        };
+        self.line(
+            3,
+            &format!(
+                "if (exec) {destination} = min(as_type<uint>({}), {maximum_layer}u);",
+                values[2]
             ),
         );
         Ok(())

@@ -6,6 +6,72 @@
 
 use super::*;
 
+fn compile_relative_move(name: &'static str, source: u32, destination: u32) -> MetalShader {
+    let mut options = MetalCompileOptions::compute(0);
+    options.allocated_vector_register_count = 8;
+    compile_msl(
+        &Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0x1000,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known(name),
+                words: vec![0],
+                sources: vec![Operand::vector(source)],
+                destinations: vec![Operand::vector(destination)],
+                control: None,
+            }],
+        ),
+        &empty_evaluation(),
+        &options,
+    )
+    .expect("relative vector move should lower")
+}
+
+#[test]
+fn lowers_relative_vector_moves_with_m0_and_the_allocated_register_limit() {
+    let source_relative = compile_relative_move("VMovrelsB32", 5, 2);
+    assert!(source_relative.source.contains("uint t0 = remu_v_0;"));
+    assert!(source_relative.source.contains("switch (remu_s_124)"));
+    assert!(
+        source_relative
+            .source
+            .contains("case 0u: t0 = remu_v_5; break;")
+    );
+    assert!(
+        source_relative
+            .source
+            .contains("case 2u: t0 = remu_v_7; break;")
+    );
+    assert!(!source_relative.source.contains("remu_v_8"));
+    assert!(source_relative.source.contains("remu_v_2 = t0;"));
+
+    let destination_relative = compile_relative_move("VMovreldB32", 2, 4);
+    assert!(
+        destination_relative
+            .source
+            .contains("exec && remu_s_124 == 0u) remu_v_4 = remu_v_2;")
+    );
+    assert!(
+        destination_relative
+            .source
+            .contains("exec && remu_s_124 == 3u) remu_v_7 = remu_v_2;")
+    );
+    assert!(!destination_relative.source.contains("remu_v_8"));
+
+    let both_relative = compile_relative_move("VMovrelsdB32", 5, 4);
+    assert!(
+        both_relative
+            .source
+            .contains("case 2u: t0 = remu_v_7; break;")
+    );
+    assert!(
+        both_relative
+            .source
+            .contains("exec && remu_s_124 == 3u) remu_v_7 = t0;")
+    );
+}
+
 #[test]
 fn lowers_unsigned_vector_bitfield_extract_without_overrunning_the_word() {
     let shader = compile_vector_instruction(

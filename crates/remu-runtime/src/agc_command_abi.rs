@@ -25,8 +25,10 @@ use self::buffer::{
 pub(crate) use self::buffer::{
     consume_recorded_graphics_range, graphics_continuation_was_consumed,
     retire_pending_graphics_continuation, take_graphics_continuations_before,
-    take_recorded_graphics_prefix, track_graphics_allocation, track_graphics_submission,
+    take_recorded_graphics_prefix, track_graphics_command_allocation, track_graphics_submission,
 };
+#[cfg(test)]
+pub(crate) use self::buffer::{graphics_tracking_test_guard, track_graphics_allocation};
 use self::common::{
     cb_branch, cb_dispatch, cb_nop, cb_release_mem, cb_set_register_range, cb_set_sh_registers,
     type_two_packet,
@@ -51,6 +53,8 @@ use self::sync::{
 
 const GRAPHICS5_ERROR_INVALID_PACKET: u64 = 0x8a6c_000c;
 
+const COMMAND_BUFFER_BASE_UP_OFFSET: u64 = 0x00;
+const COMMAND_BUFFER_BASE_DOWN_OFFSET: u64 = 0x08;
 const COMMAND_BUFFER_CURSOR_UP_OFFSET: u64 = 0x10;
 const COMMAND_BUFFER_CURSOR_DOWN_OFFSET: u64 = 0x18;
 const COMMAND_BUFFER_CALLBACK_OFFSET: u64 = 0x20;

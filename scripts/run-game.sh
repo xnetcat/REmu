@@ -6,6 +6,8 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
     echo "usage: $0 {SHORTCUT|/path/to/eboot.bin} [timeout-seconds]" >&2
     echo "  A non-path SHORTCUT resolves through the REMU_EBOOT_<SHORTCUT> environment" >&2
     echo "  variable, e.g. REMU_EBOOT_MYGAME=/path/to/eboot.bin $0 MYGAME" >&2
+    echo "  Runs stop after 600 seconds by default; pass 0 or set REMU_GAME_TIMEOUT_SECONDS=0" >&2
+    echo "  to disable the watchdog." >&2
     exit 64
 fi
 
@@ -29,9 +31,10 @@ else
     fi
     game_name=$(printf '%s' "$shortcut" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 fi
-# Interactive launches stay open until the guest exits or the user closes the window. Pass a
-# positive second argument only for a deliberately bounded diagnostic run.
-timeout_seconds=${2:-0}
+# Protect the shared Apple GPU and unified memory from an unattended wedged game. An explicit
+# second argument wins, then the environment override, and zero deliberately disables the
+# watchdog for an unbounded interactive session.
+timeout_seconds=${2:-${REMU_GAME_TIMEOUT_SECONDS:-600}}
 if [ ! -f "$game_path" ]; then
     echo "error: game executable not found: $game_path" >&2
     exit 66
@@ -173,6 +176,9 @@ if [ "${REMU_DEEP_TRACE:-0}" = 1 ]; then
 fi
 if [ "${REMU_HEADLESS_METAL:-0}" != 1 ]; then
     echo "[REMu] launching the interactive REmu.app bundle"
+fi
+if [ "$timeout_seconds" -gt 0 ] 2>/dev/null; then
+    echo "[REMu] automatic shutdown after ${timeout_seconds}s (pass 0 to disable)"
 fi
 if [ -n "${REMU_METAL_COMPILER:-}" ]; then
     echo "[REMu] using offline Metal compiler: $REMU_METAL_COMPILER"

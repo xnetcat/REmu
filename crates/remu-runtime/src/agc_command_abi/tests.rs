@@ -58,6 +58,7 @@ fn returns_exact_fixed_and_variable_packet_sizes_in_bytes() {
 
 #[test]
 fn records_a_branch_target_that_stitches_into_the_next_dcb() {
+    let _tracking = graphics_tracking_test_guard();
     let mut fixture = CommandFixture::new(0);
     let buffer = fixture.address();
     let compare = 0_u64;
@@ -81,6 +82,7 @@ fn records_a_branch_target_that_stitches_into_the_next_dcb() {
 
 #[test]
 fn explicitly_submitted_branch_target_is_not_replayed_before_the_next_dcb() {
+    let _tracking = graphics_tracking_test_guard();
     let mut fixture = CommandFixture::new(0);
     let buffer = fixture.address();
     let compare = 0_u64;
@@ -102,6 +104,7 @@ fn explicitly_submitted_branch_target_is_not_replayed_before_the_next_dcb() {
 
 #[test]
 fn directly_executed_branch_is_not_recovered_again_before_the_next_dcb() {
+    let _tracking = graphics_tracking_test_guard();
     let mut fixture = CommandFixture::new(0);
     let buffer = fixture.address();
     let compare = 0_u64;
@@ -125,6 +128,7 @@ fn directly_executed_branch_is_not_recovered_again_before_the_next_dcb() {
 
 #[test]
 fn recovers_only_a_complete_recorded_pm4_prefix() {
+    let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([
         pm4(3, IT_SET_SH_REG, 0),
         0x0c,
@@ -146,6 +150,7 @@ fn recovers_only_a_complete_recorded_pm4_prefix() {
 
 #[test]
 fn a_recorded_anchor_recovers_neighboring_guest_authored_pm4() {
+    let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([
         pm4(3, IT_SET_SH_REG, 0),
         0x0c,
@@ -165,7 +170,35 @@ fn a_recorded_anchor_recovers_neighboring_guest_authored_pm4() {
 }
 
 #[test]
+fn recycled_command_buffer_generation_cannot_replay_an_older_prefix() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let descriptor = fixture.address();
+    let start = fixture.start();
+    fixture.words[..6].copy_from_slice(&[
+        pm4(3, IT_SET_SH_REG, 0),
+        0x0c,
+        0x1111_1111,
+        pm4(3, IT_SET_SH_REG, 0),
+        0x0d,
+        0x2222_2222,
+    ]);
+
+    track_graphics_command_allocation(descriptor, start, 3, false);
+    // A successful grow callback may recycle the same virtual extent. The new allocation is
+    // newer even though its address follows the previous one numerically.
+    track_graphics_command_allocation(descriptor, start + 12, 3, true);
+
+    assert_eq!(
+        take_recorded_graphics_prefix(start + 24),
+        Some((start + 12, 3)),
+        "a recycled generation must not stitch stale PM4 that precedes its first allocation"
+    );
+}
+
+#[test]
 fn consumed_continuation_target_cannot_be_replayed_as_a_prefix() {
+    let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([
         pm4(3, IT_SET_SH_REG, 0),
         0x0c,
@@ -185,6 +218,7 @@ fn consumed_continuation_target_cannot_be_replayed_as_a_prefix() {
 
 #[test]
 fn submitted_commands_are_not_replayed_before_a_later_tail() {
+    let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([
         pm4(3, IT_SET_SH_REG, 0),
         0x0c,
@@ -206,7 +240,38 @@ fn submitted_commands_are_not_replayed_before_a_later_tail() {
 }
 
 #[test]
+fn a_recorded_prefix_cannot_cross_an_explicit_submission_boundary() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let descriptor = fixture.address();
+    let start = fixture.start();
+    fixture.words[..9].copy_from_slice(&[
+        pm4(3, IT_SET_SH_REG, 0),
+        0x0c,
+        0x1111_1111,
+        pm4(3, IT_SET_SH_REG, 0),
+        0x0d,
+        0x2222_2222,
+        pm4(3, IT_SET_SH_REG, 0),
+        0x0e,
+        0x3333_3333,
+    ]);
+
+    track_graphics_command_allocation(descriptor, start, 3, false);
+    track_graphics_command_allocation(descriptor, start + 12, 3, false);
+    track_graphics_submission(start + 12, 3);
+    track_graphics_command_allocation(descriptor, start + 24, 3, false);
+
+    assert_eq!(
+        take_recorded_graphics_prefix(start + 36),
+        Some((start + 24, 3)),
+        "a stale constructor anchor must not join through already-executed PM4"
+    );
+}
+
+#[test]
 fn async_allocations_are_not_recorded_as_a_graphics_prefix() {
+    let _tracking = graphics_tracking_test_guard();
     let mut fixture = CommandFixture::new(0);
     let descriptor = fixture.address();
     let graphics = call("TRO721eVt4g", args(&[descriptor, 0, 0]), [0; 6]);
@@ -221,6 +286,7 @@ fn async_allocations_are_not_recorded_as_a_graphics_prefix() {
 
 #[test]
 fn a_higher_submission_does_not_discard_a_wrapped_lower_prefix() {
+    let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([
         pm4(3, IT_SET_SH_REG, 0),
         0x0c,

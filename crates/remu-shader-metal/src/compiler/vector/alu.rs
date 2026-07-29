@@ -4,7 +4,7 @@
 //! VOP1/VOP2/VOP3 lowering: the vector ALU opcode dispatch and the scalar
 //! expression each unpacked, converted or arithmetic opcode produces.
 
-use remu_shader::{Instruction, InstructionControl};
+use remu_shader::{Instruction, InstructionControl, OperandKind};
 
 use crate::Compiler;
 use crate::compiler::scalar::destination_scalar;
@@ -50,6 +50,9 @@ impl Compiler<'_> {
                 | "VAddCoCiU32"
         ) {
             return self.emit_vector_carry(instruction, name);
+        }
+        if matches!(name, "VMovreldB32" | "VMovrelsB32" | "VMovrelsdB32") {
+            return self.emit_relative_vector_move(instruction, name);
         }
         if name == "VReadlaneB32" {
             let destination = destination_scalar(instruction)?;
@@ -831,5 +834,73 @@ impl Compiler<'_> {
             };
         self.store_vector(destination, &expression);
         Ok(())
+    }
+
+    fn emit_relative_vector_move(
+        &mut self,
+        instruction: &Instruction,
+        name: &str,
+    ) -> Result<(), String> {
+        let destination = destination_vector(instruction)?;
+        let source = instruction
+            .sources
+            .first()
+            .copied()
+            .ok_or_else(|| "missing relative-move source operand".to_owned())?;
+        let relative_source = matches!(name, "VMovrelsB32" | "VMovrelsdB32");
+        let relative_destination = matches!(name, "VMovreldB32" | "VMovrelsdB32");
+        let value = if relative_source {
+            if source.kind != OperandKind::VectorRegister {
+                return Err(format!(
+                    "{name} requires a vector-register source, found {source}"
+                ));
+            }
+            self.relative_vector_source(source.value)?
+        } else {
+            self.raw_source(instruction, 0)?
+        };
+        if relative_destination {
+            self.store_relative_vector(destination, &value);
+        } else {
+            self.store_vector(destination, &value);
+        }
+        Ok(())
+    }
+
+    fn relative_vector_source(&mut self, base: u32) -> Result<String, String> {
+        if base >= crate::VECTOR_REGISTER_COUNT {
+            return Err(format!(
+                "relative vector source v{base} exceeds the vector register file"
+            ));
+        }
+        // GFX10 returns VGPR0 when M0 selects beyond the stage's allocation. Expanding this into
+        // fixed cases preserves that behavior and lets module scalarization keep independent
+        // register locals instead of materializing a 256-word addressable array per Metal lane.
+        let selected = self.temp("uint", "v[0]");
+        self.line(3, "switch (s[124]) {");
+        for register in base..self.options.allocated_vector_register_count {
+            self.line(
+                4,
+                &format!(
+                    "case {}u: {selected} = v[{register}]; break;",
+                    register - base
+                ),
+            );
+        }
+        self.line(4, "default: break;");
+        self.line(3, "}");
+        Ok(selected)
+    }
+
+    fn store_relative_vector(&mut self, base: u32, value: &str) {
+        for register in base..self.options.allocated_vector_register_count {
+            self.line(
+                3,
+                &format!(
+                    "if (exec && s[124] == {}u) v[{register}] = {value};",
+                    register - base
+                ),
+            );
+        }
     }
 }

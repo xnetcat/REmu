@@ -253,8 +253,14 @@ impl Compiler<'_> {
                 }
             }
             MetalShaderStage::Mesh => {
-                parameters
-                    .push("mesh<RemuVsOut, void, 64, 64, topology::triangle> remu_mesh".to_owned());
+                let primitive_type = if self.options.render_target_array_length > 1 {
+                    "RemuPrimitiveOut"
+                } else {
+                    "void"
+                };
+                parameters.push(format!(
+                    "mesh<RemuVsOut, {primitive_type}, 64, 64, topology::triangle> remu_mesh"
+                ));
                 parameters.push("const device uint* remu_indices [[buffer(29)]]".to_owned());
                 parameters.push("constant uint* remu_draw [[buffer(30)]]".to_owned());
                 parameters
@@ -301,6 +307,11 @@ impl Compiler<'_> {
                 "    threadgroup atomic_uint remu_lds_storage[{}];\n    threadgroup atomic_uint* remu_lds = remu_lds_storage;",
                 self.options.lds_size_bytes / 4
             );
+        }
+        if self.options.stage == MetalShaderStage::Mesh
+            && self.options.render_target_array_length > 1
+        {
+            source.push_str("    threadgroup uint remu_mesh_render_target_indices[64];\n");
         }
         if self.split_wave64() {
             source.push_str(
@@ -417,6 +428,13 @@ impl Compiler<'_> {
                      \x20   remu_mesh.set_index(remu_thread_index * 3u + 1u, 0u);\n\
                      \x20   remu_mesh.set_index(remu_thread_index * 3u + 2u, 0u);\n",
                 );
+                if self.options.render_target_array_length > 1 {
+                    let _ = writeln!(
+                        source,
+                        "    remu_mesh_render_target_indices[remu_thread_index] = min(remu_draw[1], {}u);",
+                        self.options.render_target_array_length - 1
+                    );
+                }
                 if contains_register_reference(&self.body, 's', 3) {
                     source.push_str(
                         "    s[3] = remu_mesh_vertex_count | (remu_mesh_primitive_count << 8u);\n",
@@ -579,6 +597,15 @@ impl Compiler<'_> {
             }
             MetalShaderStage::Compute => {}
             MetalShaderStage::Mesh => {
+                if self.options.render_target_array_length > 1 {
+                    source.push_str(
+                        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+                         \x20   RemuPrimitiveOut remu_primitive_out = {};\n\
+                         \x20   uint remu_primitive_source_vertex = min(remu_thread_index * 3u, 63u);\n\
+                         \x20   remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];\n\
+                         \x20   remu_mesh.set_primitive(remu_thread_index, remu_primitive_out);\n",
+                    );
+                }
                 source.push_str(
                     "    remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
                      \x20   if (remu_thread_index == 0u) remu_mesh.set_primitive_count(64u);\n",

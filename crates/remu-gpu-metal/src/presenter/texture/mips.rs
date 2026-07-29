@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::GuestMipChainLayout;
+use super::super::completion::commit_and_settle;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, ResidentGuestTexture, WriteWatchRefresh,
@@ -11,8 +12,8 @@ use super::{
     snapshot_watched_guest_range, watch_resident_texture,
 };
 use metal::{
-    Device, MTLRegion, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange, Texture,
-    TextureDescriptor,
+    CommandQueue, Device, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
+    MTLTextureUsage, NSRange, Texture, TextureDescriptor,
 };
 use remu_shader::ImageBinding;
 use std::collections::HashMap;
@@ -141,6 +142,119 @@ pub(crate) fn create_mipmapped_guest_texture(
             | MTLTextureUsage::ShaderWrite
             | MTLTextureUsage::PixelFormatView,
     )
+}
+
+pub(crate) fn promote_gpu_written_resident_mip_hierarchy(
+    device: &Device,
+    queue: &CommandQueue,
+    descriptor: DecodedImageDescriptor,
+    resident: ResidentGuestTexture,
+    origin: Mode27WorkOrigin,
+) -> Result<ResidentGuestTexture, String> {
+    let underlying_mip_count = descriptor
+        .base_mip_level
+        .checked_add(descriptor.mip_level_count)
+        .ok_or("storage-image mip range overflows")?;
+    if descriptor.texture_type != 9
+        || descriptor.layer_count != 1
+        || descriptor.guest.tile_mode != 27
+        || underlying_mip_count <= resident.mip_level_count
+        || resident.texture_type != 9
+        || resident.layer_count != 1
+    {
+        return Err(format!(
+            "GPU-written mip promotion requires a larger 2D mode-27 hierarchy, got old={}/{} new={underlying_mip_count} type={}/{} layers={}/{} tile={}",
+            resident.mip_level_count,
+            resident.texture.mipmap_level_count(),
+            resident.texture_type,
+            descriptor.texture_type,
+            resident.layer_count,
+            descriptor.layer_count,
+            descriptor.guest.tile_mode
+        ));
+    }
+
+    let started = Instant::now();
+    let layout = mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
+    let write_watch = watch_resident_texture(
+        descriptor.guest,
+        descriptor.texture_type,
+        descriptor.layer_count,
+        underlying_mip_count,
+    )?;
+    let raw =
+        snapshot_watched_guest_range(descriptor.guest.address, layout.byte_count, &write_watch)?;
+    let (_, linear_levels) =
+        decode_mode27_mip_chain_from_raw(descriptor.guest, underlying_mip_count, &raw)?;
+    let texture = create_mipmapped_guest_texture(
+        device,
+        descriptor.guest,
+        underlying_mip_count,
+        &linear_levels,
+    )?;
+
+    // Guest RAM is stale for levels previously written by Metal. Seed the new hierarchy from RAM
+    // for untouched levels, then copy every GPU-current level from the old resident. Callers flush
+    // ordered guest batches before entering this helper, so the copy observes all prior writes.
+    let command_buffer = queue.new_command_buffer().to_owned();
+    command_buffer.set_label("REMu GPU-written mip hierarchy promotion");
+    let blit = command_buffer.new_blit_command_encoder();
+    blit.set_label("REMu preserve GPU-current mip levels");
+    let preserved_mip_count = resident.mip_level_count.min(underlying_mip_count);
+    for level in 0..preserved_mip_count {
+        let width = u64::from(
+            descriptor
+                .guest
+                .width
+                .checked_shr(level)
+                .unwrap_or(0)
+                .max(1),
+        );
+        let height = u64::from(
+            descriptor
+                .guest
+                .height
+                .checked_shr(level)
+                .unwrap_or(0)
+                .max(1),
+        );
+        blit.copy_from_texture(
+            &resident.texture,
+            0,
+            u64::from(level),
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize::new(width, height, 1),
+            &texture,
+            0,
+            u64::from(level),
+            MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+    }
+    blit.end_encoding();
+    commit_and_settle(&command_buffer, "GPU-written mip hierarchy promotion")?;
+
+    record_mode27_work_detail(
+        origin,
+        descriptor.guest,
+        underlying_mip_count,
+        layout.byte_count,
+        started.elapsed(),
+    );
+    texture.set_label(&format!(
+        "REMu promoted {}-level GPU image {:#x}",
+        underlying_mip_count, descriptor.guest.address
+    ));
+    Ok(ResidentGuestTexture {
+        texture,
+        component_reorder_view: None,
+        descriptor: descriptor.guest,
+        texture_type: descriptor.texture_type,
+        layer_count: descriptor.layer_count,
+        mip_level_count: underlying_mip_count,
+        write_watch,
+        gpu_written: true,
+        content_version: resident.content_version,
+    })
 }
 
 fn create_mipmapped_guest_texture_from_layout(

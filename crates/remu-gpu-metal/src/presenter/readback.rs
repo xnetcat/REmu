@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::completion::{commit_and_settle, settle};
 use super::{
     DecodedRenderTarget, GuestTextureDescriptor, METAL_TEXTURE_BUFFER_ROW_ALIGNMENT,
     MetalPresenter, PendingTextureReadback, ResidentGuestTexture, TextureReadbackLayout,
@@ -8,12 +9,13 @@ use super::{
     diagnostic_dump_target_minimum_draw, diagnostic_scanout_writer,
     encode_mode27_mip_chain_into_raw, guest_texture_descriptors_overlap, half_float_to_srgb_unorm8,
     half_float_to_unorm8, linear_unorm8_to_srgb_unorm8, mode27_mip_chain_layout,
-    snapshot_watched_guest_range, unsigned_float_to_srgb_unorm8, write_watched_guest_range,
+    snapshot_watched_guest_range, texture_element_layout, unsigned_float_to_srgb_unorm8,
+    write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
     write_watched_guest_texture_linear,
 };
 use metal::{
-    Device, MTLBlitOption, MTLCommandBufferStatus, MTLOrigin, MTLPixelFormat, MTLResourceOptions,
-    MTLSize, MTLStorageMode, MTLTextureType, Texture,
+    Device, MTLBlitOption, MTLOrigin, MTLPixelFormat, MTLResourceOptions, MTLSize, MTLStorageMode,
+    MTLTextureType, Texture,
 };
 use remu_gpu::IndexedDraw;
 use std::io::{BufWriter, Write};
@@ -328,13 +330,7 @@ impl PendingTextureReadback {
     }
 
     pub(super) fn finish(self) -> Result<Vec<u8>, String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "Metal texture readback ended in {:?}",
-                self.command_buffer.status()
-            ));
-        }
+        settle(&self.command_buffer, "Metal texture readback")?;
         let packed_row = usize::try_from(self.layout.packed_bytes_per_row)
             .map_err(|_| "Metal texture readback packed row does not fit usize")?;
         let staging_row = usize::try_from(self.layout.staging_bytes_per_row)
@@ -665,12 +661,40 @@ pub(super) fn write_resident_texture_contents_to_guest(
     resident: &ResidentGuestTexture,
 ) -> Result<(), String> {
     if resident.mip_level_count == 1 {
-        let linear = read_texture_linear(device, queue, &resident.texture, resident.descriptor)?;
-        return write_watched_guest_texture_linear(
-            resident.descriptor,
-            &linear,
-            &resident.write_watch,
-        );
+        match resident.texture.texture_type() {
+            MTLTextureType::D2 => {
+                let linear =
+                    read_texture_linear(device, queue, &resident.texture, resident.descriptor)?;
+                return write_watched_guest_texture_linear(
+                    resident.descriptor,
+                    &linear,
+                    &resident.write_watch,
+                );
+            }
+            MTLTextureType::D2Array => {
+                let linear = read_texture_array_linear(
+                    device,
+                    queue,
+                    &resident.texture,
+                    resident.descriptor,
+                )?;
+                return write_layered_resident_texture_contents_to_guest(resident, &linear);
+            }
+            MTLTextureType::D3 => {
+                let linear = read_texture_volume_linear(
+                    device,
+                    queue,
+                    &resident.texture,
+                    resident.descriptor,
+                )?;
+                return write_layered_resident_texture_contents_to_guest(resident, &linear);
+            }
+            texture_type => {
+                return Err(format!(
+                    "resident texture writeback does not support Metal type {texture_type:?}"
+                ));
+            }
+        }
     }
     if resident.texture_type != 9 || resident.layer_count != 1 {
         return Err(format!(
@@ -695,6 +719,52 @@ pub(super) fn write_resident_texture_contents_to_guest(
         )?);
     }
     encode_mode27_mip_chain_into_raw(&layout, &levels, &mut raw)?;
+    write_watched_guest_range(resident.descriptor.address, &raw, &resident.write_watch)
+}
+
+fn write_layered_resident_texture_contents_to_guest(
+    resident: &ResidentGuestTexture,
+    linear: &[u8],
+) -> Result<(), String> {
+    let face_raw_bytes = usize::try_from(
+        super::guest_texture_byte_count(resident.descriptor)
+            .ok_or("layered guest texture face byte count overflows")?,
+    )
+    .map_err(|_| "layered guest texture face byte count does not fit usize")?;
+    let (width, height, _, bytes_per_element) = texture_element_layout(resident.descriptor)?;
+    let face_linear_bytes = width
+        .checked_mul(height)
+        .and_then(|elements| elements.checked_mul(bytes_per_element))
+        .ok_or("layered guest texture linear face size overflows")?;
+    let layer_count = usize::try_from(resident.layer_count)
+        .map_err(|_| "layered guest texture layer count does not fit usize")?;
+    let expected_linear_bytes = face_linear_bytes
+        .checked_mul(layer_count)
+        .ok_or("layered guest texture linear size overflows")?;
+    if linear.len() != expected_linear_bytes {
+        return Err(format!(
+            "layered guest texture readback has {} bytes, expected {expected_linear_bytes}",
+            linear.len()
+        ));
+    }
+    let raw_bytes = face_raw_bytes
+        .checked_mul(layer_count)
+        .ok_or("layered guest texture raw size overflows")?;
+    let mut raw = snapshot_watched_guest_range(
+        resident.descriptor.address,
+        raw_bytes,
+        &resident.write_watch,
+    )?;
+    for layer in 0..layer_count {
+        let linear_start = layer * face_linear_bytes;
+        let raw_start = layer * face_raw_bytes;
+        write_guest_texture_linear_into_raw_at_z(
+            resident.descriptor,
+            &linear[linear_start..linear_start + face_linear_bytes],
+            &mut raw[raw_start..raw_start + face_raw_bytes],
+            layer,
+        )?;
+    }
     write_watched_guest_range(resident.descriptor.address, &raw, &resident.write_watch)
 }
 
@@ -778,14 +848,7 @@ pub(super) fn read_texture_volume_linear(
         MTLBlitOption::None,
     );
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-    if command_buffer.status() != MTLCommandBufferStatus::Completed {
-        return Err(format!(
-            "Metal volume readback ended in {:?}",
-            command_buffer.status()
-        ));
-    }
+    commit_and_settle(&command_buffer, "Metal volume readback")?;
     let packed_row = usize::try_from(layout.packed_bytes_per_row)
         .map_err(|_| "Metal volume packed row does not fit usize")?;
     let staging_row = usize::try_from(layout.staging_bytes_per_row)

@@ -3,8 +3,8 @@
 
 use metal::{
     CompileOptions, Device, MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLCullMode,
-    MTLPixelFormat, MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLTriangleFillMode, MTLWinding,
-    RenderPipelineDescriptor,
+    MTLPixelFormat, MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLTextureType,
+    MTLTriangleFillMode, MTLWinding, RenderPipelineDescriptor,
 };
 use remu_gpu::GpuRegister;
 use remu_shader::PixelOutputKind;
@@ -25,7 +25,8 @@ use super::{
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
     metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, read_draw_indices,
-    read_texture_linear, rearm_depth_metadata_clear, render_target_fast_clear_color,
+    read_texture_array_linear, read_texture_linear, rearm_depth_metadata_clear,
+    render_target_fast_clear_color,
 };
 
 #[test]
@@ -262,6 +263,7 @@ fn depth_target_view_selects_the_backing_array_slice() {
         .expect("enabled depth target");
     let slice_bytes = 2 * 1_024 * 1_024;
     assert_eq!(depth.texture.address, address + 3 * slice_bytes);
+    assert_eq!(depth.layer_count, 1);
     assert_eq!(guest_texture_byte_count(depth.texture), Some(slice_bytes));
 
     draw.context_registers
@@ -269,8 +271,12 @@ fn depth_target_view_selects_the_backing_array_slice() {
         .find(|register| register.offset == DB_DEPTH_VIEW)
         .expect("depth view")
         .value = 2 | (4 << 13);
-    let error = decode_depth_target(&draw).expect_err("multi-slice view is unsupported");
-    assert!(error.contains("slice range 2..=4"), "{error}");
+    let depth = decode_depth_target(&draw)
+        .expect("multi-slice depth views are supported")
+        .expect("enabled layered depth target");
+    assert_eq!(depth.texture.address, address + 2 * slice_bytes);
+    assert_eq!(depth.layer_count, 3);
+    assert_eq!(guest_texture_byte_count(depth.texture), Some(slice_bytes));
 }
 
 #[test]
@@ -508,6 +514,7 @@ fn promotes_small_depth_target_to_the_color_framebuffer_extent() {
     };
     let depth = DecodedDepthTarget {
         texture: descriptor,
+        layer_count: 1,
         htile_address: None,
         compare: MTLCompareFunction::Less,
         test_enabled: true,
@@ -541,6 +548,81 @@ fn promotes_small_depth_target_to_the_color_framebuffer_extent() {
     };
     assert_eq!(sample(0, 0), 0.0);
     assert_eq!(sample(100, 50), 1.0);
+}
+
+#[test]
+fn promotes_layered_depth_target_without_collapsing_its_slices() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let allocation_size = 8 * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            allocation_size,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest layered depth mapping");
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::Depth32Float,
+        bytes_per_pixel: 4,
+    };
+    let depth = DecodedDepthTarget {
+        texture: descriptor,
+        layer_count: 3,
+        htile_address: None,
+        compare: MTLCompareFunction::Less,
+        test_enabled: true,
+        write_enabled: false,
+        clear_enabled: false,
+        clear_depth: 1.0,
+        sample_count: 1,
+    };
+
+    let promoted = presenter
+        .ensure_depth_render_target_texture(&device, depth, 128, 96)
+        .expect("promote layered depth target");
+    assert_eq!(promoted.texture_type(), MTLTextureType::D2Array);
+    assert_eq!(promoted.array_length(), 3);
+    assert_eq!((promoted.width(), promoted.height()), (128, 96));
+
+    let promoted_descriptor = GuestTextureDescriptor {
+        width: 128,
+        height: 96,
+        pitch: 128,
+        ..descriptor
+    };
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let bytes = read_texture_array_linear(&device, &queue, &promoted, promoted_descriptor)
+        .expect("read promoted layered depth target");
+    let face_bytes = 128 * 96 * 4;
+    for layer in 0..3 {
+        let sample = |x: usize, y: usize| {
+            let offset = layer * face_bytes + (y * 128 + x) * 4;
+            f32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("depth sample"))
+        };
+        assert_eq!(sample(0, 0), 0.0);
+        assert_eq!(sample(100, 50), 1.0);
+    }
 }
 
 #[test]

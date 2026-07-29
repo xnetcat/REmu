@@ -13,7 +13,7 @@ use super::{
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, UploadedImageTexture, WriteWatchRefresh,
-    canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled,
+    canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled_at_z,
     copy_tiled_to_linear_at_z, decode_image_descriptor, decode_mode5_mip_chain_from_raw,
     decode_mode27_mip_chain_from_raw, fallback_image_descriptor, guest_frame_fingerprint,
     guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
@@ -42,7 +42,7 @@ pub(crate) use self::depth_array::{depth_array_face_descriptor, depth_array_face
 pub(crate) use self::mips::{
     create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
     create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
-    storage_image_requires_mip_hierarchy,
+    promote_gpu_written_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::residency::{create_guest_texture, ensure_resident_texture_in_map};
 pub(crate) use self::retire::{
@@ -146,6 +146,15 @@ pub(super) fn write_guest_texture_linear_into_raw(
     linear: &[u8],
     destination: &mut [u8],
 ) -> Result<(), String> {
+    write_guest_texture_linear_into_raw_at_z(descriptor, linear, destination, 0)
+}
+
+pub(super) fn write_guest_texture_linear_into_raw_at_z(
+    descriptor: GuestTextureDescriptor,
+    linear: &[u8],
+    destination: &mut [u8],
+    surface_z: usize,
+) -> Result<(), String> {
     let (width, height, pitch, bytes_per_element) = texture_element_layout(descriptor)?;
     if descriptor.tile_mode == 0 {
         let destination_row_bytes = pitch
@@ -167,7 +176,7 @@ pub(super) fn write_guest_texture_linear_into_raw(
                 .copy_from_slice(&linear[source_offset..source_offset + source_row_bytes]);
         }
     } else {
-        copy_linear_to_tiled(linear, descriptor, destination)?;
+        copy_linear_to_tiled_at_z(linear, descriptor, destination, surface_z)?;
     }
     Ok(())
 }

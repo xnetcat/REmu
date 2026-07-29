@@ -18,7 +18,7 @@ use super::{
     VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, WriteWatchRefresh,
     apply_image_destination_select, apply_pending_guest_memory_writes, canonical_sampler_bindings,
     canonical_texture_bindings, common_render_target_array_length, comparison_depth32_upload,
-    consume_depth_metadata_clear, copy_linear_to_tiled, create_exact_mode27_sampled_mip_view,
+    consume_depth_metadata_clear, copy_linear_to_tiled_at_z, create_exact_mode27_sampled_mip_view,
     create_sampled_guest_texture, decode_color_eliminate_fast_clear_target,
     decode_color_operation_mode, decode_color_resolve_targets, decode_depth_target,
     decode_fast_clear_color, decode_image_descriptor, decode_metal_blend_attachment,
@@ -58,6 +58,7 @@ use super::{
     wave64_split_blockers, write_back_pending_globals, write_guest_texture_linear,
     write_watched_guest_texture_linear,
 };
+mod completion;
 mod decode;
 mod present;
 mod readback;

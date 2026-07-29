@@ -105,10 +105,11 @@ pub(super) fn copy_tiled_to_linear_at_z(
     Ok(())
 }
 
-pub(super) fn copy_linear_to_tiled(
+pub(super) fn copy_linear_to_tiled_at_z(
     source: &[u8],
     descriptor: GuestTextureDescriptor,
     destination: &mut [u8],
+    surface_z: usize,
 ) -> Result<(), String> {
     let (width, height, pitch, bytes_per_element) = texture_element_layout(descriptor)?;
     let block_bytes = tiled_block_bytes(descriptor.tile_mode)
@@ -152,8 +153,13 @@ pub(super) fn copy_linear_to_tiled(
                 let offset_row = local_y * block_width;
                 for local_x in 0..columns {
                     let source_offset = source_row + local_x * bytes_per_element;
-                    let destination_offset =
-                        block_base + usize::from(offsets[offset_row + local_x]);
+                    let within_block = usize::from(offsets[offset_row + local_x])
+                        ^ if descriptor.tile_mode == 27 {
+                            mode27_surface_z_xor(surface_z)
+                        } else {
+                            0
+                        };
+                    let destination_offset = block_base + within_block;
                     destination[destination_offset..destination_offset + bytes_per_element]
                         .copy_from_slice(&source[source_offset..source_offset + bytes_per_element]);
                 }

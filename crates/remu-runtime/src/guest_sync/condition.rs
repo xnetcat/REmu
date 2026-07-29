@@ -92,8 +92,8 @@ where
     };
     if trace_guest_sync() && trace_logarithmic_sequence(waiter, 8) {
         eprintln!(
-            "[REMu][COND] wait ticket={waiter} thread={} condition={condition:#x} mutex={mutex_address:#x} recursion={released_recursion}",
-            current_guest_thread_handle()
+            "[REMu][COND] wait ticket={waiter} thread={} condition={condition:#x} mutex={mutex_address:#x} recursion={released_recursion} timeout_usec={timeout_usec:?}",
+            current_guest_thread_handle(),
         );
     }
     mutex.owner = None;
@@ -209,6 +209,17 @@ where
             !state.condition_waiter_released(waiter) && guest_exception_is_pending(guest_thread);
         (false, interrupted)
     };
+    if timed_out && trace_guest_sync() {
+        let timeouts = state
+            .conditions
+            .get(&condition)
+            .map_or(0, |guest_condition| guest_condition.timeouts);
+        if trace_logarithmic_sequence(timeouts, 8) {
+            eprintln!(
+                "[REMu][COND] timeout sequence={timeouts} thread={guest_thread:#x} condition={condition:#x} mutex={mutex_address:#x} requested_usec={timeout_usec:?}"
+            );
+        }
+    }
     state.finish_condition_wait(
         condition,
         waiter,

@@ -560,6 +560,7 @@ fn cond_exec_skips_exactly_its_zero_guarded_dword_range() {
 
 #[test]
 fn native_gen5_branch_executes_only_the_selected_indirect_buffer() {
+    let _tracking = crate::agc_command_abi::graphics_tracking_test_guard();
     let comparison_value = 5_u64;
     let comparison_address = std::ptr::from_ref(&comparison_value).addr() as u64;
     let then_commands = [agc_pm4(3, crate::AGC_IT_SET_SH_REG, 0), 0x00c, 0x1111_1111];

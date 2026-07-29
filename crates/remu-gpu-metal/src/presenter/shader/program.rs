@@ -9,6 +9,27 @@ use remu_gpu::{ComputeDispatch, GpuRegister, IndexedDraw};
 use remu_shader::{InstructionControl, Program, ShaderEvaluation, image_is_comparison};
 use std::sync::{Arc, OnceLock};
 
+pub(crate) fn graphics_allocated_vector_register_count(
+    shader_registers: &[GpuRegister],
+    user_data_register: u32,
+) -> u32 {
+    register_value(shader_registers, user_data_register.saturating_sub(2)).map_or(
+        256,
+        |resource1| {
+            // GFX10 graphics PGM_RSRC1.VGPRS is a zero-based count of four-register blocks.
+            ((resource1 & 0x3f) + 1) * 4
+        },
+    )
+}
+
+pub(crate) fn compute_allocated_vector_register_count(shader_registers: &[GpuRegister]) -> u32 {
+    register_value(shader_registers, 0x212).map_or(256, |resource1| {
+        // The Gen5 compute state consumed by shadPS4 stores the block count directly. Preserve at
+        // least one four-register block so relative-source overflow can still return VGPR0.
+        (resource1 & 0x3f).max(1) * 4
+    })
+}
+
 pub(crate) fn compute_pipeline_key(
     dispatch: &ComputeDispatch,
     evaluation: &ShaderEvaluation,
@@ -21,6 +42,9 @@ pub(crate) fn compute_pipeline_key(
         program_identity: ProgramIdentity(Arc::clone(program)),
         lds_size_bytes: dispatch.launch.lds_size_bytes,
         wave_lane_count: dispatch.launch.wave_lane_count,
+        allocated_vector_register_count: compute_allocated_vector_register_count(
+            &dispatch.shader_registers,
+        ),
         compute_system_registers: evaluation.compute_system_registers,
         initial_scalar_count: evaluation.initial_scalar_registers.len(),
         global_bindings: evaluation

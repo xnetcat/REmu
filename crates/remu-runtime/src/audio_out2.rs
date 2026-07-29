@@ -15,9 +15,9 @@ use crate::{
     guest_output_pointer, process_guest_range_has_read_access, process_guest_range_is_readable,
     read_audio_out2_context_param, read_audio_out2_port_param, read_guest_bytes, read_guest_u32,
     read_guest_u64, sce_kernel_error, trace_audio_out2_context_memory,
-    trace_audio_out2_mastering_memory, trace_audio_out2_memory, trace_logarithmic_sequence,
-    write_audio_out2_context_param, write_audio_out2_port_state, write_guest_u16, write_guest_u32,
-    write_guest_u64,
+    trace_audio_out2_mastering_memory, trace_audio_out2_memory, trace_audio_out2_pcm,
+    trace_logarithmic_sequence, write_audio_out2_context_param, write_audio_out2_port_state,
+    write_guest_u16, write_guest_u32, write_guest_u64,
 };
 
 /// Validates an audio-output argument that REmu treats as a writable guest pointer.
@@ -618,9 +618,6 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                 };
                 audio_out2_update_context_queue(context, now);
                 if context.queued < context.queue_depth {
-                    if context.queued == 0 {
-                        context.last_queue_update = now;
-                    }
                     context.queued += 1;
                     break;
                 }
@@ -670,14 +667,25 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                     *port_handle,
                     port.backend_handle
                         .expect("the buffer filter selects only audible backend ports"),
+                    port.buffer_address,
+                    port.channel_count,
                     snapshot,
                 ));
+            }
+            let audible_push = if buffers.is_empty() {
+                0
+            } else {
+                state.audible_context_pushes = state.audible_context_pushes.saturating_add(1);
+                state.audible_context_pushes
+            };
+            for (port, _, address, channels, snapshot) in &buffers {
+                trace_audio_out2_pcm(push, audible_push, *port, *address, *channels, snapshot);
             }
             #[cfg(test)]
             state.submitted_pcm.extend(
                 buffers
                     .iter()
-                    .map(|(port, _, snapshot)| (*port, snapshot.clone())),
+                    .map(|(port, _, _, _, snapshot)| (*port, snapshot.clone())),
             );
             let context_memory_trace = (trace_audio_out2_memory()
                 && trace_logarithmic_sequence(push, 8))
@@ -714,10 +722,15 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                 .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (_, handle, buffer) in buffers {
+            for (_, handle, _, _, buffer) in buffers {
                 match audio.output([handle, buffer.as_ptr() as u64, 0, 0, 0, 0]) {
                     Ok(_) => {}
-                    Err(error) => return audio_out_error(error),
+                    Err(error) => {
+                        eprintln!(
+                            "[REMu][AUDIO2] context push={push} backend={handle} failed: {error:?}"
+                        );
+                        return audio_out_error(error);
+                    }
                 }
             }
             drop(audio);

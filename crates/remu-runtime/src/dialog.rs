@@ -111,3 +111,14 @@ pub(crate) fn save_data_dialog_initialize(state: &mut ProbeDispatchState) -> u64
     state.services.common_dialog_owner = Some(CommonDialogOwner::SaveData);
     0
 }
+
+pub(crate) fn save_data_dialog_terminate(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.save_data_dialog_status == COMMON_DIALOG_STATUS_NONE.cast_signed() {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    state.services.save_data_dialog_status = COMMON_DIALOG_STATUS_NONE.cast_signed();
+    if state.services.common_dialog_owner == Some(CommonDialogOwner::SaveData) {
+        state.services.common_dialog_owner = None;
+    }
+    0
+}

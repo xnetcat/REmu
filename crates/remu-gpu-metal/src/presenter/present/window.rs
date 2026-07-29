@@ -148,10 +148,28 @@ impl MetalPresenter {
         };
         let resident =
             resident_mib.map_or_else(|| "RSS ?".to_owned(), |mib| format!("RSS {mib} MiB"));
+        let sampled_texture_cache_bytes = self
+            .sampled_texture_cache
+            .values()
+            .fold(0_u64, |total, cached| {
+                total.saturating_add(cached.write_watch.range().1)
+            });
+        let sampled_texture_cache_mib = sampled_texture_cache_bytes.div_ceil(1024 * 1024);
+        let (metal_allocated_mib, metal_recommended_mib) =
+            self.device.as_ref().map_or((0, 0), |device| {
+                (
+                    u64::try_from(device.current_allocated_size())
+                        .unwrap_or(u64::MAX)
+                        .div_ceil(1024 * 1024),
+                    device
+                        .recommended_max_working_set_size()
+                        .div_ceil(1024 * 1024),
+                )
+            });
         let pending_gpu_events = remu_gpu::gpu_work_items_pending();
         let pending_flips = remu_gpu::gpu_flips_pending();
         let title = format!(
-            "REMu | FPS {flip_rate:.1} ({frame_milliseconds:.1} ms) | Present {present_rate:.1}/s | GPU {gpu_utilization:.0}% Lat {presentation_latency_milliseconds:.1} ms | {resident} | Draw {draw_rate:.0}/s RP {render_pass_rate:.0}/s CS {compute_rate:.0}/s | CB {guest_batch_rate:.0}/s PB {pipeline_barrier_rate:.0}/s ({}) | Q W{} P{} F{} | Tex {} | Pipe {}/{} | Audio {audio_output_rate:.0}/s U {audio_underrun_percent:.1}%",
+            "REMu | FPS {flip_rate:.1} ({frame_milliseconds:.1} ms) | Present {present_rate:.1}/s | GPU {gpu_utilization:.0}% Lat {presentation_latency_milliseconds:.1} ms | {resident} MTL {metal_allocated_mib}/{metal_recommended_mib} MiB | Draw {draw_rate:.0}/s RP {render_pass_rate:.0}/s CS {compute_rate:.0}/s | CB {guest_batch_rate:.0}/s PB {pipeline_barrier_rate:.0}/s ({}) | Q W{} P{} F{} | Tex {}/{sampled_texture_cache_mib} MiB | Pipe {}/{} | Audio {audio_output_rate:.0}/s U {audio_underrun_percent:.1}%",
             self.committed_guest_batches.len(),
             pending_gpu_events,
             self.pending_presentations.len(),
@@ -255,8 +273,11 @@ impl MetalPresenter {
             let alias_writeback_nanoseconds =
                 SAMPLED_ALIAS_WRITEBACK_NANOSECONDS.swap(0, Ordering::Relaxed);
             eprintln!(
-                "[REMu][PERF-TEXTURE-CACHE] resident={} watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms",
+                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms",
                 self.sampled_texture_cache.len(),
+                sampled_texture_cache_mib,
+                metal_allocated_mib,
+                metal_recommended_mib,
                 self.sampled_texture_write_watches.len(),
                 cache_hits,
                 cache_misses,
@@ -268,6 +289,13 @@ impl MetalPresenter {
                 alias_writeback_count,
                 alias_writeback_bytes as f64 / (1024.0 * 1024.0),
                 alias_writeback_nanoseconds as f64 / 1_000_000.0,
+            );
+            eprintln!(
+                "[REMu][PERF-GLOBAL-CACHE] captured={}/{:.1}MiB identity={}/{:.1}MiB",
+                self.global_buffer_cache.len(),
+                self.global_buffer_cache_bytes as f64 / (1024.0 * 1024.0),
+                self.guest_global_buffer_cache.len(),
+                self.guest_global_buffer_cache_bytes as f64 / (1024.0 * 1024.0),
             );
             let snapshot_details = take_texture_snapshot_work_details();
             if !snapshot_details.is_empty() {

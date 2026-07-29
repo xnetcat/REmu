@@ -45,9 +45,9 @@ use super::{
     record_diagnostic_texture_writer, register_value, render_target_fast_clear_color,
     resident_color_view_sample_is_eligible, sampled_image_bindings,
     shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
-    snapshot_guest_texture_raw, trace_image_descriptors, trace_msaa_writes, trace_scanout_writes,
-    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
-    video_target_binding_summary, wave64_split_blockers,
+    snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy, trace_image_descriptors,
+    trace_msaa_writes, trace_scanout_writes, trace_target_sampling, upload_image_textures,
+    validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
 };
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
@@ -503,7 +503,11 @@ impl MetalPresenter {
                     ));
                 }
                 if descriptor.texture_type == 9 {
-                    self.ensure_resident_texture(&device, descriptor.guest)?;
+                    if storage_image_requires_mip_hierarchy(binding, descriptor) {
+                        self.ensure_mipmapped_storage_texture(&device, descriptor)?;
+                    } else {
+                        self.ensure_resident_texture(&device, descriptor.guest)?;
+                    }
                 }
             }
         }
@@ -920,6 +924,7 @@ impl MetalPresenter {
                 (
                     depth.texture,
                     depth.sample_count,
+                    depth.layer_count,
                     depth_clear_value.map(|value| (value as f32).to_bits()),
                     depth_metadata_clear_sequence,
                 )
@@ -972,6 +977,12 @@ impl MetalPresenter {
                     .depth_attachment()
                     .ok_or("Metal render pass has no depth attachment")?;
                 attachment.set_texture(Some(texture));
+                if depth.is_some_and(|depth| depth.layer_count > 1) {
+                    // `depth.texture.address` already points at DB_DEPTH_VIEW's first selected
+                    // slice, so the Metal view begins at slice zero and the render-pass array
+                    // length fans the draw out over the remaining selected slices.
+                    attachment.set_slice(0);
+                }
                 if let Some(clear_depth) = depth_clear_value {
                     attachment.set_load_action(MTLLoadAction::Clear);
                     attachment.set_clear_depth(clear_depth);

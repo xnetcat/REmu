@@ -1,6 +1,9 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::completion::{
+    COMMAND_BUFFER_SETTLE_TIMEOUT, settle_timeout_message, wait_until_settled_within,
+};
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter,
@@ -11,7 +14,14 @@ use metal::foreign_types::ForeignType;
 use metal::{Buffer, CommandBuffer, Device, MTLCommandBufferStatus, MTLResourceOptions};
 use objc::{msg_send, sel, sel_impl};
 use remu_shader::ShaderEvaluation;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, PartialEq, Eq)]
+enum GuestBatchSettlement {
+    Completed,
+    Failed(String),
+    Pending(String),
+}
 
 impl MetalPresenter {
     pub(crate) fn ensure_open_guest_batch(&mut self, queue: &metal::CommandQueue) {
@@ -155,20 +165,29 @@ impl MetalPresenter {
         self.statistics.submitted_guest_batches =
             self.statistics.submitted_guest_batches.saturating_add(1);
         if wait {
-            batch.command_buffer.wait_until_completed();
-            let execution_error =
-                (batch.command_buffer.status() != MTLCommandBufferStatus::Completed).then(|| {
-                    format!(
-                        "Metal guest command batch [{}] ended in {:?}",
-                        describe_guest_batch(&batch.work),
-                        batch.command_buffer.status()
-                    )
-                });
-            let result = self.finish_terminal_guest_batch(&batch, execution_error);
-            self.statistics.gpu_execution_time +=
-                completed_command_buffer_gpu_duration(&batch.command_buffer);
-            publish_guest_batch_completion(&batch);
-            result?;
+            match settle_guest_batch_by(&batch, Instant::now() + COMMAND_BUFFER_SETTLE_TIMEOUT) {
+                GuestBatchSettlement::Completed => {
+                    let result = self.finish_terminal_guest_batch(&batch, None);
+                    self.statistics.gpu_execution_time +=
+                        completed_command_buffer_gpu_duration(&batch.command_buffer);
+                    publish_guest_batch_completion(&batch);
+                    result?;
+                }
+                GuestBatchSettlement::Failed(error) => {
+                    let result = self.finish_terminal_guest_batch(&batch, Some(error));
+                    self.statistics.gpu_execution_time +=
+                        completed_command_buffer_gpu_duration(&batch.command_buffer);
+                    publish_guest_batch_completion(&batch);
+                    result?;
+                }
+                GuestBatchSettlement::Pending(error) => {
+                    // A timeout is an observation about the host wait, not a terminal Metal
+                    // status. Keep the command buffer and every resource/completion effect alive;
+                    // the normal retirement path will finish it once the driver does.
+                    self.committed_guest_batches.push_back(batch);
+                    return Err(error);
+                }
+            }
         } else {
             self.committed_guest_batches.push_back(batch);
         }
@@ -176,18 +195,34 @@ impl MetalPresenter {
     }
 
     pub(crate) fn wait_for_guest_command_batches(&mut self) -> Result<(), String> {
+        self.wait_for_guest_command_batches_within(COMMAND_BUFFER_SETTLE_TIMEOUT)
+    }
+
+    pub(crate) fn wait_for_guest_command_batches_within(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), String> {
         self.flush_guest_command_batch(false, GuestBatchFlushReason::CpuSynchronization)?;
         let mut result = Ok(());
+        // One budget covers the whole drain. Charging every queued batch its own timeout would sum
+        // to far past the host watchdog window this bound exists to stay inside, and a device that
+        // stalled on the first batch will not retire the rest either.
+        let deadline = Instant::now() + timeout;
         while let Some(batch) = self.committed_guest_batches.pop_front() {
-            batch.command_buffer.wait_until_completed();
-            let execution_error =
-                (batch.command_buffer.status() != MTLCommandBufferStatus::Completed).then(|| {
-                    format!(
-                        "Metal guest command batch [{}] ended in {:?}",
-                        describe_guest_batch(&batch.work),
-                        batch.command_buffer.status()
-                    )
-                });
+            let execution_error = match settle_guest_batch_by(&batch, deadline) {
+                GuestBatchSettlement::Completed => None,
+                GuestBatchSettlement::Failed(error) => Some(error),
+                GuestBatchSettlement::Pending(error) => {
+                    // Preserve ordering: later buffers from the same queue cannot complete before
+                    // this one, and none of their CPU-side completion effects may overtake it.
+                    self.committed_guest_batches.push_front(batch);
+                    return merge_guest_batch_result(
+                        result,
+                        "pending ordered guest batch",
+                        Err(error),
+                    );
+                }
+            };
             let batch_result = self.finish_terminal_guest_batch(&batch, execution_error);
             self.statistics.gpu_execution_time +=
                 completed_command_buffer_gpu_duration(&batch.command_buffer);
@@ -199,6 +234,31 @@ impl MetalPresenter {
             result = merge_guest_batch_result(result, "later ordered guest batch", batch_result);
         }
         result
+    }
+}
+
+/// Waits for one committed guest batch until `deadline` and describes why it failed, when it did.
+///
+/// A batch that outlives the budget is worded differently from a driver-reported failure: its work
+/// is still outstanding, so callers must retain it rather than treat it as having run.
+fn settle_guest_batch_by(batch: &GuestCommandBatch, deadline: Instant) -> GuestBatchSettlement {
+    let budget = deadline.saturating_duration_since(Instant::now());
+    let settled = wait_until_settled_within(&batch.command_buffer, budget);
+    let operation = format!(
+        "Metal guest command batch [{}]",
+        describe_guest_batch(&batch.work)
+    );
+    if !settled {
+        return GuestBatchSettlement::Pending(settle_timeout_message(
+            &operation,
+            &batch.command_buffer,
+        ));
+    }
+    let status = batch.command_buffer.status();
+    if status == MTLCommandBufferStatus::Completed {
+        GuestBatchSettlement::Completed
+    } else {
+        GuestBatchSettlement::Failed(format!("{operation} ended in {status:?}"))
     }
 }
 

@@ -196,8 +196,31 @@ fn save_data_dialog_initialization_requires_and_owns_common_dialog_state() {
         "save-data dialog must own the shared common-dialog service"
     );
     assert_eq!(
+        dispatch_probe_import("YuH2FA7azqQ", [0; 6], [0; 6], &mut state),
+        0
+    );
+    assert_eq!(
+        dispatch_probe_import("ERKzksauAJA", [0; 6], [0; 6], &mut state),
+        0,
+        "terminating the save-data dialog resets its lifecycle"
+    );
+    assert_eq!(
+        dispatch_probe_import("lDqxaY1UbEo", [0; 6], [0; 6], &mut state),
+        0,
+        "terminating the save-data dialog must release common-dialog ownership"
+    );
+    assert_eq!(
+        dispatch_probe_import("YuH2FA7azqQ", [0; 6], [0; 6], &mut state),
+        sce_kernel_error(0x8002_0001),
+        "terminating an inactive save-data dialog is rejected"
+    );
+    assert_eq!(
         crate::known_nid_name("s9e3+YpRnzw"),
         Some("sceSaveDataDialogInitialize")
+    );
+    assert_eq!(
+        crate::known_nid_name("YuH2FA7azqQ"),
+        Some("sceSaveDataDialogTerminate")
     );
     assert!(state.unimplemented_nids.is_empty());
 

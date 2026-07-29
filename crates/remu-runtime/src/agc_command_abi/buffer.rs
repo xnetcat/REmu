@@ -1,12 +1,18 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::{collections::BTreeSet, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use super::{
-    COMMAND_BUFFER_CALLBACK_OFFSET, COMMAND_BUFFER_CURSOR_DOWN_OFFSET,
-    COMMAND_BUFFER_CURSOR_UP_OFFSET, COMMAND_BUFFER_RESERVED_DWORDS_OFFSET,
-    COMMAND_BUFFER_USER_DATA_OFFSET, GrowCallback,
+    COMMAND_BUFFER_BASE_DOWN_OFFSET, COMMAND_BUFFER_BASE_UP_OFFSET, COMMAND_BUFFER_CALLBACK_OFFSET,
+    COMMAND_BUFFER_CURSOR_DOWN_OFFSET, COMMAND_BUFFER_CURSOR_UP_OFFSET,
+    COMMAND_BUFFER_RESERVED_DWORDS_OFFSET, COMMAND_BUFFER_USER_DATA_OFFSET, GrowCallback,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,7 +24,37 @@ pub(super) struct PendingGraphicsContinuation {
     else_end: u64,
 }
 
-pub(super) static RECENT_COMMAND_ALLOCATIONS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecentGraphicsAllocation {
+    descriptor: u64,
+    generation: u64,
+    buffer_start: u64,
+    buffer_end: u64,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphicsCommandBufferGeneration {
+    generation: u64,
+    buffer_start: u64,
+    buffer_end: u64,
+    last_allocation_end: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SubmittedGraphicsRange {
+    start: u64,
+    end: u64,
+}
+
+static NEXT_GRAPHICS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static GRAPHICS_COMMAND_BUFFER_GENERATIONS: Mutex<BTreeMap<u64, GraphicsCommandBufferGeneration>> =
+    Mutex::new(BTreeMap::new());
+static RECENT_COMMAND_ALLOCATIONS: Mutex<Vec<RecentGraphicsAllocation>> = Mutex::new(Vec::new());
+static RECENT_GRAPHICS_SUBMISSIONS: Mutex<Vec<SubmittedGraphicsRange>> = Mutex::new(Vec::new());
+#[cfg(test)]
+static GRAPHICS_TRACKING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 pub(super) static PENDING_GRAPHICS_CONTINUATIONS: Mutex<Vec<PendingGraphicsContinuation>> =
     Mutex::new(Vec::new());
@@ -33,6 +69,40 @@ pub(super) static CONSUMED_GRAPHICS_CONTINUATIONS: Mutex<Vec<u64>> = Mutex::new(
 /// the same backing ring is reconstructed as a post-submit graphics tail and then executed again
 /// through the compute submission.
 pub(super) static ASYNC_COMMAND_BUFFERS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+
+#[cfg(test)]
+pub(crate) fn graphics_tracking_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = GRAPHICS_TRACKING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    NEXT_GRAPHICS_GENERATION.store(0, Ordering::Relaxed);
+    GRAPHICS_COMMAND_BUFFER_GENERATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    RECENT_GRAPHICS_SUBMISSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    PENDING_GRAPHICS_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    CONSUMED_GRAPHICS_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    ASYNC_COMMAND_BUFFERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    guard
+}
+
 pub(super) fn mark_async_command_buffer(command_buffer: u64) {
     if command_buffer != 0 {
         ASYNC_COMMAND_BUFFERS
@@ -145,6 +215,7 @@ pub(super) fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u
     let mut cursor_up = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET);
     let mut cursor_down = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
     let reserved = read_u32(command_buffer + COMMAND_BUFFER_RESERVED_DWORDS_OFFSET);
+    let mut grew = false;
     if !has_capacity(cursor_up, cursor_down, reserved, dword_count) {
         let previous_cursor_up = cursor_up;
         let previous_cursor_down = cursor_down;
@@ -162,6 +233,7 @@ pub(super) fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u
         if !unsafe { callback(command_buffer, requested, user_data) } {
             return None;
         }
+        grew = true;
         cursor_up = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET);
         cursor_down = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
         eprintln!(
@@ -175,7 +247,7 @@ pub(super) fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u
     let next = cursor_up.checked_add(byte_count)?;
     write_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET, next);
     if !is_async_command_buffer(command_buffer) {
-        track_graphics_allocation(cursor_up, dword_count);
+        track_graphics_command_allocation(command_buffer, cursor_up, dword_count, grew);
     }
     Some(cursor_up)
 }
@@ -320,11 +392,30 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
     let mut allocations = RECENT_COMMAND_ALLOCATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Command memory is a recycled ring. Restrict the fallback to the newest concrete descriptor
+    // generation whose extent contains this tail; otherwise stale constructor records can join
+    // current bytes into a valid-looking PM4 stream and replay completed releases and waits.
+    let owner = allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.buffer_start <= command_address
+                && command_address <= allocation.buffer_end
+                && allocation.start < command_address
+        })
+        .max_by_key(|allocation| allocation.generation)
+        .map(|allocation| (allocation.descriptor, allocation.generation))?;
+    let submitted = RECENT_GRAPHICS_SUBMISSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut candidates = allocations
         .iter()
-        .filter_map(|&(start, end)| {
-            (start >= lower_bound && start < command_address && end <= command_address)
-                .then_some(start)
+        .filter_map(|allocation| {
+            (allocation.descriptor == owner.0
+                && allocation.generation == owner.1
+                && allocation.start >= lower_bound
+                && allocation.start < command_address
+                && allocation.end <= command_address)
+                .then_some(allocation.start)
         })
         .collect::<Vec<_>>();
     candidates.sort_unstable();
@@ -334,14 +425,26 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
     // begins at a constructor-recorded address and ends exactly at the submitted tail. Ranges
     // parsed by an explicit branch or earlier submission are retired separately, preventing a
     // valid-looking old stream from being selected a second time.
-    let prefix_start = candidates
-        .into_iter()
-        .find(|&start| scan_valid_command_stream_end(start, command_address) == command_address)?;
+    let prefix_start = candidates.into_iter().find(|&start| {
+        // A successful explicit submission is an execution boundary. Constructor anchors left
+        // before it may still point into perfectly valid recycled PM4, but joining across that
+        // boundary executes the already-submitted stream again. This was visible in Silent Hill
+        // as 8k-25k-dword "prefixes" at the title-movie transition.
+        !submitted
+            .iter()
+            .any(|range| range.start < command_address && start < range.end)
+            && scan_valid_command_stream_end(start, command_address) == command_address
+    })?;
+    drop(submitted);
     let dword_count = u32::try_from((command_address - prefix_start) / 4).ok()?;
     if dword_count == 0 {
         return None;
     }
-    allocations.retain(|&(start, end)| !(start >= prefix_start && end <= command_address));
+    allocations.retain(|allocation| {
+        allocation.descriptor != owner.0
+            || allocation.generation != owner.1
+            || !(allocation.start >= prefix_start && allocation.end <= command_address)
+    });
     Some((prefix_start, dword_count))
 }
 
@@ -357,12 +460,111 @@ pub(crate) fn consume_recorded_graphics_range(command_address: u64, dword_count:
     RECENT_COMMAND_ALLOCATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retain(|&(allocation_start, allocation_end)| {
-            !(allocation_start >= command_address && allocation_end <= command_end)
+        .retain(|allocation| {
+            !(allocation.start >= command_address && allocation.end <= command_end)
         });
 }
 
+#[cfg(test)]
 pub(crate) fn track_graphics_allocation(command: u64, dword_count: u32) {
+    track_graphics_allocation_for_generation(0, 0, 0, u64::MAX, command, dword_count);
+}
+
+/// Records a constructor allocation against the concrete command-buffer generation that owns it.
+///
+/// A successful growth callback is authoritative even if it recycles the same virtual extent.
+/// Cursor regression covers guest-side ring resets which do not invoke the callback.
+pub(crate) fn track_graphics_command_allocation(
+    command_buffer: u64,
+    command: u64,
+    dword_count: u32,
+    grew: bool,
+) {
+    if command == 0 || dword_count == 0 {
+        return;
+    }
+    let Some(command_end) = command.checked_add(u64::from(dword_count) * 4) else {
+        return;
+    };
+    let buffer_start = read_u64(command_buffer + COMMAND_BUFFER_BASE_UP_OFFSET);
+    let buffer_end = read_u64(command_buffer + COMMAND_BUFFER_BASE_DOWN_OFFSET);
+    if buffer_start == 0
+        || buffer_end <= buffer_start
+        || command < buffer_start
+        || command_end > buffer_end
+    {
+        eprintln!(
+            "[REMu][AGC] ignored allocation outside descriptor extent descriptor={command_buffer:#x} buffer={buffer_start:#x}..{buffer_end:#x} allocation={command:#x}..{command_end:#x}"
+        );
+        return;
+    }
+
+    let (generation, started_new_generation) = {
+        let mut generations = GRAPHICS_COMMAND_BUFFER_GENERATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let needs_new_generation = generations.get(&command_buffer).is_none_or(|current| {
+            grew || current.buffer_start != buffer_start
+                || current.buffer_end != buffer_end
+                || command < current.last_allocation_end
+        });
+        if needs_new_generation {
+            let generation = NEXT_GRAPHICS_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+            generations.insert(
+                command_buffer,
+                GraphicsCommandBufferGeneration {
+                    generation,
+                    buffer_start,
+                    buffer_end,
+                    last_allocation_end: command_end,
+                },
+            );
+            (generation, true)
+        } else {
+            let current = generations
+                .get_mut(&command_buffer)
+                .expect("an existing command-buffer generation was just observed");
+            current.last_allocation_end = current.last_allocation_end.max(command_end);
+            (current.generation, false)
+        }
+    };
+
+    let mut allocations = RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if started_new_generation {
+        allocations.retain(|allocation| allocation.descriptor != command_buffer);
+    }
+    allocations.push(RecentGraphicsAllocation {
+        descriptor: command_buffer,
+        generation,
+        buffer_start,
+        buffer_end,
+        start: command,
+        end: command_end,
+    });
+    if allocations.len() > 16_384 {
+        let drain_count = allocations.len() - 8_192;
+        allocations.drain(..drain_count);
+    }
+    drop(allocations);
+    if started_new_generation {
+        RECENT_GRAPHICS_SUBMISSIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|submission| submission.start < buffer_start || submission.end > buffer_end);
+    }
+}
+
+#[cfg(test)]
+fn track_graphics_allocation_for_generation(
+    descriptor: u64,
+    generation: u64,
+    buffer_start: u64,
+    buffer_end: u64,
+    command: u64,
+    dword_count: u32,
+) {
     if command == 0 || dword_count == 0 {
         return;
     }
@@ -372,7 +574,14 @@ pub(crate) fn track_graphics_allocation(command: u64, dword_count: u32) {
     let mut allocations = RECENT_COMMAND_ALLOCATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    allocations.push((command, command_end));
+    allocations.push(RecentGraphicsAllocation {
+        descriptor,
+        generation,
+        buffer_start,
+        buffer_end,
+        start: command,
+        end: command_end,
+    });
     if allocations.len() > 16_384 {
         let drain_count = allocations.len() - 8_192;
         allocations.drain(..drain_count);
@@ -392,9 +601,20 @@ pub(crate) fn track_graphics_submission(command_address: u64, dword_count: u32) 
         // built prefix in a recycled allocation. Allocations beyond `submitted_end` belong to a
         // future DCB: the guest can build it before submitting an intervening ACB, but it must not
         // execute until that future DCB is explicitly submitted.
-        allocations.retain(|&(allocation_start, allocation_end)| {
-            !(allocation_start >= command_address && allocation_end <= submitted_end)
+        allocations.retain(|allocation| {
+            !(allocation.start >= command_address && allocation.end <= submitted_end)
         });
+    }
+    let mut submissions = RECENT_GRAPHICS_SUBMISSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    submissions.push(SubmittedGraphicsRange {
+        start: command_address,
+        end: submitted_end,
+    });
+    if submissions.len() > 16_384 {
+        let drain_count = submissions.len() - 8_192;
+        submissions.drain(..drain_count);
     }
 
     // A grow/stitch branch can be constructed before its replacement allocation is submitted

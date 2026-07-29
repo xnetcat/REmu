@@ -240,14 +240,9 @@ fn mode27_volume_detile_applies_each_surface_z_xor() {
             );
         }
         expected.extend_from_slice(&linear);
-        let mut tiled = vec![0_u8; face_bytes];
-        super::copy_linear_to_tiled(&linear, descriptor, &mut tiled).expect("base slice tiles");
-        let xor = super::mode27_surface_z_xor(z);
         let raw_face = &mut raw[z * face_bytes..(z + 1) * face_bytes];
-        for source in (0..face_bytes).step_by(4) {
-            let destination = source ^ xor;
-            raw_face[destination..destination + 4].copy_from_slice(&tiled[source..source + 4]);
-        }
+        super::copy_linear_to_tiled_at_z(&linear, descriptor, raw_face, z)
+            .expect("volume slice tiles with its surface-Z parity");
     }
     let decoded = super::decode_sampled_texture_linear_from_raw(
         super::DecodedImageDescriptor {

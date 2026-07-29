@@ -258,6 +258,7 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
             diagnostic_force_pixel_color: false,
             lds_size_bytes: 2_048,
             wave_lane_count: 64,
+            allocated_vector_register_count: 256,
         },
     )
     .expect("wave64 readfirstlane should lower with threadgroup exchange");

@@ -30,6 +30,7 @@ pub(crate) struct AudioOut2State {
     pub(crate) port_state_queries: u64,
     pub(crate) context_advances: u64,
     pub(crate) context_pushes: u64,
+    pub(crate) audible_context_pushes: u64,
     #[cfg(test)]
     pub(crate) submitted_pcm: Vec<(u64, Vec<u8>)>,
 }
@@ -221,11 +222,20 @@ pub(crate) fn audio_out2_grain_duration(grain_frames: u32) -> Duration {
 }
 
 pub(crate) fn audio_out2_update_context_queue(context: &mut AudioOut2ContextState, now: Instant) {
+    let grain_duration = audio_out2_grain_duration(context.grain_frames);
     if context.queued == 0 {
-        context.last_queue_update = now;
+        // Preserve a short amount of producer lateness as catch-up credit. Re-anchoring every
+        // empty queue to `now` permanently reduces the guest's effective sample rate by its
+        // scheduling latency. A genuinely stopped stream is re-anchored after one complete queue
+        // depth so it does not return from a long pause with an unbounded burst.
+        let idle_limit = grain_duration
+            .checked_mul(context.queue_depth.max(1))
+            .expect("a bounded AudioOut2 queue duration cannot overflow");
+        if now.saturating_duration_since(context.last_queue_update) > idle_limit {
+            context.last_queue_update = now;
+        }
         return;
     }
-    let grain_duration = audio_out2_grain_duration(context.grain_frames);
     let elapsed = now.saturating_duration_since(context.last_queue_update);
     let drained = u32::try_from(
         (elapsed.as_nanos() / grain_duration.as_nanos()).min(u128::from(context.queued)),
@@ -238,9 +248,6 @@ pub(crate) fn audio_out2_update_context_queue(context: &mut AudioOut2ContextStat
     context.last_queue_update += grain_duration
         .checked_mul(drained)
         .expect("a bounded AudioOut2 queue duration cannot overflow");
-    if context.queued == 0 {
-        context.last_queue_update = now;
-    }
 }
 
 pub(crate) fn audio_out2_queue_wait_duration(
@@ -256,6 +263,47 @@ pub(crate) fn trace_audio_out2_memory() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var_os("REMU_TRACE_AUDIO2_MEMORY").is_some_and(|value| value == "1")
     })
+}
+
+pub(crate) fn trace_audio_out2_pcm(
+    push: u64,
+    audible_push: u64,
+    port: u64,
+    address: u64,
+    channels: u8,
+    snapshot: &[u8],
+) {
+    if !trace_audio_out2_memory()
+        || (!crate::trace_logarithmic_sequence(push, 8)
+            && !crate::trace_logarithmic_sequence(audible_push, 8))
+    {
+        return;
+    }
+    let mut live_samples = 0_u64;
+    let mut peak = 0.0_f32;
+    let mut sum_squares = 0.0_f64;
+    let mut finite_samples = 0_u64;
+    for bytes in snapshot.chunks_exact(size_of::<f32>()) {
+        let sample = f32::from_le_bytes(bytes.try_into().expect("one f32 sample"));
+        if !sample.is_finite() {
+            continue;
+        }
+        finite_samples = finite_samples.saturating_add(1);
+        if sample.abs() >= 1.0e-8 {
+            live_samples = live_samples.saturating_add(1);
+        }
+        peak = peak.max(sample.abs());
+        sum_squares += f64::from(sample) * f64::from(sample);
+    }
+    let rms = if finite_samples == 0 {
+        0.0
+    } else {
+        (sum_squares / finite_samples as f64).sqrt()
+    };
+    eprintln!(
+        "[REMu][AUDIO2-PCM] push={push} audible={audible_push} port={port} address={address:#x} channels={channels} bytes={} finite={finite_samples} live={live_samples} peak={peak:.6} rms={rms:.6}",
+        snapshot.len()
+    );
 }
 
 pub(crate) fn trace_audio_out2_context_memory(

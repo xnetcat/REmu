@@ -68,6 +68,90 @@ fn emits_instance_routing_for_layered_render_targets() {
 }
 
 #[test]
+fn emits_guest_misc_layer_as_mesh_primitive_output() {
+    let export = |pc, target, enable_mask| Instruction {
+        pc,
+        encoding: ShaderEncoding::Exp,
+        opcode: Opcode::Known("Exp"),
+        words: vec![0, 0],
+        sources: (0..4).map(Operand::vector).collect(),
+        destinations: Vec::new(),
+        control: Some(InstructionControl::Export(ExportControl {
+            target,
+            enable_mask,
+            compressed: false,
+            done: target == 20,
+            valid_mask: false,
+        })),
+    };
+    let program = Program::new(
+        0x1000,
+        vec![
+            export(0, 13, 1 << 2),
+            export(8, 12, 0x0f),
+            export(16, 20, 1),
+        ],
+    );
+    let mut options = MetalCompileOptions::mesh(0, 0);
+    options.vertex_output_control = (1 << 18) | (1 << 21);
+    options.render_target_array_length = 6;
+    let shader = compile_msl(&program, &empty_evaluation(), &options).expect("layered mesh lowers");
+
+    assert!(shader.source.contains(
+        "struct RemuPrimitiveOut {\n    uint render_target_array_index [[render_target_array_index]];"
+    ));
+    assert!(
+        shader
+            .source
+            .contains("mesh<RemuVsOut, RemuPrimitiveOut, 64, 64, topology::triangle> remu_mesh")
+    );
+    assert!(
+        shader
+            .source
+            .contains("threadgroup uint remu_mesh_render_target_indices[64];")
+    );
+    assert!(
+        shader
+            .source
+            .contains("min(as_type<uint>(as_type<float>(remu_v_2)), 5u)")
+    );
+    assert!(shader.source.contains(
+        "remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];"
+    ));
+    assert!(
+        !shader
+            .source
+            .contains("float4 position [[position]];\n    uint render_target_array_index"),
+        "Metal rejects render_target_array_index on a mesh vertex output"
+    );
+
+    #[cfg(target_os = "macos")]
+    if let Some(compiler) = std::env::var_os("REMU_METAL_COMPILER") {
+        let directory =
+            std::env::temp_dir().join(format!("remu-layered-mesh-metal-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create layered mesh Metal test directory");
+        let source = directory.join("mesh.metal");
+        let air = directory.join("mesh.air");
+        std::fs::write(&source, &shader.source).expect("write generated layered mesh MSL");
+        let output = std::process::Command::new(compiler)
+            .args(["-c", "-target", "air64-apple-macosx15.0"])
+            .arg("-fmetal-math-mode=safe")
+            .arg("-o")
+            .arg(&air)
+            .arg(&source)
+            .output()
+            .expect("run Apple Metal compiler");
+        assert!(
+            output.status.success(),
+            "layered mesh MSL failed to compile:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(directory).expect("remove layered mesh Metal test directory");
+    }
+}
+
+#[test]
 fn builds_fused_es_gs_rectangle_equivalent_for_volume_generation() {
     let shader = compile_layered_rectangle_vertex(2, 64);
 

@@ -22,7 +22,7 @@ use crate::compiler::memory::is_lds_memory_instruction;
 use crate::{
     Compiler, METAL_DIRECT_TEXTURE_LIMIT, MetalBindingLayout, MetalCompileError,
     MetalCompileOptions, MetalRegisterFootprint, MetalShader, MetalShaderStage,
-    PIXEL_INPUT_CONTROL_COUNT, SCALAR_REGISTER_COUNT,
+    PIXEL_INPUT_CONTROL_COUNT, SCALAR_REGISTER_COUNT, VECTOR_REGISTER_COUNT,
 };
 
 impl<'a> Compiler<'a> {
@@ -423,6 +423,12 @@ impl<'a> Compiler<'a> {
     }
 }
 fn validate_interface(options: &MetalCompileOptions) -> Result<(), MetalCompileError> {
+    if !(1..=VECTOR_REGISTER_COUNT).contains(&options.allocated_vector_register_count) {
+        return Err(MetalCompileError::InvalidInterface(format!(
+            "allocated vector-register count {} is outside 1..={VECTOR_REGISTER_COUNT}",
+            options.allocated_vector_register_count
+        )));
+    }
     if options.pixel_outputs.len() > 8 {
         return Err(MetalCompileError::InvalidInterface(
             "Metal supports at most eight color outputs".into(),

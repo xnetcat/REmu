@@ -36,7 +36,8 @@ pub(crate) use self::compile::{
 #[cfg(test)]
 pub(crate) use self::program::shader_scalar_metadata;
 pub(crate) use self::program::{
-    compute_pipeline_key, compute_program_can_split_wave64, image_resource_descriptor_is_null,
+    compute_pipeline_key, compute_program_can_split_wave64,
+    graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
     ngg_mesh_export_stage, pixel_interpolation_attribute_mask, pixel_scalars,
     procedural_rectangle_export_stage, program_embeds_global_base, program_uses_lds,
@@ -204,6 +205,7 @@ impl MetalPresenter {
             register_value(&draw.context_registers, 0x1b3).unwrap_or_default(),
             register_value(&draw.context_registers, 0x1b4).unwrap_or_default(),
         );
+        pixel_options.allocated_vector_register_count = key.pixel_allocated_vector_register_count;
         pixel_options.render_target_array_length = key.render_target_array_length;
         pixel_options.pixel_input_controls = key
             .pixel_input_controls
@@ -273,6 +275,7 @@ impl MetalPresenter {
         } else {
             remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count)
         };
+        vertex_options.allocated_vector_register_count = key.export_allocated_vector_register_count;
         vertex_options.render_target_array_length = key.render_target_array_length;
         vertex_options.vertex_output_control = key.vertex_output_control;
         vertex_options.diagnostic_force_visible_clip_depth =
@@ -468,5 +471,3 @@ impl MetalPresenter {
     }
 }
 pub(super) const SHADER_COMPILE_QUEUE_CAPACITY: usize = 64;
-
-pub(super) const SHADER_COMPILER_WORKER_COUNT: usize = 8;

@@ -5,12 +5,13 @@ use super::{
     ActiveGuestMemoryWait, DisplayConfiguration, GLOBAL_UPLOAD_ALIGNMENT,
     GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GlobalUploadChunk, GraphicsPipelineKey,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
-    GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker, MetalPresenter,
-    OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PIPELINE_DRAW_GATES,
-    PendingFlip, PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
-    PresenterFlow, QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
-    UploadedGlobalBuffer, WriteWatchRefresh, graphics_pipeline_key, guest_physical_ranges_overlap,
-    guest_ranges_overlap, guest_texture_byte_count, pixel_scalars, rearm_depth_metadata_clear,
+    GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
+    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OrderedEventPoll, OrderedEventSource,
+    OrderedGpuEventReceiver, PIPELINE_DRAW_GATES, PendingFlip, PendingGlobalWriteback,
+    PendingGuestMemoryWrite, PendingGuestWriteRange, PresenterFlow, QueueBlockReason,
+    ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh,
+    graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
+    guest_texture_byte_count, pixel_scalars, rearm_depth_metadata_clear,
     record_diagnostic_memory_copy, refresh_resident_texture_write_watch, register_value,
     retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
@@ -47,6 +48,12 @@ impl MetalPresenter {
         // AppKit tick. Retry suspended queue fronts once; an unsatisfied wait is re-suspended
         // without permitting any later event from that queue to overtake it.
         self.receiver.retry_guest_memory_waits();
+        // Do not pull more guest commands while Metal already owns the bounded in-flight budget.
+        // The event loop remains responsive and retries after every retirement tick, while the
+        // channel's existing capacity propagates backpressure to the guest producer.
+        if self.committed_guest_batches.len() >= MAX_COMMITTED_GUEST_BATCHES {
+            return PresenterFlow::Continue;
+        }
         // Feed the existing compile workers from bounded ordered lookahead even while the current
         // queue front is runnable. Waiting until a cold draw becomes the blocked front serialized
         // multi-second first-scene Metal compilation behind the warning/movie UI. This only
@@ -385,6 +392,9 @@ impl MetalPresenter {
             // texture; once a later draw produces that texture, return to Winit immediately so
             // `about_to_wait` can request the redraw instead of processing hundreds more events.
             if self.redraw_pending {
+                return PresenterFlow::Continue;
+            }
+            if self.committed_guest_batches.len() >= MAX_COMMITTED_GUEST_BATCHES {
                 return PresenterFlow::Continue;
             }
         }
