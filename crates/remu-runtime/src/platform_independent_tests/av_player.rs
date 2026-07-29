@@ -522,6 +522,144 @@ fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
 }
 
 #[test]
+fn av_player_current_time_tracks_delivered_pts_when_wall_clock_outruns_video() {
+    let Some(root) = av_player_generate_test_clip("delivered-presentation-time") else {
+        return;
+    };
+    let mut state = ProbeDispatchState::default();
+    state.game_root = root.clone();
+    let handle = av_player_test_player(&mut state);
+    let source = b"/app0/media/clip.mp4\0";
+    assert_eq!(
+        crate::av_player_add_source(
+            [handle, source.as_ptr().addr() as u64, 0, 0, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(crate::av_player_start(handle, &mut state), 0);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        // Model Silent Hill's video-only title movie after a long shader-translation pause.
+        player.has_audio = false;
+        player.playing_since = Some(Instant::now() - Duration::from_secs(30));
+    }
+
+    let mut frame_info = [0_u8; 112];
+    let output = frame_info.as_mut_ptr().addr() as u64;
+    assert_eq!(
+        av_player_wait_for_video_frame(handle, output, &mut state),
+        1,
+        "the first decoded frame must be delivered"
+    );
+    let delivered_timestamp = av_player_frame_timestamp(&frame_info);
+    assert_eq!(delivered_timestamp, 0);
+    assert_eq!(
+        crate::av_player_current_time(handle, &state),
+        delivered_timestamp,
+        "host wall time must not publish media time the guest has not received"
+    );
+    assert_eq!(
+        crate::av_player_is_active(handle, &state),
+        1,
+        "wall time beyond the clip duration must not end an undrained stream"
+    );
+
+    assert_eq!(crate::av_player_close(handle, &mut state), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn av_player_current_time_uses_audio_as_the_presentation_master() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    let player = state.av_player.players.get_mut(&handle).unwrap();
+    player.source = Some("test.mp4".to_owned());
+    player.decoder_seek = Duration::from_millis(250);
+    player.has_audio = true;
+    player.last_video_timestamp_milliseconds = Some(1_200);
+
+    assert_eq!(
+        crate::av_player_current_time(handle, &state),
+        250,
+        "an audio source stays at its seek position until audio is delivered"
+    );
+    state
+        .av_player
+        .players
+        .get_mut(&handle)
+        .unwrap()
+        .last_audio_timestamp_milliseconds = Some(700);
+    assert_eq!(crate::av_player_current_time(handle, &state), 700);
+    state
+        .av_player
+        .players
+        .get_mut(&handle)
+        .unwrap()
+        .last_video_timestamp_milliseconds = Some(1_600);
+    assert_eq!(
+        crate::av_player_current_time(handle, &state),
+        700,
+        "video delivery must not advance an audio-master source"
+    );
+}
+
+#[test]
+fn av_player_eof_keeps_the_last_delivered_presentation_time() {
+    let Some(root) = av_player_generate_test_clip("presentation-time-at-eof") else {
+        return;
+    };
+    let mut state = ProbeDispatchState::default();
+    state.game_root = root.clone();
+    let handle = av_player_test_player(&mut state);
+    let source = b"/app0/media/clip.mp4\0";
+    assert_eq!(
+        crate::av_player_add_source(
+            [handle, source.as_ptr().addr() as u64, 0, 0, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(crate::av_player_start(handle, &mut state), 0);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.has_audio = false;
+        player.playing_since = Some(Instant::now() - Duration::from_secs(30));
+    }
+
+    let mut frame_info = [0_u8; 112];
+    let output = frame_info.as_mut_ptr().addr() as u64;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut delivered_frames = 0_u64;
+    let mut last_timestamp = 0_u64;
+    while crate::av_player_is_active(handle, &state) != 0 && Instant::now() < deadline {
+        if crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, &mut state) != 0 {
+            delivered_frames += 1;
+            last_timestamp = av_player_frame_timestamp(&frame_info);
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        delivered_frames >= 50,
+        "the generated two-second/30fps clip should drain, got {delivered_frames} frames"
+    );
+    assert_eq!(
+        crate::av_player_is_active(handle, &state),
+        0,
+        "decoder EOF must end the active session"
+    );
+    assert_eq!(
+        crate::av_player_current_time(handle, &state),
+        last_timestamp,
+        "EOF must preserve the last frame PTS instead of publishing host wall time"
+    );
+
+    assert_eq!(crate::av_player_close(handle, &mut state), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn av_player_jump_to_time_seeks_the_decoder_instead_of_replaying_from_zero() {
     let Some(root) = av_player_generate_test_clip("jump-to-time") else {
         return;
