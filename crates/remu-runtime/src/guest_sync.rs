@@ -208,9 +208,41 @@ fn begin_main_timed_condition_trace(
     } else {
         read_guest_u64(named_queue_state.saturating_add(0x10))
     };
+    // FTaskGraphInterface::WaitUntilTaskCompletes passes an FGraphEventRef wrapper to
+    // GameThreadWaitForTask.  This title's fixed frame stores the referenced event at rbp-0x60
+    // while it pumps the named-thread queue.  The event's +0x10 word contains the completion bit
+    // (0x0400_0000); keeping the surrounding words lets a bounded run distinguish a task that was
+    // never dequeued from one that executed but failed to dispatch its subsequents.
+    let target_graph_event = if event_caller_rbp < 0x60 {
+        0
+    } else {
+        read_guest_u64(event_caller_rbp - 0x60)
+    };
+    let target_graph_event_words = if target_graph_event == 0 {
+        [0; 12]
+    } else {
+        std::array::from_fn(|index| {
+            read_guest_u64(
+                target_graph_event
+                    .saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(8)),
+            )
+        })
+    };
+    let render_named_thread = read_guest_u32(0x807_b20_9d0);
+    let parent_locals = if parent_rbp < 0x80 {
+        [0; 16]
+    } else {
+        std::array::from_fn(|index| {
+            read_guest_u64(
+                parent_rbp
+                    .saturating_sub(0x80)
+                    .saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(8)),
+            )
+        })
+    };
     let (waiters_before, notifies_before, timeouts_before) = condition_trace_stats(condition);
     eprintln!(
-        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} ancestors={parent_return:#x}/rbp:{parent_rbp:#x},{grandparent_return:#x}/rbp:{grandparent_rbp:#x},{great_grandparent_return:#x}/rbp:{great_grandparent_rbp:#x} named_queue={named_queue:#x}/index:{named_queue_index}/state:{named_queue_state:#x}/flags:{named_queue_flags:#x} limiter_start={:#018x}/{:.9} limiter_target={:#018x}/{:.9} limiter_globals={limiter_wait_millis}/{limiter_target_millis} process_counter={process_counter} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
+        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} ancestors={parent_return:#x}/rbp:{parent_rbp:#x},{grandparent_return:#x}/rbp:{grandparent_rbp:#x},{great_grandparent_return:#x}/rbp:{great_grandparent_rbp:#x} graph_event={target_graph_event:#x}/words:{target_graph_event_words:#x?} render_named_thread={render_named_thread:#x} parent_locals={parent_locals:#x?} named_queue={named_queue:#x}/index:{named_queue_index}/state:{named_queue_state:#x}/flags:{named_queue_flags:#x} limiter_start={:#018x}/{:.9} limiter_target={:#018x}/{:.9} limiter_globals={limiter_wait_millis}/{limiter_target_millis} process_counter={process_counter} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
         current_guest_thread_handle(),
         frame.map_or(0, |frame| frame.guest_return_address),
         clock_start_bits,
