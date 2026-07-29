@@ -3386,6 +3386,7 @@ fn dispatch_stateless_import(
         // The POSIX spelling shares the sleep and reports errno rather than an SCE code.
         "QcteRwbsnV0" => posix_pthread_result(guest_usleep(arguments[0])),
         "lLMT9vJAck0" | "QBi7HCK03hw" => guest_clock_gettime(arguments[0], arguments[1]),
+        "n88vx3C5nW8" => guest_posix_gettimeofday(arguments[0]),
         "ejekcaNQNq0" => guest_kernel_gettimeofday(arguments[0]),
         "0NTHN1NKONI" => guest_kernel_convert_localtime_to_utc(arguments),
         "-o5uEDpN+oY" => guest_kernel_convert_utc_to_localtime(arguments),
@@ -6499,12 +6500,24 @@ fn guest_kernel_gettimeofday(output: u64) -> u64 {
     if output == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    write_guest_timeval(output);
+    0
+}
+
+fn guest_posix_gettimeofday(output: u64) -> u64 {
+    if output == 0 {
+        return u64::MAX;
+    }
+    write_guest_timeval(output);
+    0
+}
+
+fn write_guest_timeval(output: u64) {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     write_guest_u64(output, elapsed.as_secs());
     write_guest_u64(output + 8, u64::from(elapsed.subsec_micros()));
-    0
 }
 
 /// Returns the host's UTC offset and daylight-saving component for a Unix timestamp. Console

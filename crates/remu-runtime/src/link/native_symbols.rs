@@ -175,7 +175,6 @@ pub(super) fn native_libc_symbol_name(nid: &str) -> Option<&'static std::ffi::CS
         "2vDqwBlpF-o" => c"strtod",
         "dhK16CKwhQg" => c"__isfinited",
         "GfxAp9Xyiqs" => c"__isnand",
-        "n88vx3C5nW8" => c"gettimeofday",
         "eLdDw6l0-bU" => c"snprintf",
         "Q2V+iqvjgC0" => c"vsnprintf",
         "tcVi5SivF7Q" => c"sprintf",
@@ -358,4 +357,17 @@ pub(super) fn synthetic_data_import_target(nid: &str) -> Option<u64> {
         .cells
         .get(nid)
         .map(|cell| cell.as_ptr() as usize as u64)
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
+mod tests {
+    use super::native_libc_symbol_name;
+
+    #[test]
+    fn guest_timeval_does_not_resolve_to_the_darwin_abi() {
+        // Darwin declares tv_usec as a 32-bit integer, while the console ABI reads the field as
+        // 64 bits. Calling the host export directly leaves the upper half of the guest field
+        // untouched and can turn a millisecond timeout into a multi-hour wait.
+        assert!(native_libc_symbol_name("n88vx3C5nW8").is_none());
+    }
 }

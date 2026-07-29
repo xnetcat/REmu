@@ -3,7 +3,7 @@
 
 use super::{
     civil_from_unix_seconds, guest_clock_gettime, guest_kernel_convert_localtime_to_utc,
-    guest_kernel_convert_utc_to_localtime, guest_kernel_gettimeofday,
+    guest_kernel_convert_utc_to_localtime, guest_kernel_gettimeofday, guest_posix_gettimeofday,
     rtc_get_current_clock_local_time, rtc_get_current_tick, rtc_get_tick, rtc_set_tick,
     unix_days_from_civil,
 };
@@ -23,6 +23,17 @@ fn translates_console_clock_ids_to_realtime() {
     assert!(seconds >= before);
     assert!(seconds <= before + 2);
     assert!((0..1_000_000_000).contains(&output.tv_nsec));
+}
+
+#[test]
+fn posix_gettimeofday_overwrites_the_full_guest_microsecond_field() {
+    let mut timeval = [0_u64, 0xffff_ffff_0000_0000];
+    assert_eq!(
+        guest_posix_gettimeofday((&raw mut timeval).addr() as u64),
+        0
+    );
+    assert!(timeval[0] > 1_700_000_000);
+    assert!(timeval[1] < 1_000_000);
 }
 
 #[test]
