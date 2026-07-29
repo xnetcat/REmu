@@ -409,6 +409,21 @@ impl Compiler<'_> {
             MetalShaderStage::Pixel => {
                 if !self.options.pixel_outputs.is_empty() {
                     source.push_str("    RemuPsOut remu_out = {};\n");
+                    // GFX color exports supply architectural defaults for components that the
+                    // shader masks out: RGB are zero and alpha is one. The alpha default is
+                    // observable even when CB_TARGET_MASK disables the alpha write because the
+                    // blend unit still consumes the source alpha. Leaving Metal's aggregate
+                    // initialization at zero made SRC_ALPHA passes contribute no source color,
+                    // which rendered opaque Unreal materials ghosted or fully transparent.
+                    for output in &self.options.pixel_outputs {
+                        let default = match output.kind {
+                            PixelOutputKind::Float => "float4(0.0f, 0.0f, 0.0f, 1.0f)",
+                            PixelOutputKind::Uint => "uint4(0u, 0u, 0u, 1u)",
+                            PixelOutputKind::Sint => "int4(0, 0, 0, 1)",
+                        };
+                        let _ =
+                            writeln!(source, "    remu_out.mrt{} = {default};", output.guest_slot);
+                    }
                 }
                 self.emit_pixel_input_state(&mut source);
             }
