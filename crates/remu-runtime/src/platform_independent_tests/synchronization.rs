@@ -4,6 +4,113 @@
 use super::{GUEST_CONDITION_TEST, sce_kernel_error, wait_for_guest_condition_waiters};
 
 #[test]
+fn semaphore_wait_honors_timeouts_and_rejects_impossible_counts() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    const SEMAPHORE: u32 = 0x7fff_5100;
+    let sync = crate::guest_sync();
+    sync.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .semaphores
+        .insert(
+            SEMAPHORE,
+            crate::GuestSemaphoreState {
+                count: 0,
+                maximum: 1,
+            },
+        );
+
+    let mut timeout_microseconds = 2_000_u32;
+    assert_eq!(
+        crate::guest_semaphore_wait([
+            u64::from(SEMAPHORE),
+            1,
+            (&raw mut timeout_microseconds).addr() as u64,
+            0,
+            0,
+            0,
+        ]),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_TIMED_OUT)
+    );
+    assert_eq!(timeout_microseconds, 0);
+    assert_eq!(
+        crate::guest_semaphore_wait([u64::from(SEMAPHORE), 2, 0, 0, 0, 0]),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT),
+        "a request larger than the semaphore maximum must not park forever"
+    );
+
+    {
+        let mut state = sync
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.semaphores.get_mut(&SEMAPHORE).unwrap().count = 1;
+    }
+    let mut available_timeout = 50_000_u32;
+    assert_eq!(
+        crate::guest_semaphore_wait([
+            u64::from(SEMAPHORE),
+            1,
+            (&raw mut available_timeout).addr() as u64,
+            0,
+            0,
+            0,
+        ]),
+        0
+    );
+    assert!(available_timeout <= 50_000);
+    sync.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .semaphores
+        .remove(&SEMAPHORE);
+}
+
+#[test]
+fn semaphore_signal_reports_overflow_without_losing_the_count() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    const SEMAPHORE: u32 = 0x7fff_5200;
+    let sync = crate::guest_sync();
+    sync.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .semaphores
+        .insert(
+            SEMAPHORE,
+            crate::GuestSemaphoreState {
+                count: 1,
+                maximum: 1,
+            },
+        );
+
+    assert_eq!(
+        crate::dispatch_guest_sync_import(
+            "4czppHBiriw",
+            [u64::from(SEMAPHORE), 1, 0, 0, 0, 0],
+            None,
+        ),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        sync.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .semaphores[&SEMAPHORE]
+            .count,
+        1
+    );
+    sync.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .semaphores
+        .remove(&SEMAPHORE);
+}
+
+#[test]
 fn condition_signal_selects_one_waiter_and_broadcast_selects_the_rest() {
     let mut condition = crate::GuestConditionState::default();
     let mutex = 0x1234;
