@@ -7,8 +7,91 @@ use std::time::Duration;
 use super::{
     AmprCommandBufferState, ProbeDispatchState, SCE_KERNEL_ERROR_NOT_FOUND,
     ampr_command_buffer_write_kernel_event_queue, ampr_submit_command_buffer,
-    create_ampr_test_file, kernel_add_ampr_event, sce_kernel_error,
+    create_ampr_test_file, dispatch_probe_import, kernel_add_ampr_event, read_guest_u32,
+    sce_kernel_error, set_current_guest_thread_pointer, write_guest_u32,
 };
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apr_resolver_imports_report_posix_failures_to_the_sdk_wrappers() {
+    let mut tls = [0_u64; 16];
+    let thread_pointer = tls.as_mut_ptr().addr() as u64;
+    set_current_guest_thread_pointer(thread_pointer);
+
+    let prefix = b"/app0\0";
+    let absolute = b"/app0/missing-apr-file.bin\0";
+    let relative = b"missing-apr-file.bin\0";
+    let absolute_list = [absolute.as_ptr().addr() as u64];
+    let relative_list = [relative.as_ptr().addr() as u64];
+    let mut state = ProbeDispatchState::default();
+
+    for (nid, prefixed, per_entry) in [
+        ("gEpBkcwxUjw", false, false),
+        ("WT-5NKy42fw", false, false),
+        ("eYAh2vlCY-U", false, true),
+        ("QzB4O+bJQyA", false, true),
+        ("i3HWvW35jao", true, false),
+        ("w5fcCG+t31g", true, false),
+        ("VB-BtuIW8Xc", true, true),
+        ("C+Khtbbx2g8", true, true),
+    ] {
+        let mut id = 0_u32;
+        let mut size = u64::MAX;
+        let mut detail = u32::MAX;
+        write_guest_u32(thread_pointer + 0x40, 77);
+        let arguments = if prefixed {
+            [
+                prefix.as_ptr().addr() as u64,
+                relative_list.as_ptr().addr() as u64,
+                1,
+                (&raw mut id).addr() as u64,
+                if matches!(nid, "w5fcCG+t31g" | "C+Khtbbx2g8") {
+                    (&raw mut size).addr() as u64
+                } else {
+                    (&raw mut detail).addr() as u64
+                },
+                (&raw mut detail).addr() as u64,
+            ]
+        } else {
+            [
+                absolute_list.as_ptr().addr() as u64,
+                1,
+                (&raw mut id).addr() as u64,
+                if matches!(nid, "gEpBkcwxUjw" | "QzB4O+bJQyA") {
+                    (&raw mut size).addr() as u64
+                } else {
+                    (&raw mut detail).addr() as u64
+                },
+                (&raw mut detail).addr() as u64,
+                0,
+            ]
+        };
+        let result = dispatch_probe_import(nid, arguments, [0; 6], &mut state);
+
+        assert_eq!(id, crate::AMPR_INVALID_FILE_ID, "{nid}");
+        if matches!(
+            nid,
+            "gEpBkcwxUjw" | "QzB4O+bJQyA" | "w5fcCG+t31g" | "C+Khtbbx2g8"
+        ) {
+            assert_eq!(size, 0, "{nid}");
+        }
+        if per_entry {
+            assert_eq!(result, 0, "{nid}");
+            assert_eq!(detail, SCE_KERNEL_ERROR_NOT_FOUND, "{nid} per-entry result");
+            assert_eq!(read_guest_u32(thread_pointer + 0x40), 77, "{nid}");
+        } else {
+            assert_eq!(result, u64::MAX, "{nid}");
+            assert_eq!(
+                read_guest_u32(thread_pointer + 0x40),
+                libc::ENOENT.cast_unsigned(),
+                "{nid}"
+            );
+            assert_eq!(detail, 0, "{nid} error index");
+        }
+    }
+
+    set_current_guest_thread_pointer(0);
+}
 
 #[test]
 fn ampr_read_records_a_deferred_transfer_without_touching_the_destination() {

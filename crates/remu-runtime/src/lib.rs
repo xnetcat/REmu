@@ -3491,10 +3491,13 @@ fn dispatch_probe_import(
         "ctTAcF5DiKQ" => av_player_get_stream_info(arguments, true, state),
         "ODJK2sn9w4A" | "k-q+xOxdc3E" => av_player_validate_handle(arguments[0], state),
         "hdTyRzCXQeQ" => av_player_stream_count(arguments[0], state),
-        "gEpBkcwxUjw" => ampr_resolve_file_paths(arguments, state),
+        // libkernel's APR resolver imports are POSIX-shaped: the SDK wrappers consume `-1` and
+        // `errno`, then translate that pair into an SCE kernel error. Returning an SCE error
+        // directly leaves the wrapper reading stale errno and can turn ENOENT into false success.
+        "gEpBkcwxUjw" => guest_posix_file_result(ampr_resolve_file_paths(arguments, state)),
         // One resolver reached through eight names: the variants differ only in whether the
         // caller wants sizes, supplies a prefix, or collects a per-entry result.
-        "WT-5NKy42fw" => ampr_resolve_paths_core(
+        "WT-5NKy42fw" => guest_posix_file_result(ampr_resolve_paths_core(
             arguments[0],
             arguments[1],
             None,
@@ -3504,8 +3507,8 @@ fn dispatch_probe_import(
                 ..AprResolveOutputs::default()
             },
             state,
-        ),
-        "eYAh2vlCY-U" => ampr_resolve_paths_core(
+        )),
+        "eYAh2vlCY-U" => guest_posix_file_result(ampr_resolve_paths_core(
             arguments[0],
             arguments[1],
             None,
@@ -3515,8 +3518,8 @@ fn dispatch_probe_import(
                 ..AprResolveOutputs::default()
             },
             state,
-        ),
-        "QzB4O+bJQyA" => ampr_resolve_paths_core(
+        )),
+        "QzB4O+bJQyA" => guest_posix_file_result(ampr_resolve_paths_core(
             arguments[0],
             arguments[1],
             None,
@@ -3527,8 +3530,8 @@ fn dispatch_probe_import(
                 ..AprResolveOutputs::default()
             },
             state,
-        ),
-        "i3HWvW35jao" => ampr_resolve_paths_core(
+        )),
+        "i3HWvW35jao" => guest_posix_file_result(ampr_resolve_paths_core(
             arguments[1],
             arguments[2],
             read_guest_cstring(arguments[0]),
@@ -3538,8 +3541,8 @@ fn dispatch_probe_import(
                 ..AprResolveOutputs::default()
             },
             state,
-        ),
-        "w5fcCG+t31g" => ampr_resolve_paths_core(
+        )),
+        "w5fcCG+t31g" => guest_posix_file_result(ampr_resolve_paths_core(
             arguments[1],
             arguments[2],
             read_guest_cstring(arguments[0]),
@@ -3550,8 +3553,8 @@ fn dispatch_probe_import(
                 ..AprResolveOutputs::default()
             },
             state,
-        ),
-        "VB-BtuIW8Xc" => ampr_resolve_paths_core(
+        )),
+        "VB-BtuIW8Xc" => guest_posix_file_result(ampr_resolve_paths_core(
             arguments[1],
             arguments[2],
             read_guest_cstring(arguments[0]),
@@ -3561,8 +3564,8 @@ fn dispatch_probe_import(
                 ..AprResolveOutputs::default()
             },
             state,
-        ),
-        "C+Khtbbx2g8" => ampr_resolve_paths_core(
+        )),
+        "C+Khtbbx2g8" => guest_posix_file_result(ampr_resolve_paths_core(
             arguments[1],
             arguments[2],
             read_guest_cstring(arguments[0]),
@@ -3573,7 +3576,7 @@ fn dispatch_probe_import(
                 ..AprResolveOutputs::default()
             },
             state,
-        ),
+        )),
         "WvEu7yl3Ivg" => ampr_get_file_size(arguments, state),
         "ApkYaHb8Sek" => ampr_get_file_stat(arguments, state),
         "eE4Szl8sil8" | "qvMUCyyaCSI" => ampr_submit_command_buffer(arguments, state),
