@@ -68,6 +68,12 @@ impl MetalPresenter {
         // A bounded batch prevents a continuously producing guest from starving redraw and input
         // delivery. Queue-local shader and memory waits leave independent guest queues runnable.
         for _ in 0..GPU_EVENTS_PER_TICK {
+            // A bounded drain can still spend several seconds preparing hundreds of large draws.
+            // Compiler workers publish into an independent result channel during that time.
+            // Refresh before every readiness decision so a pipeline that completed during this
+            // callback immediately releases its queue-local gate instead of remaining falsely
+            // "active" until the next AppKit callback.
+            self.receive_shader_compilations();
             let (source, event) = match self.receiver.try_recv(|key| {
                 self.compiled_shader_pairs.contains_key(key)
                     || self.failed_shader_pairs.contains(key)
