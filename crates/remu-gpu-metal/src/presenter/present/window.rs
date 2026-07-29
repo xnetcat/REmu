@@ -148,13 +148,21 @@ impl MetalPresenter {
         };
         let resident =
             resident_mib.map_or_else(|| "RSS ?".to_owned(), |mib| format!("RSS {mib} MiB"));
-        let sampled_texture_cache_bytes = self
+        let sampled_texture_cache_resident_bytes = self
+            .sampled_texture_cache
+            .values()
+            .fold(0_u64, |total, cached| {
+                total.saturating_add(cached.resident_bytes)
+            });
+        let sampled_texture_cache_guest_bytes = self
             .sampled_texture_cache
             .values()
             .fold(0_u64, |total, cached| {
                 total.saturating_add(cached.write_watch.range().1)
             });
-        let sampled_texture_cache_mib = sampled_texture_cache_bytes.div_ceil(1024 * 1024);
+        let sampled_texture_cache_mib = sampled_texture_cache_resident_bytes.div_ceil(1024 * 1024);
+        let sampled_texture_cache_guest_mib =
+            sampled_texture_cache_guest_bytes.div_ceil(1024 * 1024);
         let (metal_allocated_mib, metal_recommended_mib) =
             self.device.as_ref().map_or((0, 0), |device| {
                 (
@@ -289,9 +297,10 @@ impl MetalPresenter {
             let alias_writeback_nanoseconds =
                 SAMPLED_ALIAS_WRITEBACK_NANOSECONDS.swap(0, Ordering::Relaxed);
             eprintln!(
-                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms",
+                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB guest={}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms",
                 self.sampled_texture_cache.len(),
                 sampled_texture_cache_mib,
+                sampled_texture_cache_guest_mib,
                 metal_allocated_mib,
                 metal_recommended_mib,
                 self.sampled_texture_write_watches.len(),

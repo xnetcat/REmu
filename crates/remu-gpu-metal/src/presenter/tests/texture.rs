@@ -14,13 +14,14 @@ use super::{
     WriteWatchRefresh, apply_image_destination_select, comparison_depth32_upload,
     create_sampled_guest_texture, decode_image_descriptor, depth_array_face_descriptor,
     depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
-    guest_texture_byte_count, guest_texture_descriptors_overlap, guest_texture_raw_range,
+    guest_texture_byte_count, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
-    guest_texture_descriptors_share_storage, guest_texture_raw_matches,
+    guest_texture_descriptors_share_storage, guest_texture_raw_matches, guest_texture_raw_range,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
     mode27_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
-    render_resolve_candidate_matches, sampled_alias_descriptor, sampled_texture_cache_needs_reload,
+    render_resolve_candidate_matches, sampled_alias_descriptor, sampled_texture_cache_accepts,
+    sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
     snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
     storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
     write_watched_guest_texture_linear,
@@ -40,10 +41,7 @@ fn accepts_large_rdna2_storage_ranges_when_descriptor_math_is_valid() {
         pixel_format: MTLPixelFormat::RGBA16Float,
         bytes_per_pixel: 8,
     };
-    assert_eq!(
-        guest_texture_byte_count(descriptor),
-        Some(0x1040_0000)
-    );
+    assert_eq!(guest_texture_byte_count(descriptor), Some(0x1040_0000));
     assert_eq!(
         guest_texture_raw_range(descriptor),
         Ok((0x80_d9e4_0000, 0x1040_0000))
@@ -175,8 +173,7 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
         &mut presenter.sampled_texture_cache,
         &mut presenter.sampled_texture_write_watches,
         &mut presenter.fallback_texture_cache,
-        &mut presenter.sampled_texture_admission_order,
-        &mut presenter.next_sampled_texture_admission_id,
+        &mut presenter.next_sampled_texture_use,
     )
     .expect("storage alias upload");
 
@@ -311,6 +308,25 @@ fn sampled_texture_cache_reloads_cpu_dirty_content_without_an_acquire() {
     assert!(!sampled_texture_cache_needs_reload(
         WriteWatchRefresh::Reprotecting,
         true
+    ));
+}
+
+#[test]
+fn sampled_texture_cache_budget_uses_resident_bytes_and_rejects_oversize_entries() {
+    let capacity = Some(512 * 1024 * 1024);
+    assert!(sampled_texture_cache_accepts(128 * 1024 * 1024, capacity));
+    assert!(!sampled_texture_cache_accepts(513 * 1024 * 1024, capacity));
+    assert!(!sampled_texture_cache_requires_eviction(
+        17,
+        383 * 1024 * 1024,
+        128 * 1024 * 1024,
+        capacity,
+    ));
+    assert!(sampled_texture_cache_requires_eviction(
+        17,
+        385 * 1024 * 1024,
+        128 * 1024 * 1024,
+        capacity,
     ));
 }
 

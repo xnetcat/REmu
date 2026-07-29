@@ -26,9 +26,27 @@ use super::{
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
+
+pub(crate) fn sampled_texture_cache_accepts(
+    resident_bytes: u64,
+    byte_capacity: Option<u64>,
+) -> bool {
+    byte_capacity.is_none_or(|capacity| resident_bytes <= capacity)
+}
+
+pub(crate) fn sampled_texture_cache_requires_eviction(
+    entry_count: usize,
+    resident_bytes: u64,
+    incoming_bytes: u64,
+    byte_capacity: Option<u64>,
+) -> bool {
+    entry_count >= SAMPLED_TEXTURE_CACHE_CAPACITY
+        || byte_capacity
+            .is_some_and(|capacity| resident_bytes.saturating_add(incoming_bytes) > capacity)
+}
 
 fn diagnostic_r32_float_sample_override() -> Option<f32> {
     static VALUE: OnceLock<Option<f32>> = OnceLock::new();
@@ -101,8 +119,7 @@ pub(crate) fn upload_image_textures(
     sampled_texture_cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
     sampled_texture_write_watches: &mut HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
     fallback_texture_cache: &mut HashMap<SampledTextureKey, Texture>,
-    sampled_texture_admission_order: &mut VecDeque<(SampledTextureKey, u64)>,
-    next_sampled_texture_admission_id: &mut u64,
+    next_sampled_texture_use: &mut u64,
 ) -> Result<Vec<UploadedImageTexture>, String> {
     canonical_texture_bindings(evaluation)
         .into_iter()
@@ -504,8 +521,10 @@ pub(crate) fn upload_image_textures(
                         retire_sampled_texture(retired);
                     }
                 }
-                if let Some(cached) = sampled_texture_cache.get(&key) {
+                if let Some(cached) = sampled_texture_cache.get_mut(&key) {
                     SAMPLED_TEXTURE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                    *next_sampled_texture_use = next_sampled_texture_use.saturating_add(1);
+                    cached.last_use = *next_sampled_texture_use;
                     cached.texture.clone()
                 } else {
                     SAMPLED_TEXTURE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
@@ -556,51 +575,60 @@ pub(crate) fn upload_image_textures(
                         "REMu sampled guest image {:#x}",
                         descriptor.guest.address
                     ));
-                    let incoming_bytes = write_watch.range().1;
+                    // `allocatedSize` reflects the actual host texture retained by this cache
+                    // entry. The guest range can be block-compressed and excludes synthesized mip
+                    // levels, so charging it allowed a nominal 1.5 GiB cache to consume several
+                    // GiB of unified memory. Keep the guest span as a conservative floor for
+                    // drivers that report zero for texture views.
+                    let incoming_bytes = u64::try_from(texture.allocated_size())
+                        .unwrap_or(u64::MAX)
+                        .max(write_watch.range().1);
                     let byte_capacity = sampled_texture_cache_byte_capacity();
                     let mut cached_bytes = sampled_texture_cache.values().fold(
                         0_u64,
-                        |total, cached| {
-                            total.saturating_add(cached.write_watch.range().1)
-                        },
+                        |total, cached| total.saturating_add(cached.resident_bytes),
                     );
-                    while !sampled_texture_cache.is_empty()
-                        && (sampled_texture_cache.len() >= SAMPLED_TEXTURE_CACHE_CAPACITY
-                            || byte_capacity.is_some_and(|capacity| {
-                                cached_bytes.saturating_add(incoming_bytes) > capacity
-                            }))
+                    let cacheable = sampled_texture_cache_accepts(incoming_bytes, byte_capacity);
+                    while cacheable
+                        && !sampled_texture_cache.is_empty()
+                        && sampled_texture_cache_requires_eviction(
+                            sampled_texture_cache.len(),
+                            cached_bytes,
+                            incoming_bytes,
+                            byte_capacity,
+                        )
                     {
-                        let Some((old_key, admission_id)) =
-                            sampled_texture_admission_order.pop_front()
-                        else {
-                            break;
-                        };
-                        let is_current = sampled_texture_cache
-                            .get(&old_key)
-                            .is_some_and(|cached| cached.admission_id == admission_id);
-                        if is_current {
-                            if let Some(retired) = sampled_texture_cache.remove(&old_key) {
-                                cached_bytes =
-                                    cached_bytes.saturating_sub(retired.write_watch.range().1);
-                                SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS
-                                    .fetch_add(1, Ordering::Relaxed);
-                                retire_sampled_texture(retired);
-                            }
+                        let old_key = sampled_texture_cache
+                            .iter()
+                            .min_by_key(|(_, cached)| cached.last_use)
+                            .map(|(key, _)| *key)
+                            .expect("non-empty sampled texture cache has a least-recently-used key");
+                        if let Some(retired) = sampled_texture_cache.remove(&old_key) {
+                            cached_bytes = cached_bytes.saturating_sub(retired.resident_bytes);
+                            SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS
+                                .fetch_add(1, Ordering::Relaxed);
+                            retire_sampled_texture(retired);
                         }
                     }
-                    let admission_id = *next_sampled_texture_admission_id;
-                    *next_sampled_texture_admission_id =
-                        next_sampled_texture_admission_id.wrapping_add(1);
-                    sampled_texture_cache.insert(
-                        key,
-                        CachedSampledTexture {
-                            texture: texture.clone(),
-                            write_watch,
-                            overlap: super::GuestTextureOverlapQuery::new(descriptor.guest),
-                            admission_id,
-                        },
-                    );
-                    sampled_texture_admission_order.push_back((key, admission_id));
+                    if cacheable {
+                        *next_sampled_texture_use = next_sampled_texture_use.saturating_add(1);
+                        sampled_texture_cache.insert(
+                            key,
+                            CachedSampledTexture {
+                                texture: texture.clone(),
+                                write_watch,
+                                overlap: super::GuestTextureOverlapQuery::new(descriptor.guest),
+                                resident_bytes: incoming_bytes,
+                                last_use: *next_sampled_texture_use,
+                            },
+                        );
+                    } else {
+                        // An allocation larger than the complete cache budget remains alive through
+                        // the returned draw binding and its command batch, but must not make the
+                        // persistent cache unbounded. Its watch is no longer useful after this
+                        // immutable upload either.
+                        sampled_texture_write_watches.remove(&key);
+                    }
                     texture
                 }
             };

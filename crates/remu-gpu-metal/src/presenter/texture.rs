@@ -65,6 +65,10 @@ pub(crate) use self::sampled::{
 };
 pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
 #[cfg(test)]
+pub(crate) use self::upload::{
+    sampled_texture_cache_accepts, sampled_texture_cache_requires_eviction,
+};
+#[cfg(test)]
 pub(crate) use self::watch::{guest_texture_raw_range, sampled_texture_raw_range};
 pub(crate) use self::watch::{
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,

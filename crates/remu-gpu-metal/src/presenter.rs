@@ -53,10 +53,10 @@ use self::decode::{
     DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
     DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, NGG_MESHLET_WORDS_PER_GROUP, SPI_PS_INPUT_CNTL_0,
     VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
-    pixel_input_controls,
     common_render_target_array_length, decode_fast_clear_color,
     decode_render_targets_from_registers, decode_scanout_target, graphics_shader_resource_key,
-    initial_depth_clear_value, metal_primitive_topology_class, raw_video_out_layout_is_linear,
+    initial_depth_clear_value, metal_primitive_topology_class, pixel_input_controls,
+    raw_video_out_layout_is_linear,
 };
 #[cfg(test)]
 use self::diagnostics::parse_diagnostic_hex_address;
@@ -157,9 +157,10 @@ use self::texture::{
     depth_array_face_set_is_complete, ensure_mipmapped_resident_texture_in_map,
     guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
-    prepare_sampled_texture_upload, sampled_texture_cache_needs_reload, sampled_texture_key,
-    sampled_texture_raw_range, snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
-    watch_guest_texture, write_guest_texture_linear,
+    prepare_sampled_texture_upload, sampled_texture_cache_accepts,
+    sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
+    sampled_texture_key, sampled_texture_raw_range, snapshot_guest_texture_linear,
+    snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
 };
 use self::texture::{
     decode_guest_texture_linear_from_raw, refresh_resident_texture_write_watch,
@@ -758,7 +759,13 @@ struct CachedSampledTexture {
     texture: Texture,
     write_watch: Arc<GuestTextureWriteWatch>,
     overlap: GuestTextureOverlapQuery,
-    admission_id: u64,
+    /// Actual Metal allocation charged to the sampled-image cache budget.
+    ///
+    /// Guest bytes can be block-compressed while the host texture is expanded, and generated mip
+    /// levels also consume host storage that is absent from the watched guest range. Charging the
+    /// write-watch span therefore does not bound unified-memory use.
+    resident_bytes: u64,
+    last_use: u64,
 }
 
 struct GuestTextureWriteWatch {
@@ -1008,8 +1015,7 @@ struct MetalPresenter {
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     sampled_texture_write_watches: HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
     fallback_texture_cache: HashMap<SampledTextureKey, Texture>,
-    sampled_texture_admission_order: VecDeque<(SampledTextureKey, u64)>,
-    next_sampled_texture_admission_id: u64,
+    next_sampled_texture_use: u64,
     sampler_argument_cache: HashMap<SamplerArgumentCacheKey, CachedSamplerArguments>,
     depth_stencil_cache: HashMap<(u64, bool), DepthStencilState>,
     global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
@@ -1159,8 +1165,7 @@ impl MetalPresenter {
             sampled_texture_cache: HashMap::new(),
             sampled_texture_write_watches: HashMap::new(),
             fallback_texture_cache: HashMap::new(),
-            sampled_texture_admission_order: VecDeque::new(),
-            next_sampled_texture_admission_id: 0,
+            next_sampled_texture_use: 0,
             sampler_argument_cache: HashMap::new(),
             depth_stencil_cache: HashMap::new(),
             global_buffer_cache: HashMap::new(),

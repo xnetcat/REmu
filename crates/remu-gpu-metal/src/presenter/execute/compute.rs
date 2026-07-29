@@ -263,8 +263,7 @@ impl MetalPresenter {
             &mut self.sampled_texture_cache,
             &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
-            &mut self.sampled_texture_admission_order,
-            &mut self.next_sampled_texture_admission_id,
+            &mut self.next_sampled_texture_use,
         )?;
         let (sampler_buffer, samplers) = self.cached_sampler_argument_buffer(
             &device,

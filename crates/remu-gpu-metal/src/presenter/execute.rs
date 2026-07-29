@@ -535,8 +535,7 @@ impl MetalPresenter {
             &mut self.sampled_texture_cache,
             &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
-            &mut self.sampled_texture_admission_order,
-            &mut self.next_sampled_texture_admission_id,
+            &mut self.next_sampled_texture_use,
         )?;
         let pixel_textures = upload_image_textures(
             &device,
@@ -548,8 +547,7 @@ impl MetalPresenter {
             &mut self.sampled_texture_cache,
             &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
-            &mut self.sampled_texture_admission_order,
-            &mut self.next_sampled_texture_admission_id,
+            &mut self.next_sampled_texture_use,
         )?;
         let (
             pipeline,
@@ -1711,7 +1709,7 @@ impl MetalPresenter {
                                                 .sampled_texture_cache
                                                 .iter()
                                                 .filter(|(key, _)| key.descriptor == current)
-                                                .max_by_key(|(_, cached)| cached.admission_id)
+                                                .max_by_key(|(_, cached)| cached.last_use)
                                                 .and_then(|(_, cached)| {
                                                     let contents = read_texture_linear(
                                                         &device,
