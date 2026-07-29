@@ -149,12 +149,32 @@ fn begin_main_timed_condition_trace(
             i64::from_ne_bytes(read_guest_u64(deadline + 8).to_ne_bytes()),
         )
     };
+    let guest_rsp = frame.map_or(0, |frame| frame.guest_rsp);
+    // This trace targets the title's FEvent::Wait implementation at return 0x801210878. Its
+    // fixed prologue keeps the caller's frame pointer and return address at +0x88/+0x90 from the
+    // import stack. Following the preserved frame pointer identifies the game-loop caller above
+    // the generic event wrapper without changing guest synchronization behavior.
+    let (event_caller_rbp, event_caller_return) = if guest_rsp == 0 {
+        (0, 0)
+    } else {
+        (
+            read_guest_u64(guest_rsp.saturating_add(0x88)),
+            read_guest_u64(guest_rsp.saturating_add(0x90)),
+        )
+    };
+    let (parent_rbp, parent_return) = if event_caller_rbp == 0 {
+        (0, 0)
+    } else {
+        (
+            read_guest_u64(event_caller_rbp),
+            read_guest_u64(event_caller_rbp.saturating_add(8)),
+        )
+    };
     let (waiters_before, notifies_before, timeouts_before) = condition_trace_stats(condition);
     eprintln!(
-        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={:#x} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
+        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} parent={parent_return:#x}/rbp:{parent_rbp:#x} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
         current_guest_thread_handle(),
         frame.map_or(0, |frame| frame.guest_return_address),
-        frame.map_or(0, |frame| frame.guest_rsp),
         (0..1_000_000_000).contains(&deadline_nanoseconds),
     );
     Some(TimedConditionTrace {
