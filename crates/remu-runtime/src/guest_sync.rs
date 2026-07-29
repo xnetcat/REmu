@@ -3,7 +3,9 @@ use crate::{
     deliver_pending_guest_exception_at_import, low_u32, posix_pthread_result, read_guest_u64,
     relative_microseconds_until, trace_guest_sync,
 };
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 mod condition;
@@ -47,6 +49,32 @@ use self::state::{
 };
 
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static MAIN_CONDITION_NOTIFY_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn traced_main_conditions() -> &'static Mutex<BTreeSet<u64>> {
+    static CONDITIONS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
+    CONDITIONS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn trace_main_condition_notify(frame: Option<&ImportCallFrame>, condition: u64, broadcast: bool) {
+    if !trace_guest_sync()
+        || !traced_main_conditions()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&condition)
+    {
+        return;
+    }
+    let sequence = MAIN_CONDITION_NOTIFY_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    let (waiters, notifies, timeouts) = condition_trace_stats(condition);
+    eprintln!(
+        "[REMu][COND][MAIN-NOTIFY] sequence={sequence} thread={:?}/{:#x} return={:#x} rsp={:#x} condition={condition:#x} broadcast={broadcast} waiters={waiters} notifies_before={notifies} timeouts={timeouts}",
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+        frame.map_or(0, |frame| frame.guest_return_address),
+        frame.map_or(0, |frame| frame.guest_rsp),
+    );
+}
 
 #[derive(Clone, Copy)]
 struct TimedConditionTrace {
@@ -90,6 +118,10 @@ fn begin_main_timed_condition_trace(
     if thread_name != "main" && !thread_name.contains("GameThread") {
         return None;
     }
+    traced_main_conditions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(condition);
     let sequence = MAIN_TIMED_CONDITION_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     if sequence > 32 && !sequence.is_power_of_two() && timeout_usec < 10_000 {
         return None;
@@ -272,10 +304,22 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
             finish_main_timed_condition_trace(trace, result);
             result
         }
-        "kDh-NfxgMtE" => guest_condition_notify(arguments[0], false),
-        "2MOy+rUfuhQ" => posix_pthread_result(guest_condition_notify(arguments[0], false)),
-        "JGgj7Uvrl+A" => guest_condition_notify(arguments[0], true),
-        "mkx2fVhNMsg" => posix_pthread_result(guest_condition_notify(arguments[0], true)),
+        "kDh-NfxgMtE" => {
+            trace_main_condition_notify(frame, arguments[0], false);
+            guest_condition_notify(arguments[0], false)
+        }
+        "2MOy+rUfuhQ" => {
+            trace_main_condition_notify(frame, arguments[0], false);
+            posix_pthread_result(guest_condition_notify(arguments[0], false))
+        }
+        "JGgj7Uvrl+A" => {
+            trace_main_condition_notify(frame, arguments[0], true);
+            guest_condition_notify(arguments[0], true)
+        }
+        "mkx2fVhNMsg" => {
+            trace_main_condition_notify(frame, arguments[0], true);
+            posix_pthread_result(guest_condition_notify(arguments[0], true))
+        }
         "14bOACANTBo" => guest_pthread_once(arguments[0], arguments[1]),
         "Z4QosVuAsA0" => posix_pthread_result(guest_pthread_once(arguments[0], arguments[1])),
         "188x57JYp0g" => guest_semaphore_create(arguments),
