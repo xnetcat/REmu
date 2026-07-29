@@ -19,8 +19,9 @@ use self::async_queue::{
 use self::buffer::read_u64;
 use self::buffer::{
     allocate_dwords, is_packet, low_u8, low_u16, low_u32, mark_async_command_buffer,
-    mark_graphics_command_buffer, packet_opcode, packet_register, pm4, read_u8, read_u32,
-    register_graphics_continuation, trace_failed_sync_command, write_u32, write_u64, write_words,
+    mark_graphics_command_buffer, mark_graphics_release_allocation, packet_opcode, packet_register,
+    pm4, read_u8, read_u32, register_graphics_continuation, trace_failed_sync_command, write_u32,
+    write_u64, write_words,
 };
 pub(crate) use self::buffer::{
     consume_recorded_graphics_range, graphics_continuation_was_consumed,

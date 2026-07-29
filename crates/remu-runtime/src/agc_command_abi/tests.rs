@@ -232,6 +232,30 @@ fn ordinary_neighboring_allocations_are_not_guessed_as_a_missing_prefix() {
 }
 
 #[test]
+fn adjacent_unsubmitted_release_is_recovered_without_growth() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let buffer = fixture.address();
+    let command = call(
+        "wr23dPKyWc0",
+        args(&[buffer, 0x2f, 0x100, 1, 2, 0x70_0000_0000]),
+        args(&[2, 0x1122_3344_5566_7788, 0, 0, 2, 0x123]),
+    );
+
+    assert_eq!(command, fixture.start());
+    assert_eq!(
+        take_recorded_graphics_prefix(command + 32),
+        Some((command, 8)),
+        "the exact HLE release adjacent to a guest-authored tail is part of that submission"
+    );
+    assert_eq!(
+        take_recorded_graphics_prefix(command + 32),
+        None,
+        "a recovered release is consumed exactly once"
+    );
+}
+
+#[test]
 fn consumed_continuation_target_cannot_be_replayed_as_a_prefix() {
     let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([

@@ -32,6 +32,10 @@ struct RecentGraphicsAllocation {
     buffer_end: u64,
     start: u64,
     end: u64,
+    /// This exact allocation is an HLE-constructed release which has not yet appeared in a
+    /// successful submission. Such a release can be the synchronization prefix immediately
+    /// before a guest-authored DCB tail even when no grow callback ran.
+    recoverable_release: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -418,7 +422,7 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
     // The callback-observed replacement start is the only authoritative evidence that an
     // explicitly submitted tail lost a prefix to command-buffer growth. A cursor regression can
     // mean ordinary ring reuse; scanning that recycled memory for PM4 shape replays stale waits.
-    let (descriptor, generation, prefix_start) = recoveries
+    let grown_prefix = recoveries
         .iter()
         .filter_map(|(&descriptor, recovery)| {
             recovery
@@ -431,8 +435,42 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
                 })
                 .map(|prefix_start| (descriptor, recovery.generation, prefix_start))
         })
-        .max_by_key(|&(_, generation, _)| generation)?;
+        .max_by_key(|&(_, generation, _)| generation);
     drop(recoveries);
+
+    // Gen5 also emits a release through an HLE constructor immediately before a guest-authored
+    // DCB tail without invoking the descriptor's grow callback. The concrete allocation record,
+    // exact adjacency, and packet kind are authoritative; do not scan backward across arbitrary
+    // valid-looking PM4 as the old fallback did.
+    let adjacent_release = if grown_prefix.is_none() {
+        RECENT_COMMAND_ALLOCATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|allocation| {
+                allocation.recoverable_release
+                    && allocation.end == command_address
+                    && allocation.start >= lower_bound
+            })
+            .max_by_key(|allocation| allocation.generation)
+            .map(|allocation| {
+                (
+                    allocation.descriptor,
+                    allocation.generation,
+                    allocation.start,
+                )
+            })
+    } else {
+        None
+    };
+    let (descriptor, generation, prefix_start, grew) = grown_prefix
+        .map(|(descriptor, generation, prefix_start)| (descriptor, generation, prefix_start, true))
+        .or_else(|| {
+            adjacent_release
+                .map(|(descriptor, generation, prefix_start)| {
+                    (descriptor, generation, prefix_start, false)
+                })
+        })?;
 
     let submitted = RECENT_GRAPHICS_SUBMISSIONS
         .lock()
@@ -451,19 +489,25 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
         return None;
     }
 
-    let mut recoveries = GRAPHICS_COMMAND_BUFFER_GENERATIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let recovery = recoveries.get_mut(&descriptor)?;
-    if recovery.generation != generation || recovery.recovery_start != Some(prefix_start) {
-        return None;
-    }
-    recovery.recovery_start = None;
-    drop(recoveries);
+    if grew {
+        let mut recoveries = GRAPHICS_COMMAND_BUFFER_GENERATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recovery = recoveries.get_mut(&descriptor)?;
+        if recovery.generation != generation || recovery.recovery_start != Some(prefix_start) {
+            return None;
+        }
+        recovery.recovery_start = None;
+        drop(recoveries);
 
-    eprintln!(
-        "[REMu][AGC][PREFIX] recovered grow split={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={descriptor:#x} generation={generation}"
-    );
+        eprintln!(
+            "[REMu][AGC][PREFIX] recovered grow split={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={descriptor:#x} generation={generation}"
+        );
+    } else {
+        eprintln!(
+            "[REMu][AGC][PREFIX] recovered adjacent release={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={descriptor:#x} generation={generation}"
+        );
+    }
     let mut allocations = RECENT_COMMAND_ALLOCATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -501,6 +545,28 @@ pub(crate) fn consume_recorded_graphics_range(command_address: u64, dword_count:
         {
             recovery.recovery_start = None;
         }
+    }
+}
+
+/// Marks one exact constructor allocation as a synchronization prefix candidate.
+///
+/// The guest can submit a directly authored DCB tail beginning immediately after this release.
+/// Keeping the semantic marker on the allocation lets submission recovery include that release
+/// without treating unrelated PM4 bytes in the recycled command ring as executable.
+pub(super) fn mark_graphics_release_allocation(command: u64) {
+    const RELEASE_DWORDS: u64 = 8;
+    let Some(command_end) = command.checked_add(RELEASE_DWORDS * 4) else {
+        return;
+    };
+    let mut allocations = RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(allocation) = allocations
+        .iter_mut()
+        .rev()
+        .find(|allocation| allocation.start == command && allocation.end == command_end)
+    {
+        allocation.recoverable_release = true;
     }
 }
 
@@ -582,6 +648,7 @@ pub(crate) fn track_graphics_command_allocation(
         buffer_end,
         start: command,
         end: command_end,
+        recoverable_release: false,
     });
     if allocations.len() > 16_384 {
         let drain_count = allocations.len() - 8_192;
@@ -642,6 +709,7 @@ fn track_graphics_allocation_for_generation(
         buffer_end,
         start: command,
         end: command_end,
+        recoverable_release: false,
     });
     if allocations.len() > 16_384 {
         let drain_count = allocations.len() - 8_192;

@@ -3,8 +3,9 @@
 
 use super::{
     IT_DISPATCH_DIRECT, IT_INDIRECT_BUFFER, IT_NOP, IT_SET_SH_REG, MAX_PACKET_DWORDS,
-    R_RELEASE_MEM, R_ZERO, allocate_dwords, low_u8, low_u16, low_u32, pm4, read_u32,
-    register_graphics_continuation, write_u32, write_words,
+    R_RELEASE_MEM, R_ZERO, allocate_dwords, low_u8, low_u16, low_u32,
+    mark_graphics_release_allocation, pm4, read_u32, register_graphics_continuation, write_u32,
+    write_words,
 };
 
 pub(super) fn type_two_packet(arguments: [u64; 6]) -> u64 {
@@ -212,5 +213,6 @@ pub(super) fn cb_release_mem(arguments: [u64; 6], stack: [u64; 6]) -> u64 {
             interrupt_context,
         ],
     );
+    mark_graphics_release_allocation(command);
     command
 }
