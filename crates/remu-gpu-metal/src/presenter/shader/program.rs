@@ -1,10 +1,9 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::{
-    ComputePipelineKey, ProgramIdentity, image_component_class, pixel_input_controls,
-    register_value,
-};
+use super::{ComputePipelineKey, ProgramIdentity, image_component_class, register_value};
+#[cfg(test)]
+use super::pixel_input_controls;
 use remu_gpu::{ComputeDispatch, GpuRegister, IndexedDraw};
 use remu_shader::{
     InstructionControl, OperandKind, Program, ShaderEvaluation, image_is_comparison,
@@ -448,6 +447,7 @@ pub(crate) fn procedural_rectangle_export_stage(program: &Program) -> bool {
         && coordinate_mads >= 2
 }
 
+#[cfg(test)]
 pub(crate) fn rectangle_draw_has_incomplete_interface(draw: &IndexedDraw) -> bool {
     if !matches!(draw.primitive_type, 7 | 0x11) || draw.indexed || draw.index_count != 3 {
         return false;

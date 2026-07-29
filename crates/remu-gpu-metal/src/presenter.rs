@@ -42,9 +42,9 @@ use self::decode::{
     decode_render_target_format, decode_render_targets, decode_scissor, decode_viewport,
     fallback_image_descriptor, graphics_pipeline_key, image_component_class,
     initial_depth_clear_for_target, initial_render_target_clear_color, metal_color_write_mask,
-    metal_nonindexed_vertex_count, metal_primitive_type, pixel_input_controls,
-    prepare_indexed_primitive, prepare_ngg_meshlets, raw_video_out_texture_descriptor,
-    read_draw_indices, register_value, render_target_fast_clear_color, sampled_alias_descriptor,
+    metal_nonindexed_vertex_count, metal_primitive_type, prepare_indexed_primitive,
+    prepare_ngg_meshlets, raw_video_out_texture_descriptor, read_draw_indices, register_value,
+    render_target_fast_clear_color, sampled_alias_descriptor,
 };
 #[cfg(test)]
 use self::decode::{
@@ -53,6 +53,7 @@ use self::decode::{
     DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
     DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, NGG_MESHLET_WORDS_PER_GROUP, SPI_PS_INPUT_CNTL_0,
     VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
+    pixel_input_controls,
     common_render_target_array_length, decode_fast_clear_color,
     decode_render_targets_from_registers, decode_scanout_target, graphics_shader_resource_key,
     initial_depth_clear_value, metal_primitive_topology_class, raw_video_out_layout_is_linear,

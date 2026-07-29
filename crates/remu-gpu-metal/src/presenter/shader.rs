@@ -23,7 +23,7 @@ use super::{
     diagnostic_video_chain_selected_draw, dump_msl_instruction_filter_matches,
     dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, image_component_class, metal_color_write_mask,
-    pixel_input_controls, register_value, video_target_binding_summary,
+    register_value, video_target_binding_summary,
 };
 mod archive;
 mod compile;
@@ -33,16 +33,17 @@ pub(crate) use self::compile::{
     dump_compute_shader_msl, dump_shader_pair_ir, dump_shader_pair_msl, metal_cache_root,
 };
 #[cfg(test)]
-pub(crate) use self::program::shader_scalar_metadata;
+pub(crate) use self::program::{
+    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
+};
 pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
     ngg_mesh_export_stage, pixel_interpolation_attribute_mask, pixel_scalars,
     procedural_rectangle_export_stage, program_embeds_global_base, program_uses_lds,
-    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
-    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
-    vertex_parameter_export_mask, wave64_split_blockers,
+    rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
+    validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
 
 impl MetalPresenter {
