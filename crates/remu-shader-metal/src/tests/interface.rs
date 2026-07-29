@@ -283,21 +283,31 @@ fn builds_fused_es_gs_rectangle_equivalent_for_volume_generation() {
 }
 
 #[test]
-fn builds_procedural_rectangle_with_tint_and_scaled_uv_parameters() {
-    let shader = compile_procedural_rectangle_vertex(2);
+fn builds_procedural_rectangle_from_pixel_consumer_parameter_roles() {
+    let shader = compile_procedural_rectangle_vertex(4, 0b1011);
 
     assert_eq!(shader.stage, MetalShaderStage::Vertex);
-    assert_eq!(shader.interpolated_attribute_count, 2);
+    assert_eq!(shader.interpolated_attribute_count, 4);
     assert!(
         shader
             .source
             .contains("remu_out.position = float4(remu_uv * 2.0f - 1.0f, 0.0f, 1.0f);")
     );
-    assert!(shader.source.contains("remu_out.param0 = float4(1.0f);"));
     assert!(
         shader
             .source
-            .contains("remu_out.param1 = float4(remu_uv, 1.0f, 1.0f);")
+            .contains("remu_out.param0 = float4(remu_uv.x, 1.0f - remu_uv.y, 1.0f, 1.0f);")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_out.param1 = float4(remu_uv.x, 1.0f - remu_uv.y, 1.0f, 1.0f);")
+    );
+    assert!(shader.source.contains("remu_out.param2 = float4(1.0f);"));
+    assert!(
+        shader
+            .source
+            .contains("remu_out.param3 = float4(remu_uv.x, 1.0f - remu_uv.y, 1.0f, 1.0f);")
     );
 }
 

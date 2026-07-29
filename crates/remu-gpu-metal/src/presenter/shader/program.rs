@@ -6,7 +6,10 @@ use super::{
     register_value,
 };
 use remu_gpu::{ComputeDispatch, GpuRegister, IndexedDraw};
-use remu_shader::{InstructionControl, Program, ShaderEvaluation, image_is_comparison};
+use remu_shader::{
+    InstructionControl, OperandKind, Program, ShaderEvaluation, image_is_comparison,
+};
+use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) fn graphics_allocated_vector_register_count(
@@ -243,6 +246,74 @@ pub(crate) fn pixel_interpolation_attribute_mask(program: &Program) -> u32 {
             (interpolation.attribute < 32).then_some(1_u32 << interpolation.attribute)
         })
         .fold(0, |mask, attribute| mask | attribute)
+}
+
+/// Determines which missing physical rectangle parameters supply texture coordinates.
+///
+/// The AGC procedural rectangle stage does not contain conventional PARAM exports. Its pixel
+/// consumer still makes the parameter roles unambiguous: trace the first texture sample's address
+/// VGPRs backward through their vector data dependencies and collect the interpolation operations
+/// which produce them. `V_INTERP_P1` only creates an intermediate; `V_INTERP_P2` or
+/// `V_INTERP_MOV` materializes the attribute value. Return `None` when no analyzable texture sample
+/// exists so callers can retain a conservative legacy fallback for unrelated procedural shaders.
+pub(crate) fn rectangle_coordinate_parameter_mask(
+    program: &Program,
+    controls: &[u32; 32],
+) -> Option<u32> {
+    let (sample_index, image) =
+        program
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, instruction)| {
+                (instruction.opcode.starts_with("ImageSample")
+                    || instruction.opcode.starts_with("ImageGather"))
+                .then(|| match instruction.control.as_ref() {
+                    Some(InstructionControl::Image(image)) => Some((index, image)),
+                    _ => None,
+                })
+                .flatten()
+            })?;
+
+    let mut live_vectors = image
+        .address_registers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut mask = 0_u32;
+    for instruction in program.instructions[..sample_index].iter().rev() {
+        let writes_live_vector = instruction.destinations.iter().any(|destination| {
+            destination.kind == OperandKind::VectorRegister
+                && live_vectors.contains(&destination.value)
+        });
+        if !writes_live_vector {
+            continue;
+        }
+        for destination in &instruction.destinations {
+            if destination.kind == OperandKind::VectorRegister {
+                live_vectors.remove(&destination.value);
+            }
+        }
+
+        if let Some(InstructionControl::Interpolation(interpolation)) = instruction.control.as_ref()
+            && !instruction.opcode.starts_with("VInterpP1")
+            && interpolation.attribute < 32
+        {
+            let control = remu_shader_metal::PixelInputControl::from_register(
+                controls[interpolation.attribute as usize],
+            );
+            if !control.uses_default() {
+                mask |= 1_u32 << control.input_offset;
+            }
+            continue;
+        }
+        for source in &instruction.sources {
+            if source.kind == OperandKind::VectorRegister {
+                live_vectors.insert(source.value);
+            }
+        }
+    }
+    Some(mask)
 }
 
 pub(crate) fn missing_vertex_parameter_exports(

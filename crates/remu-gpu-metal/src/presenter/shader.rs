@@ -40,8 +40,9 @@ pub(crate) use self::program::{
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
     ngg_mesh_export_stage, pixel_interpolation_attribute_mask, pixel_scalars,
     procedural_rectangle_export_stage, program_embeds_global_base, program_uses_lds,
-    shader_scalar_metadata_for_registers, skip_incomplete_rectangle_draw,
-    validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
+    rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
+    skip_incomplete_rectangle_draw, validate_compute_launch_for_metal,
+    vertex_parameter_export_mask, wave64_split_blockers,
 };
 
 impl MetalPresenter {
@@ -301,8 +302,21 @@ impl MetalPresenter {
                 key.render_target_array_length,
             )
         } else if uses_procedural_rectangle_stage {
+            let coordinate_parameter_mask =
+                rectangle_coordinate_parameter_mask(&pixel.program, &key.pixel_input_controls)
+                    .unwrap_or_else(|| {
+                        // A sample-free procedural consumer has no data-flow evidence for
+                        // parameter roles. Preserve the previous convention for that unrelated
+                        // case: one input is UV, while input zero of a wider interface is tint.
+                        if pixel_msl.interpolated_attribute_count == 1 {
+                            1
+                        } else {
+                            u32::MAX & !1
+                        }
+                    });
             remu_shader_metal::compile_procedural_rectangle_vertex(
                 pixel_msl.interpolated_attribute_count,
+                coordinate_parameter_mask,
             )
         } else {
             remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)

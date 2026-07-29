@@ -439,11 +439,16 @@ pub fn compile_layered_rectangle_vertex(
 /// The common AGC fullscreen stage emits primitive data and position, but no conventional
 /// `EXP PARAM` instructions. On Prospero those rectangle parameters are generated as part of the
 /// primitive path. Metal exposes no equivalent stage, so emit the complete four-corner strip and
-/// its screen-space parameters directly. Attribute zero is the conventional modulation/tint
-/// parameter when a paired UI shader consumes more than one attribute; subsequent attributes
-/// carry UV and unit scale. A single attribute is treated as UV.
+/// its screen-space parameters directly. The paired pixel shader determines which physical
+/// parameters carry rectangle coordinates; every other missing parameter receives the
+/// architectural unit modulation value. Metal's render-target rows run opposite to the guest
+/// rectangle's interpolated Y coordinate, so coordinate parameters reverse Y while preserving
+/// the strip's position and winding.
 #[must_use]
-pub fn compile_procedural_rectangle_vertex(interpolated_attribute_count: u32) -> MetalShader {
+pub fn compile_procedural_rectangle_vertex(
+    interpolated_attribute_count: u32,
+    coordinate_parameter_mask: u32,
+) -> MetalShader {
     let mut source = String::from(
         "#include <metal_stdlib>\nusing namespace metal;\n\n\
          struct RemuVsOut {\n\
@@ -464,10 +469,10 @@ pub fn compile_procedural_rectangle_vertex(interpolated_attribute_count: u32) ->
          \x20   remu_out.position = float4(remu_uv * 2.0f - 1.0f, 0.0f, 1.0f);\n",
     );
     for location in 0..interpolated_attribute_count {
-        let value = if interpolated_attribute_count > 1 && location == 0 {
-            "float4(1.0f)"
+        let value = if coordinate_parameter_mask & (1 << location) != 0 {
+            "float4(remu_uv.x, 1.0f - remu_uv.y, 1.0f, 1.0f)"
         } else {
-            "float4(remu_uv, 1.0f, 1.0f)"
+            "float4(1.0f)"
         };
         let _ = writeln!(source, "    remu_out.param{location} = {value};");
     }
