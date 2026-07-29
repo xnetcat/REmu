@@ -126,12 +126,13 @@ struct AudioMixer {
 }
 
 impl AudioMixer {
-    fn add_port(&mut self, handle: i32) {
+    fn add_port(&mut self, handle: i32, maximum_queued_frames: usize) {
         self.queues.entry(handle).or_insert_with(|| AudioQueue {
-            // Audio pushes hold the same lock as the host render callback. Reserve the normal
-            // buffering window before playback starts so steady-state submissions only copy
-            // samples and cannot stop CoreAudio behind a VecDeque allocation.
-            frames: VecDeque::with_capacity(AUDIO_PREBUFFER_FRAMES),
+            // Audio pushes hold the same lock as the host render callback. Reserve the complete
+            // bounded latency window before playback starts, not only the normal prebuffer.
+            // A delayed CoreAudio callback can otherwise let the queue grow past the prebuffer
+            // and allocate while holding the real-time callback's mutex.
+            frames: VecDeque::with_capacity(maximum_queued_frames.max(AUDIO_PREBUFFER_FRAMES)),
             started: false,
         });
     }
@@ -395,10 +396,12 @@ impl AudioOutState {
             },
         );
         if let Some(host) = self.host.as_ref() {
+            let maximum_queued_frames =
+                usize::try_from(host.sample_rate).unwrap_or(48_000) * MAX_QUEUED_AUDIO_SECONDS;
             host.mixer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .add_port(handle);
+                .add_port(handle, maximum_queued_frames);
         }
         self.successful_opens = self.successful_opens.saturating_add(1);
         if self.successful_opens <= 8 || self.successful_opens.is_power_of_two() {
@@ -712,8 +715,8 @@ const fn low_i32(value: u64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIO_PREBUFFER_FRAMES, AudioFormat, AudioMixer, AudioOutState, AudioPort, SampleEncoding,
-        StreamingStereoResampler, decode_stereo_frames,
+        AUDIO_PREBUFFER_FRAMES, AudioFormat, AudioMixer, AudioOutState, AudioPort,
+        MAX_QUEUED_AUDIO_SECONDS, SampleEncoding, StreamingStereoResampler, decode_stereo_frames,
     };
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
@@ -869,7 +872,7 @@ mod tests {
     #[test]
     fn mixer_prebuffers_and_rebuffers_without_consuming_partial_callbacks() {
         let mut mixer = AudioMixer::default();
-        mixer.add_port(1);
+        mixer.add_port(1, AUDIO_PREBUFFER_FRAMES);
         assert!(mixer.push(
             1,
             std::iter::repeat_n([0.25, -0.25], AUDIO_PREBUFFER_FRAMES / 2)
@@ -904,7 +907,7 @@ mod tests {
     #[test]
     fn realtime_queue_retains_newest_frames_within_latency_budget() {
         let mut mixer = AudioMixer::default();
-        mixer.add_port(1);
+        mixer.add_port(1, 4);
         assert_eq!(
             mixer.push_realtime_bounded(1, (0..6).map(|value| [value as f32, 0.0]).collect(), 4,),
             Some(2)
@@ -929,6 +932,19 @@ mod tests {
                 .map(|frame| frame[0])
                 .collect::<Vec<_>>(),
             [5.0, 6.0, 7.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn mixer_reserves_the_complete_realtime_latency_window() {
+        let mut mixer = AudioMixer::default();
+        let maximum = 48_000 * MAX_QUEUED_AUDIO_SECONDS;
+
+        mixer.add_port(1, maximum);
+
+        assert!(
+            mixer.queues[&1].frames.capacity() >= maximum,
+            "a bounded realtime push must not allocate while holding the callback mutex"
         );
     }
 }
