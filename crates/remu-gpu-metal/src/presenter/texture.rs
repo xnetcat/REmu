@@ -3,15 +3,18 @@
 
 use super::{
     CachedSampledTexture, DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget,
-    DepthArrayKey, DepthArrayResidentTexture, DirectScanoutTexture, GuestTextureDescriptor,
-    GuestTextureOverlapQuery, GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
-    MIP_UPLOAD_NANOSECONDS, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
-    MultisampleTextureKey, RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
-    ResidentGuestTexture, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    DepthArrayKey, DepthArrayResidentTexture, DirectScanoutTexture, GuestTextureContentState,
+    GuestTextureDescriptor, GuestTextureOverlapQuery, GuestTextureWatchRange,
+    GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
+    MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
+    RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
+    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
-    SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
+    SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_DIRTY_VALIDATION_BYTES,
+    TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
+    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, UploadedImageTexture, WriteWatchRefresh,
     canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled_at_z,
     copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z, decode_image_descriptor,
@@ -202,7 +205,7 @@ pub(super) fn write_watched_guest_texture_linear(
         .ok_or("guest texture byte count overflows the host address space")?;
     let destination_length =
         usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
-    write_watch
+    let raw = write_watch
         .with_live_backing(|| {
             let mut destination = vec![0; destination_length];
             if !read_guest_shared_backing(descriptor.address, &mut destination) {
@@ -218,9 +221,11 @@ pub(super) fn write_watched_guest_texture_linear(
                     descriptor.address
                 ));
             }
-            Ok(())
+            Ok(destination)
         })
-        .and_then(|result| result)
+        .and_then(|result| result)?;
+    write_watch.record_content_snapshot(descriptor.address, &raw);
+    Ok(())
 }
 
 #[cfg(test)]

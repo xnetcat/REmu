@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedSampledTexture, DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureWriteWatch,
-    MetalPresenter, Mode27WorkOrigin, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
+    CachedSampledTexture, DecodedImageDescriptor, GuestTextureContentState, GuestTextureDescriptor,
+    GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter, Mode27WorkOrigin,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
+    TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+    TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     WriteWatchRefresh, create_guest_texture, create_mipmapped_guest_texture,
     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
@@ -23,6 +26,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+/// Validation granularity for page-dirty guest image contents.
+///
+/// This is deliberately smaller than the 16 KiB guest page and independent of the host page
+/// size. A false-positive protection fault therefore hashes only the touched neighborhood rather
+/// than copying and decoding a complete multi-megabyte image.
+const CONTENT_FINGERPRINT_CHUNK_BYTES: u64 = 4 * 1024;
 
 impl MetalPresenter {
     pub(crate) fn synchronize_cpu_written_guest_resources(
@@ -63,21 +73,27 @@ impl MetalPresenter {
                     .get_mut(&descriptor)
                     .expect("collected resident texture exists"),
             )?;
-            let was_dirty_before_renewal = match refresh {
-                WriteWatchRefresh::Renewed { was_dirty } => was_dirty,
+            match refresh {
                 WriteWatchRefresh::Replaced => {
                     if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
                         trace_resident_texture_removal("acquire-mapping-replaced", &resident);
                     }
                     continue;
                 }
-                WriteWatchRefresh::Active | WriteWatchRefresh::Reprotecting => false,
-            };
+                WriteWatchRefresh::Reprotecting => continue,
+                WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {}
+            }
             let resident = self
                 .resident_guest_textures
                 .get_mut(&descriptor)
                 .expect("overlapping resident survived write-watch refresh");
-            if !resident.write_watch.is_dirty() && !was_dirty_before_renewal {
+            if !resident.write_watch.content_has_changed()? {
+                if resident.gpu_written {
+                    // A permission-only renewal resets watch generations. Once sparse content
+                    // validation proves that guest bytes did not change, move the GPU ownership
+                    // boundary into the new generation domain instead of retiring it later.
+                    resident.note_gpu_write();
+                }
                 continue;
             }
             // When the CPU is already authoritative for the complete resident, an acquire only
@@ -178,21 +194,22 @@ impl MetalPresenter {
                     .expect("overlapping sampled texture exists"),
                 &mut self.sampled_texture_write_watches,
             )?;
-            let was_dirty_before_renewal = match refresh {
-                WriteWatchRefresh::Renewed { was_dirty } => was_dirty,
+            match refresh {
                 WriteWatchRefresh::Replaced => {
                     if let Some(retired) = self.sampled_texture_cache.remove(&key) {
                         retire_sampled_texture(retired);
                     }
                     continue;
                 }
-                WriteWatchRefresh::Active | WriteWatchRefresh::Reprotecting => false,
-            };
+                WriteWatchRefresh::Reprotecting => continue,
+                WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {}
+            }
             if !self
                 .sampled_texture_cache
                 .get(&key)
-                .is_some_and(|cached| cached.write_watch.is_dirty())
-                && !was_dirty_before_renewal
+                .expect("overlapping sampled texture survived write-watch refresh")
+                .write_watch
+                .content_has_changed()?
             {
                 continue;
             }
@@ -216,32 +233,63 @@ impl GuestTextureWriteWatch {
                 "guest texture range {address:#x}+{byte_count:#x} has no complete live shared backing"
             )
         })?;
+        let canonical_identity = guest_shared_mapping_identity(address, 1).ok_or_else(|| {
+            format!("guest texture base {address:#x} has no live shared-backing identity")
+        })?;
         let ranges = segments
             .into_iter()
             .map(|segment| {
+                let alias_identity =
+                    guest_shared_mapping_identity(segment.address, 1).ok_or_else(|| {
+                        format!(
+                            "guest texture alias {:#x} has no live shared-backing identity",
+                            segment.address
+                        )
+                    })?;
+                if alias_identity.backing_id != canonical_identity.backing_id
+                    || alias_identity.backing_offset < canonical_identity.backing_offset
+                {
+                    return Err(format!(
+                        "guest texture alias {:#x} does not belong to canonical backing at {address:#x}",
+                        segment.address
+                    ));
+                }
+                let canonical_address = address
+                    .checked_add(alias_identity.backing_offset - canonical_identity.backing_offset)
+                    .ok_or("guest texture canonical alias address overflows")?;
                 // SAFETY: the backing resolver returned live readable/writable CPU aliases that
                 // cover this exact GPU-physical resource span.
-                unsafe { CpuWriteWatch::new(segment.address, segment.byte_count) }.map_err(
-                    |error| {
+                unsafe { CpuWriteWatch::new(segment.address, segment.byte_count) }
+                    .map(|watch| GuestTextureWatchRange {
+                        watch,
+                        canonical_address,
+                    })
+                    .map_err(|error| {
                         format!(
                             "could not watch guest texture CPU writes at {:#x}+{:#x}: {error}",
                             segment.address, segment.byte_count
                         )
-                    },
-                )
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let chunk_count = usize::try_from(byte_count.div_ceil(CONTENT_FINGERPRINT_CHUNK_BYTES))
+            .map_err(|_| "guest texture fingerprint chunk count does not fit usize")?;
         Ok(Self {
             address,
             byte_count,
             ranges,
+            content_state: Arc::new(std::sync::Mutex::new(GuestTextureContentState {
+                chunk_fingerprints: vec![0; chunk_count],
+                initialized_chunks: vec![false; chunk_count],
+                pending_dirty_ranges: Vec::new(),
+            })),
         })
     }
 
     pub(crate) fn retirement(&self) -> Option<CpuWriteWatchRetirement> {
         let mut retirement = None;
-        for watch in &self.ranges {
-            match watch.retirement() {
+        for range in &self.ranges {
+            match range.watch.retirement() {
                 Some(CpuWriteWatchRetirement::Replaced) => {
                     return Some(CpuWriteWatchRetirement::Replaced);
                 }
@@ -262,31 +310,46 @@ impl GuestTextureWriteWatch {
     pub(crate) fn consume_dirty(&self) -> bool {
         self.ranges
             .iter()
-            .fold(false, |dirty, watch| watch.consume_dirty() || dirty)
+            .fold(false, |dirty, range| range.watch.consume_dirty() || dirty)
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
-        self.ranges.iter().any(CpuWriteWatch::is_dirty)
+        self.ranges.iter().any(|range| range.watch.is_dirty())
     }
 
     pub(crate) fn precise_tracking(&self) -> bool {
-        self.ranges.iter().all(CpuWriteWatch::precise_tracking)
+        self.ranges
+            .iter()
+            .all(|range| range.watch.precise_tracking())
     }
 
     pub(crate) fn generations(&self) -> Vec<u64> {
-        self.ranges.iter().map(CpuWriteWatch::generation).collect()
+        self.ranges
+            .iter()
+            .map(|range| range.watch.generation())
+            .collect()
     }
 
     pub(crate) fn dirty_page_ranges(&self) -> Vec<(u64, u64)> {
         self.ranges
             .iter()
-            .flat_map(CpuWriteWatch::dirty_page_ranges)
+            .flat_map(|range| {
+                let (alias_address, _) = range.watch.range();
+                range.watch.dirty_page_ranges().into_iter().filter_map(
+                    move |(dirty_address, dirty_bytes)| {
+                        let offset = dirty_address.checked_sub(alias_address)?;
+                        let canonical_address = range.canonical_address.checked_add(offset)?;
+                        Some((canonical_address, dirty_bytes))
+                    },
+                )
+            })
             .collect()
     }
 
     pub(crate) fn rearm(&self) -> Result<(), String> {
-        for watch in &self.ranges {
-            watch
+        for range in &self.ranges {
+            range
+                .watch
                 .rearm()
                 .map_err(|error| format!("could not rearm guest texture CPU writes: {error}"))?;
         }
@@ -314,8 +377,8 @@ impl GuestTextureWriteWatch {
         let watch = self
             .ranges
             .iter()
-            .find(|watch| {
-                let (watch_address, watch_bytes) = watch.range();
+            .find(|range| {
+                let (watch_address, watch_bytes) = range.watch.range();
                 watch_address <= address
                     && watch_address
                         .checked_add(watch_bytes)
@@ -326,7 +389,7 @@ impl GuestTextureWriteWatch {
                     "guest texture mapping {address:#x}+{byte_count:#x} has no single covering write watch"
                 )
             })?;
-        watch.with_live_mapping(operation).map_err(|error| {
+        watch.watch.with_live_mapping(operation).map_err(|error| {
             format!(
                 "guest texture mapping {address:#x}+{byte_count:#x} was retired during access: {error}"
             )
@@ -348,6 +411,7 @@ impl GuestTextureWriteWatch {
         // Pinning any one live alias therefore pins the shared backing transaction even when the
         // physical resource is exposed through several disjoint guest virtual mappings.
         watch
+            .watch
             .with_live_mapping(|| {
                 if let Some(retirement) = self.retirement() {
                     Err(format!(
@@ -371,8 +435,8 @@ impl GuestTextureWriteWatch {
         let Some(end) = address.checked_add(byte_count) else {
             return false;
         };
-        self.ranges.iter().any(|watch| {
-            let (watch_address, watch_bytes) = watch.range();
+        self.ranges.iter().any(|range| {
+            let (watch_address, watch_bytes) = range.watch.range();
             watch_address <= address
                 && watch_address
                     .checked_add(watch_bytes)
@@ -381,11 +445,136 @@ impl GuestTextureWriteWatch {
     }
 
     pub(crate) fn overlaps_alias_range(&self, address: u64, byte_count: u64) -> bool {
-        Self::ranges_overlap_alias(&self.ranges, address, byte_count, |watch| watch.range())
+        Self::ranges_overlap_alias(&self.ranges, address, byte_count, |range| {
+            range.watch.range()
+        })
     }
 
     pub(crate) fn alias_ranges(&self) -> Vec<(u64, u64)> {
-        self.ranges.iter().map(CpuWriteWatch::range).collect()
+        self.ranges
+            .iter()
+            .map(|range| range.watch.range())
+            .collect()
+    }
+
+    pub(crate) fn inherit_content_state_from(&mut self, previous: &Self) -> Result<(), String> {
+        if self.range() != previous.range() {
+            return Err(format!(
+                "cannot inherit texture content state across ranges {:#x}+{:#x} and {:#x}+{:#x}",
+                previous.address, previous.byte_count, self.address, self.byte_count
+            ));
+        }
+        let was_dirty = previous.is_dirty();
+        let mut dirty_ranges = previous.dirty_page_ranges();
+        if was_dirty && dirty_ranges.is_empty() {
+            // Lifetime-only tracking cannot provide page detail. Preserve correctness by making
+            // the whole resource a pending validation range instead of losing the old dirty bit.
+            dirty_ranges.push(previous.range());
+        }
+        let content_state = Arc::clone(&previous.content_state);
+        if !dirty_ranges.is_empty() {
+            content_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_dirty_ranges
+                .extend(dirty_ranges);
+        }
+        self.content_state = content_state;
+        Ok(())
+    }
+
+    pub(crate) fn content_has_changed(&self) -> Result<bool, String> {
+        let mut dirty_ranges = self
+            .content_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_dirty_ranges
+            .clone();
+        dirty_ranges.extend(self.dirty_page_ranges());
+        if self.is_dirty() && dirty_ranges.is_empty() {
+            dirty_ranges.push(self.range());
+        }
+        let dirty_ranges = normalize_content_ranges(self, dirty_ranges);
+        if dirty_ranges.is_empty() {
+            return Ok(false);
+        }
+        if !self.precise_tracking() {
+            return Ok(true);
+        }
+
+        let started = Instant::now();
+        let chunks = snapshot_dirty_content_chunks(self, dirty_ranges)?;
+        let validated_bytes = chunks.iter().fold(0_u64, |total, chunk| {
+            total.saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX))
+        });
+        let mut state = self
+            .content_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = chunks.iter().any(|chunk| {
+            !state
+                .initialized_chunks
+                .get(chunk.index)
+                .copied()
+                .unwrap_or(false)
+                || state
+                    .chunk_fingerprints
+                    .get(chunk.index)
+                    .copied()
+                    .unwrap_or_default()
+                    != content_fingerprint(&chunk.bytes)
+        });
+        state.pending_dirty_ranges.clear();
+        drop(state);
+
+        TEXTURE_DIRTY_VALIDATION_COUNT.fetch_add(1, Ordering::Relaxed);
+        TEXTURE_DIRTY_VALIDATION_BYTES.fetch_add(validated_bytes, Ordering::Relaxed);
+        TEXTURE_DIRTY_VALIDATION_NANOSECONDS.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if !changed {
+            TEXTURE_DIRTY_VALIDATION_UNCHANGED.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn record_content_snapshot(&self, address: u64, bytes: &[u8]) {
+        let Ok(byte_count) = u64::try_from(bytes.len()) else {
+            return;
+        };
+        let Some(snapshot_end) = address.checked_add(byte_count) else {
+            return;
+        };
+        let watch_end = self.address.saturating_add(self.byte_count);
+        if address < self.address || snapshot_end > watch_end {
+            return;
+        }
+        let mut state = self
+            .content_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for index in 0..state.chunk_fingerprints.len() {
+            let Some((chunk_address, chunk_bytes)) = content_chunk_range(self, index) else {
+                continue;
+            };
+            let chunk_end = chunk_address.saturating_add(chunk_bytes);
+            if address > chunk_address || chunk_end > snapshot_end {
+                continue;
+            }
+            let Ok(start) = usize::try_from(chunk_address - address) else {
+                continue;
+            };
+            let Ok(length) = usize::try_from(chunk_bytes) else {
+                continue;
+            };
+            let Some(chunk) = bytes.get(start..start.saturating_add(length)) else {
+                continue;
+            };
+            state.chunk_fingerprints[index] = content_fingerprint(chunk);
+            state.initialized_chunks[index] = true;
+        }
+        state.pending_dirty_ranges.clear();
     }
 
     pub(crate) fn overlaps_alias_ranges(&self, ranges: &[(u64, u64)]) -> bool {
@@ -414,6 +603,134 @@ impl GuestTextureWriteWatch {
     }
 }
 
+struct DirtyContentChunk {
+    index: usize,
+    bytes: Vec<u8>,
+}
+
+fn normalize_content_ranges(
+    write_watch: &GuestTextureWriteWatch,
+    ranges: Vec<(u64, u64)>,
+) -> Vec<(u64, u64)> {
+    let watch_end = write_watch.address.saturating_add(write_watch.byte_count);
+    let mut ranges = ranges
+        .into_iter()
+        .filter_map(|(address, byte_count)| {
+            let end = address.checked_add(byte_count)?;
+            let clipped_start = address.max(write_watch.address);
+            let clipped_end = end.min(watch_end);
+            (clipped_start < clipped_end).then_some((clipped_start, clipped_end - clipped_start))
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|&(address, _)| address);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (address, byte_count) in ranges {
+        if let Some((last_address, last_bytes)) = merged.last_mut() {
+            let last_end = last_address.saturating_add(*last_bytes);
+            if address <= last_end {
+                *last_bytes = last_end
+                    .max(address.saturating_add(byte_count))
+                    .saturating_sub(*last_address);
+                continue;
+            }
+        }
+        merged.push((address, byte_count));
+    }
+    merged
+}
+
+fn content_chunk_range(write_watch: &GuestTextureWriteWatch, index: usize) -> Option<(u64, u64)> {
+    let offset = u64::try_from(index)
+        .ok()?
+        .checked_mul(CONTENT_FINGERPRINT_CHUNK_BYTES)?;
+    if offset >= write_watch.byte_count {
+        return None;
+    }
+    Some((
+        write_watch.address.checked_add(offset)?,
+        CONTENT_FINGERPRINT_CHUNK_BYTES.min(write_watch.byte_count - offset),
+    ))
+}
+
+fn dirty_content_chunk_indices(
+    write_watch: &GuestTextureWriteWatch,
+    ranges: &[(u64, u64)],
+) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for &(address, byte_count) in ranges {
+        let start = (address - write_watch.address) / CONTENT_FINGERPRINT_CHUNK_BYTES;
+        let end = (address - write_watch.address)
+            .saturating_add(byte_count)
+            .div_ceil(CONTENT_FINGERPRINT_CHUNK_BYTES);
+        for index in start..end {
+            if let Ok(index) = usize::try_from(index) {
+                indices.push(index);
+            }
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn snapshot_dirty_content_chunks(
+    write_watch: &GuestTextureWriteWatch,
+    mut dirty_ranges: Vec<(u64, u64)>,
+) -> Result<Vec<DirtyContentChunk>, String> {
+    loop {
+        dirty_ranges.extend(write_watch.dirty_page_ranges());
+        dirty_ranges = normalize_content_ranges(write_watch, dirty_ranges);
+        let chunk_indices = dirty_content_chunk_indices(write_watch, &dirty_ranges);
+        let _ = write_watch.consume_dirty();
+        write_watch.rearm()?;
+        let generations = write_watch.generations();
+        let chunks = write_watch
+            .with_live_backing(|| {
+                chunk_indices
+                    .iter()
+                    .map(|&index| {
+                        let (address, byte_count) = content_chunk_range(write_watch, index)
+                            .ok_or("dirty texture fingerprint chunk is out of range")?;
+                        let length = usize::try_from(byte_count)
+                            .map_err(|_| "dirty texture fingerprint chunk is too large")?;
+                        let mut bytes = vec![0; length];
+                        if !read_guest_shared_backing(address, &mut bytes) {
+                            return Err(format!(
+                                "dirty texture fingerprint range {address:#x}+{byte_count:#x} lost shared backing"
+                            ));
+                        }
+                        Ok(DirtyContentChunk { index, bytes })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .and_then(|result| result)?;
+        if write_watch.generations() == generations && !write_watch.is_dirty() {
+            return Ok(chunks);
+        }
+    }
+}
+
+fn content_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 0x9e37_79b1_85eb_ca87_u64
+        ^ u64::try_from(bytes.len())
+            .unwrap_or(u64::MAX)
+            .rotate_left(17);
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        let value = u64::from_le_bytes(word.try_into().expect("eight-byte content word"));
+        hash ^= value.wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        hash = hash.rotate_left(31).wrapping_mul(0x9e37_79b1_85eb_ca87);
+    }
+    for &byte in words.remainder() {
+        hash ^= u64::from(byte).wrapping_mul(0x1656_67b1_9e37_79f9);
+        hash = hash.rotate_left(11).wrapping_mul(0x9e37_79b1_85eb_ca87);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53) ^ (hash >> 33)
+}
+
 pub(crate) fn refresh_resident_texture_write_watch(
     resident: &mut ResidentGuestTexture,
 ) -> Result<WriteWatchRefresh, String> {
@@ -422,12 +739,14 @@ pub(crate) fn refresh_resident_texture_write_watch(
         Some(CpuWriteWatchRetirement::Reprotecting) => Ok(WriteWatchRefresh::Reprotecting),
         Some(CpuWriteWatchRetirement::Reprotected) => {
             let was_dirty = resident.write_watch.is_dirty();
-            resident.write_watch = watch_resident_texture(
+            let mut renewed = watch_resident_texture(
                 resident.descriptor,
                 resident.texture_type,
                 resident.layer_count,
                 resident.mip_level_count,
             )?;
+            renewed.inherit_content_state_from(&resident.write_watch)?;
+            resident.write_watch = renewed;
             if resident.gpu_written && !was_dirty {
                 // Reprotection replaced the watch objects but not the shared backing. Preserve
                 // the ownership boundary in the new generation domain when no CPU store was
@@ -484,7 +803,7 @@ pub(crate) fn refresh_sampled_texture_write_watch(
         Some(CpuWriteWatchRetirement::Reprotecting) => Ok(WriteWatchRefresh::Reprotecting),
         Some(CpuWriteWatchRetirement::Reprotected) => {
             let was_dirty = cached.write_watch.is_dirty();
-            let write_watch = Arc::new(watch_sampled_texture(DecodedImageDescriptor {
+            let mut renewed = watch_sampled_texture(DecodedImageDescriptor {
                 guest: key.descriptor,
                 // Component selection is lowered into each shader and does not change the host
                 // texture allocation or the guest bytes covered by its write watch.
@@ -493,7 +812,9 @@ pub(crate) fn refresh_sampled_texture_write_watch(
                 mip_level_count: key.mip_level_count,
                 texture_type: key.texture_type,
                 layer_count: key.layer_count,
-            })?);
+            })?;
+            renewed.inherit_content_state_from(&cached.write_watch)?;
+            let write_watch = Arc::new(renewed);
             cached.write_watch = Arc::clone(&write_watch);
             write_watches.insert(key, write_watch);
             Ok(WriteWatchRefresh::Renewed { was_dirty })
@@ -735,7 +1056,8 @@ pub(crate) fn snapshot_watched_guest_range(
             }
         }
     };
-    if result.is_ok() {
+    if let Ok(raw) = &result {
+        write_watch.record_content_snapshot(address, raw);
         let elapsed = started.elapsed();
         record_texture_work(
             &TEXTURE_SNAPSHOT_COUNT,
@@ -771,6 +1093,7 @@ pub(crate) fn write_watched_guest_range(
     let byte_count = u64::try_from(raw.len()).map_err(|_| "guest range length does not fit u64")?;
     let wrote = write_watch.with_live_backing(|| write_guest_shared_backing(address, raw))?;
     if wrote {
+        write_watch.record_content_snapshot(address, raw);
         Ok(())
     } else {
         Err(format!(

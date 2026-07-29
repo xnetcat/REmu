@@ -295,15 +295,19 @@ fn sampled_texture_cache_reloads_cpu_dirty_content_without_an_acquire() {
     ));
     assert!(sampled_texture_cache_needs_reload(
         WriteWatchRefresh::Renewed { was_dirty: true },
-        false
+        true
     ));
     assert!(sampled_texture_cache_needs_reload(
         WriteWatchRefresh::Replaced,
         false
     ));
-    assert!(!sampled_texture_cache_needs_reload(
+    assert!(sampled_texture_cache_needs_reload(
         WriteWatchRefresh::Renewed { was_dirty: false },
         true
+    ));
+    assert!(!sampled_texture_cache_needs_reload(
+        WriteWatchRefresh::Renewed { was_dirty: true },
+        false
     ));
     assert!(!sampled_texture_cache_needs_reload(
         WriteWatchRefresh::Reprotecting,
@@ -457,11 +461,19 @@ fn texture_write_watch_observes_every_live_physical_alias_and_remap() {
     };
     let watch = watch_guest_texture(descriptor).expect("watch every backing alias");
     assert_eq!(watch.ranges.len(), 2);
+    snapshot_watched_guest_texture_raw(descriptor, &watch)
+        .expect("initialize canonical content fingerprints");
 
     memory.write(alias, &[0x5a]).expect("write through alias");
     assert!(
         watch.is_dirty(),
         "a coherent alias write must invalidate the GPU texture"
+    );
+    assert!(
+        watch
+            .content_has_changed()
+            .expect("validate content through canonical backing"),
+        "dirty alias bytes must compare against their canonical resource offset"
     );
     memory
         .unmap(alias, 4 * GUEST_PAGE_SIZE)
@@ -521,6 +533,124 @@ fn contiguous_texture_snapshot_and_writeback_retain_direct_mapping_semantics() {
     assert!(!watch.is_dirty());
     let decoded = snapshot_watched_guest_texture_raw(descriptor, &watch).expect("updated snapshot");
     assert!(decoded.iter().any(|&byte| byte == 0x3c));
+}
+
+#[test]
+fn texture_content_validation_avoids_clean_whole_resource_reloads() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("contiguous texture mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let watch = watch_guest_texture(descriptor).expect("contiguous texture watch");
+    snapshot_watched_guest_texture_raw(descriptor, &watch).expect("initialize fingerprints");
+
+    let unrelated = address
+        .checked_add(2 * 1024)
+        .expect("same-page unrelated address");
+    memory
+        .write(unrelated, &[0x7a])
+        .expect("unrelated same-page store faults the texture watch");
+    assert!(
+        !watch
+            .content_has_changed()
+            .expect("validate unrelated dirty page"),
+        "same-page writes outside the resource must retain the resident texture"
+    );
+    assert!(
+        !watch.is_dirty(),
+        "validation rearms and consumes the watch"
+    );
+
+    memory
+        .write(address, &[0x5a])
+        .expect("changed store faults the rearmed page");
+    assert!(
+        watch
+            .content_has_changed()
+            .expect("validate changed dirty page"),
+        "a real CPU content update must invalidate the resident texture"
+    );
+    let raw = snapshot_watched_guest_texture_raw(descriptor, &watch)
+        .expect("full reload establishes the new fingerprint baseline");
+    assert_eq!(raw[0], 0x5a);
+
+    memory
+        .write(address, &[0x5a])
+        .expect("same updated value faults the rearmed page");
+    assert!(
+        !watch
+            .content_has_changed()
+            .expect("validate repeated updated value")
+    );
+}
+
+#[test]
+fn texture_content_validation_survives_write_watch_renewal() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("contiguous texture mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let watch = watch_guest_texture(descriptor).expect("original texture watch");
+    snapshot_watched_guest_texture_raw(descriptor, &watch).expect("initialize fingerprints");
+    memory
+        .write(address, &[0])
+        .expect("same-value store dirties the original watch");
+
+    let mut renewed = watch_guest_texture(descriptor).expect("renewed texture watch");
+    renewed
+        .inherit_content_state_from(&watch)
+        .expect("carry dirty ranges and fingerprints into renewed watch");
+    drop(watch);
+    assert!(
+        !renewed
+            .content_has_changed()
+            .expect("validate inherited same-value dirty range"),
+        "permission renewal must not convert clean guest contents into a full reload"
+    );
 }
 
 #[test]
