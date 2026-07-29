@@ -36,15 +36,15 @@ use self::decode::{
     CB_COLOR_CONTROL, CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT,
     CB_TARGET_MASK, ColorOperationMode, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
     DEFAULT_CB_COLOR_CONTROL, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
-    decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
-    decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
-    decode_render_targets, decode_scissor, decode_viewport, fallback_image_descriptor,
-    graphics_pipeline_key, image_component_class, initial_depth_clear_for_target,
-    initial_render_target_clear_color, metal_color_write_mask, metal_nonindexed_vertex_count,
-    metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, prepare_ngg_meshlets,
-    raw_video_out_texture_descriptor, read_draw_indices, register_value,
-    render_target_fast_clear_color, sampled_alias_descriptor,
+    color_operation_is_raster_noop, decode_color_eliminate_fast_clear_target,
+    decode_color_operation_mode, decode_color_resolve_targets, decode_depth_target,
+    decode_image_descriptor, decode_metal_blend_attachment, decode_raster_state,
+    decode_render_target_format, decode_render_targets, decode_scissor, decode_viewport,
+    fallback_image_descriptor, graphics_pipeline_key, image_component_class,
+    initial_depth_clear_for_target, initial_render_target_clear_color, metal_color_write_mask,
+    metal_nonindexed_vertex_count, metal_primitive_type, pixel_input_controls,
+    prepare_indexed_primitive, prepare_ngg_meshlets, raw_video_out_texture_descriptor,
+    read_draw_indices, register_value, render_target_fast_clear_color, sampled_alias_descriptor,
 };
 #[cfg(test)]
 use self::decode::{
@@ -119,12 +119,13 @@ use self::shader::{
     dump_shader_pair_msl, graphics_allocated_vector_register_count,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
     pixel_scalars, program_embeds_global_base, shader_scalar_metadata_for_registers,
-    skip_incomplete_rectangle_draw, validate_compute_launch_for_metal, wave64_split_blockers,
+    validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
     missing_vertex_parameter_exports, procedural_rectangle_export_stage,
-    rectangle_coordinate_parameter_mask, shader_scalar_metadata,
+    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
+    shader_scalar_metadata,
 };
 use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
@@ -154,10 +155,10 @@ use self::texture::{
     decode_sampled_texture_linear_from_raw, depth_array_face_descriptor,
     depth_array_face_set_is_complete, ensure_mipmapped_resident_texture_in_map,
     guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
-    new_color_alias_texture_view, new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
-    sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_raw_range,
-    snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw, watch_guest_texture,
-    write_guest_texture_linear,
+    new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
+    prepare_sampled_texture_upload, sampled_texture_cache_needs_reload, sampled_texture_key,
+    sampled_texture_raw_range, snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
+    watch_guest_texture, write_guest_texture_linear,
 };
 use self::texture::{
     decode_guest_texture_linear_from_raw, refresh_resident_texture_write_watch,
@@ -616,6 +617,7 @@ struct ShaderCompileRequest {
 struct RenderPipelineArchiveState {
     additions: usize,
     checkpoint_serialized: bool,
+    quarantined: bool,
 }
 
 #[derive(Clone)]

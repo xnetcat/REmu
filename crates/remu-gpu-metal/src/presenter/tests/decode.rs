@@ -16,7 +16,7 @@ use super::{
     ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
     DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestTextureDescriptor,
     MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0,
-    append_color_target_registers, append_depth_target_registers,
+    append_color_target_registers, append_depth_target_registers, color_operation_is_raster_noop,
     common_render_target_array_length, consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
@@ -32,6 +32,10 @@ use super::{
 
 #[test]
 fn decodes_cb_color_control_operation_modes() {
+    assert_eq!(
+        decode_color_operation_mode(0x00cc_0000),
+        Ok(ColorOperationMode::Disable)
+    );
     assert_eq!(
         decode_color_operation_mode(0x00cc_0010),
         Ok(ColorOperationMode::Normal)
@@ -49,6 +53,22 @@ fn decodes_cb_color_control_operation_modes() {
         Ok(ColorOperationMode::FmaskDecompress)
     );
     assert!(decode_color_operation_mode(0x00cc_0040).is_err());
+}
+
+#[test]
+fn disabled_color_operation_without_depth_is_a_raster_noop() {
+    assert!(color_operation_is_raster_noop(
+        ColorOperationMode::Disable,
+        false
+    ));
+    assert!(!color_operation_is_raster_noop(
+        ColorOperationMode::Disable,
+        true
+    ));
+    assert!(!color_operation_is_raster_noop(
+        ColorOperationMode::Normal,
+        false
+    ));
 }
 
 #[test]

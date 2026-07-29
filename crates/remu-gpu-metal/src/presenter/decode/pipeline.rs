@@ -147,6 +147,13 @@ pub(crate) fn decode_color_operation_mode(control: u32) -> Result<ColorOperation
     }
 }
 
+pub(crate) const fn color_operation_is_raster_noop(
+    operation: ColorOperationMode,
+    has_active_depth: bool,
+) -> bool {
+    matches!(operation, ColorOperationMode::Disable) && !has_active_depth
+}
+
 pub(crate) fn metal_primitive_type(guest: u32) -> Result<MTLPrimitiveType, String> {
     match guest {
         1 => Ok(MTLPrimitiveType::Point),

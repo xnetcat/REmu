@@ -15,9 +15,9 @@ use super::{
     record_diagnostic_memory_copy, refresh_resident_texture_write_watch, register_value,
     retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
-    retire_sampled_textures_overlapping_writeback, skip_incomplete_rectangle_draw,
-    trace_resident_texture_removal, trace_video_target_compute_consumer,
-    trace_video_target_draw_consumer, write_resident_texture_contents_to_guest,
+    retire_sampled_textures_overlapping_writeback, trace_resident_texture_removal,
+    trace_video_target_compute_consumer, trace_video_target_draw_consumer,
+    write_resident_texture_contents_to_guest,
 };
 use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
@@ -298,21 +298,6 @@ impl MetalPresenter {
                 }
                 GpuEvent::IndexedDraw(draw) => {
                     trace_video_target_draw_consumer(&draw);
-                    if skip_incomplete_rectangle_draw(&draw) {
-                        static SKIPPED_INCOMPLETE_RECTANGLES: AtomicUsize = AtomicUsize::new(0);
-                        let sequence =
-                            SKIPPED_INCOMPLETE_RECTANGLES.fetch_add(1, Ordering::Relaxed) + 1;
-                        if sequence <= 32 || sequence.is_power_of_two() {
-                            eprintln!(
-                                "[REMu][METAL][RECT-INTERFACE-SKIP] sequence={sequence} draw={} es={:#x} ps={:#x} preserves prior target contents",
-                                draw.sequence,
-                                draw.export_shader_address,
-                                draw.pixel_shader_address,
-                            );
-                        }
-                        self.receiver.finish_event(source);
-                        continue;
-                    }
                     let key = graphics_pipeline_key(&draw);
                     if let Ok(key) = key.as_ref() {
                         self.compile_draw_shaders(&draw, key);

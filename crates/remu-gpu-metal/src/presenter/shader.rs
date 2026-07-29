@@ -40,8 +40,8 @@ pub(crate) use self::program::{
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
     ngg_mesh_export_stage, pixel_interpolation_attribute_mask, pixel_scalars,
     procedural_rectangle_export_stage, program_embeds_global_base, program_uses_lds,
-    rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
-    skip_incomplete_rectangle_draw, validate_compute_launch_for_metal,
+    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
     vertex_parameter_export_mask, wave64_split_blockers,
 };
 

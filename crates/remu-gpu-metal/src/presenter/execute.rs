@@ -14,8 +14,9 @@ use super::{
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
     append_unique_global_writebacks, append_unique_guest_write_ranges, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
-    collect_pending_guest_write_ranges, compile_metal_compute_library, compute_pipeline_key,
-    compute_program_can_split_wave64, consume_depth_metadata_clear, create_global_argument_buffer,
+    collect_pending_guest_write_ranges, color_operation_is_raster_noop,
+    compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
+    consume_depth_metadata_clear, create_global_argument_buffer,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
     decode_raster_state, decode_render_targets, decode_scissor, decode_viewport,
@@ -79,6 +80,13 @@ impl MetalPresenter {
         let color_control = register_value(&draw.context_registers, CB_COLOR_CONTROL)
             .unwrap_or(DEFAULT_CB_COLOR_CONTROL);
         let color_operation = decode_color_operation_mode(color_control)?;
+        if color_operation_is_raster_noop(color_operation, depth.is_some()) {
+            // MODE=Disable turns off color processing. With no active depth target there is
+            // nothing for the draw to rasterize. In particular, AGC uses position-only rectangle
+            // programs for such trigger/no-op packets while leaving an unrelated pixel program
+            // bound; executing that program would overwrite the target.
+            return Ok(());
+        }
         if matches!(
             color_operation,
             ColorOperationMode::Resolve

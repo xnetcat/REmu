@@ -13,9 +13,9 @@ use std::sync::Arc;
 use super::{
     MetalPresenter, canonical_sampler_bindings, canonical_texture_bindings, compute_launch,
     graphics_shader_resource_key, image_component_class, missing_vertex_parameter_exports,
-    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask, sampler_lod_bias,
-    sampler_uses_normalized_coordinates, shader_scalar_metadata,
-    shader_scalar_metadata_for_registers, skip_incomplete_rectangle_draw,
+    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
+    shader_scalar_metadata, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, wave64_split_blockers,
 };
 
@@ -92,7 +92,7 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
 }
 
 #[test]
-fn incomplete_procedural_rectangle_does_not_erase_the_completed_target() {
+fn recognizes_an_incomplete_procedural_rectangle_interface() {
     let export_words = [
         0xbfa0_0001,
         0x7e00_0000,
@@ -156,8 +156,8 @@ fn incomplete_procedural_rectangle_does_not_erase_the_completed_target() {
     draw.pixel_shader = Some(snapshot(pixel));
 
     assert!(
-        skip_incomplete_rectangle_draw(&draw),
-        "recognizing the position stage must not fabricate missing pixel parameters"
+        rectangle_draw_has_incomplete_interface(&draw),
+        "the captured interface remains incomplete even though color-disable semantics make its draw a no-op"
     );
 }
 

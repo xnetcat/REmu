@@ -10,7 +10,7 @@ use metal::{
     BinaryArchiveDescriptor, Device, Function, RenderPipelineDescriptor, RenderPipelineState, URL,
 };
 use sha1::{Digest, Sha1};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,16 @@ pub(crate) const METAL_RENDER_PIPELINE_ARCHIVE_FORMAT: &[u8] = b"remu-metal-rend
 pub(crate) const SLOW_PIPELINE_ARCHIVE_ADMISSION: Duration = Duration::from_millis(100);
 
 pub(crate) const LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS: usize = 2;
+
+impl RenderPipelineArchiveState {
+    fn quarantine_once(&mut self) -> bool {
+        if self.quarantined {
+            return false;
+        }
+        self.quarantined = true;
+        true
+    }
+}
 
 impl PersistentRenderPipelineArchive {
     pub(crate) fn open(device: &Device) -> Result<Self, String> {
@@ -98,18 +108,22 @@ impl PersistentRenderPipelineArchive {
             // is admitted after creation, under the exclusive lock, so an old archive can learn
             // shaders from later scenes without serializing every ordinary cache hit.
             let descriptor = make_descriptor()?;
-            descriptor.set_binary_archives(&[&self.archive]);
             let started = Instant::now();
-            let pipeline = {
+            let (pipeline, used_archive) = {
                 let _reader = self
                     .driver_lock
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                device
+                let used_archive = !self.archive_is_quarantined();
+                if used_archive {
+                    descriptor.set_binary_archives(&[&self.archive]);
+                }
+                let pipeline = device
                     .new_render_pipeline_state(&descriptor)
-                    .map_err(|error| format!("Metal render pipeline: {error}"))?
+                    .map_err(|error| format!("Metal render pipeline: {error}"))?;
+                (pipeline, used_archive)
             };
-            if started.elapsed() >= SLOW_PIPELINE_ARCHIVE_ADMISSION {
+            if used_archive && started.elapsed() >= SLOW_PIPELINE_ARCHIVE_ADMISSION {
                 // Archive admission is cache maintenance, not a dependency of the pipeline that
                 // was just created. Four scene-load compiler workers can all miss together; if
                 // each waits for an exclusive archive mutation here, otherwise-ready pipelines
@@ -120,6 +134,9 @@ impl PersistentRenderPipelineArchive {
                     Err(TryLockError::WouldBlock) => return Ok(pipeline),
                     Err(TryLockError::Poisoned(error)) => error.into_inner(),
                 };
+                if self.archive_is_quarantined() {
+                    return Ok(pipeline);
+                }
                 match self
                     .archive
                     .add_render_pipeline_functions_with_descriptor(&descriptor)
@@ -140,7 +157,9 @@ impl PersistentRenderPipelineArchive {
                                 false
                             }
                         };
-                        if should_serialize && let Err(error) = self.serialize_locked() {
+                        if should_serialize
+                            && let Err(error) = self.serialize_or_quarantine_locked()
+                        {
                             eprintln!(
                                 "[REMu][METAL] slow-pipeline archive checkpoint failed: {error}"
                             );
@@ -195,13 +214,20 @@ impl PersistentRenderPipelineArchive {
             // into nearly a gigabyte of synchronous archive writes. Clean shutdown still performs
             // the final serialization below.
             if should_serialize {
-                self.serialize_locked()?;
+                self.serialize_or_quarantine_locked()?;
             }
             Ok(pipeline)
         })
     }
 
-    pub(crate) fn serialize_locked(&self) -> Result<(), String> {
+    fn archive_is_quarantined(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .quarantined
+    }
+
+    fn serialize_locked(&self) -> Result<(), String> {
         let url = std::mem::ManuallyDrop::new(URL::new_with_string(&format!(
             "file://{}",
             self.path.display()
@@ -217,22 +243,117 @@ impl PersistentRenderPipelineArchive {
             })
     }
 
-    pub(crate) fn serialize(&self) -> Result<(), String> {
-        if self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .additions
-            == 0
-        {
+    fn serialize_or_quarantine_locked(&self) -> Result<(), String> {
+        if self.archive_is_quarantined() {
             return Ok(());
         }
+        let error = match self.serialize_locked() {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        // A newly-created archive failing to serialize points at the current descriptor/compiler
+        // path and must remain a visible failure. Only a loaded on-disk archive can be stale or
+        // structurally poisoned before this run.
+        if !self.loaded || !archive_serialization_failure_indicates_poison(&error) {
+            return Err(error);
+        }
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.quarantine_once() {
+                return Err(error);
+            }
+        }
+        match quarantine_pipeline_archive(&self.path) {
+            Ok(Some(quarantine)) => eprintln!(
+                "[REMu][METAL] quarantined invalid pipeline archive {} as {}; current-run pipelines will compile without it",
+                self.path.display(),
+                quarantine.display()
+            ),
+            Ok(None) => eprintln!(
+                "[REMu][METAL] invalid pipeline archive {} was already absent; current-run pipelines will compile without it",
+                self.path.display()
+            ),
+            Err(quarantine_error) => eprintln!(
+                "[REMu][METAL] could not quarantine invalid pipeline archive {}: {quarantine_error}; current-run pipelines will compile without it",
+                self.path.display()
+            ),
+        }
+        Err(error)
+    }
+
+    pub(crate) fn serialize(&self) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.additions == 0 || state.quarantined {
+            return Ok(());
+        }
+        drop(state);
         let _driver = self
             .driver_lock
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.serialize_locked()
+        self.serialize_or_quarantine_locked()
     }
+}
+
+fn archive_serialization_failure_indicates_poison(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    (error.contains("expecting '") && error.contains(" stage in pipeline no."))
+        || error.contains("binary archive is invalid")
+        || error.contains("binary archive is corrupt")
+        || error.contains("malformed binary archive")
+        || error.contains("incompatible binary archive")
+}
+
+fn pipeline_archive_quarantine_path(path: &Path, ordinal: usize) -> PathBuf {
+    let suffix = if ordinal == 0 {
+        ".invalid".to_owned()
+    } else {
+        format!(".invalid-{ordinal}")
+    };
+    let mut name = path
+        .file_name()
+        .map_or_else(|| "pipeline-archive".into(), std::ffi::OsString::from);
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn quarantine_pipeline_archive(path: &Path) -> Result<Option<PathBuf>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    for ordinal in 0..1_024 {
+        let quarantine = pipeline_archive_quarantine_path(path, ordinal);
+        match std::fs::hard_link(path, &quarantine) {
+            Ok(()) => {
+                std::fs::remove_file(path).map_err(|error| {
+                    format!(
+                        "linked {} but could not remove the active cache name: {error}",
+                        quarantine.display()
+                    )
+                })?;
+                return Ok(Some(quarantine));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "could not link {} to {}: {error}",
+                    path.display(),
+                    quarantine.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "all quarantine names for {} are already occupied",
+        path.display()
+    ))
 }
 
 impl ShaderFunctionCache {
@@ -330,4 +451,95 @@ pub(crate) fn metal_render_pipeline_archive_path(device: &Device) -> PathBuf {
     hasher.update(std::env::consts::ARCH.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
     metal_cache_root().join(format!("render-{digest}.metallibarchive"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RenderPipelineArchiveState, archive_serialization_failure_indicates_poison,
+        pipeline_archive_quarantine_path, quarantine_pipeline_archive,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "remu-pipeline-archive-test-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create archive test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn recognizes_structural_archive_poison_without_hiding_pipeline_or_io_failures() {
+        assert!(archive_serialization_failure_indicates_poison(
+            "Failed to generate machO: expecting 'fragment' stage in pipeline no. '42'"
+        ));
+        assert!(archive_serialization_failure_indicates_poison(
+            "the binary archive is corrupt"
+        ));
+        assert!(!archive_serialization_failure_indicates_poison(
+            "Metal render pipeline: fragment function failed to compile"
+        ));
+        assert!(!archive_serialization_failure_indicates_poison(
+            "could not persist pipeline archive: permission denied"
+        ));
+    }
+
+    #[test]
+    fn archive_poison_is_quarantined_only_once_per_run() {
+        let mut state = RenderPipelineArchiveState::default();
+        assert!(state.quarantine_once());
+        assert!(!state.quarantine_once());
+        assert!(state.quarantined);
+    }
+
+    #[test]
+    fn quarantines_without_overwriting_an_earlier_invalid_archive() {
+        let directory = TestDirectory::new();
+        let archive = directory.0.join("render.metallibarchive");
+        let first_quarantine = pipeline_archive_quarantine_path(&archive, 0);
+        std::fs::write(&archive, b"current invalid archive").expect("write active archive");
+        std::fs::write(&first_quarantine, b"older invalid archive")
+            .expect("write earlier quarantine");
+
+        let quarantine = quarantine_pipeline_archive(&archive)
+            .expect("quarantine invalid archive")
+            .expect("active archive exists");
+
+        assert_eq!(quarantine, pipeline_archive_quarantine_path(&archive, 1));
+        assert!(!archive.exists());
+        assert_eq!(
+            std::fs::read(&quarantine).expect("read new quarantine"),
+            b"current invalid archive"
+        );
+        assert_eq!(
+            std::fs::read(&first_quarantine).expect("read earlier quarantine"),
+            b"older invalid archive"
+        );
+    }
+
+    #[test]
+    fn absent_archive_is_already_quarantined() {
+        let directory = TestDirectory::new();
+        let archive = directory.0.join("missing.metallibarchive");
+        assert_eq!(
+            quarantine_pipeline_archive(&archive).expect("absent archive is harmless"),
+            None
+        );
+    }
 }

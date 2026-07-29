@@ -10,7 +10,7 @@ use remu_shader::{
     InstructionControl, OperandKind, Program, ShaderEvaluation, image_is_comparison,
 };
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub(crate) fn graphics_allocated_vector_register_count(
     shader_registers: &[GpuRegister],
@@ -338,19 +338,6 @@ pub(crate) fn missing_vertex_parameter_exports(
             (exported_parameters & (1 << physical) == 0).then_some((logical, physical, raw))
         })
         .collect()
-}
-
-pub(crate) fn skip_incomplete_rectangle_draw(draw: &IndexedDraw) -> bool {
-    // A non-default pixel interpolation has no defined source when the vertex/primitive stage
-    // exports no matching PARAM. Do not treat recognition of the position-only procedural stage
-    // as proof that its consumer interface has been reconstructed: until every required PARAM is
-    // supplied, executing a synthesized fullscreen triangle samples arbitrary texels and erases
-    // the valid composite immediately before scanout. Reject every incomplete interface; complete
-    // procedural rectangles still take the fixed-function lowering path.
-    static ALLOW_INVALID: OnceLock<bool> = OnceLock::new();
-    !*ALLOW_INVALID.get_or_init(|| {
-        std::env::var_os("REMU_ALLOW_INCOMPLETE_RECTANGLES").is_some_and(|value| value == "1")
-    }) && rectangle_draw_has_incomplete_interface(draw)
 }
 
 /// Recognizes a fused GFX10 NGG export/geometry program that requires a Metal mesh stage.

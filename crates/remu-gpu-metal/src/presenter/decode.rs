@@ -22,10 +22,10 @@ pub(crate) use self::image::{
     sampled_alias_descriptor,
 };
 pub(crate) use self::pipeline::{
-    ColorOperationMode, decode_color_operation_mode, decode_metal_blend_attachment,
-    decode_raster_state, graphics_pipeline_key, metal_color_write_mask,
-    metal_nonindexed_vertex_count, metal_primitive_type, prepare_indexed_primitive,
-    prepare_ngg_meshlets,
+    ColorOperationMode, color_operation_is_raster_noop, decode_color_operation_mode,
+    decode_metal_blend_attachment, decode_raster_state, graphics_pipeline_key,
+    metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
+    prepare_indexed_primitive, prepare_ngg_meshlets,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{
