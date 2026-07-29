@@ -1225,17 +1225,18 @@ impl MetalPresenter {
                 let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
                 if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
                     eprintln!(
-                        "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} primitives={} packed_vertices={} instances={} groups={}x1",
+                        "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} primitives={} packed_vertices={} instances={} groups={}x{}",
                         draw.sequence,
                         indices.len(),
                         meshlets.primitive_count,
                         meshlets.vertex_references,
                         draw.instance_count,
                         meshlets.group_count,
+                        draw.instance_count,
                     );
                 }
                 encoder.draw_mesh_threadgroups(
-                    MTLSize::new(meshlets.group_count, 1, 1),
+                    MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
                     MTLSize::new(1, 1, 1),
                     MTLSize::new(NGG_MESH_THREADS, 1, 1),
                 );

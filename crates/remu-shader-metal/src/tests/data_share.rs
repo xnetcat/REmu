@@ -174,6 +174,15 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
                 ],
             ),
             Instruction {
+                pc: 28,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(8)],
+                destinations: vec![Operand::vector(9)],
+                control: None,
+            },
+            Instruction {
                 pc: 32,
                 encoding: ShaderEncoding::Sopp,
                 opcode: Opcode::END_PROGRAM,
@@ -219,6 +228,10 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
         shader
             .source
             .contains("if (remu_thread_index < remu_mesh_vertex_count) remu_mesh.set_vertex")
+    );
+    assert!(
+        shader.source.contains("remu_v_8 = remu_group_id.y"),
+        "mesh instance ID must come from the second dispatch-grid dimension"
     );
     #[cfg(target_os = "macos")]
     if let Some(compiler) = std::env::var_os("REMU_METAL_COMPILER") {
