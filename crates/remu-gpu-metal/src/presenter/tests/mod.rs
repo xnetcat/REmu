@@ -55,6 +55,7 @@ use super::{
     sampled_texture_key, sampled_texture_raw_range, sampler_lod_bias,
     sampler_uses_normalized_coordinates, shader_scalar_metadata,
     shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
+    skip_incomplete_rectangle_draw,
     snapshot_guest_texture_linear, snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
     storage_image_requires_mip_hierarchy, tiled_block_dimensions, unsigned_float_to_f32,
     upload_image_textures, validate_compute_launch_for_metal, watch_guest_texture,

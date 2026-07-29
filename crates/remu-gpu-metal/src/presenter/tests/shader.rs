@@ -2,19 +2,21 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::CompileOptions;
-use remu_gpu::{GpuRegister, gpu_event_channel};
+use remu_gpu::{GpuRegister, ShaderSnapshot, gpu_event_channel};
 use remu_shader::{
     GlobalMemoryBinding, ImageBinding, ImageControl, Instruction, InstructionControl,
     InterpolationControl, Opcode, Operand, Program, ShaderEncoding, ShaderEvaluation,
     decode_program,
 };
+use std::sync::Arc;
 
 use super::{
     MetalPresenter, canonical_sampler_bindings, canonical_texture_bindings, compute_launch,
     graphics_shader_resource_key, image_component_class, missing_vertex_parameter_exports,
     procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask, sampler_lod_bias,
     sampler_uses_normalized_coordinates, shader_scalar_metadata,
-    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
+    shader_scalar_metadata_for_registers, skip_incomplete_rectangle_draw,
+    validate_compute_launch_for_metal, wave64_split_blockers,
 };
 
 #[test]
@@ -90,6 +92,76 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
 }
 
 #[test]
+fn incomplete_procedural_rectangle_does_not_erase_the_completed_target() {
+    let export_words = [
+        0xbfa0_0001,
+        0x7e00_0000,
+        0x7e00_0000,
+        0x7e00_0000,
+        0x93eb_ff03,
+        0x0008_0008,
+        0x8f6a_8c6b,
+        0x8700_ff03,
+        0x0000_00ff,
+        0x887c_6a00,
+        0xbf90_0009,
+        0x81ea_6bc0,
+        0x90fe_6ac1,
+        0xf800_0941,
+        0x0000_0000,
+        0x81ea_00c0,
+        0xbf8c_ff0f,
+        0x90fe_6ac1,
+        0x3604_0a81,
+        0x2c06_0a81,
+        0x7e00_0280,
+        0x7e02_02f2,
+        0xd746_0002,
+        0x0305_0302,
+        0xd746_0003,
+        0x0305_0303,
+        0x7e04_0b02,
+        0x7e06_0b03,
+        0xf800_08cf,
+        0x0100_0302,
+        0xbf81_0000,
+    ];
+    let export =
+        decode_program(0x1000, &export_words).expect("observed AGC rectangle stage decodes");
+    let pixel = Program::new(
+        0x2000,
+        vec![Instruction {
+            pc: 0x2000,
+            encoding: ShaderEncoding::Vintrp,
+            opcode: Opcode::Known("VInterpMovF32"),
+            words: Vec::new(),
+            sources: Vec::new(),
+            destinations: vec![Operand::vector(0)],
+            control: Some(InstructionControl::Interpolation(InterpolationControl {
+                attribute: 1,
+                channel: 0,
+            })),
+        }],
+    );
+    let snapshot = |program: Program| ShaderSnapshot {
+        header_address: program.address,
+        program: Arc::new(program),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    };
+    let mut draw = super::indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    draw.export_shader = Some(snapshot(export));
+    draw.pixel_shader = Some(snapshot(pixel));
+
+    assert!(
+        skip_incomplete_rectangle_draw(&draw),
+        "recognizing the position stage must not fabricate missing pixel parameters"
+    );
+}
+
+#[test]
 fn derives_procedural_rectangle_coordinates_from_the_first_sample_inputs() {
     let interpolation = |pc, opcode, attribute, destination| Instruction {
         pc,
@@ -139,7 +211,7 @@ fn derives_procedural_rectangle_coordinates_from_the_first_sample_inputs() {
                 destinations: vec![Operand::vector(10)],
                 control: None,
             },
-            sample,
+            sample.clone(),
             interpolation(16, "VInterpMovF32", 0, 10),
         ],
     );
@@ -159,6 +231,21 @@ fn derives_procedural_rectangle_coordinates_from_the_first_sample_inputs() {
         ),
         None,
         "sample-free shaders retain the conservative compatibility fallback"
+    );
+
+    let mut sample_without_address_provenance = sample;
+    let Some(InstructionControl::Image(image)) = sample_without_address_provenance.control.as_mut()
+    else {
+        panic!("test sample has image control");
+    };
+    image.address_registers.clear();
+    assert_eq!(
+        rectangle_coordinate_parameter_mask(
+            &Program::new(0x4000, vec![sample_without_address_provenance]),
+            &controls,
+        ),
+        None,
+        "an empty dependency slice must use the conservative coordinate fallback"
     );
 }
 

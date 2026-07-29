@@ -229,7 +229,7 @@ pub(crate) fn vertex_parameter_export_mask(program: &Program) -> u32 {
                 return None;
             };
             ((32..64).contains(&export.target) && export.enable_mask != 0)
-                .then_some(1_u32 << (export.target - 32))
+                .then(|| 1_u32 << (export.target - 32))
         })
         .fold(0, |mask, export| mask | export)
 }
@@ -313,7 +313,12 @@ pub(crate) fn rectangle_coordinate_parameter_mask(
             }
         }
     }
-    Some(mask)
+    // A texture operation with no recoverable interpolation dependency is not evidence that the
+    // rectangle has no coordinate parameter. Returning `Some(0)` makes the synthesized stage
+    // fill every input with unit modulation, so the consumer samples one constant texel and a
+    // fullscreen composite can become uniformly black. Let the caller use its conservative
+    // parameter convention when the decoded address provenance is incomplete.
+    (mask != 0).then_some(mask)
 }
 
 pub(crate) fn missing_vertex_parameter_exports(
@@ -337,18 +342,15 @@ pub(crate) fn missing_vertex_parameter_exports(
 
 pub(crate) fn skip_incomplete_rectangle_draw(draw: &IndexedDraw) -> bool {
     // A non-default pixel interpolation has no defined source when the vertex/primitive stage
-    // exports no matching PARAM. The architectural AGC rectangle stage is handled by the
-    // fixed-function equivalent emitted by compile_draw_shader_pair and must execute normally.
-    // Reject only genuinely unknown incomplete interfaces rather than zero-filling their
-    // varyings and allowing them to erase the current target.
+    // exports no matching PARAM. Do not treat recognition of the position-only procedural stage
+    // as proof that its consumer interface has been reconstructed: until every required PARAM is
+    // supplied, executing a synthesized fullscreen triangle samples arbitrary texels and erases
+    // the valid composite immediately before scanout. Reject every incomplete interface; complete
+    // procedural rectangles still take the fixed-function lowering path.
     static ALLOW_INVALID: OnceLock<bool> = OnceLock::new();
     !*ALLOW_INVALID.get_or_init(|| {
         std::env::var_os("REMU_ALLOW_INCOMPLETE_RECTANGLES").is_some_and(|value| value == "1")
     }) && rectangle_draw_has_incomplete_interface(draw)
-        && !draw
-            .export_shader
-            .as_ref()
-            .is_some_and(|shader| procedural_rectangle_export_stage(&shader.program))
 }
 
 /// Recognizes a fused GFX10 NGG export/geometry program that requires a Metal mesh stage.
