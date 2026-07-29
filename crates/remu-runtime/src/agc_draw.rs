@@ -68,6 +68,10 @@ pub(crate) fn agc_apply_set_base(
         let low = read_guest_u32(packet_address + 8) & !0x7;
         let high = read_guest_u32(packet_address + 12) & 0xffff;
         graphics.compute_indirect_args_address = u64::from(low) | (u64::from(high) << 32);
+    } else {
+        let low = read_guest_u32(packet_address + 8) & !0x7;
+        let high = read_guest_u32(packet_address + 12) & 0xffff;
+        graphics.graphics_indirect_args_address = u64::from(low) | (u64::from(high) << 32);
     }
     Ok(())
 }

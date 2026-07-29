@@ -286,6 +286,64 @@ fn dma_shadow_reaches_an_indirect_buffer_dispatch_without_reordering_events() {
 }
 
 #[test]
+fn dma_shadow_reaches_indirect_draw_arguments_without_executing_the_copy_early() {
+    let source_arguments = [6_u32, 2, 1, (-3_i32) as u32, 9];
+    let destination_arguments = [0_u32; 5];
+    let source_address = source_arguments.as_ptr().addr() as u64;
+    let destination_address = destination_arguments.as_ptr().addr() as u64;
+    let indices = [10_u16, 11, 12, 13, 14, 15, 16, 17];
+    let index_address = indices.as_ptr().addr() as u64;
+    let mut graphics = AgcGraphicsState {
+        graphics_indirect_args_address: destination_address,
+        index_buffer_address: index_address,
+        index_resource_address: index_address,
+        index_buffer_count: u32::try_from(indices.len()).expect("index count"),
+        index_size: 1,
+        ..AgcGraphicsState::default()
+    };
+    let mut commands = Vec::new();
+    append_native_memory_dma(
+        &mut commands,
+        source_address,
+        destination_address,
+        u32::try_from(std::mem::size_of_val(&source_arguments)).expect("argument size"),
+    );
+    commands.extend([
+        agc_pm4(5, crate::AGC_IT_DRAW_INDEX_INDIRECT, 0),
+        0,
+        0x08d_008c,
+        0x08e,
+        2,
+    ]);
+
+    let events = capture_submission_events(
+        &commands,
+        &mut graphics,
+        &mut AgcShaderRegistry::default(),
+    );
+
+    assert_eq!(
+        destination_arguments, [0; 5],
+        "the backend event is the only authoritative guest-memory mutation"
+    );
+    let [
+        remu_gpu::GpuEvent::MemoryCopy(copy),
+        remu_gpu::GpuEvent::IndexedDraw(draw),
+    ] = events.as_slice()
+    else {
+        panic!("DMA and following indirect draw must retain command order: {events:?}");
+    };
+    assert_eq!(copy.destination_address, destination_address);
+    assert_eq!(draw.index_count, 6);
+    assert_eq!(draw.instance_count, 2);
+    assert_eq!(draw.index_offset, 1);
+    assert_eq!(draw.base_vertex, -3);
+    assert_eq!(graphics.shader_registers.get(&0x08c), Some(&((-3_i32) as u32)));
+    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&1));
+    assert_eq!(graphics.shader_registers.get(&0x08e), Some(&9));
+}
+
+#[test]
 fn emits_ordered_gen5_release_and_wait_label_operations() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()
