@@ -187,22 +187,48 @@ impl MetalPresenter {
                         eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
                     }
                 }
-                GpuEvent::MemoryCopy(copy) => {
-                    if let Err(error) = self.execute_guest_memory_copy(copy) {
+                GpuEvent::MemoryCopy(copy) => match self.execute_guest_memory_copy(copy) {
+                    Ok(()) => self.receiver.retry_guest_memory_waits_overlapping(
+                        copy.destination_address,
+                        copy.byte_count,
+                    ),
+                    Err(error) => {
                         eprintln!("[REMu][METAL] DMA_DATA synchronization failed: {error}");
                     }
-                }
-                GpuEvent::MemoryWrite(write) => {
-                    if let Err(error) = self.execute_guest_memory_write(&write) {
+                },
+                GpuEvent::MemoryWrite(write) => match self.execute_guest_memory_write(&write) {
+                    Ok(()) => {
+                        let byte_count = if write.increment_address {
+                            u64::try_from(write.values.len())
+                                .unwrap_or(u64::MAX)
+                                .saturating_mul(4)
+                        } else if write.values.is_empty() {
+                            0
+                        } else {
+                            4
+                        };
+                        self.receiver
+                            .retry_guest_memory_waits_overlapping(write.address, byte_count);
+                    }
+                    Err(error) => {
                         eprintln!("[REMu][METAL] WRITE_DATA synchronization failed: {error}");
                     }
-                    self.receiver.retry_guest_memory_waits();
-                }
+                },
                 GpuEvent::MemoryRelease(release) => {
-                    if let Err(error) = self.execute_guest_memory_release(release) {
-                        eprintln!("[REMu][METAL] RELEASE_MEM synchronization failed: {error}");
+                    match self.execute_guest_memory_release(release) {
+                        Ok(()) => {
+                            let byte_count = match release.value {
+                                remu_gpu::GpuMemoryReleaseValue::Immediate32(_) => 4,
+                                remu_gpu::GpuMemoryReleaseValue::Immediate64(_)
+                                | remu_gpu::GpuMemoryReleaseValue::Timestamp => 8,
+                            };
+                            self.receiver
+                                .retry_guest_memory_waits_overlapping(release.address, byte_count);
+                        }
+                        Err(error) => {
+                            eprintln!("[REMu][METAL] RELEASE_MEM synchronization failed: {error}");
+                        }
                     }
-                    self.receiver.retry_guest_memory_waits();
                 }
                 GpuEvent::MemoryWait(wait) => {
                     match self.execute_guest_memory_wait(source, None, wait) {
@@ -211,7 +237,7 @@ impl MetalPresenter {
                             self.receiver.block_event(
                                 source,
                                 GpuEvent::MemoryWait(wait),
-                                QueueBlockReason::GuestMemoryWait,
+                                QueueBlockReason::GuestMemoryWait(wait),
                             );
                             return PresenterFlow::Continue;
                         }
@@ -227,7 +253,7 @@ impl MetalPresenter {
                             self.receiver.block_event(
                                 source,
                                 GpuEvent::RegisteredMemoryWait { id, wait },
-                                QueueBlockReason::GuestMemoryWait,
+                                QueueBlockReason::GuestMemoryWait(wait),
                             );
                             return PresenterFlow::Continue;
                         }

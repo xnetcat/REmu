@@ -78,20 +78,31 @@ impl OrderedGpuEventReceiver {
     ) -> OrderedEventPoll {
         self.ingest(GPU_EVENTS_PER_TICK);
         self.blocked_queues.retain(|_, reason| match reason {
-            QueueBlockReason::GuestMemoryWait => true,
+            QueueBlockReason::GuestMemoryWait(_) => true,
             QueueBlockReason::GraphicsPipeline(key) => !pipeline_resolved(key),
         });
         if self.host_block.as_ref().is_some_and(|reason| match reason {
-            QueueBlockReason::GuestMemoryWait => false,
+            QueueBlockReason::GuestMemoryWait(_) => false,
             QueueBlockReason::GraphicsPipeline(key) => pipeline_resolved(key),
         }) {
             self.host_block = None;
         }
 
+        let display_path_event = self
+            .host_events
+            .front()
+            .is_some_and(|host| host_event_bypasses_blocked_guest_queues(&host.event));
         let oldest_submission = self
             .submissions
-            .values()
-            .filter_map(|queue| queue.front())
+            .iter()
+            .filter(|(queue_id, _)| {
+                !display_path_event
+                    || !matches!(
+                        self.blocked_queues.get(queue_id),
+                        Some(QueueBlockReason::GuestMemoryWait(_))
+                    )
+            })
+            .filter_map(|(_, queue)| queue.front())
             .map(|submission| submission.ingress_sequence)
             .min();
         if self.host_block.is_none()
@@ -217,8 +228,27 @@ impl OrderedGpuEventReceiver {
 
     pub(crate) fn retry_guest_memory_waits(&mut self) {
         self.blocked_queues
-            .retain(|_, reason| !matches!(reason, QueueBlockReason::GuestMemoryWait));
-        if matches!(self.host_block, Some(QueueBlockReason::GuestMemoryWait)) {
+            .retain(|_, reason| !matches!(reason, QueueBlockReason::GuestMemoryWait(_)));
+        if matches!(self.host_block, Some(QueueBlockReason::GuestMemoryWait(_))) {
+            self.host_block = None;
+        }
+    }
+
+    pub(crate) fn retry_guest_memory_waits_overlapping(&mut self, address: u64, byte_count: u64) {
+        self.blocked_queues.retain(|_, reason| {
+            !matches!(
+                reason,
+                QueueBlockReason::GuestMemoryWait(wait)
+                    if guest_wait_overlaps_range(*wait, address, byte_count)
+            )
+        });
+        if self.host_block.as_ref().is_some_and(|reason| {
+            matches!(
+                reason,
+                QueueBlockReason::GuestMemoryWait(wait)
+                    if guest_wait_overlaps_range(*wait, address, byte_count)
+            )
+        }) {
             self.host_block = None;
         }
     }
@@ -287,7 +317,7 @@ impl OrderedGpuEventReceiver {
         for reason in self.blocked_queues.values().chain(self.host_block.iter()) {
             match reason {
                 QueueBlockReason::GraphicsPipeline(_) => pipeline += 1,
-                QueueBlockReason::GuestMemoryWait => memory += 1,
+                QueueBlockReason::GuestMemoryWait(_) => memory += 1,
             }
         }
         (pipeline, memory)
@@ -340,7 +370,9 @@ impl OrderedGpuEventReceiver {
                     self.blocked_queues
                         .get(queue_id)
                         .map_or("none".to_owned(), |reason| match reason {
-                            QueueBlockReason::GuestMemoryWait => "memory".to_owned(),
+                            QueueBlockReason::GuestMemoryWait(wait) => {
+                                format!("memory:{:#x}", wait.address)
+                            }
                             QueueBlockReason::GraphicsPipeline(key) => format!(
                                 "pipeline:{:#x}/{:#x}",
                                 key.export_shader_address, key.pixel_shader_address
@@ -481,4 +513,29 @@ impl OrderedGpuEventReceiver {
             producers.join(",")
         }
     }
+}
+
+/// Host display management and VideoOut presentation do not execute on a guest AGC ring.
+///
+/// They retain ingress order against runnable or pipeline-gated guest queues, but an unrelated
+/// queue parked on a WAIT_REG_MEM cannot prevent a newer display registration, system splash,
+/// direct VideoOut flip, or shutdown from reaching the window thread.
+fn host_event_bypasses_blocked_guest_queues(event: &GpuEvent) -> bool {
+    matches!(
+        event,
+        GpuEvent::DisplayRegistered { .. }
+            | GpuEvent::ShowHostSplash(_)
+            | GpuEvent::HideHostSplash
+            | GpuEvent::Flip { .. }
+            | GpuEvent::Shutdown
+    )
+}
+
+fn guest_wait_overlaps_range(wait: GpuMemoryWait, address: u64, byte_count: u64) -> bool {
+    if byte_count == 0 {
+        return false;
+    }
+    let wait_byte_count = if wait.is_64_bit { 8 } else { 4 };
+    address < wait.address.saturating_add(wait_byte_count)
+        && wait.address < address.saturating_add(byte_count)
 }

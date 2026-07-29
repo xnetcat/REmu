@@ -921,7 +921,7 @@ fn ordered_receiver_reports_only_dependency_runnable_work() {
     ordered.block_event(
         source,
         GpuEvent::MemoryWait(wait),
-        QueueBlockReason::GuestMemoryWait,
+        QueueBlockReason::GuestMemoryWait(wait),
     );
     assert!(!ordered.has_runnable_events());
 
@@ -939,6 +939,179 @@ fn ordered_receiver_reports_only_dependency_runnable_work() {
     };
     ordered.finish_event(source);
     assert!(!ordered.has_runnable_events());
+}
+
+#[test]
+fn blocked_guest_wait_does_not_stall_independent_video_out_flip() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let wait = GpuMemoryWait {
+        address: 0x4000,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("queue blocked guest wait");
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            source
+        }
+        other => panic!("expected guest wait, got {other:?}"),
+    };
+    ordered.block_event(
+        source,
+        GpuEvent::MemoryWait(wait),
+        QueueBlockReason::GuestMemoryWait(wait),
+    );
+
+    sender
+        .send(GpuEvent::Flip {
+            address: 0x7000_0000,
+            buffer_index: 2,
+            flip_argument: 11,
+            width: 1_920,
+            height: 1_080,
+            pitch: 1_920,
+            pixel_format: 0x8000_0000_2200_0000,
+            tiling_mode: 0,
+        })
+        .expect("queue independent VideoOut flip");
+
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Event {
+            source: OrderedEventSource::Host { .. },
+            event: GpuEvent::Flip {
+                address: 0x7000_0000,
+                flip_argument: 11,
+                ..
+            },
+        }
+    ));
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Blocked
+    ));
+}
+
+#[test]
+fn produced_label_retries_only_overlapping_blocked_waits() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let first = GpuMemoryWait {
+        address: 0x4000,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    let second = GpuMemoryWait {
+        address: 0x8000,
+        ..first
+    };
+    for (queue_id, wait) in [(0, first), (33, second)] {
+        sender
+            .send(GpuEvent::QueueSubmission {
+                queue_id,
+                events: vec![GpuEvent::MemoryWait(wait)],
+            })
+            .expect("queue guest wait");
+    }
+    for expected in [first, second] {
+        let source = match ordered.try_recv(|_| true) {
+            OrderedEventPoll::Event {
+                source,
+                event: GpuEvent::MemoryWait(actual),
+            } => {
+                assert_eq!(actual, expected);
+                source
+            }
+            other => panic!("expected guest wait, got {other:?}"),
+        };
+        ordered.block_event(
+            source,
+            GpuEvent::MemoryWait(expected),
+            QueueBlockReason::GuestMemoryWait(expected),
+        );
+    }
+
+    ordered.retry_guest_memory_waits_overlapping(first.address, 4);
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, first);
+            source
+        }
+        other => panic!("expected only overlapping wait to retry, got {other:?}"),
+    };
+    ordered.finish_event(source);
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Blocked
+    ));
+}
+
+#[test]
+fn video_out_flip_retains_ingress_order_against_runnable_guest_work() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWrite(GpuMemoryWrite {
+                address: 0x5000,
+                values: vec![9],
+                increment_address: true,
+            })],
+        })
+        .expect("queue runnable guest write");
+    sender
+        .send(GpuEvent::Flip {
+            address: 0x7100_0000,
+            buffer_index: 3,
+            flip_argument: 12,
+            width: 1_920,
+            height: 1_080,
+            pitch: 1_920,
+            pixel_format: 0x8000_0000_2200_0000,
+            tiling_mode: 0,
+        })
+        .expect("queue later VideoOut flip");
+
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWrite(write),
+        } => {
+            assert_eq!(write.address, 0x5000);
+            source
+        }
+        other => panic!("expected older runnable guest work, got {other:?}"),
+    };
+    ordered.finish_event(source);
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Event {
+            source: OrderedEventSource::Host { .. },
+            event: GpuEvent::Flip {
+                address: 0x7100_0000,
+                flip_argument: 12,
+                ..
+            },
+        }
+    ));
 }
 
 #[test]
@@ -992,7 +1165,7 @@ fn suspended_memory_wait_keeps_same_queue_tail_behind_it() {
     ordered.block_event(
         source,
         GpuEvent::MemoryWait(wait),
-        QueueBlockReason::GuestMemoryWait,
+        QueueBlockReason::GuestMemoryWait(wait),
     );
 
     let source = match ordered.try_recv(|_| true) {

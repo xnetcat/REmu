@@ -14,7 +14,7 @@ use metal::{
     MTLPrimitiveTopologyClass, MTLScissorRect, MTLTriangleFillMode, MTLWinding, MetalLayer,
     RenderCommandEncoder, RenderPipelineState, SamplerState, Texture,
 };
-use remu_gpu::{GpuEvent, GpuMemoryRelease, GpuMemoryWrite, IndexedDraw};
+use remu_gpu::{GpuEvent, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite, IndexedDraw};
 use remu_memory::{CpuWriteWatch, GuestSharedMappingIdentity};
 mod cache;
 mod completion;
@@ -657,7 +657,7 @@ struct ScheduledHostEvent {
 
 #[derive(Clone, Debug)]
 enum QueueBlockReason {
-    GuestMemoryWait,
+    GuestMemoryWait(GpuMemoryWait),
     GraphicsPipeline(GraphicsPipelineKey),
 }
 
