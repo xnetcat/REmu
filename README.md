@@ -62,8 +62,9 @@ keeps the display-buffer dimensions it requested.
 
 For one self-contained rendering investigation, set `REMU_DEEP_TRACE=1`. The run directory then
 retains periodic frames, decoded AGC draw/register/program state, shader opcode coverage,
-translated MSL and graphics LDS IR, plus VM, VFS, synchronization, timing, and image-alias traces.
-This mode perturbs timing and should not be used for FPS measurements.
+translated MSL and graphics LDS IR, plus VM, VFS, synchronization, timing, AVPlayer gate, stale
+guest-thread, and image-alias traces. This mode perturbs timing and should not be used for FPS
+measurements.
 
 VideoOut normally limits translation look-ahead to 64 pending GPU work items and three accepted,
 not-yet-presented flips. `REMU_FLIP_GPU_EVENT_BACKLOG` and `REMU_FLIP_PRESENT_BACKLOG` override

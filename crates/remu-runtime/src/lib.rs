@@ -1109,6 +1109,10 @@ impl ImportTelemetry {
 static IMPORT_TELEMETRY: OnceLock<RwLock<Arc<ImportTelemetry>>> = OnceLock::new();
 static IMPORT_TELEMETRY_GENERATION: AtomicUsize = AtomicUsize::new(0);
 static TRACE_HOT_IMPORTS: OnceLock<bool> = OnceLock::new();
+static GUEST_IMPORT_TRACE_EPOCH: OnceLock<Instant> = OnceLock::new();
+static GUEST_IMPORT_TRACE_RECORDS: Mutex<Vec<Arc<GuestImportTraceRecord>>> = Mutex::new(Vec::new());
+static GUEST_IMPORT_TRACE_REPORTER: OnceLock<()> = OnceLock::new();
+static GUEST_IMPORT_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static CURRENT_GUEST_THREAD_POINTER: Cell<u64> = const { Cell::new(0) };
@@ -1117,6 +1121,7 @@ thread_local! {
     static GUEST_PTHREAD_SPECIFIC: RefCell<BTreeMap<u32, (u64, u64)>> = const { RefCell::new(BTreeMap::new()) };
     static IMPORT_TELEMETRY_CACHE: RefCell<Option<(usize, Arc<ImportTelemetry>)>> = const { RefCell::new(None) };
     static PROCESS_TIME_CALLSITES: RefCell<[(u64, u64); 8]> = const { RefCell::new([(0, 0); 8]) };
+    static GUEST_IMPORT_TRACE_RECORD: Cell<*const GuestImportTraceRecord> = const { Cell::new(std::ptr::null()) };
     #[cfg(target_os = "macos")]
     static KERNEL_MEMORY_READABLE_RANGES_CACHE: RefCell<Option<(usize, Arc<[(u64, u64)]>)>> = const { RefCell::new(None) };
 }
@@ -1631,6 +1636,203 @@ struct ImportCallFrame {
     xmm_arguments: [u128; 8],
 }
 
+#[derive(Debug)]
+struct GuestImportTraceRecord {
+    thread: u64,
+    name: String,
+    active: AtomicBool,
+    in_import: AtomicBool,
+    dispatch_index: AtomicU64,
+    guest_return_address: AtomicU64,
+    guest_rsp: AtomicU64,
+    calls: AtomicU64,
+    transition_sequence: AtomicU64,
+    reported_sequence: AtomicU64,
+    transition_nanos: AtomicU64,
+}
+
+struct GuestImportTraceGuard {
+    record: *const GuestImportTraceRecord,
+    dispatch_index: u64,
+    guest_return_address: u64,
+    guest_rsp: u64,
+}
+
+fn trace_guest_threads() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_GUEST_THREADS").is_some_and(|value| value == "1")
+    })
+}
+
+fn guest_import_trace_nanos() -> u64 {
+    u64::try_from(
+        GUEST_IMPORT_TRACE_EPOCH
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn start_guest_import_trace_reporter() {
+    GUEST_IMPORT_TRACE_REPORTER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("REMu guest import trace".to_owned())
+            .spawn(|| {
+                const STALE_AFTER: Duration = Duration::from_secs(2);
+                let stale_after_nanos =
+                    u64::try_from(STALE_AFTER.as_nanos()).unwrap_or(u64::MAX);
+                loop {
+                    std::thread::sleep(STALE_AFTER);
+                    let now = guest_import_trace_nanos();
+                    let records = GUEST_IMPORT_TRACE_RECORDS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let telemetry = IMPORT_TELEMETRY
+                        .get_or_init(|| {
+                            RwLock::new(Arc::new(ImportTelemetry::new(Vec::new(), 0)))
+                        })
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    for record in records {
+                        if !record.active.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let transition_sequence =
+                            record.transition_sequence.load(Ordering::Acquire);
+                        let transition_nanos = record.transition_nanos.load(Ordering::Acquire);
+                        let age_nanos = now.saturating_sub(transition_nanos);
+                        if age_nanos < stale_after_nanos
+                            || record.reported_sequence.swap(
+                                transition_sequence,
+                                Ordering::AcqRel,
+                            ) == transition_sequence
+                        {
+                            continue;
+                        }
+                        let dispatch_index = record.dispatch_index.load(Ordering::Acquire);
+                        let nid = usize::try_from(dispatch_index)
+                            .ok()
+                            .and_then(|index| telemetry.nids.get(index))
+                            .map_or("?", String::as_str);
+                        eprintln!(
+                            "[REMu][THREAD][STALE] thread={:#x} name={:?} age_ms={} phase={} nid={} import={} return={:#x} rsp={:#x} calls={} transition={transition_sequence}",
+                            record.thread,
+                            record.name,
+                            age_nanos / 1_000_000,
+                            if record.in_import.load(Ordering::Acquire) {
+                                "in-import"
+                            } else {
+                                "in-guest"
+                            },
+                            nid,
+                            nid_display_name(nid).unwrap_or("unknown"),
+                            record.guest_return_address.load(Ordering::Acquire),
+                            record.guest_rsp.load(Ordering::Acquire),
+                            record.calls.load(Ordering::Acquire),
+                        );
+                    }
+                }
+            })
+            .expect("guest import trace reporter must start");
+    });
+}
+
+impl GuestImportTraceGuard {
+    fn enter(frame: &ImportCallFrame) -> Option<Self> {
+        if !trace_guest_threads() {
+            return None;
+        }
+        start_guest_import_trace_reporter();
+        let record = GUEST_IMPORT_TRACE_RECORD.with(|current| {
+            let existing = current.get();
+            if !existing.is_null() {
+                return existing;
+            }
+            let record = Arc::new(GuestImportTraceRecord {
+                thread: current_guest_thread_handle(),
+                name: current_guest_thread_name(),
+                active: AtomicBool::new(true),
+                in_import: AtomicBool::new(false),
+                dispatch_index: AtomicU64::new(0),
+                guest_return_address: AtomicU64::new(0),
+                guest_rsp: AtomicU64::new(0),
+                calls: AtomicU64::new(0),
+                transition_sequence: AtomicU64::new(0),
+                reported_sequence: AtomicU64::new(0),
+                transition_nanos: AtomicU64::new(guest_import_trace_nanos()),
+            });
+            let pointer = Arc::as_ptr(&record);
+            GUEST_IMPORT_TRACE_RECORDS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(record);
+            current.set(pointer);
+            pointer
+        });
+        // SAFETY: the process-lifetime registry retains this record after the current thread
+        // publishes its stable pointer in thread-local storage.
+        let record = unsafe { &*record };
+        record
+            .dispatch_index
+            .store(frame.dispatch_index, Ordering::Relaxed);
+        record
+            .guest_return_address
+            .store(frame.guest_return_address, Ordering::Relaxed);
+        record.guest_rsp.store(frame.guest_rsp, Ordering::Relaxed);
+        record.calls.fetch_add(1, Ordering::Relaxed);
+        record.in_import.store(true, Ordering::Relaxed);
+        record
+            .transition_nanos
+            .store(guest_import_trace_nanos(), Ordering::Relaxed);
+        record.transition_sequence.store(
+            GUEST_IMPORT_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Release,
+        );
+        Some(Self {
+            record,
+            dispatch_index: frame.dispatch_index,
+            guest_return_address: frame.guest_return_address,
+            guest_rsp: frame.guest_rsp,
+        })
+    }
+}
+
+impl Drop for GuestImportTraceGuard {
+    fn drop(&mut self) {
+        // SAFETY: the process-lifetime registry retains every record published to a guard.
+        let record = unsafe { &*self.record };
+        record
+            .dispatch_index
+            .store(self.dispatch_index, Ordering::Relaxed);
+        record
+            .guest_return_address
+            .store(self.guest_return_address, Ordering::Relaxed);
+        record.guest_rsp.store(self.guest_rsp, Ordering::Relaxed);
+        record.in_import.store(false, Ordering::Relaxed);
+        record
+            .transition_nanos
+            .store(guest_import_trace_nanos(), Ordering::Relaxed);
+        record.transition_sequence.store(
+            GUEST_IMPORT_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Release,
+        );
+    }
+}
+
+fn retire_current_guest_import_trace() {
+    GUEST_IMPORT_TRACE_RECORD.with(|current| {
+        let record = current.replace(std::ptr::null());
+        if !record.is_null() {
+            // SAFETY: the process-lifetime registry retains every thread-local record.
+            unsafe { &*record }.active.store(false, Ordering::Release);
+        }
+    });
+}
+
 const IMPORT_CALL_FRAME_SIZE: usize = 0xd0;
 const _: () = {
     assert!(std::mem::size_of::<ImportCallFrame>() == IMPORT_CALL_FRAME_SIZE);
@@ -1864,6 +2066,10 @@ static IMPORT_CALL_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static STALL_SNAPSHOT_EMITTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImportReturn {
+    let _guest_import_trace = (!frame.is_null())
+        // SAFETY: the import trampoline supplies one live frame for the complete dispatch.
+        .then(|| GuestImportTraceGuard::enter(unsafe { &*frame }))
+        .flatten();
     let limit = import_call_trace_limit();
     if limit == 0 {
         if trace_import_errors() && !frame.is_null() {
@@ -2310,6 +2516,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             set_current_guest_thread_pointer(guest_tls.thread_pointer);
             let result = run_guest_thread(entry, thread_argument);
             run_guest_thread_destructors();
+            retire_current_guest_import_trace();
             set_current_guest_thread_pointer(0);
             set_current_guest_thread_handle(0);
             drop(guest_tls);
