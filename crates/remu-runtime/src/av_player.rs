@@ -1,18 +1,136 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::{
-    AvPlayerEventCallback, AvPlayerInstance, PROBE_DISPATCH, ProbeDispatchState,
-    guest_aligned_alloc, guest_memset, process_guest_range_is_readable, read_guest_cstring,
+    AvPlayerDecoder, AvPlayerEventCallback, AvPlayerInstance, AvPlayerTextureDeallocation,
+    PROBE_DISPATCH, ProbeDispatchState, guest_aligned_alloc, guest_memset,
+    process_guest_range_has_read_access, process_guest_range_is_readable, read_guest_cstring,
     read_guest_u8, read_guest_u32, read_guest_u64, resolve_guest_path, sce_kernel_error,
     write_guest_u8, write_guest_u16, write_guest_u32, write_guest_u64,
 };
 
 pub(crate) const AV_PLAYER_ERROR_INVALID_PARAMS: u32 = 0x806a_0001;
 pub(crate) const AV_PLAYER_ERROR_OPERATION_FAILED: u32 = 0x806a_0002;
+
+#[derive(Debug, PartialEq, Eq)]
+enum AvPlayerDecoderPoll {
+    Frame(Vec<u8>),
+    Pending,
+    Finished,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AvPlayerFrameStatus {
+    Ready,
+    Pending,
+    Finished,
+}
+
+fn av_player_decoder_reaper() -> &'static mpsc::Sender<AvPlayerDecoder> {
+    static REAPER: OnceLock<mpsc::Sender<AvPlayerDecoder>> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<AvPlayerDecoder>();
+        std::thread::Builder::new()
+            .name("REMu AVPlayer reaper".to_owned())
+            .spawn(move || {
+                while let Ok(mut decoder) = receiver.recv() {
+                    decoder.reap();
+                }
+            })
+            .expect("AVPlayer decoder reaper thread must start");
+        sender
+    })
+}
+
+impl AvPlayerDecoder {
+    fn poll(&self) -> AvPlayerDecoderPoll {
+        let frames = self
+            .frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match frames.try_recv() {
+            Ok(frame) => AvPlayerDecoderPoll::Frame(frame),
+            Err(TryRecvError::Empty) => AvPlayerDecoderPoll::Pending,
+            Err(TryRecvError::Disconnected) => AvPlayerDecoderPoll::Finished,
+        }
+    }
+
+    pub(crate) fn retire(mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(child) = self.child.as_mut() {
+            // Closing the process side of the pipe makes a decoder worker blocked in read_exact
+            // return immediately. Child collection and the host-thread join happen on the
+            // reaper, never under the process-wide guest dispatch lock.
+            let _ = child.kill();
+        }
+        if let Err(error) = av_player_decoder_reaper().send(self) {
+            let mut decoder = error.0;
+            decoder.reap();
+        }
+    }
+
+    fn reap(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for AvPlayerDecoder {
+    fn drop(&mut self) {
+        // Normal playback teardown reaches `retire` and leaves both handles empty before drop.
+        // This fallback is for a failed reaper startup/channel and process-state destruction.
+        if self.child.is_some() || self.worker.is_some() {
+            self.reap();
+        }
+    }
+}
+
+fn av_player_send_decoded_frame(
+    sender: &SyncSender<Vec<u8>>,
+    cancelled: &AtomicBool,
+    mut frame: Vec<u8>,
+) -> bool {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        match sender.try_send(frame) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned)) => {
+                frame = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+fn av_player_decoder_worker(
+    mut output: std::process::ChildStdout,
+    frame_bytes: usize,
+    sender: SyncSender<Vec<u8>>,
+    cancelled: Arc<AtomicBool>,
+) {
+    while !cancelled.load(Ordering::Acquire) {
+        let mut frame = vec![0_u8; frame_bytes];
+        if output.read_exact(&mut frame).is_err()
+            || !av_player_send_decoded_frame(&sender, &cancelled, frame)
+        {
+            break;
+        }
+    }
+}
 
 pub(crate) fn av_player_tool(name: &str, environment: &str) -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os(environment).map(PathBuf::from)
@@ -181,6 +299,14 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
         );
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     }
+    if !process_guest_range_has_read_access(parameter, std::mem::size_of::<u64>())
+        || !process_guest_range_has_read_access(output, std::mem::size_of::<u64>())
+    {
+        eprintln!(
+            "[REMu][AVPLAYER] InitEx rejected inaccessible parameter={parameter:#x} output={output:#x}"
+        );
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
     let raw_size = read_guest_u64(parameter);
     let Ok(size) = usize::try_from(raw_size) else {
         eprintln!("[REMu][AVPLAYER] InitEx rejected non-host size={raw_size:#x}");
@@ -189,6 +315,12 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
     if !(MINIMUM_INITIALIZATION_SIZE..=MAXIMUM_INITIALIZATION_SIZE).contains(&size) {
         eprintln!(
             "[REMu][AVPLAYER] InitEx rejected size={size:#x} parameter={parameter:#x} output={output:#x}"
+        );
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    if !process_guest_range_has_read_access(parameter, size) {
+        eprintln!(
+            "[REMu][AVPLAYER] InitEx rejected unreadable initialization parameter={parameter:#x} size={size:#x}"
         );
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     }
@@ -210,13 +342,18 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             _initialization: initialization,
             allocator_object: read_guest_u64(parameter + 8),
             allocate_texture_callback: read_guest_u64(parameter + 32),
-            event_object: read_guest_u64(parameter + 88),
-            event_callback: read_guest_u64(parameter + 96),
+            deallocate_texture_callback: read_guest_u64(parameter + 40),
+            event_object: (size >= 96)
+                .then(|| read_guest_u64(parameter + 88))
+                .unwrap_or(0),
+            event_callback: (size >= 104)
+                .then(|| read_guest_u64(parameter + 96))
+                .unwrap_or(0),
             source: None,
-            // Gen5 retains the PS4 InitDataEx prefix: the signed framebuffer count is at
-            // 0xa4 and the following byte is autoStart. Reading 0xa4 treated the count itself as
-            // a boolean and could make an explicitly-controlled player start a second time.
-            auto_start: read_guest_u8(parameter + 168) != 0,
+            // Gen5 InitDataEx places autoStart after the event replacement, language pointer,
+            // and debug level. Offset 0xa8 belongs to the first decoder-thread record; treating
+            // its priority byte as autoStart spuriously double-started explicit players.
+            auto_start: size > 116 && read_guest_u8(parameter + 116) != 0,
             width: 0,
             height: 0,
             frames_per_second: 30.0,
@@ -231,7 +368,6 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             decoder_seek: Duration::ZERO,
             trick_speed_percent: 100,
             video_decoder: None,
-            video_output: None,
             raw_video_frame: Vec::new(),
             padded_video_frame: Vec::new(),
             video_buffer_base: 0,
@@ -241,7 +377,6 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             next_video_frame: 0,
             video_catch_up_origin: None,
             audio_decoder: None,
-            audio_output: None,
             raw_audio_frame: Vec::new(),
             audio_buffer_base: 0,
             next_audio_buffer: 0,
@@ -307,6 +442,29 @@ pub(crate) fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallb
     }
 }
 
+pub(crate) fn invoke_av_player_texture_deallocations(
+    deallocations: Vec<AvPlayerTextureDeallocation>,
+) {
+    type DeallocateTexture = unsafe extern "C" fn(u64, u64);
+    for deallocation in deallocations {
+        if deallocation.address == 0 {
+            continue;
+        }
+        if !process_guest_range_has_read_access(deallocation.function, 1) {
+            eprintln!(
+                "[REMu][AVPLAYER] leaked texture={:#x}: deallocator callback={:#x} is unreadable",
+                deallocation.address, deallocation.function
+            );
+            continue;
+        }
+        // SAFETY: InitEx supplied the live texture-deallocation callback and allocator object.
+        // Callbacks are invoked only after releasing the process dispatch lock, so the guest
+        // allocator may re-enter kernel memory imports exactly as it can in the native library.
+        let function: DeallocateTexture = unsafe { std::mem::transmute(deallocation.function) };
+        unsafe { function(deallocation.object, deallocation.address) };
+    }
+}
+
 pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
     let Some(dispatch) = PROBE_DISPATCH.get() else {
         return;
@@ -330,14 +488,17 @@ pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
         };
         (
             player.allocate_texture_callback,
+            player.deallocate_texture_callback,
             player.allocator_object,
             stride,
         )
     };
-    if !process_guest_range_is_readable(request.0, 1) {
+    if !process_guest_range_has_read_access(request.0, 1)
+        || !process_guest_range_has_read_access(request.1, 1)
+    {
         eprintln!(
-            "[REMu][AVPLAYER] texture allocator callback is unreadable: {:#x}",
-            request.0
+            "[REMu][AVPLAYER] texture allocator callbacks are unreadable: allocate={:#x} deallocate={:#x}",
+            request.0, request.1
         );
         return;
     }
@@ -348,28 +509,56 @@ pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
     let allocate: AllocateTexture = unsafe { std::mem::transmute(request.0) };
     let mut buffers = [0_u64; 3];
     for (index, buffer) in buffers.iter_mut().enumerate() {
-        let Ok(size) = u32::try_from(request.2) else {
+        let Ok(size) = u32::try_from(request.3) else {
             return;
         };
         // SAFETY: The callback ABI is `(object, alignment, size)`.
-        *buffer = unsafe { allocate(request.1, 0x100, size) };
+        *buffer = unsafe { allocate(request.2, 0x100, size) };
         if *buffer == 0 {
             eprintln!("[REMu][AVPLAYER] texture allocator returned null for buffer {index}");
+            invoke_av_player_texture_deallocations(
+                buffers[..index]
+                    .iter()
+                    .copied()
+                    .map(|address| AvPlayerTextureDeallocation {
+                        function: request.1,
+                        object: request.2,
+                        address,
+                    })
+                    .collect(),
+            );
             return;
         }
     }
     let mut state = dispatch
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(player) = state.av_player.players.get_mut(&handle) else {
-        return;
-    };
-    if player.video_buffers[0] == 0 {
+    let installed = if let Some(player) = state.av_player.players.get_mut(&handle)
+        && player.video_buffers[0] == 0
+    {
         player.video_buffers = buffers;
-        player.video_buffer_stride = request.2;
+        player.video_buffer_stride = request.3;
         eprintln!(
             "[REMu][AVPLAYER] allocated guest video buffers size={} addresses={buffers:#x?}",
-            request.2
+            request.3
+        );
+        true
+    } else {
+        false
+    };
+    drop(state);
+    if !installed {
+        // The player may have closed or another GetVideoData caller may have won the race while
+        // the guest allocator callbacks ran. Return this losing allocation immediately.
+        invoke_av_player_texture_deallocations(
+            buffers
+                .into_iter()
+                .map(|address| AvPlayerTextureDeallocation {
+                    function: request.1,
+                    object: request.2,
+                    address,
+                })
+                .collect(),
         );
     }
 }
@@ -432,12 +621,18 @@ pub(crate) fn av_player_add_source_ex(arguments: [u64; 6], state: &mut ProbeDisp
     if arguments[1] != 0 || details == 0 {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     }
+    if !process_guest_range_has_read_access(details, 12) {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
     let source_address = read_guest_u64(details);
     let length = u64::from(read_guest_u32(details + 8));
     let Ok(length) = usize::try_from(length) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
     if source_address == 0 || length == 0 {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    if !process_guest_range_has_read_access(source_address, length) {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     }
     // SAFETY: the source-details URI pairs this pointer with the exact readable byte length.
@@ -452,9 +647,9 @@ pub(crate) fn av_player_add_source_ex(arguments: [u64; 6], state: &mut ProbeDisp
 
 fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
     if if audio {
-        player.audio_output.is_some()
+        player.audio_decoder.is_some()
     } else {
-        player.video_output.is_some()
+        player.video_decoder.is_some()
     } {
         return true;
     }
@@ -481,6 +676,18 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
             "-map", "0:v:0", "-an", "-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1",
         ]);
     }
+    let frame_bytes = if audio {
+        Some(1024 * 2 * 2)
+    } else {
+        u64::from(player.width)
+            .checked_mul(u64::from(player.height))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .and_then(|bytes| bytes.checked_div(2))
+            .and_then(|bytes| usize::try_from(bytes).ok())
+    };
+    let Some(frame_bytes) = frame_bytes else {
+        return false;
+    };
     let Ok(mut child) = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
         return false;
     };
@@ -489,24 +696,32 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
         let _ = child.wait();
         return false;
     };
+    let (sender, frames) = mpsc::sync_channel(if audio { 8 } else { 4 });
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let kind = if audio { "audio" } else { "video" };
+    let Ok(worker) = std::thread::Builder::new()
+        .name(format!("REMu AVPlayer {kind}"))
+        .spawn(move || {
+            av_player_decoder_worker(output, frame_bytes, sender, worker_cancelled);
+        })
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    let decoder = AvPlayerDecoder {
+        child: Some(child),
+        frames: std::sync::Mutex::new(frames),
+        cancelled,
+        worker: Some(worker),
+    };
     if audio {
-        player.raw_audio_frame.resize(1024 * 2 * 2, 0);
-        player.audio_output = Some(output);
-        player.audio_decoder = Some(child);
+        player.raw_audio_frame.resize(frame_bytes, 0);
+        player.audio_decoder = Some(decoder);
     } else {
-        let frame_bytes = u64::from(player.width)
-            .checked_mul(u64::from(player.height))
-            .and_then(|pixels| pixels.checked_mul(3))
-            .and_then(|bytes| bytes.checked_div(2))
-            .and_then(|bytes| usize::try_from(bytes).ok());
-        let Some(frame_bytes) = frame_bytes else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
-        };
         player.raw_video_frame.resize(frame_bytes, 0);
-        player.video_output = Some(output);
-        player.video_decoder = Some(child);
+        player.video_decoder = Some(decoder);
     }
     player.playing_since.get_or_insert_with(Instant::now);
     eprintln!(
@@ -516,11 +731,32 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
     true
 }
 
-fn av_player_read_video_frame(player: &mut AvPlayerInstance) -> bool {
-    player
-        .video_output
-        .as_mut()
-        .is_some_and(|output| output.read_exact(&mut player.raw_video_frame).is_ok())
+fn av_player_read_video_frame(player: &mut AvPlayerInstance) -> AvPlayerFrameStatus {
+    let Some(decoder) = player.video_decoder.as_ref() else {
+        return AvPlayerFrameStatus::Finished;
+    };
+    match decoder.poll() {
+        AvPlayerDecoderPoll::Frame(frame) => {
+            player.raw_video_frame = frame;
+            AvPlayerFrameStatus::Ready
+        }
+        AvPlayerDecoderPoll::Pending => AvPlayerFrameStatus::Pending,
+        AvPlayerDecoderPoll::Finished => AvPlayerFrameStatus::Finished,
+    }
+}
+
+fn av_player_read_audio_frame(player: &mut AvPlayerInstance) -> AvPlayerFrameStatus {
+    let Some(decoder) = player.audio_decoder.as_ref() else {
+        return AvPlayerFrameStatus::Finished;
+    };
+    match decoder.poll() {
+        AvPlayerDecoderPoll::Frame(frame) => {
+            player.raw_audio_frame = frame;
+            AvPlayerFrameStatus::Ready
+        }
+        AvPlayerDecoderPoll::Pending => AvPlayerFrameStatus::Pending,
+        AvPlayerDecoderPoll::Finished => AvPlayerFrameStatus::Finished,
+    }
 }
 
 fn av_player_finish_stream(player: &mut AvPlayerInstance) {
@@ -528,9 +764,11 @@ fn av_player_finish_stream(player: &mut AvPlayerInstance) {
         player.reset_playback();
         player.playing_since = Some(Instant::now());
     } else {
+        let started = player.playing_since.take();
+        player.stop_decoders();
         player.active_session = false;
         player.end_of_stream = true;
-        if let Some(started) = player.playing_since.take() {
+        if let Some(started) = started {
             player.elapsed += started.elapsed();
         }
     }
@@ -789,11 +1027,26 @@ fn av_player_trace_zero_return(handle: u64, kind: &'static str, reason: &'static
 }
 
 pub(crate) fn av_player_close(handle: u64, state: &mut ProbeDispatchState) -> u64 {
-    if state.av_player.players.remove(&handle).is_some() {
-        0
-    } else {
-        sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS)
+    let Some(mut player) = state.av_player.players.remove(&handle) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    if player.video_buffer_base == 0 && player.deallocate_texture_callback != 0 {
+        state.av_player.pending_texture_deallocations.extend(
+            player
+                .video_buffers
+                .into_iter()
+                .filter(|address| *address != 0)
+                .map(|address| AvPlayerTextureDeallocation {
+                    function: player.deallocate_texture_callback,
+                    object: player.allocator_object,
+                    address,
+                }),
+        );
+        // The callbacks now own these addresses. Clear the instance copy before its teardown so
+        // future Drop changes cannot accidentally treat callback-owned memory as fallback memory.
+        player.video_buffers = [0; 3];
     }
+    0
 }
 
 pub(crate) fn av_player_current_time(handle: u64, state: &ProbeDispatchState) -> u64 {
@@ -1035,9 +1288,16 @@ pub(crate) fn av_player_get_video_data(
     };
     let skipped_frames = catch_up_target.saturating_sub(player.next_video_frame);
     for _ in 0..skipped_frames {
-        if !av_player_read_video_frame(player) {
-            av_player_finish_stream(player);
-            return 0;
+        match av_player_read_video_frame(player) {
+            AvPlayerFrameStatus::Ready => {}
+            AvPlayerFrameStatus::Pending => {
+                av_player_trace_zero_return(arguments[0], "video", "decoder-pending");
+                return 0;
+            }
+            AvPlayerFrameStatus::Finished => {
+                av_player_finish_stream(player);
+                return 0;
+            }
         }
         player.next_video_frame = player.next_video_frame.saturating_add(1);
     }
@@ -1048,9 +1308,16 @@ pub(crate) fn av_player_get_video_data(
             player.playback_elapsed().as_millis()
         );
     }
-    if !av_player_read_video_frame(player) {
-        av_player_finish_stream(player);
-        return 0;
+    match av_player_read_video_frame(player) {
+        AvPlayerFrameStatus::Ready => {}
+        AvPlayerFrameStatus::Pending => {
+            av_player_trace_zero_return(arguments[0], "video", "decoder-pending");
+            return 0;
+        }
+        AvPlayerFrameStatus::Finished => {
+            av_player_finish_stream(player);
+            return 0;
+        }
     }
     let timestamp = ((player.next_video_frame as f64) * 1_000.0 / player.frames_per_second.max(1.0))
         .round() as u64;
@@ -1099,13 +1366,16 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
         av_player_trace_zero_return(arguments[0], "audio", "no-decoder");
         return 0;
     }
-    if player
-        .audio_output
-        .as_mut()
-        .is_none_or(|output| output.read_exact(&mut player.raw_audio_frame).is_err())
-    {
-        av_player_trace_zero_return(arguments[0], "audio", "decoder-drained");
-        return 0;
+    match av_player_read_audio_frame(player) {
+        AvPlayerFrameStatus::Ready => {}
+        AvPlayerFrameStatus::Pending => {
+            av_player_trace_zero_return(arguments[0], "audio", "decoder-pending");
+            return 0;
+        }
+        AvPlayerFrameStatus::Finished => {
+            av_player_trace_zero_return(arguments[0], "audio", "decoder-drained");
+            return 0;
+        }
     }
     if player.audio_buffer_base == 0 {
         let total = u64::try_from(FRAME_BYTES * 8).unwrap_or(0);

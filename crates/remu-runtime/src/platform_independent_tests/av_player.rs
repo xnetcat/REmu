@@ -407,6 +407,17 @@ fn av_player_frame_timestamp(frame_info: &[u8; 112]) -> u64 {
     u64::from_ne_bytes(frame_info[16..24].try_into().unwrap())
 }
 
+fn av_player_wait_for_video_frame(handle: u64, output: u64, state: &mut ProbeDispatchState) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let result = crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, state);
+        if result != 0 || Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
     let Some(root) = av_player_generate_test_clip("prepare-pattern") else {
@@ -427,9 +438,9 @@ fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
 
     let mut frame_info = [0_u8; 112];
     let output = frame_info.as_mut_ptr().addr() as u64;
-    // The first frame is always due.
+    // The first frame is always due once the asynchronous decoder has produced it.
     assert_eq!(
-        crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, &mut state),
+        av_player_wait_for_video_frame(handle, output, &mut state),
         1,
         "first video frame must be delivered"
     );
@@ -542,7 +553,7 @@ fn av_player_jump_to_time_seeks_the_decoder_instead_of_replaying_from_zero() {
     let mut frame_info = [0_u8; 112];
     let output = frame_info.as_mut_ptr().addr() as u64;
     assert_eq!(
-        crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, &mut state),
+        av_player_wait_for_video_frame(handle, output, &mut state),
         1,
         "the frame at the seek target must be delivered"
     );

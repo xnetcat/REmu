@@ -50,8 +50,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CString;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -174,7 +175,7 @@ pub(crate) use av_player::{
     av_player_pause, av_player_post_init, av_player_resume, av_player_set_log_callback,
     av_player_set_looping, av_player_set_trick_speed, av_player_start, av_player_stop,
     av_player_stream_count, av_player_validate_handle, invoke_av_player_event_callbacks,
-    prepare_av_player_video_buffers,
+    invoke_av_player_texture_deallocations, prepare_av_player_video_buffers,
 };
 #[cfg(test)]
 pub(crate) use dialog::{
@@ -469,6 +470,7 @@ struct AvPlayerRuntimeState {
     next_handle: u64,
     players: BTreeMap<u64, AvPlayerInstance>,
     pending_callbacks: Vec<AvPlayerEventCallback>,
+    pending_texture_deallocations: Vec<AvPlayerTextureDeallocation>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -478,11 +480,27 @@ struct AvPlayerEventCallback {
     event: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AvPlayerTextureDeallocation {
+    function: u64,
+    object: u64,
+    address: u64,
+}
+
+#[derive(Debug)]
+struct AvPlayerDecoder {
+    child: Option<Child>,
+    frames: Mutex<Receiver<Vec<u8>>>,
+    cancelled: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
 #[derive(Debug)]
 struct AvPlayerInstance {
     _initialization: Vec<u8>,
     allocator_object: u64,
     allocate_texture_callback: u64,
+    deallocate_texture_callback: u64,
     event_object: u64,
     event_callback: u64,
     source: Option<String>,
@@ -507,8 +525,7 @@ struct AvPlayerInstance {
     /// Playback-rate percentage from sceAvPlayerSetTrickSpeed; 100 is normal speed. It scales
     /// the player media clock, not media timestamps.
     trick_speed_percent: u32,
-    video_decoder: Option<Child>,
-    video_output: Option<ChildStdout>,
+    video_decoder: Option<AvPlayerDecoder>,
     raw_video_frame: Vec<u8>,
     padded_video_frame: Vec<u8>,
     video_buffer_base: u64,
@@ -520,8 +537,7 @@ struct AvPlayerInstance {
     /// frame. This prevents a long initial shader compile from seeking a short splash straight to
     /// EOF, while still allowing later frames to catch up when emulation runs below movie FPS.
     video_catch_up_origin: Option<(Instant, u64)>,
-    audio_decoder: Option<Child>,
-    audio_output: Option<ChildStdout>,
+    audio_decoder: Option<AvPlayerDecoder>,
     raw_audio_frame: Vec<u8>,
     audio_buffer_base: u64,
     next_audio_buffer: usize,
@@ -530,15 +546,11 @@ struct AvPlayerInstance {
 
 impl AvPlayerInstance {
     fn stop_decoders(&mut self) {
-        self.video_output = None;
-        self.audio_output = None;
-        if let Some(mut decoder) = self.video_decoder.take() {
-            let _ = decoder.kill();
-            let _ = decoder.wait();
+        if let Some(decoder) = self.video_decoder.take() {
+            decoder.retire();
         }
-        if let Some(mut decoder) = self.audio_decoder.take() {
-            let _ = decoder.kill();
-            let _ = decoder.wait();
+        if let Some(decoder) = self.audio_decoder.take() {
+            decoder.retire();
         }
         self.playing_since = None;
     }
@@ -2342,6 +2354,8 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     let dispatch_started = trace_lock_stall.then(Instant::now);
     begin_deferred_gpu_publication();
     let result = dispatch_probe_import(nid, call_args, stack_args, &mut state);
+    let av_player_texture_deallocations =
+        std::mem::take(&mut state.av_player.pending_texture_deallocations);
     let gpu_publication = take_deferred_gpu_publication();
     if let Some(dispatch_started) = dispatch_started {
         let held = dispatch_started.elapsed();
@@ -2365,6 +2379,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         );
     }
     invoke_av_player_event_callbacks(av_player_callbacks);
+    invoke_av_player_texture_deallocations(av_player_texture_deallocations);
     // Paced after the dispatch lock is released: the submitting thread waits for its own vblank,
     // exactly as it would on the console, without stalling other guest threads.
     let queued_flips = QUEUED_FLIPS.with(|queued| queued.replace(0));
