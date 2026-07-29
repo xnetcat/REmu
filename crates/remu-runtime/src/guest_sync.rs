@@ -67,12 +67,27 @@ fn trace_main_condition_notify(frame: Option<&ImportCallFrame>, condition: u64, 
     }
     let sequence = MAIN_CONDITION_NOTIFY_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let (waiters, notifies, timeouts) = condition_trace_stats(condition);
+    let guest_rsp = frame.map_or(0, |frame| frame.guest_rsp);
+    let stack = if guest_rsp == 0 {
+        [0; 6]
+    } else {
+        std::array::from_fn(|index| {
+            read_guest_u64(
+                guest_rsp.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(8)),
+            )
+        })
+    };
     eprintln!(
-        "[REMu][COND][MAIN-NOTIFY] sequence={sequence} thread={:?}/{:#x} return={:#x} rsp={:#x} condition={condition:#x} broadcast={broadcast} waiters={waiters} notifies_before={notifies} timeouts={timeouts}",
+        "[REMu][COND][MAIN-NOTIFY] sequence={sequence} thread={:?}/{:#x} return={:#x} rsp={guest_rsp:#x} stack={:#x},{:#x},{:#x},{:#x},{:#x},{:#x} condition={condition:#x} broadcast={broadcast} waiters={waiters} notifies_before={notifies} timeouts={timeouts}",
         current_guest_thread_name(),
         current_guest_thread_handle(),
         frame.map_or(0, |frame| frame.guest_return_address),
-        frame.map_or(0, |frame| frame.guest_rsp),
+        stack[0],
+        stack[1],
+        stack[2],
+        stack[3],
+        stack[4],
+        stack[5],
     );
 }
 
