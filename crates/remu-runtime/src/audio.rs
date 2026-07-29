@@ -91,10 +91,24 @@ struct AudioPort {
 
 impl AudioPort {
     fn output_deadline(&mut self) -> Duration {
-        let now = Instant::now();
-        let deadline = self.next_deadline.unwrap_or(now).max(now);
+        self.output_deadline_at(Instant::now())
+    }
+
+    fn output_deadline_at(&mut self, now: Instant) -> Duration {
         let frame_duration =
             Duration::from_secs_f64(f64::from(self.buffer_frames) / f64::from(self.frequency));
+        let deadline = self.next_deadline.map_or(now, |scheduled| {
+            // Preserve up to one grain of scheduling lateness as catch-up credit. Clamping every
+            // late deadline to `now` permanently lowers the effective sample rate by the thread's
+            // wake-up latency and turns ordinary AudioOut into the same crackle-producing clock
+            // that AudioOut2 used to have. A longer gap is a real stream stop, so re-anchor then
+            // rather than submitting an unbounded burst.
+            if now.saturating_duration_since(scheduled) > frame_duration {
+                now
+            } else {
+                scheduled
+            }
+        });
         self.next_deadline = Some(deadline + frame_duration);
         deadline.saturating_duration_since(now)
     }
@@ -113,7 +127,13 @@ struct AudioMixer {
 
 impl AudioMixer {
     fn add_port(&mut self, handle: i32) {
-        self.queues.entry(handle).or_default();
+        self.queues.entry(handle).or_insert_with(|| AudioQueue {
+            // Audio pushes hold the same lock as the host render callback. Reserve the normal
+            // buffering window before playback starts so steady-state submissions only copy
+            // samples and cannot stop CoreAudio behind a VecDeque allocation.
+            frames: VecDeque::with_capacity(AUDIO_PREBUFFER_FRAMES),
+            started: false,
+        });
     }
 
     fn remove_port(&mut self, handle: i32) {
@@ -518,10 +538,11 @@ impl AudioOutState {
             unsafe { std::slice::from_raw_parts(source_address as *const u8, byte_length) };
         let stereo = decode_stereo_frames(source, port);
         if let Some(host) = self.host.as_ref() {
-            let resampled = port
-                .resampler
-                .as_mut()
-                .map_or_else(|| stereo.clone(), |resampler| resampler.process(&stereo));
+            let resampled = if let Some(resampler) = port.resampler.as_mut() {
+                resampler.process(&stereo)
+            } else {
+                stereo
+            };
             let mut mixer = host
                 .mixer
                 .lock()
@@ -695,6 +716,7 @@ mod tests {
         StreamingStereoResampler, decode_stereo_frames,
     };
     use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
 
     fn stereo_audio_port() -> AudioPort {
         AudioPort {
@@ -711,6 +733,47 @@ mod tests {
             next_deadline: None,
             resampler: None,
         }
+    }
+
+    #[test]
+    fn ordinary_audio_deadline_preserves_short_lateness_as_catch_up_credit() {
+        let mut port = stereo_audio_port();
+        let grain = Duration::from_secs_f64(256.0 / 48_000.0);
+        let start = Instant::now();
+
+        assert_eq!(port.output_deadline_at(start), Duration::ZERO);
+        let late = start + grain + Duration::from_millis(1);
+        assert_eq!(
+            port.output_deadline_at(late),
+            Duration::ZERO,
+            "a late call must return immediately to catch the stream back up"
+        );
+        assert_eq!(
+            port.next_deadline,
+            Some(start + grain + grain),
+            "short producer lateness must not shift the device timeline"
+        );
+        assert_eq!(
+            port.output_deadline_at(late),
+            grain - Duration::from_millis(1),
+            "the following call must reclaim the sub-grain scheduling lateness"
+        );
+    }
+
+    #[test]
+    fn ordinary_audio_deadline_reanchors_after_a_real_stream_stop() {
+        let mut port = stereo_audio_port();
+        let grain = Duration::from_secs_f64(256.0 / 48_000.0);
+        let start = Instant::now();
+
+        assert_eq!(port.output_deadline_at(start), Duration::ZERO);
+        let resumed = start + grain + grain + Duration::from_millis(1);
+        assert_eq!(port.output_deadline_at(resumed), Duration::ZERO);
+        assert_eq!(
+            port.next_deadline,
+            Some(resumed + grain),
+            "a stopped stream must resume from the current device time"
+        );
     }
 
     #[test]
