@@ -207,6 +207,31 @@ fn recycled_command_buffer_generation_cannot_replay_an_older_prefix() {
 }
 
 #[test]
+fn ordinary_neighboring_allocations_are_not_guessed_as_a_missing_prefix() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let descriptor = fixture.address();
+    let start = fixture.start();
+    fixture.words[..6].copy_from_slice(&[
+        pm4(3, IT_SET_SH_REG, 0),
+        0x0c,
+        0x1111_1111,
+        pm4(3, IT_SET_SH_REG, 0),
+        0x0d,
+        0x2222_2222,
+    ]);
+
+    track_graphics_command_allocation(descriptor, start, 3, false);
+    track_graphics_command_allocation(descriptor, start + 12, 3, false);
+
+    assert_eq!(
+        take_recorded_graphics_prefix(start + 24),
+        None,
+        "valid PM4 in recycled command memory is not evidence of a grow-split DCB"
+    );
+}
+
+#[test]
 fn consumed_continuation_target_cannot_be_replayed_as_a_prefix() {
     let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([
@@ -227,7 +252,7 @@ fn consumed_continuation_target_cannot_be_replayed_as_a_prefix() {
 }
 
 #[test]
-fn submitted_commands_are_not_replayed_before_a_later_tail() {
+fn a_successful_submission_consumes_its_grow_recovery_boundary() {
     let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([
         pm4(3, IT_SET_SH_REG, 0),
@@ -243,10 +268,7 @@ fn submitted_commands_are_not_replayed_before_a_later_tail() {
 
     track_graphics_submission(start, 3);
 
-    assert_eq!(
-        take_recorded_graphics_prefix(start + 24),
-        Some((start + 12, 3))
-    );
+    assert_eq!(take_recorded_graphics_prefix(start + 24), None);
 }
 
 #[test]
@@ -270,7 +292,7 @@ fn a_recorded_prefix_cannot_cross_an_explicit_submission_boundary() {
     track_graphics_command_allocation(descriptor, start, 3, false);
     track_graphics_command_allocation(descriptor, start + 12, 3, false);
     track_graphics_submission(start + 12, 3);
-    track_graphics_command_allocation(descriptor, start + 24, 3, false);
+    track_graphics_command_allocation(descriptor, start + 24, 3, true);
 
     assert_eq!(
         take_recorded_graphics_prefix(start + 36),

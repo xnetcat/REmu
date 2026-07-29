@@ -40,6 +40,12 @@ struct GraphicsCommandBufferGeneration {
     buffer_start: u64,
     buffer_end: u64,
     last_allocation_end: u64,
+    /// Start of a replacement allocation observed directly after the guest grow callback.
+    ///
+    /// Only this boundary proves that commands preceding an explicitly submitted tail were split
+    /// away by growth. Cursor regression is ordinary ring reuse and does not prove a missing
+    /// prefix, even when the recycled bytes still form valid PM4.
+    recovery_start: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,68 +412,64 @@ pub(crate) fn retire_pending_graphics_continuation(packet: u64) {
 pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64, u32)> {
     const MAX_PREFIX_DWORDS: u64 = 1_000_000;
     let lower_bound = command_address.saturating_sub(MAX_PREFIX_DWORDS * 4);
-    let mut allocations = RECENT_COMMAND_ALLOCATIONS
+    let recoveries = GRAPHICS_COMMAND_BUFFER_GENERATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Command memory is a recycled ring. Restrict the fallback to the newest concrete descriptor
-    // generation whose extent contains this tail; otherwise stale constructor records can join
-    // current bytes into a valid-looking PM4 stream and replay completed releases and waits.
-    let owner = allocations
+    // The callback-observed replacement start is the only authoritative evidence that an
+    // explicitly submitted tail lost a prefix to command-buffer growth. A cursor regression can
+    // mean ordinary ring reuse; scanning that recycled memory for PM4 shape replays stale waits.
+    let (descriptor, generation, prefix_start) = recoveries
         .iter()
-        .filter(|allocation| {
-            allocation.buffer_start <= command_address
-                && command_address <= allocation.buffer_end
-                && allocation.start < command_address
+        .filter_map(|(&descriptor, recovery)| {
+            recovery
+                .recovery_start
+                .filter(|&prefix_start| {
+                    recovery.buffer_start <= prefix_start
+                        && prefix_start < command_address
+                        && command_address <= recovery.buffer_end
+                        && prefix_start >= lower_bound
+                })
+                .map(|prefix_start| (descriptor, recovery.generation, prefix_start))
         })
-        .max_by_key(|allocation| allocation.generation)
-        .map(|allocation| (allocation.descriptor, allocation.generation))?;
+        .max_by_key(|&(_, generation, _)| generation)?;
+    drop(recoveries);
+
     let submitted = RECENT_GRAPHICS_SUBMISSIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut candidates = allocations
+    if submitted
         .iter()
-        .filter_map(|allocation| {
-            (allocation.descriptor == owner.0
-                && allocation.generation == owner.1
-                && allocation.start >= lower_bound
-                && allocation.start < command_address
-                && allocation.end <= command_address)
-                .then_some(allocation.start)
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_unstable();
-    candidates.dedup();
-    // Some Gen5 command helpers reserve only an anchor packet; the guest writes neighboring PM4
-    // directly. Accept those guest-authored packets only inside a complete readable stream that
-    // begins at a constructor-recorded address and ends exactly at the submitted tail. Ranges
-    // parsed by an explicit branch or earlier submission are retired separately, preventing a
-    // valid-looking old stream from being selected a second time.
-    let candidate_count = candidates.len();
-    let closest_candidates = candidates.iter().rev().take(8).copied().collect::<Vec<_>>();
-    let prefix_start = candidates.iter().copied().find(|&start| {
-        // A successful explicit submission is an execution boundary. Constructor anchors left
-        // before it may still point into perfectly valid recycled PM4, but joining across that
-        // boundary executes the already-submitted stream again. This was visible in Silent Hill
-        // as 8k-25k-dword "prefixes" at the title-movie transition.
-        !submitted
-            .iter()
-            .any(|range| range.start < command_address && start < range.end)
-            && scan_valid_command_stream_end(start, command_address) == command_address
-    })?;
+        .any(|range| range.start < command_address && prefix_start < range.end)
+        || scan_valid_command_stream_end(prefix_start, command_address) != command_address
+    {
+        return None;
+    }
     drop(submitted);
+
     let dword_count = u32::try_from((command_address - prefix_start) / 4).ok()?;
     if dword_count == 0 {
         return None;
     }
-    if dword_count >= 4_096 {
-        eprintln!(
-            "[REMu][AGC][PREFIX] reconstructed={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={:#x} generation={} candidates={candidate_count} closest={closest_candidates:#x?}",
-            owner.0, owner.1,
-        );
+
+    let mut recoveries = GRAPHICS_COMMAND_BUFFER_GENERATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let recovery = recoveries.get_mut(&descriptor)?;
+    if recovery.generation != generation || recovery.recovery_start != Some(prefix_start) {
+        return None;
     }
+    recovery.recovery_start = None;
+    drop(recoveries);
+
+    eprintln!(
+        "[REMu][AGC][PREFIX] recovered grow split={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={descriptor:#x} generation={generation}"
+    );
+    let mut allocations = RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     allocations.retain(|allocation| {
-        allocation.descriptor != owner.0
-            || allocation.generation != owner.1
+        allocation.descriptor != descriptor
+            || allocation.generation != generation
             || !(allocation.start >= prefix_start && allocation.end <= command_address)
     });
     Some((prefix_start, dword_count))
@@ -488,6 +490,18 @@ pub(crate) fn consume_recorded_graphics_range(command_address: u64, dword_count:
         .retain(|allocation| {
             !(allocation.start >= command_address && allocation.end <= command_end)
         });
+    for recovery in GRAPHICS_COMMAND_BUFFER_GENERATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values_mut()
+    {
+        if recovery
+            .recovery_start
+            .is_some_and(|start| command_address <= start && start < command_end)
+        {
+            recovery.recovery_start = None;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -542,6 +556,7 @@ pub(crate) fn track_graphics_command_allocation(
                     buffer_start,
                     buffer_end,
                     last_allocation_end: command_end,
+                    recovery_start: grew.then_some(command),
                 },
             );
             (generation, true)
@@ -596,6 +611,27 @@ fn track_graphics_allocation_for_generation(
     let Some(command_end) = command.checked_add(u64::from(dword_count) * 4) else {
         return;
     };
+    let mut generations = GRAPHICS_COMMAND_BUFFER_GENERATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match generations.get_mut(&descriptor) {
+        Some(current) if current.generation == generation => {
+            current.last_allocation_end = current.last_allocation_end.max(command_end);
+        }
+        _ => {
+            generations.insert(
+                descriptor,
+                GraphicsCommandBufferGeneration {
+                    generation,
+                    buffer_start,
+                    buffer_end,
+                    last_allocation_end: command_end,
+                    recovery_start: Some(command),
+                },
+            );
+        }
+    }
+    drop(generations);
     let mut allocations = RECENT_COMMAND_ALLOCATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -629,6 +665,18 @@ pub(crate) fn track_graphics_submission(command_address: u64, dword_count: u32) 
         allocations.retain(|allocation| {
             !(allocation.start >= command_address && allocation.end <= submitted_end)
         });
+    }
+    for recovery in GRAPHICS_COMMAND_BUFFER_GENERATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values_mut()
+    {
+        if recovery
+            .recovery_start
+            .is_some_and(|start| command_address <= start && start < submitted_end)
+        {
+            recovery.recovery_start = None;
+        }
     }
     let mut submissions = RECENT_GRAPHICS_SUBMISSIONS
         .lock()
