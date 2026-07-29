@@ -170,6 +170,22 @@ fn begin_main_timed_condition_trace(
             read_guest_u64(event_caller_rbp.saturating_add(8)),
         )
     };
+    let (grandparent_rbp, grandparent_return) = if parent_rbp == 0 {
+        (0, 0)
+    } else {
+        (
+            read_guest_u64(parent_rbp),
+            read_guest_u64(parent_rbp.saturating_add(8)),
+        )
+    };
+    let (great_grandparent_rbp, great_grandparent_return) = if grandparent_rbp == 0 {
+        (0, 0)
+    } else {
+        (
+            read_guest_u64(grandparent_rbp),
+            read_guest_u64(grandparent_rbp.saturating_add(8)),
+        )
+    };
     let (clock_start_bits, clock_target_bits) = if event_caller_rbp < 0x78 {
         (0, 0)
     } else {
@@ -181,9 +197,20 @@ fn begin_main_timed_condition_trace(
     let limiter_wait_millis = read_guest_u32(0x807_b26_f74);
     let limiter_target_millis = read_guest_u32(0x807_b26_f78);
     let process_counter = kernel_process_time(true);
+    let named_thread = 0x807_b39_d68;
+    let named_queue_index = i64::from(i32::from_ne_bytes(
+        read_guest_u32(named_thread + 0x20).to_ne_bytes(),
+    ));
+    let named_queue = named_thread.wrapping_add_signed(named_queue_index.saturating_mul(16));
+    let named_queue_state = read_guest_u64(named_queue);
+    let named_queue_flags = if named_queue_state == 0 {
+        0
+    } else {
+        read_guest_u64(named_queue_state.saturating_add(0x10))
+    };
     let (waiters_before, notifies_before, timeouts_before) = condition_trace_stats(condition);
     eprintln!(
-        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} parent={parent_return:#x}/rbp:{parent_rbp:#x} limiter_start={:#018x}/{:.9} limiter_target={:#018x}/{:.9} limiter_globals={limiter_wait_millis}/{limiter_target_millis} process_counter={process_counter} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
+        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} ancestors={parent_return:#x}/rbp:{parent_rbp:#x},{grandparent_return:#x}/rbp:{grandparent_rbp:#x},{great_grandparent_return:#x}/rbp:{great_grandparent_rbp:#x} named_queue={named_queue:#x}/index:{named_queue_index}/state:{named_queue_state:#x}/flags:{named_queue_flags:#x} limiter_start={:#018x}/{:.9} limiter_target={:#018x}/{:.9} limiter_globals={limiter_wait_millis}/{limiter_target_millis} process_counter={process_counter} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
         current_guest_thread_handle(),
         frame.map_or(0, |frame| frame.guest_return_address),
         clock_start_bits,
