@@ -70,7 +70,8 @@ pub(crate) use agc_api::{
     AGC_DB_Z_INFO, AGC_DB_Z_READ_BASE, AGC_DB_Z_READ_BASE_HI, AGC_DB_Z_WRITE_BASE,
     AGC_DB_Z_WRITE_BASE_HI, AGC_IT_CLEAR_STATE, AGC_IT_COND_EXEC, AGC_IT_DISPATCH_DIRECT,
     AGC_IT_DISPATCH_INDIRECT, AGC_IT_DMA_DATA, AGC_IT_DRAW_INDEX_2, AGC_IT_DRAW_INDEX_AUTO,
-    AGC_IT_DRAW_INDEX_OFFSET, AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE,
+    AGC_IT_DRAW_INDEX_INDIRECT, AGC_IT_DRAW_INDEX_INDIRECT_MULTI, AGC_IT_DRAW_INDEX_OFFSET,
+    AGC_IT_DRAW_INDIRECT, AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE,
     AGC_IT_INDEX_TYPE, AGC_IT_INDIRECT_BUFFER, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
     AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE, AGC_IT_SET_CONTEXT_REG, AGC_IT_SET_CONTEXT_REG_INDIRECT,
     AGC_IT_SET_PREDICATION, AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG,
@@ -951,6 +952,7 @@ struct AgcGraphicsState {
     index_size: u32,
     instance_count: u32,
     draw_index_offset: u32,
+    graphics_indirect_args_address: u64,
     compute_indirect_args_address: u64,
     emitted_draws: u64,
     emitted_compute_dispatches: u64,
@@ -986,6 +988,7 @@ impl AgcGraphicsState {
         self.index_size = 0;
         self.instance_count = 1;
         self.draw_index_offset = 0;
+        self.graphics_indirect_args_address = 0;
         self.compute_indirect_args_address = 0;
     }
 }

@@ -637,6 +637,22 @@ pub(crate) enum AgcSubmissionError {
     UnsupportedBaseIndex(u32),
     #[error("SET_BASE selects unsupported shader type {0}")]
     UnsupportedSetBaseShaderType(u32),
+    #[error("indirect graphics draw has no active graphics indirect-argument base")]
+    MissingGraphicsIndirectBase,
+    #[error(
+        "indirect graphics draw packet opcode 0x{opcode:02X} has {actual} dwords, expected {expected}"
+    )]
+    IndirectDrawPacketLength {
+        opcode: u32,
+        actual: u32,
+        expected: u32,
+    },
+    #[error("indirect graphics draw argument address overflows the guest address space")]
+    IndirectDrawAddressOverflow,
+    #[error("indirect graphics draw arguments at 0x{0:016X} are not readable")]
+    UnreadableIndirectDrawArguments(u64),
+    #[error("indirect graphics draw packet opcode 0x{0:02X} is not implemented")]
+    UnsupportedIndirectDrawPacket(u32),
     #[error("CLEAR_STATE packet has {actual} dwords, expected 2")]
     ClearStatePacketLength { actual: u32 },
     #[error("CLEAR_STATE control has unsupported bits 0x{0:08X}")]

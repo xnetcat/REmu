@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::{
-    AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE,
-    AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE, AGC_IT_SET_SH_REG_INDIRECT, AGC_R_ACB_RESET,
+    AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_DRAW_INDEX_INDIRECT,
+    AGC_IT_DRAW_INDIRECT, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP,
+    AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE, AGC_IT_SET_SH_REG_INDIRECT, AGC_R_ACB_RESET,
     AGC_R_DRAW_INDEX_AUTO, AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState,
     AgcShaderRegistry, AgcSubmitPacket, AlignedComputeProgram, AlignedIndirectArguments,
     GPU_EVENT_SINK_TEST, ProbeDispatchState, VideoOutBufferAttributes, VideoOutState,
@@ -247,6 +248,132 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
     assert_eq!(draw.draw_flags, 2);
     assert_eq!(submission_count, 1);
     assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn executes_nonindexed_indirect_draw_from_the_graphics_set_base() {
+    let arguments = AlignedIndirectArguments([6, 3, 4, 7, 0, 0, 0, 0]);
+    let arguments_address = arguments.0.as_ptr().addr() as u64;
+    let set_base = [
+        agc_pm4(4, AGC_IT_SET_BASE, 0),
+        1,
+        low_u32(arguments_address),
+        low_u32(arguments_address >> 32),
+    ];
+    let packet = [agc_pm4(5, AGC_IT_DRAW_INDIRECT, 0), 0, 0x08c, 0x08d, 2];
+    let mut graphics = AgcGraphicsState::default();
+    let mut shaders = AgcShaderRegistry::default();
+    let mut flips = Vec::new();
+    let mut event_writes = Vec::new();
+    agc_apply_set_base(set_base.as_ptr().addr() as u64, 4, &mut graphics)
+        .expect("graphics indirect base");
+
+    let (result, events) = crate::capture_agc_gpu_events(|| {
+        crate::agc_handle_submission_packet(
+            crate::AgcSubmissionPacket {
+                address: packet.as_ptr().addr() as u64,
+                length: 5,
+                opcode: AGC_IT_DRAW_INDIRECT,
+                register: 0,
+                predicated: false,
+            },
+            &mut graphics,
+            &mut shaders,
+            &VideoOutState::default(),
+            &mut flips,
+            &mut event_writes,
+            None,
+        )
+    });
+    result.expect("nonindexed indirect draw");
+
+    let [remu_gpu::GpuEvent::IndexedDraw(draw)] = events.as_slice() else {
+        panic!("indirect draw emitted unexpected events: {events:?}");
+    };
+    assert!(!draw.indexed);
+    assert_eq!(draw.index_count, 6);
+    assert_eq!(draw.instance_count, 3);
+    assert_eq!(draw.index_offset, 4);
+    assert_eq!(draw.base_vertex, 0);
+    assert_eq!(draw.draw_flags, 2);
+    assert_eq!(graphics.shader_registers.get(&0x08c), Some(&4));
+    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&7));
+}
+
+#[test]
+fn executes_indexed_indirect_draw_with_all_five_argument_fields() {
+    #[repr(C, align(8))]
+    struct OffsetIndirectArguments {
+        padding: [u32; 10],
+        draw: [u32; 5],
+    }
+    let arguments = OffsetIndirectArguments {
+        padding: [0; 10],
+        draw: [6, 2, 1, (-3_i32) as u32, 9],
+    };
+    let arguments_address = arguments.padding.as_ptr().addr() as u64;
+    let indices = [10_u16, 11, 12, 13, 14, 15, 16, 17];
+    let index_address = indices.as_ptr().addr() as u64;
+    let set_base = [
+        agc_pm4(4, AGC_IT_SET_BASE, 0),
+        1,
+        low_u32(arguments_address),
+        low_u32(arguments_address >> 32),
+    ];
+    let packet = [
+        agc_pm4(5, AGC_IT_DRAW_INDEX_INDIRECT, 0),
+        0x28,
+        0x08d_008c,
+        0x08e,
+        2,
+    ];
+    let mut graphics = AgcGraphicsState {
+        index_buffer_address: index_address,
+        index_resource_address: index_address,
+        index_buffer_count: u32::try_from(indices.len()).expect("index count"),
+        index_size: 1,
+        ..AgcGraphicsState::default()
+    };
+    let mut shaders = AgcShaderRegistry::default();
+    let mut flips = Vec::new();
+    let mut event_writes = Vec::new();
+    agc_apply_set_base(set_base.as_ptr().addr() as u64, 4, &mut graphics)
+        .expect("graphics indirect base");
+
+    let (result, events) = crate::capture_agc_gpu_events(|| {
+        crate::agc_handle_submission_packet(
+            crate::AgcSubmissionPacket {
+                address: packet.as_ptr().addr() as u64,
+                length: 5,
+                opcode: AGC_IT_DRAW_INDEX_INDIRECT,
+                register: 0,
+                predicated: false,
+            },
+            &mut graphics,
+            &mut shaders,
+            &VideoOutState::default(),
+            &mut flips,
+            &mut event_writes,
+            None,
+        )
+    });
+    result.expect("indexed indirect draw");
+
+    let [remu_gpu::GpuEvent::IndexedDraw(draw)] = events.as_slice() else {
+        panic!("indexed indirect draw emitted unexpected events: {events:?}");
+    };
+    assert!(draw.indexed);
+    assert_eq!(draw.index_count, 6);
+    assert_eq!(draw.instance_count, 2);
+    assert_eq!(draw.index_offset, 1);
+    assert_eq!(draw.base_vertex, -3);
+    assert_eq!(draw.draw_flags, 2);
+    assert_eq!(
+        graphics.shader_registers.get(&0x08c),
+        Some(&((-3_i32) as u32))
+    );
+    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&1));
+    assert_eq!(graphics.shader_registers.get(&0x08e), Some(&9));
 }
 
 #[test]
