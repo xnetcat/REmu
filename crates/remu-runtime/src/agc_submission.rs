@@ -18,6 +18,7 @@ mod decode;
 mod driver;
 mod flow;
 mod parse;
+mod shadow;
 
 #[cfg(test)]
 pub(crate) use self::decode::decode_agc_pipeline_barrier;
@@ -35,10 +36,12 @@ pub(crate) use self::parse::{
     AgcSubmissionContext, agc_parse_graphics_submission, agc_parse_submission,
 };
 
-use self::decode::{
-    decode_agc_memory_release, decode_agc_memory_write, mirror_agc_cpu_memory_copy,
-};
+use self::decode::{decode_agc_memory_release, decode_agc_memory_write};
 use self::flow::{agc_apply_predication, agc_branch_target, agc_cond_exec_skip_end};
+use self::shadow::stage_agc_memory_copy;
+pub(crate) use self::shadow::{
+    agc_memory_shadow_overlaps, apply_agc_memory_shadow, begin_agc_memory_shadow,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct AgcSubmissionPacket {
@@ -128,14 +131,13 @@ pub(crate) fn agc_handle_submission_packet(
         emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryWrite(write));
     }
     if (opcode == AGC_IT_DMA_DATA || (opcode == AGC_IT_NOP && register == AGC_R_DMA_DATA))
-        && let Some(mut copy) =
-            decode_agc_dma_data(packet_address, length, opcode == AGC_IT_DMA_DATA)
+        && let Some(copy) = decode_agc_dma_data(packet_address, length, opcode == AGC_IT_DMA_DATA)
     {
-        // Shader evaluation happens while the command buffer is parsed, before the asynchronous
-        // Metal consumer reaches this event. Mirror bounded CPU-sourced uploads now so later
-        // draws observe the descriptors and vertex data that DMA_DATA established. The ordered
-        // event remains authoritative for copies whose source is produced by prior GPU work.
-        copy.cpu_applied = mirror_agc_cpu_memory_copy(&copy);
+        // Descriptor and indirect-argument decoding happens synchronously, so following packets
+        // need to observe this copy before the asynchronous backend reaches it. Stage that view
+        // in the submission shadow without changing guest memory; the MemoryCopy event below is
+        // the sole authoritative mutation and executes at this exact queue position.
+        let shadowed = stage_agc_memory_copy(&copy);
         static DMA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
         let sequence = DMA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if trace_guest_sync()
@@ -147,7 +149,7 @@ pub(crate) fn agc_handle_submission_packet(
                 .contains(&copy.destination_address)
         {
             eprintln!(
-                "[REMu][AGC][DMA] sequence={sequence} packet={packet_address:#x} standard={} src_sel={} dst_sel={} source={:#x} destination={:#x} bytes={:#x}",
+                "[REMu][AGC][DMA] sequence={sequence} packet={packet_address:#x} standard={} src_sel={} dst_sel={} source={:#x} destination={:#x} bytes={:#x} shadowed={shadowed}",
                 opcode == AGC_IT_DMA_DATA,
                 copy.source_selection,
                 copy.destination_selection,

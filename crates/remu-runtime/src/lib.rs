@@ -120,8 +120,9 @@ pub(crate) use agc_registers::{
 };
 pub(crate) use agc_submission::{
     AgcSubmissionContext, agc_driver_submit_acb, agc_driver_submit_dcb,
-    agc_driver_submit_multi_acbs, agc_driver_submit_multi_dcbs, agc_parse_graphics_submission,
-    agc_read_mapped_u64,
+    agc_driver_submit_multi_acbs, agc_driver_submit_multi_dcbs, agc_memory_shadow_overlaps,
+    agc_parse_graphics_submission, agc_read_mapped_u64, apply_agc_memory_shadow,
+    begin_agc_memory_shadow,
 };
 #[cfg(test)]
 pub(crate) use agc_submission::{
@@ -5435,7 +5436,9 @@ fn capture_agc_gpu_events<R>(operation: impl FnOnce() -> R) -> (R, Vec<remu_gpu:
         );
         *capture = Some(Vec::new());
     });
+    let memory_shadow = begin_agc_memory_shadow();
     let result = operation();
+    drop(memory_shadow);
     let events = AGC_GPU_EVENT_CAPTURE.with_borrow_mut(|capture| {
         capture
             .take()
@@ -5487,6 +5490,7 @@ impl GuestMemoryReader for ProcessGuestMemory {
                         output.len(),
                     );
                 }
+                apply_agc_memory_shadow(address, output);
                 return true;
             }
             let mut copied = 0_u64;
@@ -5501,7 +5505,11 @@ impl GuestMemoryReader for ProcessGuestMemory {
                     &raw mut copied,
                 )
             };
-            result == 0 && copied == length
+            let complete = result == 0 && copied == length;
+            if complete {
+                apply_agc_memory_shadow(address, output);
+            }
+            complete
         }
         #[cfg(target_os = "linux")]
         {
@@ -5521,7 +5529,11 @@ impl GuestMemoryReader for ProcessGuestMemory {
             // process_vm_readv returns EFAULT instead of dereferencing an unreadable guest range.
             let copied =
                 unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
-            copied == isize::try_from(output.len()).unwrap_or(-1)
+            let complete = copied == isize::try_from(output.len()).unwrap_or(-1);
+            if complete {
+                apply_agc_memory_shadow(address, output);
+            }
+            complete
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -5720,21 +5732,45 @@ fn write_guest_u64(address: u64, value: u64) {
 }
 
 fn read_guest_u8(address: u64) -> u8 {
+    if agc_memory_shadow_overlaps(address, 1) {
+        let mut bytes = [0_u8; 1];
+        if ProcessGuestMemory.read(address, &mut bytes) {
+            return bytes[0];
+        }
+    }
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u8) }
 }
 
 fn read_guest_u16(address: u64) -> u16 {
+    if agc_memory_shadow_overlaps(address, 2) {
+        let mut bytes = [0_u8; 2];
+        if ProcessGuestMemory.read(address, &mut bytes) {
+            return u16::from_le_bytes(bytes);
+        }
+    }
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u16) }
 }
 
 fn read_guest_u32(address: u64) -> u32 {
+    if agc_memory_shadow_overlaps(address, 4) {
+        let mut bytes = [0_u8; 4];
+        if ProcessGuestMemory.read(address, &mut bytes) {
+            return u32::from_le_bytes(bytes);
+        }
+    }
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u32) }
 }
 
 fn read_guest_u64(address: u64) -> u64 {
+    if agc_memory_shadow_overlaps(address, 8) {
+        let mut bytes = [0_u8; 8];
+        if ProcessGuestMemory.read(address, &mut bytes) {
+            return u64::from_le_bytes(bytes);
+        }
+    }
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u64) }
 }

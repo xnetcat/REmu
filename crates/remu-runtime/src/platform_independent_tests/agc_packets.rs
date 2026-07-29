@@ -5,8 +5,62 @@ use super::{
     AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT,
     AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT, AgcGraphicsState,
     AgcShaderRegistry, GPU_EVENT_SINK_TEST, VideoOutState, agc_apply_submission_registers, agc_pm4,
-    decode_agc_dma_data, decode_agc_memory_acquire, decode_agc_memory_wait, low_u32,
+    compute_graphics_state, decode_agc_dma_data, decode_agc_memory_acquire, decode_agc_memory_wait,
+    low_u32,
 };
+
+fn append_native_memory_dma(
+    commands: &mut Vec<u32>,
+    source_address: u64,
+    destination_address: u64,
+    byte_count: u32,
+) {
+    commands.extend([
+        agc_pm4(7, crate::AGC_IT_DMA_DATA, 0),
+        (3 << 29) | (3 << 20),
+        low_u32(source_address),
+        low_u32(source_address >> 32),
+        low_u32(destination_address),
+        low_u32(destination_address >> 32),
+        byte_count,
+    ]);
+}
+
+fn append_native_indexed_draw(commands: &mut Vec<u32>, index_address: u64, index_count: u32) {
+    commands.extend([
+        agc_pm4(6, crate::AGC_IT_DRAW_INDEX_2, 0),
+        index_count,
+        low_u32(index_address),
+        low_u32(index_address >> 32),
+        index_count,
+        2,
+    ]);
+}
+
+fn capture_submission_events(
+    commands: &[u32],
+    graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
+) -> Vec<remu_gpu::GpuEvent> {
+    let mut submission_count = 0;
+    let (result, events) = crate::capture_agc_gpu_events(|| {
+        crate::agc_parse_submission(
+            commands.as_ptr().addr() as u64,
+            u32::try_from(commands.len()).expect("command dword count"),
+            &mut crate::AgcSubmissionContext {
+                graphics,
+                shaders,
+                video_out: &VideoOutState::default(),
+                submission_count: &mut submission_count,
+                flips: &mut Vec::new(),
+                event_writes: &mut Vec::new(),
+            },
+        )
+    });
+    result.expect("ordered DMA submission");
+    assert_eq!(submission_count, 1);
+    events
+}
 
 #[test]
 fn decodes_gen5_memory_acquire_ranges_and_controls() {
@@ -83,8 +137,140 @@ fn decodes_native_dma_immediate_fill_without_treating_the_value_as_an_address() 
             byte_count: 8,
             source_selection: 2,
             destination_selection: 3,
-            cpu_applied: false,
         })
+    );
+}
+
+#[test]
+fn draw_before_dma_keeps_the_pre_copy_index_snapshot_and_event_order() {
+    let source = [9_u16, 8, 7];
+    let destination = [1_u16, 2, 3];
+    let source_address = source.as_ptr().addr() as u64;
+    let destination_address = destination.as_ptr().addr() as u64;
+    let mut commands = Vec::new();
+    append_native_indexed_draw(&mut commands, destination_address, 3);
+    append_native_memory_dma(
+        &mut commands,
+        source_address,
+        destination_address,
+        u32::try_from(std::mem::size_of_val(&source)).expect("source size"),
+    );
+
+    let events = capture_submission_events(
+        &commands,
+        &mut AgcGraphicsState::default(),
+        &mut AgcShaderRegistry::default(),
+    );
+
+    assert_eq!(
+        destination,
+        [1, 2, 3],
+        "parsing must not execute a later DMA packet"
+    );
+    let [
+        remu_gpu::GpuEvent::IndexedDraw(draw),
+        remu_gpu::GpuEvent::MemoryCopy(copy),
+    ] = events.as_slice()
+    else {
+        panic!("draw and following DMA must retain command order: {events:?}");
+    };
+    assert_eq!(draw.index_snapshot.as_deref(), Some([1, 2, 3].as_slice()));
+    assert_eq!(copy.source_address, source_address);
+    assert_eq!(copy.destination_address, destination_address);
+}
+
+#[test]
+fn dma_before_draw_shadows_indices_without_executing_the_copy_early() {
+    let source = [9_u16, 8, 7];
+    let destination = [1_u16, 2, 3];
+    let source_address = source.as_ptr().addr() as u64;
+    let destination_address = destination.as_ptr().addr() as u64;
+    let mut commands = Vec::new();
+    append_native_memory_dma(
+        &mut commands,
+        source_address,
+        destination_address,
+        u32::try_from(std::mem::size_of_val(&source)).expect("source size"),
+    );
+    append_native_indexed_draw(&mut commands, destination_address, 3);
+
+    let events = capture_submission_events(
+        &commands,
+        &mut AgcGraphicsState::default(),
+        &mut AgcShaderRegistry::default(),
+    );
+
+    assert_eq!(
+        destination,
+        [1, 2, 3],
+        "the backend event is the only authoritative guest-memory mutation"
+    );
+    let [
+        remu_gpu::GpuEvent::MemoryCopy(copy),
+        remu_gpu::GpuEvent::IndexedDraw(draw),
+    ] = events.as_slice()
+    else {
+        panic!("DMA and following draw must retain command order: {events:?}");
+    };
+    assert_eq!(copy.destination_address, destination_address);
+    assert_eq!(
+        draw.index_snapshot.as_deref(),
+        Some([9, 8, 7].as_slice()),
+        "following CPU-side draw decoding must observe the staged DMA result"
+    );
+}
+
+#[test]
+fn dma_shadow_reaches_an_indirect_buffer_dispatch_without_reordering_events() {
+    let program = super::AlignedComputeProgram([0; 4]);
+    let program_address = program.0.as_ptr().addr() as u64;
+    let (mut graphics, mut shaders) = compute_graphics_state(program_address);
+    let source_dimensions = [3_u32, 2, 1];
+    let destination_dimensions = [0_u32; 3];
+    let source_address = source_dimensions.as_ptr().addr() as u64;
+    let destination_address = destination_dimensions.as_ptr().addr() as u64;
+    graphics.compute_indirect_args_address = destination_address;
+
+    let indirect = [agc_pm4(3, crate::AGC_IT_DISPATCH_INDIRECT, 0), 0, 0x8041];
+    let indirect_address = indirect.as_ptr().addr() as u64;
+    let mut commands = Vec::new();
+    append_native_memory_dma(
+        &mut commands,
+        source_address,
+        destination_address,
+        u32::try_from(std::mem::size_of_val(&source_dimensions)).expect("dimension size"),
+    );
+    commands.extend([
+        agc_pm4(4, crate::AGC_IT_INDIRECT_BUFFER, 0),
+        low_u32(indirect_address),
+        low_u32(indirect_address >> 32),
+        u32::try_from(indirect.len()).expect("indirect dword count"),
+    ]);
+
+    let events = capture_submission_events(&commands, &mut graphics, &mut shaders);
+
+    assert_eq!(
+        destination_dimensions,
+        [0, 0, 0],
+        "nested parsing must not commit DMA to guest memory"
+    );
+    let [
+        remu_gpu::GpuEvent::MemoryCopy(copy),
+        remu_gpu::GpuEvent::ComputeDispatch(dispatch),
+    ] = events.as_slice()
+    else {
+        panic!("DMA and nested indirect dispatch must retain command order: {events:?}");
+    };
+    assert_eq!(copy.destination_address, destination_address);
+    assert_eq!(
+        dispatch.source,
+        remu_gpu::ComputeDispatchSource::Indirect {
+            dimensions_address: destination_address,
+        }
+    );
+    assert_eq!(
+        dispatch.launch.grid,
+        remu_gpu::ComputeGrid::Threadgroups(source_dimensions)
     );
 }
 

@@ -110,7 +110,6 @@ impl MetalPresenter {
             }) || self.committed_guest_batches.iter().any(|batch| {
                 guest_batch_writes_overlap(batch, copy.source_address, copy.byte_count)
             });
-            let source_was_gpu_written = !source_descriptors.is_empty();
             if !source_descriptors.is_empty() || pending_source_write {
                 self.wait_for_guest_command_batches()?;
             }
@@ -189,18 +188,15 @@ impl MetalPresenter {
                 }
             }
 
-            if !copy.cpu_applied || source_was_gpu_written || pending_source_write {
-                // SAFETY: the runtime decodes DMA only for bounded non-null guest virtual
-                // addresses. The guest owns these mappings for the lifetime of the ordered GPU
-                // event stream. `copy` intentionally provides memmove semantics for legal
-                // overlapping packets.
-                unsafe {
-                    std::ptr::copy(
-                        copy.source_address as *const u8,
-                        copy.destination_address as *mut u8,
-                        byte_count,
-                    );
-                }
+            // SAFETY: the runtime decodes DMA only for bounded non-null guest virtual addresses.
+            // The guest owns these mappings for the lifetime of the ordered GPU event stream.
+            // `copy` intentionally provides memmove semantics for legal overlapping packets.
+            unsafe {
+                std::ptr::copy(
+                    copy.source_address as *const u8,
+                    copy.destination_address as *mut u8,
+                    byte_count,
+                );
             }
             self.record_submitted_gpu_waits_in_range(copy.destination_address, copy.byte_count);
         }

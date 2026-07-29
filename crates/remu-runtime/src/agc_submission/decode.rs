@@ -3,11 +3,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use remu_shader::GuestMemoryReader;
-
 use crate::{
-    AGC_R_WAIT_MEM_64, AgcSubmissionError, ProcessGuestMemory, low_u32, read_guest_u32,
-    read_guest_u64, trace_guest_sync,
+    AGC_R_WAIT_MEM_64, AgcSubmissionError, low_u32, read_guest_u32, read_guest_u64,
+    trace_guest_sync,
 };
 
 pub(crate) fn decode_agc_event_write(
@@ -153,39 +151,7 @@ pub(crate) fn decode_agc_dma_data(
         byte_count,
         source_selection,
         destination_selection,
-        cpu_applied: false,
     })
-}
-
-pub(super) fn mirror_agc_cpu_memory_copy(copy: &remu_gpu::GpuMemoryCopy) -> bool {
-    const MAX_MIRRORED_COPY_BYTES: u64 = 1024 * 1024;
-    if !matches!(copy.source_selection, 0 | 3)
-        || !matches!(copy.destination_selection, 0 | 3)
-        || copy.byte_count > MAX_MIRRORED_COPY_BYTES
-    {
-        return false;
-    }
-    let Ok(byte_count) = usize::try_from(copy.byte_count) else {
-        return false;
-    };
-    if ProcessGuestMemory.readable_prefix_length(copy.source_address, byte_count)
-        != Some(byte_count)
-        || ProcessGuestMemory.readable_prefix_length(copy.destination_address, byte_count)
-            != Some(byte_count)
-    {
-        return false;
-    }
-    // SAFETY: both complete ranges were validated against the runtime's live guest mappings.
-    // `copy` provides memmove semantics. A destination protected by CpuWriteWatch is made
-    // writable by its fault handler and dirtied exactly as a guest CPU write would be.
-    unsafe {
-        std::ptr::copy(
-            copy.source_address as *const u8,
-            copy.destination_address as *mut u8,
-            byte_count,
-        );
-    }
-    true
 }
 
 pub(crate) fn decode_agc_memory_acquire(packet_address: u64) -> remu_gpu::GpuMemoryAcquire {

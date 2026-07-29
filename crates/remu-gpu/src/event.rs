@@ -112,10 +112,6 @@ pub struct GpuMemoryCopy {
     pub byte_count: u64,
     pub source_selection: u32,
     pub destination_selection: u32,
-    /// The command parser already mirrored this raw guest-memory copy for CPU-side shader
-    /// descriptor discovery. Backends still consume the event for ordering and resource-cache
-    /// invalidation, and must redo it if an earlier GPU write supplies the source.
-    pub cpu_applied: bool,
 }
 
 /// An ordered CPU-visible label write produced by a Gen5 end-of-pipe packet.
