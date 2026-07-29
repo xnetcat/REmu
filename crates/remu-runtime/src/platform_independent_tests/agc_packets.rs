@@ -511,6 +511,83 @@ fn skips_predicated_packets_when_boolean_predication_is_false() {
 }
 
 #[test]
+fn skipped_predicated_packet_is_not_rejected_during_predecode() {
+    let predicate = 1_u64;
+    let predicate_address = std::ptr::from_ref(&predicate).addr() as u64;
+    let commands = [
+        agc_pm4(4, crate::AGC_IT_SET_PREDICATION, 0),
+        3 << 16,
+        low_u32(predicate_address) & !0x0f,
+        low_u32(predicate_address >> 32),
+        // EVENT_INDEX=4 is unsupported when executed. Its predication bit is set, so the active
+        // false predicate must skip it before payload validation.
+        agc_pm4(2, crate::AGC_IT_EVENT_WRITE, 0) | 1,
+        0x416,
+        agc_pm4(3, crate::AGC_IT_SET_SH_REG, 0),
+        0x00d,
+        0x1234_5678,
+    ];
+    let mut graphics = AgcGraphicsState::default();
+    let mut shaders = AgcShaderRegistry::default();
+    let mut submission_count = 0;
+
+    crate::agc_parse_submission(
+        commands.as_ptr().addr() as u64,
+        u32::try_from(commands.len()).expect("command dword count"),
+        &mut crate::AgcSubmissionContext {
+            graphics: &mut graphics,
+            shaders: &mut shaders,
+            video_out: &VideoOutState::default(),
+            submission_count: &mut submission_count,
+            flips: &mut Vec::new(),
+            event_writes: &mut Vec::new(),
+        },
+    )
+    .expect("skipped invalid packet must not reject the submission");
+
+    assert_eq!(graphics.shader_registers.get(&0x00d), Some(&0x1234_5678));
+}
+
+#[test]
+fn cond_exec_skips_packet_payload_validation_inside_its_guarded_range() {
+    let predicate = 0_u32;
+    let predicate_address = std::ptr::from_ref(&predicate).addr() as u64;
+    let commands = [
+        agc_pm4(5, crate::AGC_IT_COND_EXEC, 0),
+        low_u32(predicate_address) & !3,
+        low_u32(predicate_address >> 32),
+        0,
+        2,
+        // EVENT_INDEX=4 would fail if its payload were decoded. The command processor only needs
+        // its header length to advance across the zero-guarded COND_EXEC span.
+        agc_pm4(2, crate::AGC_IT_EVENT_WRITE, 0),
+        0x416,
+        agc_pm4(3, crate::AGC_IT_SET_SH_REG, 0),
+        0x00d,
+        0x1234_5678,
+    ];
+    let mut graphics = AgcGraphicsState::default();
+    let mut shaders = AgcShaderRegistry::default();
+    let mut submission_count = 0;
+
+    crate::agc_parse_submission(
+        commands.as_ptr().addr() as u64,
+        u32::try_from(commands.len()).expect("command dword count"),
+        &mut crate::AgcSubmissionContext {
+            graphics: &mut graphics,
+            shaders: &mut shaders,
+            video_out: &VideoOutState::default(),
+            submission_count: &mut submission_count,
+            flips: &mut Vec::new(),
+            event_writes: &mut Vec::new(),
+        },
+    )
+    .expect("conditionally skipped invalid packet must not reject the submission");
+
+    assert_eq!(graphics.shader_registers.get(&0x00d), Some(&0x1234_5678));
+}
+
+#[test]
 fn cond_exec_skips_exactly_its_zero_guarded_dword_range() {
     let predicate = 0_u32;
     let predicate_address = std::ptr::from_ref(&predicate).addr() as u64;

@@ -166,19 +166,6 @@ pub(super) fn agc_parse_command_stream(
         offset += length;
     }
 
-    // Validate newly decoded order-visible packet forms before emitting any GPU side effect from
-    // the submission.
-    for packet in &packets {
-        if packet.opcode == AGC_IT_EVENT_WRITE {
-            decode_agc_event_write(packet.address, packet.length)?;
-        }
-        if packet.opcode == AGC_IT_INDIRECT_BUFFER && !matches!(packet.length, 4 | 14) {
-            return Err(AgcSubmissionError::IndirectBufferPacketLength {
-                actual: packet.length,
-            });
-        }
-    }
-
     let future_scanout_targets = agc_future_scanout_targets(&packets, context.video_out);
     let command_end = command_address + u64::from(dword_count) * 4;
     let mut conditional_skip_end = None;
@@ -206,6 +193,18 @@ pub(super) fn agc_parse_command_stream(
                 );
             }
             continue;
+        }
+        // The command processor decodes order-visible packet payloads only after predication and
+        // COND_EXEC have selected the executable stream. Validating all packet forms in a
+        // preliminary pass rejected intentionally skipped debug/query packets and therefore the
+        // whole DCB, which Unreal treats as fatal.
+        if packet.opcode == AGC_IT_EVENT_WRITE {
+            decode_agc_event_write(packet.address, packet.length)?;
+        }
+        if packet.opcode == AGC_IT_INDIRECT_BUFFER && !matches!(packet.length, 4 | 14) {
+            return Err(AgcSubmissionError::IndirectBufferPacketLength {
+                actual: packet.length,
+            });
         }
         if packet.opcode == AGC_IT_SET_PREDICATION {
             agc_apply_predication(packet, context.graphics)?;

@@ -36,7 +36,7 @@ pub(super) fn set_range_predication(arguments: [u64; 6]) -> u64 {
     while packet < end {
         let header = read_u32(packet);
         write_u32(packet, (header & !1) | predication);
-        let dword_count = if header & 0x3fff_ff00 == 0x3fff_1000 {
+        let dword_count = if header >> 30 == 2 || header & 0x3fff_ff00 == 0x3fff_1000 {
             1
         } else {
             ((header >> 16) & 0x3fff) + 2

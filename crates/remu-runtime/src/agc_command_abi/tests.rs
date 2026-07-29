@@ -394,6 +394,14 @@ fn patches_single_and_range_packet_predication_bits() {
     assert_eq!(range[2], pm4(3, IT_SET_SH_REG, 0) | 1);
     assert_eq!(&range[1..2], &[0x0f]);
     assert_eq!(&range[3..], &[0x123, 0x456]);
+
+    let mut type_two_range = [0x8000_0000, pm4(3, IT_SET_SH_REG, 0), 0x123, 0x456];
+    let start = type_two_range.as_mut_ptr().addr() as u64;
+    let end = start + u64::try_from(type_two_range.len() * 4).expect("range byte count fits u64");
+    assert_eq!(call("n8vgpaQg6dA", args(&[start, end, 1]), [0; 6]), 0);
+    assert_eq!(type_two_range[0], 0x8000_0001);
+    assert_eq!(type_two_range[1], pm4(3, IT_SET_SH_REG, 0) | 1);
+    assert_eq!(&type_two_range[2..], &[0x123, 0x456]);
 }
 
 #[test]
