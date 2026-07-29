@@ -4,16 +4,17 @@
 use metal::CompileOptions;
 use remu_gpu::{GpuRegister, gpu_event_channel};
 use remu_shader::{
-    GlobalMemoryBinding, ImageBinding, ImageControl, Instruction, Opcode, Operand, Program,
-    ShaderEncoding, ShaderEvaluation, decode_program,
+    GlobalMemoryBinding, ImageBinding, ImageControl, Instruction, InstructionControl,
+    InterpolationControl, Opcode, Operand, Program, ShaderEncoding, ShaderEvaluation,
+    decode_program,
 };
 
 use super::{
     MetalPresenter, canonical_sampler_bindings, canonical_texture_bindings, compute_launch,
     graphics_shader_resource_key, image_component_class, missing_vertex_parameter_exports,
-    procedural_rectangle_export_stage, sampler_lod_bias, sampler_uses_normalized_coordinates,
-    shader_scalar_metadata, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask, sampler_lod_bias,
+    sampler_uses_normalized_coordinates, shader_scalar_metadata,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 
 #[test]
@@ -86,6 +87,79 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
     let program = decode_program(0x1000, &words).expect("observed AGC rectangle stage decodes");
 
     assert!(procedural_rectangle_export_stage(&program));
+}
+
+#[test]
+fn derives_procedural_rectangle_coordinates_from_the_first_sample_inputs() {
+    let interpolation = |pc, opcode, attribute, destination| Instruction {
+        pc,
+        encoding: ShaderEncoding::Vintrp,
+        opcode: Opcode::Known(opcode),
+        words: Vec::new(),
+        sources: Vec::new(),
+        destinations: vec![Operand::vector(destination)],
+        control: Some(InstructionControl::Interpolation(InterpolationControl {
+            attribute,
+            channel: 0,
+        })),
+    };
+    let sample = Instruction {
+        pc: 12,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSample"),
+        words: Vec::new(),
+        sources: vec![Operand::vector(10)],
+        destinations: vec![Operand::vector(0)],
+        control: Some(InstructionControl::Image(ImageControl {
+            dmask: 0xf,
+            vector_address: 10,
+            address_registers: vec![10],
+            vector_data: 0,
+            scalar_resource: 0,
+            scalar_sampler: 8,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+        })),
+    };
+    let program = Program::new(
+        0x2000,
+        vec![
+            interpolation(0, "VInterpP1F32", 0, 20),
+            interpolation(4, "VInterpP2F32", 1, 30),
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: Vec::new(),
+                sources: vec![Operand::vector(30)],
+                destinations: vec![Operand::vector(10)],
+                control: None,
+            },
+            sample,
+            interpolation(16, "VInterpMovF32", 0, 10),
+        ],
+    );
+    let mut controls =
+        std::array::from_fn(|index| u32::try_from(index).expect("control index fits u32"));
+    controls[1] = 3;
+
+    assert_eq!(
+        rectangle_coordinate_parameter_mask(&program, &controls),
+        Some(1 << 3),
+        "P1 intermediates and modulation values first materialized after the sample are not UVs"
+    );
+    assert_eq!(
+        rectangle_coordinate_parameter_mask(
+            &Program::new(0x3000, vec![interpolation(0, "VInterpP2F32", 0, 10)]),
+            &controls,
+        ),
+        None,
+        "sample-free shaders retain the conservative compatibility fallback"
+    );
 }
 
 #[test]

@@ -123,7 +123,8 @@ use self::shader::{
 };
 #[cfg(test)]
 use self::shader::{
-    missing_vertex_parameter_exports, procedural_rectangle_export_stage, shader_scalar_metadata,
+    missing_vertex_parameter_exports, procedural_rectangle_export_stage,
+    rectangle_coordinate_parameter_mask, shader_scalar_metadata,
 };
 use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
