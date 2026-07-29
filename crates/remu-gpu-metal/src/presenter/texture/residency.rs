@@ -49,12 +49,20 @@ impl MetalPresenter {
                     && resident.mip_level_count < underlying_mip_count
             });
         if needs_gpu_promotion {
-            self.wait_for_guest_command_batches()?;
             let queue = self
                 .command_queue
                 .as_ref()
                 .ok_or("Metal command queue is unavailable")?
                 .clone();
+            self.ensure_open_guest_batch(&queue);
+            let command_buffer = {
+                let batch = self
+                    .open_guest_batch
+                    .as_mut()
+                    .expect("guest batch was opened for mip promotion");
+                batch.end_render_pass();
+                batch.command_buffer.clone()
+            };
             let refresh = refresh_resident_texture_write_watch(
                 self.resident_guest_textures
                     .get_mut(&descriptor.guest)
@@ -67,7 +75,7 @@ impl MetalPresenter {
                     .expect("selected GPU-written resident exists");
                 let promoted = promote_resident_mip_hierarchy(
                     device,
-                    &queue,
+                    &command_buffer,
                     descriptor,
                     resident,
                     Mode27WorkOrigin::StorageCreate,
@@ -84,11 +92,34 @@ impl MetalPresenter {
             }
             self.resident_guest_textures.remove(&descriptor.guest);
         }
+        let needs_clean_promotion = self
+            .resident_guest_textures
+            .get(&descriptor.guest)
+            .is_some_and(|resident| {
+                !resident.gpu_written
+                    && resident.texture_type == 9
+                    && resident.layer_count == 1
+                    && resident.mip_level_count < underlying_mip_count
+            });
+        let promotion_command_buffer = if needs_clean_promotion {
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
+            self.ensure_open_guest_batch(&queue);
+            let batch = self
+                .open_guest_batch
+                .as_mut()
+                .expect("guest batch was opened for mip promotion");
+            batch.end_render_pass();
+            Some(batch.command_buffer.clone())
+        } else {
+            None
+        };
         super::ensure_mipmapped_resident_texture_in_map(
             device,
-            self.command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?,
+            promotion_command_buffer.as_deref(),
             descriptor,
             &mut self.resident_guest_textures,
             Mode27WorkOrigin::StorageCreate,
@@ -200,6 +231,10 @@ impl MetalPresenter {
                     .resident_guest_textures
                     .get(&alias)
                     .is_some_and(|resident| resident.gpu_written);
+                let cpu_write_obsoletes_writeback = self
+                    .resident_guest_textures
+                    .get(&alias)
+                    .is_some_and(|resident| resident.cpu_write_obsoletes_gpu_writeback(refresh));
                 if refresh == WriteWatchRefresh::Reprotecting && gpu_written {
                     return Err(format!(
                         "resident alias mapping {:#x} is being reprotected",
@@ -215,6 +250,12 @@ impl MetalPresenter {
                         .resident_guest_textures
                         .remove(&alias)
                         .expect("collected GPU-written resident alias exists");
+                    if cpu_write_obsoletes_writeback {
+                        // The guest reused this heap range after the last render. Publishing the
+                        // old Metal image now would overwrite the new indirect-command bytes.
+                        trace_resident_texture_removal("cpu-reused-gpu-alias", &resident);
+                        continue;
+                    }
                     let alias_ranges = resident.write_watch.alias_ranges();
                     retire_sampled_textures_overlapping_writeback(
                         &mut self.sampled_texture_cache,
@@ -287,12 +328,20 @@ impl MetalPresenter {
             .get(&target.texture)
             .is_some_and(|resident| resident.gpu_written)
         {
-            self.wait_for_guest_command_batches()?;
             let queue = self
                 .command_queue
                 .as_ref()
                 .ok_or("Metal command queue is unavailable")?
                 .clone();
+            self.ensure_open_guest_batch(&queue);
+            let command_buffer = {
+                let batch = self
+                    .open_guest_batch
+                    .as_mut()
+                    .expect("guest batch was opened for mip promotion");
+                batch.end_render_pass();
+                batch.command_buffer.clone()
+            };
             retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
             let resident = self
                 .resident_guest_textures
@@ -308,7 +357,7 @@ impl MetalPresenter {
             };
             let promoted = promote_resident_mip_hierarchy(
                 device,
-                &queue,
+                &command_buffer,
                 descriptor,
                 resident,
                 Mode27WorkOrigin::RenderTargetCreate,
@@ -361,6 +410,7 @@ impl MetalPresenter {
                 write_watch,
                 gpu_written: false,
                 content_version: 0,
+                gpu_write_watch_generations: Vec::new(),
             },
         );
         Ok(texture)
@@ -455,6 +505,7 @@ impl MetalPresenter {
                 write_watch,
                 gpu_written: false,
                 content_version: 0,
+                gpu_write_watch_generations: Vec::new(),
             },
         );
         Ok(texture)
@@ -638,13 +689,17 @@ impl MetalPresenter {
                     .resident_guest_textures
                     .remove(&alias)
                     .expect("collected layered-depth alias exists");
-                if refresh != WriteWatchRefresh::Replaced {
+                if refresh != WriteWatchRefresh::Replaced
+                    && !resident.cpu_write_obsoletes_gpu_writeback(refresh)
+                {
                     let alias_ranges = resident.write_watch.alias_ranges();
                     retire_sampled_textures_overlapping_writeback(
                         &mut self.sampled_texture_cache,
                         &alias_ranges,
                     );
                     write_resident_texture_contents_to_guest(device, &queue, &resident)?;
+                } else if refresh != WriteWatchRefresh::Replaced {
+                    trace_resident_texture_removal("cpu-reused-layered-depth-alias", &resident);
                 }
             }
         }
@@ -682,6 +737,7 @@ impl MetalPresenter {
                 write_watch,
                 gpu_written: false,
                 content_version: 0,
+                gpu_write_watch_generations: Vec::new(),
             },
         );
         Ok(texture)
@@ -860,6 +916,7 @@ impl MetalPresenter {
                 .expect("selected resident survived clean-alias retirement");
             resident.gpu_written = true;
             resident.content_version = self.resident_content_version;
+            resident.note_gpu_write();
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
     }
@@ -949,6 +1006,7 @@ pub(crate) fn ensure_resident_texture_in_map(
             write_watch,
             gpu_written: false,
             content_version: 0,
+            gpu_write_watch_generations: Vec::new(),
         },
     );
     Ok(texture)

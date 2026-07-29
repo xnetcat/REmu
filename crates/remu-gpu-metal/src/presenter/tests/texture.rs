@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{
-    CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLRegion,
-    MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
-    RenderPassDescriptor, TextureDescriptor,
+    CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat,
+    MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
+    MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
 };
 use remu_memory::CpuWriteWatchRetirement;
 use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
@@ -947,6 +947,101 @@ fn a_single_level_descriptor_does_not_gain_an_inferred_mip_hierarchy() {
 }
 
 #[test]
+fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let allocation_size = 4 * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            allocation_size,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest mip mapping");
+    let guest = GuestTextureDescriptor {
+        address: address.get(),
+        width: 32,
+        height: 32,
+        pitch: 32,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RG16Uint,
+        bytes_per_pixel: 4,
+    };
+    let descriptor = DecodedImageDescriptor {
+        guest,
+        destination_select: 0x22c,
+        base_mip_level: 2,
+        mip_level_count: 1,
+        texture_type: 9,
+        layer_count: 1,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    presenter
+        .ensure_resident_texture(&device, guest)
+        .expect("single-level resident");
+
+    let error = super::ensure_mipmapped_resident_texture_in_map(
+        &device,
+        None,
+        descriptor,
+        &mut presenter.resident_guest_textures,
+        super::Mode27WorkOrigin::StorageCreate,
+    )
+    .expect_err("promotion without an ordered command buffer must be rejected");
+    assert!(error.contains("ordered guest command buffer"));
+    assert!(
+        presenter.resident_guest_textures.contains_key(&guest),
+        "a rejected promotion must retain the original resident"
+    );
+
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let view = super::ensure_mipmapped_resident_texture_in_map(
+        &device,
+        Some(&command_buffer),
+        descriptor,
+        &mut presenter.resident_guest_textures,
+        super::Mode27WorkOrigin::StorageCreate,
+    )
+    .expect("ordered clean mip promotion");
+    assert_eq!(
+        command_buffer.status(),
+        MTLCommandBufferStatus::NotEnqueued,
+        "promotion must not synchronously commit or wait"
+    );
+    assert_eq!(view.width(), 8);
+    assert_eq!(view.height(), 8);
+    let resident = presenter
+        .resident_guest_textures
+        .get(&guest)
+        .expect("promoted resident");
+    assert_eq!(resident.mip_level_count, 3);
+    assert!(
+        !resident.gpu_written,
+        "copying clean guest-derived levels must not invent GPU ownership"
+    );
+    assert!(resident.gpu_write_watch_generations.is_empty());
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+}
+
+#[test]
 fn clean_overlapping_render_views_coexist_until_one_is_written() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1043,11 +1138,6 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
     let device = presenter.device.as_ref().expect("Metal device").clone();
-    let queue = presenter
-        .command_queue
-        .as_ref()
-        .expect("Metal command queue")
-        .clone();
     let complete = super::DecodedImageDescriptor {
         guest,
         destination_select: 0x22c,
@@ -1060,7 +1150,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     // never promoted into a larger one on the presenter's own initiative.
     let original = super::ensure_mipmapped_resident_texture_in_map(
         &device,
-        &queue,
+        None,
         complete,
         &mut presenter.resident_guest_textures,
         super::Mode27WorkOrigin::StorageCreate,
@@ -1070,7 +1160,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
 
     let complete_view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
-        &queue,
+        None,
         complete,
         &mut presenter.resident_guest_textures,
         super::Mode27WorkOrigin::StorageCreate,
@@ -1096,7 +1186,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     };
     let view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
-        &queue,
+        None,
         sampled,
         &mut presenter.resident_guest_textures,
         super::Mode27WorkOrigin::StorageCreate,

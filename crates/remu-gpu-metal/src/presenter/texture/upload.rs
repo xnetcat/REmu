@@ -463,7 +463,7 @@ pub(crate) fn upload_image_textures(
                 } else if storage_image_requires_mip_hierarchy(binding, descriptor) {
                     ensure_mipmapped_resident_texture_in_map(
                         device,
-                        queue,
+                        None,
                         descriptor,
                         resident_guest_textures,
                         Mode27WorkOrigin::StorageCreate,

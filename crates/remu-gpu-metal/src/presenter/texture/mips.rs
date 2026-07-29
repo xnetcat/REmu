@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::GuestMipChainLayout;
-use super::super::completion::commit_and_settle;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, ResidentGuestTexture, WriteWatchRefresh,
@@ -13,7 +12,7 @@ use super::{
     watch_resident_texture,
 };
 use metal::{
-    CommandQueue, Device, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
+    CommandBufferRef, Device, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
     MTLTextureUsage, NSRange, Texture, TextureDescriptor,
 };
 use remu_shader::ImageBinding;
@@ -23,7 +22,7 @@ use std::time::Instant;
 
 pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     device: &Device,
-    queue: &CommandQueue,
+    promotion_command_buffer: Option<&CommandBufferRef>,
     descriptor: DecodedImageDescriptor,
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     origin: Mode27WorkOrigin,
@@ -82,10 +81,17 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
                 && resident.mip_level_count < underlying_mip_count
         });
     if clean_promotion {
+        let command_buffer = promotion_command_buffer.ok_or_else(|| {
+            format!(
+                "mip hierarchy growth for image {:#x} requires an ordered guest command buffer",
+                descriptor.guest.address
+            )
+        })?;
         let resident = resident_guest_textures
             .remove(&descriptor.guest)
             .expect("selected clean mip resident exists");
-        let promoted = promote_resident_mip_hierarchy(device, queue, descriptor, resident, origin)?;
+        let promoted =
+            promote_resident_mip_hierarchy(device, command_buffer, descriptor, resident, origin)?;
         resident_guest_textures.insert(descriptor.guest, promoted);
         return resident_texture_for_sample(
             resident_guest_textures
@@ -139,6 +145,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             write_watch,
             gpu_written: false,
             content_version: 0,
+            gpu_write_watch_generations: Vec::new(),
         },
     );
     resident_texture_for_sample(
@@ -172,7 +179,7 @@ pub(crate) fn create_mipmapped_guest_texture(
 
 pub(crate) fn promote_resident_mip_hierarchy(
     device: &Device,
-    queue: &CommandQueue,
+    command_buffer: &CommandBufferRef,
     descriptor: DecodedImageDescriptor,
     resident: ResidentGuestTexture,
     origin: Mode27WorkOrigin,
@@ -243,8 +250,6 @@ pub(crate) fn promote_resident_mip_hierarchy(
     // with a GPU-to-GPU copy. This is required for GPU-written residents because RAM is stale, and
     // avoids repeatedly detiling and Apple-compressing the same clean levels while Unreal grows a
     // hierarchy one mip at a time.
-    let command_buffer = queue.new_command_buffer().to_owned();
-    command_buffer.set_label("REMu mip hierarchy promotion");
     let blit = command_buffer.new_blit_command_encoder();
     blit.set_label("REMu preserve GPU-current mip levels");
     let preserved_mip_count = resident.mip_level_count.min(underlying_mip_count);
@@ -278,7 +283,6 @@ pub(crate) fn promote_resident_mip_hierarchy(
         );
     }
     blit.end_encoding();
-    commit_and_settle(&command_buffer, "GPU-written mip hierarchy promotion")?;
 
     record_mode27_work_detail(
         origin,
@@ -288,9 +292,24 @@ pub(crate) fn promote_resident_mip_hierarchy(
         started.elapsed(),
     );
     texture.set_label(&format!(
-        "REMu promoted {}-level GPU image {:#x}",
+        "REMu promoted {}-level image {:#x}",
         underlying_mip_count, descriptor.guest.address
     ));
+    let gpu_write_watch_generations = if resident.gpu_written {
+        write_watch.generations()
+    } else {
+        Vec::new()
+    };
+    eprintln!(
+        "[REMu][METAL] encoded ordered mip promotion image={:#x} {}x{} {:?} levels={}->{} gpu_current={}",
+        descriptor.guest.address,
+        descriptor.guest.width,
+        descriptor.guest.height,
+        descriptor.guest.pixel_format,
+        resident.mip_level_count,
+        underlying_mip_count,
+        resident.gpu_written,
+    );
     Ok(ResidentGuestTexture {
         texture,
         component_reorder_view: None,
@@ -299,8 +318,9 @@ pub(crate) fn promote_resident_mip_hierarchy(
         layer_count: descriptor.layer_count,
         mip_level_count: underlying_mip_count,
         write_watch,
-        gpu_written: true,
+        gpu_written: resident.gpu_written,
         content_version: resident.content_version,
+        gpu_write_watch_generations,
     })
 }
 
