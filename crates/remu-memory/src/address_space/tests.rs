@@ -501,6 +501,62 @@ fn gpu_backing_range_rejects_unmapped_physical_holes() {
 }
 
 #[test]
+fn repeated_gpu_backing_reads_reuse_a_coherent_mapping() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+
+    memory.write(mapped, b"first").unwrap();
+    let mut bytes = [0_u8; 5];
+    assert!(read_guest_shared_backing(mapped.get(), &mut bytes));
+    assert_eq!(&bytes, b"first");
+    assert_eq!(backing.read_mapping_cache_stats(), (1, 0, 1));
+
+    assert!(write_guest_shared_backing(mapped.get(), b"later"));
+    assert!(read_guest_shared_backing(mapped.get(), &mut bytes));
+    assert_eq!(
+        &bytes, b"later",
+        "the cached MAP_SHARED view stays coherent"
+    );
+    let interior = GuestAddress::new(mapped.get() + 1);
+    let mut interior_bytes = [0_u8; 3];
+    assert!(read_guest_shared_backing(
+        interior.get(),
+        &mut interior_bytes
+    ));
+    assert_eq!(&interior_bytes, b"ate");
+    assert_eq!(
+        backing.read_mapping_cache_stats(),
+        (1, 2, 1),
+        "the exact repeat and contained read must avoid new mmap calls",
+    );
+}
+
+#[test]
+fn gpu_backing_read_mapping_cache_stays_bounded() {
+    const PAGE_COUNT: u64 = 257;
+    let backing = GuestPhysicalBacking::new(PAGE_COUNT * GUEST_PAGE_SIZE).unwrap();
+    let mut byte = [0_u8; 1];
+    for page_index in 0..PAGE_COUNT {
+        assert!(backing.read_exact_at(page_index * GUEST_PAGE_SIZE, &mut byte));
+    }
+    assert_eq!(
+        backing.read_mapping_cache_stats(),
+        (256, 0, PAGE_COUNT),
+        "the least-recently-used view is retired at the fixed entry limit",
+    );
+}
+
+#[test]
 fn gpu_backing_alias_enumeration_tracks_aliases_and_remaps() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
