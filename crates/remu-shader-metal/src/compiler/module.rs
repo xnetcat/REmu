@@ -452,7 +452,7 @@ impl Compiler<'_> {
                 if self.options.render_target_array_length > 1 {
                     let _ = writeln!(
                         source,
-                        "    remu_mesh_render_target_indices[remu_thread_index] = min(remu_draw[1], {}u);",
+                        "    remu_mesh_render_target_indices[remu_thread_index] = min(remu_group_id.y, {}u);",
                         self.options.render_target_array_length - 1
                     );
                 }
@@ -474,7 +474,7 @@ impl Compiler<'_> {
                     );
                 }
                 if contains_register_reference(&self.body, 'v', 8) {
-                    source.push_str("    v[8] = remu_draw[1];\n");
+                    source.push_str("    v[8] = remu_group_id.y;\n");
                 }
             }
         }

@@ -268,10 +268,8 @@ impl MetalPresenter {
                 );
             }
         }
-        let uses_mesh_stage = draw.indexed
-            && draw.instance_count == 1
-            && draw.primitive_type == 4
-            && ngg_mesh_export_stage(&export.program);
+        let uses_mesh_stage =
+            draw.indexed && draw.primitive_type == 4 && ngg_mesh_export_stage(&export.program);
         let mut vertex_options = if uses_mesh_stage {
             remu_shader_metal::MetalCompileOptions::mesh(
                 pixel_msl.interpolated_attribute_count,
