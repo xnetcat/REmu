@@ -63,6 +63,17 @@ fn capture_submission_events(
 }
 
 #[test]
+fn submission_parser_skips_the_one_dword_uncounted_nop() {
+    let events = capture_submission_events(
+        &[0xffff_1000],
+        &mut AgcGraphicsState::default(),
+        &mut AgcShaderRegistry::default(),
+    );
+
+    assert!(events.is_empty());
+}
+
+#[test]
 fn decodes_gen5_memory_acquire_ranges_and_controls() {
     let packet = [
         agc_pm4(8, AGC_IT_NOP, crate::AGC_R_ACQUIRE_MEM),

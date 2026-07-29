@@ -8,8 +8,8 @@ use crate::{
     AGC_IT_CLEAR_STATE, AGC_IT_COND_EXEC, AGC_IT_EVENT_WRITE, AGC_IT_INDIRECT_BUFFER, AGC_IT_NOP,
     AGC_IT_SET_PREDICATION, AGC_R_ACB_RESET, AGC_R_DRAW_RESET, AGC_R_FLIP, AgcGraphicsState,
     AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, VideoOutState, agc_command_abi,
-    agc_video_out_target, process_guest_range_is_readable, read_guest_u32, trace_agc_programs,
-    trace_agc_registers, trace_logarithmic_sequence,
+    agc_packet_dword_count, agc_video_out_target, process_guest_range_is_readable, read_guest_u32,
+    trace_agc_programs, trace_agc_registers, trace_logarithmic_sequence,
 };
 
 use super::{
@@ -131,18 +131,17 @@ pub(super) fn agc_parse_command_stream(
         let packet_address = command_address + u64::from(offset) * 4;
         let header = read_guest_u32(packet_address);
         let packet_type = header >> 30;
-        if packet_type == 2 {
-            offset += 1;
-            continue;
-        }
-        if packet_type != 3 {
+        let Some(length) = agc_packet_dword_count(header) else {
             return Err(AgcSubmissionError::UnsupportedPacketType {
                 dword: offset,
                 packet_type,
                 header,
             });
+        };
+        if length == 1 {
+            offset += 1;
+            continue;
         }
-        let length = ((header >> 16) & 0x3fff) + 2;
         let remaining = dword_count - offset;
         if length > remaining {
             return Err(AgcSubmissionError::InvalidPacketLength {

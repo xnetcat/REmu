@@ -692,10 +692,8 @@ pub(super) fn scan_valid_command_stream_end(start: u64, recorded_end: u64) -> u6
     let mut command = start;
     while command < recorded_end {
         let header = read_u32(command);
-        let dword_count = match header >> 30 {
-            2 => 1,
-            3 => ((header >> 16) & 0x3fff) + 2,
-            _ => break,
+        let Some(dword_count) = crate::agc_packet_dword_count(header) else {
+            break;
         };
         let Some(next) = command.checked_add(u64::from(dword_count) * 4) else {
             break;

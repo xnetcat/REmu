@@ -236,6 +236,21 @@ pub(crate) fn agc_pm4(length_dwords: u32, opcode: u32, register: u32) -> u32 {
         | ((register & 0x3f) << 2)
 }
 
+/// Returns the encoded PM4 packet size, including AGC's one-dword uncounted NOP.
+///
+/// A Type-3 count field normally stores `dwords - 2`. The all-ones count paired with NOP is a
+/// special filler encoding, however, and occupies only its header dword. Treating it as the
+/// ordinary maximum-length packet desynchronizes command-buffer scans or rejects a valid stream
+/// as a 16,385-dword packet.
+pub(crate) const fn agc_packet_dword_count(header: u32) -> Option<u32> {
+    match header >> 30 {
+        2 => Some(1),
+        3 if header & 0x3fff_ff00 == 0x3fff_1000 => Some(1),
+        3 => Some(((header >> 16) & 0x3fff) + 2),
+        _ => None,
+    }
+}
+
 pub(crate) fn agc_allocate_command_dwords(command_buffer: u64, size_dwords: u32) -> Option<u64> {
     if command_buffer == 0 || size_dwords == 0 {
         return None;

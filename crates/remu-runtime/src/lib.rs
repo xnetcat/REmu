@@ -87,8 +87,8 @@ pub(crate) use agc_api::{
     agc_create_primitive_state, agc_create_shader, agc_dcb_acquire_mem, agc_dcb_dma_data,
     agc_dcb_event_write, agc_dcb_reset_queue, agc_dcb_set_registers_indirect, agc_dcb_wait_reg_mem,
     agc_dma_data_patch_destination, agc_fuse_shader_halves, agc_get_data_packet_payload_address,
-    agc_get_fused_shader_size, agc_pm4, agc_register_defaults, agc_release_mem_patch_address,
-    agc_set_indirect_patch_address, agc_wait_reg_mem_patch_address,
+    agc_get_fused_shader_size, agc_packet_dword_count, agc_pm4, agc_register_defaults,
+    agc_release_mem_patch_address, agc_set_indirect_patch_address, agc_wait_reg_mem_patch_address,
 };
 #[cfg(test)]
 pub(crate) use agc_api::{

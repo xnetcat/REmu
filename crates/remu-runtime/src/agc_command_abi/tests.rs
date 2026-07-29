@@ -1,3 +1,4 @@
+use super::buffer::scan_valid_command_stream_end;
 use super::*;
 
 struct CommandFixture {
@@ -146,6 +147,15 @@ fn recovers_only_a_complete_recorded_pm4_prefix() {
 
     assert_eq!(take_recorded_graphics_prefix(start + 24), Some((start, 6)));
     assert_eq!(take_recorded_graphics_prefix(start + 24), None);
+}
+
+#[test]
+fn recorded_prefix_scan_counts_the_uncounted_nop_as_one_dword() {
+    let commands = Box::new([0xffff_1000, pm4(3, IT_SET_SH_REG, 0), 0x0c, 0x1111_1111]);
+    let start = commands.as_ptr().addr() as u64;
+    let end = start + u64::try_from(commands.len() * 4).expect("command byte count fits u64");
+
+    assert_eq!(scan_valid_command_stream_end(start, end), end);
 }
 
 #[test]
