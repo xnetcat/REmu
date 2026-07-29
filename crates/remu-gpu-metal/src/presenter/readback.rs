@@ -21,7 +21,19 @@ use remu_gpu::IndexedDraw;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+fn begin_capture_attempt_if_due(
+    last_capture: &mut Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if last_capture.is_some_and(|last| now.saturating_duration_since(last) < interval) {
+        return false;
+    }
+    *last_capture = Some(now);
+    true
+}
 
 impl MetalPresenter {
     pub(super) fn direct_scanout_needs_initial_clear(&self, address: u64) -> bool {
@@ -162,10 +174,11 @@ impl MetalPresenter {
         let Some(directory) = self.capture_directory.as_deref() else {
             return;
         };
-        if self
-            .last_guest_capture
-            .is_some_and(|last| last.elapsed() < capture_interval())
-        {
+        if !begin_capture_attempt_if_due(
+            &mut self.last_guest_capture,
+            Instant::now(),
+            capture_interval(),
+        ) {
             return;
         }
         let fingerprint = guest_frame_fingerprint(&self.guest_bgra_bytes);
@@ -181,7 +194,6 @@ impl MetalPresenter {
         {
             return;
         }
-        self.last_guest_capture = Some(Instant::now());
         match capture_guest_frame(directory, &self.guest_bgra_bytes, descriptor, fingerprint) {
             Ok(path) => eprintln!("[REMu][METAL] captured frame {}", path.display()),
             Err(error) => eprintln!("[REMu][METAL] could not capture frame: {error}"),
@@ -948,4 +960,38 @@ pub(super) fn capture_guest_frame(
         .write_all(&rgb)
         .map_err(|error| format!("could not write {}: {error}", path.display()))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::begin_capture_attempt_if_due;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn capture_attempts_remain_throttled_after_each_due_attempt() {
+        let interval = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut last_capture = None;
+
+        assert!(begin_capture_attempt_if_due(
+            &mut last_capture,
+            start,
+            interval
+        ));
+        assert!(!begin_capture_attempt_if_due(
+            &mut last_capture,
+            start + Duration::from_secs(9),
+            interval
+        ));
+        assert!(begin_capture_attempt_if_due(
+            &mut last_capture,
+            start + interval,
+            interval
+        ));
+        assert!(!begin_capture_attempt_if_due(
+            &mut last_capture,
+            start + interval + Duration::from_secs(1),
+            interval
+        ));
+    }
 }
