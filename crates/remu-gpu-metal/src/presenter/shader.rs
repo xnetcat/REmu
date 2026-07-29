@@ -274,6 +274,7 @@ impl MetalPresenter {
             remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count)
         };
         vertex_options.render_target_array_length = key.render_target_array_length;
+        vertex_options.vertex_output_control = key.vertex_output_control;
         vertex_options.diagnostic_force_visible_clip_depth =
             key.sample_count > 1 && diagnostic_force_visible_clip_depth();
         vertex_options.diagnostic_force_vertex_pattern =

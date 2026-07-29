@@ -7,16 +7,26 @@ use super::{
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
     compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
     create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
-    dump_compute_shader_msl, dump_msl_compute_filter_matches, image_resource_descriptor_is_null,
-    is_storage_image_opcode, record_diagnostic_global_writers, record_diagnostic_texture_writer,
-    sampled_image_bindings, shader_scalar_metadata_for_registers, upload_image_textures,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    dump_compute_shader_msl, dump_msl_compute_filter_matches, guest_texture_descriptors_overlap,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    read_texture_linear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
+    record_diagnostic_texture_writer, resident_color_view_sample_is_eligible,
+    sampled_image_bindings, shader_scalar_metadata_for_registers, trace_target_sampling,
+    upload_image_textures, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 use metal::{MTLResourceUsage, MTLSize};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
 use std::ffi::c_void;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+fn storage_image_requires_exact_preacquire(
+    opcode: remu_shader::Opcode,
+    has_component_reordered_resident: bool,
+) -> bool {
+    is_writable_image_opcode(opcode) || !has_component_reordered_resident
+}
 
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
@@ -162,7 +172,68 @@ impl MetalPresenter {
         {
             let descriptor = decode_image_descriptor(&binding.resource_descriptor)
                 .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-            if descriptor.texture_type == 9 {
+            // ImageLoad is read-only and Metal can read a GPU-current RGBA/BGRA resident through
+            // the component-swizzled texture view selected by `upload_image_textures`. Forcing an
+            // exact descriptor here would first write that resident back to guest memory, retire
+            // it, and reconstruct an exact-key texture before upload selection gets a chance to
+            // preserve it. Writable storage images still require the conservative exact resident.
+            let has_component_reordered_resident = !is_writable_image_opcode(binding.opcode)
+                && self.resident_guest_textures.values().any(|resident| {
+                    resident_color_view_sample_is_eligible(resident, descriptor, false)
+                });
+            if !is_writable_image_opcode(binding.opcode)
+                && !has_component_reordered_resident
+                && trace_target_sampling()
+            {
+                let overlapping = self
+                    .resident_guest_textures
+                    .values()
+                    .filter(|resident| {
+                        resident.gpu_written
+                            && guest_texture_descriptors_overlap(
+                                resident.descriptor,
+                                descriptor.guest,
+                            )
+                    })
+                    .map(|resident| {
+                        (
+                            resident.descriptor.address,
+                            resident.descriptor.width,
+                            resident.descriptor.height,
+                            resident.descriptor.pitch,
+                            resident.descriptor.pixel_format,
+                            resident.descriptor.tile_mode,
+                            resident.mip_level_count,
+                            resident.content_version,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if !overlapping.is_empty() {
+                    static LOGGED_PREACQUIRE_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
+                    let sequence = LOGGED_PREACQUIRE_MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sequence <= 32 {
+                        eprintln!(
+                            "[REMu][METAL][STORAGE-PREACQUIRE] sequence={sequence} pc={:#x} sampled={:#x}/{}x{}/p{}/{:?}/tile{}/mips{}/type{}/layers{} overlapping_gpu={overlapping:?}",
+                            binding.pc,
+                            descriptor.guest.address,
+                            descriptor.guest.width,
+                            descriptor.guest.height,
+                            descriptor.guest.pitch,
+                            descriptor.guest.pixel_format,
+                            descriptor.guest.tile_mode,
+                            descriptor.mip_level_count,
+                            descriptor.texture_type,
+                            descriptor.layer_count,
+                        );
+                    }
+                }
+            }
+            if descriptor.texture_type == 9
+                && storage_image_requires_exact_preacquire(
+                    binding.opcode,
+                    has_component_reordered_resident,
+                )
+            {
                 self.ensure_resident_texture(&device, descriptor.guest)?;
             }
         }
@@ -296,6 +367,24 @@ impl MetalPresenter {
             }
             encoder.end_encoding();
         }
+        // GNM also clears HTILE through small compute fills. Follow shadPS4's conservative
+        // metadata heuristic: a writable binding at a registered metadata base rearms the clear
+        // unless XOR semantics indicate that this is an update rather than a fill.
+        if !snapshot
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| instruction.opcode.contains("Xor"))
+        {
+            for address in evaluation
+                .global_memory_bindings
+                .iter()
+                .filter(|binding| binding.writable)
+                .map(|binding| binding.base_address)
+            {
+                rearm_depth_metadata_clear(&mut self.depth_metadata_clears, address);
+            }
+        }
         let diagnostic_sampled = diagnostic_texture_writer_enabled().then(|| {
             sampled_image_bindings(evaluation)
                 .filter_map(|binding| decode_image_descriptor(&binding.resource_descriptor).ok())
@@ -327,6 +416,43 @@ impl MetalPresenter {
                 self.note_pending_flip_target_write(texture.descriptor.guest);
             }
         }
+        if let Some(directory) = std::env::var_os("REMU_DUMP_COMPUTE_TEXTURE_DIR")
+            && dump_msl_compute_filter_matches(dispatch.shader_address)
+            && textures.iter().any(|texture| {
+                texture.descriptor.guest.width >= 1_000 && texture.descriptor.guest.height >= 500
+            })
+            && {
+                static MATCHING_COMPUTE_DUMPS: AtomicUsize = AtomicUsize::new(0);
+                MATCHING_COMPUTE_DUMPS.fetch_add(1, Ordering::Relaxed) == 0
+            }
+        {
+            self.wait_for_guest_command_batches()?;
+            let directory = Path::new(&directory);
+            std::fs::create_dir_all(directory)
+                .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+            for (index, texture) in textures.iter().enumerate() {
+                let descriptor = texture.descriptor.guest;
+                let bytes = read_texture_linear(&device, &queue, &texture.texture, descriptor)
+                    .map_err(|error| {
+                        format!(
+                            "compute texture {index} at {:#x} readback: {error}",
+                            descriptor.address
+                        )
+                    })?;
+                let access = if texture.writable { "write" } else { "read" };
+                let path = directory.join(format!(
+                    "compute-{}-cs-{:x}-{access}-{index}-{:x}-{}x{}-{:?}.bin",
+                    dispatch.sequence,
+                    dispatch.shader_address,
+                    descriptor.address,
+                    descriptor.width,
+                    descriptor.height,
+                    descriptor.pixel_format,
+                ));
+                std::fs::write(&path, bytes)
+                    .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+            }
+        }
         if self
             .open_guest_batch
             .as_ref()
@@ -335,5 +461,35 @@ impl MetalPresenter {
             self.flush_guest_command_batch(false, GuestBatchFlushReason::WorkCapacity)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::storage_image_requires_exact_preacquire;
+    use remu_shader::Opcode;
+
+    #[test]
+    fn read_only_storage_load_can_skip_exact_preacquire_for_component_reordered_resident() {
+        assert!(!storage_image_requires_exact_preacquire(
+            Opcode::Known("ImageLoad"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn writable_or_unresolved_storage_image_still_requires_exact_preacquire() {
+        assert!(storage_image_requires_exact_preacquire(
+            Opcode::Known("ImageLoad"),
+            false,
+        ));
+        assert!(storage_image_requires_exact_preacquire(
+            Opcode::Known("ImageStore"),
+            true,
+        ));
+        assert!(storage_image_requires_exact_preacquire(
+            Opcode::Known("ImageAtomicAdd"),
+            true,
+        ));
     }
 }

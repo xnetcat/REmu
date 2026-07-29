@@ -168,19 +168,54 @@ pub(crate) fn export_user_data_register(draw: &remu_gpu::IndexedDraw) -> u32 {
 
 pub(crate) fn draw_required_vertex_record_count(draw: &remu_gpu::IndexedDraw) -> Option<u32> {
     if !draw.indexed {
-        return Some(if draw.primitive_type == 0x11 {
+        let count = if draw.primitive_type == 0x11 {
             4
         } else {
             draw.index_count
-        });
+        };
+        let first = i64::from(draw.index_offset) + i64::from(draw.base_vertex);
+        return u32::try_from(first).ok()?.checked_add(count);
     }
+    let restart = draw_primitive_restart_index(draw);
     draw.index_snapshot
         .as_deref()
         .unwrap_or_default()
         .iter()
         .copied()
-        .max()
+        .filter(|index| restart != Some(*index))
+        .try_fold(None, |maximum, index| {
+            let adjusted = i64::from(index) + i64::from(draw.base_vertex);
+            let adjusted = u32::try_from(adjusted).ok()?;
+            Some(Some(
+                maximum.map_or(adjusted, |current: u32| current.max(adjusted)),
+            ))
+        })?
         .and_then(|maximum| maximum.checked_add(1))
+}
+
+pub(crate) fn draw_primitive_restart_index(draw: &remu_gpu::IndexedDraw) -> Option<u32> {
+    const VGT_MULTI_PRIM_IB_RESET_EN: u32 = 0x2a5;
+    const VGT_MULTI_PRIM_IB_RESET_INDX: u32 = 0x103;
+
+    let enabled = draw
+        .context_registers
+        .iter()
+        .find(|register| register.offset == VGT_MULTI_PRIM_IB_RESET_EN)
+        .is_some_and(|register| register.value & 1 != 0);
+    if !enabled {
+        return None;
+    }
+    let programmed = draw
+        .context_registers
+        .iter()
+        .find(|register| register.offset == VGT_MULTI_PRIM_IB_RESET_INDX)
+        .map_or(u32::MAX, |register| register.value);
+    match draw.index_size {
+        0 => Some(programmed & u32::from(u16::MAX)),
+        1 => Some(programmed),
+        2 => Some(programmed & u32::from(u8::MAX)),
+        _ => None,
+    }
 }
 
 pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<[u32]>> {
@@ -222,7 +257,13 @@ pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<
 pub(crate) fn snapshot_small_readonly_global_bindings(
     evaluation: Arc<remu_shader::ShaderEvaluation>,
 ) -> Result<Arc<remu_shader::ShaderEvaluation>, String> {
-    const SNAPSHOT_LIMIT: usize = 64 * 1024;
+    // Unity's transient vertex rings in Superliminal expose five overlapping attribute views
+    // whose live ranges are about 76 KiB for an ordinary scene draw. Keeping the old 64 KiB
+    // cutoff made those views the only draw inputs read lazily by the presenter, after the guest
+    // had already recycled the ring allocation. The stale vertices produced intermittent
+    // full-height triangles/vertical smears. Retain packet-time contents for those normal-sized
+    // inputs while still avoiding accidental snapshots of genuinely large persistent resources.
+    const SNAPSHOT_LIMIT: usize = 128 * 1024;
 
     let requires_snapshot = evaluation.global_memory_bindings.iter().any(|binding| {
         !binding.writable
@@ -620,5 +661,42 @@ fn trace_shader_evaluation(
             )
         }
         Err(error) => format!("error({error})"),
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::sync::Arc;
+
+    use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
+
+    use super::snapshot_small_readonly_global_bindings;
+
+    #[test]
+    fn snapshots_transient_vertex_bindings_larger_than_sixty_four_kibibytes() {
+        let source = (0..96 * 1024)
+            .map(|offset| u8::try_from(offset & 0xff).unwrap())
+            .collect::<Vec<_>>();
+        let evaluation = ShaderEvaluation {
+            initial_scalar_registers: Default::default(),
+            scalar_registers: Default::default(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: Vec::new(),
+            global_memory_bindings: vec![GlobalMemoryBinding {
+                scalar_address: 0,
+                base_address: source.as_ptr() as u64,
+                instruction_pcs: Default::default(),
+                byte_count: source.len(),
+                data: Vec::new(),
+                writable: false,
+                write_back_to_guest: false,
+            }],
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        };
+
+        let snapshot =
+            snapshot_small_readonly_global_bindings(Arc::new(evaluation)).expect("snapshot");
+        assert_eq!(snapshot.global_memory_bindings[0].data, source);
     }
 }

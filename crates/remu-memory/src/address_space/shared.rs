@@ -52,6 +52,11 @@ fn resolve_shared_backing_range(
     if physical_end > first.backing.size() {
         return None;
     }
+    let first_mapping_length = first.end.checked_sub(first_start)?;
+    let first_mapping_physical_end = first.backing_offset.checked_add(first_mapping_length)?;
+    if physical_end <= first_mapping_physical_end {
+        return Some((first.backing.clone(), physical_start, physical_end));
+    }
     let mut physical_cursor = physical_start;
     while physical_cursor < physical_end {
         let covered_end = mappings
@@ -112,6 +117,31 @@ pub fn guest_shared_mapping_identity(
         cursor = next.end.min(end);
     }
     Some(identity)
+}
+
+/// Resolves a GPU-physical guest range to its backing object identity and byte offset.
+///
+/// Unlike [`guest_shared_mapping_identity`], this accepts a physically contiguous range exposed
+/// through disjoint virtual mappings. The full physical interval must still have live CPU mapping
+/// coverage.
+#[must_use]
+pub fn guest_shared_backing_identity(
+    address: u64,
+    byte_count: u64,
+) -> Option<GuestSharedMappingIdentity> {
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    resolve_shared_backing_range(&mappings, address, byte_count).map(
+        |(backing, physical_start, _)| GuestSharedMappingIdentity {
+            backing_id: backing.id(),
+            backing_offset: physical_start,
+        },
+    )
+}
+
+fn ranges_overlap(left: u64, left_end: u64, right: u64, right_end: u64) -> bool {
+    left < right_end && right < left_end
 }
 
 /// Resolves a GPU resource range through the shared physical backing behind its first VA.
@@ -196,6 +226,73 @@ pub fn guest_shared_backing_alias_segments(
     aliases.sort_unstable_by_key(|segment| (segment.address, segment.byte_count));
     aliases.dedup();
     (!aliases.is_empty()).then_some(aliases)
+}
+
+/// Reports whether two guest ranges name overlapping bytes of one shared physical backing.
+///
+/// The common case compares physical offsets without allocating an alias list. If the right-hand
+/// range is only partially mapped, the fallback retains the alias-intersection behavior used by
+/// GPU hazard tracking.
+#[must_use]
+pub fn guest_shared_backing_ranges_overlap(
+    left: u64,
+    left_byte_count: u64,
+    right: u64,
+    right_byte_count: u64,
+) -> bool {
+    if left_byte_count == 0 || right_byte_count == 0 {
+        return false;
+    }
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((left_backing, left_physical_start, left_physical_end)) =
+        resolve_shared_backing_range(&mappings, left, left_byte_count)
+    else {
+        return false;
+    };
+    if let Some((right_backing, right_physical_start, right_physical_end)) =
+        resolve_shared_backing_range(&mappings, right, right_byte_count)
+    {
+        return left_backing.id() == right_backing.id()
+            && ranges_overlap(
+                left_physical_start,
+                left_physical_end,
+                right_physical_start,
+                right_physical_end,
+            );
+    }
+
+    let Some(right_virtual_end) = right.checked_add(right_byte_count) else {
+        return false;
+    };
+    mappings
+        .iter()
+        .filter(|(_, record)| record.backing.id() == left_backing.id())
+        .any(|(&mapping_start, record)| {
+            let Some(mapping_length) = record.end.checked_sub(mapping_start) else {
+                return false;
+            };
+            let Some(mapping_physical_end) = record.backing_offset.checked_add(mapping_length)
+            else {
+                return false;
+            };
+            let intersection_start = record.backing_offset.max(left_physical_start);
+            let intersection_end = mapping_physical_end.min(left_physical_end);
+            if intersection_start >= intersection_end {
+                return false;
+            }
+            let Some(alias_start) =
+                mapping_start.checked_add(intersection_start - record.backing_offset)
+            else {
+                return false;
+            };
+            let Some(alias_end) = alias_start.checked_add(intersection_end - intersection_start)
+            else {
+                return false;
+            };
+            ranges_overlap(alias_start, alias_end, right, right_virtual_end)
+        })
 }
 
 /// Copies a GPU-physical resource range out of its shared direct-memory backing.

@@ -8,22 +8,24 @@ use metal::{
 };
 use remu_gpu::GpuRegister;
 use remu_shader::PixelOutputKind;
+use std::collections::HashMap;
 
 use super::{
-    CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_CLEAR_WORD0,
-    CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, ColorOperationMode,
-    DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_RENDER_CONTROL, DB_Z_INFO,
-    DecodedDepthTarget, DecodedRasterState, GuestTextureDescriptor, MetalPresenter,
-    PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
-    append_depth_target_registers, common_render_target_array_length, decode_color_operation_mode,
-    decode_depth_target, decode_fast_clear_color, decode_metal_blend_attachment,
-    decode_raster_state, decode_render_target_format, decode_render_targets_from_registers,
-    decode_scissor, decode_viewport, effective_linear_pitch, guest_texture_byte_count,
-    guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
+    CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
+    CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
+    ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
+    DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestTextureDescriptor,
+    MetalPresenter, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
+    append_depth_target_registers, common_render_target_array_length, consume_depth_metadata_clear,
+    decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
+    decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
+    decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
+    decode_render_targets_from_registers, decode_scissor, decode_viewport, effective_linear_pitch,
+    guest_texture_byte_count, guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
-    metal_primitive_type, pixel_input_controls, read_draw_indices, read_texture_linear,
-    render_target_fast_clear_color,
+    metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, read_draw_indices,
+    read_texture_linear, rearm_depth_metadata_clear, render_target_fast_clear_color,
 };
 
 #[test]
@@ -45,6 +47,95 @@ fn decodes_cb_color_control_operation_modes() {
         Ok(ColorOperationMode::FmaskDecompress)
     );
     assert!(decode_color_operation_mode(0x00cc_0040).is_err());
+}
+
+#[test]
+fn color_resolve_decodes_mrt1_without_a_target_mask_or_shader_export() {
+    let source_address = 0x0070_649d_0000;
+    let destination_address = 0x0070_7c0d_0000;
+    let mut draw = indexed_draw(0, 0, 0);
+    append_color_target_registers(
+        &mut draw.context_registers,
+        0,
+        source_address,
+        1_920,
+        1_080,
+        12,
+        7,
+        27,
+    );
+    append_color_target_registers(
+        &mut draw.context_registers,
+        1,
+        destination_address,
+        1_920,
+        1_080,
+        12,
+        7,
+        27,
+    );
+    draw.context_registers.push(GpuRegister {
+        offset: CB_TARGET_MASK,
+        value: 0xf,
+    });
+    draw.context_registers
+        .iter_mut()
+        .find(|register| register.offset == CB_COLOR0_ATTRIB)
+        .expect("MRT0 attributes")
+        .value = (1 << 12) | (1 << 15);
+    draw.context_registers
+        .sort_unstable_by_key(|register| register.offset);
+
+    let (source, destination) =
+        decode_color_resolve_targets(&draw).expect("valid MRT0-to-MRT1 resolve");
+    assert_eq!(source.guest_slot, 0);
+    assert_eq!(source.texture.address, source_address);
+    assert_eq!(source.sample_count, 2);
+    assert_eq!(destination.guest_slot, 1);
+    assert_eq!(destination.texture.address, destination_address);
+    assert_eq!(destination.sample_count, 1);
+}
+
+#[test]
+fn fast_clear_elimination_decodes_mrt0_without_a_target_mask_or_shader_export() {
+    let address = 0x0070_649d_0000;
+    let mut draw = indexed_draw(0, 0, 0);
+    append_color_target_registers(
+        &mut draw.context_registers,
+        0,
+        address,
+        1_920,
+        1_080,
+        12,
+        7,
+        27,
+    );
+    draw.context_registers
+        .iter_mut()
+        .find(|register| register.offset == CB_COLOR0_INFO)
+        .expect("MRT0 info")
+        .value |= 1 << 13;
+    draw.context_registers
+        .sort_unstable_by_key(|register| register.offset);
+
+    let target = decode_color_eliminate_fast_clear_target(&draw)
+        .expect("valid fast-clear state")
+        .expect("fast-clear target");
+    assert_eq!(target.guest_slot, 0);
+    assert_eq!(target.texture.address, address);
+    assert!(target.fast_clear_enabled);
+
+    draw.context_registers
+        .iter_mut()
+        .find(|register| register.offset == CB_COLOR0_INFO)
+        .expect("MRT0 info")
+        .value &= !(1 << 13);
+    assert!(
+        decode_color_eliminate_fast_clear_target(&draw)
+            .expect("valid ordinary color state")
+            .is_none(),
+        "an elimination trigger is a no-op when CMASK fast clear is disabled"
+    );
 }
 
 #[test]
@@ -86,6 +177,47 @@ fn decodes_observed_depth16_greater_equal_read_only_target() {
     assert_eq!(depth.compare, MTLCompareFunction::GreaterEqual);
     assert!(!depth.write_enabled);
     assert_eq!(initial_depth_clear_for_target(depth), 0.0);
+}
+
+#[test]
+fn decodes_htile_address_only_when_tile_surface_is_enabled() {
+    let mut draw = indexed_draw(0, 0, 0);
+    append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0x66);
+    draw.context_registers.push(GpuRegister {
+        offset: DB_HTILE_DATA_BASE,
+        value: 0x0012_3456,
+    });
+    draw.context_registers
+        .sort_unstable_by_key(|register| register.offset);
+
+    let depth = decode_depth_target(&draw)
+        .expect("valid HTILE depth target")
+        .expect("enabled depth target");
+    assert_eq!(depth.htile_address, Some(0x1234_5600));
+
+    draw.context_registers
+        .iter_mut()
+        .find(|register| register.offset == DB_Z_INFO)
+        .expect("depth info")
+        .value &= !(1 << 29);
+    let depth = decode_depth_target(&draw)
+        .expect("valid uncompressed depth target")
+        .expect("enabled depth target");
+    assert_eq!(depth.htile_address, None);
+}
+
+#[test]
+fn depth_metadata_clear_is_one_shot_and_can_be_rearmed() {
+    let address = 0x1234_5600;
+    let mut states = HashMap::new();
+
+    assert!(consume_depth_metadata_clear(&mut states, Some(address)));
+    assert!(!consume_depth_metadata_clear(&mut states, Some(address)));
+    assert!(rearm_depth_metadata_clear(&mut states, address));
+    assert!(consume_depth_metadata_clear(&mut states, Some(address)));
+    assert!(!consume_depth_metadata_clear(&mut states, Some(address)));
+    assert!(!rearm_depth_metadata_clear(&mut states, address + 0x100));
+    assert!(!consume_depth_metadata_clear(&mut states, None));
 }
 
 #[test]
@@ -174,7 +306,11 @@ fn decodes_depth32_write_target_and_ignores_stencil_only_state() {
     assert_eq!(depth.texture.pixel_format, MTLPixelFormat::Depth32Float);
     assert_eq!(depth.compare, MTLCompareFunction::GreaterEqual);
     assert!(depth.write_enabled);
-    assert_eq!(initial_depth_clear_for_target(depth), 1.0);
+    assert_eq!(
+        initial_depth_clear_for_target(depth),
+        0.0,
+        "an implicit first-use clear must not consume stale DB_DEPTH_CLEAR state"
+    );
 
     draw.context_registers
         .iter_mut()
@@ -279,7 +415,7 @@ fn decodes_observed_clockwise_back_face_culling() {
 }
 
 #[test]
-fn compensates_winding_when_normalizing_negative_viewport_height() {
+fn preserves_guest_winding_with_a_negative_viewport_height() {
     let mut draw = indexed_draw(0, 0, 0);
     draw.context_registers.extend([
         GpuRegister {
@@ -310,7 +446,7 @@ fn compensates_winding_when_normalizing_negative_viewport_height() {
         decode_raster_state(&draw).expect("negative-height viewport raster state"),
         DecodedRasterState {
             cull_mode: MTLCullMode::Back,
-            front_winding: MTLWinding::CounterClockwise,
+            front_winding: MTLWinding::Clockwise,
             fill_mode: MTLTriangleFillMode::Fill,
         }
     );
@@ -372,6 +508,7 @@ fn promotes_small_depth_target_to_the_color_framebuffer_extent() {
     };
     let depth = DecodedDepthTarget {
         texture: descriptor,
+        htile_address: None,
         compare: MTLCompareFunction::Less,
         test_enabled: true,
         write_enabled: false,
@@ -1040,6 +1177,47 @@ fn maps_legacy_and_gen5_triangle_list_codes_to_metal_triangles() {
         metal_primitive_topology_class(7),
         Ok(MTLPrimitiveTopologyClass::Triangle)
     );
+}
+
+#[test]
+fn removes_triangle_list_primitive_restart_indices() {
+    let mut draw = indexed_draw(0x10_000, 0, 7);
+    draw.context_registers = vec![
+        GpuRegister {
+            offset: 0x103,
+            value: u32::MAX,
+        },
+        GpuRegister {
+            offset: 0x2a5,
+            value: 1,
+        },
+    ];
+    let (indices, primitive) =
+        prepare_indexed_primitive(&draw, [0, 1, 2, u32::from(u16::MAX), 3, 4, 5].into())
+            .expect("triangle-list primitive restart");
+    assert_eq!(indices.as_ref(), &[0, 1, 2, 3, 4, 5]);
+    assert_eq!(primitive, MTLPrimitiveType::Triangle);
+}
+
+#[test]
+fn expands_restarted_triangle_strips_to_triangle_lists() {
+    let mut draw = indexed_draw(0x10_000, 0, 8);
+    draw.primitive_type = 6;
+    draw.context_registers = vec![
+        GpuRegister {
+            offset: 0x103,
+            value: u32::MAX,
+        },
+        GpuRegister {
+            offset: 0x2a5,
+            value: 1,
+        },
+    ];
+    let (indices, primitive) =
+        prepare_indexed_primitive(&draw, [0, 1, 2, 3, u32::from(u16::MAX), 4, 5, 6].into())
+            .expect("triangle-strip primitive restart");
+    assert_eq!(indices.as_ref(), &[0, 1, 2, 2, 1, 3, 4, 5, 6]);
+    assert_eq!(primitive, MTLPrimitiveType::Triangle);
 }
 
 #[test]

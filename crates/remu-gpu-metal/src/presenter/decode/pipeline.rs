@@ -3,11 +3,11 @@
 
 use super::{
     CB_BLEND0_CONTROL, DecodedRasterState, DecodedRenderTarget, DepthTargetPipelineState,
-    GraphicsPipelineKey, GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_SU_SC_MODE_CNTL,
-    ProgramIdentity, RenderTargetPipelineState, common_render_target_array_length,
-    decode_depth_target, decode_render_targets, image_component_class, is_storage_image_opcode,
-    pixel_input_controls, program_embeds_global_base, programmed_viewport_has_negative_height,
-    register_value,
+    GraphicsPipelineKey, GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL,
+    PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState,
+    common_render_target_array_length, decode_depth_target, decode_render_targets,
+    image_component_class, is_storage_image_opcode, pixel_input_controls,
+    program_embeds_global_base, register_value,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
@@ -55,6 +55,93 @@ pub(crate) fn metal_primitive_type(guest: u32) -> Result<MTLPrimitiveType, Strin
     }
 }
 
+pub(crate) fn prepare_indexed_primitive(
+    draw: &IndexedDraw,
+    indices: Arc<[u32]>,
+) -> Result<(Arc<[u32]>, MTLPrimitiveType), String> {
+    let primitive = metal_primitive_type(draw.primitive_type)?;
+    let Some(restart) = primitive_restart_index(draw) else {
+        return Ok((indices, primitive));
+    };
+    if !indices.contains(&restart) {
+        return Ok((indices, primitive));
+    }
+
+    let mut prepared = Vec::with_capacity(indices.len());
+    let primitive = match draw.primitive_type {
+        1 | 2 | 4 => {
+            let vertices_per_primitive = match draw.primitive_type {
+                1 => 1,
+                2 => 2,
+                _ => 3,
+            };
+            for segment in indices.split(|&index| index == restart) {
+                let complete = segment.len() / vertices_per_primitive * vertices_per_primitive;
+                prepared.extend_from_slice(&segment[..complete]);
+            }
+            primitive
+        }
+        3 => {
+            for segment in indices.split(|&index| index == restart) {
+                for pair in segment.windows(2) {
+                    prepared.extend_from_slice(pair);
+                }
+            }
+            MTLPrimitiveType::Line
+        }
+        6 => {
+            for segment in indices.split(|&index| index == restart) {
+                for (triangle, vertices) in segment.windows(3).enumerate() {
+                    if triangle & 1 == 0 {
+                        prepared.extend_from_slice(vertices);
+                    } else {
+                        prepared.extend_from_slice(&[vertices[1], vertices[0], vertices[2]]);
+                    }
+                }
+            }
+            MTLPrimitiveType::Triangle
+        }
+        _ => {
+            return Err(format!(
+                "primitive restart is unsupported for guest topology {:#x}",
+                draw.primitive_type
+            ));
+        }
+    };
+
+    static LOGGED_RESTARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sequence = LOGGED_RESTARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL][PRIMITIVE-RESTART] draw={} topology={:#x} restart={restart:#x} raw={} prepared={}",
+            draw.sequence,
+            draw.primitive_type,
+            indices.len(),
+            prepared.len(),
+        );
+    }
+    Ok((prepared.into(), primitive))
+}
+
+fn primitive_restart_index(draw: &IndexedDraw) -> Option<u32> {
+    const VGT_MULTI_PRIM_IB_RESET_EN: u32 = 0x2a5;
+    const VGT_MULTI_PRIM_IB_RESET_INDX: u32 = 0x103;
+
+    let enabled = register_value(&draw.context_registers, VGT_MULTI_PRIM_IB_RESET_EN)
+        .is_some_and(|value| value & 1 != 0);
+    if !enabled {
+        return None;
+    }
+    let programmed =
+        register_value(&draw.context_registers, VGT_MULTI_PRIM_IB_RESET_INDX).unwrap_or(u32::MAX);
+    match draw.index_size {
+        0 => Some(programmed & u32::from(u16::MAX)),
+        1 => Some(programmed),
+        2 => Some(programmed & u32::from(u8::MAX)),
+        _ => None,
+    }
+}
+
 pub(crate) fn metal_primitive_topology_class(
     guest: u32,
 ) -> Result<MTLPrimitiveTopologyClass, String> {
@@ -93,21 +180,11 @@ pub(crate) fn decode_raster_state(draw: &IndexedDraw) -> Result<DecodedRasterSta
             );
         }
     };
-    let mut front_winding = if control & (1 << 2) != 0 {
+    let front_winding = if control & (1 << 2) != 0 {
         MTLWinding::Clockwise
     } else {
         MTLWinding::CounterClockwise
     };
-    // Gen5 titles commonly program a negative viewport Y scale to account for the framebuffer's
-    // top-left origin. `decode_viewport` represents that transform with a positive Metal viewport
-    // (Metal rejects a negative height), which mirrors the projected triangle orientation. Keep
-    // guest front/back-face classification intact by applying the corresponding winding flip.
-    if programmed_viewport_has_negative_height(draw) {
-        front_winding = match front_winding {
-            MTLWinding::Clockwise => MTLWinding::CounterClockwise,
-            MTLWinding::CounterClockwise => MTLWinding::Clockwise,
-        };
-    }
 
     let polygon_mode = (control >> 3) & 0x3;
     let fill_mode = match polygon_mode {
@@ -221,6 +298,8 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             pixel_evaluation,
             program_embeds_global_base(pixel_program),
         ),
+        vertex_output_control: register_value(&draw.context_registers, PA_CL_VS_OUT_CNTL)
+            .unwrap_or_default(),
         pixel_input_controls: pixel_input_controls(&draw.context_registers),
         targets: targets
             .iter()

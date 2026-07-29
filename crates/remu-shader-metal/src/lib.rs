@@ -118,6 +118,13 @@ pub const fn identity_pixel_input_controls() -> [PixelInputControl; PIXEL_INPUT_
 pub struct MetalCompileOptions {
     pub stage: MetalShaderStage,
     pub required_vertex_output_count: u32,
+    /// Raw `PA_CL_VS_OUT_CNTL` state used to map `EXP POS1..3` onto clip/cull distances and
+    /// miscellaneous fixed-function vertex outputs.
+    ///
+    /// GFX10 packs only the enabled output vectors, so the same POS target can denote the misc
+    /// vector or either clip/cull-distance vector depending on this register. Keeping the raw
+    /// value in the compile options makes that mapping part of the generated Metal interface.
+    pub vertex_output_control: u32,
     /// Number of active color-target layers. Gen5 volume draws route each guest instance to the
     /// corresponding layer.
     pub render_target_array_length: u32,
@@ -156,6 +163,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Vertex,
             required_vertex_output_count,
+            vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_input_enable: 0,
@@ -181,6 +189,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Pixel,
             required_vertex_output_count: 0,
+            vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs,
             pixel_input_enable,
@@ -202,6 +211,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
+            vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_input_enable: 0,
@@ -223,6 +233,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
+            vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_input_enable: 0,
@@ -249,6 +260,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Mesh,
             required_vertex_output_count,
+            vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_input_enable: 0,

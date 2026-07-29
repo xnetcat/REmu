@@ -222,6 +222,7 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             frames_per_second: 30.0,
             duration: Duration::ZERO,
             has_audio: false,
+            active_session: false,
             paused: false,
             end_of_stream: false,
             playing_since: None,
@@ -399,6 +400,7 @@ pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatc
     player.frames_per_second = frames_per_second;
     player.duration = duration;
     player.has_audio = av_player_probe_has_audio(&host_path);
+    player.active_session = true;
     player.paused = false;
     if player.auto_start {
         player.playing_since = Some(Instant::now());
@@ -526,6 +528,7 @@ fn av_player_finish_stream(player: &mut AvPlayerInstance) {
         player.reset_playback();
         player.playing_since = Some(Instant::now());
     } else {
+        player.active_session = false;
         player.end_of_stream = true;
         if let Some(started) = player.playing_since.take() {
             player.elapsed += started.elapsed();
@@ -802,12 +805,10 @@ pub(crate) fn av_player_current_time(handle: u64, state: &ProbeDispatchState) ->
 
 pub(crate) fn av_player_is_active(handle: u64, state: &ProbeDispatchState) -> u64 {
     state.av_player.players.get(&handle).map_or(0, |player| {
-        // Host wall time can advance by many seconds while an emulated frame is translated.
-        // AVPlayer stays active until its decoder actually reaches EOF so a short intro cannot
-        // disappear before the guest has received its first frame. A paused player is still
-        // active: pausing suspends the clock, not the playback session (behavior cross-checked
-        // against shadPS4's AvPlayer state machine).
-        u64::from((player.playing_since.is_some() || player.paused) && !player.end_of_stream)
+        // Source activity is independent of its media clock. In particular, AddSource's Ready
+        // state and Pause both remain active; only Stop, Error/EOF, or Close ends the session.
+        // Unity queries this Ready window before calling Start.
+        u64::from(player.active_session && !player.end_of_stream)
     })
 }
 
@@ -839,6 +840,7 @@ pub(crate) fn av_player_start(handle: u64, state: &mut ProbeDispatchState) -> u6
         return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
     }
     player.paused = false;
+    player.active_session = true;
     player.end_of_stream = false;
     player.video_catch_up_origin = None;
     player.playing_since.get_or_insert_with(Instant::now);
@@ -856,6 +858,7 @@ pub(crate) fn av_player_resume(handle: u64, state: &mut ProbeDispatchState) -> u
         return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
     }
     player.paused = false;
+    player.active_session = true;
     player.video_catch_up_origin = None;
     player.playing_since = Some(Instant::now());
     let callback = (player.event_callback, player.event_object);
@@ -877,6 +880,7 @@ pub(crate) fn av_player_jump_to_time(arguments: [u64; 6], state: &mut ProbeDispa
     // counters are aligned to the frames that seek actually emits, so delivered timestamps
     // continue to reflect stream position.
     player.decoder_seek = target;
+    player.active_session = true;
     player.elapsed = target;
     player.end_of_stream = false;
     player.next_video_frame = (target.as_secs_f64() * player.frames_per_second).round() as u64;
@@ -900,6 +904,7 @@ pub(crate) fn av_player_stop(handle: u64, state: &mut ProbeDispatchState) -> u64
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
     player.reset_playback();
+    player.active_session = false;
     player.paused = false;
     let callback = (player.event_callback, player.event_object);
     av_player_queue_event(callback.0, callback.1, 1, state);
@@ -1150,12 +1155,13 @@ pub(crate) fn av_player_validate_handle(handle: u64, state: &ProbeDispatchState)
     }
 }
 
-// Silent Hill's Gen5 Unreal media player consumes the same zero-based stream discriminator as
-// the public AvPlayer ABI: video=0, audio=1, timed text=2. Returning one-based values makes Unreal
-// classify its only video stream as audio and call GetAudioData forever, leaving the movie black.
-pub(crate) const AV_PLAYER_STREAM_TYPE_VIDEO: u32 = 0;
-pub(crate) const AV_PLAYER_STREAM_TYPE_AUDIO: u32 = 1;
+// Gen5 callers use one-based stream discriminators: video=1, audio=2, timed text=3. This differs
+// from the zero-based PS4 ABI. Both the local Unity and Unreal call sites compare the legacy
+// stream-info type against these values before selecting GetVideoData or GetAudioData.
+pub(crate) const AV_PLAYER_STREAM_TYPE_VIDEO: u32 = 1;
+pub(crate) const AV_PLAYER_STREAM_TYPE_AUDIO: u32 = 2;
 const AV_PLAYER_STREAM_INFO_SIZE: u64 = 32;
+const AV_PLAYER_STREAM_INFO_EX_SIZE: u64 = 104;
 
 pub(crate) fn av_player_write_stream_info(
     output: u64,
@@ -1185,7 +1191,43 @@ pub(crate) fn av_player_write_stream_info(
     );
 }
 
-pub(crate) fn av_player_get_stream_info(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+pub(crate) fn av_player_write_stream_info_ex(
+    output: u64,
+    stream_index: u64,
+    width: u32,
+    height: u32,
+    frames_per_second: f64,
+    duration: Duration,
+) {
+    // Preserve the caller-populated this_size field. The remaining 96 bytes are the Gen5
+    // discriminator, stream-specific payload, and duration.
+    guest_memset(output + 8, 0, AV_PLAYER_STREAM_INFO_EX_SIZE - 8);
+    let stream_type = if stream_index == 0 {
+        AV_PLAYER_STREAM_TYPE_VIDEO
+    } else {
+        AV_PLAYER_STREAM_TYPE_AUDIO
+    };
+    write_guest_u32(output + 8, stream_type);
+    if stream_type == AV_PLAYER_STREAM_TYPE_VIDEO {
+        write_guest_u32(output + 16, width);
+        write_guest_u32(output + 20, height);
+        write_guest_u32(output + 24, ((width as f32) / (height as f32)).to_bits());
+        write_guest_u64(output + 64, frames_per_second.to_bits());
+    } else {
+        write_guest_u16(output + 16, 2);
+        write_guest_u32(output + 20, 48_000);
+    }
+    write_guest_u64(
+        output + 96,
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+    );
+}
+
+pub(crate) fn av_player_get_stream_info(
+    arguments: [u64; 6],
+    extended: bool,
+    state: &ProbeDispatchState,
+) -> u64 {
     let Some(player) = state.av_player.players.get(&arguments[0]) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
@@ -1196,21 +1238,37 @@ pub(crate) fn av_player_get_stream_info(arguments: [u64; 6], state: &ProbeDispat
     {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     }
-    // Gen5's stream-info structure is 32 bytes and omits the PS4 start-time tail.
-    av_player_write_stream_info(
-        arguments[2],
-        arguments[1],
-        player.width,
-        player.height,
-        player.duration,
-    );
+    if extended {
+        if read_guest_u64(arguments[2]) < AV_PLAYER_STREAM_INFO_EX_SIZE {
+            return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+        }
+        av_player_write_stream_info_ex(
+            arguments[2],
+            arguments[1],
+            player.width,
+            player.height,
+            player.frames_per_second,
+            player.duration,
+        );
+    } else {
+        // Gen5's legacy stream-info structure is 32 bytes and omits the PS4 start-time tail.
+        av_player_write_stream_info(
+            arguments[2],
+            arguments[1],
+            player.width,
+            player.height,
+            player.duration,
+        );
+    }
     eprintln!(
-        "[REMu][AVPLAYER] stream info handle={:#x} index={} type={} {}x{} duration_ms={}",
+        "[REMu][AVPLAYER] stream info{} handle={:#x} index={} type={} {}x{} fps={:.3} duration_ms={}",
+        if extended { " ex" } else { "" },
         arguments[0],
         arguments[1],
         if arguments[1] == 0 { "video" } else { "audio" },
         player.width,
         player.height,
+        player.frames_per_second,
         player.duration.as_millis(),
     );
     0

@@ -4,10 +4,10 @@
 use super::{
     CachedSampledTexture, DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget,
     DepthArrayKey, DepthArrayResidentTexture, DirectScanoutTexture, GuestTextureDescriptor,
-    GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
-    MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
-    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    GuestTextureOverlapQuery, GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
+    MIP_UPLOAD_NANOSECONDS, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
+    MultisampleTextureKey, RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
+    ResidentGuestTexture, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
@@ -17,7 +17,7 @@ use super::{
     copy_tiled_to_linear_at_z, decode_image_descriptor, decode_mode5_mip_chain_from_raw,
     decode_mode27_mip_chain_from_raw, fallback_image_descriptor, guest_frame_fingerprint,
     guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_component_reordered_storage,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, initial_depth_clear_for_target, is_storage_image_opcode,
     is_writable_image_opcode, mode5_mip_chain_layout, mode27_mip_chain_layout,
@@ -53,11 +53,12 @@ pub(crate) use self::retire::{
 #[cfg(test)]
 pub(crate) use self::sampled::{
     apply_image_destination_select, image_destination_select_is_native,
-    new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
+    new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
+    prepare_sampled_texture_upload,
 };
 pub(crate) use self::sampled::{
     create_sampled_guest_texture, decode_sampled_texture_linear_from_raw,
-    resident_component_reordered_sample_is_eligible, resident_depth_sample_is_eligible,
+    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_texture_for_sample, sampled_texture_cache_needs_reload, sampled_texture_key,
 };
 pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};

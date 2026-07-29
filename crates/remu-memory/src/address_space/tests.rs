@@ -534,6 +534,100 @@ fn gpu_backing_alias_enumeration_tracks_aliases_and_remaps() {
 }
 
 #[test]
+fn physical_range_overlap_compares_aliases_without_requiring_matching_virtual_addresses() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let other_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let base = memory.base();
+    let first = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(page(base, 0)),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let continuation = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(page(base, 4)),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    let alias = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(page(base, 8)),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let unrelated = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(page(base, 12)),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &other_backing,
+            0,
+        )
+        .unwrap();
+
+    assert!(guest_shared_backing_ranges_overlap(
+        first.get(),
+        GUEST_PAGE_SIZE,
+        alias.get(),
+        GUEST_PAGE_SIZE,
+    ));
+    assert!(!guest_shared_backing_ranges_overlap(
+        first.get(),
+        GUEST_PAGE_SIZE,
+        continuation.get(),
+        GUEST_PAGE_SIZE,
+    ));
+    assert!(guest_shared_backing_ranges_overlap(
+        first.get(),
+        2 * GUEST_PAGE_SIZE,
+        continuation.get(),
+        GUEST_PAGE_SIZE,
+    ));
+    assert!(!guest_shared_backing_ranges_overlap(
+        first.get(),
+        GUEST_PAGE_SIZE,
+        unrelated.get(),
+        GUEST_PAGE_SIZE,
+    ));
+    assert!(!guest_shared_backing_ranges_overlap(
+        first.get(),
+        0,
+        alias.get(),
+        GUEST_PAGE_SIZE,
+    ));
+    let first_identity =
+        guest_shared_backing_identity(first.get(), GUEST_PAGE_SIZE).expect("first identity");
+    assert_eq!(
+        guest_shared_backing_identity(alias.get(), GUEST_PAGE_SIZE),
+        Some(first_identity),
+    );
+    assert_eq!(
+        guest_shared_backing_identity(first.get(), 2 * GUEST_PAGE_SIZE),
+        Some(first_identity),
+        "physical identity accepts a contiguous backing exposed through disjoint virtual maps",
+    );
+    assert_ne!(
+        guest_shared_backing_identity(continuation.get(), GUEST_PAGE_SIZE),
+        Some(first_identity),
+    );
+}
+
+#[test]
 fn no_coalesce_shared_maps_retain_independent_query_boundaries() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();

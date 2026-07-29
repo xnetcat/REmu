@@ -169,6 +169,7 @@ fn compile_vector_instruction(instruction: Instruction, stage: MetalShaderStage)
         &MetalCompileOptions {
             stage,
             required_vertex_output_count: 0,
+            vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_input_enable: 0,

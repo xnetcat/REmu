@@ -613,8 +613,10 @@ pub(crate) fn ensure_resident_texture_in_map(
     }
     resident_guest_textures.remove(&descriptor);
     let write_watch = watch_guest_texture(descriptor)?;
-    let usage =
-        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
+    let usage = MTLTextureUsage::RenderTarget
+        | MTLTextureUsage::ShaderRead
+        | MTLTextureUsage::ShaderWrite
+        | MTLTextureUsage::PixelFormatView;
     let texture = if upload_guest_contents {
         let raw = snapshot_watched_guest_texture_raw(descriptor, &write_watch)?;
         let linear = decode_guest_texture_linear_from_raw(descriptor, &raw)?;

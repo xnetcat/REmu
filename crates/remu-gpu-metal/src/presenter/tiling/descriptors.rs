@@ -3,7 +3,69 @@
 
 use super::{GuestTextureDescriptor, guest_texture_byte_count};
 use metal::MTLPixelFormat;
-use remu_memory::{guest_shared_backing_alias_segments, guest_shared_mapping_identity};
+use remu_memory::{GuestSharedMappingIdentity, guest_shared_mapping_identity};
+
+pub(crate) struct GuestTextureOverlapQuery {
+    descriptor: GuestTextureDescriptor,
+    byte_count: Option<u64>,
+    backing: Option<GuestSharedMappingIdentity>,
+}
+
+impl GuestTextureOverlapQuery {
+    pub(crate) fn new(descriptor: GuestTextureDescriptor) -> Self {
+        let byte_count = guest_texture_byte_count(descriptor);
+        let backing = byte_count.and_then(|byte_count| {
+            remu_memory::guest_shared_backing_identity(descriptor.address, byte_count)
+        });
+        Self {
+            descriptor,
+            byte_count,
+            backing,
+        }
+    }
+
+    pub(crate) fn overlaps(&self, other: GuestTextureDescriptor) -> bool {
+        let Some(left_bytes) = self.byte_count else {
+            return false;
+        };
+        let Some(right_bytes) = guest_texture_byte_count(other) else {
+            return false;
+        };
+        if guest_ranges_overlap(
+            self.descriptor.address,
+            left_bytes,
+            other.address,
+            right_bytes,
+        ) {
+            return true;
+        }
+        let Some(left_backing) = self.backing else {
+            return remu_memory::guest_shared_backing_ranges_overlap(
+                self.descriptor.address,
+                left_bytes,
+                other.address,
+                right_bytes,
+            );
+        };
+        let Some(right_backing) =
+            remu_memory::guest_shared_backing_identity(other.address, right_bytes)
+        else {
+            return remu_memory::guest_shared_backing_ranges_overlap(
+                self.descriptor.address,
+                left_bytes,
+                other.address,
+                right_bytes,
+            );
+        };
+        left_backing.backing_id == right_backing.backing_id
+            && guest_ranges_overlap(
+                left_backing.backing_offset,
+                left_bytes,
+                right_backing.backing_offset,
+                right_bytes,
+            )
+    }
+}
 
 pub(crate) fn guest_texture_descriptors_overlap(
     left: GuestTextureDescriptor,
@@ -18,19 +80,12 @@ pub(crate) fn guest_texture_descriptors_overlap(
     if guest_ranges_overlap(left.address, left_bytes, right.address, right_bytes) {
         return true;
     }
-    let Some(left_mapping) = guest_shared_mapping_identity(left.address, left_bytes) else {
-        return false;
-    };
-    let Some(right_mapping) = guest_shared_mapping_identity(right.address, right_bytes) else {
-        return false;
-    };
-    left_mapping.backing_id == right_mapping.backing_id
-        && guest_ranges_overlap(
-            left_mapping.backing_offset,
-            left_bytes,
-            right_mapping.backing_offset,
-            right_bytes,
-        )
+    remu_memory::guest_shared_backing_ranges_overlap(
+        left.address,
+        left_bytes,
+        right.address,
+        right_bytes,
+    )
 }
 
 pub(crate) fn guest_texture_descriptors_share_storage(
@@ -46,6 +101,7 @@ pub(crate) fn guest_texture_descriptors_share_storage(
     guest_texture_descriptors_share_byte_storage(left, right)
 }
 
+#[cfg(test)]
 pub(crate) fn guest_texture_descriptors_share_component_reordered_storage(
     left: GuestTextureDescriptor,
     right: GuestTextureDescriptor,
@@ -64,6 +120,26 @@ pub(crate) fn guest_texture_descriptors_share_component_reordered_storage(
             )
     );
     formats_are_red_blue_reorders
+        && guest_texture_descriptors_have_same_byte_layout(left, right)
+        && guest_texture_descriptors_share_byte_storage(left, right)
+}
+
+pub(crate) fn guest_texture_descriptors_share_color_view_storage(
+    left: GuestTextureDescriptor,
+    right: GuestTextureDescriptor,
+) -> bool {
+    let is_view_compatible_color = |format| {
+        matches!(
+            format,
+            MTLPixelFormat::RGBA8Unorm
+                | MTLPixelFormat::RGBA8Unorm_sRGB
+                | MTLPixelFormat::BGRA8Unorm
+                | MTLPixelFormat::BGRA8Unorm_sRGB
+        )
+    };
+    left.pixel_format != right.pixel_format
+        && is_view_compatible_color(left.pixel_format)
+        && is_view_compatible_color(right.pixel_format)
         && guest_texture_descriptors_have_same_byte_layout(left, right)
         && guest_texture_descriptors_share_byte_storage(left, right)
 }
@@ -185,9 +261,5 @@ pub(crate) fn guest_physical_ranges_overlap(
     if guest_ranges_overlap(left, left_bytes, right, right_bytes) {
         return true;
     }
-    guest_shared_backing_alias_segments(left, left_bytes).is_some_and(|aliases| {
-        aliases
-            .into_iter()
-            .any(|alias| guest_ranges_overlap(alias.address, alias.byte_count, right, right_bytes))
-    })
+    remu_memory::guest_shared_backing_ranges_overlap(left, left_bytes, right, right_bytes)
 }

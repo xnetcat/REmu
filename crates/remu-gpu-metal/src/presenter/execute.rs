@@ -15,12 +15,13 @@ use super::{
     append_unique_global_writebacks, append_unique_guest_write_ranges, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, compile_metal_compute_library, compute_pipeline_key,
-    compute_program_can_split_wave64, create_global_argument_buffer, decode_color_operation_mode,
-    decode_depth_target, decode_image_descriptor, decode_raster_state, decode_render_targets,
-    decode_scissor, decode_viewport, diagnostic_capture_pixel_output,
-    diagnostic_capture_vertex_position, diagnostic_disable_culling, diagnostic_disable_depth,
-    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
-    diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
+    compute_program_can_split_wave64, consume_depth_metadata_clear, create_global_argument_buffer,
+    decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
+    decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
+    decode_raster_state, decode_render_targets, decode_scissor, decode_viewport,
+    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
+    diagnostic_disable_culling, diagnostic_disable_depth, diagnostic_disable_depth_and_culling,
+    diagnostic_dump_complex_msaa, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
     diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_match_index,
     diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
@@ -37,19 +38,21 @@ use super::{
     guest_frame_fingerprint, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_storage, half_float_to_f32, image_resource_descriptor_is_null,
     initial_depth_clear_for_target, initial_render_target_clear_color, is_storage_image_opcode,
-    metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, read_draw_indices, read_texture_array_linear,
-    read_texture_linear, read_texture_volume_linear, record_diagnostic_global_writers,
-    record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
-    render_target_fast_clear_color, sampled_image_bindings, shader_scalar_metadata_for_registers,
-    should_record_diagnostic_target_writer, snapshot_guest_texture_raw, trace_image_descriptors,
-    trace_msaa_writes, trace_scanout_writes, trace_target_sampling, upload_image_textures,
-    validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
+    is_writable_image_opcode, metal_nonindexed_vertex_count, metal_primitive_type,
+    metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, prepare_indexed_primitive,
+    read_draw_indices, read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
+    rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_scanout_writer,
+    record_diagnostic_texture_writer, register_value, render_target_fast_clear_color,
+    resident_color_view_sample_is_eligible, sampled_image_bindings,
+    shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
+    snapshot_guest_texture_raw, trace_image_descriptors, trace_msaa_writes, trace_scanout_writes,
+    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
+    video_target_binding_summary, wave64_split_blockers,
 };
 use metal::{
-    MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderStages, MTLResourceOptions, MTLResourceUsage, MTLSize, MTLStoreAction, MTLTextureType,
-    MTLViewport, RenderPassDescriptor,
+    MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRenderStages, MTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLStoreAction, MTLTextureType, MTLViewport, RenderPassDescriptor,
 };
 use remu_gpu::IndexedDraw;
 use std::collections::{HashMap, HashSet};
@@ -83,10 +86,10 @@ impl MetalPresenter {
                 | ColorOperationMode::FmaskDecompress
         ) {
             // CB_COLOR_CONTROL special operations use a draw packet only as a command-processor
-            // trigger; its attached shader is not rasterized. REmu keeps color residents
-            // decompressed and resolves every ordinary Metal MSAA pass, so ending the current
-            // pass publishes the already-current single-sample image. Executing the trigger
-            // shader as a normal draw overwrote Superliminal's HDR scene with constant white.
+            // trigger; its attached shader is not rasterized. Executing the trigger shader as a
+            // normal draw overwrites the color target. Ordinary passes maintain a single-sample
+            // MRT0 resident. Resolve transfers that resident to MRT1; EliminateFastClear
+            // materializes the logical CMASK clear before later geometry loads the attachment.
             if self
                 .open_guest_batch
                 .as_mut()
@@ -97,12 +100,22 @@ impl MetalPresenter {
                     .render_pass_ends_for_target_change
                     .saturating_add(1);
             }
+            let operation_targets = match color_operation {
+                ColorOperationMode::Resolve => {
+                    let (source, destination) = self.execute_color_resolve(draw)?;
+                    Some((source, Some(destination)))
+                }
+                ColorOperationMode::EliminateFastClear => self
+                    .execute_eliminate_fast_clear(draw)?
+                    .map(|target| (target, None)),
+                _ => None,
+            };
             if trace_target_sampling() {
                 static LOGGED_COLOR_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
                 let sequence = LOGGED_COLOR_OPERATIONS.fetch_add(1, Ordering::Relaxed) + 1;
                 if sequence <= 16 || sequence.is_power_of_two() {
                     eprintln!(
-                        "[REMu][METAL][COLOR-OP] draw={} operation={color_operation:?} control={color_control:#010x} targets={targets:?}",
+                        "[REMu][METAL][COLOR-OP] draw={} operation={color_operation:?} control={color_control:#010x} targets={targets:?} operated={operation_targets:?}",
                         draw.sequence,
                     );
                 }
@@ -622,8 +635,12 @@ impl MetalPresenter {
             pixel_global_argument_buffer_index,
             &pixel_buffers,
         )?;
+        let mut primitive = metal_primitive_type(draw.primitive_type)?;
         let indexed_draw = if draw.indexed {
             let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
+            let prepared = prepare_indexed_primitive(draw, indices)?;
+            primitive = prepared.1;
+            let indices = prepared.0;
             let buffer = self.cached_index_buffer(&device, indices.as_ref())?;
             Some((indices, buffer))
         } else {
@@ -690,7 +707,6 @@ impl MetalPresenter {
                 );
             }
         }
-        let primitive = metal_primitive_type(draw.primitive_type)?;
         let export_buffer_indices = (0..export_buffers.len())
             .map(|index| u64::try_from(index).map_err(|_| "vertex buffer index overflow"))
             .collect::<Result<Vec<_>, _>>()?;
@@ -860,6 +876,27 @@ impl MetalPresenter {
             None
         };
 
+        // HTILE is logical compression metadata, not ordinary depth pixels. New metadata is
+        // cleared by definition and a guest DMA/compute fill rearms it. Consume that state once
+        // at attachment use and expand it through Metal's depth load clear.
+        let depth_metadata_clear = depth.is_some_and(|depth| {
+            consume_depth_metadata_clear(&mut self.depth_metadata_clears, depth.htile_address)
+        });
+        let depth_metadata_clear_sequence = depth_metadata_clear.then(|| {
+            let sequence = self.next_depth_metadata_clear_sequence;
+            self.next_depth_metadata_clear_sequence =
+                self.next_depth_metadata_clear_sequence.wrapping_add(1);
+            sequence
+        });
+        let depth_clear_value = depth.and_then(|depth| {
+            if depth.clear_enabled || depth_metadata_clear {
+                Some(depth.clear_depth)
+            } else if clear_uninitialized_depth {
+                Some(initial_depth_clear_for_target(depth))
+            } else {
+                None
+            }
+        });
         let render_pass_key = GuestRenderPassKey {
             targets: targets
                 .iter()
@@ -883,8 +920,8 @@ impl MetalPresenter {
                 (
                     depth.texture,
                     depth.sample_count,
-                    depth.clear_enabled,
-                    (depth.clear_depth as f32).to_bits(),
+                    depth_clear_value.map(|value| (value as f32).to_bits()),
+                    depth_metadata_clear_sequence,
                 )
             }),
         };
@@ -930,14 +967,14 @@ impl MetalPresenter {
                     attachment.set_store_action(MTLStoreAction::Store);
                 }
             }
-            if let (Some(depth), Some(texture)) = (depth, depth_texture.as_ref()) {
+            if let (Some(_depth), Some(texture)) = (depth, depth_texture.as_ref()) {
                 let attachment = pass
                     .depth_attachment()
                     .ok_or("Metal render pass has no depth attachment")?;
                 attachment.set_texture(Some(texture));
-                if depth.clear_enabled || clear_uninitialized_depth {
+                if let Some(clear_depth) = depth_clear_value {
                     attachment.set_load_action(MTLLoadAction::Clear);
-                    attachment.set_clear_depth(initial_depth_clear_for_target(depth));
+                    attachment.set_clear_depth(clear_depth);
                 } else {
                     attachment.set_load_action(MTLLoadAction::Load);
                 }
@@ -1145,7 +1182,7 @@ impl MetalPresenter {
                     .ok_or("NGG mesh draw requires captured indices")?;
                 let index_count =
                     u32::try_from(indices.len()).map_err(|_| "mesh index count exceeds u32")?;
-                let mesh_draw = [index_count, 0_u32];
+                let mesh_draw = [index_count, 0_u32, draw.base_vertex as u32];
                 encoder.set_mesh_buffer(NGG_MESH_INDEX_BUFFER_INDEX, Some(index_buffer), 0);
                 encoder.set_mesh_bytes(
                     NGG_MESH_DRAW_BUFFER_INDEX,
@@ -1167,18 +1204,22 @@ impl MetalPresenter {
                 // Metal rejects an empty scissor, so a guest empty-scissor draw encodes no
                 // primitive while preserving command-stream ordering.
             } else if let Some((_, index_buffer)) = indexed_draw.as_ref() {
-                encoder.draw_indexed_primitives_instanced(
+                encoder.draw_indexed_primitives_instanced_base_instance(
                     primitive,
                     indexed_count.expect("indexed draw count was precomputed"),
                     MTLIndexType::UInt32,
                     index_buffer,
                     0,
                     u64::from(draw.instance_count),
+                    i64::from(draw.base_vertex),
+                    0,
                 );
             } else {
+                let first_vertex = i64::from(draw.index_offset) + i64::from(draw.base_vertex);
                 encoder.draw_primitives_instanced(
                     primitive,
-                    u64::from(draw.index_offset),
+                    u64::try_from(first_vertex)
+                        .map_err(|_| format!("negative first vertex {first_vertex}"))?,
                     u64::from(metal_nonindexed_vertex_count(
                         draw.primitive_type,
                         draw.index_count,
@@ -1776,6 +1817,10 @@ impl MetalPresenter {
                             indices
                                 .iter()
                                 .copied()
+                                .filter_map(|index| {
+                                    let adjusted = i64::from(index) + i64::from(draw.base_vertex);
+                                    u32::try_from(adjusted).ok()
+                                })
                                 .filter(|index| {
                                     usize::try_from(*index).is_ok_and(|index| {
                                         index < DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
@@ -1863,7 +1908,7 @@ impl MetalPresenter {
                         ))
                     });
                 eprintln!(
-                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_summaries:x?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals={:x?} pixel_globals={:x?}",
+                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_summaries:x?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals={:x?} pixel_globals={:x?}",
                     draw.sequence,
                     draw.export_shader_address,
                     draw.pixel_shader_address,
@@ -1871,6 +1916,8 @@ impl MetalPresenter {
                     draw.index_count,
                     draw.instance_count,
                     draw.primitive_type,
+                    draw.index_offset,
+                    draw.base_vertex,
                     indexed_draw
                         .as_ref()
                         .map(|(indices, _)| &indices[..indices.len().min(24)]),
@@ -1881,6 +1928,7 @@ impl MetalPresenter {
                     bytes.len(),
                     nonzero,
                     key.targets,
+                    key.vertex_output_control,
                     key.pixel_input_controls,
                     vertex_scalar_metadata,
                     pixel_evaluation.initial_scalar_registers,
@@ -2038,6 +2086,11 @@ impl MetalPresenter {
         }
         if let Some(directory) = std::env::var_os("REMU_DUMP_VIDEO_TARGET_DIR")
             && evaluation_samples_large_linear_video(pixel_evaluation)
+            && {
+                static VIDEO_TARGET_DUMP_MATCHES: AtomicUsize = AtomicUsize::new(0);
+                VIDEO_TARGET_DUMP_MATCHES.fetch_add(1, Ordering::Relaxed)
+                    == diagnostic_dump_target_match_index()
+            }
         {
             self.wait_for_guest_command_batches()?;
             let descriptor = targets
@@ -2155,5 +2208,162 @@ impl MetalPresenter {
             );
         }
         Ok(())
+    }
+
+    /// Executes the command-processor color resolve defined by MRT0 -> MRT1.
+    ///
+    /// Ordinary Metal render passes already resolve REmu's private multisample attachment into a
+    /// single-sample resident for MRT0. The guest resolve operation still names distinct
+    /// destination storage, so that current resident must be copied to MRT1 before post-processing
+    /// samples it. shadPS4's Vulkan path performs the same explicit MRT0-to-MRT1 transfer.
+    fn execute_color_resolve(
+        &mut self,
+        draw: &IndexedDraw,
+    ) -> Result<(GuestTextureDescriptor, GuestTextureDescriptor), String> {
+        let (source, destination) = decode_color_resolve_targets(draw)?;
+        if source.texture_type != 9
+            || destination.texture_type != 9
+            || source.layer_count != 1
+            || destination.layer_count != 1
+            || source.mip_level != 0
+            || destination.mip_level != 0
+            || source.mip_level_count != 1
+            || destination.mip_level_count != 1
+        {
+            return Err(format!(
+                "color resolve requires base-level 2D surfaces, got source={source:?} destination={destination:?}"
+            ));
+        }
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
+        let source_texture = self.ensure_layered_render_target_texture(&device, source, false)?;
+        let destination_texture =
+            self.ensure_layered_render_target_texture(&device, destination, true)?;
+
+        self.ensure_open_guest_batch(&queue);
+        let batch = self
+            .open_guest_batch
+            .as_mut()
+            .expect("color resolve opened a guest command batch");
+        let encoder = batch.command_buffer.new_blit_command_encoder();
+        encoder.set_label("REMu translated MRT0-to-MRT1 color resolve");
+        encoder.copy_from_texture(
+            &source_texture,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize::new(
+                u64::from(source.texture.width),
+                u64::from(source.texture.height),
+                1,
+            ),
+            &destination_texture,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        encoder.end_encoding();
+        batch.work.push(GuestBatchWork::Draw {
+            export: draw.export_shader_address,
+            pixel: draw.pixel_shader_address,
+        });
+        self.mark_resident_texture_written(destination.texture);
+        self.note_pending_flip_target_write(destination.texture);
+        Ok((source.texture, destination.texture))
+    }
+
+    /// Materializes the logical color represented by MRT0's fast-clear metadata.
+    ///
+    /// shadPS4 consumes an EliminateFastClear trigger by clearing the image when CMASK still marks
+    /// the selected slice as cleared. REmu keeps render targets in uncompressed Metal storage and
+    /// does not expose CMASK as an image, so the trigger itself is the ordering point at which the
+    /// programmed clear value must replace any resident pixels from the preceding frame.
+    fn execute_eliminate_fast_clear(
+        &mut self,
+        draw: &IndexedDraw,
+    ) -> Result<Option<GuestTextureDescriptor>, String> {
+        let Some(target) = decode_color_eliminate_fast_clear_target(draw)? else {
+            return Ok(None);
+        };
+        if target.texture_type != 9
+            || target.layer_count != 1
+            || target.mip_level != 0
+            || target.mip_level_count != 1
+        {
+            return Err(format!(
+                "fast-clear elimination requires a base-level 2D surface, got {target:?}"
+            ));
+        }
+        let clear_color = render_target_fast_clear_color(&target, &draw.context_registers)
+            .ok_or("fast-clear elimination has no decodable clear color")?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
+        let resolved = self.ensure_layered_render_target_texture(&device, target, true)?;
+        let (attachment_texture, resolve_texture) = if target.sample_count > 1 {
+            let (multisample, _) = self.ensure_multisample_texture(
+                &device,
+                target.texture,
+                target.sample_count,
+                target.texture.width,
+                target.texture.height,
+            )?;
+            (multisample, Some(resolved))
+        } else {
+            (resolved, None)
+        };
+
+        self.ensure_open_guest_batch(&queue);
+        let pass = RenderPassDescriptor::new();
+        pass.set_render_target_width(u64::from(target.texture.width));
+        pass.set_render_target_height(u64::from(target.texture.height));
+        let attachment = pass
+            .color_attachments()
+            .object_at(0)
+            .ok_or("Metal render pass has no color attachment zero")?;
+        attachment.set_texture(Some(&attachment_texture));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_clear_color(clear_color);
+        if let Some(resolve_texture) = resolve_texture.as_ref() {
+            attachment.set_resolve_texture(Some(resolve_texture));
+            attachment.set_store_action(MTLStoreAction::StoreAndMultisampleResolve);
+        } else {
+            attachment.set_store_action(MTLStoreAction::Store);
+        }
+
+        let batch = self
+            .open_guest_batch
+            .as_mut()
+            .expect("fast-clear elimination opened a guest command batch");
+        let encoder = batch.command_buffer.new_render_command_encoder(pass);
+        encoder.set_label("REMu translated color fast-clear elimination");
+        encoder.end_encoding();
+        batch.work.push(GuestBatchWork::Draw {
+            export: draw.export_shader_address,
+            pixel: draw.pixel_shader_address,
+        });
+        if target.sample_count > 1 {
+            self.mark_multisample_texture_initialized(target.texture, target.sample_count);
+            self.mark_resident_texture_written_preserving_multisample(target.texture);
+        } else {
+            self.mark_resident_texture_written(target.texture);
+        }
+        self.note_pending_flip_target_write(target.texture);
+        Ok(Some(target.texture))
     }
 }

@@ -35,20 +35,22 @@ use self::decode::{
     CB_COLOR_CONTROL, CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT,
     CB_TARGET_MASK, ColorOperationMode, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
     DEFAULT_CB_COLOR_CONTROL, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    decode_color_operation_mode, decode_depth_target, decode_image_descriptor,
+    decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
+    decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
     decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
     decode_render_targets, decode_scissor, decode_viewport, fallback_image_descriptor,
     graphics_pipeline_key, image_component_class, initial_depth_clear_for_target,
     initial_render_target_clear_color, metal_color_write_mask, metal_nonindexed_vertex_count,
-    metal_primitive_type, pixel_input_controls, raw_video_out_texture_descriptor,
-    read_draw_indices, register_value, render_target_fast_clear_color, sampled_alias_descriptor,
+    metal_primitive_type, pixel_input_controls, prepare_indexed_primitive,
+    raw_video_out_texture_descriptor, read_draw_indices, register_value,
+    render_target_fast_clear_color, sampled_alias_descriptor,
 };
 #[cfg(test)]
 use self::decode::{
     CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_BASE, CB_COLOR0_BASE_EXT,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, DB_DEPTH_CLEAR,
-    DB_DEPTH_VIEW, DB_RENDER_CONTROL, DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE,
-    DB_Z_WRITE_BASE_HI, SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE,
+    DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
+    DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE,
     VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length,
     decode_fast_clear_color, decode_render_targets_from_registers, decode_scanout_target,
     graphics_shader_resource_key, initial_depth_clear_value, metal_primitive_topology_class,
@@ -150,7 +152,7 @@ use self::texture::{
     create_exact_mode27_sampled_mip_view, create_sampled_guest_texture,
     decode_sampled_texture_linear_from_raw, depth_array_face_descriptor,
     depth_array_face_set_is_complete, ensure_mipmapped_resident_texture_in_map,
-    guest_texture_raw_matches, image_destination_select_is_native,
+    guest_texture_raw_matches, image_destination_select_is_native, new_color_alias_texture_view,
     new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
     sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_raw_range,
     snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
@@ -158,28 +160,29 @@ use self::texture::{
 };
 use self::texture::{
     decode_guest_texture_linear_from_raw, refresh_resident_texture_write_watch,
-    retire_multisample_textures_overlapping_writeback,
+    resident_color_view_sample_is_eligible, retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
     snapshot_watched_guest_range, upload_image_textures, write_watched_guest_range,
     write_watched_guest_texture_linear,
 };
 use self::tiling::{
-    copy_linear_to_tiled, copy_tiled_to_linear_at_z, decode_mode5_mip_chain_from_raw,
-    decode_mode27_mip_chain_from_raw, effective_linear_pitch, encode_mode27_mip_chain_into_raw,
-    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
-    guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_component_reordered_storage,
+    GuestTextureOverlapQuery, copy_linear_to_tiled, copy_tiled_to_linear_at_z,
+    decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, effective_linear_pitch,
+    encode_mode27_mip_chain_into_raw, guest_physical_ranges_overlap, guest_ranges_overlap,
+    guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
     mode5_mip_chain_layout, mode27_mip_chain_layout, render_resolve_candidate_matches,
     tiled_block_dimensions,
 };
 #[cfg(test)]
 use self::tiling::{
-    encode_mode5_mip_chain_into_raw, mode5_within_block_byte_offset,
-    mode9_within_block_byte_offset, mode24_within_block_byte_offset_for_format,
-    mode27_block_dimensions, mode27_source_byte_offset, mode27_surface_z_xor,
-    mode27_within_block_byte_offset, mode27_within_block_byte_offset_for_format,
+    encode_mode5_mip_chain_into_raw, guest_texture_descriptors_share_component_reordered_storage,
+    mode5_within_block_byte_offset, mode9_within_block_byte_offset,
+    mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_source_byte_offset,
+    mode27_surface_z_xor, mode27_within_block_byte_offset,
+    mode27_within_block_byte_offset_for_format,
 };
 
 #[cfg(test)]
@@ -386,6 +389,7 @@ struct GraphicsPipelineKey {
     pixel_program_identity: ProgramIdentity,
     export_resources: GraphicsShaderResourceKey,
     pixel_resources: GraphicsShaderResourceKey,
+    vertex_output_control: u32,
     pixel_input_controls: [u32; 32],
     targets: Vec<RenderTargetPipelineState>,
     depth: Option<DepthTargetPipelineState>,
@@ -429,12 +433,31 @@ struct DiagnosticScanoutWriter {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DecodedDepthTarget {
     texture: GuestTextureDescriptor,
+    htile_address: Option<u64>,
     compare: MTLCompareFunction,
     test_enabled: bool,
     write_enabled: bool,
     clear_enabled: bool,
     clear_depth: f64,
     sample_count: u32,
+}
+
+fn consume_depth_metadata_clear(states: &mut HashMap<u64, bool>, address: Option<u64>) -> bool {
+    let Some(address) = address else {
+        return false;
+    };
+    let pending = states.entry(address).or_insert(true);
+    let consumed = *pending;
+    *pending = false;
+    consumed
+}
+
+fn rearm_depth_metadata_clear(states: &mut HashMap<u64, bool>, address: u64) -> bool {
+    let Some(pending) = states.get_mut(&address) else {
+        return false;
+    };
+    *pending = true;
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -833,7 +856,7 @@ struct GuestMemoryWaitTracker {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GuestRenderPassKey {
     targets: Vec<(GuestTextureDescriptor, u32, bool, u32, u32, u32, u32, u32)>,
-    depth: Option<(GuestTextureDescriptor, u32, bool, u32)>,
+    depth: Option<(GuestTextureDescriptor, u32, Option<u32>, Option<u64>)>,
 }
 
 struct OpenGuestRenderPass {
@@ -904,6 +927,11 @@ struct MetalPresenter {
     direct_scanout_textures: HashMap<u64, DirectScanoutTexture>,
     scanout_snapshot_textures: HashMap<u64, ScanoutSnapshotTexture>,
     multisample_textures: HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
+    /// Logical HTILE clear state keyed by the byte address in DB_HTILE_DATA_BASE. Metal cannot
+    /// consume guest HTILE directly, so the next attachment use materializes a pending state as
+    /// a depth load clear.
+    depth_metadata_clears: HashMap<u64, bool>,
+    next_depth_metadata_clear_sequence: u64,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     sampled_texture_write_watches: HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
     fallback_texture_cache: HashMap<SampledTextureKey, Texture>,
@@ -1043,6 +1071,8 @@ impl MetalPresenter {
             direct_scanout_textures: HashMap::new(),
             scanout_snapshot_textures: HashMap::new(),
             multisample_textures: HashMap::new(),
+            depth_metadata_clears: HashMap::new(),
+            next_depth_metadata_clear_sequence: 0,
             sampled_texture_cache: HashMap::new(),
             sampled_texture_write_watches: HashMap::new(),
             fallback_texture_cache: HashMap::new(),

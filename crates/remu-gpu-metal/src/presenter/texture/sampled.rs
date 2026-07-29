@@ -7,7 +7,7 @@ use super::{
     SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey,
     WriteWatchRefresh, comparison_depth32_upload, compressed_texture_block_extent,
     decode_guest_texture_linear_from_raw_at_z, guest_frame_fingerprint, guest_texture_byte_count,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_component_reordered_storage,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
@@ -83,7 +83,7 @@ impl MetalPresenter {
                                     resident.descriptor,
                                     sampled.guest,
                                 )
-                                && !resident_component_reordered_sample_is_eligible(
+                                && !resident_color_view_sample_is_eligible(
                                     resident, sampled, comparison,
                                 )
                                 && !resident_depth_sample_is_eligible(resident, sampled)
@@ -255,10 +255,45 @@ pub(crate) fn sampled_texture_key(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn new_red_blue_swizzled_texture_view(
     texture: &Texture,
     base_mip_level: u32,
     mip_level_count: u32,
+) -> Option<Texture> {
+    new_texture_view_with_swizzle(
+        texture,
+        texture.pixel_format(),
+        base_mip_level,
+        mip_level_count,
+        true,
+    )
+}
+
+pub(crate) fn new_color_alias_texture_view(
+    texture: &Texture,
+    pixel_format: MTLPixelFormat,
+    base_mip_level: u32,
+    mip_level_count: u32,
+) -> Option<Texture> {
+    // Selecting the sampled pixel format reinterprets both the component byte order and the
+    // linear/sRGB transfer function. An additional red/blue swizzle would double-swap BGRA/RGBA
+    // aliases, so this view intentionally uses the identity component mapping.
+    new_texture_view_with_swizzle(
+        texture,
+        pixel_format,
+        base_mip_level,
+        mip_level_count,
+        false,
+    )
+}
+
+fn new_texture_view_with_swizzle(
+    texture: &Texture,
+    pixel_format: MTLPixelFormat,
+    base_mip_level: u32,
+    mip_level_count: u32,
+    swap_red_blue: bool,
 ) -> Option<Texture> {
     let underlying_mip_count = base_mip_level.checked_add(mip_level_count)?;
     if mip_level_count == 0 || underlying_mip_count > texture.mipmap_level_count() as u32 {
@@ -269,9 +304,9 @@ pub(crate) fn new_red_blue_swizzled_texture_view(
     const BLUE: u8 = 4;
     const ALPHA: u8 = 5;
     let swizzle = MetalTextureSwizzleChannels {
-        red: BLUE,
+        red: if swap_red_blue { BLUE } else { RED },
         green: GREEN,
-        blue: RED,
+        blue: if swap_red_blue { RED } else { BLUE },
         alpha: ALPHA,
     };
     // SAFETY: `texture` is a live MTLTexture. The selector is available on every supported macOS
@@ -281,7 +316,7 @@ pub(crate) fn new_red_blue_swizzled_texture_view(
     let view: *mut Object = unsafe {
         msg_send![
             texture.as_ref(),
-            newTextureViewWithPixelFormat: texture.pixel_format()
+            newTextureViewWithPixelFormat: pixel_format
             textureType: texture.texture_type()
             levels: NSRange::new(u64::from(base_mip_level), u64::from(mip_level_count))
             slices: NSRange::new(0, texture.array_length())
@@ -342,23 +377,25 @@ pub(crate) fn resident_texture_for_sample(
             NSRange::new(0, 1),
         ));
     }
-    if !guest_texture_descriptors_share_component_reordered_storage(
-        resident.descriptor,
-        sampled.guest,
-    ) {
+    if !guest_texture_descriptors_share_color_view_storage(resident.descriptor, sampled.guest) {
         return None;
     }
     let sampled_mip_level_count = sampled.mip_level_count.max(1);
     let uses_complete_hierarchy =
         sampled.base_mip_level == 0 && sampled_mip_level_count == resident.mip_level_count;
-    if uses_complete_hierarchy && resident.component_reorder_view.is_none() {
-        let view = new_red_blue_swizzled_texture_view(
+    let cached_view_matches = resident
+        .component_reorder_view
+        .as_ref()
+        .is_some_and(|view| view.pixel_format() == sampled.guest.pixel_format);
+    if uses_complete_hierarchy && !cached_view_matches {
+        let view = new_color_alias_texture_view(
             &resident.texture,
+            sampled.guest.pixel_format,
             sampled.base_mip_level,
             sampled_mip_level_count,
         )?;
         view.set_label(&format!(
-            "REMu component-reordered guest image {:#x}",
+            "REMu color-aliased guest image {:#x}",
             resident.descriptor.address
         ));
         resident.component_reorder_view = Some(view);
@@ -381,13 +418,14 @@ pub(crate) fn resident_texture_for_sample(
     if uses_complete_hierarchy {
         resident.component_reorder_view.clone()
     } else {
-        let view = new_red_blue_swizzled_texture_view(
+        let view = new_color_alias_texture_view(
             &resident.texture,
+            sampled.guest.pixel_format,
             sampled.base_mip_level,
             sampled_mip_level_count,
         )?;
         view.set_label(&format!(
-            "REMu component-reordered guest image {:#x} mips {}..{}",
+            "REMu color-aliased guest image {:#x} mips {}..{}",
             resident.descriptor.address,
             sampled.base_mip_level,
             sampled.base_mip_level + sampled_mip_level_count,
@@ -396,7 +434,7 @@ pub(crate) fn resident_texture_for_sample(
     }
 }
 
-pub(crate) fn resident_component_reordered_sample_is_eligible(
+pub(crate) fn resident_color_view_sample_is_eligible(
     resident: &ResidentGuestTexture,
     sampled: DecodedImageDescriptor,
     comparison: bool,
@@ -411,10 +449,7 @@ pub(crate) fn resident_component_reordered_sample_is_eligible(
         && sampled.texture_type == 9
         && sampled.layer_count == 1
         && underlying_mip_count.is_some_and(|count| resident.mip_level_count >= count)
-        && guest_texture_descriptors_share_component_reordered_storage(
-            resident.descriptor,
-            sampled.guest,
-        )
+        && guest_texture_descriptors_share_color_view_storage(resident.descriptor, sampled.guest)
 }
 
 pub(crate) fn resident_depth_sample_is_eligible(

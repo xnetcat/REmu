@@ -85,7 +85,15 @@ pub(super) fn video_target_binding_summary(evaluation: &ShaderEvaluation) -> Opt
         .iter()
         .filter_map(|binding| {
             let descriptor = decode_image_descriptor(&binding.resource_descriptor).ok()?;
-            (descriptor.guest.width == 378 && descriptor.guest.height == 150).then(|| {
+            let known_small_video = descriptor.guest.width == 378 && descriptor.guest.height == 150;
+            let large_linear_video = descriptor.guest.tile_mode == 0
+                && descriptor.guest.width >= 700
+                && descriptor.guest.height >= 500
+                && matches!(
+                    descriptor.guest.pixel_format,
+                    MTLPixelFormat::R8Unorm | MTLPixelFormat::RG8Unorm
+                );
+            (known_small_video || large_linear_video).then(|| {
                 format!(
                     "pc={:#x} op={:?} addr={:#x} format={:?} tile={} base_mip={} mips={} storage={}",
                     binding.pc,

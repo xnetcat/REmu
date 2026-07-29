@@ -6,11 +6,11 @@ use super::{
     CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1,
     CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, COLOR_TARGET_COUNT, DB_DEPTH_CLEAR,
     DB_DEPTH_CONTROL, DB_DEPTH_SIZE, DB_DEPTH_SIZE_XY, DB_DEPTH_SLICE, DB_DEPTH_VIEW,
-    DB_RENDER_CONTROL, DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE,
-    DB_Z_WRITE_BASE_HI, DecodedDepthTarget, DecodedRenderTarget, GuestTextureDescriptor,
-    RenderTargetFormat, decode_scanout_target, effective_linear_pitch, guest_texture_byte_count,
-    half_float_to_f32, register_value, tiled_block_dimensions, trace_target_sampling,
-    unsigned_float_to_f32,
+    DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
+    DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, DecodedDepthTarget, DecodedRenderTarget,
+    GuestTextureDescriptor, RenderTargetFormat, decode_scanout_target, effective_linear_pitch,
+    guest_texture_byte_count, half_float_to_f32, register_value, tiled_block_dimensions,
+    trace_target_sampling, unsigned_float_to_f32,
 };
 use metal::{MTLClearColor, MTLCompareFunction, MTLPixelFormat};
 use remu_gpu::{GpuRegister, IndexedDraw};
@@ -445,6 +445,64 @@ pub(crate) fn decode_render_targets(
     decode_render_targets_from_registers(&draw.context_registers, export_masks)
 }
 
+/// Decodes the source and destination surfaces named by a `CB_COLOR_CONTROL=Resolve` operation.
+///
+/// The command processor defines MRT0 as the source and MRT1 as the destination. The trigger
+/// shader normally exports only slot zero, so neither `CB_TARGET_MASK` nor the shader export mask
+/// can be used to discover MRT1.
+pub(crate) fn decode_color_resolve_targets(
+    draw: &IndexedDraw,
+) -> Result<(DecodedRenderTarget, DecodedRenderTarget), String> {
+    if draw.scanout_target.is_some() {
+        return Err("color resolve cannot target a synthetic scanout attachment".to_owned());
+    }
+    let source = decode_render_target_slot(&draw.context_registers, 0, 0xf)?;
+    let destination = decode_render_target_slot(&draw.context_registers, 1, 0xf)?;
+    if source.texture.pixel_format != destination.texture.pixel_format {
+        return Err(format!(
+            "color resolve format mismatch source={:?} destination={:?}",
+            source.texture.pixel_format, destination.texture.pixel_format
+        ));
+    }
+    if source.texture.width != destination.texture.width
+        || source.texture.height != destination.texture.height
+    {
+        return Err(format!(
+            "color resolve extent mismatch source={}x{} destination={}x{}",
+            source.texture.width,
+            source.texture.height,
+            destination.texture.width,
+            destination.texture.height
+        ));
+    }
+    if source.sample_count <= 1 || destination.sample_count != 1 {
+        return Err(format!(
+            "color resolve requires multisample MRT0 and single-sample MRT1, got source={} destination={}",
+            source.sample_count, destination.sample_count
+        ));
+    }
+    Ok((source, destination))
+}
+
+/// Decodes the MRT0 surface materialized by an `EliminateFastClear` operation.
+///
+/// Like Resolve, this command-processor operation uses a trigger draw whose shader exports and
+/// target mask do not describe the affected attachment.
+pub(crate) fn decode_color_eliminate_fast_clear_target(
+    draw: &IndexedDraw,
+) -> Result<Option<DecodedRenderTarget>, String> {
+    if draw.scanout_target.is_some() {
+        return Err(
+            "fast-clear elimination cannot target a synthetic scanout attachment".to_owned(),
+        );
+    }
+    let target = decode_render_target_slot(&draw.context_registers, 0, 0xf)?;
+    if !target.fast_clear_enabled {
+        return Ok(None);
+    }
+    Ok(Some(target))
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn decode_render_targets_from_registers(
     context_registers: &[GpuRegister],
@@ -460,23 +518,10 @@ pub(crate) fn decode_render_targets_from_registers(
         if write_mask == 0 {
             continue;
         }
-        let primary = guest_slot * CB_COLOR_REGISTER_STRIDE;
-        let required = |offset, name| {
-            register_value(context_registers, offset).ok_or_else(|| {
-                format!("color target {guest_slot} has no {name} register ({offset:#x})")
-            })
-        };
-        let base = required(CB_COLOR0_BASE + primary, "CB_COLOR_BASE")?;
-        let base_ext = required(CB_COLOR0_BASE_EXT + guest_slot, "CB_COLOR_BASE_EXT")?;
-        let view = required(CB_COLOR0_VIEW + primary, "CB_COLOR_VIEW")?;
-        let info = required(CB_COLOR0_INFO + primary, "CB_COLOR_INFO")?;
-        let attrib = required(CB_COLOR0_ATTRIB + primary, "CB_COLOR_ATTRIB")?;
-        let attrib2 = required(CB_COLOR0_ATTRIB2 + guest_slot, "CB_COLOR_ATTRIB2")?;
-        let attrib3 = required(CB_COLOR0_ATTRIB3 + guest_slot, "CB_COLOR_ATTRIB3")?;
-
-        let address = (u64::from(base_ext & 0xff) << 40) | (u64::from(base) << 8);
-        targets.push(decode_render_target_state(
-            guest_slot, address, view, info, attrib, attrib2, attrib3, write_mask,
+        targets.push(decode_render_target_slot(
+            context_registers,
+            guest_slot,
+            write_mask,
         )?);
     }
     if targets.is_empty() && target_mask != 0 {
@@ -485,6 +530,30 @@ pub(crate) fn decode_render_targets_from_registers(
         ));
     }
     Ok(targets)
+}
+
+fn decode_render_target_slot(
+    context_registers: &[GpuRegister],
+    guest_slot: u32,
+    write_mask: u32,
+) -> Result<DecodedRenderTarget, String> {
+    let primary = guest_slot * CB_COLOR_REGISTER_STRIDE;
+    let required = |offset, name| {
+        register_value(context_registers, offset).ok_or_else(|| {
+            format!("color target {guest_slot} has no {name} register ({offset:#x})")
+        })
+    };
+    let base = required(CB_COLOR0_BASE + primary, "CB_COLOR_BASE")?;
+    let base_ext = required(CB_COLOR0_BASE_EXT + guest_slot, "CB_COLOR_BASE_EXT")?;
+    let view = required(CB_COLOR0_VIEW + primary, "CB_COLOR_VIEW")?;
+    let info = required(CB_COLOR0_INFO + primary, "CB_COLOR_INFO")?;
+    let attrib = required(CB_COLOR0_ATTRIB + primary, "CB_COLOR_ATTRIB")?;
+    let attrib2 = required(CB_COLOR0_ATTRIB2 + guest_slot, "CB_COLOR_ATTRIB2")?;
+    let attrib3 = required(CB_COLOR0_ATTRIB3 + guest_slot, "CB_COLOR_ATTRIB3")?;
+    let address = (u64::from(base_ext & 0xff) << 40) | (u64::from(base) << 8);
+    decode_render_target_state(
+        guest_slot, address, view, info, attrib, attrib2, attrib3, write_mask,
+    )
 }
 
 pub(crate) fn decode_depth_target(
@@ -505,6 +574,13 @@ pub(crate) fn decode_depth_target(
             .ok_or_else(|| format!("active depth target is missing {name}"))
     };
     let z_info = required(DB_Z_INFO, "DB_Z_INFO")?;
+    let htile_address = (z_info & (1 << 29) != 0)
+        .then(|| {
+            u64::from(
+                register_value(&draw.context_registers, DB_HTILE_DATA_BASE).unwrap_or_default(),
+            ) << 8
+        })
+        .filter(|address| *address != 0);
     let size = required(DB_DEPTH_SIZE_XY, "DB_DEPTH_SIZE_XY")?;
     let format = match z_info & 0x3 {
         // The AGC register defaults leave the high metadata bit set while the format is zero.
@@ -669,6 +745,7 @@ pub(crate) fn decode_depth_target(
     }
     Ok(Some(DecodedDepthTarget {
         texture,
+        htile_address,
         compare,
         test_enabled: depth_enabled,
         write_enabled,
@@ -690,12 +767,15 @@ pub(crate) fn initial_depth_clear_value(compare: MTLCompareFunction) -> f64 {
 }
 
 pub(crate) fn initial_depth_clear_for_target(depth: DecodedDepthTarget) -> f64 {
-    if depth.clear_enabled || !depth.test_enabled || depth.write_enabled {
+    if depth.clear_enabled {
         depth.clear_depth
     } else {
-        // If a depth surface is first encountered as read-only, its guest clear register can be
-        // stale state from another target. Pick the comparison-neutral far value so first use
-        // cannot discard the whole scene. This is also SharpEmu's proven Silent Hill behavior.
+        // DB_DEPTH_CLEAR is only consumed by an explicit DB_RENDER_CONTROL clear. On implicit
+        // first use (including a write-enabled MSAA pass), that register may still describe a
+        // different target. Materialize missing HTILE state with the comparison-neutral far
+        // value so the first geometry can populate the surface instead of being rejected by a
+        // stale clear. shadPS4 likewise distinguishes explicit depth clears from metadata-backed
+        // first use rather than applying DB_DEPTH_CLEAR to every writable attachment.
         initial_depth_clear_value(depth.compare)
     }
 }

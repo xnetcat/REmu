@@ -165,7 +165,7 @@ pub(crate) use av_player::{
     AV_PLAYER_ERROR_INVALID_PARAMS, AV_PLAYER_ERROR_OPERATION_FAILED, AV_PLAYER_STREAM_TYPE_AUDIO,
     AV_PLAYER_STREAM_TYPE_VIDEO, av_player_resolve_source, av_player_tool,
     av_player_video_catch_up_target, av_player_video_frame_is_due, av_player_write_stream_info,
-    av_player_write_video_frame_info,
+    av_player_write_stream_info_ex, av_player_write_video_frame_info,
 };
 pub(crate) use av_player::{
     av_player_add_source, av_player_add_source_ex, av_player_change_stream, av_player_close,
@@ -492,6 +492,10 @@ struct AvPlayerInstance {
     frames_per_second: f64,
     duration: Duration,
     has_audio: bool,
+    /// Whether the source still belongs to an active playback session. Native AvPlayer reports a
+    /// newly-added source as active while it is Ready, before Start establishes the media clock.
+    /// This must therefore remain distinct from `playing_since` and `paused`.
+    active_session: bool,
     paused: bool,
     end_of_stream: bool,
     playing_since: Option<Instant>,
@@ -3392,8 +3396,8 @@ fn dispatch_probe_import(
         "Wnp1OVcrZgk" => av_player_get_audio_data(arguments, state),
         "o3+RWnHViSg" => av_player_get_video_data(arguments, false, state),
         "JdksQu8pNdQ" => av_player_get_video_data(arguments, true, state),
-        "d8FcbzfAdQw" => av_player_get_stream_info(arguments, state),
-        "ctTAcF5DiKQ" => av_player_get_stream_info(arguments, state),
+        "d8FcbzfAdQw" => av_player_get_stream_info(arguments, false, state),
+        "ctTAcF5DiKQ" => av_player_get_stream_info(arguments, true, state),
         "ODJK2sn9w4A" | "k-q+xOxdc3E" => av_player_validate_handle(arguments[0], state),
         "hdTyRzCXQeQ" => av_player_stream_count(arguments[0], state),
         "gEpBkcwxUjw" => ampr_resolve_file_paths(arguments, state),

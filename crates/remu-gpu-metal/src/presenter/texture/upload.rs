@@ -15,7 +15,7 @@ use super::{
     guest_texture_descriptors_share_storage, is_storage_image_opcode, is_writable_image_opcode,
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
     refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
-    resident_component_reordered_sample_is_eligible, resident_depth_sample_is_eligible,
+    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
     sampled_texture_key, sampled_texture_uses_exact_mode5_mips,
     sampled_texture_uses_exact_mode27_mips, sampler_uses_normalized_coordinates,
@@ -279,7 +279,7 @@ pub(crate) fn upload_image_textures(
                                                 && (guest_texture_descriptors_share_storage(
                                                     resident.descriptor,
                                                     descriptor.guest,
-                                                ) || resident_component_reordered_sample_is_eligible(
+                                                ) || resident_color_view_sample_is_eligible(
                                                     resident,
                                                     descriptor,
                                                     comparison,
@@ -451,7 +451,15 @@ pub(crate) fn upload_image_textures(
                     texture
                 }
             } else if storage && descriptor.texture_type == 9 {
-                if storage_image_requires_mip_hierarchy(binding, descriptor) {
+                // `ensure_resident_texture` may have selected a GPU-current resident through a
+                // coherent guest alias rather than the descriptor's exact virtual address. Do
+                // not discard that selection and reconstruct an exact-key texture from guest
+                // RAM: render-target and earlier storage writes intentionally remain resident
+                // until an alias really requires a CPU-visible writeback. Metal encoder order
+                // supplies the attachment/storage dependency for this same texture.
+                if let Some(texture) = render_resolve {
+                    texture
+                } else if storage_image_requires_mip_hierarchy(binding, descriptor) {
                     ensure_mipmapped_resident_texture_in_map(
                         device,
                         descriptor,

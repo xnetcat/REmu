@@ -433,7 +433,7 @@ impl Compiler<'_> {
                 }
                 if contains_register_reference(&self.body, 'v', 5) {
                     source.push_str(
-                        "    v[5] = remu_thread_index < remu_mesh_vertex_count ? remu_indices[remu_mesh_vertex_base + remu_thread_index] : 0u;\n",
+                        "    v[5] = remu_thread_index < remu_mesh_vertex_count ? remu_indices[remu_mesh_vertex_base + remu_thread_index] + remu_draw[2] : 0u;\n",
                     );
                 }
                 if contains_register_reference(&self.body, 'v', 8) {

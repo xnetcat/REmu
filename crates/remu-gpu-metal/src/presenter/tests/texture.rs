@@ -2,26 +2,169 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{
-    CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLResourceOptions,
-    MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor,
-    TextureDescriptor,
+    CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLRegion,
+    MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
+    RenderPassDescriptor, TextureDescriptor,
 };
 use remu_memory::CpuWriteWatchRetirement;
-use remu_shader::{ImageBinding, ImageControl, Opcode};
+use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
 
 use super::{
-    DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, WriteWatchRefresh,
-    apply_image_destination_select, comparison_depth32_upload, create_sampled_guest_texture,
-    decode_image_descriptor, depth_array_face_descriptor, depth_array_face_set_is_complete,
-    fallback_image_descriptor, guest_shared_mapping_identity, guest_texture_byte_count,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_component_reordered_storage,
+    DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter,
+    WriteWatchRefresh, apply_image_destination_select, comparison_depth32_upload,
+    create_sampled_guest_texture, decode_image_descriptor, depth_array_face_descriptor,
+    depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
+    guest_texture_byte_count, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_color_view_storage,
+    guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_storage, guest_texture_raw_matches,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
-    mode27_mip_chain_layout, new_red_blue_swizzled_texture_view, render_resolve_candidate_matches,
-    sampled_alias_descriptor, sampled_texture_cache_needs_reload, snapshot_guest_texture_raw,
-    snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy, watch_guest_texture,
+    mode27_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
+    render_resolve_candidate_matches, sampled_alias_descriptor, sampled_texture_cache_needs_reload,
+    snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
+    storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
     write_watched_guest_texture_linear,
 };
+
+#[test]
+fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let first = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("first coherent alias");
+    let second = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("second coherent alias");
+    let rendered = GuestTextureDescriptor {
+        address: first.get(),
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::BGRA8Unorm_sRGB,
+        bytes_per_pixel: 4,
+    };
+    let storage_alias = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        address: second.get(),
+        ..rendered
+    };
+    assert!(guest_texture_descriptors_share_color_view_storage(
+        rendered,
+        storage_alias
+    ));
+    assert!(!guest_texture_descriptors_share_storage(
+        rendered,
+        storage_alias
+    ));
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    let _gpu_current = presenter
+        .ensure_resident_texture(&device, rendered)
+        .expect("render target resident");
+    presenter.mark_resident_texture_written(rendered);
+
+    let address_words = storage_alias.address >> 8;
+    let width_minus_one = storage_alias.width - 1;
+    let height_minus_one = storage_alias.height - 1;
+    let resource_descriptor = vec![
+        address_words as u32,
+        ((address_words >> 32) as u32 & 0xff) | 0x0380_0000 | ((width_minus_one & 3) << 30),
+        (width_minus_one >> 2) | (height_minus_one << 14),
+        0x9000_0f2e,
+        storage_alias.pitch - 1,
+        0,
+        0,
+        0,
+    ];
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            pc: 0x60,
+            opcode: Opcode::Known("ImageLoad"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 12,
+                scalar_sampler: 0,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+            },
+            resource_descriptor: resource_descriptor.into(),
+            sampler_descriptor: Vec::new().into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let uploaded = upload_image_textures(
+        &device,
+        &queue,
+        &evaluation,
+        &mut presenter.resident_guest_textures,
+        &presenter.depth_array_textures,
+        &presenter.multisample_textures,
+        &mut presenter.sampled_texture_cache,
+        &mut presenter.sampled_texture_write_watches,
+        &mut presenter.fallback_texture_cache,
+        &mut presenter.sampled_texture_admission_order,
+        &mut presenter.next_sampled_texture_admission_id,
+    )
+    .expect("storage alias upload");
+
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(
+        uploaded[0].texture.pixel_format(),
+        MTLPixelFormat::RGBA8Unorm,
+        "the alias view must expose the storage descriptor's typed format"
+    );
+    assert!(
+        uploaded[0].texture.parent_texture().is_some(),
+        "the storage load must retain a view of the GPU-current render target"
+    );
+    assert!(
+        !presenter
+            .resident_guest_textures
+            .contains_key(&storage_alias),
+        "binding a coherent alias must not materialize stale guest memory under an exact key"
+    );
+}
 
 #[test]
 fn layered_depth_sample_faces_resolve_to_per_face_depth_targets() {
@@ -1110,6 +1253,103 @@ fn rgba_and_bgra_descriptors_can_share_component_reordered_storage() {
 }
 
 #[test]
+fn rgba_bgra_and_transfer_variants_can_share_typed_color_view_storage() {
+    let bgra_srgb = GuestTextureDescriptor {
+        address: 0x8006_b7b00,
+        width: 3_840,
+        height: 2_160,
+        pitch: 3_840,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::BGRA8Unorm_sRGB,
+        bytes_per_pixel: 4,
+    };
+    let rgba_linear = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        ..bgra_srgb
+    };
+    let rgba_srgb = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::RGBA8Unorm_sRGB,
+        ..bgra_srgb
+    };
+    let bgra_linear = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        ..bgra_srgb
+    };
+    assert!(guest_texture_descriptors_share_color_view_storage(
+        bgra_srgb,
+        rgba_linear,
+    ));
+    assert!(guest_texture_descriptors_share_color_view_storage(
+        bgra_srgb, rgba_srgb,
+    ));
+    assert!(guest_texture_descriptors_share_color_view_storage(
+        bgra_srgb,
+        bgra_linear,
+    ));
+}
+
+#[test]
+fn typed_color_alias_view_preserves_guest_byte_order_and_transfer_semantics() {
+    let device = Device::system_default().expect("Metal device");
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm_sRGB);
+    descriptor.set_width(1);
+    descriptor.set_height(1);
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView);
+    let texture = device.new_texture(&descriptor);
+    let raw_bgra = [30_u8, 20, 10, 40];
+    texture.replace_region(
+        MTLRegion::new_2d(0, 0, 1, 1),
+        0,
+        raw_bgra.as_ptr().cast::<std::ffi::c_void>(),
+        4,
+    );
+    let view = new_color_alias_texture_view(&texture, MTLPixelFormat::RGBA8Unorm, 0, 1)
+        .expect("linear RGBA alias view");
+    assert_eq!(view.pixel_format(), MTLPixelFormat::RGBA8Unorm);
+
+    let source = r"
+#include <metal_stdlib>
+using namespace metal;
+kernel void read_alias(
+    texture2d<float, access::read> input [[texture(0)]],
+    device float4* output [[buffer(0)]])
+{
+    output[0] = input.read(uint2(0));
+}
+";
+    let library = device
+        .new_library_with_source(source, &CompileOptions::new())
+        .expect("typed alias test MSL compiles");
+    let function = library
+        .get_function("read_alias", None)
+        .expect("typed alias test function exists");
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("typed alias test pipeline compiles");
+    let queue = device.new_command_queue();
+    let output = device.new_buffer(16, MTLResourceOptions::StorageModeShared);
+    let command = queue.new_command_buffer().to_owned();
+    let compute = command.new_compute_command_encoder();
+    compute.set_compute_pipeline_state(&pipeline);
+    compute.set_texture(0, Some(&view));
+    compute.set_buffer(0, Some(&output), 0);
+    compute.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+    compute.end_encoding();
+    command.commit();
+    command.wait_until_completed();
+
+    // The RGBA-linear view must expose the underlying guest bytes directly: there is neither an
+    // sRGB decode nor an extra red/blue swap after the pixel-format reinterpretation.
+    let sampled = unsafe { std::slice::from_raw_parts(output.contents().cast::<f32>(), 4) };
+    for (actual, expected) in sampled.iter().copied().zip(raw_bgra.map(f32::from)) {
+        assert!((actual - expected / 255.0).abs() <= 1.0 / 255.0);
+    }
+}
+
+#[test]
 fn metal_accepts_a_same_format_red_blue_swizzled_view_without_pixel_format_view_usage() {
     let device = Device::system_default().expect("Metal device");
     let queue = device.new_command_queue();
@@ -1356,6 +1596,12 @@ fn shared_backing_aliases_reuse_identical_metal_storage() {
 
     assert!(guest_texture_descriptors_overlap(first, second));
     assert!(guest_texture_descriptors_share_storage(first, second));
+    let overlap = GuestTextureOverlapQuery::new(first);
+    assert!(overlap.overlaps(second));
+    assert!(!overlap.overlaps(GuestTextureDescriptor {
+        address: second.address + GUEST_PAGE_SIZE,
+        ..second
+    }));
 }
 
 #[test]

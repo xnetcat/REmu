@@ -24,7 +24,7 @@ pub(crate) use self::image::{
 pub(crate) use self::pipeline::{
     ColorOperationMode, decode_color_operation_mode, decode_metal_blend_attachment,
     decode_raster_state, graphics_pipeline_key, metal_color_write_mask,
-    metal_nonindexed_vertex_count, metal_primitive_type,
+    metal_nonindexed_vertex_count, metal_primitive_type, prepare_indexed_primitive,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{graphics_shader_resource_key, metal_primitive_topology_class};
@@ -35,7 +35,8 @@ pub(crate) use self::scanout::{
 };
 pub(crate) use self::scanout::{decode_scanout_target, raw_video_out_texture_descriptor};
 pub(crate) use self::targets::{
-    common_render_target_array_length, decode_depth_target, decode_render_target_format,
+    common_render_target_array_length, decode_color_eliminate_fast_clear_target,
+    decode_color_resolve_targets, decode_depth_target, decode_render_target_format,
     decode_render_target_state, decode_render_targets, initial_depth_clear_for_target,
     initial_render_target_clear_color, render_target_fast_clear_color,
 };
@@ -63,6 +64,8 @@ pub(super) const CB_COLOR_CONTROL: u32 = 0x202;
 pub(super) const DEFAULT_CB_COLOR_CONTROL: u32 = 0x00cc_0010;
 
 pub(super) const PA_SU_SC_MODE_CNTL: u32 = 0x205;
+
+pub(super) const PA_CL_VS_OUT_CNTL: u32 = 0x207;
 
 pub(super) const CB_COLOR0_BASE: u32 = 0x318;
 
@@ -97,6 +100,8 @@ pub(super) const COLOR_TARGET_COUNT: u32 = 8;
 pub(super) const DB_RENDER_CONTROL: u32 = 0x000;
 
 pub(super) const DB_DEPTH_VIEW: u32 = 0x002;
+
+pub(super) const DB_HTILE_DATA_BASE: u32 = 0x005;
 
 pub(super) const DB_DEPTH_SIZE_XY: u32 = 0x007;
 
@@ -277,20 +282,6 @@ pub(super) fn decode_viewport(
         znear: f64::from(minimum_depth),
         zfar: f64::from(maximum_depth),
     }
-}
-
-pub(super) fn programmed_viewport_has_negative_height(draw: &IndexedDraw) -> bool {
-    let programmed = [0x10f, 0x110, 0x111, 0x112]
-        .map(|register| register_value(&draw.context_registers, register).map(f32::from_bits));
-    matches!(
-        programmed,
-        [Some(x_scale), Some(x_offset), Some(y_scale), Some(y_offset)]
-            if [x_scale, x_offset, y_scale, y_offset]
-                .into_iter()
-                .all(f32::is_finite)
-                && x_scale > 0.0
-                && y_scale < 0.0
-    )
 }
 
 pub(super) fn register_value(registers: &[GpuRegister], offset: u32) -> Option<u32> {

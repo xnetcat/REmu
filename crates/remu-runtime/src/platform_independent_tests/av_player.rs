@@ -139,7 +139,44 @@ fn av_player_initialization_accepts_the_gen5_layout_and_owns_handles() {
 }
 
 #[test]
-fn av_player_gen5_stream_info_is_zero_based_and_exactly_32_bytes() {
+fn av_player_source_is_active_while_ready_before_start_and_inactive_after_stop() {
+    let Some(root) = av_player_generate_test_clip("ready-active") else {
+        return;
+    };
+    let mut state = ProbeDispatchState::default();
+    state.game_root = root.clone();
+    let handle = av_player_test_player(&mut state);
+    let source = b"/app0/media/clip.mp4\0";
+    assert_eq!(
+        crate::av_player_add_source(
+            [handle, source.as_ptr().addr() as u64, 0, 0, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        crate::av_player_is_active(handle, &state),
+        1,
+        "a source in the native Ready state is active before Start"
+    );
+    assert!(
+        state.av_player.players[&handle].playing_since.is_none(),
+        "Ready activity must not start the media clock"
+    );
+
+    assert_eq!(crate::av_player_start(handle, &mut state), 0);
+    assert_eq!(crate::av_player_stop(handle, &mut state), 0);
+    assert_eq!(
+        crate::av_player_is_active(handle, &state),
+        0,
+        "Stop ends the active session even though the source remains attached"
+    );
+    assert_eq!(crate::av_player_close(handle, &mut state), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn av_player_gen5_stream_info_is_one_based_and_exactly_32_bytes() {
     let mut stream_info = [0xab_u8; 40];
     crate::av_player_write_stream_info(
         stream_info.as_mut_ptr().addr() as u64,
@@ -153,6 +190,7 @@ fn av_player_gen5_stream_info_is_zero_based_and_exactly_32_bytes() {
         u32::from_ne_bytes(stream_info[0..4].try_into().unwrap()),
         crate::AV_PLAYER_STREAM_TYPE_VIDEO
     );
+    assert_eq!(crate::AV_PLAYER_STREAM_TYPE_VIDEO, 1);
     assert_eq!(
         u32::from_ne_bytes(stream_info[8..12].try_into().unwrap()),
         384
@@ -178,6 +216,47 @@ fn av_player_gen5_stream_info_is_zero_based_and_exactly_32_bytes() {
         u32::from_ne_bytes(stream_info[0..4].try_into().unwrap()),
         crate::AV_PLAYER_STREAM_TYPE_AUDIO
     );
+    assert_eq!(crate::AV_PLAYER_STREAM_TYPE_AUDIO, 2);
+}
+
+#[test]
+fn av_player_gen5_extended_stream_info_preserves_size_and_reports_frame_rate() {
+    let mut stream_info = [0xab_u8; 112];
+    stream_info[..8].copy_from_slice(&104_u64.to_ne_bytes());
+    crate::av_player_write_stream_info_ex(
+        stream_info.as_mut_ptr().addr() as u64,
+        0,
+        1_440,
+        1_080,
+        60.0,
+        std::time::Duration::from_millis(43_166),
+    );
+
+    assert_eq!(
+        u64::from_ne_bytes(stream_info[0..8].try_into().unwrap()),
+        104
+    );
+    assert_eq!(
+        u32::from_ne_bytes(stream_info[8..12].try_into().unwrap()),
+        crate::AV_PLAYER_STREAM_TYPE_VIDEO
+    );
+    assert_eq!(
+        u32::from_ne_bytes(stream_info[16..20].try_into().unwrap()),
+        1_440
+    );
+    assert_eq!(
+        u32::from_ne_bytes(stream_info[20..24].try_into().unwrap()),
+        1_080
+    );
+    assert_eq!(
+        f64::from_ne_bytes(stream_info[64..72].try_into().unwrap()),
+        60.0
+    );
+    assert_eq!(
+        u64::from_ne_bytes(stream_info[96..104].try_into().unwrap()),
+        43_166
+    );
+    assert_eq!(&stream_info[104..], &[0xab; 8]);
 }
 
 #[test]
@@ -286,7 +365,8 @@ fn av_player_generate_test_clip(name: &str) -> Option<std::path::PathBuf> {
         eprintln!("[REMu][TEST-SKIP] {name}: ffmpeg/ffprobe unavailable, media test skipped");
         return None;
     };
-    let root = std::env::temp_dir().join(format!("remu-avplayer-clip-{}", std::process::id()));
+    let root =
+        std::env::temp_dir().join(format!("remu-avplayer-clip-{}-{name}", std::process::id()));
     std::fs::create_dir_all(root.join("media")).ok()?;
     let clip = root.join("media/clip.mp4");
     if !clip.is_file() {

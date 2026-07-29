@@ -6,6 +6,7 @@
 
 use remu_shader::{ExportControl, Instruction, InstructionControl, PixelOutputKind};
 
+use crate::compiler::interface::vertex_clip_distance_mask;
 use crate::compiler::vector::{destination_vector, vector_operand};
 use crate::{Compiler, MetalShaderStage};
 
@@ -60,6 +61,9 @@ impl Compiler<'_> {
         instruction: &Instruction,
         export: &ExportControl,
     ) -> Result<(), String> {
+        if (13..=15).contains(&export.target) {
+            return self.emit_vertex_distance_export(instruction, export);
+        }
         let field = if export.target == 12 {
             "position".to_owned()
         } else if (32..64).contains(&export.target)
@@ -77,6 +81,51 @@ impl Compiler<'_> {
                 values[0], values[1], values[2], values[3]
             ),
         );
+        Ok(())
+    }
+
+    fn emit_vertex_distance_export(
+        &mut self,
+        instruction: &Instruction,
+        export: &ExportControl,
+    ) -> Result<(), String> {
+        let control = self.options.vertex_output_control;
+        let mut packed_target = 13_u32;
+        // POS1..3 contain only enabled vectors. A miscellaneous output therefore shifts both
+        // clip/cull vectors by one even when REmu does not consume the misc components itself.
+        if control & (1 << 21) != 0 {
+            if export.target == packed_target {
+                return Ok(());
+            }
+            packed_target += 1;
+        }
+        let distance_base = if control & (1 << 22) != 0 {
+            if export.target == packed_target {
+                Some(0_usize)
+            } else {
+                packed_target += 1;
+                None
+            }
+        } else {
+            None
+        }
+        .or_else(|| {
+            (control & (1 << 23) != 0 && export.target == packed_target).then_some(4_usize)
+        });
+        let Some(distance_base) = distance_base else {
+            return Ok(());
+        };
+        let distance_mask = vertex_clip_distance_mask(control);
+        let values = self.export_float_values(instruction, export)?;
+        for (component, value) in values.iter().enumerate() {
+            let distance = distance_base + component;
+            if export.enable_mask & (1 << component) != 0 && distance_mask & (1 << distance) != 0 {
+                self.line(
+                    3,
+                    &format!("if (exec) remu_out.clip_distances[{distance}] = {value};"),
+                );
+            }
+        }
         Ok(())
     }
 

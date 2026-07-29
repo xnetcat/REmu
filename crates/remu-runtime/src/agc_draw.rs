@@ -327,12 +327,13 @@ fn agc_trace_draw_summary(draw: &remu_gpu::IndexedDraw) {
                 .map(|register| register.value)
         });
         eprintln!(
-            "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x} scanout={:#x} target_mask={:#x} viewport={viewport:x?} es_user_base={export_user_data_base:#x} es_user={export_user_data:x?} ps_user={pixel_user_data:x?}",
+            "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} base_vertex={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x} scanout={:#x} target_mask={:#x} viewport={viewport:x?} es_user_base={export_user_data_base:#x} es_user={export_user_data:x?} ps_user={pixel_user_data:x?}",
             draw.sequence,
             draw.indexed,
             draw.index_count,
             draw.instance_count,
             draw.index_offset,
+            draw.base_vertex,
             draw.index_buffer_address,
             draw.index_buffer_count,
             draw.index_resource_address,
@@ -422,6 +423,11 @@ pub(crate) fn agc_emit_draw(
         index_buffer_count: graphics.index_buffer_count,
         index_size: graphics.index_size,
         index_offset: element_offset,
+        base_vertex: graphics
+            .context_registers
+            .get(&0x102)
+            .copied()
+            .unwrap_or_default() as i32,
         index_count: element_count,
         index_snapshot: None,
         draw_flags,

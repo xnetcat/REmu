@@ -5,6 +5,47 @@
 //! modes, built-in rectangle shaders and compute system register state.
 
 use super::*;
+use remu_shader::ExportControl;
+
+#[test]
+fn maps_packed_secondary_position_exports_to_metal_clip_distances() {
+    let export = |pc, target| Instruction {
+        pc,
+        encoding: ShaderEncoding::Exp,
+        opcode: Opcode::Known("Exp"),
+        words: vec![0, 0],
+        sources: (0..4).map(Operand::vector).collect(),
+        destinations: Vec::new(),
+        control: Some(InstructionControl::Export(ExportControl {
+            target,
+            enable_mask: 0x0f,
+            compressed: false,
+            done: target == 14,
+            valid_mask: false,
+        })),
+    };
+    let program = Program::new(0x1000, vec![export(0, 13), export(8, 14)]);
+    let mut options = MetalCompileOptions::vertex(0);
+    // Misc occupies POS1; clip/cull-distance vector 0 is therefore packed into POS2. Enable clip
+    // distance 0 and cull distance 2. Metal has no cull-distance output, so only the true clip
+    // distance is emitted.
+    options.vertex_output_control = (1 << 21) | (1 << 22) | (1 << 0) | (1 << (8 + 2));
+    let shader =
+        compile_msl(&program, &empty_evaluation(), &options).expect("clip exports should lower");
+
+    assert!(
+        shader
+            .source
+            .contains("float clip_distances [[clip_distance]] [8];")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_out.clip_distances[0] = as_type<float>(remu_v_0);")
+    );
+    assert!(!shader.source.contains("remu_out.clip_distances[2] ="));
+    assert!(!shader.source.contains("remu_out.clip_distances[1] ="));
+}
 
 #[test]
 fn emits_instance_routing_for_layered_render_targets() {

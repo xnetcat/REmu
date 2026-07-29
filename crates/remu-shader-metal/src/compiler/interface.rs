@@ -12,6 +12,20 @@ use remu_shader::PixelOutputKind;
 use crate::Compiler;
 use crate::compiler::module::contains_register_reference;
 
+pub(crate) const fn vertex_clip_distance_mask(control: u32) -> u32 {
+    let low = if control & (1 << 22) != 0 {
+        control & 0x0f
+    } else {
+        0
+    };
+    let high = if control & (1 << 23) != 0 {
+        control & 0xf0
+    } else {
+        0
+    };
+    low | high
+}
+
 impl Compiler<'_> {
     pub(crate) fn emit_compute_system_registers(&self, source: &mut String) {
         let Some(registers) = self.evaluation.compute_system_registers else {
@@ -74,6 +88,12 @@ impl Compiler<'_> {
             source.push_str("};\n\n");
         }
         source.push_str("struct RemuVsOut {\n    float4 position [[position]];\n");
+        if vertex_clip_distance_mask(self.options.vertex_output_control) != 0 {
+            // Metal has no cull-distance vertex output. Preserve native clip-distance semantics
+            // here; treating cull distances as clip distances would incorrectly reject a
+            // primitive when only one of its vertices is outside the cull plane.
+            source.push_str("    float clip_distances [[clip_distance]] [8];\n");
+        }
         if self.options.render_target_array_length > 1 {
             source.push_str("    uint render_target_array_index [[render_target_array_index]];\n");
         }

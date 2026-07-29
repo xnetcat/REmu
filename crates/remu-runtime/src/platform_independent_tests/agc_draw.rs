@@ -13,10 +13,42 @@ use super::{
     GPU_EVENT_SINK_TEST, ProbeDispatchState, VideoOutBufferAttributes, VideoOutState,
     agc_apply_set_base, agc_color_target_state, agc_dcb_draw_index_auto, agc_dcb_set_index_buffer,
     agc_dcb_set_num_instances, agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4,
-    compute_graphics_state, low_u32, read_guest_u64, targetless_barrier_acquire_flip_commands,
-    targetless_scanout_test_draw, targetless_scanout_test_shader_state,
-    targetless_scanout_test_video, write_guest_u32, write_guest_u64,
+    compute_graphics_state, draw_required_vertex_record_count, low_u32, read_guest_u64,
+    targetless_barrier_acquire_flip_commands, targetless_scanout_test_draw,
+    targetless_scanout_test_shader_state, targetless_scanout_test_video, write_guest_u32,
+    write_guest_u64,
 };
+
+#[test]
+fn base_vertex_expands_the_required_indexed_vertex_resource_range() {
+    let mut draw = targetless_scanout_test_draw();
+    draw.indexed = true;
+    draw.index_snapshot = Some(vec![3, 7, 5].into());
+    draw.base_vertex = 11;
+    assert_eq!(draw_required_vertex_record_count(&draw), Some(19));
+
+    draw.base_vertex = -3;
+    assert_eq!(draw_required_vertex_record_count(&draw), Some(5));
+}
+
+#[test]
+fn primitive_restart_does_not_expand_the_required_vertex_resource_range() {
+    let mut draw = targetless_scanout_test_draw();
+    draw.indexed = true;
+    draw.index_size = 0;
+    draw.index_snapshot = Some(vec![3, u32::from(u16::MAX), 7].into());
+    draw.context_registers = vec![
+        remu_gpu::GpuRegister {
+            offset: 0x103,
+            value: u32::MAX,
+        },
+        remu_gpu::GpuRegister {
+            offset: 0x2a5,
+            value: 1,
+        },
+    ];
+    assert_eq!(draw_required_vertex_record_count(&draw), Some(8));
+}
 
 #[test]
 fn distinguishes_absent_disabled_programmed_and_malformed_color_target_state() {
@@ -207,6 +239,7 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
     assert_eq!(draw.index_resource_address, index_resource);
     assert_eq!(draw.index_buffer_count, 6);
     assert_eq!(draw.index_offset, 0);
+    assert_eq!(draw.base_vertex, 0);
     assert_eq!(draw.index_count, 6);
     indices.fill(u16::MAX);
     assert_eq!(

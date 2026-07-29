@@ -90,6 +90,11 @@ pub struct IndexedDraw {
     pub index_buffer_count: u32,
     pub index_size: u32,
     pub index_offset: u32,
+    /// Signed GFX10 `INDEX_OFFSET` added to each indexed vertex ID (Metal `baseVertex`).
+    ///
+    /// This is independent of `index_offset`, which selects the first element in the index
+    /// buffer for `DRAW_INDEX_OFFSET_2`.
+    pub base_vertex: i32,
     pub index_count: u32,
     /// Immutable indices captured while the guest submission still owns its transient ring data.
     /// The presenter can lag command decoding during shader compilation, so retaining only the

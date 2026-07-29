@@ -7,6 +7,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_QUEUED_AUDIO_SECONDS: usize = 2;
+// Sixteen 256-frame AudioOut2 grains cover an 85 ms guest scheduling stall at 48 kHz. Superliminal
+// can spend a complete 60-70 ms frame submitting graphics work, so a shorter buffer repeatedly
+// drained even though the guest sustained the correct average sample rate. Starting from the first
+// grain also made a 512-frame CoreAudio callback consume half real audio and half silence; the
+// resulting discontinuities were heard as crackling.
+// Thirty-two 256-frame grains cover roughly 170 ms at 48 kHz, enough to ride
+// through the 80-100 ms render stalls seen while Gen5 pipelines compile.
+const AUDIO_PREBUFFER_FRAMES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AudioOutError {
@@ -116,7 +124,6 @@ impl AudioMixer {
             return false;
         };
         queue.frames.extend(frames);
-        queue.started = true;
         true
     }
 
@@ -125,7 +132,23 @@ impl AudioMixer {
             output.fill(0.0);
             return;
         }
-        let has_started_port = self.queues.values().any(|queue| queue.started);
+        let requested_frames = output.len() / channels;
+        let mut starved_port = false;
+        for queue in self.queues.values_mut() {
+            if queue.started && queue.frames.len() < requested_frames {
+                // Do not consume a partial callback. Rebuffering produces a short clean silence
+                // instead of a sharp audio-to-zero edge in the middle of CoreAudio's buffer.
+                queue.started = false;
+                starved_port = true;
+            }
+            if !queue.started && queue.frames.len() >= AUDIO_PREBUFFER_FRAMES {
+                queue.started = true;
+            }
+        }
+        let has_audio_port = self
+            .queues
+            .values()
+            .any(|queue| queue.started || !queue.frames.is_empty());
         let mut output_frames = 0_u64;
         let mut underrun_frames = 0_u64;
         for frame in output.chunks_mut(channels) {
@@ -140,7 +163,7 @@ impl AudioMixer {
                     missing_port_sample = true;
                 }
             }
-            if has_started_port && missing_port_sample {
+            if starved_port || missing_port_sample {
                 underrun_frames = underrun_frames.saturating_add(1);
             }
             frame.fill(0.0);
@@ -151,7 +174,7 @@ impl AudioMixer {
                 frame[1] = mixed[1].clamp(-1.0, 1.0);
             }
         }
-        if has_started_port {
+        if has_audio_port {
             remu_gpu::report_audio_frames(output_frames, underrun_frames);
         }
     }
@@ -591,8 +614,8 @@ const fn low_i32(value: u64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioFormat, AudioOutState, AudioPort, SampleEncoding, StreamingStereoResampler,
-        decode_stereo_frames,
+        AUDIO_PREBUFFER_FRAMES, AudioFormat, AudioMixer, AudioOutState, AudioPort, SampleEncoding,
+        StreamingStereoResampler, decode_stereo_frames,
     };
     use std::collections::BTreeMap;
 
@@ -701,5 +724,40 @@ mod tests {
             .expect("the AudioOut2 port owns a live backend port");
 
         assert_eq!(state.ports.get(&1).unwrap().channel_volume, gains);
+    }
+
+    #[test]
+    fn mixer_prebuffers_and_rebuffers_without_consuming_partial_callbacks() {
+        let mut mixer = AudioMixer::default();
+        mixer.add_port(1);
+        assert!(mixer.push(
+            1,
+            std::iter::repeat_n([0.25, -0.25], AUDIO_PREBUFFER_FRAMES / 2)
+        ));
+        let mut output = vec![1.0_f32; 256 * 2];
+        mixer.write_interleaved(&mut output, 2);
+        assert_eq!(output, vec![0.0; 256 * 2]);
+        assert_eq!(
+            mixer.queues[&1].frames.len(),
+            AUDIO_PREBUFFER_FRAMES / 2,
+            "startup silence must retain the partial prebuffer"
+        );
+
+        assert!(mixer.push(
+            1,
+            std::iter::repeat_n([0.25, -0.25], AUDIO_PREBUFFER_FRAMES / 2)
+        ));
+        mixer.write_interleaved(&mut output, 2);
+        assert!(output.chunks_exact(2).all(|frame| frame == [0.25, -0.25]));
+
+        let queued = mixer.queues[&1].frames.len();
+        let mut oversized_callback = vec![1.0_f32; (queued + 1) * 2];
+        mixer.write_interleaved(&mut oversized_callback, 2);
+        assert_eq!(oversized_callback, vec![0.0; (queued + 1) * 2]);
+        assert_eq!(
+            mixer.queues[&1].frames.len(),
+            queued,
+            "an underrun must rebuffer instead of emitting a partial callback"
+        );
     }
 }

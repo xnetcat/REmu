@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedSampledTexture, GuestTextureDescriptor, MultisampleResidentTexture,
-    MultisampleTextureKey, ResidentGuestTexture, SampledTextureKey, guest_ranges_overlap,
-    guest_texture_byte_count, guest_texture_descriptors_overlap,
+    CachedSampledTexture, GuestTextureDescriptor, GuestTextureOverlapQuery,
+    MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture, SampledTextureKey,
+    guest_ranges_overlap, guest_texture_byte_count,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -56,9 +56,8 @@ pub(crate) fn retire_overlapping_sampled_textures(
     cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
     descriptor: GuestTextureDescriptor,
 ) {
-    retire_sampled_textures_matching(cache, |key| {
-        guest_texture_descriptors_overlap(key.descriptor, descriptor)
-    });
+    let overlap = GuestTextureOverlapQuery::new(descriptor);
+    retire_sampled_textures_matching(cache, |key| overlap.overlaps(key.descriptor));
 }
 
 pub(crate) fn retire_sampled_textures_overlapping_writeback(

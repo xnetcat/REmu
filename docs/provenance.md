@@ -138,14 +138,15 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   posts, intent-buffer/property behavior, trophy lifecycle validation, and callback retention.
 - REmu applies the four relocation types present in the first two authorized test titles before
   finalizing memory protections: `R_X86_64_64`, `GLOB_DAT`, `JUMP_SLOT`, and `RELATIVE`.
-- AvPlayer pause/IsActive state semantics (a paused player remains an active playback session,
-  freezes `CurrentTime`, and releases neither video nor audio frames until Resume) were
-  cross-checked against shadPS4's GPL-2.0-or-later AvPlayer state machine
+- AvPlayer Ready/Pause/IsActive state semantics (a newly added source is active before Start, and
+  a paused player remains active while freezing `CurrentTime` and releasing neither video nor audio
+  frames until Resume) were cross-checked against shadPS4's GPL-2.0-or-later AvPlayer state machine
   (`src/core/libraries/avplayer/`). The `sceAvPlayerChangeStream`/`sceAvPlayerSetTrickSpeed`
   export names and the percent-based trick-speed rate follow the public PS4/PS5 AvPlayer API
-  surface as documented in open-source homebrew headers; REmu's ffmpeg pipe decoders, input-side
-  `-ss` seek, and host-elapsed media clock are independent implementations. No SDK material was
-  copied.
+  surface as documented in open-source homebrew headers. The Gen5 one-based stream discriminators
+  and 104-byte extended stream-info fields were recovered from the authorized local Unity and
+  Unreal executable call sites. REmu's ffmpeg pipe decoders, input-side `-ss` seek, and
+  host-elapsed media clock are independent implementations. No SDK material was copied.
 
 ## `remu-shader`
 
@@ -185,6 +186,11 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   against shadPS4's GPL-2.0-or-later shader recompiler's cube handling. Binding cube resources
   as Metal 2D arrays and indexing the face layer directly from the atlas triple is REmu's own
   lowering choice; no code was copied.
+- GFX10 secondary position-export packing and `PA_CL_VS_OUT_CNTL` semantics follow AMD's public
+  register definitions and were cross-checked against shadPS4's GPL-2.0-or-later
+  `MapOutputs`/`ExportPosition` behavior. REmu independently lowers enabled clip distances to
+  Metal's documented `[[clip_distance]]` vertex output. Metal has no native cull-distance output,
+  so enabled cull components use the same conservative clipping path rather than being ignored.
 
 ## `remu-gpu-metal`
 
@@ -199,9 +205,14 @@ synthetic tests. No game bytes or proprietary SDK material are included.
 - GFX10 `CB_COLOR_CONTROL` operation-mode decoding follows AMD's public PAL register
   definitions and was cross-checked against shadPS4's GPL-2.0-or-later renderer handling.
   In particular, `Resolve`, `EliminateFastClear`, and `FmaskDecompress` draw packets are
-  command-processor operations rather than ordinary shader rasterization. REmu ends the
-  current Metal pass for those operations because its color residents are already
-  decompressed and ordinary MSAA passes maintain a current single-sample resolve.
+  command-processor operations rather than ordinary shader rasterization. REmu keeps color
+  residents decompressed and ordinary MSAA passes maintain a current single-sample MRT0 resolve;
+  for the explicit Resolve operation it then copies MRT0 into the separately programmed MRT1
+  destination. `EliminateFastClear` materializes MRT0's programmed clear color into Metal storage
+  instead of retaining pixels from an older frame. These surface roles and the CMASK clear
+  materialization point were cross-checked against shadPS4's `Rasterizer::Resolve`,
+  `Image::Resolve`, and `Rasterizer::EliminateFastClear`; REmu's Metal implementation is
+  independent.
 - Texture readback storage, synchronization, resolve, and row-layout rules follow Apple's public
   Metal documentation for `MTLStorageMode`, `MTLBlitCommandEncoder`, `MTLCommandBuffer`,
   `MTLTexture.getBytes`, load/store actions, and the published Metal feature limits. They were also

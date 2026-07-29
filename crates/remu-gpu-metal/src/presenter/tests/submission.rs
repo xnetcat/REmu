@@ -502,6 +502,7 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
             image_bindings: Vec::new(),
             vertex_inputs: Vec::new(),
         },
+        vertex_output_control: 0,
         pixel_input_controls: std::array::from_fn(|index| {
             u32::try_from(index).expect("PS input index fits u32")
         }),
