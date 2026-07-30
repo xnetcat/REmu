@@ -74,6 +74,42 @@ fn submission_parser_skips_the_one_dword_uncounted_nop() {
 }
 
 #[test]
+fn pfp_sync_me_becomes_an_ordered_command_processor_barrier() {
+    let packet = [agc_pm4(2, crate::AGC_IT_PFP_SYNC_ME, 0), 0];
+    let events = capture_submission_events(
+        &packet,
+        &mut AgcGraphicsState::default(),
+        &mut AgcShaderRegistry::default(),
+    );
+
+    assert_eq!(events, [remu_gpu::GpuEvent::CommandProcessorBarrier]);
+}
+
+#[test]
+fn pfp_sync_me_rejects_a_non_native_packet_length() {
+    let packet = [agc_pm4(3, crate::AGC_IT_PFP_SYNC_ME, 0), 0, 0xfeed_face];
+    let mut submission_count = 0;
+    let result = crate::agc_parse_submission(
+        packet.as_ptr().addr() as u64,
+        u32::try_from(packet.len()).expect("command dword count"),
+        &mut crate::AgcSubmissionContext {
+            graphics: &mut AgcGraphicsState::default(),
+            shaders: &mut AgcShaderRegistry::default(),
+            video_out: &VideoOutState::default(),
+            submission_count: &mut submission_count,
+            flips: &mut Vec::new(),
+            event_writes: &mut Vec::new(),
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(crate::AgcSubmissionError::PfpSyncMePacketLength { actual: 3 })
+    ));
+    assert_eq!(submission_count, 0);
+}
+
+#[test]
 fn decodes_gen5_memory_acquire_ranges_and_controls() {
     let packet = [
         agc_pm4(8, AGC_IT_NOP, crate::AGC_R_ACQUIRE_MEM),

@@ -95,6 +95,7 @@ pub(crate) const AGC_IT_WRITE_DATA: u32 = 0x37;
 pub(crate) const AGC_IT_DRAW_INDEX_INDIRECT_MULTI: u32 = 0x38;
 pub(crate) const AGC_IT_WAIT_REG_MEM: u32 = 0x3c;
 pub(crate) const AGC_IT_INDIRECT_BUFFER: u32 = 0x3f;
+pub(crate) const AGC_IT_PFP_SYNC_ME: u32 = 0x42;
 pub(crate) const AGC_IT_EVENT_WRITE: u32 = 0x46;
 pub(crate) const AGC_IT_RELEASE_MEM: u32 = 0x49;
 pub(crate) const AGC_IT_DMA_DATA: u32 = 0x50;

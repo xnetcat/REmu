@@ -910,6 +910,7 @@ enum GuestBatchFlushReason {
     BlockedWait,
     FlipSnapshot,
     WorkCapacity,
+    CommandProcessorBarrier,
     CpuSynchronization,
 }
 
@@ -931,6 +932,7 @@ struct PresenterStatistics {
     batch_flushes_for_blocked_wait: u32,
     batch_flushes_for_flip_snapshot: u32,
     batch_flushes_for_work_capacity: u32,
+    batch_flushes_for_command_processor_barrier: u32,
     batch_flushes_for_cpu_synchronization: u32,
     gpu_execution_time: Duration,
     presentation_queue_latency: Duration,

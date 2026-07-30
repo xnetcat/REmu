@@ -197,7 +197,7 @@ impl MetalPresenter {
         if self.statistics.last_logged.elapsed() >= Duration::from_secs(5) {
             eprintln!("[REMu][PERF] {title}");
             eprintln!(
-                "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s flip={:.0}/s capacity={:.0}/s sync={:.0}/s",
+                "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
                 f64::from(self.statistics.render_pass_ends_for_compute) / seconds,
                 f64::from(self.statistics.render_pass_ends_for_target_change) / seconds,
                 f64::from(self.statistics.render_pass_ends_for_batch_flush) / seconds,
@@ -206,6 +206,7 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_for_blocked_wait) / seconds,
                 f64::from(self.statistics.batch_flushes_for_flip_snapshot) / seconds,
                 f64::from(self.statistics.batch_flushes_for_work_capacity) / seconds,
+                f64::from(self.statistics.batch_flushes_for_command_processor_barrier) / seconds,
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
             );
             let compile_enqueued = PIPELINE_COMPILE_ENQUEUED.swap(0, Ordering::Relaxed);
@@ -656,6 +657,7 @@ impl MetalPresenter {
         self.statistics.batch_flushes_for_blocked_wait = 0;
         self.statistics.batch_flushes_for_flip_snapshot = 0;
         self.statistics.batch_flushes_for_work_capacity = 0;
+        self.statistics.batch_flushes_for_command_processor_barrier = 0;
         self.statistics.batch_flushes_for_cpu_synchronization = 0;
         self.statistics.gpu_execution_time = Duration::ZERO;
         self.statistics.presentation_queue_latency = Duration::ZERO;

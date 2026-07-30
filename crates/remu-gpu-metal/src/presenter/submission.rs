@@ -187,6 +187,13 @@ impl MetalPresenter {
                         }
                     };
                 }
+                GpuEvent::CommandProcessorBarrier => {
+                    if let Err(error) = self.end_guest_command_processor_barrier() {
+                        eprintln!(
+                            "[REMu][METAL] PFP_SYNC_ME command-processor barrier failed: {error}"
+                        );
+                    }
+                }
                 GpuEvent::PipelineBarrier(barrier) => self.end_guest_pipeline_barrier(barrier),
                 GpuEvent::MemoryAcquire(acquire) => {
                     if let Err(error) = self.synchronize_cpu_written_guest_resources(acquire) {
@@ -452,5 +459,14 @@ impl MetalPresenter {
             .statistics
             .coalesced_pipeline_barriers
             .saturating_add(1);
+    }
+
+    fn end_guest_command_processor_barrier(&mut self) -> Result<(), String> {
+        // Metal command encoders execute serially, but PFP_SYNC_ME has a stronger queue-visible
+        // role than an EVENT_WRITE partial flush: parser-side indirect fetches must wait for every
+        // preceding ME producer. Commit the preceding work without waiting on the CPU. Metal
+        // command queues preserve command-buffer order, while later indirect bindings can still
+        // forward the exact pending writer buffer across the committed-batch boundary.
+        self.flush_guest_command_batch(false, GuestBatchFlushReason::CommandProcessorBarrier)
     }
 }

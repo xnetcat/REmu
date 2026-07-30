@@ -148,6 +148,12 @@ impl MetalPresenter {
                     .batch_flushes_for_work_capacity
                     .saturating_add(1);
             }
+            GuestBatchFlushReason::CommandProcessorBarrier => {
+                self.statistics.batch_flushes_for_command_processor_barrier = self
+                    .statistics
+                    .batch_flushes_for_command_processor_barrier
+                    .saturating_add(1);
+            }
             GuestBatchFlushReason::CpuSynchronization => {
                 self.statistics.batch_flushes_for_cpu_synchronization = self
                     .statistics

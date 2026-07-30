@@ -221,6 +221,65 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
 }
 
 #[test]
+fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let original_command_buffer = command_buffer.clone();
+    presenter.open_guest_batch = Some(GuestCommandBatch {
+        command_buffer,
+        work: Vec::new(),
+        global_upload_chunks: Vec::new(),
+        global_writebacks: Vec::new(),
+        guest_write_ranges: Vec::new(),
+        memory_writes: Vec::new(),
+        render_pass: None,
+        completion_sequences: vec![40],
+    });
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 7,
+            events: vec![
+                GpuEvent::CommandProcessorBarrier,
+                GpuEvent::SubmissionBoundary(41),
+            ],
+        })
+        .expect("queue command-processor barrier");
+
+    assert!(matches!(
+        presenter.receive_events(),
+        super::PresenterFlow::Continue
+    ));
+    assert!(presenter.open_guest_batch.is_none());
+    assert_eq!(presenter.statistics.submitted_guest_batches, 1);
+    assert_eq!(
+        presenter
+            .statistics
+            .batch_flushes_for_command_processor_barrier,
+        1
+    );
+    let committed = presenter
+        .committed_guest_batches
+        .pop_front()
+        .expect("barrier retains the nonblocking committed batch");
+    assert!(std::ptr::eq(
+        committed.command_buffer.as_ref(),
+        original_command_buffer.as_ref()
+    ));
+    assert_eq!(committed.completion_sequences, [40, 41]);
+    committed.command_buffer.wait_until_completed();
+    assert_eq!(
+        committed.command_buffer.status(),
+        metal::MTLCommandBufferStatus::Completed
+    );
+}
+
+#[test]
 fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
