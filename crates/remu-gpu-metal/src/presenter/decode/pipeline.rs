@@ -18,9 +18,9 @@ use super::{
     diagnostic_video_chain_selected_draw, evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count, image_component_class,
-    is_storage_image_opcode, ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_input_controls,
-    procedural_rectangle_stage_for_draw, program_embeds_global_base, register_value,
-    video_target_binding_summary,
+    is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_stage_for_draw,
+    pixel_input_controls, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    register_value, video_target_binding_summary,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
@@ -36,6 +36,19 @@ pub(crate) const NGG_MESHLET_WORDS_PER_GROUP: usize = 514;
 const NGG_MESHLET_STORAGE_VERTICES: usize = 256;
 const NGG_MESHLET_STORAGE_PRIMITIVES: usize = 256;
 const METAL_MESH_MAX_OUTPUTS: u32 = 256;
+
+/// Cover topologies that UE/Poppy emit as memoryless NGG stages and that currently shard under
+/// the meshlet ABI. Vertex-fetching NGG programs with the same topologies are excluded by
+/// [`ngg_memoryless_cover_export_stage`].
+pub(crate) fn ngg_fullscreen_cover_draw(program: &remu_shader::Program, draw: &IndexedDraw) -> bool {
+    draw.indirect_arguments_address.is_none()
+        && ngg_memoryless_cover_export_stage(program)
+        && ((!draw.indexed && draw.primitive_type == 6 && draw.index_count == 4)
+            || (draw.indexed
+                && draw.primitive_type == 4
+                && matches!(draw.index_count, 3 | 6)
+                && draw.instance_count == 1))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedNggMeshlets {
@@ -312,7 +325,10 @@ pub(crate) fn decode_ngg_subgroup_limits(
                 0 => Ok(NggOutputPrimitiveType::PointList),
                 1 => Ok(NggOutputPrimitiveType::LineStrip),
                 2 => Ok(NggOutputPrimitiveType::TriangleStrip),
-                3 => Ok(NggOutputPrimitiveType::RectangleList),
+                // Prospero `GsOutputPrimitiveType`: k2dRectangle=3, kRectList=4. Both describe
+                // the three-vertex AMD rectangle-list contract that host paths expand to a
+                // four-corner triangle strip (Dreaming Sarah Gen5 UI covers, fullscreen blits).
+                3 | 4 => Ok(NggOutputPrimitiveType::RectangleList),
                 kind => Err(format!("unknown VGT_GS_OUT_PRIM_TYPE {kind:#x}")),
             }
         })
@@ -826,62 +842,65 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             pixel_program,
             sample_count,
         ),
-        targets: targets
-            .iter()
-            .map(|target| {
-                let control = register_value(
-                    &draw.context_registers,
-                    CB_BLEND0_CONTROL + target.guest_slot,
-                )
-                .unwrap_or(0x2001_0001);
-                Ok(RenderTargetPipelineState {
-                    guest_slot: target.guest_slot,
-                    pixel_format: target.texture.pixel_format,
-                    output_kind: target.output_kind,
-                    write_mask: target.write_mask,
-                    blend: decode_metal_blend_attachment(control).map_err(|error| {
-                        format!(
-                            "color target {} has invalid CB_BLEND_CONTROL={control:#010x}: {error}",
-                            target.guest_slot
-                        )
-                    })?,
+        targets: {
+            let mut targets = targets
+                .iter()
+                .map(|target| {
+                    let control = register_value(
+                        &draw.context_registers,
+                        CB_BLEND0_CONTROL + target.guest_slot,
+                    )
+                    .unwrap_or(0x2001_0001);
+                    Ok(RenderTargetPipelineState {
+                        guest_slot: target.guest_slot,
+                        pixel_format: target.texture.pixel_format,
+                        output_kind: target.output_kind,
+                        write_mask: target.write_mask,
+                        blend: decode_metal_blend_attachment(control).map_err(|error| {
+                            format!(
+                                "color target {} has invalid CB_BLEND_CONTROL={control:#010x}: {error}",
+                                target.guest_slot
+                            )
+                        })?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, String>>()?;
+            let live_pixel_scalars = Some(std::array::from_fn(|index| {
+                register_value(
+                    &draw.shader_registers,
+                    0x00c + u32::try_from(index).expect("scalar index fits"),
+                )
+                .unwrap_or_default()
+            }));
+            apply_transparent_premultiplied_fill_clear_with_color(
+                &mut targets,
+                export_evaluation,
+                pixel_evaluation,
+                live_pixel_scalars,
+            );
+            targets
+        },
         depth: depth.map(|depth| DepthTargetPipelineState {
             pixel_format: depth.texture.pixel_format,
         }),
         sample_count,
         render_target_array_length,
         uses_mesh_stage: {
-            // UE fullscreen/UI covers often arrive as NGG-export stages. Three common shapes
-            // currently survive as diagonal half-screens / shards under the meshlet ABI:
-            //   - nonindexed triangle strip count=4
-            //   - indexed triangle list count=6 (two-triangle quad / duplicated cover)
-            //   - indexed triangle list count=3 with sparse VB indices (e.g. [0,4,5])
-            // Prefer the synthesized covering VS whenever the export stage is NGG-shaped.
-            let ngg_fullscreen = draw.indirect_arguments_address.is_none()
-                && ngg_mesh_export_stage(export_program)
-                && ((!draw.indexed && draw.primitive_type == 6 && draw.index_count == 4)
-                    || (draw.indexed
-                        && draw.primitive_type == 4
-                        && matches!(draw.index_count, 3 | 6)
-                        && draw.instance_count == 1));
-            if ngg_fullscreen || procedural_rectangle_stage_for_draw(export_program, draw) {
+            // Memoryless NGG covers (Poppy/UE fullscreen blits) still shard under the meshlet ABI
+            // for a few topologies. Only those position-from-VID stages may use the synthesized
+            // covering VS — NGG sprite quads that fetch vertex buffers (Dreaming Sarah) must keep
+            // the mesh path so per-draw bounds survive.
+            if ngg_fullscreen_cover_draw(export_program, draw)
+                || procedural_rectangle_stage_for_draw(export_program, draw)
+            {
                 false
             } else {
                 ngg_mesh_stage_for_draw(export_program, draw)?
             }
         },
         uses_procedural_rectangle_stage: {
-            let ngg_fullscreen = draw.indirect_arguments_address.is_none()
-                && ngg_mesh_export_stage(export_program)
-                && ((!draw.indexed && draw.primitive_type == 6 && draw.index_count == 4)
-                    || (draw.indexed
-                        && draw.primitive_type == 4
-                        && matches!(draw.index_count, 3 | 6)
-                        && draw.instance_count == 1));
-            ngg_fullscreen || procedural_rectangle_stage_for_draw(export_program, draw)
+            ngg_fullscreen_cover_draw(export_program, draw)
+                || procedural_rectangle_stage_for_draw(export_program, draw)
         },
         primitive_topology_class: metal_primitive_topology_class(draw.primitive_type)?,
     })
@@ -943,10 +962,9 @@ pub(crate) fn graphics_shader_resource_key(
     }
 }
 
-pub(crate) fn decode_metal_blend_attachment(
-    control: u32,
-) -> Result<MetalBlendAttachmentState, String> {
-    let disabled = MetalBlendAttachmentState {
+/// Disabled Metal blend attachment used for both guest blend-off and Chowdren fill clears.
+pub(crate) const fn disabled_metal_blend_attachment() -> MetalBlendAttachmentState {
+    MetalBlendAttachmentState {
         enabled: false,
         source_rgb: MTLBlendFactor::One,
         destination_rgb: MTLBlendFactor::Zero,
@@ -954,7 +972,82 @@ pub(crate) fn decode_metal_blend_attachment(
         source_alpha: MTLBlendFactor::One,
         destination_alpha: MTLBlendFactor::Zero,
         alpha_operation: MTLBlendOperation::Add,
+    }
+}
+
+fn transparent_premultiplied_fill_clear_enabled() -> bool {
+    !std::env::var_os("REMU_DISABLE_TRANSPARENT_FILL_CLEAR").is_some_and(|value| value == "1")
+}
+
+/// Chowdren resets effect layers with an untextured transparent-black fill using premultiplied
+/// blending (`One` / `OneMinusSrcAlpha`). That draw is otherwise a no-op and fog/vignette layers
+/// accumulate across frames. Treat precisely that shape as an overwrite.
+///
+/// Do not widen this to straight `SrcAlpha` / `OneMinusSrcAlpha`: those transparent-black draws
+/// are often intentional no-ops, and forcing an overwrite wipes scene layers (e.g. the player).
+///
+/// Opt out with `REMU_DISABLE_TRANSPARENT_FILL_CLEAR=1`.
+pub(crate) fn apply_transparent_premultiplied_fill_clear(
+    targets: &mut [RenderTargetPipelineState],
+    export_evaluation: &ShaderEvaluation,
+    pixel_evaluation: &ShaderEvaluation,
+) {
+    apply_transparent_premultiplied_fill_clear_with_color(
+        targets,
+        export_evaluation,
+        pixel_evaluation,
+        None,
+    );
+}
+
+/// Same as [`apply_transparent_premultiplied_fill_clear`], but prefers live pixel user-data words
+/// from the draw's SH registers when provided. Evaluation caches key on user data, so the two
+/// sources normally agree; the live words are the ground truth for the color the Metal scalar
+/// buffer will actually bind.
+pub(crate) fn apply_transparent_premultiplied_fill_clear_with_color(
+    targets: &mut [RenderTargetPipelineState],
+    export_evaluation: &ShaderEvaluation,
+    pixel_evaluation: &ShaderEvaluation,
+    live_pixel_scalars: Option<[u32; 4]>,
+) {
+    if !transparent_premultiplied_fill_clear_enabled()
+        || targets.is_empty()
+        || !export_evaluation.vertex_inputs.is_empty()
+        || !pixel_evaluation.image_bindings.is_empty()
+        || !targets
+            .iter()
+            .all(|target| is_transparent_premultiplied_fill_blend(&target.blend))
+    {
+        return;
+    }
+    let fill_color = match live_pixel_scalars {
+        Some(scalars) => scalars,
+        None => {
+            if pixel_evaluation.initial_scalar_registers.len() < 4 {
+                return;
+            }
+            std::array::from_fn(|index| pixel_evaluation.initial_scalar_registers[index])
+        }
     };
+    if fill_color.iter().any(|value| value & 0x7fff_ffff != 0) {
+        return;
+    }
+    for target in targets.iter_mut() {
+        target.blend = disabled_metal_blend_attachment();
+    }
+}
+
+pub(crate) fn is_transparent_premultiplied_fill_blend(blend: &MetalBlendAttachmentState) -> bool {
+    blend.enabled
+        && blend.source_rgb == MTLBlendFactor::One
+        && blend.destination_rgb == MTLBlendFactor::OneMinusSourceAlpha
+        && blend.rgb_operation == MTLBlendOperation::Add
+}
+
+pub(crate) fn decode_metal_blend_attachment(
+    control: u32,
+) -> Result<MetalBlendAttachmentState, String> {
+    let disabled = disabled_metal_blend_attachment();
     if control & (1 << 30) == 0 {
         return Ok(disabled);
     }

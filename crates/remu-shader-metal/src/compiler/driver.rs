@@ -384,10 +384,12 @@ impl<'a> Compiler<'a> {
                     .map(|source| source.value)
                     .ok_or("S_SENDMSG requires an encoded message immediate")?;
                 if message == 9 {
+                    // NGG passthrough rectangle-list stages still emit GS_ALLOC_REQ even when the
+                    // host expands the three-vertex AMD rect into a Metal triangle strip and runs
+                    // the guest export as an ordinary vertex shader. Ignore the alloc on that
+                    // path; only the mesh ABI needs the threadgroup counters.
                     if self.options.stage != MetalShaderStage::Mesh {
-                        return Err(
-                            "GS_ALLOC_REQ can only be represented by a Metal mesh stage".to_owned()
-                        );
+                        return Ok(());
                     }
                     // GFX10 GS_ALLOC_REQ is issued by subgroup zero. M0 carries the actual
                     // allocation: vertices[10:0], primitives[22:12]. Capture it once for the

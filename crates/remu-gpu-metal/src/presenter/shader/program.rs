@@ -414,6 +414,43 @@ pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
     allocation_message && primitive_export && position_export
 }
 
+/// True when an NGG export only computes cover geometry (no memory/image/LDS traffic).
+///
+/// Poppy-style UE fullscreen covers arrive as NGG-shaped programs that derive position from the
+/// vertex ID alone. Dreaming Sarah UI sprites also use NGG markers with indexed two-triangle
+/// quads, but they fetch per-vertex attributes from buffers — those must keep the mesh path so
+/// sprite bounds survive. Topology alone cannot distinguish the two.
+pub(crate) fn ngg_memoryless_cover_export_stage(program: &Program) -> bool {
+    if !ngg_mesh_export_stage(program) {
+        return false;
+    }
+    for instruction in &program.instructions {
+        if matches!(
+            instruction.control.as_ref(),
+            Some(
+                InstructionControl::Image(_)
+                    | InstructionControl::GlobalMemory(_)
+                    | InstructionControl::BufferMemory(_)
+                    | InstructionControl::DataShare(_),
+            )
+        ) {
+            return false;
+        }
+        if let Some(name) = instruction.opcode.known_name()
+            && (name.starts_with("Ds")
+                || name.starts_with("Image")
+                || name.starts_with("Buffer")
+                || name.starts_with("SBuffer")
+                || name.starts_with("Global")
+                || name.starts_with("Flat")
+                || name.starts_with("Scratch"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Returns whether a direct native draw can be represented by the CPU-prepared NGG meshlet ABI.
 pub(crate) const fn ngg_mesh_draw_supported(draw: &IndexedDraw) -> bool {
     draw.indirect_arguments_address.is_none()
@@ -438,6 +475,16 @@ pub(crate) fn ngg_mesh_stage_for_draw(
     }
     if ngg_mesh_draw_supported(draw) {
         return Ok(true);
+    }
+    // Three-vertex AMD rectangle lists expand to a four-corner Metal triangle strip. The guest
+    // export still looks like an NGG stage (GS_ALLOC_REQ + prim EXP), but the host runs it as an
+    // ordinary vertex shader so per-draw rectangle bounds from the export survive.
+    if !draw.indexed
+        && draw.indirect_arguments_address.is_none()
+        && draw.index_count == 3
+        && matches!(draw.primitive_type, 7 | 0x11)
+    {
+        return Ok(false);
     }
     if procedural_rectangle_stage_for_draw(program, draw) {
         return Ok(false);

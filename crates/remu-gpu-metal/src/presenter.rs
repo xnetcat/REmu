@@ -62,8 +62,10 @@ use self::decode::{
     SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
     VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length, decode_fast_clear_color,
     decode_ngg_subgroup_limits, decode_render_targets_from_registers, decode_scanout_target,
-    graphics_shader_resource_key, initial_depth_clear_value, metal_primitive_topology_class,
-    pixel_input_controls, raw_video_out_layout_is_linear,
+    apply_transparent_premultiplied_fill_clear, disabled_metal_blend_attachment,
+    graphics_shader_resource_key, initial_depth_clear_value,
+    is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
+    ngg_fullscreen_cover_draw, pixel_input_controls, raw_video_out_layout_is_linear,
 };
 #[cfg(test)]
 use self::diagnostics::parse_diagnostic_hex_address;
@@ -133,15 +135,16 @@ use self::shader::{
     compute_pipeline_key, compute_program_can_split_wave64, dump_shader_pair_msl,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
-    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    is_storage_image_opcode, is_writable_image_opcode, ngg_memoryless_cover_export_stage,
+    ngg_mesh_stage_for_draw, pixel_scalars, procedural_rectangle_stage_for_draw,
+    program_embeds_global_base,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
-    missing_vertex_parameter_exports, ngg_mesh_draw_supported, procedural_rectangle_export_stage,
-    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
-    shader_scalar_metadata,
+    missing_vertex_parameter_exports, ngg_mesh_draw_supported, ngg_mesh_export_stage,
+    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
 };
 #[cfg(test)]
 use self::stats::process_resident_bytes;

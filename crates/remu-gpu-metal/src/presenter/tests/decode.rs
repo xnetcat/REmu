@@ -17,12 +17,15 @@ use super::{
     ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
     DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestScissor,
     GuestTextureDescriptor, MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType,
+    RenderTargetPipelineState,
     NggSubgroupLimits, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
     append_depth_target_registers, color_operation_is_raster_noop,
     common_render_target_array_length, consume_color_metadata_clear, consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
-    decode_metal_blend_attachment, decode_ngg_subgroup_limits, decode_raster_state,
+    apply_transparent_premultiplied_fill_clear, decode_metal_blend_attachment,
+    decode_ngg_subgroup_limits, decode_raster_state, disabled_metal_blend_attachment,
+    is_transparent_premultiplied_fill_blend,
     decode_render_target_format, decode_render_targets_from_registers, decode_scissor,
     decode_viewport, effective_linear_pitch, fragmentless_pixel_program, graphics_pipeline_key,
     guest_texture_byte_count, guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
@@ -1200,6 +1203,97 @@ fn translates_separate_premultiplied_guest_blending() {
     assert_eq!(blend.source_alpha, MTLBlendFactor::One);
     assert_eq!(blend.destination_alpha, MTLBlendFactor::OneMinusSourceAlpha);
     assert_eq!(blend.alpha_operation, MTLBlendOperation::Add);
+    assert!(is_transparent_premultiplied_fill_blend(&blend));
+}
+
+#[test]
+fn treats_chowdren_transparent_premultiplied_fills_as_overwrites() {
+    // Guest CB_BLEND_CONTROL for enabled One / OneMinusSrcAlpha / Add (shared alpha).
+    let blend = decode_metal_blend_attachment((1 << 30) | 1 | (5 << 8)).expect("premult blend");
+    let mut targets = vec![RenderTargetPipelineState {
+        guest_slot: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        output_kind: PixelOutputKind::Float,
+        write_mask: 0xf,
+        blend,
+    }];
+    let export = empty_shader_evaluation();
+    let pixel = Arc::new(ShaderEvaluation {
+        initial_scalar_registers: vec![0, 0, 0, 0].into(),
+        scalar_registers: vec![0, 0, 0, 0].into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    });
+
+    apply_transparent_premultiplied_fill_clear(&mut targets, &export, &pixel);
+    assert_eq!(targets[0].blend, disabled_metal_blend_attachment());
+
+    targets[0].blend = blend;
+    let tinted = Arc::new(ShaderEvaluation {
+        initial_scalar_registers: vec![0, 0, 0, 0x3f80_0000].into(),
+        ..(*pixel).clone()
+    });
+    apply_transparent_premultiplied_fill_clear(&mut targets, &export, &tinted);
+    assert!(
+        targets[0].blend.enabled,
+        "non-zero fill color must keep premultiplied blending"
+    );
+
+    targets[0].blend = blend;
+    let with_vertex_fetch = Arc::new(ShaderEvaluation {
+        vertex_inputs: vec![remu_shader::VertexInputBinding {
+            pc: 0,
+            location: 0,
+            component_count: 4,
+            data_format: 14,
+            number_format: 7,
+            base_address: 0x1000,
+            stride: 16,
+            offset_bytes: 0,
+            data: vec![0; 16],
+        }],
+        ..(*export).clone()
+    });
+    apply_transparent_premultiplied_fill_clear(&mut targets, &with_vertex_fetch, &pixel);
+    assert!(
+        targets[0].blend.enabled,
+        "vertex-fetched draws must not be rewritten as clears"
+    );
+}
+
+#[test]
+fn does_not_rewrite_straight_alpha_transparent_fills_as_clears() {
+    // ENABLE|SEPARATE_ALPHA|SrcAlpha/OneMinusSrcAlpha — also a no-op for RGBA=0, but rewriting
+    // those draws as overwrites erases scene content that Chowdren meant to leave alone.
+    let blend = decode_metal_blend_attachment(0x6504_0504).expect("straight-alpha blend");
+    assert!(!is_transparent_premultiplied_fill_blend(&blend));
+
+    let mut targets = vec![RenderTargetPipelineState {
+        guest_slot: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        output_kind: PixelOutputKind::Float,
+        write_mask: 0xf,
+        blend,
+    }];
+    let export = empty_shader_evaluation();
+    let pixel = Arc::new(ShaderEvaluation {
+        initial_scalar_registers: vec![0, 0, 0, 0].into(),
+        scalar_registers: vec![0, 0, 0, 0].into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    });
+
+    apply_transparent_premultiplied_fill_clear(&mut targets, &export, &pixel);
+    assert!(
+        targets[0].blend.enabled,
+        "straight-alpha transparent fills must remain no-ops"
+    );
 }
 
 #[test]
@@ -1497,6 +1591,45 @@ fn ordinary_agc_geometry_defaults_do_not_activate_ngg() {
         ]),
         Ok(None)
     );
+}
+
+#[test]
+fn decodes_prospero_rectangle_gs_output_primitive_types() {
+    for outprim in [3_u32, 4_u32] {
+        let limits = decode_ngg_subgroup_limits(&[
+            GpuRegister {
+                offset: 0x1ff,
+                value: 64,
+            },
+            GpuRegister {
+                offset: 0x291,
+                value: 64 | (64 << 11) | (64 << 22),
+            },
+            GpuRegister {
+                offset: 0x29b,
+                value: outprim,
+            },
+            GpuRegister {
+                offset: 0x2ce,
+                value: 0,
+            },
+            GpuRegister {
+                offset: 0x2d3,
+                value: 1,
+            },
+            GpuRegister {
+                offset: 0x2e4,
+                value: 0,
+            },
+        ])
+        .unwrap_or_else(|error| panic!("OUTPRIM {outprim} should decode: {error}"))
+        .expect("NGG registers are present");
+        assert_eq!(
+            limits.output_primitive_type,
+            Some(NggOutputPrimitiveType::RectangleList),
+            "Prospero k2dRectangle=3 and kRectList=4 both map to RectangleList"
+        );
+    }
 }
 
 #[test]

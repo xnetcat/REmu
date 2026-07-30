@@ -20,7 +20,8 @@ use super::{
     compile_shader_request_catching_panics, compute_launch, export_resource_render_stage,
     fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
     image_component_class, missing_vertex_parameter_exports, ngg_mesh_draw_supported,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
+    ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
     rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
     sampler_uses_normalized_coordinates, shader_scalar_metadata,
     shader_scalar_metadata_for_registers, speculative_pipeline_compile_in_flight_capacity,
@@ -361,6 +362,10 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
         ngg_mesh_export_stage(&program),
         "allocation plus primitive and position exports form an NGG contract even without LDS"
     );
+    assert!(
+        ngg_memoryless_cover_export_stage(&program),
+        "the architectural rectangle stage has no memory traffic"
+    );
     let mut draw = super::indexed_draw(0, 0, 3);
     draw.indexed = false;
     draw.primitive_type = 7;
@@ -369,6 +374,15 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
         Ok(false),
         "the exact three-vertex rectangle retains its synthesized vertex-stage path"
     );
+    draw.indexed = true;
+    draw.primitive_type = 4;
+    draw.index_count = 6;
+    assert!(
+        ngg_fullscreen_cover_draw(&program, &draw),
+        "memoryless NGG covers with indexed two-triangle topology keep the synthesized path"
+    );
+    draw.indexed = false;
+    draw.primitive_type = 7;
     draw.index_count = 4;
     assert!(
         ngg_mesh_stage_for_draw(&program, &draw)
@@ -382,6 +396,83 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
             .expect_err("an indirect count cannot use the exact procedural rectangle path")
             .contains("ordered GPU-side mesh geometry preparation is not implemented")
     );
+}
+
+#[test]
+fn keeps_vertex_fetching_ngg_sprite_quads_on_the_mesh_path() {
+    // Minimal NGG contract (alloc + prim/pos export) plus a buffer fetch — the shape Dreaming
+    // Sarah uses for positioned UI quads. Topology matches the Poppy cover heuristic, but memory
+    // traffic must force the mesh path so sprite bounds are not replaced by a fullscreen triangle.
+    let program = Program::new(
+        0x5000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: Vec::new(),
+                sources: vec![Operand {
+                    kind: remu_shader::OperandKind::LiteralConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Mubuf,
+                opcode: Opcode::Known("BufferLoadFormatXyz"),
+                words: Vec::new(),
+                sources: vec![Operand::vector(0)],
+                destinations: vec![Operand::vector(0)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::Known("Exp"),
+                words: Vec::new(),
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(remu_shader::ExportControl {
+                    target: 20,
+                    enable_mask: 0x1,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                })),
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::Known("Exp"),
+                words: Vec::new(),
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(remu_shader::ExportControl {
+                    target: 12,
+                    enable_mask: 0xf,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                })),
+            },
+        ],
+    );
+    assert!(ngg_mesh_export_stage(&program));
+    assert!(
+        !ngg_memoryless_cover_export_stage(&program),
+        "buffer traffic disqualifies the synthesized cover path"
+    );
+    let mut draw = super::indexed_draw(0, 0, 6);
+    draw.indexed = true;
+    draw.primitive_type = 4;
+    draw.instance_count = 1;
+    assert!(
+        !ngg_fullscreen_cover_draw(&program, &draw),
+        "Sarah-style indexed NGG quads must not become procedural fullscreen covers"
+    );
+    assert_eq!(ngg_mesh_stage_for_draw(&program, &draw), Ok(true));
 }
 
 #[test]

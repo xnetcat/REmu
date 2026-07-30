@@ -17,7 +17,7 @@ use super::{
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
-    is_storage_image_opcode, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_stage_for_draw,
     procedural_rectangle_stage_for_draw, program_embeds_global_base, tiled_block_dimensions,
     trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
     video_target_binding_summary,
@@ -42,8 +42,10 @@ pub(crate) use self::pipeline::{
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{
-    NGG_MESHLET_WORDS_PER_GROUP, decode_ngg_subgroup_limits, graphics_shader_resource_key,
-    metal_primitive_topology_class,
+    NGG_MESHLET_WORDS_PER_GROUP, apply_transparent_premultiplied_fill_clear,
+    decode_ngg_subgroup_limits, disabled_metal_blend_attachment, graphics_shader_resource_key,
+    is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
+    ngg_fullscreen_cover_draw,
 };
 #[cfg(test)]
 pub(crate) use self::scanout::{
