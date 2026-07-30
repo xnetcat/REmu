@@ -517,7 +517,7 @@ impl MetalPresenter {
             );
             let transitions = &self.statistics.render_pass_key_transitions;
             eprintln!(
-                "[REMu][PERF-RP-KEY] target count={:.0}/s addr={:.0}/s width={:.0}/s height={:.0}/s pitch={:.0}/s tile={:.0}/s format={:.0}/s bpp={:.0}/s samples={:.0}/s scanout={:.0}/s type={:.0}/s layers={:.0}/s base-layer={:.0}/s mip={:.0}/s mip-count={:.0}/s | depth presence={:.0}/s addr={:.0}/s width={:.0}/s height={:.0}/s pitch={:.0}/s tile={:.0}/s format={:.0}/s bpp={:.0}/s samples={:.0}/s layers={:.0}/s clear={:.0}/s clear-seq={:.0}/s",
+                "[REMu][PERF-RP-KEY] target count={:.0}/s addr={:.0}/s width={:.0}/s height={:.0}/s pitch={:.0}/s tile={:.0}/s format={:.0}/s bpp={:.0}/s samples={:.0}/s scanout={:.0}/s type={:.0}/s layers={:.0}/s base-layer={:.0}/s mip={:.0}/s mip-count={:.0}/s clear-seq={:.0}/s | depth presence={:.0}/s addr={:.0}/s width={:.0}/s height={:.0}/s pitch={:.0}/s tile={:.0}/s format={:.0}/s bpp={:.0}/s samples={:.0}/s layers={:.0}/s clear={:.0}/s clear-seq={:.0}/s",
                 f64::from(transitions.target_count) / seconds,
                 f64::from(transitions.target_address) / seconds,
                 f64::from(transitions.target_width) / seconds,
@@ -533,6 +533,7 @@ impl MetalPresenter {
                 f64::from(transitions.target_base_layer) / seconds,
                 f64::from(transitions.target_mip_level) / seconds,
                 f64::from(transitions.target_mip_level_count) / seconds,
+                f64::from(transitions.target_clear_sequence) / seconds,
                 f64::from(transitions.depth_presence) / seconds,
                 f64::from(transitions.depth_address) / seconds,
                 f64::from(transitions.depth_width) / seconds,

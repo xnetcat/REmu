@@ -22,7 +22,7 @@ fn texture(address: u64) -> GuestTextureDescriptor {
 
 fn key() -> GuestRenderPassKey {
     GuestRenderPassKey {
-        targets: vec![(texture(0x1000), 1, false, 2, 1, 0, 0, 1)],
+        targets: vec![(texture(0x1000), 1, false, 2, 1, 0, 0, 1, None)],
         depth: Some((texture(0x2000), 1, 1, None, None)),
     }
 }
@@ -45,7 +45,7 @@ fn render_pass_key_transition_classifies_color_fields_independently() {
 
     let mut next = current.clone();
     next.targets
-        .push((texture(0x3000), 1, false, 2, 1, 0, 0, 1));
+        .push((texture(0x3000), 1, false, 2, 1, 0, 0, 1, None));
     assert_eq!(
         current.transition_to(&next),
         transition(&[GuestRenderPassKeyField::TargetCount])
@@ -66,6 +66,7 @@ fn render_pass_key_transition_classifies_color_fields_independently() {
     next.targets[0].5 += 1;
     next.targets[0].6 += 1;
     next.targets[0].7 += 1;
+    next.targets[0].8 = Some(7);
     assert_eq!(
         current.transition_to(&next),
         transition(&[
@@ -83,7 +84,26 @@ fn render_pass_key_transition_classifies_color_fields_independently() {
             GuestRenderPassKeyField::TargetBaseLayer,
             GuestRenderPassKeyField::TargetMipLevel,
             GuestRenderPassKeyField::TargetMipLevelCount,
+            GuestRenderPassKeyField::TargetClearSequence,
         ])
+    );
+}
+
+#[test]
+fn render_pass_key_consumes_color_load_clear_for_compatible_continuation() {
+    let mut clear = key();
+    clear.targets[0].8 = Some(7);
+    let continuation = clear.continuation_after_color_loads();
+
+    assert_eq!(continuation.targets[0].8, None);
+    assert_eq!(continuation.depth, clear.depth);
+    assert_eq!(
+        continuation.transition_to(&clear),
+        transition(&[GuestRenderPassKeyField::TargetClearSequence])
+    );
+    assert_eq!(
+        continuation.transition_to(&continuation),
+        GuestRenderPassKeyTransition::default()
     );
 }
 
