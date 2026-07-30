@@ -235,6 +235,7 @@ fn import_trampoline_captures_the_complete_sysv_register_frame() {
     );
     assert_eq!(frame.rax, 0x0102_0304_0506_0708);
     assert_eq!(frame.dispatch_index, crate::TEST_CAPTURE_DISPATCH_INDEX);
+    assert_eq!(frame.guest_rbx, 0x7172_7374_7576_7778);
     assert_ne!(frame.guest_return_address, 0);
     assert_eq!(frame.guest_rsp & 0xf, 8);
     for (index, xmm) in frame.xmm_arguments.iter().enumerate() {
