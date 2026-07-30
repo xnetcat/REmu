@@ -20,6 +20,7 @@ class TaskGraphTraceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.memory = {
             0x1018: 0x2000,
+            0x31A8: (0x15 << TRACE.TASK_QUEUE_WAITER_BITS) | 0x12,
             **{0x2000 + index * 8: 0xA0 + index for index in range(12)},
         }
         self.state = TRACE.TaskGraphTraceState(cycle_limit=2, hit_limit=32)
@@ -62,6 +63,10 @@ class TaskGraphTraceTests(unittest.TestCase):
             {"rsi": 0x1000, "rdi": 0x3000, "rdx": 0, "rsp": 0x5000},
         )
         self.assertTrue(published.accepted)
+        self.assertIn(
+            "wait_state_before=0x54000012/waiters=0x12/generation=0x15",
+            published.message or "",
+        )
         self.assertEqual(self.state.publisher_thread, 7)
         self.assertEqual(
             set(self.state.active_breakpoints()),
@@ -84,6 +89,10 @@ class TaskGraphTraceTests(unittest.TestCase):
             TRACE.PUBLISH_RETURN, {"rax": 0, "rsp": 0x5008}
         )
         self.assertTrue(wake_required.accepted)
+        self.assertIn(
+            "wait_state_after=0x54000012/waiters=0x12/generation=0x15",
+            wake_required.message or "",
+        )
         self.assertEqual(self.state.phase, TRACE.PHASE_PUBLISH)
         self.assertEqual(
             set(self.state.active_breakpoints()), {TRACE.DISPATCH, TRACE.WAKE}
@@ -118,7 +127,10 @@ class TaskGraphTraceTests(unittest.TestCase):
 
     def test_pop_execute_and_completion_filter_exact_task(self) -> None:
         self.observe(TRACE.DISPATCH, {"rsi": 0x1000})
-        self.observe(TRACE.PUBLISH, {"rsi": 0x1000, "rsp": 0x5000})
+        self.observe(
+            TRACE.PUBLISH,
+            {"rsi": 0x1000, "rdi": 0x3000, "rsp": 0x5000},
+        )
         self.observe(
             TRACE.PUBLISH_RETURN,
             {"rax": (1 << 64) - 1, "rsp": 0x5008},
@@ -129,6 +141,10 @@ class TaskGraphTraceTests(unittest.TestCase):
         )
         popped = self.observe(TRACE.POP_DRAIN, {"rax": 0x1000})
         self.assertTrue(popped.accepted)
+        self.assertIn(
+            "wait_state=0x54000012/waiters=0x12/generation=0x15",
+            popped.message or "",
+        )
         self.assertEqual(self.state.pop_site, TRACE.POP_DRAIN)
         self.assertEqual(
             set(self.state.active_breakpoints()), {TRACE.DISPATCH, TRACE.EXECUTE}
@@ -237,6 +253,14 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertEqual(TRACE.signed_u32((1 << 32) - 1), -1)
         self.assertEqual(TRACE.signed_u32(1 << 31), -(1 << 31))
         self.assertEqual(TRACE.signed_u32((1 << 64) - 1), -1)
+
+    def test_queue_wait_state_decodes_bitmap_and_generation(self) -> None:
+        value = (0x123456 << TRACE.TASK_QUEUE_WAITER_BITS) | 0x02000001
+        self.assertEqual(
+            TRACE.describe_queue_wait_state(value),
+            f"{value:#x}/waiters=0x2000001/generation=0x123456",
+        )
+        self.assertEqual(TRACE.describe_queue_wait_state(None), "unreadable")
 
     def test_loader_notification_filter_is_exact_to_dyld_trace_symbol(self) -> None:
         self.assertTrue(

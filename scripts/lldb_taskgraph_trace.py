@@ -37,6 +37,8 @@ MAXIMUM_HIT_LIMIT = 100_000
 # libraries and Rust allocations are in the high 0x7f/0x7ff ranges instead.
 MINIMUM_GUEST_EXECUTION_ADDRESS = 0x8_0000_0000
 MAXIMUM_GUEST_EXECUTION_ADDRESS = 0x100_0000_0000
+TASK_QUEUE_WAITER_BITS = 26
+TASK_QUEUE_WAITER_MASK = (1 << TASK_QUEUE_WAITER_BITS) - 1
 
 PHASE_PUBLISH = "publish"
 PHASE_CONSUME = "consume"
@@ -175,6 +177,17 @@ def is_guest_bad_access_stop(address: int, description: Optional[str]) -> bool:
     )
 
 
+def describe_queue_wait_state(value: Optional[int]) -> str:
+    """Decode the queue waiter bitmap and ABA generation used by UE TaskGraph."""
+
+    if value is None:
+        return "unreadable"
+    return (
+        f"{value:#x}/waiters={value & TASK_QUEUE_WAITER_MASK:#x}"
+        f"/generation={value >> TASK_QUEUE_WAITER_BITS:#x}"
+    )
+
+
 def _register(registers: Mapping[str, int], name: str) -> int:
     return registers.get(name, 0) & ((1 << 64) - 1)
 
@@ -207,6 +220,7 @@ class TaskGraphTraceState:
         self.publisher_thread = 0
         self.publisher_entry_rsp = 0
         self.publisher_return_rsp = 0
+        self.publish_wait_state_before: int | None = None
         self.wake_event = 0
         self.pop_site = ""
 
@@ -266,6 +280,7 @@ class TaskGraphTraceState:
         self.publisher_thread = 0
         self.publisher_entry_rsp = 0
         self.publisher_return_rsp = 0
+        self.publish_wait_state_before = None
         self.wake_event = 0
         self.pop_site = ""
 
@@ -299,7 +314,7 @@ class TaskGraphTraceState:
         if self.phase == PHASE_PUBLISH:
             result = self._observe_publish(label, registers, thread_id, read_u64)
         elif self.phase == PHASE_CONSUME:
-            result = self._observe_consume(label, registers)
+            result = self._observe_consume(label, registers, read_u64)
         elif self.phase == PHASE_COMPLETE:
             result = self._observe_complete(label, registers, read_u64)
         else:
@@ -345,12 +360,15 @@ class TaskGraphTraceState:
             self.queue = _register(registers, "rdi")
             self.publisher_thread = thread_id
             self.publisher_entry_rsp = _register(registers, "rsp")
+            self.publish_wait_state_before = read_u64(self.queue + 0x1A8)
             return TraceResult(
                 True,
                 f"cycle={self.cycles_started} publish task={self.task:#x} "
                 f"queue={self.queue:#x} "
                 f"priority={_register(registers, 'rdx') & 0xffffffff} "
-                f"entry_rsp={self.publisher_entry_rsp:#x}",
+                f"entry_rsp={self.publisher_entry_rsp:#x} "
+                "wait_state_before="
+                f"{describe_queue_wait_state(self.publish_wait_state_before)}",
             )
 
         if label == PUBLISH_RETURN:
@@ -364,9 +382,13 @@ class TaskGraphTraceState:
                 return TraceResult(False)
             self.publisher_return_rsp = return_rsp
             wake_result = signed_u32(_register(registers, "rax"))
+            wait_state_after = read_u64(self.queue + 0x1A8)
             message = (
                 f"cycle={self.cycles_started} publish-return task={self.task:#x} "
-                f"result={wake_result}"
+                f"result={wake_result} "
+                f"wait_state_before="
+                f"{describe_queue_wait_state(self.publish_wait_state_before)} "
+                f"wait_state_after={describe_queue_wait_state(wait_state_after)}"
             )
             if wake_result < 0:
                 self.phase = PHASE_CONSUME
@@ -393,7 +415,10 @@ class TaskGraphTraceState:
         return TraceResult(False)
 
     def _observe_consume(
-        self, label: str, registers: Mapping[str, int]
+        self,
+        label: str,
+        registers: Mapping[str, int],
+        read_u64: ReadU64,
     ) -> TraceResult:
         if label in (POP_LOCAL, POP_WAIT, POP_DRAIN):
             if _register(registers, "rax") != self.task:
@@ -401,7 +426,9 @@ class TaskGraphTraceState:
             self.pop_site = label
             return TraceResult(
                 True,
-                f"cycle={self.cycles_started} pop task={self.task:#x} site={label}",
+                f"cycle={self.cycles_started} pop task={self.task:#x} "
+                f"site={label} wait_state="
+                f"{describe_queue_wait_state(read_u64(self.queue + 0x1A8))}",
             )
         if label == EXECUTE:
             if _register(registers, "rdi") != self.task:
