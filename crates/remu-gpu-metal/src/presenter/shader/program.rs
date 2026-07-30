@@ -400,6 +400,11 @@ pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
     allocation_message && primitive_export && position_export
 }
 
+/// Returns whether a native draw topology can be represented by the NGG meshlet ABI.
+pub(crate) const fn ngg_mesh_draw_supported(draw: &IndexedDraw) -> bool {
+    (draw.indexed && draw.primitive_type == 4) || (!draw.indexed && draw.primitive_type == 6)
+}
+
 /// Recognizes the position-only AGC primitive stage used for procedural fullscreen rectangles.
 ///
 /// This deliberately describes architectural behavior instead of matching a game address or an

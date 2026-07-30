@@ -97,8 +97,7 @@ impl Compiler<'_> {
             return Ok(());
         }
         if name == "SGetpcB64" {
-            let address = self.program.address
-                + u64::from(instruction.pc)
+            let address = self.program.instruction_address(instruction.pc)
                 + u64::try_from(instruction.words.len() * 4)
                     .map_err(|_| "instruction size overflow".to_owned())?;
             let low = u32::try_from(address & u64::from(u32::MAX))

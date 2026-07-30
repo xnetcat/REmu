@@ -46,8 +46,9 @@ use self::decode::{
     fallback_image_descriptor, graphics_pipeline_key, image_component_class,
     initial_depth_clear_for_target, initial_render_target_clear_color, metal_color_write_mask,
     metal_nonindexed_vertex_count, metal_primitive_type, prepare_indexed_primitive,
-    prepare_ngg_meshlets, raw_video_out_texture_descriptor, read_draw_indices, register_value,
-    render_target_cmask_address, render_target_fast_clear_color, sampled_alias_descriptor,
+    prepare_ngg_meshlets, prepare_nonindexed_ngg_indices, raw_video_out_texture_descriptor,
+    read_draw_indices, register_value, render_target_cmask_address, render_target_fast_clear_color,
+    sampled_alias_descriptor,
 };
 #[cfg(test)]
 use self::decode::{
@@ -126,12 +127,12 @@ use self::shader::{
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    pixel_scalars, program_embeds_global_base, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    ngg_mesh_draw_supported, ngg_mesh_export_stage, pixel_scalars, program_embeds_global_base,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
-    missing_vertex_parameter_exports, ngg_mesh_export_stage, procedural_rectangle_export_stage,
+    missing_vertex_parameter_exports, procedural_rectangle_export_stage,
     rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
     shader_scalar_metadata,
 };
@@ -485,6 +486,7 @@ struct GraphicsPipelineKey {
     depth: Option<DepthTargetPipelineState>,
     sample_count: u32,
     render_target_array_length: u32,
+    uses_mesh_stage: bool,
     primitive_topology_class: MTLPrimitiveTopologyClass,
 }
 

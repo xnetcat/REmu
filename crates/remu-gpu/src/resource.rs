@@ -40,11 +40,13 @@ pub struct GpuRegister {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShaderSnapshot {
     pub header_address: u64,
+    /// Executable shader control-flow graph. For an AGC fused shader this combines the separately
+    /// allocated front and exact back entry points and turns the known `S_SETPC_B64` handoff into
+    /// an ordinary branch while preserving each instruction's architectural guest address.
     pub program: Arc<Program>,
-    /// Additional entry points retained in execution order. Independently terminated programs
-    /// from the leading AGC allocation come first. When AGC fuses a separately allocated back
-    /// half, its exact leading program is appended last; a leading `S_SETPC_B64` makes that final
-    /// entry a linked continuation rather than an independent segment.
+    /// Raw additional entry points retained in allocation order for diagnostics. Independently
+    /// terminated programs from the leading AGC allocation come first. When AGC fuses a separately
+    /// allocated back half, its exact leading program is appended last.
     pub supplemental_programs: Arc<[Program]>,
     pub metadata: Option<Arc<ShaderMetadata>>,
 }
@@ -97,11 +99,11 @@ pub struct IndexedDraw {
     pub index_resource_address: u64,
     pub index_buffer_count: u32,
     pub index_size: u32,
+    /// First index-buffer element for indexed draws, or first vertex ID for non-indexed draws.
     pub index_offset: u32,
     /// Signed GFX10 `INDEX_OFFSET` added to each indexed vertex ID (Metal `baseVertex`).
     ///
-    /// This is independent of `index_offset`, which selects the first element in the index
-    /// buffer for `DRAW_INDEX_OFFSET_2`.
+    /// This is independent of `index_offset`, which supplies the draw's first index or vertex.
     pub base_vertex: i32,
     pub index_count: u32,
     /// Immutable indices captured while the guest submission still owns its transient ring data.

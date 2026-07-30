@@ -29,9 +29,9 @@ use super::{
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
     metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, prepare_ngg_meshlets,
-    read_draw_indices, read_texture_array_linear, read_texture_linear,
-    rearm_color_metadata_clear, rearm_depth_metadata_clear, render_target_cmask_address,
-    render_target_fast_clear_color,
+    prepare_nonindexed_ngg_indices, read_draw_indices, read_texture_array_linear,
+    read_texture_linear, rearm_color_metadata_clear, rearm_depth_metadata_clear,
+    render_target_cmask_address, render_target_fast_clear_color,
 };
 
 fn empty_shader_evaluation() -> Arc<ShaderEvaluation> {
@@ -1400,6 +1400,42 @@ fn packs_ngg_meshlets_with_shared_vertex_indices() {
     assert_eq!(&prepared.words[2..6], &[10, 11, 12, 13]);
     assert_eq!(prepared.words[66], 1 << 10 | 2 << 20);
     assert_eq!(prepared.words[67], 2 | 1 << 10 | 3 << 20);
+}
+
+#[test]
+fn preserves_nonindexed_first_vertex_and_alternates_triangle_strip_winding() {
+    let mut draw = indexed_draw(0, 0, 5);
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    draw.index_offset = 7;
+    let indices = prepare_nonindexed_ngg_indices(&draw).expect("strip expands");
+    assert_eq!(indices.as_ref(), &[7, 8, 9, 9, 8, 10, 9, 10, 11]);
+    let prepared = prepare_ngg_meshlets(indices.as_ref());
+    assert_eq!(prepared.group_count, 1);
+    assert_eq!(prepared.vertex_references, 5);
+    assert_eq!(prepared.primitive_count, 3);
+}
+
+#[test]
+fn empty_nonindexed_triangle_strip_has_no_meshlets() {
+    let mut draw = indexed_draw(0, 0, 2);
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    let indices = prepare_nonindexed_ngg_indices(&draw).expect("short strip is empty");
+    assert!(indices.is_empty());
+    assert_eq!(prepare_ngg_meshlets(indices.as_ref()).group_count, 0);
+}
+
+#[test]
+fn rejects_nonindexed_triangle_strip_vertex_id_overflow_before_allocating() {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    draw.index_offset = u32::MAX;
+    assert_eq!(
+        prepare_nonindexed_ngg_indices(&draw),
+        Err("triangle-strip vertex ID overflow".to_owned())
+    );
 }
 
 #[test]

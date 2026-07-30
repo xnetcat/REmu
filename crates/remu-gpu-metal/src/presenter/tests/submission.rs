@@ -966,6 +966,7 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
         depth: None,
         sample_count: 1,
         render_target_array_length: 1,
+        uses_mesh_stage: false,
         primitive_topology_class: MTLPrimitiveTopologyClass::Triangle,
     };
     let mut draw = indexed_draw(0, 0, 0);
