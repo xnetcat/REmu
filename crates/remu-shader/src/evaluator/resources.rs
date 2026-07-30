@@ -476,21 +476,40 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         registers: &[u32; SCALAR_REGISTER_COUNT],
         _supplemental: bool,
     ) -> Result<(), EvaluationError> {
-        let descriptor =
-            decode_buffer_descriptor(registers, control.scalar_resource).map_err(|()| {
+        let writable =
+            instruction.opcode.contains("Store") || instruction.opcode.contains("Atomic");
+        let descriptor = match decode_buffer_descriptor(registers, control.scalar_resource) {
+            Ok(descriptor) => descriptor,
+            Err(()) if !writable => {
+                // Resource tables may keep a noncanonical sentinel in a read-only slot whose
+                // vector path has no active lanes. The native descriptor fetch is robust for
+                // loads, and shadPS4 likewise canonicalizes an invalid buffer sharp to its null
+                // descriptor. Metal still has to type-check the instruction, so bind the same
+                // bounded zero resource used for null and unreadable load descriptors.
+                return self.record_global_binding(
+                    instruction,
+                    BindingRequest {
+                        scalar_address: control.scalar_resource,
+                        base_address: 0,
+                        requested_bytes: 4,
+                        writable: false,
+                        allow_shorter: false,
+                    },
+                );
+            }
+            Err(()) => {
                 let [words0, words1, words2, words3] =
                     buffer_descriptor_words(registers, control.scalar_resource).unwrap_or_default();
-                EvaluationError::InvalidBufferDescriptor {
+                return Err(EvaluationError::InvalidBufferDescriptor {
                     pc: instruction.pc,
                     register: control.scalar_resource,
                     words0,
                     words1,
                     words2,
                     words3,
-                }
-            })?;
-        let writable =
-            instruction.opcode.contains("Store") || instruction.opcode.contains("Atomic");
+                });
+            }
+        };
         if descriptor.base_address == 0 {
             return self.record_global_binding(
                 instruction,

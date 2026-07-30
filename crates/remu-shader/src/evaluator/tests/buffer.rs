@@ -147,6 +147,111 @@ fn keeps_null_buffer_resources_as_bounded_zero_bindings() {
 }
 
 #[test]
+fn noncanonical_buffer_loads_use_a_bounded_zero_binding() {
+    let shader = state(
+        vec![
+            instruction(
+                0x904,
+                ShaderEncoding::Mubuf,
+                "BufferLoadDword",
+                Vec::new(),
+                vec![Operand::vector(0)],
+                Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                    dword_count: 1,
+                    vector_address: 0,
+                    vector_data: 0,
+                    scalar_resource: 8,
+                    instruction_format: None,
+                    offset_bytes: 0,
+                    index_enabled: false,
+                    offset_enabled: false,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                    tfe: false,
+                })),
+            ),
+            end(0x90c),
+        ],
+        {
+            let mut user_data = vec![0; 12];
+            user_data[8..12].copy_from_slice(&[1, u32::MAX, 1, u32::MAX]);
+            user_data
+        },
+    );
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("a noncanonical read-only buffer sharp must resolve as null");
+
+    assert_eq!(evaluation.global_memory_bindings.len(), 1);
+    assert_eq!(evaluation.global_memory_bindings[0].scalar_address, 8);
+    assert_eq!(evaluation.global_memory_bindings[0].base_address, 0);
+    assert_eq!(evaluation.global_memory_bindings[0].byte_count, 4);
+    assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4]);
+    assert!(!evaluation.global_memory_bindings[0].writable);
+    assert!(!evaluation.global_memory_bindings[0].write_back_to_guest);
+}
+
+#[test]
+fn noncanonical_buffer_stores_and_atomics_remain_errors() {
+    for opcode in ["BufferStoreDword", "BufferAtomicAdd"] {
+        let shader = state(
+            vec![
+                instruction(
+                    0x904,
+                    ShaderEncoding::Mubuf,
+                    opcode,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        scalar_resource: 8,
+                        instruction_format: None,
+                        offset_bytes: 0,
+                        index_enabled: false,
+                        offset_enabled: false,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                        tfe: false,
+                    })),
+                ),
+                end(0x90c),
+            ],
+            {
+                let mut user_data = vec![0; 12];
+                user_data[8..12].copy_from_slice(&[1, u32::MAX, 1, u32::MAX]);
+                user_data
+            },
+        );
+
+        assert!(matches!(
+            evaluate_shader(
+                &TestMemory::default(),
+                &shader,
+                EvaluationOptions::default(),
+            ),
+            Err(EvaluationError::InvalidBufferDescriptor {
+                pc: 0x904,
+                register: 8,
+                words0: 1,
+                words1: u32::MAX,
+                words2: 1,
+                words3: u32::MAX,
+            })
+        ));
+    }
+}
+
+#[test]
 fn unreadable_global_loads_use_a_bounded_zero_binding() {
     let sentinel = 0xf000_0000_0090_u64;
     let shader = state(
