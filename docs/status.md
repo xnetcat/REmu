@@ -148,11 +148,25 @@ in the first floating-point register), `sceSystemGestureOpen`,
 hardware this host does not have; each reports the state that is actually true here — no touch
 occurs, no network link exists — rather than a placeholder, and that is recorded on each call.
 
-The title still submits no draws, and it plateaus in the same place. That is the useful result: the
-remaining defect is a behavioural difference, not a missing ABI. Something REmu returns or does
-differs from what the engine expects, and no further import coverage will find it. SharpEmu is
-reported to reach menus, intro video, and gameplay on this title, so a working reference exists to
-difference against; that comparison is the next step.
+The title still submits no draws. Differencing against SharpEmu, which reaches menus and gameplay
+on this title, located the divergence. SharpEmu was built from its `main` at `5f1bd5a` and run on
+the same dump with `--trace-imports`.
+
+The gross measure first: SharpEmu issues 17.5 million guest import calls in 150 seconds where REmu
+issues about 110 thousand in 120. REmu's guest is barely executing by comparison, so the plateau is
+not slowness — the engine is not doing the work at all.
+
+The concrete divergence is the audio DSP path. In SharpEmu the title creates one ACM context and
+then runs it hard: 7,424 `sceAcmBatchStartBuffers`, 7,424 `sceAcmBatchWait`, and 2,472
+`sceAcm_ConvReverb_SharedInput`. In REmu it creates a context, destroys it, unloads the module,
+and finalizes Ajm, having issued zero batch calls. Every one of those batch and DSP entry points is
+unserved here.
+
+This corrects an earlier reading recorded in this file: the create-then-destroy sequence was
+described as a capability probe. It is not. It is a failure path, and the title abandons its audio
+stack down it. What is not yet explained is *why* it abandons it: no import is unimplemented
+between the create and the destroy, so the engine is reacting to a value REmu returns rather than
+to a missing call. Finding that value, then serving the ACM batch family, is the next step.
 
 Note for whoever picks this up: `scripts/audit-import-coverage.py` under-reports. It walks modules
 from `lib.rs` and does not recognise every dispatch shape, so it lists NIDs as unserved that
