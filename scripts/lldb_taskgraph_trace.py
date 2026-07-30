@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Optional
 
 try:
     import lldb  # type: ignore[import-not-found]
@@ -84,7 +84,7 @@ BREAKPOINTS = {
 for _phase_breakpoints in BREAKPOINTS.values():
     assert len(_phase_breakpoints) <= MAXIMUM_HARDWARE_BREAKPOINTS
 
-ReadU64 = Callable[[int], int | None]
+ReadU64 = Callable[[int], Optional[int]]
 
 
 def _positive_limit(name: str, default: int, maximum: int) -> int:
