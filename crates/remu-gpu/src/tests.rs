@@ -10,14 +10,21 @@ use super::{
     clear_event_sink, compute_program_address, decode_compute_dispatch_direct,
     decode_compute_dispatch_indirect, decode_compute_launch, decode_compute_system_registers,
     emit_event, gpu_completed_submission_sequence, gpu_event_channel, gpu_events_in_flight,
-    gpu_work_items_pending, host_pad_state, install_event_sink, record_gpu_event_consumed,
+    gpu_work_items_pending, host_pad_state, install_event_sink, install_gpu_completion_notifier,
+    record_gpu_event_consumed,
     record_gpu_flip_completed, record_gpu_submission_completed, record_gpu_wait_producer,
     record_gpu_work_item_processed, report_audio_frames, set_host_pad_state,
     take_gpu_completed_flips, take_gpu_completed_submission_ids, take_gpu_wait_latch,
 };
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
+static GPU_COMPLETION_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn record_gpu_completion_notification() {
+    GPU_COMPLETION_NOTIFICATIONS.fetch_add(1, Ordering::Relaxed);
+}
 
 #[test]
 fn host_image_requires_exact_nonempty_rgba8_storage() {
@@ -64,10 +71,16 @@ fn runtime_telemetry_tracks_gpu_queue_and_audio_callback_progress() {
     record_gpu_work_item_processed();
     assert_eq!(gpu_work_items_pending(), 0);
 
+    install_gpu_completion_notifier(record_gpu_completion_notification);
+    let notifications_before = GPU_COMPLETION_NOTIFICATIONS.load(Ordering::Relaxed);
     record_gpu_submission_completed(2);
     record_gpu_submission_completed(1);
     assert_eq!(gpu_completed_submission_sequence(), 2);
     assert_eq!(take_gpu_completed_submission_ids(), [1, 2]);
+    assert_eq!(
+        GPU_COMPLETION_NOTIFICATIONS.load(Ordering::Relaxed),
+        notifications_before + 2
+    );
 
     let flip = GpuFlipCompletion {
         address: 0x7000_0000,
@@ -77,6 +90,10 @@ fn runtime_telemetry_tracks_gpu_queue_and_audio_callback_progress() {
     record_gpu_flip_completed(flip);
     record_gpu_flip_completed(flip);
     assert_eq!(take_gpu_completed_flips(), [flip, flip]);
+    assert_eq!(
+        GPU_COMPLETION_NOTIFICATIONS.load(Ordering::Relaxed),
+        notifications_before + 4
+    );
 
     report_audio_frames(480, 12);
     assert_eq!(audio_output_frames(), 480);

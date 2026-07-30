@@ -20,6 +20,8 @@ pub(crate) static GPU_COMPLETED_SUBMISSIONS: OnceLock<Mutex<BTreeSet<u64>>> = On
 
 pub(crate) static GPU_COMPLETED_FLIPS: OnceLock<Mutex<Vec<GpuFlipCompletion>>> = OnceLock::new();
 
+static GPU_COMPLETION_NOTIFIER: OnceLock<fn()> = OnceLock::new();
+
 pub(crate) static AUDIO_OUTPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) static AUDIO_UNDERRUN_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -100,6 +102,21 @@ pub fn gpu_completed_submission_sequence() -> u64 {
     GPU_COMPLETED_SUBMISSION_SEQUENCE.load(Ordering::Acquire)
 }
 
+/// Installs the process-lifetime callback used to wake the runtime when backend work completes.
+///
+/// Completion payloads remain in the exact-ID and flip queues below. The callback only announces
+/// that a consumer should re-check those queues, so it cannot publish a guest completion early or
+/// change ordering between hardware queues.
+pub fn install_gpu_completion_notifier(notifier: fn()) {
+    let _ = GPU_COMPLETION_NOTIFIER.set(notifier);
+}
+
+fn notify_gpu_completion_consumer() {
+    if let Some(notifier) = GPU_COMPLETION_NOTIFIER.get() {
+        notifier();
+    }
+}
+
 /// Publishes completion of an ordered guest submission.
 ///
 /// Backends may retire different hardware queues out of submission order. Exact IDs are retained
@@ -111,6 +128,7 @@ pub fn record_gpu_submission_completed(sequence: u64) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(sequence);
     let _ = GPU_COMPLETED_SUBMISSION_SEQUENCE.fetch_max(sequence, Ordering::AcqRel);
+    notify_gpu_completion_consumer();
 }
 
 /// Drains the exact set of guest submission IDs completed since the previous runtime refresh.
@@ -134,6 +152,7 @@ pub fn record_gpu_flip_completed(completion: GpuFlipCompletion) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(completion);
+    notify_gpu_completion_consumer();
 }
 
 /// Drains display-buffer presentations completed since the previous runtime refresh.
