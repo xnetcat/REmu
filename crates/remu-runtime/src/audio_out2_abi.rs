@@ -30,6 +30,7 @@ pub(crate) struct AudioOut2State {
     pub(crate) port_state_queries: u64,
     pub(crate) context_advances: u64,
     pub(crate) context_pushes: u64,
+    pub(crate) failed_context_pushes: u64,
     pub(crate) audible_context_pushes: u64,
     #[cfg(test)]
     pub(crate) submitted_pcm: Vec<(u64, Vec<u8>)>,

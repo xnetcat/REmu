@@ -53,6 +53,38 @@ fn audio_out2_output_pointer(
     None
 }
 
+/// Rejects a PCM block after `ContextPush` reserved one virtual hardware-queue slot.
+///
+/// The reservation and the guest-memory snapshot form one operation. Returning an error without
+/// undoing the reservation makes an invalid or concurrently unmapped PCM pointer consume queue
+/// capacity until the device clock happens to drain it, so later valid nonblocking pushes can
+/// spuriously report `NOT_READY`.
+fn reject_audio_out2_reserved_pcm(
+    state: &mut AudioOut2State,
+    context_handle: u64,
+    push: u64,
+    port_handle: u64,
+    address: u64,
+    byte_length: Option<usize>,
+    reason: &str,
+) -> u64 {
+    if let Some(context) = state.contexts.get_mut(&context_handle) {
+        context.queued = context.queued.saturating_sub(1);
+    }
+    state.failed_context_pushes = state.failed_context_pushes.saturating_add(1);
+    let failure = state.failed_context_pushes;
+    if failure <= 8 || failure.is_power_of_two() {
+        let byte_length = byte_length.map_or_else(
+            || "overflow".to_owned(),
+            |byte_length| byte_length.to_string(),
+        );
+        eprintln!(
+            "[REMu][AUDIO2] context push={push} failure={failure} rejected port={port_handle} address={address:#x} bytes={byte_length} reason={reason}; released reserved queue slot"
+        );
+    }
+    sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+}
+
 pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 {
     let state = AUDIO_OUT2.get_or_init(|| Mutex::new(AudioOut2State::default()));
     let mut state = state
@@ -646,6 +678,7 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
             // cannot mutate an already-submitted block. In particular, context/mastering memory
             // is never searched for plausible sample pointers.
             let mut buffers = Vec::new();
+            let mut invalid_pcm = None;
             for (port_handle, port) in state.ports.iter().filter(|(_, port)| {
                 port.context == arguments[0]
                     && port.buffer_address != 0
@@ -656,10 +689,22 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                     .and_then(|frames| frames.checked_mul(usize::from(port.channel_count)))
                     .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
                 else {
-                    return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                    invalid_pcm = Some((
+                        *port_handle,
+                        port.buffer_address,
+                        None,
+                        "grain byte length overflow",
+                    ));
+                    break;
                 };
                 if !process_guest_range_has_read_access(port.buffer_address, byte_length) {
-                    return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+                    invalid_pcm = Some((
+                        *port_handle,
+                        port.buffer_address,
+                        Some(byte_length),
+                        "PCM range is not readable",
+                    ));
+                    break;
                 }
                 let mut snapshot = vec![0_u8; byte_length];
                 read_guest_bytes(port.buffer_address, &mut snapshot);
@@ -671,6 +716,17 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                     port.channel_count,
                     snapshot,
                 ));
+            }
+            if let Some((port_handle, address, byte_length, reason)) = invalid_pcm {
+                return reject_audio_out2_reserved_pcm(
+                    &mut state,
+                    arguments[0],
+                    push,
+                    port_handle,
+                    address,
+                    byte_length,
+                    reason,
+                );
             }
             let audible_push = if buffers.is_empty() {
                 0
