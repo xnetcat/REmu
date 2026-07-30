@@ -21,6 +21,7 @@ mod audio_out2;
 mod audio_out2_abi;
 mod av;
 mod av_player;
+mod ces;
 mod dialog;
 mod guest_files;
 mod guest_libc;
@@ -200,8 +201,10 @@ pub(crate) use dialog::{
 pub(crate) use dialog::{
     common_dialog_initialize, message_dialog_close, message_dialog_get_result,
     message_dialog_get_status, message_dialog_initialize, message_dialog_open,
-    message_dialog_terminate, message_dialog_update_status, save_data_dialog_initialize,
-    save_data_dialog_terminate,
+    message_dialog_terminate, message_dialog_update_status, publish_host_toast,
+    save_data_dialog_close, save_data_dialog_get_result, save_data_dialog_get_status,
+    save_data_dialog_initialize, save_data_dialog_is_ready_to_display, save_data_dialog_open,
+    save_data_dialog_terminate, save_data_dialog_update_status,
 };
 #[cfg(any(test, not(unix)))]
 pub(crate) use guest_files::kernel_stat_payload;
@@ -255,8 +258,9 @@ pub use nid_table::{known_nid_name, nid_display_name};
 pub(crate) use np_api::{
     np_game_intent_get_property_string, np_game_intent_initialize, np_game_intent_receive,
     np_trophy_abort_handle, np_trophy_create_context, np_trophy_create_handle,
-    np_trophy_destroy_context, np_trophy_destroy_handle, np_trophy_register_context,
-    np_trophy_register_unlock_callback, np_trophy_unregister_unlock_callback,
+    np_trophy_destroy_context, np_trophy_destroy_handle, np_trophy_get_game_info,
+    np_trophy_register_context, np_trophy_register_unlock_callback,
+    np_trophy_unregister_unlock_callback,
     np_universal_data_abort_handle, np_universal_data_array_set_string,
     np_universal_data_create_context, np_universal_data_create_event,
     np_universal_data_create_handle, np_universal_data_create_property_object,
@@ -310,7 +314,8 @@ pub(crate) use save_data::{
 };
 pub(crate) use save_data::{
     current_unix_seconds, read_guest_bytes, save_data_commit,
-    save_data_create_transaction_resource, save_data_dir_name_search, save_data_initialize,
+    save_data_create_transaction_resource, save_data_delete_transaction_resource,
+    save_data_dir_name_search, save_data_initialize,
     save_data_mount3, save_data_prepare, save_data_save_icon, save_data_set_param,
     save_data_umount2, write_guest_bytes,
 };
@@ -419,6 +424,8 @@ struct ProbeDispatchState {
     process_param_address: u64,
     thread_atexit_count_callback: u64,
     thread_atexit_report_callback: u64,
+    /// Per-guest-thread counts `_sceKernelRtldThreadAtexitIncrement` accumulates for CRT teardown.
+    thread_atexit_counts: BTreeMap<u64, u64>,
     thread_dtors_callback: u64,
     /// Pending `__cxa_thread_atexit` destructor references keyed by module base.
     ///
@@ -775,6 +782,10 @@ const DEFAULT_THREAD_AFFINITY_MASK: u64 = 0x7f;
 const DEFAULT_THREAD_STACK_SIZE: u64 = 0x10_0000;
 const DEFAULT_THREAD_GUARD_SIZE: u64 = 0x1000;
 const DEFAULT_THREAD_PRIORITY: i32 = 700;
+/// Floor applied only to the host `std::thread` stack. Guest-visible pthread attributes keep the
+/// size the title requested; Rosetta plus deep AGC HLE on graphics submit threads needs more than
+/// the console's 16 KiB minimum.
+const HOST_PTHREAD_STACK_FLOOR: usize = 0x20_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PthreadAttrState {
@@ -908,9 +919,14 @@ struct RuntimeServiceState {
     common_dialog_owner: Option<CommonDialogOwner>,
     /// Lifecycle state of the system message dialog, using the common-dialog status values.
     message_dialog_status: u32,
+    message_dialog_sequence: u64,
+    message_dialog_result_code: u32,
+    message_dialog_button: u32,
     play_go_initialized: bool,
     play_go_open: bool,
     save_data_dialog_status: i32,
+    save_data_dialog_sequence: u64,
+    save_data_dialog_result_code: u32,
     agc_states: BTreeMap<u64, u32>,
     game_update: InitializationState,
     np_entitlement_access: Option<(u64, u64)>,
@@ -1522,6 +1538,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.process_param_address = image.process_param.map_or(0, GuestAddress::get);
     state.thread_atexit_count_callback = 0;
     state.thread_atexit_report_callback = 0;
+    state.thread_atexit_counts.clear();
     state.thread_dtors_callback = 0;
     state.module_tls_destructor_refs.clear();
     state.application_heap_api_address = 0;
@@ -1578,6 +1595,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.np_universal_data = np::UniversalDataState::default();
     state.np_game_intent = np::GameIntentState::default();
     state.np_trophy = np::TrophyState::default();
+    remu_gpu::reset_host_dialog_state();
     state.agc_submission_count = 0;
     state.agc_graphics = AgcGraphicsState::default();
     state.agc_compute_queues.clear();
@@ -2789,10 +2807,21 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN));
         };
         let mut builder = std::thread::Builder::new();
-        if let Ok(stack_size) = usize::try_from(attributes.stack_size)
-            && stack_size >= usize::try_from(MACOS_GUEST_PAGE_ALIGNMENT).unwrap_or(0x4000)
-        {
-            builder = builder.stack_size(stack_size);
+        let guest_stack_size = usize::try_from(attributes.stack_size).unwrap_or(0);
+        let page_alignment = usize::try_from(MACOS_GUEST_PAGE_ALIGNMENT).unwrap_or(0x4000);
+        let host_stack_size = if guest_stack_size >= page_alignment {
+            guest_stack_size.max(HOST_PTHREAD_STACK_FLOOR)
+        } else {
+            0
+        };
+        if host_stack_size != 0 {
+            builder = builder.stack_size(host_stack_size);
+            if host_stack_size > guest_stack_size {
+                eprintln!(
+                    "[REMu][THREAD] raised host stack name={:?} guest={guest_stack_size:#x} host={host_stack_size:#x}",
+                    thread_name.as_deref().unwrap_or(""),
+                );
+            }
         }
         if let Some(name) = thread_name.as_ref() {
             builder = builder.name(name.clone());
@@ -2809,7 +2838,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
                     (0, 0)
                 };
             eprintln!(
-                "[REMu][THREAD] create handle={handle} name={:?} entry={entry:#x} arg={thread_argument:#x} inner={inner_entry:#x}/{inner_argument:#x} detach={} stack={:#x}",
+                "[REMu][THREAD] create handle={handle} name={:?} entry={entry:#x} arg={thread_argument:#x} inner={inner_entry:#x}/{inner_argument:#x} detach={} stack={:#x} host_stack={host_stack_size:#x}",
                 thread_name.as_deref().unwrap_or(""),
                 attributes.detach_state,
                 attributes.stack_size
@@ -4103,6 +4132,7 @@ fn dispatch_stateless_import(
         "YUeqkyT7mEQ" => agc_dcb_set_flip(arguments),
         "rPo6tV8D9bM" => system_service_get_status(arguments),
         "fZo48un7LK4" => system_service_param_get_int(arguments),
+        "SsC-m-S9JTA" => system_service_param_get_string(arguments),
         "3RQ5aQfnstU" => system_service_get_notice_screen_skip_flag(arguments[0]),
         "Xjoosiw+XPI" => guest_uuid_create(arguments[0]),
         "yDBwVAolDgg" => guest_kernel_is_stack(arguments),
@@ -4117,7 +4147,8 @@ fn dispatch_stateless_import(
         "-sD02mFDBh4" => user_service_get_game_presets(arguments),
         "R9lA82OraNs" => app_content_initialize(arguments),
         "99b82IKXpH4" => app_content_app_param_get_int(arguments),
-        "eaFXjfJv3xs" | "-4GCfYdNF1s" => 0,
+        "eaFXjfJv3xs" => dialog::ime_keyboard_open(),
+        "-4GCfYdNF1s" => 0,
         "18B2NS1y9UU" => rtc_get_current_tick(arguments[0]),
         "ZPD1YOKI+Kw" => rtc_get_current_clock_local_time(arguments[0]),
         "8w-H19ip48I" => rtc_get_tick(arguments),
@@ -4604,6 +4635,7 @@ fn dispatch_probe_import(
         // libSceSystemService status used by the foreground/background state machine.
         "rPo6tV8D9bM" => system_service_get_status(arguments),
         "fZo48un7LK4" => system_service_param_get_int(arguments),
+        "SsC-m-S9JTA" => system_service_param_get_string(arguments),
         "RpQJJVKTiFM" | "4fU5yvOkVG4" => kernel_module_info_for_unwind(arguments, state),
         "f7KBOafysXo" => kernel_module_info_from_addr(arguments, state),
         "crb5j7mkk1c" | "OMDRKKAZ8I4" => 0,
@@ -4625,6 +4657,7 @@ fn dispatch_probe_import(
         "dyIhnXq-0SM" => save_data_dir_name_search(arguments, state),
         "ZP4e7rlzOUk" => save_data_mount3(arguments, state),
         "gjRZNnw0JPE" => save_data_create_transaction_resource(arguments, state),
+        "lJUQuaKqoKY" => save_data_delete_transaction_resource(arguments, state),
         "uW4vfTwMQVo" => save_data_umount2(arguments, state),
         "sDCBrmc61XU" => save_data_prepare(arguments, state),
         "85zul--eGXs" => save_data_set_param(arguments, state),
@@ -4675,11 +4708,12 @@ fn dispatch_probe_import(
         "uoUpLGNkygk" => common_dialog_initialize(state),
         "s9e3+YpRnzw" => save_data_dialog_initialize(state),
         "YuH2FA7azqQ" => save_data_dialog_terminate(state),
-        "ERKzksauAJA" => state
-            .services
-            .save_data_dialog_status
-            .cast_unsigned()
-            .into(),
+        "4tPhsP6FpDI" => save_data_dialog_open(arguments[0], state),
+        "fH46Lag88XY" => save_data_dialog_close(state),
+        "ERKzksauAJA" => save_data_dialog_get_status(state),
+        "KK3Bdg1RWK0" => save_data_dialog_update_status(state),
+        "yEiJ-qqr6Cg" => save_data_dialog_get_result(arguments[0], state),
+        "en7gNVnh878" => save_data_dialog_is_ready_to_display(state),
         "D0OdFMjp46I" => kernel_create_equeue(arguments[0], state),
         "jpFjmgAC5AE" => kernel_delete_equeue(arguments[0], state),
         "kmSe30JTs+E" => video_out_add_output_mode_event(arguments, state),
@@ -4721,6 +4755,7 @@ fn dispatch_probe_import(
         "d8P11CI40KE" => np_trophy_destroy_handle(arguments[0], state),
         "fYapWA9xVmA" => np_trophy_abort_handle(arguments[0], state),
         "bIDov3wBu5Q" => np_trophy_register_context(arguments, state),
+        "4IzqhhUQ3nk" => np_trophy_get_game_info(arguments, state),
         "sUXGfNMalIo" => np_trophy_register_unlock_callback(arguments, state),
         "wVqxM58sIKs" => np_trophy_unregister_unlock_callback(state),
         // Exact Gen5 register-default descriptors consumed by indirect AGC state packets.
@@ -4790,6 +4825,9 @@ fn dispatch_extended_import(
         return Some(result);
     }
     if let Some(result) = av::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    if let Some(result) = ces::dispatch(nid, arguments, state) {
         return Some(result);
     }
     None
@@ -5792,6 +5830,38 @@ fn system_service_param_get_int(arguments: [u64; 6]) -> u64 {
         _ => 0,
     };
     write_guest_u32(arguments[1], value.cast_unsigned());
+    0
+}
+
+fn system_service_param_get_string(arguments: [u64; 6]) -> u64 {
+    const SYSTEM_SERVICE_ERROR_PARAMETER: u32 = 0x80a1_0003;
+
+    let (param, output, capacity) = (low_i32(arguments[0]), arguments[1], arguments[2]);
+    if output == 0 || capacity == 0 {
+        return sce_kernel_error(SYSTEM_SERVICE_ERROR_PARAMETER);
+    }
+    let value: &[u8] = match param {
+        1 => b"en\0",
+        2 => b"en-US\0",
+        3 | 6 => b"US\0",
+        4 => b"America/Los_Angeles\0",
+        5 => b"\0",
+        _ => return sce_kernel_error(SYSTEM_SERVICE_ERROR_PARAMETER),
+    };
+    let Some(capacity) = usize::try_from(capacity).ok() else {
+        return sce_kernel_error(SYSTEM_SERVICE_ERROR_PARAMETER);
+    };
+    if capacity < value.len() {
+        return sce_kernel_error(SYSTEM_SERVICE_ERROR_PARAMETER);
+    }
+    write_guest_bytes(output, value);
+    if capacity > value.len() {
+        guest_memset(
+            output + u64::try_from(value.len()).unwrap_or(u64::MAX),
+            0,
+            u64::try_from(capacity - value.len()).unwrap_or(0),
+        );
+    }
     0
 }
 

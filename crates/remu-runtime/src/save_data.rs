@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::{
-    ProbeDispatchState, SaveDataMount, SaveDataTransaction, low_i32, read_guest_u32,
+    ProbeDispatchState, SaveDataMount, SaveDataTransaction, low_i32, low_u32, read_guest_u32,
     read_guest_u64, sce_kernel_error, write_guest_u32, write_guest_u64,
 };
 
@@ -199,6 +199,21 @@ pub(crate) fn save_data_create_transaction_resource(
         arguments[0]
     );
     u64::from(id)
+}
+
+pub(crate) fn save_data_delete_transaction_resource(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
+    let resource = low_u32(arguments[0]);
+    if resource == 0 || !state.save_transaction_resources.remove(&resource) {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    eprintln!("[REMu][SAVEDATA] deleted transaction resource={resource}");
+    0
 }
 
 pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {

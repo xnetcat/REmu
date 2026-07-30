@@ -25,6 +25,7 @@ mod decode;
 mod diagnostics;
 mod execute;
 mod format;
+mod host_ui;
 mod present;
 mod readback;
 mod sampler;
@@ -74,6 +75,7 @@ use self::diagnostics::{
     diagnostic_capture_vertex_position, diagnostic_context_register_snapshot,
     diagnostic_disable_blending, diagnostic_disable_culling, diagnostic_disable_depth,
     diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
+    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader,
     diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
@@ -372,9 +374,18 @@ enum PresentationResolution {
 }
 
 struct PresentationResources {
-    pipeline: RenderPipelineState,
+    /// Drawable + pipeline for linear float scanout (Unity RGBA16F): Metal writes sRGB.
+    srgb_pipeline: RenderPipelineState,
+    /// Drawable + pipeline for display-referred Unorm scanout (VT RGB10A2): passthrough.
+    unorm_pipeline: RenderPipelineState,
+    /// Alpha-blended system UI overlay for sRGB drawables.
+    overlay_srgb_pipeline: RenderPipelineState,
+    /// Alpha-blended system UI overlay for Unorm drawables.
+    overlay_unorm_pipeline: RenderPipelineState,
+    overlay_texture: Texture,
     _vertex_function: Function,
     _fragment_function: Function,
+    _overlay_fragment_function: Function,
     sampler: SamplerState,
 }
 

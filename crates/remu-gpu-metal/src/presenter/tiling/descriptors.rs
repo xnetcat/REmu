@@ -155,8 +155,8 @@ pub(crate) fn guest_texture_descriptors_share_depth_sample_storage(
     );
     // Prospero depth SRDs expose the native Z plane through R, optionally replicating it or
     // supplying zero/one in the other channels. Metal samples the native depth texture as a
-    // scalar float, so these encodings need no CPU materialization or pixel-format conversion.
-    let supported_select = matches!(destination_select, 0 | 0x004 | 0x204 | 0x924);
+    // scalar float in .x; XYZW identity (0xFAC) is common for R32 views that only read .x/.r.
+    let supported_select = matches!(destination_select, 0 | 0x004 | 0x204 | 0x924 | 0xfac);
     formats_are_depth_sample_views
         && supported_select
         && guest_texture_descriptors_have_same_byte_layout(rendered, sampled)

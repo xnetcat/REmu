@@ -57,12 +57,24 @@ pub use resource::{
     GpuScanoutTarget, GraphicsApi, IndexedDraw, ShaderSnapshot,
 };
 
+mod dialog;
+pub use dialog::{
+    HostDialogButtons, HostDialogKind, HostDialogRequest, HostDialogResult,
+    HostDialogResultCode, HostToastRequest, begin_host_dialog, cancel_host_dialog,
+    complete_host_dialog, host_dialog_is_pending, host_dialog_result, reset_host_dialog_state,
+};
+
+mod system_ui;
+pub use system_ui::{
+    SYSTEM_UI_HEIGHT, SYSTEM_UI_WIDTH, SystemUiFramebuffer, rasterize_system_ui,
+};
+
 mod pad;
 pub use pad::{
     HostPadState, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
     PAD_BUTTON_L2, PAD_BUTTON_L3, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1,
     PAD_BUTTON_R2, PAD_BUTTON_R3, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE,
-    PAD_BUTTON_UP, host_pad_state, set_host_pad_state,
+    PAD_BUTTON_UP, host_pad_buttons_held, host_pad_state, set_host_pad_state,
 };
 
 #[cfg(test)]

@@ -256,7 +256,49 @@ fn save_data_dialog_initialization_requires_and_owns_common_dialog_state() {
         crate::known_nid_name("YuH2FA7azqQ"),
         Some("sceSaveDataDialogTerminate")
     );
+    assert_eq!(
+        crate::known_nid_name("KK3Bdg1RWK0"),
+        Some("sceSaveDataDialogUpdateStatus")
+    );
     assert!(state.unimplemented_nids.is_empty());
+
+    // Without a presenter, Open auto-completes with cancel so UpdateStatus reaches FINISHED.
+    remu_gpu::reset_host_dialog_state();
+    let mut open_state = ProbeDispatchState::default();
+    assert_eq!(
+        dispatch_probe_import("uoUpLGNkygk", [0; 6], [0; 6], &mut open_state),
+        0
+    );
+    assert_eq!(
+        dispatch_probe_import("s9e3+YpRnzw", [0; 6], [0; 6], &mut open_state),
+        0
+    );
+    let mut parameters = [0_u8; 32];
+    assert_eq!(
+        dispatch_probe_import(
+            "4tPhsP6FpDI",
+            [(&raw mut parameters).addr() as u64, 0, 0, 0, 0, 0],
+            [0; 6],
+            &mut open_state,
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch_probe_import("KK3Bdg1RWK0", [0; 6], [0; 6], &mut open_state),
+        3,
+        "auto-dismissed save dialog finishes on the first UpdateStatus poll"
+    );
+    let mut result = [0_u32; 4];
+    assert_eq!(
+        dispatch_probe_import(
+            "yEiJ-qqr6Cg",
+            [(&raw mut result).addr() as u64, 0, 0, 0, 0, 0],
+            [0; 6],
+            &mut open_state,
+        ),
+        0
+    );
+    assert_eq!(result[1], 1, "auto-dismissed dialog reports user canceled");
 
     let mut busy = ProbeDispatchState::default();
     assert_eq!(

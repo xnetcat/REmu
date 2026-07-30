@@ -135,6 +135,24 @@ fn lowers_observed_bit_reverse_and_wave32_saveexec_operations() {
     assert!(saveexec.source.contains("& 0xFFFFFFFFul"));
     assert!(saveexec.source.contains("remu_s_20 = (uint)"));
     assert!(saveexec.source.contains("exec = (("));
+
+    let saveexec32 = compile_vector_instruction(
+        Instruction {
+            pc: 0xb0c,
+            encoding: ShaderEncoding::Sop1,
+            opcode: Opcode::Known("SAndSaveexecB32"),
+            words: vec![0],
+            sources: vec![Operand::scalar(10)],
+            destinations: vec![Operand::scalar(20)],
+            control: None,
+        },
+        MetalShaderStage::Pixel,
+    );
+    assert!(saveexec32.source.contains("(uint)(uint64_t)simd_ballot(exec)"));
+    assert!(saveexec32.source.contains("s[20] = ") || saveexec32.source.contains("remu_s_20 = "));
+    assert!(saveexec32.source.contains("s[126]") || saveexec32.source.contains("remu_s_126"));
+    assert!(saveexec32.source.contains("s[127] = 0u") || saveexec32.source.contains("remu_s_127 = 0u"));
+    assert!(saveexec32.source.contains("exec = "));
 }
 
 #[test]

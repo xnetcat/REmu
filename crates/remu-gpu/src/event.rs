@@ -2,7 +2,7 @@
 
 //! Ordered guest GPU events and the command payloads they carry.
 
-use crate::{ComputeDispatch, GpuHostImage, IndexedDraw};
+use crate::{ComputeDispatch, GpuHostImage, HostDialogRequest, HostToastRequest, IndexedDraw};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -35,6 +35,12 @@ pub enum GpuEvent {
     ShowHostSplash(GpuHostImage),
     /// Removes the system-owned splash, revealing the newest guest scanout (or black).
     HideHostSplash,
+    /// A modal host dialog the guest common-dialog ABIs poll until the user dismisses it.
+    ShowHostDialog(HostDialogRequest),
+    /// Forces any visible modal dialog closed (guest `Close` / `Terminate`).
+    HideHostDialog { sequence: u64 },
+    /// A non-modal toast (trophy unlock, notification) that does not block dialog polling.
+    ShowHostToast(HostToastRequest),
     Flip {
         address: u64,
         buffer_index: u32,

@@ -218,18 +218,26 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
             .contains("threadgroup_barrier(mem_flags::mem_threadgroup)")
     );
     assert!(
-        shader.source.contains(
-            "remu_s_3 = remu_mesh_counts | (((remu_thread_index >> 5u) & 0xfu) << 24u);"
-        ) || shader.source.contains(
-            "s[3] = remu_mesh_counts | (((remu_thread_index >> 5u) & 0xfu) << 24u);"
-        ),
+        shader.source.contains("remu_mesh_wave_count"),
+        "96-thread NGG subgroups must compute a wave32 count for s3[31:28]"
+    );
+    assert!(
+        shader
+            .source
+            .contains("((remu_thread_index >> 5u) & 0xfu) << 24u"),
         "96-thread NGG subgroups must pack a wave32 index into s3[27:24]"
     );
     assert!(
         shader
             .source
-            .contains("remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f);"),
-        "unexported mesh vertices must default to clipped w=0, not NDC center"
+            .contains("((remu_mesh_wave_count & 0xfu) << 28u)"),
+        "96-thread NGG subgroups must pack wave count into s3[31:28] for export reduce"
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f)"),
+        "unexported mesh vertices must default to w=0 so they stay clipped"
     );
     assert!(shader.source.contains("remu_mesh.set_index("));
     assert!(shader.source.contains("remu_mesh.set_vertex("));

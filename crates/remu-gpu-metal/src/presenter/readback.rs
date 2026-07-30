@@ -471,6 +471,8 @@ pub(super) fn native_texture_capture_to_bgra(
             if native_bytes.len() < bgra.len() {
                 return None;
             }
+            // RGB10A2 VideoOut is display-referred Unorm (same as the host Unorm present path).
+            // Do not apply a second linear→sRGB encode here.
             for (source, destination) in native_bytes.chunks_exact(4).zip(bgra.chunks_exact_mut(4))
             {
                 let packed = u32::from_le_bytes(source.try_into().expect("four-byte pixel"));
@@ -479,9 +481,9 @@ pub(super) fn native_texture_capture_to_bgra(
                 let blue = (((packed >> 20) & 0x3ff) * 255 + 511) / 1023;
                 let alpha = ((packed >> 30) & 0x3) * 85;
                 destination.copy_from_slice(&[
-                    linear_unorm8_to_srgb_unorm8(u8::try_from(blue).expect("10-bit blue scales")),
-                    linear_unorm8_to_srgb_unorm8(u8::try_from(green).expect("10-bit green scales")),
-                    linear_unorm8_to_srgb_unorm8(u8::try_from(red).expect("10-bit red scales")),
+                    u8::try_from(blue).expect("10-bit blue scales"),
+                    u8::try_from(green).expect("10-bit green scales"),
+                    u8::try_from(red).expect("10-bit red scales"),
                     u8::try_from(alpha).expect("2-bit alpha scales"),
                 ]);
             }

@@ -128,7 +128,7 @@ fn capture_decodes_packed_rgb10a2_unorm_channels() {
     };
     assert_eq!(
         native_texture_capture_to_bgra(&packed.to_le_bytes(), descriptor),
-        Some(vec![137, 188, 255, 170]),
+        Some(vec![64, 128, 255, 170]),
     );
 }
 

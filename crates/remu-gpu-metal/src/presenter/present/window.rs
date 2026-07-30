@@ -56,10 +56,9 @@ impl MetalPresenter {
             .ok_or("Metal presenter resources are unavailable")?;
         let mut layer = MetalLayer::new();
         layer.set_device(device);
-        // Guest render targets are linear (including the RGBA16F scanout used by Unity). An
-        // sRGB drawable applies the display transfer function while storing into the 8-bit
-        // swapchain. Presenting into BGRA8Unorm copied those linear values verbatim and crushed
-        // the entire lower end of the scene toward black.
+        // Default to sRGB for linear float scanouts (Unity RGBA16F). Display-referred Unorm
+        // scanouts such as Void Terrarium's RGB10A2 switch the layer to BGRA8Unorm at present
+        // time so Metal does not apply a second linear→sRGB encode.
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm_sRGB);
         // Presentation uses a fullscreen sampling pass so a high-resolution guest display buffer
         // does not force an equally large host drawable. The layer remains framebuffer-only.
@@ -943,6 +942,7 @@ impl ApplicationHandler for MetalPresenter {
         }
         self.retire_completed_presentations();
         self.update_window_title();
+        crate::presenter::host_ui::poll_host_ui();
         if self.redraw_pending
             && let Some(window) = self.window.as_ref()
         {
