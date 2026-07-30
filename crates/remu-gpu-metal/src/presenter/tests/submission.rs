@@ -22,7 +22,8 @@ use std::time::Duration;
 use super::super::UploadedGlobalBuffer;
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::submission::{
-    append_unique_guest_write_ranges, collect_pending_guest_write_ranges,
+    append_unique_global_writebacks, append_unique_guest_write_ranges,
+    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
 };
 use super::{
     ComputePipelineKey, GLOBAL_UPLOAD_ALIGNMENT, GraphicsDiagnosticPipelineState,
@@ -80,10 +81,16 @@ fn record_zero_copy_guest_writer(
         .expect("Metal queue")
         .clone();
     presenter.ensure_open_guest_batch(&queue);
-    let uploaded = presenter
-        .upload_global_buffer(device, binding)
-        .expect("writable shared guest binding uploads");
-    assert!(uploaded.guest_memory);
+    let byte_count = u64::try_from(binding.byte_count).expect("binding byte count fits u64");
+    let backing_range = guest_shared_backing_range(binding.base_address, byte_count)
+        .expect("synthetic zero-copy writer range resolves");
+    let uploaded = UploadedGlobalBuffer {
+        buffer: metal_buffer_with_guest_backing_range(device, &backing_range)
+            .expect("synthetic zero-copy writer buffer"),
+        offset: backing_range.resource_offset(),
+        guest_memory: true,
+        physical_identity: guest_shared_backing_identity(binding.base_address, byte_count),
+    };
     let evaluation = evaluation_with_global(binding.clone());
     let mut pending = Vec::new();
     collect_pending_guest_write_ranges(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
@@ -697,7 +704,7 @@ fn disjoint_guest_aliases_share_one_coherent_physical_global_buffer() {
         instruction_pcs: Default::default(),
         byte_count: requested_bytes,
         data: Vec::new(),
-        writable: true,
+        writable: false,
         write_back_to_guest: false,
     };
     let mut contiguous_binding = disjoint_binding.clone();
@@ -708,6 +715,8 @@ fn disjoint_guest_aliases_share_one_coherent_physical_global_buffer() {
     let contiguous_upload = presenter
         .upload_global_buffer(&device, &contiguous_binding)
         .expect("contiguous alias reuses the physical view");
+    assert!(disjoint_upload.guest_memory);
+    assert!(contiguous_upload.guest_memory);
     assert!(
         std::ptr::eq(
             disjoint_upload.buffer.as_ref(),
@@ -719,7 +728,117 @@ fn disjoint_guest_aliases_share_one_coherent_physical_global_buffer() {
 }
 
 #[test]
-fn queued_zero_copy_writer_forwards_exact_buffer_across_shifted_aliases_and_eviction() {
+fn writable_physical_alias_uses_exact_staging_and_preserves_adjacent_bytes() {
+    let mut address_space = GuestAddressSpace::new(5 * GUEST_PAGE_SIZE).unwrap();
+    let base = address_space.base();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let observer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base.checked_add(2 * GUEST_PAGE_SIZE).unwrap()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let binding_offset = 128_u64;
+    let binding_byte_count = 16_usize;
+    let before = producer_alias.get() + binding_offset - 1;
+    let binding_address = producer_alias.get() + binding_offset;
+    let after = binding_address + u64::try_from(binding_byte_count).unwrap();
+    // SAFETY: both aliases remain mapped read/write for the duration of the test.
+    unsafe {
+        (before as *mut u8).write(0xa1);
+        (after as *mut u8).write(0xb2);
+        std::ptr::write_bytes(binding_address as *mut u8, 0x11, binding_byte_count);
+    }
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: binding_address,
+        instruction_pcs: Default::default(),
+        byte_count: binding_byte_count,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("writable alias uses staged storage");
+    assert!(!uploaded.guest_memory);
+    assert_eq!(uploaded.offset, 0);
+    assert_eq!(
+        uploaded.buffer.length(),
+        u64::try_from(binding_byte_count).unwrap()
+    );
+    assert_eq!(
+        uploaded.physical_identity,
+        guest_shared_backing_identity(binding_address, u64::try_from(binding_byte_count).unwrap())
+    );
+
+    let evaluation = evaluation_with_global(binding.clone());
+    let mut pending = Vec::new();
+    collect_pending_global_writebacks(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
+        .expect("exact staged writeback is captured");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].mapping_identity, uploaded.physical_identity);
+    assert!(pending[0].write_watch.is_none());
+    // SAFETY: the exact shared buffer is binding_byte_count bytes long and retained by `uploaded`.
+    unsafe {
+        std::ptr::write_bytes(
+            uploaded.buffer.contents().cast::<u8>(),
+            0x5a,
+            binding_byte_count,
+        );
+    }
+    write_back_pending_globals(&pending).expect("identity-checked exact writeback succeeds");
+
+    let observer_binding = observer_alias.get() + binding_offset;
+    // SAFETY: both aliases remain mapped and share the same physical backing.
+    unsafe {
+        assert_eq!((before as *const u8).read(), 0xa1);
+        assert_eq!((after as *const u8).read(), 0xb2);
+        assert_eq!(
+            ((observer_binding - 1) as *const u8).read(),
+            0xa1,
+            "the byte before the exact writable range is preserved through the alias"
+        );
+        assert_eq!(
+            ((observer_binding + u64::try_from(binding_byte_count).unwrap()) as *const u8).read(),
+            0xb2,
+            "the byte after the exact writable range is preserved through the alias"
+        );
+        for offset in 0..binding_byte_count {
+            assert_eq!(
+                ((observer_binding + u64::try_from(offset).unwrap()) as *const u8).read(),
+                0x5a
+            );
+        }
+    }
+}
+
+#[test]
+fn queued_zero_copy_writer_stages_writable_alias_across_shifted_aliases_and_eviction() {
     let mut address_space = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).unwrap();
     let base = address_space.base();
     let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
@@ -779,32 +898,33 @@ fn queued_zero_copy_writer_forwards_exact_buffer_across_shifted_aliases_and_evic
         byte_count: 64,
         data: Vec::new(),
         writable: true,
-        write_back_to_guest: false,
+        write_back_to_guest: true,
     };
     let consumer = presenter
         .upload_global_buffer(&device, &consumer_binding)
-        .expect("contained aliased consumer forwards the queued producer");
-    assert!(consumer.guest_memory);
-    assert!(std::ptr::eq(
+        .expect("contained writable alias stages the queued producer");
+    assert!(!consumer.guest_memory);
+    assert!(!std::ptr::eq(
         producer.buffer.as_ref(),
         consumer.buffer.as_ref()
     ));
-    assert_eq!(consumer.offset, producer.offset + 64);
+    assert_eq!(consumer.offset, 0);
+    assert_eq!(consumer.buffer.length(), 64);
 
     let consumer_evaluation = evaluation_with_global(consumer_binding.clone());
     let mut pending_consumer = Vec::new();
-    collect_pending_guest_write_ranges(
+    collect_pending_global_writebacks(
         std::slice::from_ref(&consumer),
         &consumer_evaluation,
         &mut pending_consumer,
     )
     .unwrap();
-    append_unique_guest_write_ranges(
+    append_unique_global_writebacks(
         &mut presenter
             .open_guest_batch
             .as_mut()
             .expect("producer batch stays open")
-            .guest_write_ranges,
+            .global_writebacks,
         pending_consumer,
     );
 
@@ -820,12 +940,12 @@ fn queued_zero_copy_writer_forwards_exact_buffer_across_shifted_aliases_and_evic
     let third = presenter
         .upload_global_buffer(&device, &third_binding)
         .expect("third read forwards the latest writable alias");
-    assert!(third.guest_memory);
+    assert!(!third.guest_memory);
     assert!(std::ptr::eq(
-        producer.buffer.as_ref(),
+        consumer.buffer.as_ref(),
         third.buffer.as_ref()
     ));
-    assert_eq!(third.offset, producer.offset + 80);
+    assert_eq!(third.offset, 16);
 }
 
 #[test]
