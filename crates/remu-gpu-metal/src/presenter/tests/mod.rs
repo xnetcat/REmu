@@ -48,6 +48,7 @@ use super::{
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     linear_unorm8_to_srgb_unorm8, metal_buffer_with_guest_backing_range, metal_color_write_mask,
     metal_nonindexed_vertex_count, metal_primitive_topology_class, metal_primitive_type,
+    metal_scissor_rect_for_draw,
     missing_vertex_parameter_exports,
     mode5_mip_chain_layout, mode5_within_block_byte_offset, mode9_within_block_byte_offset,
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_mip_chain_layout,

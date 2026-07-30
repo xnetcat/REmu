@@ -36,7 +36,9 @@ mod tiling;
 #[cfg(test)]
 use self::cache::metal_buffer_with_guest_backing_range;
 #[cfg(test)]
-use self::execute::{export_resource_render_stage, ngg_mesh_dispatch_required};
+use self::execute::{
+    export_resource_render_stage, metal_scissor_rect_for_draw, ngg_mesh_dispatch_required,
+};
 use self::cache::{GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT};
 use self::decode::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_BLEND0_CONTROL,

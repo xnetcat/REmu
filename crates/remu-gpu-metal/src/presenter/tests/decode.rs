@@ -29,9 +29,10 @@ use super::{
     guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
-    metal_primitive_type, ngg_mesh_base_vertex, ngg_mesh_dispatch_required, pixel_input_controls,
-    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
-    read_draw_indices, read_texture_array_linear, read_texture_linear, rearm_color_metadata_clear,
+    metal_primitive_type, metal_scissor_rect_for_draw, ngg_mesh_base_vertex,
+    ngg_mesh_dispatch_required, pixel_input_controls, prepare_indexed_primitive,
+    prepare_ngg_meshlets, prepare_nonindexed_ngg_indices, read_draw_indices,
+    read_texture_array_linear, read_texture_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, render_target_cmask_address, render_target_fast_clear_color,
 };
 
@@ -45,6 +46,38 @@ fn empty_shader_evaluation() -> Arc<ShaderEvaluation> {
         compute_system_registers: None,
         vertex_inputs: Vec::new(),
     })
+}
+
+#[test]
+fn programs_full_scissor_after_a_restricted_draw() {
+    let restricted = metal_scissor_rect_for_draw(
+        GuestScissor::Rect(metal::MTLScissorRect {
+            x: 32,
+            y: 16,
+            width: 640,
+            height: 360,
+        }),
+        3_840,
+        2_160,
+    )
+    .expect("restricted draw programs its guest scissor");
+    assert_eq!(
+        (
+            restricted.x,
+            restricted.y,
+            restricted.width,
+            restricted.height
+        ),
+        (32, 16, 640, 360)
+    );
+
+    let full = metal_scissor_rect_for_draw(GuestScissor::Full, 3_840, 2_160)
+        .expect("full draw must reset persistent Metal scissor state");
+    assert_eq!((full.x, full.y, full.width, full.height), (0, 0, 3_840, 2_160));
+    assert!(
+        metal_scissor_rect_for_draw(GuestScissor::Empty, 3_840, 2_160).is_none(),
+        "empty guest scissors remain draw suppression instead of invalid Metal rectangles"
+    );
 }
 
 #[test]
