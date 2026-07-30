@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -426,6 +427,124 @@ pub(crate) fn agc_shader_prefix_snapshot(address: u64) -> [u32; 4] {
     })
 }
 
+const SHADER_DECODE_FAILURE_WINDOW_BYTES: u32 = 128;
+const SHADER_DECODE_FAILURE_PREFIX_BYTES: u32 = 64;
+
+#[derive(Debug, Eq, PartialEq)]
+struct ShaderDecodeFailureWindow {
+    offset: u32,
+    bytes: Vec<u8>,
+}
+
+fn shader_decode_error_pc(error: &remu_shader::DecodeError) -> Option<u32> {
+    match error {
+        remu_shader::DecodeError::Truncated { pc, .. }
+        | remu_shader::DecodeError::UnknownEncoding { pc, .. }
+        | remu_shader::DecodeError::UnknownOpcode { pc, .. }
+        | remu_shader::DecodeError::FlatSegment { pc, .. }
+        | remu_shader::DecodeError::AddressOverflow { pc }
+        | remu_shader::DecodeError::MemoryFault { pc, .. } => Some(*pc),
+        remu_shader::DecodeError::Empty
+        | remu_shader::DecodeError::Unterminated { .. }
+        | remu_shader::DecodeError::InvalidCodeSize { .. }
+        | remu_shader::DecodeError::ProgramCounterOverflow => None,
+    }
+}
+
+fn shader_decode_failure_window(
+    memory: &impl GuestMemoryReader,
+    address: u64,
+    code_size: Option<u32>,
+    error: &remu_shader::DecodeError,
+) -> Option<ShaderDecodeFailureWindow> {
+    let pc = shader_decode_error_pc(error)?;
+    let offset = pc.saturating_sub(SHADER_DECODE_FAILURE_PREFIX_BYTES) & !3;
+    let requested_end = offset.saturating_add(SHADER_DECODE_FAILURE_WINDOW_BYTES);
+    let end = code_size.map_or(requested_end, |size| requested_end.min(size));
+    if end <= offset {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(usize::try_from(end - offset).ok()?);
+    let mut word_offset = offset;
+    while word_offset.saturating_add(4) <= end {
+        let word_address = address.checked_add(u64::from(word_offset))?;
+        let mut word = [0_u8; 4];
+        if !memory.read(word_address, &mut word) {
+            break;
+        }
+        bytes.extend_from_slice(&word);
+        word_offset = word_offset.saturating_add(4);
+    }
+    (!bytes.is_empty()).then_some(ShaderDecodeFailureWindow { offset, bytes })
+}
+
+fn trace_shader_decode_failure(
+    memory: &impl GuestMemoryReader,
+    address: u64,
+    header_address: u64,
+    code_size: Option<u32>,
+    error: &remu_shader::DecodeError,
+) {
+    let dump_directory = std::env::var_os("REMU_DUMP_MSL_DIR").map(PathBuf::from);
+    if !trace_agc_programs() && dump_directory.is_none() {
+        return;
+    }
+    let Some(window) = shader_decode_failure_window(memory, address, code_size, error) else {
+        if trace_agc_programs() {
+            eprintln!(
+                "[REMu][AGC][SHADER][DECODE-CONTEXT] code={address:#x} header={header_address:#x} registered_code_size={code_size:x?} window=unavailable"
+            );
+        }
+        return;
+    };
+
+    if trace_agc_programs() {
+        let words = window
+            .bytes
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(index, bytes)| {
+                let offset = window.offset
+                    + u32::try_from(index).expect("bounded shader window index fits u32") * 4;
+                (
+                    offset,
+                    u32::from_le_bytes(bytes.try_into().expect("dword chunk has four bytes")),
+                )
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[REMu][AGC][SHADER][DECODE-CONTEXT] code={address:#x} header={header_address:#x} registered_code_size={code_size:x?} window_offset={:#x} window_bytes={} words={words:x?}",
+            window.offset,
+            window.bytes.len(),
+        );
+    }
+
+    let Some(directory) = dump_directory else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        eprintln!("[REMu][AGC][SHADER] could not create decode failure dump directory: {error}");
+        return;
+    }
+    let pc = shader_decode_error_pc(error).unwrap_or_default();
+    let stem = format!("{address:016x}-failed-pc-{pc:08x}");
+    if let Err(error) = std::fs::write(directory.join(format!("{stem}-window.bin")), &window.bytes)
+    {
+        eprintln!("[REMu][AGC][SHADER] could not write decode failure window: {error}");
+        return;
+    }
+    let metadata = format!(
+        "code={address:#x}\nheader={header_address:#x}\nregistered_code_size={code_size:x?}\nerror_pc={pc:#x}\nwindow_offset={:#x}\nwindow_address={:#x}\nwindow_bytes={}\nerror={error}\n",
+        window.offset,
+        address.saturating_add(u64::from(window.offset)),
+        window.bytes.len(),
+    );
+    if let Err(error) = std::fs::write(directory.join(format!("{stem}-window.txt")), metadata) {
+        eprintln!("[REMu][AGC][SHADER] could not write decode failure metadata: {error}");
+    }
+}
+
 pub(crate) fn agc_shader_snapshot(
     shaders: &mut AgcShaderRegistry,
     address: u64,
@@ -454,6 +573,13 @@ pub(crate) fn agc_shader_snapshot(
         Err(error) => {
             shaders.decode_failures.insert(address);
             eprintln!("[REMu][AGC][SHADER] decode failed at {address:#x}: {error}");
+            trace_shader_decode_failure(
+                &memory,
+                address,
+                shaders.headers.get(&address).copied().unwrap_or_default(),
+                shaders.code_sizes.get(&address).copied(),
+                &error,
+            );
             return None;
         }
     };
@@ -693,4 +819,58 @@ pub(crate) enum AgcSubmissionError {
         #[source]
         source: AgcComputeDispatchError,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SliceMemory {
+        base: u64,
+        bytes: Vec<u8>,
+    }
+
+    impl GuestMemoryReader for SliceMemory {
+        fn read(&self, address: u64, output: &mut [u8]) -> bool {
+            let Some(offset) = address.checked_sub(self.base) else {
+                return false;
+            };
+            let Ok(offset) = usize::try_from(offset) else {
+                return false;
+            };
+            let Some(end) = offset.checked_add(output.len()) else {
+                return false;
+            };
+            let Some(source) = self.bytes.get(offset..end) else {
+                return false;
+            };
+            output.copy_from_slice(source);
+            true
+        }
+    }
+
+    #[test]
+    fn shader_decode_failure_window_includes_branch_tail_and_obeys_registered_extent() {
+        let base = 0x0080_db60_0000;
+        let code_size = 0x16d0_u32;
+        let mut bytes = vec![0_u8; usize::try_from(code_size).expect("test code size fits")];
+        bytes[0x16a8..0x16ac].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+        bytes[0x16b4..0x16b8].copy_from_slice(&0x0000_023e_u32.to_le_bytes());
+        let memory = SliceMemory { base, bytes };
+        let error = remu_shader::DecodeError::UnknownOpcode {
+            pc: 0x16b4,
+            encoding: remu_shader::ShaderEncoding::Vop2,
+            opcode: 0,
+            word: 0x0000_023e,
+        };
+
+        let window = shader_decode_failure_window(&memory, base, Some(code_size), &error)
+            .expect("failure pc has a readable diagnostic window");
+
+        assert_eq!(window.offset, 0x1674);
+        assert_eq!(window.bytes.len(), 0x5c);
+        assert_eq!(&window.bytes[0x34..0x38], &0xdead_beef_u32.to_le_bytes());
+        assert_eq!(&window.bytes[0x40..0x44], &0x0000_023e_u32.to_le_bytes());
+        assert_eq!(window.bytes.last(), Some(&0));
+    }
 }
