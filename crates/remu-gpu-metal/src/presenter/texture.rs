@@ -48,7 +48,9 @@ pub(crate) use self::mips::{
     create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
-pub(crate) use self::residency::{create_guest_texture, ensure_resident_texture_in_map};
+pub(crate) use self::residency::{
+    create_guest_texture, ensure_resident_texture_in_map, resident_texture_ownership_stats,
+};
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_resident_textures_overlapping_writeback, retire_sampled_texture,

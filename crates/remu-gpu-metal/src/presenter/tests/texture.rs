@@ -20,11 +20,11 @@ use super::{
     guest_texture_descriptors_share_storage, guest_texture_raw_matches, guest_texture_raw_range,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
     mode27_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
-    render_resolve_candidate_matches, sampled_alias_descriptor, sampled_texture_cache_accepts,
-    sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
-    snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
-    storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
-    write_watched_guest_texture_linear,
+    render_resolve_candidate_matches, resident_texture_ownership_stats, sampled_alias_descriptor,
+    sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
+    sampled_texture_cache_requires_eviction, snapshot_guest_texture_raw,
+    snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy,
+    upload_image_textures, watch_guest_texture, write_watched_guest_texture_linear,
 };
 
 #[test]
@@ -1126,6 +1126,83 @@ fn a_single_level_descriptor_does_not_gain_an_inferred_mip_hierarchy() {
             .mip_level_count,
         1
     );
+}
+
+#[test]
+fn resident_ownership_stats_distinguish_gpu_state_and_replaced_mappings() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("guest backing");
+    let first_address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("first target mapping");
+    let second_address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .expect("second target mapping");
+    let first = GuestTextureDescriptor {
+        address: first_address.get(),
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let second = GuestTextureDescriptor {
+        address: second_address.get(),
+        ..first
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, first)
+        .expect("first target resident");
+    presenter
+        .ensure_resident_texture(&device, second)
+        .expect("second target resident");
+    presenter.mark_resident_texture_written(first);
+
+    let live = resident_texture_ownership_stats(&presenter.resident_guest_textures);
+    assert_eq!(live.gpu_owned_count, 1);
+    assert_eq!(live.cpu_owned_count, 1);
+    assert_eq!(live.active_mapping_count, 2);
+    assert_eq!(live.replaced_mapping_count, 0);
+    assert_eq!(live.unique_backing_bases, 2);
+    assert_eq!(live.duplicate_backing_bases, 0);
+    assert_eq!(live.unique_backing_spans, 2);
+    assert_eq!(live.duplicate_backing_spans, 0);
+    assert_eq!(live.unresolved_backing_count, 0);
+
+    memory
+        .unmap(second_address, GUEST_PAGE_SIZE)
+        .expect("replace the second target mapping");
+    let retired = resident_texture_ownership_stats(&presenter.resident_guest_textures);
+    assert_eq!(retired.active_mapping_count, 1);
+    assert_eq!(retired.replaced_mapping_count, 1);
+    assert_eq!(retired.replaced_mapping_bytes, live.cpu_owned_bytes);
+    assert_eq!(retired.unique_backing_bases, 1);
+    assert_eq!(retired.unique_backing_spans, 1);
+    assert_eq!(retired.unresolved_backing_count, 0);
 }
 
 #[test]
