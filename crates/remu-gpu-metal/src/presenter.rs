@@ -105,9 +105,9 @@ use self::present::{
     presentation_viewport,
 };
 use self::readback::{
-    capture_guest_frame, guest_frame_fingerprint, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, read_texture_array_linear, read_texture_linear,
-    read_texture_volume_linear, write_resident_texture_contents_to_guest,
+    capture_guest_frame, diagnostic_texture_depth_plane_summaries, guest_frame_fingerprint,
+    metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, read_texture_array_linear,
+    read_texture_linear, read_texture_volume_linear, write_resident_texture_contents_to_guest,
 };
 #[cfg(test)]
 use self::sampler::sampler_lod_bias;

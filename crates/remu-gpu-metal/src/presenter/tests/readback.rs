@@ -10,10 +10,10 @@ use std::ffi::c_void;
 
 use super::{
     DecodedRenderTarget, GuestTextureDescriptor, MetalPresenter, PendingTextureReadback,
-    TextureReadbackLayout, guest_texture_byte_count, half_float_to_srgb_unorm8,
-    half_float_to_unorm8, linear_unorm8_to_srgb_unorm8, native_texture_capture_to_bgra,
-    parse_diagnostic_hex_address, read_texture_array_linear,
-    should_record_diagnostic_target_writer, unsigned_float_to_f32,
+    TextureReadbackLayout, diagnostic_texture_depth_plane_summaries, guest_frame_fingerprint,
+    guest_texture_byte_count, half_float_to_srgb_unorm8, half_float_to_unorm8,
+    linear_unorm8_to_srgb_unorm8, native_texture_capture_to_bgra, parse_diagnostic_hex_address,
+    read_texture_array_linear, should_record_diagnostic_target_writer, unsigned_float_to_f32,
 };
 
 #[test]
@@ -130,6 +130,98 @@ fn capture_decodes_packed_rgb10a2_unorm_channels() {
         native_texture_capture_to_bgra(&packed.to_le_bytes(), descriptor),
         Some(vec![137, 188, 255, 170]),
     );
+}
+
+#[test]
+fn diagnostic_volume_summary_keeps_each_depth_plane_distinct() {
+    let descriptor = GuestTextureDescriptor {
+        address: 0x1_0000,
+        width: 2,
+        height: 1,
+        pitch: 2,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let bytes = [
+        0, 0, 0, 0, 0, 0, 0, 0, // z=0
+        255, 0, 0, 255, 0, 128, 0, 255, // z=1
+        0, 0, 64, 255, 0, 0, 255, 255, // z=2
+    ];
+    let summaries =
+        diagnostic_texture_depth_plane_summaries(&bytes, descriptor, 3).expect("valid volume");
+    assert_eq!(summaries.len(), 3);
+    assert_eq!(summaries[0].depth_plane, 0);
+    assert_eq!(summaries[0].byte_count, 8);
+    assert_eq!(summaries[0].nonzero_bytes, 0);
+    assert_eq!(
+        summaries[0].fingerprint,
+        guest_frame_fingerprint(&bytes[..8])
+    );
+    assert_eq!(summaries[1].nonzero_bytes, 4);
+    assert_eq!(
+        summaries[1].fingerprint,
+        guest_frame_fingerprint(&bytes[8..16])
+    );
+    let numeric = summaries[1].numeric.as_ref().expect("RGBA8 numeric range");
+    assert_eq!(numeric.component_count, 4);
+    assert_eq!(
+        numeric.minimum,
+        [Some(0.0), Some(0.0), Some(0.0), Some(1.0)]
+    );
+    assert_eq!(
+        numeric.maximum,
+        [Some(1.0), Some(128.0 / 255.0), Some(0.0), Some(1.0)]
+    );
+    assert_eq!(numeric.non_finite, [0; 4]);
+    assert_ne!(summaries[1].fingerprint, summaries[2].fingerprint);
+}
+
+#[test]
+fn diagnostic_volume_numeric_range_ignores_non_finite_half_values() {
+    let descriptor = GuestTextureDescriptor {
+        address: 0x2_0000,
+        width: 2,
+        height: 1,
+        pitch: 2,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA16Float,
+        bytes_per_pixel: 8,
+    };
+    let components = [
+        0x3c00_u16, 0xc000, 0x7c00, 0x0000, // 1, -2, +inf, 0
+        0x4000, 0x3800, 0x7e00, 0xbc00, // 2, 0.5, NaN, -1
+    ];
+    let bytes = components
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let summaries =
+        diagnostic_texture_depth_plane_summaries(&bytes, descriptor, 1).expect("valid volume");
+    let numeric = summaries[0]
+        .numeric
+        .as_ref()
+        .expect("RGBA16Float numeric range");
+    assert_eq!(numeric.component_count, 4);
+    assert_eq!(numeric.minimum, [Some(1.0), Some(-2.0), None, Some(-1.0)]);
+    assert_eq!(numeric.maximum, [Some(2.0), Some(0.5), None, Some(0.0)]);
+    assert_eq!(numeric.non_finite, [0, 0, 2, 0]);
+}
+
+#[test]
+fn diagnostic_volume_summary_rejects_truncated_contents() {
+    let descriptor = GuestTextureDescriptor {
+        address: 0x3_0000,
+        width: 2,
+        height: 2,
+        pitch: 2,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::R8Unorm,
+        bytes_per_pixel: 1,
+    };
+    let error = diagnostic_texture_depth_plane_summaries(&[0; 7], descriptor, 2)
+        .expect_err("truncated volume");
+    assert!(error.contains("has 7 bytes, expected 8"));
 }
 
 #[test]

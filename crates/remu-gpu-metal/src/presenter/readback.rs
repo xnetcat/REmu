@@ -7,11 +7,11 @@ use super::{
     MetalPresenter, PendingTextureReadback, ResidentGuestTexture, TextureReadbackLayout,
     capture_interval, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_minimum_draw, diagnostic_scanout_writer,
-    encode_mode27_mip_chain_into_raw, guest_texture_descriptors_overlap, half_float_to_srgb_unorm8,
-    half_float_to_unorm8, linear_unorm8_to_srgb_unorm8, mode27_mip_chain_layout,
-    snapshot_watched_guest_range, texture_element_layout, unsigned_float_to_srgb_unorm8,
-    write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
-    write_watched_guest_texture_linear,
+    encode_mode27_mip_chain_into_raw, guest_texture_descriptors_overlap, half_float_to_f32,
+    half_float_to_srgb_unorm8, half_float_to_unorm8, linear_unorm8_to_srgb_unorm8,
+    mode27_mip_chain_layout, snapshot_watched_guest_range, texture_element_layout,
+    unsigned_float_to_f32, unsigned_float_to_srgb_unorm8, write_guest_texture_linear_into_raw_at_z,
+    write_watched_guest_range, write_watched_guest_texture_linear,
 };
 use metal::{
     Device, MTLBlitOption, MTLOrigin, MTLPixelFormat, MTLResourceOptions, MTLSize, MTLStorageMode,
@@ -489,6 +489,178 @@ pub(super) fn native_texture_capture_to_bgra(
         _ => return None,
     }
     Some(bgra)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct DiagnosticTextureNumericRange {
+    pub(super) component_count: usize,
+    pub(super) minimum: [Option<f64>; 4],
+    pub(super) maximum: [Option<f64>; 4],
+    pub(super) non_finite: [usize; 4],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct DiagnosticTextureDepthPlaneSummary {
+    pub(super) depth_plane: usize,
+    pub(super) byte_count: usize,
+    pub(super) nonzero_bytes: usize,
+    pub(super) fingerprint: u64,
+    pub(super) numeric: Option<DiagnosticTextureNumericRange>,
+}
+
+fn diagnostic_texture_numeric_components(
+    pixel: &[u8],
+    pixel_format: MTLPixelFormat,
+) -> Option<([f64; 4], usize)> {
+    let unorm8 = |value: u8| f64::from(value) / f64::from(u8::MAX);
+    let unorm16 = |value: u16| f64::from(value) / f64::from(u16::MAX);
+    match pixel_format {
+        MTLPixelFormat::RGBA8Unorm | MTLPixelFormat::RGBA8Unorm_sRGB => Some((
+            [
+                unorm8(*pixel.first()?),
+                unorm8(*pixel.get(1)?),
+                unorm8(*pixel.get(2)?),
+                unorm8(*pixel.get(3)?),
+            ],
+            4,
+        )),
+        MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB => Some((
+            [
+                unorm8(*pixel.get(2)?),
+                unorm8(*pixel.get(1)?),
+                unorm8(*pixel.first()?),
+                unorm8(*pixel.get(3)?),
+            ],
+            4,
+        )),
+        MTLPixelFormat::R16Unorm | MTLPixelFormat::Depth16Unorm => {
+            let value = u16::from_le_bytes([*pixel.first()?, *pixel.get(1)?]);
+            Some(([unorm16(value), 0.0, 0.0, 0.0], 1))
+        }
+        MTLPixelFormat::RGBA16Float => {
+            let component = |offset: usize| {
+                pixel
+                    .get(offset..offset + 2)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u16::from_le_bytes)
+                    .map(half_float_to_f32)
+                    .map(f64::from)
+            };
+            Some((
+                [component(0)?, component(2)?, component(4)?, component(6)?],
+                4,
+            ))
+        }
+        MTLPixelFormat::RG11B10Float => {
+            let packed = u32::from_le_bytes(pixel.get(..4)?.try_into().ok()?);
+            Some((
+                [
+                    f64::from(unsigned_float_to_f32(packed & 0x7ff, 6)),
+                    f64::from(unsigned_float_to_f32((packed >> 11) & 0x7ff, 6)),
+                    f64::from(unsigned_float_to_f32((packed >> 22) & 0x3ff, 5)),
+                    0.0,
+                ],
+                3,
+            ))
+        }
+        MTLPixelFormat::RGB10A2Unorm => {
+            let packed = u32::from_le_bytes(pixel.get(..4)?.try_into().ok()?);
+            Some((
+                [
+                    f64::from(packed & 0x3ff) / 1023.0,
+                    f64::from((packed >> 10) & 0x3ff) / 1023.0,
+                    f64::from((packed >> 20) & 0x3ff) / 1023.0,
+                    f64::from((packed >> 30) & 0x3) / 3.0,
+                ],
+                4,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn diagnostic_texture_numeric_range(
+    plane: &[u8],
+    descriptor: GuestTextureDescriptor,
+) -> Option<DiagnosticTextureNumericRange> {
+    let bytes_per_pixel = usize::try_from(descriptor.bytes_per_pixel).ok()?;
+    if bytes_per_pixel == 0 || plane.len() % bytes_per_pixel != 0 {
+        return None;
+    }
+    let mut minimum = [None; 4];
+    let mut maximum = [None; 4];
+    let mut non_finite = [0_usize; 4];
+    let mut component_count: Option<usize> = None;
+    for pixel in plane.chunks_exact(bytes_per_pixel) {
+        let (values, decoded_component_count) =
+            diagnostic_texture_numeric_components(pixel, descriptor.pixel_format)?;
+        if component_count
+            .replace(decoded_component_count)
+            .is_some_and(|count| count != decoded_component_count)
+        {
+            return None;
+        }
+        for component in 0..decoded_component_count {
+            let value = values[component];
+            if value.is_finite() {
+                minimum[component] =
+                    Some(minimum[component].map_or(value, |current: f64| current.min(value)));
+                maximum[component] =
+                    Some(maximum[component].map_or(value, |current: f64| current.max(value)));
+            } else {
+                non_finite[component] = non_finite[component].saturating_add(1);
+            }
+        }
+    }
+    Some(DiagnosticTextureNumericRange {
+        component_count: component_count?,
+        minimum,
+        maximum,
+        non_finite,
+    })
+}
+
+pub(super) fn diagnostic_texture_depth_plane_summaries(
+    native_bytes: &[u8],
+    descriptor: GuestTextureDescriptor,
+    depth: u64,
+) -> Result<Vec<DiagnosticTextureDepthPlaneSummary>, String> {
+    let depth =
+        usize::try_from(depth).map_err(|_| "diagnostic texture depth does not fit usize")?;
+    if depth == 0 {
+        return Err("diagnostic texture depth is zero".to_owned());
+    }
+    let plane_byte_count = u64::from(descriptor.width)
+        .checked_mul(u64::from(descriptor.height))
+        .and_then(|pixels| pixels.checked_mul(u64::from(descriptor.bytes_per_pixel)))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or("diagnostic texture plane size overflows")?;
+    if plane_byte_count == 0 {
+        return Err("diagnostic texture plane size is zero".to_owned());
+    }
+    let expected_byte_count = plane_byte_count
+        .checked_mul(depth)
+        .ok_or("diagnostic texture volume size overflows")?;
+    if native_bytes.len() != expected_byte_count {
+        return Err(format!(
+            "diagnostic texture volume has {} bytes, expected {expected_byte_count} for {}x{}x{depth} at {} bytes per pixel",
+            native_bytes.len(),
+            descriptor.width,
+            descriptor.height,
+            descriptor.bytes_per_pixel,
+        ));
+    }
+    Ok(native_bytes
+        .chunks_exact(plane_byte_count)
+        .enumerate()
+        .map(|(depth_plane, plane)| DiagnosticTextureDepthPlaneSummary {
+            depth_plane,
+            byte_count: plane.len(),
+            nonzero_bytes: plane.iter().filter(|&&value| value != 0).count(),
+            fingerprint: guest_frame_fingerprint(plane),
+            numeric: diagnostic_texture_numeric_range(plane, descriptor),
+        })
+        .collect())
 }
 
 pub(super) fn validate_texture_readback_source(
