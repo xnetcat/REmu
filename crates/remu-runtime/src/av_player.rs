@@ -956,16 +956,17 @@ fn av_player_queue_natural_stop(callback: Option<(u64, u64)>, state: &mut ProbeD
 pub(crate) fn av_player_nv12_layout(
     width: u32,
     height: u32,
-    _extended: bool,
+    extended: bool,
 ) -> Option<(usize, usize)> {
     let width = usize::try_from(width).ok()?;
     let height = usize::try_from(height).ok()?;
-    // AVPlayer's NV12 surfaces use a 64-pixel pitch and a 16-row storage height for both frame
-    // info variants. FrameInfoEx exposes that pitch explicitly; its width and height still name
-    // the 16-pixel-aligned storage extent, with the visible remainder represented by right/bottom
-    // crop offsets.
-    let row_pitch = width.checked_add(63)? & !63;
-    let storage_height = height.checked_add(15)? & !15;
+    // The Gen5 extended ABI exposes a 256-byte-aligned pitch and the visible height. Legacy
+    // frame info has no explicit pitch and therefore uses its 16-pixel-aligned dimensions.
+    let (row_pitch, storage_height) = if extended {
+        (width.checked_add(255)? & !255, height)
+    } else {
+        (width.checked_add(15)? & !15, height.checked_add(15)? & !15)
+    };
     let frame_bytes = row_pitch
         .checked_mul(storage_height)?
         .checked_mul(3)?
@@ -1031,7 +1032,11 @@ fn av_player_write_video_frame(
     }
     let width = usize::try_from(player.width).unwrap_or(0);
     let height = usize::try_from(player.height).unwrap_or(0);
-    let storage_height = height.saturating_add(15) & !15;
+    let storage_height = if extended {
+        height
+    } else {
+        height.saturating_add(15) & !15
+    };
     let frame = if row_pitch == width {
         &player.raw_video_frame
     } else {
@@ -1082,8 +1087,16 @@ pub(crate) fn av_player_write_video_frame_info(
 ) {
     let visible_width = usize::try_from(width).unwrap_or(0);
     let visible_height = usize::try_from(height).unwrap_or(0);
-    let output_width = visible_width.saturating_add(15) & !15;
-    let output_height = visible_height.saturating_add(15) & !15;
+    let output_width = if extended {
+        row_pitch
+    } else {
+        visible_width.saturating_add(15) & !15
+    };
+    let output_height = if extended {
+        visible_height
+    } else {
+        visible_height.saturating_add(15) & !15
+    };
     guest_memset(output, 0, if extended { 104 } else { 40 });
     write_guest_u64(output, address);
     write_guest_u64(output + 16, timestamp_milliseconds);
