@@ -1203,7 +1203,7 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
         ordered.try_recv(|_| false),
         OrderedEventPoll::Blocked
     ));
-    let prefetched = ordered.prefetch_pipeline_work(16, 16);
+    let prefetched = ordered.prefetch_pipeline_work(16, 16, |_| true);
     assert_eq!(
         prefetched
             .iter()
@@ -1326,7 +1326,7 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
         })
         .expect("queue compute submission");
 
-    let prefetched = ordered.prefetch_pipeline_work(16, 16);
+    let prefetched = ordered.prefetch_pipeline_work(16, 16, |_| true);
     assert_eq!(
         prefetched
             .iter()
@@ -1381,6 +1381,66 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
     assert!(matches!(
         ordered.try_recv(|_| true),
         OrderedEventPoll::Empty
+    ));
+}
+
+#[test]
+fn pipeline_prefetch_filters_before_clone_and_shares_lookahead_across_queues() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut first = super::indexed_draw(0, 0, 3);
+    first.sequence = 1;
+    let mut second = first.clone();
+    second.sequence = 2;
+    let mut third = first.clone();
+    third.sequence = 3;
+    let dispatch = ComputeDispatch {
+        sequence: 9,
+        source: ComputeDispatchSource::Direct,
+        launch: ComputeLaunch {
+            grid: ComputeGrid::Threadgroups([1, 1, 1]),
+            group_count: [1, 1, 1],
+            base_group: [0, 0, 0],
+            threads_per_group: [8, 8, 1],
+            wave_lane_count: 64,
+            lds_size_bytes: 0,
+            initiator: 1,
+        },
+        shader_address: 0x9000,
+        shader_prefix: [0; 4],
+        shader: None,
+        shader_evaluation: None,
+        shader_registers: Vec::new(),
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![
+                GpuEvent::IndexedDraw(Box::new(first)),
+                GpuEvent::IndexedDraw(Box::new(second)),
+                GpuEvent::IndexedDraw(Box::new(third)),
+            ],
+        })
+        .expect("queue graphics lookahead");
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: vec![GpuEvent::ComputeDispatch(Box::new(dispatch))],
+        })
+        .expect("queue compute lookahead");
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+
+    let prefetched = ordered.prefetch_pipeline_work(16, 2, |event| {
+        !matches!(event, GpuEvent::IndexedDraw(draw) if draw.sequence == 1)
+    });
+
+    assert_eq!(prefetched.len(), 2);
+    assert!(matches!(
+        &prefetched[0],
+        PipelineCompileCandidate::Graphics(draw) if draw.sequence == 2
+    ));
+    assert!(matches!(
+        &prefetched[1],
+        PipelineCompileCandidate::Compute(dispatch) if dispatch.sequence == 9
     ));
 }
 
