@@ -760,14 +760,18 @@ pub(crate) fn apply_pending_guest_memory_writes(
 ) -> Result<(), String> {
     for pending_write in pending {
         validate_guest_memory_operation(&pending_write.operation)?;
-        let pixel_pipe_trace = match pending_write.operation {
-            GuestMemoryWriteOperation::Release(release) => {
-                remu_gpu::take_pixel_pipe_stat_release_trace(release)
+        let (pixel_pipe_trace, query_completion_trace) = match pending_write.operation {
+            GuestMemoryWriteOperation::Release(release) => (
+                remu_gpu::take_pixel_pipe_stat_release_trace(release),
+                remu_gpu::take_pixel_pipe_query_completion_release_trace(release),
+            ),
+            GuestMemoryWriteOperation::Write(_) | GuestMemoryWriteOperation::Fill { .. } => {
+                (None, None)
             }
-            GuestMemoryWriteOperation::Write(_) | GuestMemoryWriteOperation::Fill { .. } => None,
         };
-        let observed_before =
-            pixel_pipe_trace.and_then(|_| observe_pending_guest_memory_release(pending_write));
+        let observed_before = (pixel_pipe_trace.is_some() || query_completion_trace.is_some())
+            .then(|| observe_pending_guest_memory_release(pending_write))
+            .flatten();
         let result = if let Some(identity) = pending_write.mapping_identity {
             apply_guest_memory_operation_shared(&pending_write.operation, identity)
         } else if let Some(write_watch) = pending_write.write_watch.as_ref() {
@@ -803,6 +807,21 @@ pub(crate) fn apply_pending_guest_memory_writes(
                 "[REMu][AGC][PIXEL-PIPE][PUBLISH] sequence={} pair={} address={:#x} expected={expected:#018x} observed_before={observed_before:#018x?} observed_after={observed_after:#018x?} success={} error={:?}",
                 trace.dump_sequence,
                 trace.pair_index,
+                release.address,
+                result.is_ok(),
+                result.as_ref().err(),
+            );
+        }
+        if let Some(trace) = query_completion_trace {
+            let GuestMemoryWriteOperation::Release(release) = pending_write.operation else {
+                unreachable!("only a release can carry query-completion trace provenance");
+            };
+            let observed_after = observe_pending_guest_memory_release(pending_write);
+            eprintln!(
+                "[REMu][AGC][PIXEL-PIPE][COMPLETE][PUBLISH] first_sequence={} second_sequence={} payload={:#x} address={:#x} expected=0x0000000000000001 observed_before={observed_before:#018x?} observed_after={observed_after:#018x?} success={} error={:?}",
+                trace.first_dump_sequence,
+                trace.second_dump_sequence,
+                trace.payload_address,
                 release.address,
                 result.is_ok(),
                 result.as_ref().err(),

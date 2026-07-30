@@ -2432,8 +2432,24 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
                     )
                     .unwrap_or(0)
                 });
+                // This sampled RenderThread call site saves its RHI query object in RBX at
+                // stack[4]. The object owns a counter payload at +0x28 and a completion-label
+                // pointer at +0x30. All reads remain fallible because another yield call site can
+                // have a different frame shape.
+                let query_object = stack[4];
+                let query_payload = (query_object != 0)
+                    .then(|| query_object.checked_add(0x28))
+                    .flatten()
+                    .and_then(try_read_process_guest_u64);
+                let query_completion = (query_object != 0)
+                    .then(|| query_object.checked_add(0x30))
+                    .flatten()
+                    .and_then(try_read_process_guest_u64);
+                let query_completion_value = query_completion
+                    .filter(|address| *address != 0)
+                    .and_then(try_read_process_guest_u64);
                 eprintln!(
-                    "[REMu][PTHREAD][YIELD] sequence={sequence} thread={thread_name:?}/{:#x} return={guest_return_address:#x} rsp={:#x} stack={stack:#x?}",
+                    "[REMu][PTHREAD][YIELD] sequence={sequence} thread={thread_name:?}/{:#x} return={guest_return_address:#x} rsp={:#x} stack={stack:#x?} query_object={query_object:#x} query_payload={query_payload:#x?} query_completion={query_completion:#x?} query_completion_value={query_completion_value:#x?}",
                     current_guest_thread_handle(),
                     frame.guest_rsp,
                 );

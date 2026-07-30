@@ -66,6 +66,21 @@ const PIXEL_PIPE_STAT_STEP: u64 = 0x02ff_ffff;
 /// `PIXEL_PIPE_STAT_DUMP`; every even qword is a counter and every odd qword is padding.
 const PIXEL_PIPE_STAT_COUNTER_PAIRS: u64 = 16;
 
+fn emit_agc_memory_release(packet_address: u64, release: remu_gpu::GpuMemoryRelease) {
+    if trace_guest_sync()
+        && let Some(trace) = remu_gpu::record_pixel_pipe_query_completion_release_trace(release)
+    {
+        eprintln!(
+            "[REMu][AGC][PIXEL-PIPE][COMPLETE][EMIT] first_sequence={} second_sequence={} packet={packet_address:#x} payload={:#x} address={:#x} value=0x0000000000000001",
+            trace.first_dump_sequence,
+            trace.second_dump_sequence,
+            trace.payload_address,
+            trace.completion_address,
+        );
+    }
+    emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(release));
+}
+
 #[derive(Clone, Copy)]
 struct AgcIndirectDrawArguments {
     element_count: u32,
@@ -332,6 +347,13 @@ pub(crate) fn agc_handle_submission_packet(
                     .then(|| PIXEL_PIPE_STAT_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1);
                 let trace_query =
                     trace_sequence.filter(|sequence| *sequence <= 32 || sequence.is_power_of_two());
+                if let Some(trace_sequence) = trace_sequence {
+                    remu_gpu::record_pixel_pipe_stat_dump_trace(
+                        u64::try_from(trace_sequence).unwrap_or(u64::MAX),
+                        destination,
+                        trace_query.is_some(),
+                    );
+                }
                 if let Some(trace_sequence) = trace_query {
                     eprintln!(
                         "[REMu][AGC][PIXEL-PIPE][EMIT] sequence={trace_sequence} packet={packet_address:#x} destination={destination:#x} value={value:#018x} pairs={PIXEL_PIPE_STAT_COUNTER_PAIRS}"
@@ -413,13 +435,13 @@ pub(crate) fn agc_handle_submission_packet(
         && length >= 7
         && let Some(release) = decode_agc_memory_release(packet_address, false)
     {
-        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(release));
+        emit_agc_memory_release(packet_address, release);
     }
     if opcode == AGC_IT_RELEASE_MEM
         && length >= 8
         && let Some(release) = decode_agc_memory_release(packet_address, true)
     {
-        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(release));
+        emit_agc_memory_release(packet_address, release);
     }
     if opcode == AGC_IT_NOP
         && matches!(register, AGC_R_WAIT_MEM_32 | AGC_R_WAIT_MEM_64)
