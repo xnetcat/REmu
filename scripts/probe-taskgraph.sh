@@ -9,6 +9,7 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
     echo "  Defaults: timeout=120, cycles=16, hit-limit=4096." >&2
     echo "  Set REMU_TASKGRAPH_TRACE_PREPARE_ONLY=1 for one persistent breakpoint." >&2
     echo "  Set REMU_TASKGRAPH_TRACE_TARGET_FOLLOW=1 for caller-filtered stages." >&2
+    echo "  Add REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF=1 for named-queue handoff." >&2
     exit 64
 fi
 
@@ -66,7 +67,7 @@ trace_script="$script_dir/lldb_taskgraph_trace.py"
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 run_root=${REMU_RUN_ROOT:-"${TMPDIR:-/tmp}/remu-runs"}
 run_dir="$run_root/$run_id-$game_name-taskgraph"
-raw_binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
+raw_binary=${REMU_RUNNER_BINARY:-"$repo_dir/target/x86_64-apple-darwin/release/remu"}
 app_bundle=${REMU_APP_BUNDLE:-"$repo_dir/target/x86_64-apple-darwin/release/REMu.app"}
 launch_working_directory=${REMU_LAUNCH_WORKING_DIRECTORY:-"$repo_dir"}
 watchdog_slack_seconds=${REMU_WATCHDOG_SLACK_SECONDS:-15}
@@ -113,6 +114,18 @@ case "$target_follow" in
         exit 64
         ;;
 esac
+queue_handoff=${REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF:-0}
+case "$queue_handoff" in
+    0 | 1) ;;
+    *)
+        echo "error: REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF must be 0 or 1" >&2
+        exit 64
+        ;;
+esac
+if [ "$queue_handoff" = 1 ] && [ "$target_follow" != 1 ]; then
+    echo "error: queue handoff requires target follow" >&2
+    exit 64
+fi
 prepare_only=${REMU_TASKGRAPH_TRACE_PREPARE_ONLY:-0}
 case "$prepare_only" in
     0 | 1) ;;
@@ -149,6 +162,7 @@ echo "[REMu] launching bounded TaskGraph LLDB trace; artifacts: $run_dir"
 echo "[REMu] timeout=${timeout_seconds}s cycles=$cycle_limit hit-limit=$hit_limit"
 echo "[REMu] prepare-only=$prepare_only cpu-write-watch-disabled=$disable_cpu_write_watch"
 echo "[REMu] target-follow=$target_follow caller=$target_caller parent=$target_parent"
+echo "[REMu] queue-handoff=$queue_handoff"
 set +e
 (
     cd "$launch_working_directory"
@@ -161,6 +175,7 @@ set +e
             REMU_TASKGRAPH_TRACE_HITS="$hit_limit" \
             REMU_TASKGRAPH_TRACE_PREPARE_ONLY="$prepare_only" \
             REMU_TASKGRAPH_TRACE_TARGET_FOLLOW="$target_follow" \
+            REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF="$queue_handoff" \
             REMU_TASKGRAPH_TRACE_TARGET_CALLER="$target_caller" \
             REMU_TASKGRAPH_TRACE_TARGET_PARENT="$target_parent" \
             REMU_DISABLE_CPU_WRITE_WATCH="$disable_cpu_write_watch" \
@@ -213,6 +228,7 @@ finished_at=$(date +%s)
     echo "hit_limit=$hit_limit"
     echo "prepare_only=$prepare_only"
     echo "target_follow=$target_follow"
+    echo "queue_handoff=$queue_handoff"
     echo "target_caller=$target_caller"
     echo "target_parent=$target_parent"
     echo "cpu_write_watch_disabled=$disable_cpu_write_watch"

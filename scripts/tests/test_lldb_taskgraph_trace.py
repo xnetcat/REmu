@@ -52,6 +52,10 @@ class TaskGraphTraceTests(unittest.TestCase):
             },
         )
         self.assertEqual(len(TRACE.BREAKPOINTS[TRACE.PHASE_CONSUME]), 4)
+        self.assertLessEqual(
+            len(TRACE.QUEUE_HANDOFF_BREAKPOINTS),
+            TRACE.MAXIMUM_HARDWARE_BREAKPOINTS,
+        )
 
     def test_prepare_captures_a_fence_blocked_before_conditional_dispatch(
         self,
@@ -228,6 +232,122 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertIn("published=True executed=True", completed.message or "")
         self.assertEqual(state.task, 0)
         self.assertEqual(state.active_breakpoints(), fixed)
+
+    def test_queue_handoff_correlates_enqueue_register_and_event_wait(
+        self,
+    ) -> None:
+        state = TRACE.TaskGraphTraceState(
+            cycle_limit=2,
+            hit_limit=32,
+            target_follow=True,
+            queue_handoff=True,
+        )
+        queue = 0x3000
+        queue_object = queue - 0x38
+        wrapper = 0x4000
+        underlying = 0x5000
+        singleton = 0x6000
+        self.memory.update(
+            {
+                0x1008: 1,
+                TRACE.TASKGRAPH_SINGLETON_POINTER: singleton,
+                singleton + 0x18 + 0x8: queue_object,
+                queue + 0x1A8: (0x15 << TRACE.TASK_QUEUE_WAITER_BITS) | 1,
+                queue + 0x118: 0xA1,
+                queue + 0x160: 0xB1,
+                queue + 0x1F8: wrapper,
+                wrapper + 0x10: underlying,
+                underlying + 0x10: 0,
+                0x8000: 0x9000,
+                0x8008: TRACE.DEFAULT_TARGET_FENCE_CALLER,
+                0x9008: TRACE.DEFAULT_TARGET_FENCE_PARENT,
+            }
+        )
+
+        ignored = state.observe(
+            TRACE.PREPARE,
+            {"rbx": 0x1000, "rbp": 0x7000},
+            7,
+            self.read_u64,
+        )
+        self.assertFalse(ignored.accepted)
+        self.assertEqual(
+            state.active_breakpoints(),
+            TRACE.QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS,
+        )
+
+        self.memory[0x1018] = 0x2100
+        target = state.observe(
+            TRACE.PREPARE,
+            {
+                "rbx": 0x1000,
+                "rbp": 0x8000,
+                "r12": 1,
+                "rax": 1,
+            },
+            7,
+            self.read_u64,
+        )
+        self.assertTrue(target.accepted)
+        self.assertIn("target=1 capture", target.message or "")
+        self.assertIn("taskgraph=0x6000", target.message or "")
+        self.assertIn("event_condition=0x5028", target.message or "")
+        self.assertEqual(state.queue_object, queue_object)
+        self.assertEqual(
+            state.active_breakpoints(),
+            TRACE.QUEUE_HANDOFF_BREAKPOINTS,
+        )
+
+        self.memory[queue + 0x1A8] = 0x16 << TRACE.TASK_QUEUE_WAITER_BITS
+        self.memory[queue + 0x118] = 0xA2
+        self.memory[queue + 0x160] = 0xB2
+        enqueue = state.observe(
+            TRACE.PUBLISH_RETURN,
+            {"r14": queue_object, "rbx": 0, "rax": 0},
+            7,
+            self.read_u64,
+        )
+        self.assertTrue(enqueue.accepted)
+        self.assertIn("target=True", enqueue.message or "")
+        self.assertIn("wake_waiter=0", enqueue.message or "")
+        self.assertIn("lane1_head=162", enqueue.message or "")
+        self.assertIn("lane1_tail=178", enqueue.message or "")
+
+        self.memory[0xA000 - 0x48] = 1
+        self.memory[queue + 0x1A8] |= 1
+        registered = state.observe(
+            TRACE.QUEUE_REGISTER,
+            {
+                "r13": queue,
+                "rflags": 1 << 6,
+                "rbp": 0xA000,
+                "rax": 0x58000000,
+                "rbx": 0x58000001,
+            },
+            8,
+            self.read_u64,
+        )
+        self.assertTrue(registered.accepted)
+        self.assertIn("registered=True", registered.message or "")
+        self.assertIn("waiter_bit=1", registered.message or "")
+
+        waiting = state.observe(
+            TRACE.EVENT_WAIT_ENTRY,
+            {"r12": underlying},
+            8,
+            self.read_u64,
+        )
+        self.assertTrue(waiting.accepted)
+        self.assertIn("mutex=0x5020", waiting.message or "")
+        self.assertIn("condition=0x5028", waiting.message or "")
+
+    def test_queue_handoff_requires_target_follow(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires target follow"):
+            TRACE.TaskGraphTraceState(
+                cycle_limit=1,
+                hit_limit=8,
+                queue_handoff=True,
+            )
 
     def test_persistent_breakpoint_planner_adds_without_replacing(self) -> None:
         prepare = {TRACE.PREPARE: TRACE.PREPARE_ADDRESS}

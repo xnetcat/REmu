@@ -16,7 +16,9 @@ hardware breakpoint at the prerequisite-release site and avoid dynamic
 breakpoint rotation while logging every fence.  Set
 ``REMU_TASKGRAPH_TRACE_TARGET_FOLLOW=1`` to log only the configured BeginFence
 caller chain and add persistent publish, execute, and complete breakpoints once
-that task is captured.
+that task is captured.  Add ``REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF=1`` to derive
+the RenderThread queue when the selected fence is captured and trace that
+queue's post-enqueue state, waiter registration, and event wait entry.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ MINIMUM_GUEST_EXECUTION_ADDRESS = 0x8_0000_0000
 MAXIMUM_GUEST_EXECUTION_ADDRESS = 0x100_0000_0000
 DEFAULT_TARGET_FENCE_CALLER = 0x801BE0507
 DEFAULT_TARGET_FENCE_PARENT = 0x80101AF94
+TASKGRAPH_SINGLETON_POINTER = 0x807BA35E0
 TASK_QUEUE_WAITER_BITS = 26
 TASK_QUEUE_WAITER_MASK = (1 << TASK_QUEUE_WAITER_BITS) - 1
 
@@ -63,6 +66,8 @@ POP_WAIT = "pop-wait-return"
 POP_DRAIN = "pop-drain-return"
 EXECUTE = "execute"
 COMPLETE = "complete"
+QUEUE_REGISTER = "queue-register"
+EVENT_WAIT_ENTRY = "event-wait-entry"
 
 BREAKPOINTS = {
     PHASE_PUBLISH: {
@@ -83,9 +88,19 @@ BREAKPOINTS = {
     PHASE_DONE: {},
 }
 PREPARE_ADDRESS = 0x801BE1ADF
+QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS = {
+    PREPARE: PREPARE_ADDRESS,
+}
+QUEUE_HANDOFF_BREAKPOINTS = {
+    PREPARE: PREPARE_ADDRESS,
+    PUBLISH_RETURN: BREAKPOINTS[PHASE_PUBLISH][PUBLISH_RETURN],
+    QUEUE_REGISTER: 0x8011C4C00,
+    EVENT_WAIT_ENTRY: 0x801210940,
+}
 TASKGRAPH_BREAKPOINT_ADDRESSES = frozenset(
     {
         PREPARE_ADDRESS,
+        *QUEUE_HANDOFF_BREAKPOINTS.values(),
         *(
             address
             for phase_breakpoints in BREAKPOINTS.values()
@@ -111,6 +126,8 @@ TASKGRAPH_TRACE_FALLTHROUGH_ADDRESSES = frozenset(
         0x8011C6EEF,  # POP_DRAIN test completed
         0x8011CD3F1,  # EXECUTE entry push completed
         0x8011CD41D,  # COMPLETE lea completed
+        0x8011C4C06,  # waiter-registration cmpxchg/branch completed
+        0x801210944,  # event wait loaded its condition address
     }
 )
 
@@ -271,6 +288,7 @@ class TaskGraphTraceState:
         target_follow: bool = False,
         target_caller: int = DEFAULT_TARGET_FENCE_CALLER,
         target_parent: int = DEFAULT_TARGET_FENCE_PARENT,
+        queue_handoff: bool = False,
     ) -> None:
         if not 1 <= cycle_limit <= MAXIMUM_CYCLE_LIMIT:
             raise ValueError("cycle_limit is outside the bounded diagnostic range")
@@ -280,12 +298,20 @@ class TaskGraphTraceState:
         self.hit_limit = hit_limit
         self.prepare_only = prepare_only or target_follow
         self.target_follow = target_follow
+        self.queue_handoff = queue_handoff
+        if self.queue_handoff and not self.target_follow:
+            raise ValueError("queue handoff tracing requires target follow")
         self.target_caller = target_caller
         self.target_parent = target_parent
         self.target_stages_installed = False
         self.target_capture_count = 0
         self.target_published = False
         self.target_executed = False
+        self.queue_object = 0
+        self.queue_event_wrapper = 0
+        self.queue_event_underlying = 0
+        self.target_publisher_thread = 0
+        self.queue_transitions = 0
         self.phase = PHASE_PUBLISH
         self.hits = 0
         self.cycles_started = 0
@@ -310,6 +336,10 @@ class TaskGraphTraceState:
     def active_breakpoints(self) -> Mapping[str, int]:
         if self.done:
             return BREAKPOINTS[PHASE_DONE]
+        if self.queue_handoff:
+            if self.queue == 0:
+                return QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS
+            return QUEUE_HANDOFF_BREAKPOINTS
         if self.target_follow:
             breakpoints = {PREPARE: PREPARE_ADDRESS}
             if self.target_stages_installed:
@@ -406,6 +436,13 @@ class TaskGraphTraceState:
             return self._finish("hit-limit")
         if label not in self.active_breakpoints():
             return TraceResult(False)
+        if self.queue_handoff:
+            return self._observe_queue_handoff(
+                label,
+                registers,
+                thread_id,
+                read_u64,
+            )
         if self.target_follow:
             return self._observe_target_follow(
                 label,
@@ -454,6 +491,181 @@ class TaskGraphTraceState:
                 message += f" next=({result.message})"
             return TraceResult(True, message)
         return result
+
+    @staticmethod
+    def _fence_caller_chain(
+        registers: Mapping[str, int],
+        read_u64: ReadU64,
+    ) -> tuple[int, int]:
+        frame_pointer = _register(registers, "rbp")
+        caller_frame = read_u64(frame_pointer) or 0
+        caller = read_u64(frame_pointer + 0x8) or 0
+        parent = read_u64(caller_frame + 0x8) or 0
+        return caller, parent
+
+    def _queue_event_description(self, read_u64: ReadU64) -> str:
+        event_word = (
+            read_u64(self.queue_event_underlying + 0x10)
+            if self.queue_event_underlying != 0
+            else None
+        )
+        condition = (
+            self.queue_event_underlying + 0x28
+            if self.queue_event_underlying != 0
+            else 0
+        )
+        return (
+            f"object={self.queue_object:#x} "
+            f"event_wrapper={self.queue_event_wrapper:#x} "
+            f"event_underlying={self.queue_event_underlying:#x} "
+            f"event_condition={condition:#x} "
+            f"event_word="
+            f"{event_word if event_word is not None else 'unreadable'}"
+        )
+
+    def _queue_snapshot(self, read_u64: ReadU64) -> str:
+        wait_state = read_u64(self.queue + 0x1A8)
+        lane_one_head = read_u64(self.queue + 0x118)
+        lane_one_tail = read_u64(self.queue + 0x160)
+        return (
+            f"wait_state={describe_queue_wait_state(wait_state)} "
+            f"lane1_head="
+            f"{lane_one_head if lane_one_head is not None else 'unreadable'} "
+            f"lane1_tail="
+            f"{lane_one_tail if lane_one_tail is not None else 'unreadable'}"
+        )
+
+    def _observe_queue_handoff(
+        self,
+        label: str,
+        registers: Mapping[str, int],
+        thread_id: int,
+        read_u64: ReadU64,
+    ) -> TraceResult:
+        """Follow one RenderThread queue from enqueue through its event wait."""
+
+        if label == PREPARE:
+            task = _register(registers, "rbx")
+            if task == 0:
+                return TraceResult(False)
+            task_word = read_u64(task + 0x8)
+            desired_word = (
+                task_word & 0xFFFFFFFF if task_word is not None else 0xFFFFFFFF
+            )
+            desired_thread = desired_word & 0xFF
+            queue_index = (desired_word >> 8) & 1
+            caller, parent = self._fence_caller_chain(registers, read_u64)
+            if (
+                caller != self.target_caller
+                or parent != self.target_parent
+                or task == self.task
+            ):
+                return TraceResult(False)
+            singleton = read_u64(TASKGRAPH_SINGLETON_POINTER) or 0
+            self.queue_object = (
+                read_u64(singleton + desired_thread * 0x18 + 0x8) or 0
+            )
+            self.queue = (
+                self.queue_object + queue_index * 0x200 + 0x38
+                if self.queue_object != 0
+                else 0
+            )
+            self.queue_event_wrapper = (
+                read_u64(self.queue + 0x1F8) or 0
+                if self.queue != 0
+                else 0
+            )
+            self.queue_event_underlying = (
+                read_u64(self.queue_event_wrapper + 0x10) or 0
+            )
+            self.task = task
+            self.completion_event = read_u64(task + 0x18) or 0
+            self.counter_before_release = (
+                _register(registers, "r12") & 0xFFFFFFFF
+            )
+            self.release_threshold = (
+                _register(registers, "rax") & 0xFFFFFFFF
+            )
+            self.target_capture_count += 1
+            self.target_published = False
+            self.target_publisher_thread = thread_id
+            return TraceResult(
+                True,
+                f"target={self.target_capture_count} capture task={task:#x} "
+                f"event={self.completion_event:#x} "
+                f"desired={desired_thread:#x} queue_index={queue_index} "
+                f"dispatchable="
+                f"{self.counter_before_release == self.release_threshold} "
+                f"caller={caller:#x} caller_parent={parent:#x} "
+                f"publisher_thread={thread_id:#x} "
+                f"taskgraph={singleton:#x} queue={self.queue:#x} "
+                f"{self._queue_snapshot(read_u64)} "
+                f"{self._queue_event_description(read_u64)}",
+            )
+
+        if self.queue == 0:
+            return TraceResult(False)
+        if label == PUBLISH_RETURN:
+            queue = (
+                _register(registers, "r14")
+                + _register(registers, "rbx")
+                + 0x38
+            )
+            if queue != self.queue:
+                return TraceResult(False)
+            self.queue_transitions += 1
+            result = signed_u32(_register(registers, "rax"))
+            target = (
+                self.task != 0
+                and not self.target_published
+                and thread_id == self.target_publisher_thread
+            )
+            if target:
+                self.target_published = True
+            return TraceResult(
+                True,
+                f"post-enqueue transition={self.queue_transitions} "
+                f"queue={queue:#x} target={target} "
+                f"wake_waiter={result} "
+                f"{self._queue_snapshot(read_u64)} "
+                f"{self._queue_event_description(read_u64)} "
+                f"thread={thread_id:#x}",
+            )
+
+        if label == QUEUE_REGISTER:
+            queue = _register(registers, "r13")
+            if queue != self.queue:
+                return TraceResult(False)
+            self.queue_transitions += 1
+            registered = bool(_register(registers, "rflags") & (1 << 6))
+            waiter_bit = read_u64(_register(registers, "rbp") - 0x48)
+            return TraceResult(
+                True,
+                f"queue-register transition={self.queue_transitions} "
+                f"queue={queue:#x} registered={registered} "
+                f"waiter_bit="
+                f"{waiter_bit if waiter_bit is not None else 'unreadable'} "
+                f"expected={_register(registers, 'rax'):#x} "
+                f"desired={_register(registers, 'rbx'):#x} "
+                f"{self._queue_snapshot(read_u64)} "
+                f"thread={thread_id:#x}",
+            )
+
+        if label != EVENT_WAIT_ENTRY:
+            return TraceResult(False)
+        underlying = _register(registers, "r12")
+        if underlying != self.queue_event_underlying:
+            return TraceResult(False)
+        self.queue_transitions += 1
+        return TraceResult(
+            True,
+            f"event-wait-entry transition={self.queue_transitions} "
+            f"queue={self.queue:#x} mutex={underlying + 0x20:#x} "
+            f"condition={underlying + 0x28:#x} "
+            f"{self._queue_snapshot(read_u64)} "
+            f"{self._queue_event_description(read_u64)} "
+            f"thread={thread_id:#x}",
+        )
 
     def _observe_target_follow(
         self,
@@ -826,16 +1038,21 @@ class LldbTaskGraphTrace:
         "r8",
         "r9",
         "r12",
+        "r13",
         "r14",
         "r15",
         "rbp",
         "rsp",
+        "rflags",
     )
 
     def __init__(self, target) -> None:
         self.target = target
         target_follow = (
             os.environ.get("REMU_TASKGRAPH_TRACE_TARGET_FOLLOW") == "1"
+        )
+        queue_handoff = (
+            os.environ.get("REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF") == "1"
         )
         self.state = TaskGraphTraceState(
             _positive_limit(
@@ -848,16 +1065,19 @@ class LldbTaskGraphTrace:
                 DEFAULT_HIT_LIMIT,
                 MAXIMUM_HIT_LIMIT,
             ),
-            os.environ.get("REMU_TASKGRAPH_TRACE_PREPARE_ONLY") == "1",
-            target_follow,
-            guest_address_setting(
+            prepare_only=(
+                os.environ.get("REMU_TASKGRAPH_TRACE_PREPARE_ONLY") == "1"
+            ),
+            target_follow=target_follow,
+            target_caller=guest_address_setting(
                 "REMU_TASKGRAPH_TRACE_TARGET_CALLER",
                 DEFAULT_TARGET_FENCE_CALLER,
             ),
-            guest_address_setting(
+            target_parent=guest_address_setting(
                 "REMU_TASKGRAPH_TRACE_TARGET_PARENT",
                 DEFAULT_TARGET_FENCE_PARENT,
             ),
+            queue_handoff=queue_handoff,
         )
         self.enabled_breakpoints = {}
 
@@ -912,7 +1132,7 @@ class LldbTaskGraphTrace:
                 flush=True,
             )
             return False
-        if self.state.target_follow:
+        if self.state.target_follow and not self.state.queue_handoff:
             added = []
             additions = persistent_breakpoint_additions(
                 self.enabled_breakpoints,
@@ -1022,6 +1242,7 @@ def install_taskgraph_trace(frame, breakpoint_location, _internal_dict):
         f"hit_limit={SESSION.state.hit_limit} "
         f"prepare_only={SESSION.state.prepare_only} "
         f"target_follow={SESSION.state.target_follow} "
+        f"queue_handoff={SESSION.state.queue_handoff} "
         f"target_caller={SESSION.state.target_caller:#x} "
         f"target_parent={SESSION.state.target_parent:#x}",
         flush=True,
@@ -1054,6 +1275,15 @@ def start_taskgraph_trace(debugger, _command, result, _internal_dict):
         except ValueError as error:
             result.SetError(str(error))
             return
+    if (
+        os.environ.get("REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF") == "1"
+        and os.environ.get("REMU_TASKGRAPH_TRACE_TARGET_FOLLOW") != "1"
+    ):
+        result.SetError(
+            "REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF requires "
+            "REMU_TASKGRAPH_TRACE_TARGET_FOLLOW=1"
+        )
+        return
     target = debugger.GetSelectedTarget()
     seed = target.BreakpointCreateByRegex("remu_runtime::import_dispatch_entry")
     if not seed.IsValid() or seed.GetNumLocations() == 0:
