@@ -1424,6 +1424,55 @@ fn decodes_captured_ngg_subgroup_limits_and_derives_ninety_six_threads() {
 }
 
 #[test]
+fn decodes_passthrough_ngg_subgroup_without_an_api_gs_output_limit() {
+    let limits = decode_ngg_subgroup_limits(&[
+        GpuRegister {
+            offset: 0x1ff,
+            value: 64,
+        },
+        GpuRegister {
+            offset: 0x291,
+            value: 64 | (64 << 11) | (64 << 22),
+        },
+        GpuRegister {
+            offset: 0x29b,
+            value: 2,
+        },
+        GpuRegister {
+            offset: 0x2ce,
+            value: 0,
+        },
+        GpuRegister {
+            offset: 0x2d3,
+            value: 1,
+        },
+        GpuRegister {
+            offset: 0x2e4,
+            value: 0,
+        },
+    ])
+    .expect("passthrough NGG state is representable")
+    .expect("passthrough NGG registers are present");
+
+    assert_eq!(limits.es_vertices_per_subgroup, 64);
+    assert_eq!(limits.gs_primitives_per_subgroup, 64);
+    assert_eq!(limits.gs_instance_primitives_per_subgroup, 64);
+    assert_eq!(limits.gs_instance_count, 1);
+    assert_eq!(
+        limits.gs_max_vertices_out, 0,
+        "zero preserves the inactive API-GS clamp"
+    );
+    assert_eq!(limits.max_output_vertices_per_subgroup, 64);
+    assert_eq!(limits.primitive_amplification_factor, 1);
+    assert_eq!(limits.max_output_primitives_per_subgroup, 64);
+    assert_eq!(
+        limits.output_primitive_type,
+        Some(NggOutputPrimitiveType::TriangleStrip)
+    );
+    assert_eq!(limits.threadgroup_threads, 64);
+}
+
+#[test]
 fn ordinary_agc_geometry_defaults_do_not_activate_ngg() {
     assert_eq!(
         decode_ngg_subgroup_limits(&[
@@ -1458,6 +1507,23 @@ fn rejects_ngg_subgroups_that_exceed_metal_capacity() {
     )
     .expect_err("257 guest outputs cannot be silently clamped to Metal's limit");
     assert!(error.contains("exceed Metal's limit"));
+}
+
+#[test]
+fn still_enforces_a_programmed_api_gs_output_limit() {
+    let error = NggSubgroupLimits::new(
+        64,
+        64,
+        64,
+        1,
+        65,
+        1,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect_err("a programmed GS output clamp must bound subgroup vertices");
+
+    assert!(error.contains("VGT_GS_MAX_VERT_OUT(1)"));
 }
 
 #[test]

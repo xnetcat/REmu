@@ -161,7 +161,6 @@ impl NggSubgroupLimits {
             || limits.gs_primitives_per_subgroup == 0
             || limits.gs_instance_primitives_per_subgroup == 0
             || limits.gs_instance_count == 0
-            || limits.gs_max_vertices_out == 0
             || limits.max_output_vertices_per_subgroup == 0
             || limits.primitive_amplification_factor == 0
         {
@@ -186,17 +185,23 @@ impl NggSubgroupLimits {
                 limits.threadgroup_threads
             ));
         }
-        let architectural_max = limits
-            .gs_instance_primitives_per_subgroup
-            .checked_mul(limits.gs_max_vertices_out)
-            .ok_or("NGG subgroup output limit overflow")?;
-        if limits.max_output_vertices_per_subgroup > architectural_max {
-            return Err(format!(
-                "GE_MAX_OUTPUT_PER_SUBGROUP={} exceeds GS_INST_PRIMS_IN_SUBGRP({}) * VGT_GS_MAX_VERT_OUT({})",
-                limits.max_output_vertices_per_subgroup,
-                limits.gs_instance_primitives_per_subgroup,
-                limits.gs_max_vertices_out
-            ));
+        // VGT_GS_MAX_VERT_OUT is the per-input-primitive clamp for an API geometry shader. A
+        // zero value leaves that GS-only clamp inactive in passthrough NGG pipelines; their
+        // subgroup output storage remains independently and explicitly bounded by
+        // GE_MAX_OUTPUT_PER_SUBGROUP. Apply the derived GS bound only when the guest programs it.
+        if limits.gs_max_vertices_out != 0 {
+            let architectural_max = limits
+                .gs_instance_primitives_per_subgroup
+                .checked_mul(limits.gs_max_vertices_out)
+                .ok_or("NGG subgroup output limit overflow")?;
+            if limits.max_output_vertices_per_subgroup > architectural_max {
+                return Err(format!(
+                    "GE_MAX_OUTPUT_PER_SUBGROUP={} exceeds GS_INST_PRIMS_IN_SUBGRP({}) * VGT_GS_MAX_VERT_OUT({})",
+                    limits.max_output_vertices_per_subgroup,
+                    limits.gs_instance_primitives_per_subgroup,
+                    limits.gs_max_vertices_out
+                ));
+            }
         }
         Ok(limits)
     }
