@@ -96,6 +96,17 @@ pub(crate) fn analyze_control_flow(
     // fell through the dispatcher's default arm and silently terminated the shader.
     for instruction in &program.instructions {
         if !is_scalar_branch(instruction.opcode) {
+            if let Some(target) = program.linked_transfer_target(instruction.pc)
+                && !instruction_by_pc.contains_key(&target)
+            {
+                return Err(MetalCompileError::Instruction {
+                    pc: instruction.pc,
+                    opcode: instruction.opcode,
+                    message: format!(
+                        "linked S_SETPC target 0x{target:X} is not an instruction boundary"
+                    ),
+                });
+            }
             continue;
         }
         let target =
@@ -127,7 +138,13 @@ pub(crate) fn analyze_control_flow(
         }
         path.push(index);
         match instruction.opcode.known_name() {
-            Some("SEndpgm" | "SSetpcB64") => break,
+            Some("SEndpgm") => break,
+            Some("SSetpcB64") => {
+                let Some(target) = program.linked_transfer_target(instruction.pc) else {
+                    break;
+                };
+                index = instruction_by_pc[&target];
+            }
             Some("SBranch") => {
                 let target = branch_target(instruction).expect("all branch targets were validated");
                 index = instruction_by_pc[&target];
@@ -173,6 +190,8 @@ pub(crate) fn dispatcher_basic_blocks(program: &Program) -> Vec<std::ops::Range<
         if is_scalar_branch(instruction.opcode) {
             let target = branch_target(instruction)
                 .expect("dispatcher block construction follows validated control flow");
+            leaders.insert(instruction_by_pc[&target]);
+        } else if let Some(target) = program.linked_transfer_target(instruction.pc) {
             leaders.insert(instruction_by_pc[&target]);
         }
     }

@@ -146,3 +146,182 @@ fn branched_programs_keep_conservative_shader_inputs() {
     );
     assert!(program.input_scalar_registers().contains(&6));
 }
+
+#[test]
+fn links_setpc_to_the_exact_continuation_pc_namespace() {
+    let front = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sop1,
+            opcode: Opcode::from_static("SSetpcB64"),
+            words: vec![0xbe80_2006],
+            sources: vec![Operand::scalar(6)],
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let continuation = Program::new(
+        0x4000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::from_static("SGetpcB64"),
+                words: vec![0xbe80_1f14],
+                sources: Vec::new(),
+                destinations: vec![Operand::scalar(20)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+
+    let linked = link_program_continuation(&front, &continuation).expect("registered continuation");
+
+    assert_eq!(linked.address, front.address);
+    assert_eq!(linked.linked_transfer_target(0), Some(0x3000));
+    assert_eq!(linked.instructions[1].pc, 0x3000);
+    assert_eq!(
+        linked.address + u64::from(linked.instructions[1].pc),
+        continuation.address
+    );
+    assert_ne!(
+        front, linked,
+        "a linked program has a distinct cache identity"
+    );
+}
+
+#[test]
+fn linked_continuation_operations_are_visible_to_whole_program_classifiers() {
+    let front = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sop1,
+            opcode: Opcode::from_static("SSetpcB64"),
+            words: vec![0xbe80_2006],
+            sources: vec![Operand::scalar(6)],
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let continuation = Program::new(
+        0x4000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::from_static("SSendmsg"),
+                words: vec![0],
+                sources: vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::EXPORT,
+                words: vec![0, 0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(ExportControl {
+                    target: 20,
+                    enable_mask: 1,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                })),
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::EXPORT,
+                words: vec![0, 0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(ExportControl {
+                    target: 12,
+                    enable_mask: 0x0f,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                })),
+            },
+        ],
+    );
+
+    let linked = link_program_continuation(&front, &continuation).expect("registered continuation");
+
+    assert!(linked.instructions.iter().any(|instruction| {
+        instruction.opcode.is("SSendmsg")
+            && instruction
+                .sources
+                .first()
+                .is_some_and(|source| source.value == 9)
+    }));
+    assert!(linked.instructions.iter().any(|instruction| {
+        matches!(
+            instruction.control,
+            Some(InstructionControl::Export(ExportControl {
+                target: 20,
+                enable_mask: 1,
+                ..
+            }))
+        )
+    }));
+    assert!(linked.instructions.iter().any(|instruction| {
+        matches!(
+            instruction.control,
+            Some(InstructionControl::Export(ExportControl {
+                target: 12,
+                enable_mask: 0x0f,
+                ..
+            }))
+        )
+    }));
+}
+
+#[test]
+fn refuses_to_infer_a_continuation_without_an_explicit_setpc() {
+    let front = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0xbf81_0000],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let continuation = Program::new(
+        0x2000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0xbf81_0000],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+
+    assert_eq!(
+        link_program_continuation(&front, &continuation),
+        Err(ProgramLinkError::MissingSetpc)
+    );
+}

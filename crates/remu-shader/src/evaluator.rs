@@ -288,6 +288,22 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             if instruction.opcode == Opcode::END_PROGRAM {
                 break;
             }
+            if instruction.opcode.is("SSetpcB64") {
+                let Some(target_pc) = self.state.program.linked_transfer_target(instruction.pc)
+                else {
+                    break;
+                };
+                path.instruction_index = self
+                    .state
+                    .program
+                    .instructions
+                    .binary_search_by_key(&target_pc, |candidate| candidate.pc)
+                    .map_err(|_| EvaluationError::InvalidBranchTarget {
+                        pc: instruction.pc,
+                        target: target_pc,
+                    })?;
+                continue;
+            }
             if instruction.encoding == ShaderEncoding::Sopp && is_scalar_branch(instruction.opcode)
             {
                 let target_pc = branch_target(instruction)?;
@@ -384,7 +400,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 instruction.encoding,
                 ShaderEncoding::Sop1 | ShaderEncoding::Sop2 | ShaderEncoding::Sopk
             ) {
-                if instruction.opcode.is("SSetpcB64") || instruction.opcode.is("SSwappcB64") {
+                if instruction.opcode.is("SSwappcB64") {
                     break;
                 }
                 execute_scalar_alu(

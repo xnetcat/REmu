@@ -192,6 +192,78 @@ fn setpc_deactivates_each_forward_control_flow_path() {
 }
 
 #[test]
+fn linked_setpc_lowers_real_continuation_param_exports() {
+    let front = Program::new(0x1000, vec![setpc(0)]);
+    // Decode an architectural RDNA2 EXP PARAM0 rather than constructing export IR by hand.
+    let export_param0 = 0xf800_0000 | (32 << 4) | 0x0f | (1 << 11) | (1 << 12);
+    let continuation = decode_program(0x4000, &[export_param0, 0x0403_0201, 0xbf81_0000])
+        .expect("copy program PARAM export");
+    let linked = remu_shader::link_program_continuation(&front, &continuation)
+        .expect("exact registered front/back pair");
+
+    let shader = compile_msl(
+        &linked,
+        &empty_evaluation(),
+        &MetalCompileOptions::vertex(1),
+    )
+    .expect("linked PARAM export should lower");
+
+    assert!(shader.register_footprint.direct_control_flow);
+    assert!(shader.source.contains(
+        "remu_out.param0 = float4(as_type<float>(remu_v_1), as_type<float>(remu_v_2), as_type<float>(remu_v_3), as_type<float>(remu_v_4));"
+    ));
+    assert!(!shader.source.contains("active = false;"));
+}
+
+#[test]
+fn linked_continuation_getpc_uses_its_original_absolute_address() {
+    let front = Program::new(0x1000, vec![setpc(0)]);
+    let continuation = Program::new(
+        0x4000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SGetpcB64"),
+                words: vec![0xbe80_1f14],
+                sources: Vec::new(),
+                destinations: vec![Operand::scalar(20)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(20)],
+                destinations: vec![Operand::vector(1)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let linked = remu_shader::link_program_continuation(&front, &continuation)
+        .expect("exact registered front/back pair");
+
+    let shader = compile_msl(
+        &linked,
+        &empty_evaluation(),
+        &MetalCompileOptions::vertex(0),
+    )
+    .expect("linked GETPC should lower");
+
+    assert!(shader.source.contains("remu_s_20 = 0x4004u;"));
+}
+
+#[test]
 fn swappc_remains_a_nonterminal_unsupported_dynamic_call() {
     let program = Program::new(
         0x1000,

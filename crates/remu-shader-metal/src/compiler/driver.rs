@@ -330,9 +330,19 @@ impl<'a> Compiler<'a> {
             .ok_or_else(|| "raw opcode has no lowering semantics".to_owned())?;
 
         match name {
-            "SEndpgm" | "SSetpcB64" => {
+            "SEndpgm" => {
                 if dispatched {
                     self.line(3, "active = false;");
+                }
+                return Ok(());
+            }
+            "SSetpcB64" => {
+                if dispatched {
+                    if let Some(target) = self.program.linked_transfer_target(instruction.pc) {
+                        self.line(3, &format!("pc = {target}u;"));
+                    } else {
+                        self.line(3, "active = false;");
+                    }
                 }
                 return Ok(());
             }
