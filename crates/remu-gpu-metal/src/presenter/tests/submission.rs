@@ -11,7 +11,8 @@ use remu_gpu::{
     GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
 };
 use remu_memory::{
-    CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestProtection,
+    CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+    GuestProtection,
 };
 use remu_shader::{GlobalMemoryBinding, Program};
 use std::time::Duration;
@@ -19,11 +20,34 @@ use std::time::Duration;
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason,
     GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus,
-    GuestMemoryWaitTracker, GuestRenderPassKey, MetalPresenter, OpenGuestRenderPass,
-    OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PendingGlobalWriteback,
-    PendingGuestMemoryWrite, QueueBlockReason, apply_pending_guest_memory_writes, indexed_draw,
+    GuestMemoryWaitTracker, GuestMemoryWriteOperation, GuestRenderPassKey, MetalPresenter,
+    OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
+    PendingGlobalWriteback, PendingGuestMemoryWrite, QueueBlockReason,
+    apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
     write_back_pending_globals,
 };
+
+fn mapped_test_label() -> (GuestAddressSpace, u64) {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest label address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest label backing");
+    let address = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest label mapping");
+    (address_space, address.get())
+}
+
+fn read_test_label(address: u64) -> u32 {
+    // SAFETY: every caller retains the `GuestAddressSpace` returned by `mapped_test_label`.
+    unsafe { std::ptr::read_volatile(address as *const u32) }
+}
 
 #[test]
 fn native_metal_draw_arguments_match_the_gen5_indirect_layouts() {
@@ -162,9 +186,7 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
     assert_eq!(presenter.statistics.submitted_guest_batches, 0);
     assert_eq!(presenter.statistics.coalesced_pipeline_barriers, 3);
 
-    let mut release_label = 0_u32;
-    let release_address =
-        u64::try_from((&raw mut release_label) as usize).expect("test label address fits u64");
+    let (_release_space, release_address) = mapped_test_label();
     presenter
         .execute_guest_memory_release(GpuMemoryRelease {
             address: release_address,
@@ -178,12 +200,15 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
     assert!(open.render_pass.is_some());
     assert!(matches!(
         open.memory_writes.as_slice(),
-        [PendingGuestMemoryWrite::Release(GpuMemoryRelease {
-            address,
-            value: GpuMemoryReleaseValue::Immediate32(1),
-        })] if *address == release_address
+        [PendingGuestMemoryWrite {
+            operation: GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+                address,
+                value: GpuMemoryReleaseValue::Immediate32(1),
+            }),
+            ..
+        }] if *address == release_address
     ));
-    assert_eq!(release_label, 0, "the label remains deferred");
+    assert_eq!(read_test_label(release_address), 0, "the label remains deferred");
     assert!(presenter.committed_guest_batches.is_empty());
     assert_eq!(presenter.statistics.submitted_guest_batches, 0);
     assert_eq!(presenter.statistics.batch_flushes_for_guest_memory_write, 0);
@@ -205,10 +230,10 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
     assert_eq!(committed.completion_sequences, [40, 41, 42]);
     assert!(matches!(
         committed.memory_writes.as_slice(),
-        [PendingGuestMemoryWrite::Release(GpuMemoryRelease {
-            address,
+        [PendingGuestMemoryWrite {
+            operation: GuestMemoryWriteOperation::Release(GpuMemoryRelease { address, .. }),
             ..
-        })] if *address == release_address
+        }] if *address == release_address
     ));
     committed.command_buffer.wait_until_completed();
     assert_eq!(
@@ -217,7 +242,7 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
     );
     apply_pending_guest_memory_writes(&committed.memory_writes)
         .expect("completed release publishes its label");
-    assert_eq!(release_label, 1);
+    assert_eq!(read_test_label(release_address), 1);
 }
 
 #[test]
@@ -362,8 +387,7 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
         completion_sequences: Vec::new(),
     });
 
-    let mut label = 0_u32;
-    let address = u64::try_from((&raw mut label) as usize).expect("test label address fits u64");
+    let (_label_space, address) = mapped_test_label();
     for value in [1, 2] {
         presenter
             .execute_guest_memory_release(GpuMemoryRelease {
@@ -372,7 +396,11 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
             })
             .expect("label release coalesces");
     }
-    assert_eq!(label, 0, "open-batch label writes remain deferred");
+    assert_eq!(
+        read_test_label(address),
+        0,
+        "open-batch label writes remain deferred"
+    );
     assert_eq!(
         presenter.pending_guest_memory_value(address, false),
         Some(2)
@@ -419,7 +447,11 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
     assert_eq!(presenter.committed_guest_batches.len(), 1);
     assert_eq!(presenter.statistics.submitted_guest_batches, 1);
     assert_eq!(presenter.statistics.batch_flushes_for_blocked_wait, 1);
-    assert_eq!(label, 0, "blocked wait commits before CPU publication");
+    assert_eq!(
+        read_test_label(address),
+        0,
+        "blocked wait commits before CPU publication"
+    );
     assert_eq!(
         presenter.pending_guest_memory_value(address, false),
         Some(2)
@@ -429,15 +461,18 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
         .wait_for_guest_command_batches()
         .expect("committed label batch completes");
     assert!(presenter.committed_guest_batches.is_empty());
-    assert_eq!(label, 2, "deferred writes publish in exact packet order");
+    assert_eq!(
+        read_test_label(address),
+        2,
+        "deferred writes publish in exact packet order"
+    );
 }
 
 #[test]
 fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
-    let mut label = 0_u32;
-    let address = u64::try_from((&raw mut label) as usize).expect("test label address fits u64");
+    let (_label_space, address) = mapped_test_label();
     let wait = GpuMemoryWait {
         address,
         reference: 7,
@@ -450,10 +485,13 @@ fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
         presenter.guest_memory_waits.observe_unsatisfied(key),
         GuestMemoryWaitRecovery::None
     );
-    let pending = [PendingGuestMemoryWrite::Release(GpuMemoryRelease {
-        address,
-        value: GpuMemoryReleaseValue::Immediate32(7),
-    })];
+    let pending = [pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+        GpuMemoryRelease {
+            address,
+            value: GpuMemoryReleaseValue::Immediate32(7),
+        },
+    ))
+    .expect("pin release label mapping")];
 
     let error = presenter
         .publish_terminal_guest_memory_writes(
@@ -467,7 +505,7 @@ fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
         "publishing the completion label must not erase the primary failure"
     );
     assert_eq!(
-        label, 7,
+        read_test_label(address), 7,
         "terminal failure must not strand its following RELEASE_MEM"
     );
     assert_eq!(
@@ -486,19 +524,23 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
         .as_ref()
         .expect("Metal queue")
         .clone();
-    let mut completion_label = 0_u32;
-    let completion_address =
-        u64::try_from((&raw mut completion_label) as usize).expect("test label address fits u64");
-    for memory_writes in [
-        vec![PendingGuestMemoryWrite::Release(GpuMemoryRelease {
+    let (_completion_space, completion_address) = mapped_test_label();
+    let invalid = PendingGuestMemoryWrite {
+        operation: GuestMemoryWriteOperation::Release(GpuMemoryRelease {
             address: 2,
             value: GpuMemoryReleaseValue::Immediate32(1),
-        })],
-        vec![PendingGuestMemoryWrite::Release(GpuMemoryRelease {
+        }),
+        mapping_identity: None,
+        write_watch: None,
+    };
+    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+        GpuMemoryRelease {
             address: completion_address,
             value: GpuMemoryReleaseValue::Immediate32(9),
-        })],
-    ] {
+        },
+    ))
+    .expect("pin completion label mapping");
+    for memory_writes in [vec![invalid], vec![completion]] {
         let command_buffer = queue.new_command_buffer().to_owned();
         command_buffer.commit();
         presenter
@@ -526,7 +568,7 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
         "a failed terminal batch must not abandon later committed tickets"
     );
     assert_eq!(
-        completion_label, 9,
+        read_test_label(completion_address), 9,
         "the later batch's ordered completion label must still publish"
     );
 }
@@ -546,9 +588,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
     command_buffer.encode_wait_for_event(&event, 1);
     command_buffer.commit();
 
-    let mut completion_label = 0_u32;
-    let completion_address =
-        u64::try_from((&raw mut completion_label) as usize).expect("test label address fits u64");
+    let (_completion_space, completion_address) = mapped_test_label();
     presenter
         .committed_guest_batches
         .push_back(GuestCommandBatch {
@@ -557,10 +597,13 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
             global_upload_chunks: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
-            memory_writes: vec![PendingGuestMemoryWrite::Release(GpuMemoryRelease {
-                address: completion_address,
-                value: GpuMemoryReleaseValue::Immediate32(9),
-            })],
+            memory_writes: vec![pin_guest_memory_write(
+                GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+                    address: completion_address,
+                    value: GpuMemoryReleaseValue::Immediate32(9),
+                }),
+            )
+            .expect("pin completion label mapping")],
             render_pass: None,
             completion_sequences: Vec::new(),
         });
@@ -575,7 +618,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
         "a timeout must retain the still-running command buffer"
     );
     assert_eq!(
-        completion_label, 0,
+        read_test_label(completion_address), 0,
         "a timeout must not publish ordered guest completion effects"
     );
 
@@ -584,7 +627,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
         .wait_for_guest_command_batches()
         .expect("the retained batch retires after Metal completes it");
     assert!(presenter.committed_guest_batches.is_empty());
-    assert_eq!(completion_label, 9);
+    assert_eq!(read_test_label(completion_address), 9);
 }
 
 #[test]
@@ -746,40 +789,140 @@ fn anonymous_global_writeback_updates_the_pinned_guest_mapping() {
 
 #[test]
 fn ordered_guest_label_writes_publish_only_the_declared_values() {
-    let mut release_value = 0_u64;
-    let mut words = [0_u32; 3];
-    let mut fill_words = [0_u32; 3];
-    let release = PendingGuestMemoryWrite::Release(GpuMemoryRelease {
-        address: std::ptr::addr_of_mut!(release_value) as u64,
+    let (_label_space, release_address) = mapped_test_label();
+    let words_address = release_address + 16;
+    let fill_address = release_address + 32;
+    let release = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+        address: release_address,
         value: GpuMemoryReleaseValue::Immediate64(0x1122_3344_5566_7788),
-    });
-    let write = PendingGuestMemoryWrite::Write(GpuMemoryWrite {
-        address: words.as_mut_ptr() as u64,
+    }))
+    .expect("pin release destination");
+    let write = pin_guest_memory_write(GuestMemoryWriteOperation::Write(GpuMemoryWrite {
+        address: words_address,
         values: vec![3, 5, 8],
         increment_address: true,
-    });
-    let fill = PendingGuestMemoryWrite::Fill {
-        address: fill_words.as_mut_ptr() as u64,
+    }))
+    .expect("pin write destination");
+    let fill = pin_guest_memory_write(GuestMemoryWriteOperation::Fill {
+        address: fill_address,
         value: 0xaabb_ccdd,
         dword_count: 3,
-    };
+    })
+    .expect("pin fill destination");
     assert_eq!(
-        release.value_at(std::ptr::addr_of!(release_value) as u64, true),
+        release.value_at(release_address, true),
         Some(0x1122_3344_5566_7788)
     );
-    assert_eq!(write.value_at(words.as_ptr() as u64 + 8, false), Some(8));
+    assert_eq!(write.value_at(words_address + 8, false), Some(8));
     assert_eq!(
-        fill.value_at(fill_words.as_ptr() as u64 + 4, false),
+        fill.value_at(fill_address + 4, false),
         Some(0xaabb_ccdd)
     );
     assert_eq!(
-        fill.value_at(fill_words.as_ptr() as u64, true),
+        fill.value_at(fill_address, true),
         Some(0xaabb_ccdd_aabb_ccdd)
     );
     apply_pending_guest_memory_writes(&[release, write, fill]).expect("ordered guest writes");
-    assert_eq!(release_value, 0x1122_3344_5566_7788);
-    assert_eq!(words, [3, 5, 8]);
-    assert_eq!(fill_words, [0xaabb_ccdd; 3]);
+    assert_eq!(
+        unsafe { std::ptr::read_volatile(release_address as *const u64) },
+        0x1122_3344_5566_7788
+    );
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(words_address as *const u32, 3) },
+        [3, 5, 8]
+    );
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(fill_address as *const u32, 3) },
+        [0xaabb_ccdd; 3]
+    );
+}
+
+#[test]
+fn deferred_shared_guest_write_rejects_reused_mapping() {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
+    let original_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original guest backing");
+    let address = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("original shared mapping");
+    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+        address: address.get(),
+        value: GpuMemoryReleaseValue::Immediate32(0xdead_beef),
+    }))
+    .expect("pin original shared mapping");
+
+    address_space
+        .unmap(address, GUEST_PAGE_SIZE)
+        .expect("unmap original shared mapping");
+    let replacement_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement guest backing");
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(address),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement shared mapping");
+
+    let error = apply_pending_guest_memory_writes(&[pending])
+        .expect_err("stale deferred write must reject the replacement mapping");
+    assert!(error.contains("mapping changed before completion"));
+    let mut replacement = [0_u8; 4];
+    address_space
+        .read(address, &mut replacement)
+        .expect("read replacement mapping");
+    assert_eq!(replacement, [0; 4]);
+}
+
+#[test]
+fn deferred_anonymous_guest_write_rejects_reused_mapping() {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
+    let address = address_space
+        .map_anonymous(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .expect("original anonymous mapping");
+    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+        address: address.get(),
+        value: GpuMemoryReleaseValue::Immediate32(0xdead_beef),
+    }))
+    .expect("pin original anonymous mapping");
+
+    address_space
+        .unmap(address, GUEST_PAGE_SIZE)
+        .expect("unmap original anonymous mapping");
+    address_space
+        .map_anonymous(
+            GuestMapPlacement::Fixed(address),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .expect("replacement anonymous mapping");
+
+    let error = apply_pending_guest_memory_writes(&[pending])
+        .expect_err("stale deferred write must reject the replacement mapping");
+    assert!(error.contains("mapping changed before completion"));
+    let mut replacement = [0_u8; 4];
+    address_space
+        .read(address, &mut replacement)
+        .expect("read replacement mapping");
+    assert_eq!(replacement, [0; 4]);
 }
 
 #[test]

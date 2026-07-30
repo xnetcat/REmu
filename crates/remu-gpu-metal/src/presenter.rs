@@ -152,7 +152,9 @@ use self::submission::{
     completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
 };
 #[cfg(test)]
-use self::submission::{apply_pending_guest_memory_writes, write_back_pending_globals};
+use self::submission::{
+    apply_pending_guest_memory_writes, pin_guest_memory_write, write_back_pending_globals,
+};
 use self::texture::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, decode_guest_texture_linear_from_raw,
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
@@ -1034,7 +1036,7 @@ struct PendingGuestWriteRange {
 }
 
 #[derive(Clone, Debug)]
-enum PendingGuestMemoryWrite {
+enum GuestMemoryWriteOperation {
     Release(GpuMemoryRelease),
     Write(GpuMemoryWrite),
     Fill {
@@ -1042,6 +1044,13 @@ enum PendingGuestMemoryWrite {
         value: u32,
         dword_count: u64,
     },
+}
+
+#[derive(Debug)]
+struct PendingGuestMemoryWrite {
+    operation: GuestMemoryWriteOperation,
+    mapping_identity: Option<GuestSharedMappingIdentity>,
+    write_watch: Option<CpuWriteWatch>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
