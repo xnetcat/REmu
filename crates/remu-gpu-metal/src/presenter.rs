@@ -52,16 +52,14 @@ use self::decode::{
 #[cfg(test)]
 use self::decode::{
     CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_BASE, CB_COLOR0_BASE_EXT,
-    CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_CMASK, CB_COLOR0_INFO,
-    CB_COLOR0_VIEW, DB_DEPTH_CLEAR, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL,
-    DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI,
-    NGG_MESHLET_WORDS_PER_GROUP, SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE,
-    VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length,
-    decode_fast_clear_color,
-    decode_render_targets_from_registers, decode_scanout_target, graphics_shader_resource_key,
-    initial_depth_clear_value, metal_primitive_topology_class, pixel_input_controls,
-    decode_ngg_subgroup_limits,
-    raw_video_out_layout_is_linear,
+    CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_CMASK, CB_COLOR0_INFO, CB_COLOR0_VIEW,
+    DB_DEPTH_CLEAR, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE,
+    DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, NGG_MESHLET_WORDS_PER_GROUP,
+    SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
+    VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length, decode_fast_clear_color,
+    decode_ngg_subgroup_limits, decode_render_targets_from_registers, decode_scanout_target,
+    graphics_shader_resource_key, initial_depth_clear_value, metal_primitive_topology_class,
+    pixel_input_controls, raw_video_out_layout_is_linear,
 };
 #[cfg(test)]
 use self::diagnostics::parse_diagnostic_hex_address;
@@ -94,7 +92,7 @@ use self::diagnostics::{
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer,
     should_record_diagnostic_target_writer, trace_image_descriptors, trace_msaa_writes,
     trace_scanout_writes, trace_target_sampling, trace_video_target_compute_consumer,
-    trace_video_target_draw_consumer, trace_video_target_consumers, video_target_binding_summary,
+    trace_video_target_consumers, trace_video_target_draw_consumer, video_target_binding_summary,
 };
 use self::format::{
     compressed_texture_block_extent, decode_sampled_texture_format, half_float_to_f32,
@@ -124,10 +122,9 @@ use self::sampler::{
 use self::shader::{
     SHADER_COMPILE_QUEUE_CAPACITY, compile_metal_compute_library, compile_metal_library_with_tools,
     compute_pipeline_key, compute_program_can_split_wave64, dump_shader_pair_msl,
-    graphics_allocated_vector_register_count,
-    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    pixel_scalars, program_embeds_global_base, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
+    is_storage_image_opcode, is_writable_image_opcode, pixel_scalars, program_embeds_global_base,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
@@ -135,24 +132,24 @@ use self::shader::{
     rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
     shader_scalar_metadata,
 };
+#[cfg(test)]
+use self::stats::process_resident_bytes;
 use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
     MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
-    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
-    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
-    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
-    SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
-    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, TEXTURE_DIRTY_VALIDATION_BYTES,
-    TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
-    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
-    TEXTURE_SNAPSHOT_NANOSECONDS, process_memory_statistics, record_mode27_work_detail,
-    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
-    take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, SAMPLED_ALIAS_WRITEBACK_BYTES,
+    SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
+    SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
+    SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
+    TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+    TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
+    TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
+    process_memory_statistics, record_mode27_work_detail, record_texture_dirty_work_detail,
+    record_texture_snapshot_work_detail, record_texture_work, take_mode27_work_details,
+    take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
-#[cfg(test)]
-use self::stats::process_resident_bytes;
 use self::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
@@ -1391,10 +1388,7 @@ impl GuestRenderPassKey {
                 GuestRenderPassKeyField::TargetBaseLayer,
                 current.5 != next.5,
             );
-            transition.mark(
-                GuestRenderPassKeyField::TargetMipLevel,
-                current.6 != next.6,
-            );
+            transition.mark(GuestRenderPassKeyField::TargetMipLevel, current.6 != next.6);
             transition.mark(
                 GuestRenderPassKeyField::TargetMipLevelCount,
                 current.7 != next.7,
@@ -1663,10 +1657,8 @@ impl MetalPresenter {
         eprintln!(
             "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB resident texture cache={} MiB",
             SAMPLED_TEXTURE_CACHE_CAPACITY,
-            sampled_texture_cache_byte_capacity()
-                .map_or(0, |bytes| bytes / (1024 * 1024)),
-            resident_texture_cache_byte_capacity()
-                .map_or(0, |bytes| bytes / (1024 * 1024)),
+            sampled_texture_cache_byte_capacity().map_or(0, |bytes| bytes / (1024 * 1024)),
+            resident_texture_cache_byte_capacity().map_or(0, |bytes| bytes / (1024 * 1024)),
         );
         for worker in 0..shader_compiler_workers {
             let compiler_device = device.clone();
@@ -1685,8 +1677,8 @@ impl MetalPresenter {
                         let Ok(request) = request else {
                             break;
                         };
-                        let result = compile_shader_request_catching_panics(&request, || {
-                            match &request {
+                        let result =
+                            compile_shader_request_catching_panics(&request, || match &request {
                                 ShaderCompileRequest::Graphics { key, draw } => {
                                     let compiled = Self::compile_draw_shader_pair(
                                         &compiler_device,
@@ -1715,8 +1707,7 @@ impl MetalPresenter {
                                         compiled,
                                     }
                                 }
-                            }
-                        });
+                            });
                         if shader_compile_results.send(result).is_err() {
                             break;
                         }

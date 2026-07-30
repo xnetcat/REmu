@@ -14,8 +14,8 @@ use remu_shader::{
 use std::sync::Arc;
 
 use super::{
-    CompiledComputePipeline, ComputePipelineKey, MetalPresenter, ProgramIdentity,
-    OrderedEventPoll, OrderedGpuEventReceiver, QueueBlockReason, ShaderCompileRequest,
+    CompiledComputePipeline, ComputePipelineKey, MetalPresenter, OrderedEventPoll,
+    OrderedGpuEventReceiver, ProgramIdentity, QueueBlockReason, ShaderCompileRequest,
     ShaderCompileResult, canonical_sampler_bindings, canonical_texture_bindings,
     compile_shader_request_catching_panics, compute_launch, graphics_shader_resource_key,
     image_component_class, missing_vertex_parameter_exports, ngg_mesh_export_stage,

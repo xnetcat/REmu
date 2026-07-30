@@ -423,7 +423,11 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
             .source
             .contains("remu_mesh.set_index(remu_thread_index * 3u")
     );
-    assert!(!shader.source.contains("remu_mesh.set_index(remu_wave_lane * 3u"));
+    assert!(
+        !shader
+            .source
+            .contains("remu_mesh.set_index(remu_wave_lane * 3u")
+    );
     assert!(
         shader
             .source

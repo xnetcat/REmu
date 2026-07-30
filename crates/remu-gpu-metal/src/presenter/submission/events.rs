@@ -16,9 +16,8 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 /// deliberately finite: a malformed or genuinely cyclic stream containing only more work for
 /// blocked queues must retain backpressure instead of moving an unbounded command stream into the
 /// presenter.
-const BLOCKED_DEPENDENCY_LOOKAHEAD_CAPACITY: usize = remu_gpu::GPU_EVENT_QUEUE_CAPACITY
-    * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
-    * 2;
+const BLOCKED_DEPENDENCY_LOOKAHEAD_CAPACITY: usize =
+    remu_gpu::GPU_EVENT_QUEUE_CAPACITY * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE * 2;
 
 impl OrderedGpuEventReceiver {
     pub(crate) fn new(receiver: Receiver<GpuEvent>) -> Self {
@@ -377,8 +376,7 @@ impl OrderedGpuEventReceiver {
                     .take(work_limit - candidates.len()),
             );
         }
-        self.next_prefetch_source_index =
-            (start + visited_sources.max(1)) % sources.len();
+        self.next_prefetch_source_index = (start + visited_sources.max(1)) % sources.len();
         candidates
     }
 
@@ -655,9 +653,9 @@ fn pipeline_compile_candidate(event: &GpuEvent) -> Option<PipelineCompileCandida
         GpuEvent::IndexedDraw(draw) => {
             Some(PipelineCompileCandidate::Graphics(draw.as_ref().clone()))
         }
-        GpuEvent::ComputeDispatch(dispatch) => Some(PipelineCompileCandidate::Compute(
-            dispatch.as_ref().clone(),
-        )),
+        GpuEvent::ComputeDispatch(dispatch) => {
+            Some(PipelineCompileCandidate::Compute(dispatch.as_ref().clone()))
+        }
         _ => None,
     }
 }

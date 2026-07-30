@@ -5,9 +5,8 @@ use super::{
     GuestMemoryWriteOperation, MetalPresenter, PendingGlobalWriteback, PendingGuestMemoryWrite,
     WriteWatchRefresh, guest_batch_writes_overlap, guest_ranges_overlap, guest_texture_byte_count,
     merge_guest_batch_result, read_guest_memory_wait_value, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear,
-    record_diagnostic_memory_copy, refresh_resident_texture_write_watch,
-    retire_multisample_textures_overlapping_writeback,
+    rearm_depth_metadata_clear, record_diagnostic_memory_copy,
+    refresh_resident_texture_write_watch, retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, trace_resident_texture_removal,
     write_resident_texture_contents_to_guest,
@@ -80,10 +79,7 @@ impl MetalPresenter {
                 value: copy.source_address as u32,
                 dword_count: copy.byte_count / 4,
             })?;
-            rearm_color_metadata_clear(
-                &mut self.color_metadata_clears,
-                copy.destination_address,
-            );
+            rearm_color_metadata_clear(&mut self.color_metadata_clears, copy.destination_address);
             rearm_depth_metadata_clear(&mut self.depth_metadata_clears, copy.destination_address);
         } else {
             copy.source_address

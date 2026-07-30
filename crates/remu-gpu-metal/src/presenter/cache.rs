@@ -4,11 +4,10 @@
 use super::{
     CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
     GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, NggSubgroupLimits,
-    PendingGlobalWriteback,
-    SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey, UploadedGlobalBuffer,
-    canonical_sampler_bindings, create_sampler_argument_buffer, guest_batch_writes_overlap,
-    guest_global_buffer_view, guest_physical_ranges_overlap, metal_buffer_with_bytes,
-    prepare_ngg_meshlets,
+    PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey,
+    UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
+    guest_batch_writes_overlap, guest_global_buffer_view, guest_physical_ranges_overlap,
+    metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -562,8 +561,7 @@ impl MetalPresenter {
         if self.ngg_meshlet_cache.len() >= NGG_MESHLET_CACHE_CAPACITY {
             self.ngg_meshlet_cache.clear();
         }
-        self.ngg_meshlet_cache
-            .insert(cache_key, cached.clone());
+        self.ngg_meshlet_cache.insert(cache_key, cached.clone());
         Ok(cached)
     }
 }

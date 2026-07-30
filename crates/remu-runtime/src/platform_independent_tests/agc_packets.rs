@@ -352,11 +352,8 @@ fn dma_shadow_reaches_indirect_draw_arguments_without_executing_the_copy_early()
         2,
     ]);
 
-    let events = capture_submission_events(
-        &commands,
-        &mut graphics,
-        &mut AgcShaderRegistry::default(),
-    );
+    let events =
+        capture_submission_events(&commands, &mut graphics, &mut AgcShaderRegistry::default());
 
     assert_eq!(
         destination_arguments, [0; 5],

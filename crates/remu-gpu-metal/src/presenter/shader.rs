@@ -16,10 +16,9 @@ use super::{
     PersistentRenderPipelineArchive, PipelineCompileCandidate, ProgramIdentity,
     RenderPipelineArchiveState, ShaderCompileRequest, ShaderCompileResult, ShaderFunctionCache,
     ShaderFunctionCacheEntry, ShaderFunctionStageCache, diagnostic_disable_blending,
-    dump_msl_compute_filter_matches,
-    dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
-    evaluation_samples_large_linear_video, image_component_class, metal_color_write_mask,
-    register_value, speculative_pipeline_compile_in_flight_capacity,
+    dump_msl_compute_filter_matches, dump_msl_instruction_filter_matches,
+    dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video, image_component_class,
+    metal_color_write_mask, register_value, speculative_pipeline_compile_in_flight_capacity,
     video_target_binding_summary,
 };
 mod archive;
@@ -28,10 +27,6 @@ mod program;
 pub(crate) use self::compile::{
     compile_metal_compute_library, compile_metal_library_with_tools, compile_metal_shader_library,
     dump_compute_shader_msl, dump_shader_pair_ir, dump_shader_pair_msl, metal_cache_root,
-};
-#[cfg(test)]
-pub(crate) use self::program::{
-    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
 };
 pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64,
@@ -42,6 +37,8 @@ pub(crate) use self::program::{
     rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
+#[cfg(test)]
+pub(crate) use self::program::{rectangle_draw_has_incomplete_interface, shader_scalar_metadata};
 
 impl MetalPresenter {
     pub(super) fn prefetch_pipeline_compilations(&mut self) {
@@ -80,8 +77,7 @@ impl MetalPresenter {
                         ) else {
                             return false;
                         };
-                        let key =
-                            compute_pipeline_key(dispatch, evaluation, &snapshot.program);
+                        let key = compute_pipeline_key(dispatch, evaluation, &snapshot.program);
                         !compiled_compute_pipelines.contains_key(&key)
                             && !compiling_compute_pipelines.contains(&key)
                             && !failed_compute_pipelines.contains(&key)
@@ -460,9 +456,10 @@ impl MetalPresenter {
             let limits = key
                 .ngg_subgroup_limits
                 .ok_or("NGG mesh shader is missing subgroup sizing registers")?;
-            if limits.output_primitive_type.is_some_and(|primitive| {
-                primitive != NggOutputPrimitiveType::TriangleStrip
-            }) {
+            if limits
+                .output_primitive_type
+                .is_some_and(|primitive| primitive != NggOutputPrimitiveType::TriangleStrip)
+            {
                 return Err(format!(
                     "NGG output primitive {:?} cannot use Metal triangle mesh topology",
                     limits.output_primitive_type
@@ -488,8 +485,7 @@ impl MetalPresenter {
             key.diagnostics.force_visible_clip_depth;
         vertex_options.diagnostic_force_vertex_pattern = key.diagnostics.force_vertex_pattern;
         vertex_options.diagnostic_force_vertex_fetch_id = key.diagnostics.force_vertex_fetch_id;
-        vertex_options.diagnostic_capture_vertex_position =
-            key.diagnostics.capture_vertex_position;
+        vertex_options.diagnostic_capture_vertex_position = key.diagnostics.capture_vertex_position;
         let vertex_msl = if uses_mesh_stage {
             remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)
                 .map_err(|error| format!("mesh lowering: {error}"))?
@@ -633,9 +629,8 @@ impl MetalPresenter {
             let limits = key
                 .ngg_subgroup_limits
                 .expect("mesh pipeline subgroup limits were validated above");
-            descriptor.set_max_total_threads_per_mesh_threadgroup(u64::from(
-                limits.threadgroup_threads,
-            ));
+            descriptor
+                .set_max_total_threads_per_mesh_threadgroup(u64::from(limits.threadgroup_threads));
             descriptor.set_mesh_threadgroup_size_is_multiple_of_thread_execution_width(
                 limits.threadgroup_threads % 32 == 0,
             );

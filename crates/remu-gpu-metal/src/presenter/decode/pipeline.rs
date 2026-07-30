@@ -3,22 +3,22 @@
 
 use super::{
     CB_BLEND0_CONTROL, DB_SHADER_CONTROL, DecodedRasterState, DecodedRenderTarget,
-    DepthTargetPipelineState, GraphicsDiagnosticPipelineState, GraphicsPipelineKey,
-    GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL, GraphicsShaderResourceKey,
+    DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
+    GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, PA_CL_VS_OUT_CNTL,
     PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState, VGT_GS_INSTANCE_CNT,
     VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
-    diagnostic_capture_pixel_output,
-    diagnostic_capture_vertex_position, diagnostic_dump_shadow_consumer,
-    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
-    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
-    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
-    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
-    diagnostic_force_visible_clip_depth, diagnostic_video_chain_selected_draw,
-    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
-    graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
-    pixel_input_controls, program_embeds_global_base, register_value, video_target_binding_summary,
+    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
+    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
+    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
+    diagnostic_video_chain_selected_draw, evaluation_samples_large_linear_video,
+    evaluation_samples_layered_comparison, graphics_allocated_vector_register_count,
+    image_component_class, is_storage_image_opcode, pixel_input_controls,
+    program_embeds_global_base, register_value, video_target_binding_summary,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
@@ -160,8 +160,7 @@ pub(crate) fn decode_ngg_subgroup_limits(
     let onchip = onchip.ok_or("NGG state is missing VGT_GS_ONCHIP_CNTL")?;
     let max_vert_out = max_vert_out.ok_or("NGG state is missing VGT_GS_MAX_VERT_OUT")?;
     let max_output = max_output.ok_or("NGG state is missing GE_MAX_OUTPUT_PER_SUBGROUP")?;
-    let subgroup_control =
-        subgroup_control.ok_or("NGG state is missing GE_NGG_SUBGRP_CNTL")?;
+    let subgroup_control = subgroup_control.ok_or("NGG state is missing GE_NGG_SUBGRP_CNTL")?;
     if subgroup_control >> 9 != 0 {
         return Err(format!(
             "non-zero GE_NGG_SUBGRP_CNTL.THDS_PER_SUBGRP is not represented: {subgroup_control:#010x}"
@@ -561,8 +560,8 @@ fn graphics_diagnostic_pipeline_state(
             && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence)
         || (diagnostic_dump_shadow_consumer()
             && evaluation_samples_layered_comparison(pixel_evaluation));
-    let samples_large_video = diagnostic_dump_video_draw()
-        && evaluation_samples_large_linear_video(pixel_evaluation);
+    let samples_large_video =
+        diagnostic_dump_video_draw() && evaluation_samples_large_linear_video(pixel_evaluation);
 
     GraphicsDiagnosticPipelineState {
         force_pixel_color: sample_count > 1

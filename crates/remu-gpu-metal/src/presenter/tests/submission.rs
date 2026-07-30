@@ -7,9 +7,9 @@ use metal::{
     RenderPassDescriptor, TextureDescriptor,
 };
 use remu_gpu::{
-    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent,
-    GpuMemoryAcquire, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
-    GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
+    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuMemoryAcquire,
+    GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier,
+    GpuPipelineStage, gpu_event_channel,
 };
 use remu_memory::{
     CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -26,8 +26,7 @@ use super::{
     GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor, MetalPresenter,
     OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PipelineCompileCandidate, ProgramIdentity,
-    QueueBlockReason,
-    apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
+    QueueBlockReason, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
     read_texture_linear, write_back_pending_globals,
 };
 
@@ -57,7 +56,10 @@ fn read_test_label(address: u64) -> u32 {
 fn native_metal_draw_arguments_match_the_gen5_indirect_layouts() {
     use metal::{MTLDrawIndexedPrimitivesIndirectArguments, MTLDrawPrimitivesIndirectArguments};
 
-    assert_eq!(std::mem::size_of::<MTLDrawPrimitivesIndirectArguments>(), 16);
+    assert_eq!(
+        std::mem::size_of::<MTLDrawPrimitivesIndirectArguments>(),
+        16
+    );
     assert_eq!(
         std::mem::offset_of!(MTLDrawPrimitivesIndirectArguments, vertexCount),
         0
@@ -212,7 +214,11 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
             ..
         }] if *address == release_address
     ));
-    assert_eq!(read_test_label(release_address), 0, "the label remains deferred");
+    assert_eq!(
+        read_test_label(release_address),
+        0,
+        "the label remains deferred"
+    );
     assert!(presenter.committed_guest_batches.is_empty());
     assert_eq!(presenter.statistics.submitted_guest_batches, 0);
     assert_eq!(presenter.statistics.batch_flushes_for_guest_memory_write, 0);
@@ -567,13 +573,13 @@ fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
         presenter.guest_memory_waits.observe_unsatisfied(key),
         GuestMemoryWaitRecovery::None
     );
-    let pending = [pin_guest_memory_write(GuestMemoryWriteOperation::Release(
-        GpuMemoryRelease {
+    let pending = [
+        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
             address,
             value: GpuMemoryReleaseValue::Immediate32(7),
-        },
-    ))
-    .expect("pin release label mapping")];
+        }))
+        .expect("pin release label mapping"),
+    ];
 
     let error = presenter
         .publish_terminal_guest_memory_writes(
@@ -587,7 +593,8 @@ fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
         "publishing the completion label must not erase the primary failure"
     );
     assert_eq!(
-        read_test_label(address), 7,
+        read_test_label(address),
+        7,
         "terminal failure must not strand its following RELEASE_MEM"
     );
     assert_eq!(
@@ -615,12 +622,10 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
         mapping_identity: None,
         write_watch: None,
     };
-    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
-        GpuMemoryRelease {
-            address: completion_address,
-            value: GpuMemoryReleaseValue::Immediate32(9),
-        },
-    ))
+    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+        address: completion_address,
+        value: GpuMemoryReleaseValue::Immediate32(9),
+    }))
     .expect("pin completion label mapping");
     for memory_writes in [vec![invalid], vec![completion]] {
         let command_buffer = queue.new_command_buffer().to_owned();
@@ -650,7 +655,8 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
         "a failed terminal batch must not abandon later committed tickets"
     );
     assert_eq!(
-        read_test_label(completion_address), 9,
+        read_test_label(completion_address),
+        9,
         "the later batch's ordered completion label must still publish"
     );
 }
@@ -679,13 +685,13 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
             global_upload_chunks: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
-            memory_writes: vec![pin_guest_memory_write(
-                GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+            memory_writes: vec![
+                pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
                     address: completion_address,
                     value: GpuMemoryReleaseValue::Immediate32(9),
-                }),
-            )
-            .expect("pin completion label mapping")],
+                }))
+                .expect("pin completion label mapping"),
+            ],
             render_pass: None,
             completion_sequences: Vec::new(),
         });
@@ -700,7 +706,8 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
         "a timeout must retain the still-running command buffer"
     );
     assert_eq!(
-        read_test_label(completion_address), 0,
+        read_test_label(completion_address),
+        0,
         "a timeout must not publish ordered guest completion effects"
     );
 
@@ -896,10 +903,7 @@ fn ordered_guest_label_writes_publish_only_the_declared_values() {
         Some(0x1122_3344_5566_7788)
     );
     assert_eq!(write.value_at(words_address + 8, false), Some(8));
-    assert_eq!(
-        fill.value_at(fill_address + 4, false),
-        Some(0xaabb_ccdd)
-    );
+    assert_eq!(fill.value_at(fill_address + 4, false), Some(0xaabb_ccdd));
     assert_eq!(
         fill.value_at(fill_address, true),
         Some(0xaabb_ccdd_aabb_ccdd)
@@ -1430,9 +1434,11 @@ fn pipeline_prefetch_filters_before_clone_and_shares_lookahead_across_queues() {
         .expect("queue compute lookahead");
     let mut ordered = OrderedGpuEventReceiver::new(receiver);
 
-    let prefetched = ordered.prefetch_pipeline_work(16, 2, |event| {
-        !matches!(event, GpuEvent::IndexedDraw(draw) if draw.sequence == 1)
-    });
+    let prefetched = ordered.prefetch_pipeline_work(
+        16,
+        2,
+        |event| !matches!(event, GpuEvent::IndexedDraw(draw) if draw.sequence == 1),
+    );
 
     assert_eq!(prefetched.len(), 2);
     assert!(matches!(

@@ -4,17 +4,17 @@
 use super::{
     ActiveGuestMemoryWait, DisplayConfiguration, GLOBAL_UPLOAD_ALIGNMENT,
     GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GlobalUploadChunk, GuestBatchFlushReason,
-    GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
-    GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
-    GuestMemoryWriteOperation, MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OrderedEventPoll,
-    OrderedEventSource, OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES,
-    PendingFlip, PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
+    GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery,
+    GuestMemoryWaitStatus, GuestMemoryWaitTracker, GuestMemoryWriteOperation,
+    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OrderedEventPoll, OrderedEventSource,
+    OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PendingFlip,
+    PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
     PipelineCompileCandidate, PresenterFlow, QueueBlockReason, ScheduledGpuSubmission,
     ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh, compute_pipeline_key,
     graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
     guest_texture_byte_count, pixel_scalars, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear,
-    record_diagnostic_memory_copy, refresh_resident_texture_write_watch, register_value,
+    rearm_depth_metadata_clear, record_diagnostic_memory_copy,
+    refresh_resident_texture_write_watch, register_value,
     retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, trace_resident_texture_removal,
@@ -292,8 +292,7 @@ impl MetalPresenter {
                             && !self.failed_compute_pipelines.contains(&key)
                         {
                             PIPELINE_COMPUTE_GATES.fetch_add(1, Ordering::Relaxed);
-                            static LOGGED_COMPUTE_PIPELINE_GATES: AtomicUsize =
-                                AtomicUsize::new(0);
+                            static LOGGED_COMPUTE_PIPELINE_GATES: AtomicUsize = AtomicUsize::new(0);
                             if LOGGED_COMPUTE_PIPELINE_GATES.fetch_add(1, Ordering::Relaxed) < 16 {
                                 eprintln!(
                                     "[REMu][METAL] preserving cold compute={} cs={:#x} while its pipeline compiles",

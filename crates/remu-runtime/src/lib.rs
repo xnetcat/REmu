@@ -256,6 +256,8 @@ pub(crate) use np_api::{
     np_universal_data_object_set_string, np_universal_data_post_event,
     np_universal_data_register_context, np_universal_data_terminate,
 };
+#[cfg(target_arch = "x86_64")]
+pub(crate) use pad::reset_pad_runtime;
 #[cfg(test)]
 pub(crate) use pad::{
     SCE_PAD_ERROR_ALREADY_OPENED, SCE_PAD_ERROR_DEVICE_NO_HANDLE, SCE_PAD_ERROR_INVALID_HANDLE,
@@ -268,8 +270,6 @@ pub(crate) use pad::{
     pad_pointer_operation, pad_read, pad_read_state, pad_set_motion_sensor_state,
     pad_set_vibration_mode,
 };
-#[cfg(target_arch = "x86_64")]
-pub(crate) use pad::reset_pad_runtime;
 pub(crate) use playgo::{
     play_go_accept_request, play_go_close, play_go_get_chunk_id, play_go_get_eta,
     play_go_get_install_speed, play_go_get_language_mask, play_go_get_locus, play_go_get_progress,

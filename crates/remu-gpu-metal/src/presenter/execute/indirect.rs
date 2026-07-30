@@ -143,10 +143,7 @@ kernel void write_arguments(device uint4* output [[buffer(0)]]) {
         // contiguous uint4 records.
         let converted =
             unsafe { std::slice::from_raw_parts(destination.contents().cast::<u32>(), 12) };
-        assert_eq!(
-            converted,
-            &[4, 7, 11, 13, 0, 17, 19, 23, 6, 29, 31, 37]
-        );
+        assert_eq!(converted, &[4, 7, 11, 13, 0, 17, 19, 23, 6, 29, 31, 37]);
         assert!(RECTANGLE_INDIRECT_ARGUMENT_SOURCE.contains("vertex_count == 3u"));
     }
 }

@@ -3,22 +3,22 @@
 
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRasterState, DecodedRenderTarget,
-    DepthTargetPipelineState, DisplayConfiguration, GraphicsPipelineKey, GraphicsShaderResourceKey,
-    GraphicsDiagnosticPipelineState, GuestScissor, GuestTextureDescriptor,
+    DepthTargetPipelineState, DisplayConfiguration, GraphicsDiagnosticPipelineState,
+    GraphicsPipelineKey, GraphicsShaderResourceKey, GuestScissor, GuestTextureDescriptor,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, ProgramIdentity,
     RenderTargetFormat, RenderTargetPipelineState, decode_sampled_texture_format,
-    diagnostic_capture_pixel_output,
-    diagnostic_capture_vertex_position, diagnostic_dump_shadow_consumer,
-    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
-    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
-    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
-    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
-    diagnostic_force_visible_clip_depth, diagnostic_video_chain_selected_draw,
-    effective_linear_pitch, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison, graphics_allocated_vector_register_count,
-    guest_texture_byte_count, half_float_to_f32, is_storage_image_opcode,
-    program_embeds_global_base, tiled_block_dimensions, trace_image_descriptors,
-    trace_target_sampling, unsigned_float_to_f32, video_target_binding_summary,
+    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
+    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
+    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
+    diagnostic_video_chain_selected_draw, effective_linear_pitch,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
+    graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
+    is_storage_image_opcode, program_embeds_global_base, tiled_block_dimensions,
+    trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
+    video_target_binding_summary,
 };
 use metal::{MTLScissorRect, MTLViewport};
 use remu_gpu::{GpuRegister, IndexedDraw};
@@ -52,8 +52,7 @@ pub(crate) use self::targets::{
     common_render_target_array_length, decode_color_eliminate_fast_clear_target,
     decode_color_resolve_targets, decode_depth_target, decode_render_target_format,
     decode_render_target_state, decode_render_targets, initial_depth_clear_for_target,
-    initial_render_target_clear_color, render_target_cmask_address,
-    render_target_fast_clear_color,
+    initial_render_target_clear_color, render_target_cmask_address, render_target_fast_clear_color,
 };
 #[cfg(test)]
 pub(crate) use self::targets::{

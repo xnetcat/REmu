@@ -1,9 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::{
-    GuestTextureDescriptor, ResidentGuestTexture, guest_texture_descriptors_overlap,
-};
+use super::{GuestTextureDescriptor, ResidentGuestTexture, guest_texture_descriptors_overlap};
 use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
 use std::collections::{HashMap, HashSet};
 
@@ -104,10 +102,7 @@ pub(crate) fn resident_texture_eviction_plan(
                 || !residents.values().any(|other| {
                     other.descriptor != resident.descriptor
                         && other.gpu_written
-                        && guest_texture_descriptors_overlap(
-                            resident.descriptor,
-                            other.descriptor,
-                        )
+                        && guest_texture_descriptors_overlap(resident.descriptor, other.descriptor)
                 })
         })
         .map(|resident| {
