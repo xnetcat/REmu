@@ -66,6 +66,9 @@ static RECENT_GRAPHICS_SUBMISSIONS: Mutex<Vec<SubmittedGraphicsRange>> = Mutex::
 #[cfg(test)]
 static GRAPHICS_TRACKING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+const MAX_RECENT_GRAPHICS_ALLOCATIONS: usize = 16_384;
+const TARGET_RECENT_GRAPHICS_ALLOCATIONS: usize = 8_192;
+
 pub(super) static PENDING_GRAPHICS_CONTINUATIONS: Mutex<Vec<PendingGraphicsContinuation>> =
     Mutex::new(Vec::new());
 
@@ -466,10 +469,9 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
     let (descriptor, generation, prefix_start, grew) = grown_prefix
         .map(|(descriptor, generation, prefix_start)| (descriptor, generation, prefix_start, true))
         .or_else(|| {
-            adjacent_release
-                .map(|(descriptor, generation, prefix_start)| {
-                    (descriptor, generation, prefix_start, false)
-                })
+            adjacent_release.map(|(descriptor, generation, prefix_start)| {
+                (descriptor, generation, prefix_start, false)
+            })
         })?;
 
     let submitted = RECENT_GRAPHICS_SUBMISSIONS
@@ -570,6 +572,31 @@ pub(super) fn mark_graphics_release_allocation(command: u64) {
     }
 }
 
+/// Bounds ordinary constructor history without discarding pending queue synchronization.
+///
+/// A recoverable release remains live until a submission consumes it, prefix recovery takes it,
+/// or its command-buffer generation is replaced. Evicting one merely because unrelated draw
+/// constructors crossed the history budget loses a real release/wait handshake and can leave both
+/// guest queues waiting forever. Ordinary allocation records are only reconstruction aids, so
+/// those are the safe records to prune under pressure.
+fn prune_recent_graphics_allocations(allocations: &mut Vec<RecentGraphicsAllocation>) {
+    if allocations.len() <= MAX_RECENT_GRAPHICS_ALLOCATIONS {
+        return;
+    }
+
+    let mut ordinary_to_remove = allocations
+        .len()
+        .saturating_sub(TARGET_RECENT_GRAPHICS_ALLOCATIONS);
+    allocations.retain(|allocation| {
+        if ordinary_to_remove != 0 && !allocation.recoverable_release {
+            ordinary_to_remove -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
 #[cfg(test)]
 pub(crate) fn track_graphics_allocation(command: u64, dword_count: u32) {
     track_graphics_allocation_for_generation(0, 0, 0, u64::MAX, command, dword_count);
@@ -641,6 +668,9 @@ pub(crate) fn track_graphics_command_allocation(
     if started_new_generation {
         allocations.retain(|allocation| allocation.descriptor != command_buffer);
     }
+    // Prune before appending so a release constructor's fresh allocation remains present for
+    // `mark_graphics_release_allocation`, which runs after its words have been written.
+    prune_recent_graphics_allocations(&mut allocations);
     allocations.push(RecentGraphicsAllocation {
         descriptor: command_buffer,
         generation,
@@ -650,10 +680,6 @@ pub(crate) fn track_graphics_command_allocation(
         end: command_end,
         recoverable_release: false,
     });
-    if allocations.len() > 16_384 {
-        let drain_count = allocations.len() - 8_192;
-        allocations.drain(..drain_count);
-    }
     drop(allocations);
     if started_new_generation {
         RECENT_GRAPHICS_SUBMISSIONS
@@ -702,6 +728,7 @@ fn track_graphics_allocation_for_generation(
     let mut allocations = RECENT_COMMAND_ALLOCATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    prune_recent_graphics_allocations(&mut allocations);
     allocations.push(RecentGraphicsAllocation {
         descriptor,
         generation,
@@ -711,10 +738,6 @@ fn track_graphics_allocation_for_generation(
         end: command_end,
         recoverable_release: false,
     });
-    if allocations.len() > 16_384 {
-        let drain_count = allocations.len() - 8_192;
-        allocations.drain(..drain_count);
-    }
 }
 
 pub(crate) fn track_graphics_submission(command_address: u64, dword_count: u32) {
