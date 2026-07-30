@@ -84,33 +84,85 @@ pub(super) fn diagnostic_video_chain_selected_draw() -> &'static AtomicU64 {
     &DRAW
 }
 
+fn descriptors_are_nv12_plane_pair(
+    left: DecodedImageDescriptor,
+    right: DecodedImageDescriptor,
+) -> bool {
+    let (luma, chroma) = if left.guest.pixel_format == MTLPixelFormat::R8Unorm
+        && right.guest.pixel_format == MTLPixelFormat::RG8Unorm
+    {
+        (left, right)
+    } else if right.guest.pixel_format == MTLPixelFormat::R8Unorm
+        && left.guest.pixel_format == MTLPixelFormat::RG8Unorm
+    {
+        (right, left)
+    } else {
+        return false;
+    };
+    luma.guest.tile_mode == 0
+        && chroma.guest.tile_mode == 0
+        && luma.texture_type == 9
+        && chroma.texture_type == 9
+        && luma.layer_count == 1
+        && chroma.layer_count == 1
+        && chroma.guest.width.checked_mul(2) == Some(luma.guest.width)
+        && chroma.guest.height.checked_mul(2) == Some(luma.guest.height)
+}
+
+fn descriptor_is_planar_video_plane(
+    candidate: DecodedImageDescriptor,
+    descriptors: &[DecodedImageDescriptor],
+) -> bool {
+    descriptors
+        .iter()
+        .copied()
+        .any(|other| descriptors_are_nv12_plane_pair(candidate, other))
+}
+
+fn descriptor_is_large_linear_video_plane(descriptor: DecodedImageDescriptor) -> bool {
+    descriptor.guest.tile_mode == 0
+        && descriptor.guest.width >= 700
+        && descriptor.guest.height >= 500
+        && matches!(
+            descriptor.guest.pixel_format,
+            MTLPixelFormat::R8Unorm | MTLPixelFormat::RG8Unorm
+        )
+}
+
 pub(super) fn video_target_binding_summary(evaluation: &ShaderEvaluation) -> Option<String> {
-    let bindings = evaluation
+    let decoded = evaluation
         .image_bindings
         .iter()
         .filter_map(|binding| {
             let descriptor = decode_image_descriptor(&binding.resource_descriptor).ok()?;
-            let known_small_video = descriptor.guest.width == 378 && descriptor.guest.height == 150;
-            let large_linear_video = descriptor.guest.tile_mode == 0
-                && descriptor.guest.width >= 700
-                && descriptor.guest.height >= 500
-                && matches!(
-                    descriptor.guest.pixel_format,
-                    MTLPixelFormat::R8Unorm | MTLPixelFormat::RG8Unorm
-                );
-            (known_small_video || large_linear_video).then(|| {
-                format!(
-                    "pc={:#x} op={:?} addr={:#x} format={:?} tile={} base_mip={} mips={} storage={}",
-                    binding.pc,
-                    binding.opcode,
-                    descriptor.guest.address,
-                    descriptor.guest.pixel_format,
-                    descriptor.guest.tile_mode,
-                    descriptor.base_mip_level,
-                    descriptor.mip_level_count,
-                    is_storage_image_opcode(binding.opcode),
-                )
-            })
+            (!is_writable_image_opcode(binding.opcode)).then_some((binding, descriptor))
+        })
+        .collect::<Vec<_>>();
+    let descriptors = decoded
+        .iter()
+        .map(|(_, descriptor)| *descriptor)
+        .collect::<Vec<_>>();
+    let bindings = decoded
+        .into_iter()
+        .filter(|(_, descriptor)| {
+            descriptor_is_large_linear_video_plane(*descriptor)
+                || descriptor_is_planar_video_plane(*descriptor, &descriptors)
+        })
+        .map(|(binding, descriptor)| {
+            format!(
+                "pc={:#x} op={:?} addr={:#x} {}x{} pitch={} format={:?} tile={} base_mip={} mips={} storage={}",
+                binding.pc,
+                binding.opcode,
+                descriptor.guest.address,
+                descriptor.guest.width,
+                descriptor.guest.height,
+                descriptor.guest.pitch,
+                descriptor.guest.pixel_format,
+                descriptor.guest.tile_mode,
+                descriptor.base_mip_level,
+                descriptor.mip_level_count,
+                is_storage_image_opcode(binding.opcode),
+            )
         })
         .collect::<Vec<_>>();
     (!bindings.is_empty()).then(|| bindings.join("; "))
@@ -348,29 +400,33 @@ pub(super) fn trace_video_target_draw_consumer(draw: &IndexedDraw) {
             }
         }
     }
-    eprintln!(
-        "[REMu][METAL][VIDEO-CHAIN] kind=draw generation={} root={} sequence={} es={:#x} ps={:#x} ps_insns={} indexed={} count={} instances={} target_mask={:#010x} depth=[{}] raster=[{}] geometry=[{}] export=[{}] pixel=[{}] export_chain=[{}] pixel_chain=[{}] targets=[{}]",
-        if root { 1 } else { 2 },
-        root,
-        draw.sequence,
-        draw.export_shader_address,
-        draw.pixel_shader_address,
-        draw.pixel_shader
-            .as_ref()
-            .map_or(0, |shader| shader.program.instructions.len()),
-        draw.indexed,
-        draw.index_count,
-        draw.instance_count,
-        target_mask,
-        depth,
-        raster,
-        geometry,
-        export.as_deref().unwrap_or(""),
-        pixel.as_deref().unwrap_or(""),
-        export_chain.as_deref().unwrap_or(""),
-        pixel_chain.as_deref().unwrap_or(""),
-        targets,
-    );
+    static LOGGED_DRAWS: AtomicU64 = AtomicU64::new(0);
+    let logged = LOGGED_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+    if logged <= 16 || logged.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL][VIDEO-CHAIN] kind=draw generation={} root={} sequence={} es={:#x} ps={:#x} ps_insns={} indexed={} count={} instances={} target_mask={:#010x} depth=[{}] raster=[{}] geometry=[{}] export=[{}] pixel=[{}] export_chain=[{}] pixel_chain=[{}] targets=[{}]",
+            if root { 1 } else { 2 },
+            root,
+            draw.sequence,
+            draw.export_shader_address,
+            draw.pixel_shader_address,
+            draw.pixel_shader
+                .as_ref()
+                .map_or(0, |shader| shader.program.instructions.len()),
+            draw.indexed,
+            draw.index_count,
+            draw.instance_count,
+            target_mask,
+            depth,
+            raster,
+            geometry,
+            export.as_deref().unwrap_or(""),
+            pixel.as_deref().unwrap_or(""),
+            export_chain.as_deref().unwrap_or(""),
+            pixel_chain.as_deref().unwrap_or(""),
+            targets,
+        );
+    }
 }
 
 pub(super) fn trace_video_target_compute_consumer(dispatch: &ComputeDispatch) {
@@ -421,19 +477,23 @@ pub(super) fn trace_video_target_compute_consumer(dispatch: &ComputeDispatch) {
             descriptor.guest.tile_mode,
         ));
     }
-    eprintln!(
-        "[REMu][METAL][VIDEO-CHAIN] kind=compute generation={} root={} sequence={} cs={:#x} grid={:?} groups={:?} threads_per_group={:?} root_bindings=[{}] chain_bindings=[{}] outputs=[{}]",
-        generation,
-        root.is_some(),
-        dispatch.sequence,
-        dispatch.shader_address,
-        dispatch.launch.grid,
-        dispatch.launch.group_count,
-        dispatch.launch.threads_per_group,
-        root.as_deref().unwrap_or(""),
-        chain.as_deref().unwrap_or(""),
-        outputs.join("; "),
-    );
+    static LOGGED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+    let logged = LOGGED_DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if logged <= 16 || logged.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL][VIDEO-CHAIN] kind=compute generation={} root={} sequence={} cs={:#x} grid={:?} groups={:?} threads_per_group={:?} root_bindings=[{}] chain_bindings=[{}] outputs=[{}]",
+            generation,
+            root.is_some(),
+            dispatch.sequence,
+            dispatch.shader_address,
+            dispatch.launch.grid,
+            dispatch.launch.group_count,
+            dispatch.launch.threads_per_group,
+            root.as_deref().unwrap_or(""),
+            chain.as_deref().unwrap_or(""),
+            outputs.join("; "),
+        );
+    }
 }
 
 pub(super) fn capture_target_sample_textures() -> bool {
@@ -1084,16 +1144,12 @@ pub(super) fn diagnostic_overlapping_global_writers(
 }
 
 pub(super) fn evaluation_samples_large_linear_video(evaluation: &ShaderEvaluation) -> bool {
-    sampled_image_bindings(evaluation).any(|binding| {
-        decode_image_descriptor(&binding.resource_descriptor).is_ok_and(|descriptor| {
-            descriptor.guest.tile_mode == 0
-                && descriptor.guest.width >= 700
-                && descriptor.guest.height >= 500
-                && matches!(
-                    descriptor.guest.pixel_format,
-                    MTLPixelFormat::R8Unorm | MTLPixelFormat::RG8Unorm
-                )
-        })
+    let descriptors = sampled_image_bindings(evaluation)
+        .filter_map(|binding| decode_image_descriptor(&binding.resource_descriptor).ok())
+        .collect::<Vec<_>>();
+    descriptors.iter().copied().any(|descriptor| {
+        descriptor_is_large_linear_video_plane(descriptor)
+            || descriptor_is_planar_video_plane(descriptor, &descriptors)
     })
 }
 
@@ -1131,6 +1187,56 @@ pub(super) fn dump_msl_instruction_filter_matches(pixel_instruction_count: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn video_plane(
+        address: u64,
+        width: u32,
+        height: u32,
+        pixel_format: MTLPixelFormat,
+    ) -> DecodedImageDescriptor {
+        let bytes_per_pixel = if pixel_format == MTLPixelFormat::RG8Unorm {
+            2
+        } else {
+            1
+        };
+        DecodedImageDescriptor {
+            guest: GuestTextureDescriptor {
+                address,
+                width,
+                height,
+                pitch: width,
+                tile_mode: 0,
+                pixel_format,
+                bytes_per_pixel,
+            },
+            destination_select: 0,
+            base_mip_level: 0,
+            mip_level_count: 1,
+            texture_type: 9,
+            layer_count: 1,
+        }
+    }
+
+    #[test]
+    fn planar_video_detection_accepts_pitched_nv12_plane_geometry() {
+        let luma = video_plane(0x80b2_030000, 512, 150, MTLPixelFormat::R8Unorm);
+        let chroma = video_plane(0x804e_fc0000, 256, 75, MTLPixelFormat::RG8Unorm);
+        let descriptors = [luma, chroma];
+
+        assert!(descriptors_are_nv12_plane_pair(luma, chroma));
+        assert!(descriptor_is_planar_video_plane(luma, &descriptors));
+        assert!(descriptor_is_planar_video_plane(chroma, &descriptors));
+    }
+
+    #[test]
+    fn planar_video_detection_rejects_unrelated_linear_images() {
+        let luma = video_plane(0x1000_0000, 512, 150, MTLPixelFormat::R8Unorm);
+        let wrong_height = video_plane(0x1002_0000, 256, 76, MTLPixelFormat::RG8Unorm);
+        let rgba = video_plane(0x1004_0000, 256, 75, MTLPixelFormat::RGBA8Unorm);
+
+        assert!(!descriptors_are_nv12_plane_pair(luma, wrong_height));
+        assert!(!descriptors_are_nv12_plane_pair(luma, rgba));
+    }
 
     #[test]
     fn explicit_target_filter_conjoins_draw_shader_and_target() {

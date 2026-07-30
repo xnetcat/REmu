@@ -28,7 +28,8 @@ use super::{
     record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, render_resolve_candidate_matches,
     sampled_alias_descriptor, sampler_uses_normalized_coordinates, texture_element_layout,
-    trace_image_descriptors, trace_target_sampling, write_resident_texture_contents_to_guest,
+    trace_image_descriptors, trace_target_sampling, trace_video_target_consumers,
+    write_resident_texture_contents_to_guest,
 };
 #[cfg(test)]
 use remu_memory::guest_shared_mapping_identity;

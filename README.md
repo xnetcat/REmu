@@ -73,6 +73,11 @@ off by default and can be restored for diagnostics with `REMU_AVPLAYER_WALL_CLOC
 `REMU_TRACE_AVPLAYER_CONTENT=1` logs bounded luma/chroma or PCM content statistics for the first
 four and power-of-two decoded frames, which separates decoder output from downstream texture,
 shader, and host-audio failures without changing media timing.
+`REMU_TRACE_VIDEO_TARGETS=1` follows sampled linear NV12 plane pairs through their conversion
+targets and later consumers, logging the first sixteen and power-of-two chain events plus bounded
+uploaded-plane content hashes. For a one-shot byte-exact check, combine it with
+`REMU_DUMP_VIDEO_TARGET_DIR=/tmp/remu-video-target` and `REMU_DUMP_TARGET_MATCH_INDEX=0`; the dump
+contains both sampled planes and the converted target after the draw completes.
 
 Enable Apple's in-window Metal Performance HUD with `REMU_METAL_HUD=1`; add
 `REMU_METAL_HUD_LOG=1` to record its metrics. Automated input is disabled by default; opt into a
