@@ -482,7 +482,7 @@ fn pthread_keys_reuse_deleted_slots_and_clear_values_before_destructors() {
     );
     assert_eq!(first_key, 0);
     assert_eq!(
-        crate::pthread_set_specific([u64::from(first_key), 0xcafe_babe, 0, 0, 0, 0], &state),
+        crate::pthread_set_specific([u64::from(first_key), 0xcafe_babe, 0, 0, 0, 0]),
         0
     );
 
@@ -517,6 +517,28 @@ fn pthread_keys_reuse_deleted_slots_and_clear_values_before_destructors() {
     assert!(
         crate::take_current_thread_specific_destructors(&state).is_empty(),
         "a reused key must not inherit the deleted key's thread-specific value"
+    );
+    crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
+}
+
+#[test]
+fn pthread_set_specific_is_a_stateless_leaf_import() {
+    let mut state = ProbeDispatchState::default();
+    let mut key = u32::MAX;
+    assert_eq!(
+        crate::pthread_key_create([(&raw mut key).addr() as u64, 0, 0, 0, 0, 0], &mut state,),
+        0
+    );
+    let arguments = [u64::from(key), 0xdead_beef, 0, 0, 0, 0];
+    assert_eq!(
+        crate::dispatch_stateless_import("WrOLvHU0yQM", arguments, [0; 6]),
+        Some(0)
+    );
+    assert_eq!(crate::pthread_get_specific(key), 0xdead_beef);
+    assert_eq!(crate::pthread_key_delete(key, &mut state), 0);
+    assert_eq!(
+        crate::dispatch_stateless_import("WrOLvHU0yQM", arguments, [0; 6]),
+        Some(u64::from(libc::EINVAL.cast_unsigned()))
     );
     crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
 }

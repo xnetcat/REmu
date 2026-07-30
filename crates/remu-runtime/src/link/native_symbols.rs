@@ -4,7 +4,8 @@
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 use crate::{
     current_guest_thread_handle, guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock,
-    guest_rwlock_unlock, kernel_process_time, low_u32, pthread_get_specific,
+    guest_rwlock_unlock, kernel_process_time, low_u32, posix_pthread_result, pthread_get_specific,
+    pthread_set_specific,
 };
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -223,6 +224,16 @@ extern "C" fn direct_pthread_get_specific(key: u64) -> u64 {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_posix_pthread_set_specific(key: u64, value: u64) -> u64 {
+    posix_pthread_result(pthread_set_specific([key, value, 0, 0, 0, 0]))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" fn direct_sce_pthread_set_specific(key: u64, value: u64) -> u64 {
+    pthread_set_specific([key, value, 0, 0, 0, 0])
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_guest_mutex_lock(address: u64) -> u64 {
     guest_mutex_lock(address, false)
 }
@@ -255,6 +266,8 @@ pub(super) fn direct_runtime_import_target(nid: &str) -> Option<u64> {
         // state and need neither the process dispatch lock nor a captured eight-XMM import frame.
         "aI+OeCz8xrQ" | "EotR8a3ASf4" => direct_pthread_self as *const () as usize as u64,
         "0-KXaS70xy4" | "eoht7mQOCmo" => direct_pthread_get_specific as *const () as usize as u64,
+        "WrOLvHU0yQM" => direct_posix_pthread_set_specific as *const () as usize as u64,
+        "+BzXYkqYeLE" => direct_sce_pthread_set_specific as *const () as usize as u64,
         "9UK1vLZQft4" | "7H0iTOciTLo" => direct_guest_mutex_lock as *const () as usize as u64,
         "tn3VlD0hG60" | "2Z+PpY6CaJg" => direct_guest_mutex_unlock as *const () as usize as u64,
         "sIlRvQqsN2Y" => direct_guest_rwlock_write_lock as *const () as usize as u64,
@@ -361,7 +374,10 @@ pub(super) fn synthetic_data_import_target(nid: &str) -> Option<u64> {
 
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 mod tests {
-    use super::native_libc_symbol_name;
+    use super::{
+        direct_posix_pthread_set_specific, direct_runtime_import_target,
+        direct_sce_pthread_set_specific, native_libc_symbol_name,
+    };
 
     #[test]
     fn guest_timeval_does_not_resolve_to_the_darwin_abi() {
@@ -369,5 +385,17 @@ mod tests {
         // 64 bits. Calling the host export directly leaves the upper half of the guest field
         // untouched and can turn a millisecond timeout into a multi-hour wait.
         assert!(native_libc_symbol_name("n88vx3C5nW8").is_none());
+    }
+
+    #[test]
+    fn pthread_set_specific_resolves_to_lock_free_leaf_targets() {
+        assert_eq!(
+            direct_runtime_import_target("WrOLvHU0yQM"),
+            Some(direct_posix_pthread_set_specific as *const () as usize as u64)
+        );
+        assert_eq!(
+            direct_runtime_import_target("+BzXYkqYeLE"),
+            Some(direct_sce_pthread_set_specific as *const () as usize as u64)
+        );
     }
 }
