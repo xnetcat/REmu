@@ -262,11 +262,14 @@ pub(crate) use pad::{
     SCE_PAD_ERROR_NOT_INITIALIZED,
 };
 pub(crate) use pad::{
-    pad_boolean_operation, pad_close, pad_device_class_parse_data, pad_get_controller_information,
-    pad_get_extended_information, pad_get_handle, pad_get_trigger_effect_state,
-    pad_handle_operation, pad_initialize, pad_open, pad_pointer_operation, pad_read,
-    pad_read_state, pad_set_motion_sensor_state, pad_set_vibration_mode,
+    dispatch_pad_import, pad_boolean_operation, pad_close, pad_device_class_parse_data,
+    pad_get_controller_information, pad_get_extended_information, pad_get_handle,
+    pad_get_trigger_effect_state, pad_handle_operation, pad_initialize, pad_open,
+    pad_pointer_operation, pad_read, pad_read_state, pad_set_motion_sensor_state,
+    pad_set_vibration_mode,
 };
+#[cfg(target_arch = "x86_64")]
+pub(crate) use pad::reset_pad_runtime;
 pub(crate) use playgo::{
     play_go_accept_request, play_go_close, play_go_get_chunk_id, play_go_get_eta,
     play_go_get_install_speed, play_go_get_language_mask, play_go_get_locus, play_go_get_progress,
@@ -860,9 +863,6 @@ struct RuntimeServiceState {
     splash: SplashState,
     user_service: InitializationState,
     user_login_event_delivered: bool,
-    pad: InitializationState,
-    pad_handle: Option<i32>,
-    next_pad_handle: i32,
     common_dialog: InitializationState,
     common_dialog_owner: Option<CommonDialogOwner>,
     /// Lifecycle state of the system message dialog, using the common-dialog status values.
@@ -1461,6 +1461,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.json_runtime = JsonRuntimeState::default();
     state.av_player = AvPlayerRuntimeState::default();
     state.services = RuntimeServiceState::default();
+    reset_pad_runtime();
     reset_kernel_process_time();
     *AUDIO_OUT
         .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
@@ -2523,8 +2524,14 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     ) {
         return ProbeImportReturn::integer(dispatch_audio_out_import(nid, call_args));
     }
+    if let Some(result) = dispatch_pad_import(nid, call_args) {
+        // Controller lifecycle and polling belong to one small service-local lock. In particular,
+        // the per-frame read path must not queue behind command-buffer translation, which owns no
+        // pad state and can take tens of milliseconds under shader-heavy workloads.
+        return ProbeImportReturn::integer(result);
+    }
     // Most hot imports return above without consuming stack arguments. Reading them lazily avoids
-    // six guest-memory loads on every timer, synchronization, numeric, and audio call while
+    // six guest-memory loads on every timer, synchronization, numeric, audio, and pad call while
     // preserving the complete ABI frame for the less common dispatch paths below.
     let stack_args = read_import_stack_arguments(frame);
     if let Some(result) = dispatch_stateless_import(nid, call_args, stack_args) {
@@ -4090,8 +4097,8 @@ fn dispatch_probe_import(
         "m5-2bsNfv7s" => pthread_condition_attr_init(arguments[0], state),
         "waPcxYiR3WA" => pthread_condition_attr_destroy(arguments[0], state),
         // Initial single-device handles for input, video, and audio.
-        "xk0AcarP3V4" => pad_open(arguments, state),
-        "u1GRHp+oWoY" => pad_get_handle(arguments, state),
+        "xk0AcarP3V4" => pad_open(arguments),
+        "u1GRHp+oWoY" => pad_get_handle(arguments),
         "Up36PTk687E" => video_out_open(arguments, state),
         "utPrVdxio-8" => video_out_get_output_status(arguments, state),
         "CBiu4mCE1DA" => video_out_set_flip_rate(arguments, state),
@@ -4153,19 +4160,19 @@ fn dispatch_probe_import(
             .unwrap_or_else(|| sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE)),
         // libScePad output structures must always be initialized; successful no-ops would expose
         // stale guest stack contents as controller capabilities and button state.
-        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments, state),
-        "gjP9-KQzoUk" => pad_get_controller_information(arguments, state),
-        "6ncge5+l5Qs" => pad_close(arguments, state),
-        "AcslpN1jHR8" => pad_get_extended_information(arguments, state),
-        "YndgXqQVV7c" => pad_read_state(arguments, state),
-        "q1cHNfGycLI" => pad_read(arguments, state),
-        "W2G-yoyMF5U" => pad_set_vibration_mode(arguments, state),
-        "rIZnR6eSpvk" | "DscD1i9HX1w" => pad_handle_operation(arguments, state),
-        "r44mAxdSG+U" | "vDLMoJLde8I" => pad_boolean_operation(arguments, state),
-        "yFVnOdGxvZY" | "2JgFB2n9oUM" | "RR4novUEENY" => pad_pointer_operation(arguments, state),
-        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments, state),
-        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments, state),
-        "hv1luiJrqQM" => pad_initialize(state),
+        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments),
+        "gjP9-KQzoUk" => pad_get_controller_information(arguments),
+        "6ncge5+l5Qs" => pad_close(arguments),
+        "AcslpN1jHR8" => pad_get_extended_information(arguments),
+        "YndgXqQVV7c" => pad_read_state(arguments),
+        "q1cHNfGycLI" => pad_read(arguments),
+        "W2G-yoyMF5U" => pad_set_vibration_mode(arguments),
+        "rIZnR6eSpvk" | "DscD1i9HX1w" => pad_handle_operation(arguments),
+        "r44mAxdSG+U" | "vDLMoJLde8I" => pad_boolean_operation(arguments),
+        "yFVnOdGxvZY" | "2JgFB2n9oUM" | "RR4novUEENY" => pad_pointer_operation(arguments),
+        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments),
+        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),
+        "hv1luiJrqQM" => pad_initialize(),
         // libSceSystemService status used by the foreground/background state machine.
         "rPo6tV8D9bM" => system_service_get_status(arguments),
         "fZo48un7LK4" => system_service_param_get_int(arguments),

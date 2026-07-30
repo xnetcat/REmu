@@ -3,9 +3,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::{
-    InitializationState, ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, guest_memset,
-    low_i32, low_u32, read_guest_u8, sce_kernel_error, write_guest_u8, write_guest_u16,
-    write_guest_u32, write_guest_u64,
+    InitializationState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, guest_memset, low_i32, low_u32,
+    read_guest_u8, sce_kernel_error, write_guest_u8, write_guest_u16, write_guest_u32,
+    write_guest_u64,
 };
 
 pub(crate) const SCE_PAD_ERROR_INVALID_HANDLE: u32 = 0x8092_0003;
@@ -14,13 +14,60 @@ pub(crate) const SCE_PAD_ERROR_NOT_INITIALIZED: u32 = 0x8092_0005;
 const SCE_PAD_ERROR_DEVICE_NOT_CONNECTED: u32 = 0x8092_0007;
 pub(crate) const SCE_PAD_ERROR_DEVICE_NO_HANDLE: u32 = 0x8092_0008;
 
-pub(crate) fn pad_initialize(state: &mut ProbeDispatchState) -> u64 {
-    state.services.pad = InitializationState::Initialized;
+#[derive(Debug, Default)]
+struct PadRuntimeState {
+    initialization: InitializationState,
+    handle: Option<i32>,
+    next_handle: i32,
+}
+
+static PAD_RUNTIME: OnceLock<Mutex<PadRuntimeState>> = OnceLock::new();
+
+fn pad_runtime() -> &'static Mutex<PadRuntimeState> {
+    PAD_RUNTIME.get_or_init(|| Mutex::new(PadRuntimeState::default()))
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn reset_pad_runtime() {
+    *pad_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = PadRuntimeState::default();
+}
+
+pub(crate) fn dispatch_pad_import(nid: &str, arguments: [u64; 6]) -> Option<u64> {
+    Some(match nid {
+        "xk0AcarP3V4" => pad_open(arguments),
+        "u1GRHp+oWoY" => pad_get_handle(arguments),
+        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments),
+        "gjP9-KQzoUk" => pad_get_controller_information(arguments),
+        "6ncge5+l5Qs" => pad_close(arguments),
+        "AcslpN1jHR8" => pad_get_extended_information(arguments),
+        "YndgXqQVV7c" => pad_read_state(arguments),
+        "q1cHNfGycLI" => pad_read(arguments),
+        "W2G-yoyMF5U" => pad_set_vibration_mode(arguments),
+        "rIZnR6eSpvk" | "DscD1i9HX1w" => pad_handle_operation(arguments),
+        "r44mAxdSG+U" | "vDLMoJLde8I" => pad_boolean_operation(arguments),
+        "yFVnOdGxvZY" | "2JgFB2n9oUM" | "RR4novUEENY" => pad_pointer_operation(arguments),
+        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments),
+        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),
+        "hv1luiJrqQM" => pad_initialize(),
+        _ => return None,
+    })
+}
+
+pub(crate) fn pad_initialize() -> u64 {
+    pad_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .initialization = InitializationState::Initialized;
     0
 }
 
-pub(crate) fn pad_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    if state.services.pad != InitializationState::Initialized {
+pub(crate) fn pad_open(arguments: [u64; 6]) -> u64 {
+    let mut state = pad_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.initialization != InitializationState::Initialized {
         return sce_kernel_error(SCE_PAD_ERROR_NOT_INITIALIZED);
     }
     let user = low_i32(arguments[0]);
@@ -29,17 +76,20 @@ pub(crate) fn pad_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u
     if user != 0x1000_0000 || port_type != 0 || index != 0 {
         return sce_kernel_error(SCE_PAD_ERROR_DEVICE_NOT_CONNECTED);
     }
-    if state.services.pad_handle.is_some() {
+    if state.handle.is_some() {
         return sce_kernel_error(SCE_PAD_ERROR_ALREADY_OPENED);
     }
-    let handle = state.services.next_pad_handle.max(1);
-    state.services.next_pad_handle = handle.saturating_add(1);
-    state.services.pad_handle = Some(handle);
+    let handle = state.next_handle.max(1);
+    state.next_handle = handle.saturating_add(1);
+    state.handle = Some(handle);
     u64::from(handle.cast_unsigned())
 }
 
-pub(crate) fn pad_get_handle(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if state.services.pad != InitializationState::Initialized {
+pub(crate) fn pad_get_handle(arguments: [u64; 6]) -> u64 {
+    let state = pad_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.initialization != InitializationState::Initialized {
         return sce_kernel_error(SCE_PAD_ERROR_NOT_INITIALIZED);
     }
     let user = low_i32(arguments[0]);
@@ -48,32 +98,42 @@ pub(crate) fn pad_get_handle(arguments: [u64; 6], state: &ProbeDispatchState) ->
     if user != 0x1000_0000 || port_type != 0 || index != 0 {
         return sce_kernel_error(SCE_PAD_ERROR_DEVICE_NO_HANDLE);
     }
-    state.services.pad_handle.map_or_else(
+    state.handle.map_or_else(
         || sce_kernel_error(SCE_PAD_ERROR_DEVICE_NO_HANDLE),
         |handle| u64::from(handle.cast_unsigned()),
     )
 }
 
-fn validate_pad_handle(handle: u64, state: &ProbeDispatchState) -> Result<(), u64> {
-    if state.services.pad != InitializationState::Initialized {
+fn validate_pad_handle_state(handle: u64, state: &PadRuntimeState) -> Result<(), u64> {
+    if state.initialization != InitializationState::Initialized {
         return Err(sce_kernel_error(SCE_PAD_ERROR_NOT_INITIALIZED));
     }
-    if state.services.pad_handle != Some(low_i32(handle)) {
+    if state.handle != Some(low_i32(handle)) {
         return Err(sce_kernel_error(SCE_PAD_ERROR_INVALID_HANDLE));
     }
     Ok(())
 }
 
-pub(crate) fn pad_close(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+fn validate_pad_handle(handle: u64) -> Result<(), u64> {
+    let state = pad_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    validate_pad_handle_state(handle, &state)
+}
+
+pub(crate) fn pad_close(arguments: [u64; 6]) -> u64 {
+    let mut state = pad_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Err(error) = validate_pad_handle_state(arguments[0], &state) {
         return error;
     }
-    state.services.pad_handle = None;
+    state.handle = None;
     0
 }
 
-pub(crate) fn pad_get_extended_information(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+pub(crate) fn pad_get_extended_information(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     if arguments[1] == 0 {
@@ -85,8 +145,8 @@ pub(crate) fn pad_get_extended_information(arguments: [u64; 6], state: &ProbeDis
     0
 }
 
-pub(crate) fn pad_set_motion_sensor_state(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+pub(crate) fn pad_set_motion_sensor_state(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     if !matches!(low_i32(arguments[1]), 0 | 1) {
@@ -95,8 +155,8 @@ pub(crate) fn pad_set_motion_sensor_state(arguments: [u64; 6], state: &ProbeDisp
     0
 }
 
-pub(crate) fn pad_set_vibration_mode(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+pub(crate) fn pad_set_vibration_mode(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     if low_u32(arguments[1]) > 2 {
@@ -105,12 +165,12 @@ pub(crate) fn pad_set_vibration_mode(arguments: [u64; 6], state: &ProbeDispatchS
     0
 }
 
-pub(crate) fn pad_handle_operation(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    validate_pad_handle(arguments[0], state).map_or_else(|error| error, |()| 0)
+pub(crate) fn pad_handle_operation(arguments: [u64; 6]) -> u64 {
+    validate_pad_handle(arguments[0]).map_or_else(|error| error, |()| 0)
 }
 
-pub(crate) fn pad_boolean_operation(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+pub(crate) fn pad_boolean_operation(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     if !matches!(low_u32(arguments[1]), 0 | 1) {
@@ -119,8 +179,8 @@ pub(crate) fn pad_boolean_operation(arguments: [u64; 6], state: &ProbeDispatchSt
     0
 }
 
-pub(crate) fn pad_pointer_operation(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+pub(crate) fn pad_pointer_operation(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     if arguments[1] == 0 {
@@ -129,8 +189,8 @@ pub(crate) fn pad_pointer_operation(arguments: [u64; 6], state: &ProbeDispatchSt
     0
 }
 
-pub(crate) fn pad_get_trigger_effect_state(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+pub(crate) fn pad_get_trigger_effect_state(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     if arguments[1] == 0 {
@@ -140,8 +200,8 @@ pub(crate) fn pad_get_trigger_effect_state(arguments: [u64; 6], state: &ProbeDis
     0
 }
 
-pub(crate) fn pad_device_class_parse_data(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+pub(crate) fn pad_device_class_parse_data(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     if arguments[1] == 0 || arguments[2] == 0 {
@@ -152,11 +212,8 @@ pub(crate) fn pad_device_class_parse_data(arguments: [u64; 6], state: &ProbeDisp
     0
 }
 
-pub(crate) fn pad_get_controller_information(
-    arguments: [u64; 6],
-    state: &ProbeDispatchState,
-) -> u64 {
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+pub(crate) fn pad_get_controller_information(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     let output = arguments[1];
@@ -174,9 +231,9 @@ pub(crate) fn pad_get_controller_information(
     0
 }
 
-pub(crate) fn pad_read_state(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+pub(crate) fn pad_read_state(arguments: [u64; 6]) -> u64 {
     static LAST_LOGGED_BUTTONS: AtomicU32 = AtomicU32::new(u32::MAX);
-    if let Err(error) = validate_pad_handle(arguments[0], state) {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
     let output = arguments[1];
@@ -218,11 +275,11 @@ pub(crate) fn pad_read_state(arguments: [u64; 6], state: &ProbeDispatchState) ->
     0
 }
 
-pub(crate) fn pad_read(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+pub(crate) fn pad_read(arguments: [u64; 6]) -> u64 {
     if arguments[2] == 0 || arguments[2] > 64 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let result = pad_read_state(arguments, state);
+    let result = pad_read_state(arguments);
     if result == 0 { 1 } else { result }
 }
 
