@@ -11,10 +11,10 @@ use super::{
     guest_texture_descriptors_overlap, image_resource_descriptor_is_null, is_storage_image_opcode,
     is_writable_image_opcode, read_texture_linear, rearm_depth_metadata_clear,
     record_diagnostic_global_writers, record_diagnostic_texture_writer,
-    resident_color_view_sample_is_eligible, sampled_image_bindings,
-    shader_scalar_metadata_for_registers, storage_image_requires_mip_hierarchy,
-    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
-    wave64_split_blockers,
+    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
+    sampled_image_bindings, shader_scalar_metadata_for_registers,
+    storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
+    validate_compute_launch_for_metal, wave64_split_blockers,
 };
 use metal::{MTLResourceUsage, MTLSize};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
@@ -25,9 +25,9 @@ use std::time::Instant;
 
 fn storage_image_requires_exact_preacquire(
     opcode: remu_shader::Opcode,
-    has_component_reordered_resident: bool,
+    has_read_compatible_resident: bool,
 ) -> bool {
-    is_writable_image_opcode(opcode) || !has_component_reordered_resident
+    is_writable_image_opcode(opcode) || !has_read_compatible_resident
 }
 
 impl MetalPresenter {
@@ -179,16 +179,18 @@ impl MetalPresenter {
             let descriptor = decode_image_descriptor(&binding.resource_descriptor)
                 .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
             // ImageLoad is read-only and Metal can read a GPU-current RGBA/BGRA resident through
-            // the component-swizzled texture view selected by `upload_image_textures`. Forcing an
-            // exact descriptor here would first write that resident back to guest memory, retire
-            // it, and reconstruct an exact-key texture before upload selection gets a chance to
-            // preserve it. Writable storage images still require the conservative exact resident.
-            let has_component_reordered_resident = !is_writable_image_opcode(binding.opcode)
+            // a component-swizzled view or a native depth surface through its R32/R16 Z view.
+            // Forcing an exact descriptor here would first write that resident back to guest
+            // memory, retire it, and reconstruct an exact-key texture before upload selection gets
+            // a chance to preserve it. Writable storage images still require the conservative
+            // exact resident.
+            let has_read_compatible_resident = !is_writable_image_opcode(binding.opcode)
                 && self.resident_guest_textures.values().any(|resident| {
                     resident_color_view_sample_is_eligible(resident, descriptor, false)
+                        || resident_depth_sample_is_eligible(resident, descriptor)
                 });
             if !is_writable_image_opcode(binding.opcode)
-                && !has_component_reordered_resident
+                && !has_read_compatible_resident
                 && trace_target_sampling()
             {
                 let overlapping = self
@@ -239,7 +241,7 @@ impl MetalPresenter {
                     self.ensure_mipmapped_storage_texture(&device, descriptor)?;
                 } else if storage_image_requires_exact_preacquire(
                     binding.opcode,
-                    has_component_reordered_resident,
+                    has_read_compatible_resident,
                 ) {
                     self.ensure_resident_texture(&device, descriptor.guest)?;
                 }
@@ -506,7 +508,7 @@ mod tests {
     use remu_shader::Opcode;
 
     #[test]
-    fn read_only_storage_load_can_skip_exact_preacquire_for_component_reordered_resident() {
+    fn read_only_storage_load_can_skip_exact_preacquire_for_compatible_gpu_resident() {
         assert!(!storage_image_requires_exact_preacquire(
             Opcode::Known("ImageLoad"),
             true,

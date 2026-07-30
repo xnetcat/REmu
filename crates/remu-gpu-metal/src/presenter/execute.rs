@@ -47,10 +47,11 @@ use super::{
     read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
     rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_scanout_writer,
     record_diagnostic_texture_writer, register_value, render_target_fast_clear_color,
-    resident_color_view_sample_is_eligible, sampled_image_bindings,
-    shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
-    snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy, trace_image_descriptors,
-    trace_msaa_writes, trace_scanout_writes, trace_target_sampling, upload_image_textures,
+    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
+    sampled_image_bindings, shader_scalar_metadata_for_registers,
+    should_record_diagnostic_target_writer, snapshot_guest_texture_raw,
+    storage_image_requires_mip_hierarchy, trace_image_descriptors, trace_msaa_writes,
+    trace_scanout_writes, trace_target_sampling, upload_image_textures,
     validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
 };
 use metal::{
@@ -495,29 +496,52 @@ impl MetalPresenter {
             {
                 let descriptor = decode_image_descriptor(&binding.resource_descriptor)
                     .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                for target in &targets {
-                    if descriptor.guest != target.texture
-                        && guest_texture_descriptors_overlap(descriptor.guest, target.texture)
+                let writable = is_writable_image_opcode(binding.opcode);
+                // ImageLoad is read-only. Preserve a GPU-current render/depth image when Metal
+                // can expose the requested component or native Z view directly; materializing an
+                // exact SRD first would synchronously write the attachment back to guest memory
+                // and recreate it. Writable storage operations still require exact storage.
+                let has_read_compatible_resident = !writable
+                    && self.resident_guest_textures.values().any(|resident| {
+                        resident_color_view_sample_is_eligible(resident, descriptor, false)
+                            || resident_depth_sample_is_eligible(resident, descriptor)
+                    });
+                if !has_read_compatible_resident {
+                    for target in &targets {
+                        if descriptor.guest != target.texture
+                            && guest_texture_descriptors_overlap(descriptor.guest, target.texture)
+                        {
+                            return Err(format!(
+                                "{} image at PC {:#x} aliases render target {} through an incompatible view",
+                                if writable {
+                                    "writable"
+                                } else {
+                                    "read-only storage"
+                                },
+                                binding.pc,
+                                target.guest_slot
+                            ));
+                        }
+                    }
+                    if let Some(depth) = depth
+                        && descriptor.guest != depth.texture
+                        && guest_texture_descriptors_overlap(descriptor.guest, depth.texture)
                     {
                         return Err(format!(
-                            "writable image at PC {:#x} aliases render target {} through an incompatible view",
-                            binding.pc, target.guest_slot
+                            "{} image at PC {:#x} aliases the depth target through an incompatible view",
+                            if writable {
+                                "writable"
+                            } else {
+                                "read-only storage"
+                            },
+                            binding.pc
                         ));
                     }
-                }
-                if let Some(depth) = depth
-                    && descriptor.guest != depth.texture
-                    && guest_texture_descriptors_overlap(descriptor.guest, depth.texture)
-                {
-                    return Err(format!(
-                        "writable image at PC {:#x} aliases the depth target through an incompatible view",
-                        binding.pc
-                    ));
                 }
                 if descriptor.texture_type == 9 {
                     if storage_image_requires_mip_hierarchy(binding, descriptor) {
                         self.ensure_mipmapped_storage_texture(&device, descriptor)?;
-                    } else {
+                    } else if writable || !has_read_compatible_resident {
                         self.ensure_resident_texture(&device, descriptor.guest)?;
                     }
                 }
