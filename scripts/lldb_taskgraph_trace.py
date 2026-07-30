@@ -104,12 +104,13 @@ QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS = {
 QUEUE_HANDOFF_BREAKPOINTS = {
     PUBLISH: BREAKPOINTS[PHASE_PUBLISH][PUBLISH],
     PUBLISH_RETURN: BREAKPOINTS[PHASE_PUBLISH][PUBLISH_RETURN],
-    QUEUE_REGISTER: 0x8011C4C00,
-    EVENT_WAIT_ENTRY: 0x801210940,
+    COMPLETE: BREAKPOINTS[PHASE_COMPLETE][COMPLETE],
 }
 QUEUE_HANDOFF_POST_PUBLISH_BREAKPOINTS = {
-    QUEUE_REGISTER: QUEUE_HANDOFF_BREAKPOINTS[QUEUE_REGISTER],
-    EVENT_WAIT_ENTRY: QUEUE_HANDOFF_BREAKPOINTS[EVENT_WAIT_ENTRY],
+    EXECUTE: BREAKPOINTS[PHASE_CONSUME][EXECUTE],
+    COMPLETE: BREAKPOINTS[PHASE_COMPLETE][COMPLETE],
+    QUEUE_REGISTER: 0x8011C4C00,
+    EVENT_WAIT_ENTRY: 0x801210940,
 }
 TASKGRAPH_BREAKPOINT_ADDRESSES = frozenset(
     {
@@ -286,6 +287,8 @@ class TaskQueueChainSnapshot:
     target_handle: int = 0
     target_slot: int = 0
     target_slot_words: tuple[Optional[int], ...] = ()
+    matched_task: int = 0
+    match_reason: str = ""
     target_words: tuple[Optional[int], ...] = ()
 
 
@@ -346,6 +349,7 @@ def inspect_task_queue_chain(
     head: Optional[int],
     target_task: int,
     read_u64: ReadU64,
+    target_event: int = 0,
     limit: int = TASK_QUEUE_CHAIN_LIMIT,
 ) -> TaskQueueChainSnapshot:
     """Walk queue node handles without following unreadable or cyclic links."""
@@ -391,7 +395,21 @@ def inspect_task_queue_chain(
         nodes.append(
             TaskQueueNodeSnapshot(handle, slot_address, slot_words)
         )
-        if target_task != 0 and slot_words[1] == target_task:
+        candidate_task = slot_words[1] or 0
+        candidate_event = (
+            read_u64(candidate_task + 0x18)
+            if candidate_task != 0 and target_event != 0
+            else None
+        )
+        pointer_match = target_task != 0 and candidate_task == target_task
+        event_match = (
+            target_event != 0 and candidate_event == target_event
+        )
+        if pointer_match or event_match:
+            matched_words = tuple(
+                read_u64(candidate_task + index * 8)
+                for index in range(4)
+            )
             return TaskQueueChainSnapshot(
                 "linked",
                 tuple(handles),
@@ -399,7 +417,15 @@ def inspect_task_queue_chain(
                 target_handle=handle,
                 target_slot=slot_address,
                 target_slot_words=slot_words,
-                target_words=target_words,
+                matched_task=candidate_task,
+                match_reason=(
+                    "pointer+event"
+                    if pointer_match and event_match
+                    else "pointer"
+                    if pointer_match
+                    else "event"
+                ),
+                target_words=matched_words,
             )
         next_handle = slot_words[0]
         if next_handle is None:
@@ -439,6 +465,8 @@ def describe_task_queue_chain(snapshot: TaskQueueChainSnapshot) -> str:
         f"target_handle={snapshot.target_handle:#x} "
         f"target_slot={snapshot.target_slot:#x} "
         f"target_slot_words=[{slot_words}] "
+        f"matched_task={snapshot.matched_task:#x} "
+        f"match_reason={snapshot.match_reason or 'none'} "
         f"target_words=[{target_words}]"
     )
 
@@ -729,6 +757,7 @@ class TaskGraphTraceState:
             lane_one_head,
             self.task,
             read_u64,
+            self.completion_event,
         )
         if (
             chain.target_slot != 0
@@ -825,7 +854,9 @@ class TaskGraphTraceState:
                 _register(registers, "rax") & 0xFFFFFFFF
             )
             self.target_capture_count += 1
+            self.cycles_started += 1
             self.target_published = False
+            self.target_executed = False
             self.target_publisher_thread = 0
             self.target_publisher_entry_rsp = 0
             self.target_publisher_return_rsp = 0
@@ -896,6 +927,45 @@ class TaskGraphTraceState:
                 f"thread={thread_id:#x}",
             )
 
+        if label == COMPLETE:
+            if _register(registers, "r14") != self.task:
+                return TraceResult(False)
+            queue_snapshot = self._queue_snapshot(read_u64)
+            event_words = tuple(
+                read_u64(self.completion_event + index * 8)
+                for index in range(12)
+            )
+            task = self.task
+            event = self.completion_event
+            capture = self.target_capture_count
+            self.cycles_completed += 1
+            message = (
+                f"target={capture} normal-complete task={task:#x} "
+                f"event={event:#x} {queue_snapshot} "
+                f"event_words="
+                f"[{','.join(_optional_hex(value) for value in event_words)}]"
+            )
+            self._reset_queue_handoff_target()
+            if self.cycles_completed >= self.cycle_limit:
+                self.phase = PHASE_DONE
+                message += (
+                    " done reason=cycle-limit "
+                    f"cycles={self.cycles_completed}/{self.cycles_started}"
+                )
+            return TraceResult(True, message)
+
+        if label == EXECUTE:
+            if _register(registers, "rdi") != self.task:
+                return TraceResult(False)
+            self.target_executed = True
+            return TraceResult(
+                True,
+                f"target={self.target_capture_count} execute "
+                f"task={self.task:#x} event={self.completion_event:#x} "
+                f"thread={thread_id:#x} "
+                f"{self._queue_snapshot(read_u64)}",
+            )
+
         if label == QUEUE_REGISTER:
             queue = _register(registers, "r13")
             if queue != self.queue:
@@ -921,14 +991,6 @@ class TaskGraphTraceState:
         if underlying != self.queue_event_underlying:
             return TraceResult(False)
         self.queue_transitions += 1
-        terminal = self.target_published
-        if terminal:
-            self.phase = PHASE_DONE
-        terminal_text = (
-            " done reason=decisive-queue-wait"
-            if terminal
-            else ""
-        )
         return TraceResult(
             True,
             f"event-wait-entry transition={self.queue_transitions} "
@@ -936,9 +998,45 @@ class TaskGraphTraceState:
             f"condition={underlying + 0x28:#x} "
             f"{self._queue_snapshot(read_u64)} "
             f"{self._queue_event_description(read_u64)} "
-            f"thread={thread_id:#x}"
-            f"{terminal_text}",
+            f"thread={thread_id:#x}",
         )
+
+    def final_queue_handoff_snapshot(self, read_u64: ReadU64) -> str:
+        """Describe the exact unresolved target when the attach timer ends."""
+
+        if not self.queue_handoff:
+            return "queue-handoff-disabled"
+        if self.task == 0:
+            return (
+                "no-unresolved-target "
+                f"cycles={self.cycles_completed}/{self.cycles_started}"
+            )
+        return (
+            f"unresolved-target task={self.task:#x} "
+            f"event={self.completion_event:#x} "
+            f"published={self.target_published} "
+            f"executed={self.target_executed} "
+            f"{self._queue_snapshot(read_u64)} "
+            f"{self._queue_event_description(read_u64)}"
+        )
+
+    def _reset_queue_handoff_target(self) -> None:
+        """Release a normally completed candidate and rearm target discovery."""
+
+        self.task = 0
+        self.completion_event = 0
+        self.queue = 0
+        self.queue_object = 0
+        self.queue_event_wrapper = 0
+        self.queue_event_underlying = 0
+        self.target_published = False
+        self.target_executed = False
+        self.target_publisher_thread = 0
+        self.target_publisher_entry_rsp = 0
+        self.target_publisher_return_rsp = 0
+        self.target_queue_node_handle = 0
+        self.target_queue_node_slot = 0
+        self.target_queue_node_initial_words = ()
 
     def _observe_target_follow(
         self,
@@ -1672,9 +1770,12 @@ def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
 
     target = debugger.GetSelectedTarget()
     process = target.GetProcess()
-    if SESSION is not None and (
-        SESSION.state.done or SESSION.attach_timeout_requested
-    ):
+    def hold_for_detach() -> bool:
+        return SESSION is not None and (
+            SESSION.state.done or SESSION.attach_timeout_requested
+        )
+
+    if hold_for_detach():
         SESSION.cancel_attach_timeout()
         reason = (
             "terminal trace observation"
@@ -1689,6 +1790,13 @@ def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
     write_watch_enabled = os.environ.get("REMU_DISABLE_CPU_WRITE_WATCH") != "1"
     resumed = 0
     while process.GetState() == lldb.eStateStopped:
+        if hold_for_detach():
+            SESSION.cancel_attach_timeout()
+            result.AppendMessage(
+                "[REMu][LLDB][TASKGRAPH] holding stopped process for detach "
+                "during diagnostic-stop drain"
+            )
+            return
         diagnostic_stop = False
         stop_kind = ""
         for thread in process:
@@ -1733,9 +1841,16 @@ def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
             f"count={resumed} kind={stop_kind}",
             flush=True,
         )
+        if hold_for_detach():
+            SESSION.cancel_attach_timeout()
+            result.AppendMessage(
+                "[REMu][LLDB][TASKGRAPH] timer/terminal stop won race "
+                "before diagnostic resume; holding for detach"
+            )
+            return
         error = process.Continue()
         if error.Fail():
-            result.SetError(
+            result.AppendMessage(
                 "could not resume diagnostic stop: "
                 f"{error.GetCString()}"
             )
@@ -1751,6 +1866,90 @@ def resume_loader_notifications(debugger, command, result, internal_dict):
     """Backward-compatible alias for the diagnostic resume command."""
 
     resume_diagnostic_stops(debugger, command, result, internal_dict)
+
+
+def _append_report_command(debugger, command: str, result) -> None:
+    """Run one best-effort report command without aborting later detach."""
+
+    command_result = lldb.SBCommandReturnObject()
+    debugger.GetCommandInterpreter().HandleCommand(command, command_result)
+    output = command_result.GetOutput()
+    if output:
+        result.AppendMessage(output.rstrip())
+    error = command_result.GetError()
+    if error:
+        result.AppendMessage(
+            f"[REMu][LLDB][TASKGRAPH] report warning ({command}): "
+            f"{error.strip()}"
+        )
+
+
+def _detach_taskgraph_process(process, result) -> None:
+    """Best-effort explicit detach that never aborts LLDB's remaining cleanup."""
+
+    error = process.Detach(False)
+    if error.Fail():
+        result.AppendMessage(
+            "[REMu][LLDB][TASKGRAPH] detach failed: "
+            f"{error.GetCString()}"
+        )
+        return
+    result.AppendMessage(
+        "[REMu][LLDB][TASKGRAPH] detached without terminating target"
+    )
+
+
+def finish_taskgraph_trace(debugger, _command, result, _internal_dict):
+    """Stop, report, and detach even when individual report commands fail."""
+
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    if SESSION is not None:
+        SESSION.cancel_attach_timeout()
+    if not process.IsValid():
+        result.AppendMessage(
+            "[REMu][LLDB][TASKGRAPH] finish skipped: no valid process"
+        )
+        return
+    if process.GetState() in (lldb.eStateExited, lldb.eStateDetached):
+        result.AppendMessage(
+            "[REMu][LLDB][TASKGRAPH] finish skipped: process already ended"
+        )
+        return
+    stopped_states = (
+        lldb.eStateStopped,
+        lldb.eStateCrashed,
+        lldb.eStateSuspended,
+    )
+    if process.GetState() not in stopped_states:
+        error = process.Stop()
+        if error.Fail():
+            result.AppendMessage(
+                "[REMu][LLDB][TASKGRAPH] stop-before-detach warning: "
+                f"{error.GetCString()}"
+            )
+    if process.GetState() in stopped_states:
+        if SESSION is not None and SESSION.state.queue_handoff:
+            snapshot = SESSION.state.final_queue_handoff_snapshot(
+                lambda address: SESSION._read_u64(process, address)
+            )
+            result.AppendMessage(
+                "[REMu][LLDB][TASKGRAPH] final-snapshot "
+                f"{snapshot}"
+            )
+        for command in ("thread backtrace all -c 24", "register read"):
+            try:
+                _append_report_command(debugger, command, result)
+            except Exception as error:  # LLDB plugins must not strand the target.
+                result.AppendMessage(
+                    "[REMu][LLDB][TASKGRAPH] report exception "
+                    f"({command}): {error}"
+                )
+    else:
+        result.AppendMessage(
+            "[REMu][LLDB][TASKGRAPH] report skipped: process did not stop"
+        )
+    _detach_taskgraph_process(process, result)
 
 
 def detach_taskgraph_trace(debugger, _command, result, _internal_dict):
@@ -1770,16 +1969,7 @@ def detach_taskgraph_trace(debugger, _command, result, _internal_dict):
             "[REMu][LLDB][TASKGRAPH] detach skipped: process already ended"
         )
         return
-    error = process.Detach(False)
-    if error.Fail():
-        result.SetError(
-            "could not detach TaskGraph diagnostic: "
-            f"{error.GetCString()}"
-        )
-        return
-    result.AppendMessage(
-        "[REMu][LLDB][TASKGRAPH] detached without terminating target"
-    )
+    _detach_taskgraph_process(process, result)
 
 
 def __lldb_init_module(debugger, _internal_dict):
@@ -1799,4 +1989,9 @@ def __lldb_init_module(debugger, _internal_dict):
         "command script add "
         "-f lldb_taskgraph_trace.detach_taskgraph_trace "
         "remu-taskgraph-trace-detach"
+    )
+    debugger.HandleCommand(
+        "command script add "
+        "-f lldb_taskgraph_trace.finish_taskgraph_trace "
+        "remu-taskgraph-trace-finish"
     )

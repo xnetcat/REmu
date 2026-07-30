@@ -370,6 +370,7 @@ class TaskGraphTraceTests(unittest.TestCase):
             state.active_breakpoints(),
             TRACE.QUEUE_HANDOFF_POST_PUBLISH_BREAKPOINTS,
         )
+        self.assertIn(TRACE.EXECUTE, state.active_breakpoints())
 
         self.memory[0xA000 - 0x48] = 1
         self.memory[queue + 0x1A8] |= 1
@@ -409,9 +410,107 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertTrue(waiting.accepted)
         self.assertIn("mutex=0x5020", waiting.message or "")
         self.assertIn("condition=0x5028", waiting.message or "")
-        self.assertIn("done reason=decisive-queue-wait", waiting.message or "")
-        self.assertTrue(state.done)
-        self.assertEqual(state.active_breakpoints(), {})
+        self.assertFalse(state.done)
+        self.assertEqual(
+            state.active_breakpoints(),
+            TRACE.QUEUE_HANDOFF_POST_PUBLISH_BREAKPOINTS,
+        )
+        final_snapshot = state.final_queue_handoff_snapshot(
+            self.read_u64
+        )
+        self.assertIn("unresolved-target task=0x1000", final_snapshot)
+        self.assertIn("published=True executed=False", final_snapshot)
+        self.assertIn("known_target_mutated=True", final_snapshot)
+
+    def test_queue_handoff_cycles_a_normally_completed_fence(self) -> None:
+        state = TRACE.TaskGraphTraceState(
+            cycle_limit=2,
+            hit_limit=32,
+            target_follow=True,
+            queue_handoff=True,
+        )
+        task = 0x1000
+        queue = 0x3000
+        queue_object = queue - 0x38
+        wrapper = 0x4000
+        underlying = 0x5000
+        singleton = 0x6000
+        memory = {
+            task + 0x8: 1,
+            task + 0x18: 0x2100,
+            TRACE.TASKGRAPH_SINGLETON_POINTER: singleton,
+            singleton + 0x18 + 0x8: queue_object,
+            queue + 0x1F8: wrapper,
+            wrapper + 0x10: underlying,
+            0x8000: 0x9000,
+            0x8008: TRACE.DEFAULT_TARGET_FENCE_CALLER,
+            0x9008: TRACE.DEFAULT_TARGET_FENCE_PARENT,
+        }
+
+        captured = state.observe(
+            TRACE.PREPARE,
+            {
+                "rbx": task,
+                "rbp": 0x8000,
+                "r12": 1,
+                "rax": 1,
+            },
+            7,
+            memory.get,
+        )
+        self.assertTrue(captured.accepted)
+        self.assertIn(TRACE.COMPLETE, state.active_breakpoints())
+        published = state.observe(
+            TRACE.PUBLISH,
+            {
+                "rsi": task,
+                "rdi": queue,
+                "rdx": 1,
+                "rsp": 0x7000,
+            },
+            7,
+            memory.get,
+        )
+        self.assertTrue(published.accepted)
+        enqueue = state.observe(
+            TRACE.PUBLISH_RETURN,
+            {
+                "r14": queue_object,
+                "rbx": 0,
+                "rax": 0,
+                "rsp": 0x7008,
+            },
+            7,
+            memory.get,
+        )
+        self.assertTrue(enqueue.accepted)
+        self.assertIn(TRACE.EXECUTE, state.active_breakpoints())
+        executed = state.observe(
+            TRACE.EXECUTE,
+            {"rdi": task},
+            8,
+            memory.get,
+        )
+        self.assertTrue(executed.accepted)
+        self.assertTrue(state.target_executed)
+        completed = state.observe(
+            TRACE.COMPLETE,
+            {"r14": task},
+            8,
+            memory.get,
+        )
+
+        self.assertTrue(completed.accepted)
+        self.assertIn("normal-complete", completed.message or "")
+        self.assertFalse(state.done)
+        self.assertEqual(state.cycles_started, 1)
+        self.assertEqual(state.cycles_completed, 1)
+        self.assertEqual(state.task, 0)
+        self.assertEqual(state.queue, 0)
+        self.assertEqual(
+            state.active_breakpoints(),
+            TRACE.QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS,
+        )
 
     def test_queue_handoff_requires_target_follow(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires target follow"):
@@ -508,6 +607,7 @@ class TaskGraphTraceTests(unittest.TestCase):
             "target_words=[0x1111,0x2222,0x3333,0x4444]",
             description,
         )
+        self.assertEqual(snapshot.match_reason, "pointer")
 
         memory[second_slot + 8] = 0
         vanished = TRACE.inspect_task_queue_chain(
@@ -517,6 +617,20 @@ class TaskGraphTraceTests(unittest.TestCase):
         )
         self.assertEqual(vanished.termination, "null")
         self.assertEqual(vanished.target_slot, 0)
+
+        replacement = 0x222200
+        completion_event = 0x333300
+        memory[second_slot + 8] = replacement
+        memory[replacement + 0x18] = completion_event
+        event_match = TRACE.inspect_task_queue_chain(
+            first_handle,
+            target,
+            memory.get,
+            completion_event,
+        )
+        self.assertEqual(event_match.termination, "linked")
+        self.assertEqual(event_match.matched_task, replacement)
+        self.assertEqual(event_match.match_reason, "event")
 
     def test_persistent_breakpoint_planner_adds_without_replacing(self) -> None:
         prepare = {TRACE.PREPARE: TRACE.PREPARE_ADDRESS}
@@ -671,6 +785,82 @@ class TaskGraphTraceTests(unittest.TestCase):
             "[REMu][LLDB][TASKGRAPH] detached without terminating target"
         )
 
+    def test_finish_stops_and_detaches_even_if_backtrace_fails(self) -> None:
+        class FakeError:
+            def Fail(self) -> bool:
+                return False
+
+            def GetCString(self) -> str:
+                return ""
+
+        state = {"value": 6}
+        process = mock.Mock()
+        process.IsValid.return_value = True
+        process.GetState.side_effect = lambda: state["value"]
+
+        def stop() -> FakeError:
+            state["value"] = 5
+            return FakeError()
+
+        process.Stop.side_effect = stop
+        process.Detach.return_value = FakeError()
+        target = mock.Mock()
+        target.GetProcess.return_value = process
+        debugger = mock.Mock()
+        debugger.GetSelectedTarget.return_value = target
+        result = mock.Mock()
+        fake_lldb = SimpleNamespace(
+            eStateRunning=6,
+            eStateStopped=5,
+            eStateCrashed=8,
+            eStateDetached=9,
+            eStateExited=10,
+            eStateSuspended=11,
+        )
+        session = mock.Mock()
+        session.state.queue_handoff = True
+        session.state.final_queue_handoff_snapshot.return_value = (
+            "unresolved-target task=0x1000"
+        )
+
+        def report(_debugger, command: str, _result) -> None:
+            if command.startswith("thread backtrace"):
+                raise RuntimeError("synthetic report failure")
+
+        with mock.patch.object(TRACE, "lldb", fake_lldb), \
+            mock.patch.object(TRACE, "SESSION", session), \
+            mock.patch.object(
+                TRACE,
+                "_append_report_command",
+                side_effect=report,
+            ) as report_command:
+            TRACE.finish_taskgraph_trace(debugger, "", result, {})
+
+        process.Stop.assert_called_once_with()
+        self.assertEqual(report_command.call_count, 2)
+        process.Detach.assert_called_once_with(False)
+        session.cancel_attach_timeout.assert_called_once_with()
+        session.state.final_queue_handoff_snapshot.assert_called_once()
+        self.assertTrue(
+            any(
+                "report exception" in call.args[0]
+                for call in result.AppendMessage.call_args_list
+            )
+        )
+        self.assertTrue(
+            any(
+                "detached without terminating target" in call.args[0]
+                for call in result.AppendMessage.call_args_list
+            )
+        )
+        self.assertTrue(
+            any(
+                "final-snapshot unresolved-target task=0x1000"
+                in call.args[0]
+                for call in result.AppendMessage.call_args_list
+            )
+        )
+
     def test_attach_duration_interrupts_before_external_watchdog(self) -> None:
         class FakeTimer:
             def __init__(self, duration: int, callback) -> None:
@@ -766,6 +956,15 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertIn(
             'REMU_TASKGRAPH_TRACE_ATTACH_DURATION_SECONDS='
             '"$attach_trace_seconds"',
+            source,
+        )
+        self.assertIn(
+            "settings set "
+            "interpreter.stop-command-source-on-error false",
+            source,
+        )
+        self.assertIn(
+            "-o 'remu-taskgraph-trace-finish'",
             source,
         )
 
