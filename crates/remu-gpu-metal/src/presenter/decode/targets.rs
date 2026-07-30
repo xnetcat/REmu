@@ -453,10 +453,22 @@ pub(crate) fn decode_render_target_state(
 pub(crate) fn decode_render_targets(
     draw: &IndexedDraw,
 ) -> Result<Vec<DecodedRenderTarget>, String> {
-    let pixel = draw
-        .pixel_shader
-        .as_ref()
-        .ok_or("draw has no decoded pixel shader")?;
+    let Some(pixel) = draw.pixel_shader.as_ref() else {
+        if draw.scanout_target.is_some() {
+            return Err("scanout draw has no decoded pixel shader".to_owned());
+        }
+        // An absent mask leaves programmed color targets discoverable to the command processor,
+        // but a missing pixel stage still has no color exports. Treat the mask as zero only for
+        // this fragmentless path; an explicit nonzero mask remains an invalid color-write request.
+        let target_mask =
+            register_value(&draw.context_registers, CB_TARGET_MASK).unwrap_or_default();
+        if target_mask == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "draw has no decoded pixel shader but CB_TARGET_MASK={target_mask:#010x} requests color output"
+        ));
+    };
     let export_masks = pixel.program.pixel_color_export_masks();
     if let Some(target) = draw.scanout_target {
         let shader_write_mask = (export_masks >> (target.export_slot * 4)) & 0xf;

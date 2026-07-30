@@ -36,6 +36,7 @@ use super::{
     diagnostic_texture_depth_plane_summaries, effective_linear_pitch,
     encode_mode5_mip_chain_into_raw, encode_mode27_mip_chain_into_raw,
     ensure_mipmapped_resident_texture_in_map, fallback_image_descriptor,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_pipeline_key,
     graphics_shader_resource_key, guest_frame_fingerprint, guest_shared_mapping_identity,
     guest_texture_byte_count, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_color_view_storage,

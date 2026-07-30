@@ -6,9 +6,10 @@ use metal::{
     MTLPixelFormat, MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLTextureType,
     MTLTriangleFillMode, MTLWinding, RenderPipelineDescriptor,
 };
-use remu_gpu::GpuRegister;
-use remu_shader::PixelOutputKind;
+use remu_gpu::{GpuRegister, ShaderSnapshot};
+use remu_shader::{PixelOutputKind, Program, ShaderEvaluation};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::{
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
@@ -23,7 +24,8 @@ use super::{
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
     decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
     decode_render_targets_from_registers, decode_scissor, decode_viewport, effective_linear_pitch,
-    guest_texture_byte_count, guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
+    fragmentless_pixel_program, graphics_pipeline_key, guest_texture_byte_count,
+    guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
     metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, prepare_ngg_meshlets,
@@ -31,6 +33,77 @@ use super::{
     rearm_color_metadata_clear, rearm_depth_metadata_clear, render_target_cmask_address,
     render_target_fast_clear_color,
 };
+
+fn empty_shader_evaluation() -> Arc<ShaderEvaluation> {
+    Arc::new(ShaderEvaluation {
+        initial_scalar_registers: std::iter::once(0).collect(),
+        scalar_registers: std::iter::once(0).collect(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    })
+}
+
+#[test]
+fn accepts_fragmentless_depth_only_pipeline() {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    draw.export_shader_address = 0x0080_07a8_0000;
+    draw.export_shader = Some(ShaderSnapshot {
+        header_address: 0,
+        program: Arc::new(Program::new(draw.export_shader_address, Vec::new())),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    });
+    draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    append_depth_target_registers(
+        &mut draw,
+        0x0080_10b5_0000,
+        256,
+        256,
+        0xa000_0003,
+        0x66,
+    );
+
+    let key = graphics_pipeline_key(&draw).expect("depth-only draw has a Metal pipeline");
+    assert!(key.targets.is_empty());
+    assert!(key.depth.is_some());
+    assert_eq!(key.pixel_shader_address, 0);
+    assert_eq!(key.pixel_program_identity.0.address, 0);
+    assert!(Arc::ptr_eq(
+        &key.pixel_program_identity.0,
+        fragmentless_pixel_program()
+    ));
+    assert!(!key.pixel_depth_export);
+    assert_eq!(key.pixel_resources.initial_scalar_count, 1);
+    assert!(key.pixel_resources.global_bindings.is_empty());
+    assert!(key.pixel_resources.image_bindings.is_empty());
+}
+
+#[test]
+fn rejects_fragmentless_pipeline_with_color_writes() {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.export_shader_address = 0x0080_07a8_0000;
+    draw.export_shader = Some(ShaderSnapshot {
+        header_address: 0,
+        program: Arc::new(Program::new(draw.export_shader_address, Vec::new())),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    });
+    draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    draw.context_registers.push(GpuRegister {
+        offset: CB_TARGET_MASK,
+        value: 0xf,
+    });
+    draw.context_registers
+        .sort_unstable_by_key(|register| register.offset);
+
+    let error = graphics_pipeline_key(&draw).expect_err("color writes require a pixel shader");
+    assert!(error.contains("requests color output"), "{error}");
+}
 
 #[test]
 fn decodes_cb_color_control_operation_modes() {

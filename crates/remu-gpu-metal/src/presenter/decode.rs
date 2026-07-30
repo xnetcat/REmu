@@ -6,8 +6,9 @@ use super::{
     DepthTargetPipelineState, DisplayConfiguration, GraphicsPipelineKey, GraphicsShaderResourceKey,
     GuestScissor, GuestTextureDescriptor, MetalBlendAttachmentState, ProgramIdentity,
     RenderTargetFormat, RenderTargetPipelineState, decode_sampled_texture_format,
-    effective_linear_pitch, graphics_allocated_vector_register_count, guest_texture_byte_count,
-    half_float_to_f32, is_storage_image_opcode, program_embeds_global_base, tiled_block_dimensions,
+    effective_linear_pitch, fragmentless_pixel_evaluation, fragmentless_pixel_program,
+    graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
+    is_storage_image_opcode, program_embeds_global_base, tiled_block_dimensions,
     trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
 };
 use metal::{MTLScissorRect, MTLViewport};
