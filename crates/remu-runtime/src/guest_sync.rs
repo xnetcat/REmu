@@ -58,6 +58,30 @@ static MAIN_TIMED_WAIT_TIMEOUT_STREAK: AtomicU64 = AtomicU64::new(0);
 static MAIN_TIMED_WAIT_STREAK_STARTED_NANOS: AtomicU64 = AtomicU64::new(0);
 
 const CONDITION_LIFECYCLE_TRACE_CAPACITY: usize = 256;
+const TASKGRAPH_WAIT_EVENT_CALLER_RETURN: u64 = 0x801_be2_28e;
+const TASKGRAPH_WAIT_PARENT_RETURN: u64 = 0x801_be0_511;
+const TASKGRAPH_WAIT_GRANDPARENT_RETURN: u64 = 0x801_01a_f94;
+const TASKGRAPH_SINGLETON_POINTER: u64 = 0x807_ba3_5e0;
+const TASKGRAPH_NODE_SLAB_POINTERS: u64 = 0x807_ba8_cd0;
+const TASKGRAPH_RENDER_THREAD_INDEX: u64 = 3;
+const TASKGRAPH_QUEUE_OBJECT_OFFSET: u64 = TASKGRAPH_RENDER_THREAD_INDEX * 0x18 + 0x8;
+const TASKGRAPH_QUEUE_INDEX_STRIDE: u64 = 0x200;
+const TASKGRAPH_QUEUE_OFFSET: u64 = 0x38;
+const TASKGRAPH_QUEUE_INDEX_COUNT: u64 = 2;
+const TASKGRAPH_QUEUE_LANES: [(u64, u64, u64); 2] = [(0, 0x48, 0x90), (1, 0x118, 0x160)];
+const TASKGRAPH_NODE_ID_BITS: u32 = 26;
+const TASKGRAPH_NODE_ID_MASK: u64 = (1 << TASKGRAPH_NODE_ID_BITS) - 1;
+const TASKGRAPH_NODE_PAGE_BITS: u32 = 14;
+const TASKGRAPH_NODE_PAGE_MASK: u64 = (1 << TASKGRAPH_NODE_PAGE_BITS) - 1;
+const TASKGRAPH_NODE_STRIDE: u64 = 24;
+const TASKGRAPH_CHAIN_LIMIT: usize = 64;
+const TASKGRAPH_ALLOCATOR_PAGE_BYTES: u64 = 1024 * 1024;
+const TASKGRAPH_TASK_ALIGNMENT: u64 = 0x100;
+const TASKGRAPH_MAX_ALLOCATOR_PAGES: usize = 8;
+const TASKGRAPH_MAX_ALLOCATOR_MATCHES: usize = 64;
+const TASKGRAPH_FENCE_TASK_VPTR: u64 = 0x807_4b5_c50;
+const MINIMUM_GUEST_ADDRESS: u64 = 0x8_0000_0000;
+const MAXIMUM_GUEST_ADDRESS: u64 = 0x100_0000_0000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConditionWaitCallTrace {
@@ -482,6 +506,353 @@ fn trace_read_guest_u64(address: u64) -> u64 {
     try_read_process_guest_u64(address).unwrap_or(0)
 }
 
+fn trace_taskgraph_wait_snapshot() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_TASKGRAPH_WAIT").is_some_and(|value| value == "1")
+    })
+}
+
+fn plausible_guest_address(address: u64) -> bool {
+    (MINIMUM_GUEST_ADDRESS..MAXIMUM_GUEST_ADDRESS).contains(&address)
+}
+
+fn plausible_guest_pointer(address: u64) -> bool {
+    plausible_guest_address(address) && address.is_multiple_of(8)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TaskGraphQueueNode {
+    index: usize,
+    handle: u64,
+    address: u64,
+    next_handle: Option<u64>,
+    task: Option<u64>,
+    event_match: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaskGraphLaneSnapshot {
+    queue_index: u64,
+    lane: u64,
+    head: Option<u64>,
+    tail: Option<u64>,
+    head_task: Option<u64>,
+    tail_task: Option<u64>,
+    termination: &'static str,
+    classification: &'static str,
+    nodes: Vec<TaskGraphQueueNode>,
+}
+
+impl TaskGraphLaneSnapshot {
+    fn event_match_indexes(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .filter_map(|node| node.event_match.then_some(node.index))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaskGraphAllocatorMatch {
+    task: u64,
+    words: [Option<u64>; 8],
+}
+
+fn resolve_taskgraph_node(
+    handle: u64,
+    read_u64: &mut impl FnMut(u64) -> Option<u64>,
+) -> Option<u64> {
+    if handle == 0 {
+        return None;
+    }
+    let node_id = handle & TASKGRAPH_NODE_ID_MASK;
+    let page = node_id >> TASKGRAPH_NODE_PAGE_BITS;
+    let slot = node_id & TASKGRAPH_NODE_PAGE_MASK;
+    let page_pointer_address = TASKGRAPH_NODE_SLAB_POINTERS.checked_add(page.checked_mul(8)?)?;
+    let page_base = read_u64(page_pointer_address)?;
+    if !plausible_guest_pointer(page_base) {
+        return None;
+    }
+    let node = page_base.checked_add(slot.checked_mul(TASKGRAPH_NODE_STRIDE)?)?;
+    plausible_guest_pointer(node).then_some(node)
+}
+
+fn read_taskgraph_node_task(
+    handle: Option<u64>,
+    read_u64: &mut impl FnMut(u64) -> Option<u64>,
+) -> Option<u64> {
+    let node = resolve_taskgraph_node(handle?, read_u64)?;
+    let task = read_u64(node.checked_add(8)?)?;
+    plausible_guest_pointer(task).then_some(task)
+}
+
+fn walk_taskgraph_lane(
+    queue_index: u64,
+    lane: u64,
+    head: Option<u64>,
+    tail: Option<u64>,
+    event: u64,
+    read_u64: &mut impl FnMut(u64) -> Option<u64>,
+) -> TaskGraphLaneSnapshot {
+    let head_task = read_taskgraph_node_task(head, read_u64);
+    let tail_task = read_taskgraph_node_task(tail, read_u64);
+    let (Some(head), Some(tail)) = (head, tail) else {
+        return TaskGraphLaneSnapshot {
+            queue_index,
+            lane,
+            head,
+            tail,
+            head_task,
+            tail_task,
+            termination: "unreadable-cursor",
+            classification: "unknown",
+            nodes: Vec::new(),
+        };
+    };
+    if head == 0 {
+        return TaskGraphLaneSnapshot {
+            queue_index,
+            lane,
+            head: Some(head),
+            tail: Some(tail),
+            head_task,
+            tail_task,
+            termination: "null-head",
+            classification: "absent",
+            nodes: Vec::new(),
+        };
+    }
+
+    let mut nodes = Vec::new();
+    let mut seen_node_ids = BTreeSet::new();
+    let mut handle = head;
+    let mut termination = "limit";
+    for index in 0..TASKGRAPH_CHAIN_LIMIT {
+        let node_id = handle & TASKGRAPH_NODE_ID_MASK;
+        if !seen_node_ids.insert(node_id) {
+            termination = "cycle";
+            break;
+        }
+        let Some(address) = resolve_taskgraph_node(handle, read_u64) else {
+            termination = "unreadable-node";
+            break;
+        };
+        let next_handle = read_u64(address);
+        let task =
+            read_u64(address.saturating_add(8)).filter(|task| plausible_guest_pointer(*task));
+        let event_match =
+            task.is_some_and(|task| task.checked_add(0x18).and_then(&mut *read_u64) == Some(event));
+        nodes.push(TaskGraphQueueNode {
+            index,
+            handle,
+            address,
+            next_handle,
+            task,
+            event_match,
+        });
+        if handle == tail {
+            termination = "tail";
+            break;
+        }
+        let Some(next_handle) = next_handle else {
+            termination = "unreadable-next";
+            break;
+        };
+        if next_handle == 0 {
+            termination = "null-before-tail";
+            break;
+        }
+        handle = next_handle;
+    }
+
+    let has_queued_match = nodes.iter().any(|node| node.index > 0 && node.event_match);
+    let has_head_match = nodes.first().is_some_and(|node| node.event_match);
+    let classification = if has_queued_match {
+        "queued"
+    } else if has_head_match {
+        "popped-head"
+    } else {
+        "absent"
+    };
+    TaskGraphLaneSnapshot {
+        queue_index,
+        lane,
+        head: Some(head),
+        tail: Some(tail),
+        head_task,
+        tail_task,
+        termination,
+        classification,
+        nodes,
+    }
+}
+
+fn taskgraph_allocator_pages(task_anchors: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let page_mask = TASKGRAPH_ALLOCATOR_PAGE_BYTES - 1;
+    let mut pages = BTreeSet::new();
+    for task in task_anchors {
+        if pages.len() >= TASKGRAPH_MAX_ALLOCATOR_PAGES {
+            break;
+        }
+        if plausible_guest_pointer(task) && task.is_multiple_of(TASKGRAPH_TASK_ALIGNMENT) {
+            let page = task & !page_mask;
+            if page >= MINIMUM_GUEST_ADDRESS
+                && page
+                    .checked_add(TASKGRAPH_ALLOCATOR_PAGE_BYTES)
+                    .is_some_and(|end| end <= MAXIMUM_GUEST_ADDRESS)
+            {
+                pages.insert(page);
+            }
+        }
+    }
+    pages.into_iter().collect()
+}
+
+fn scan_taskgraph_allocator_pages(
+    pages: &[u64],
+    event: u64,
+    read_u64: &mut impl FnMut(u64) -> Option<u64>,
+) -> (Vec<TaskGraphAllocatorMatch>, bool) {
+    let mut matches = Vec::new();
+    for page in pages.iter().copied().take(TASKGRAPH_MAX_ALLOCATOR_PAGES) {
+        let Some(page_end) = page.checked_add(TASKGRAPH_ALLOCATOR_PAGE_BYTES) else {
+            continue;
+        };
+        if page < MINIMUM_GUEST_ADDRESS
+            || page_end > MAXIMUM_GUEST_ADDRESS
+            || !page.is_multiple_of(TASKGRAPH_ALLOCATOR_PAGE_BYTES)
+        {
+            continue;
+        }
+        for offset in (0..TASKGRAPH_ALLOCATOR_PAGE_BYTES)
+            .step_by(usize::try_from(TASKGRAPH_TASK_ALIGNMENT).expect("task alignment fits usize"))
+        {
+            let task = page + offset;
+            if read_u64(task + 0x18) != Some(event) {
+                continue;
+            }
+            let words = std::array::from_fn(|index| {
+                let offset = u64::try_from(index).ok()?.checked_mul(8)?;
+                read_u64(task.checked_add(offset)?)
+            });
+            matches.push(TaskGraphAllocatorMatch { task, words });
+            if matches.len() == TASKGRAPH_MAX_ALLOCATOR_MATCHES {
+                return (matches, true);
+            }
+        }
+    }
+    (matches, false)
+}
+
+fn taskgraph_wait_chain_matches(
+    event_caller_return: u64,
+    parent_return: u64,
+    grandparent_return: u64,
+) -> bool {
+    event_caller_return == TASKGRAPH_WAIT_EVENT_CALLER_RETURN
+        && parent_return == TASKGRAPH_WAIT_PARENT_RETURN
+        && grandparent_return == TASKGRAPH_WAIT_GRANDPARENT_RETURN
+}
+
+fn optional_hex(value: Option<u64>) -> String {
+    value.map_or_else(|| "unreadable".to_owned(), |value| format!("{value:#x}"))
+}
+
+fn emit_taskgraph_wait_snapshot(sequence: u64, event: u64) {
+    let mut read_u64 = try_read_process_guest_u64;
+    let singleton = read_u64(TASKGRAPH_SINGLETON_POINTER);
+    let queue_object = singleton
+        .filter(|singleton| plausible_guest_pointer(*singleton))
+        .and_then(|singleton| singleton.checked_add(TASKGRAPH_QUEUE_OBJECT_OFFSET))
+        .and_then(&mut read_u64)
+        .filter(|queue_object| plausible_guest_pointer(*queue_object));
+    eprintln!(
+        "[REMu][TASKGRAPH][WAIT] sequence={sequence} event={event:#x} singleton={} render_thread={} queue_object={}",
+        optional_hex(singleton),
+        TASKGRAPH_RENDER_THREAD_INDEX,
+        optional_hex(queue_object),
+    );
+    let Some(queue_object) = queue_object else {
+        eprintln!(
+            "[REMu][TASKGRAPH][WAIT] sequence={sequence} done reason=unreadable-render-queue"
+        );
+        return;
+    };
+
+    let mut lanes = Vec::new();
+    for queue_index in 0..TASKGRAPH_QUEUE_INDEX_COUNT {
+        let Some(queue) = queue_object
+            .checked_add(queue_index * TASKGRAPH_QUEUE_INDEX_STRIDE)
+            .and_then(|queue| queue.checked_add(TASKGRAPH_QUEUE_OFFSET))
+        else {
+            continue;
+        };
+        for (lane, head_offset, tail_offset) in TASKGRAPH_QUEUE_LANES {
+            let head = queue.checked_add(head_offset).and_then(&mut read_u64);
+            let tail = queue.checked_add(tail_offset).and_then(&mut read_u64);
+            lanes.push(walk_taskgraph_lane(
+                queue_index,
+                lane,
+                head,
+                tail,
+                event,
+                &mut read_u64,
+            ));
+        }
+    }
+
+    for snapshot in &lanes {
+        eprintln!(
+            "[REMu][TASKGRAPH][WAIT] sequence={sequence} queue_index={} lane={} head={} tail={} head_task={} tail_task={} termination={} classification={} nodes={} matches={:?}",
+            snapshot.queue_index,
+            snapshot.lane,
+            optional_hex(snapshot.head),
+            optional_hex(snapshot.tail),
+            optional_hex(snapshot.head_task),
+            optional_hex(snapshot.tail_task),
+            snapshot.termination,
+            snapshot.classification,
+            snapshot.nodes.len(),
+            snapshot.event_match_indexes(),
+        );
+        for node in &snapshot.nodes {
+            eprintln!(
+                "[REMu][TASKGRAPH][WAIT] sequence={sequence} node queue_index={} lane={} index={} handle={:#x} address={:#x} next={} task={} event_match={}",
+                snapshot.queue_index,
+                snapshot.lane,
+                node.index,
+                node.handle,
+                node.address,
+                optional_hex(node.next_handle),
+                optional_hex(node.task),
+                node.event_match,
+            );
+        }
+    }
+
+    let allocator_pages = taskgraph_allocator_pages(lanes.iter().flat_map(|snapshot| {
+        [snapshot.head_task, snapshot.tail_task]
+            .into_iter()
+            .flatten()
+    }));
+    let (allocator_matches, allocator_matches_truncated) =
+        scan_taskgraph_allocator_pages(&allocator_pages, event, &mut read_u64);
+    eprintln!(
+        "[REMu][TASKGRAPH][WAIT] sequence={sequence} allocator_pages={allocator_pages:#x?} allocator_matches={} truncated={allocator_matches_truncated}",
+        allocator_matches.len(),
+    );
+    for allocator_match in allocator_matches {
+        eprintln!(
+            "[REMu][TASKGRAPH][WAIT] sequence={sequence} allocator_match task={:#x} expected_vptr={} words={:#x?}",
+            allocator_match.task,
+            allocator_match.words[0] == Some(TASKGRAPH_FENCE_TASK_VPTR),
+            allocator_match.words,
+        );
+    }
+    eprintln!("[REMu][TASKGRAPH][WAIT] sequence={sequence} done reason=complete");
+}
+
 fn traced_main_conditions() -> &'static Mutex<BTreeSet<u64>> {
     static CONDITIONS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
     CONDITIONS.get_or_init(|| Mutex::new(BTreeSet::new()))
@@ -651,6 +1022,14 @@ fn begin_main_timed_condition_trace(
     } else {
         trace_read_guest_u64(parent_rbp - 0x40)
     };
+    if trace_taskgraph_wait_snapshot()
+        && sequence >= 4096
+        && sequence.is_power_of_two()
+        && plausible_guest_pointer(target_graph_event)
+        && taskgraph_wait_chain_matches(event_caller_return, parent_return, grandparent_return)
+    {
+        emit_taskgraph_wait_snapshot(sequence, target_graph_event);
+    }
     let target_graph_event_words = if target_graph_event == 0 {
         [0; 12]
     } else {
@@ -904,6 +1283,145 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         "JTvBflhYazQ" => guest_event_flag_wait(arguments),
         "PZku4ZrXJqg" => guest_event_flag_cancel(arguments),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod taskgraph_wait_snapshot_tests {
+    use super::{
+        MAXIMUM_GUEST_ADDRESS, MINIMUM_GUEST_ADDRESS, TASKGRAPH_ALLOCATOR_PAGE_BYTES,
+        TASKGRAPH_FENCE_TASK_VPTR, TASKGRAPH_NODE_PAGE_BITS, TASKGRAPH_NODE_PAGE_MASK,
+        TASKGRAPH_NODE_SLAB_POINTERS, TASKGRAPH_NODE_STRIDE, TASKGRAPH_TASK_ALIGNMENT,
+        TASKGRAPH_WAIT_EVENT_CALLER_RETURN, TASKGRAPH_WAIT_GRANDPARENT_RETURN,
+        TASKGRAPH_WAIT_PARENT_RETURN, scan_taskgraph_allocator_pages, taskgraph_allocator_pages,
+        taskgraph_wait_chain_matches, walk_taskgraph_lane,
+    };
+    use std::collections::BTreeMap;
+
+    fn install_node(
+        memory: &mut BTreeMap<u64, u64>,
+        handle: u64,
+        page_base: u64,
+        next_handle: u64,
+        task: u64,
+        event: u64,
+    ) {
+        let node_id = handle & ((1 << 26) - 1);
+        let page = node_id >> TASKGRAPH_NODE_PAGE_BITS;
+        let slot = node_id & TASKGRAPH_NODE_PAGE_MASK;
+        let node = page_base + slot * TASKGRAPH_NODE_STRIDE;
+        memory.insert(TASKGRAPH_NODE_SLAB_POINTERS + page * 8, page_base);
+        memory.insert(node, next_handle);
+        memory.insert(node + 8, task);
+        memory.insert(task, TASKGRAPH_FENCE_TASK_VPTR);
+        memory.insert(task + 0x18, event);
+    }
+
+    #[test]
+    fn exact_silent_hill_wait_chain_is_required() {
+        assert!(taskgraph_wait_chain_matches(
+            TASKGRAPH_WAIT_EVENT_CALLER_RETURN,
+            TASKGRAPH_WAIT_PARENT_RETURN,
+            TASKGRAPH_WAIT_GRANDPARENT_RETURN,
+        ));
+        assert!(!taskgraph_wait_chain_matches(
+            TASKGRAPH_WAIT_EVENT_CALLER_RETURN,
+            TASKGRAPH_WAIT_PARENT_RETURN + 1,
+            TASKGRAPH_WAIT_GRANDPARENT_RETURN,
+        ));
+    }
+
+    #[test]
+    fn paged_queue_walk_finds_same_event_task_after_dummy_head() {
+        let event = 0x75_00e1_2300;
+        let page_base = 0x75_00f0_0000;
+        let head = 0x4001;
+        let tail = 0x4002;
+        let dummy_task = 0x75_00e1_0000;
+        let fence_task = 0x75_00e2_0000;
+        let mut memory = BTreeMap::new();
+        install_node(&mut memory, head, page_base, tail, dummy_task, event + 8);
+        install_node(&mut memory, tail, page_base, 0, fence_task, event);
+        let mut read_u64 = |address| memory.get(&address).copied();
+
+        let snapshot = walk_taskgraph_lane(1, 0, Some(head), Some(tail), event, &mut read_u64);
+
+        assert_eq!(snapshot.queue_index, 1);
+        assert_eq!(snapshot.termination, "tail");
+        assert_eq!(snapshot.classification, "queued");
+        assert_eq!(snapshot.event_match_indexes(), vec![1]);
+        assert_eq!(snapshot.head_task, Some(dummy_task));
+        assert_eq!(snapshot.tail_task, Some(fence_task));
+    }
+
+    #[test]
+    fn queue_walk_stops_on_recycled_node_cycle() {
+        let page_base = 0x75_00f0_0000;
+        let head = 0x4001;
+        let recycled_head = head | (1 << 26);
+        let tail = 0x4002;
+        let mut memory = BTreeMap::new();
+        install_node(
+            &mut memory,
+            head,
+            page_base,
+            recycled_head,
+            0x75_00e1_0000,
+            0x75_00e1_2308,
+        );
+        let mut read_u64 = |address| memory.get(&address).copied();
+
+        let snapshot =
+            walk_taskgraph_lane(0, 1, Some(head), Some(tail), 0x75_00e1_2300, &mut read_u64);
+
+        assert_eq!(snapshot.termination, "cycle");
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.classification, "absent");
+    }
+
+    #[test]
+    fn allocator_pages_are_only_those_containing_cursor_task_anchors() {
+        let first_page = 0x75_00e0_0000;
+        let second_page = first_page + 3 * TASKGRAPH_ALLOCATOR_PAGE_BYTES;
+
+        let pages = taskgraph_allocator_pages([
+            0,
+            MINIMUM_GUEST_ADDRESS - TASKGRAPH_TASK_ALIGNMENT,
+            first_page + 0x100,
+            first_page + 0x800,
+            second_page + 0x200,
+            MAXIMUM_GUEST_ADDRESS,
+        ]);
+
+        assert_eq!(pages, vec![first_page, second_page]);
+    }
+
+    #[test]
+    fn allocator_scan_is_bounded_to_anchor_page_and_matches_task_event() {
+        let page = 0x75_00e0_0000;
+        let task = page + 0x200;
+        let event = 0x75_00d0_0100;
+        let mut memory = BTreeMap::from([(task, TASKGRAPH_FENCE_TASK_VPTR), (task + 0x18, event)]);
+        for index in 1..8_u64 {
+            memory.entry(task + index * 8).or_insert(0xa0 + index);
+        }
+        let mut reads = Vec::new();
+        let mut read_u64 = |address| {
+            reads.push(address);
+            memory.get(&address).copied()
+        };
+
+        let (matches, truncated) = scan_taskgraph_allocator_pages(&[page], event, &mut read_u64);
+
+        assert!(!truncated);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].task, task);
+        assert_eq!(matches[0].words[0], Some(TASKGRAPH_FENCE_TASK_VPTR));
+        assert!(
+            reads
+                .iter()
+                .all(|address| (page..page + TASKGRAPH_ALLOCATOR_PAGE_BYTES).contains(address))
+        );
     }
 }
 
