@@ -194,11 +194,11 @@ fn agc_indirect_draw_argument_address(
     graphics: &AgcGraphicsState,
     data_offset: u32,
 ) -> Result<u64, AgcSubmissionError> {
-    if graphics.indirect_args_address == 0 {
+    if graphics.graphics_indirect_args_address == 0 {
         return Err(AgcSubmissionError::MissingGraphicsIndirectBase);
     }
     graphics
-        .indirect_args_address
+        .graphics_indirect_args_address
         .checked_add(u64::from(data_offset))
         .ok_or(AgcSubmissionError::IndirectDrawAddressOverflow)
 }
