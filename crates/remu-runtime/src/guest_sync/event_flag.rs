@@ -9,8 +9,8 @@ use crate::{
     SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INTERRUPTED, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
     SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TIMED_OUT,
     current_guest_thread_handle, current_guest_thread_name, guest_exception_is_pending, low_u32,
-    read_guest_cstring, read_guest_u32, sce_kernel_error, trace_guest_sync, write_guest_u32,
-    write_guest_u64,
+    read_guest_cstring, read_guest_u32, sce_kernel_error, stall_report_interval, trace_guest_sync,
+    write_guest_u32, write_guest_u64,
 };
 
 use super::{EVENT_FLAG_SET_SEQUENCE, EVENT_FLAG_WAIT_SEQUENCE, GuestEventFlagState, guest_sync};
@@ -239,6 +239,7 @@ pub(crate) fn guest_event_flag_wait(arguments: [u64; 6]) -> u64 {
         return 0;
     }
     flag.waiters = flag.waiters.saturating_add(1);
+    let mut stall_reported = false;
     loop {
         let Some(flag) = state.event_flags.get_mut(&handle) else {
             return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
@@ -286,6 +287,27 @@ pub(crate) fn guest_event_flag_wait(arguments: [u64; 6]) -> u64 {
             state = next_state;
             if wait_result.timed_out() {
                 continue;
+            }
+        } else if let Some(report_after) = stall_report_interval() {
+            let (next_state, wait_result) = sync
+                .1
+                .wait_timeout(state, report_after)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if wait_result.timed_out() && !stall_reported {
+                let Some(flag) = state.event_flags.get(&handle) else {
+                    return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+                };
+                stall_reported = true;
+                eprintln!(
+                    "[REMu][STALL] event flag wait exceeded {}s thread={:?} handle={guest_thread:#x} event_flag={handle} name={:?} pattern={pattern:#x} mode={wait_mode:#x} bits={:#x} waiters={} cancellation_generation={}",
+                    report_after.as_secs(),
+                    current_guest_thread_name(),
+                    flag.name,
+                    flag.bits,
+                    flag.waiters,
+                    flag.cancellation_generation,
+                );
             }
         } else {
             state = sync
