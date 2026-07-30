@@ -15,9 +15,9 @@ use super::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
     snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
-    snapshot_watched_sampled_texture_raw, texture_element_layout, trace_resident_texture_removal,
-    watch_guest_texture, watch_resident_texture, watch_sampled_texture,
-    write_resident_texture_contents_to_guest,
+    snapshot_watched_sampled_texture_raw, texture_element_layout, trace_residency_churn,
+    trace_resident_texture_removal, watch_guest_texture, watch_resident_texture,
+    watch_sampled_texture, write_resident_texture_contents_to_guest,
 };
 use metal::{
     Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
@@ -26,8 +26,6 @@ use metal::{
 use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Read-only attribution for persistent Metal render/storage targets.
@@ -1078,45 +1076,6 @@ impl MetalPresenter {
             activity.note_read(activity_stamp);
         }
     }
-}
-
-fn trace_residency_churn(
-    descriptor: GuestTextureDescriptor,
-    upload_guest_contents: bool,
-    aliases: impl Iterator<Item = (GuestTextureDescriptor, bool, u64)>,
-) {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_TEXTURE_RESIDENCY").is_some()) {
-        return;
-    }
-    static COUNT: AtomicUsize = AtomicUsize::new(0);
-    if COUNT.fetch_add(1, Ordering::Relaxed) >= 512 {
-        return;
-    }
-    let aliases = aliases
-        .map(|(alias, gpu_written, version)| {
-            format!(
-                "{:#x}/{}x{}/p{}/{:?}/tile{}/gpu{gpu_written}/v{version}",
-                alias.address,
-                alias.width,
-                alias.height,
-                alias.pitch,
-                alias.pixel_format,
-                alias.tile_mode,
-            )
-        })
-        .collect::<Vec<_>>();
-    eprintln!(
-        "[REMu][METAL][RESIDENCY-CHURN] target={:#x}/{}x{}/p{}/{:?}/tile{} upload={} aliases=[{}]",
-        descriptor.address,
-        descriptor.width,
-        descriptor.height,
-        descriptor.pitch,
-        descriptor.pixel_format,
-        descriptor.tile_mode,
-        upload_guest_contents,
-        aliases.join(", "),
-    );
 }
 
 pub(crate) fn ensure_resident_texture_in_map(

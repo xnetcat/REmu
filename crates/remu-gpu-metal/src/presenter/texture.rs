@@ -33,6 +33,7 @@ use super::{
 #[cfg(test)]
 use remu_memory::guest_shared_mapping_identity;
 use remu_memory::{CpuWriteWatchRetirement, read_guest_shared_backing, write_guest_shared_backing};
+mod correlation;
 mod depth_array;
 mod lifetime;
 mod mips;
@@ -41,6 +42,10 @@ mod retire;
 mod sampled;
 mod upload;
 mod watch;
+pub(crate) use self::correlation::{
+    texture_alias_trace_match, trace_alias_correlated_acquire,
+    trace_alias_correlated_image_bindings, trace_residency_churn,
+};
 pub(crate) use self::depth_array::resident_is_depth_array_face;
 #[cfg(test)]
 pub(crate) use self::depth_array::{depth_array_face_descriptor, depth_array_face_set_is_complete};

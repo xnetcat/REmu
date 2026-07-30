@@ -14,7 +14,7 @@ use super::{
     guest_texture_byte_count, guest_texture_descriptors_overlap, mode5_mip_chain_layout,
     mode27_mip_chain_layout, record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
-    trace_resident_texture_removal,
+    texture_alias_trace_match, trace_alias_correlated_acquire, trace_resident_texture_removal,
 };
 use metal::MTLTextureUsage;
 use remu_gpu::GpuMemoryAcquire;
@@ -68,6 +68,57 @@ impl MetalPresenter {
             if !acquire.overlaps(address, byte_count) {
                 continue;
             }
+            let alias_trace = texture_alias_trace_match(descriptor);
+            let alias_trace_state = alias_trace.as_ref().map(|_| {
+                let resident = self
+                    .resident_guest_textures
+                    .get(&descriptor)
+                    .expect("collected resident texture exists");
+                (
+                    resident.gpu_written,
+                    resident.write_watch.is_dirty(),
+                    resident.write_watch.precise_tracking(),
+                    resident.write_watch.dirty_page_ranges(),
+                    resident.write_watch.generations(),
+                    resident.gpu_write_watch_generations.clone(),
+                )
+            });
+            let trace_acquire = |resident: &ResidentGuestTexture,
+                                 refresh: WriteWatchRefresh,
+                                 after_owner: &str,
+                                 content_changed: Option<bool>,
+                                 outcome: &str| {
+                let (
+                    Some(trace),
+                    Some((
+                        before_gpu_owned,
+                        dirty,
+                        precise,
+                        dirty_pages,
+                        watch_generations_before,
+                        gpu_write_generations_before,
+                    )),
+                ) = (alias_trace.as_ref(), alias_trace_state.as_ref())
+                else {
+                    return;
+                };
+                trace_alias_correlated_acquire(
+                    trace,
+                    acquire,
+                    *before_gpu_owned,
+                    after_owner,
+                    refresh,
+                    *dirty,
+                    *precise,
+                    dirty_pages,
+                    watch_generations_before,
+                    &resident.write_watch.generations(),
+                    gpu_write_generations_before,
+                    &resident.gpu_write_watch_generations,
+                    content_changed,
+                    outcome,
+                );
+            };
             let refresh = refresh_resident_texture_write_watch(
                 self.resident_guest_textures
                     .get_mut(&descriptor)
@@ -75,25 +126,59 @@ impl MetalPresenter {
             )?;
             match refresh {
                 WriteWatchRefresh::Replaced => {
+                    if let Some(resident) = self.resident_guest_textures.get(&descriptor) {
+                        trace_acquire(
+                            resident,
+                            refresh,
+                            "removed",
+                            None,
+                            "removed-mapping-replaced",
+                        );
+                    }
                     if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
                         trace_resident_texture_removal("acquire-mapping-replaced", &resident);
                     }
                     continue;
                 }
-                WriteWatchRefresh::Reprotecting => continue,
+                WriteWatchRefresh::Reprotecting => {
+                    let resident = self
+                        .resident_guest_textures
+                        .get(&descriptor)
+                        .expect("reprotecting resident texture exists");
+                    trace_acquire(
+                        resident,
+                        refresh,
+                        if resident.gpu_written { "gpu" } else { "cpu" },
+                        None,
+                        "retained-reprotecting",
+                    );
+                    continue;
+                }
                 WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {}
             }
             let resident = self
                 .resident_guest_textures
                 .get_mut(&descriptor)
                 .expect("overlapping resident survived write-watch refresh");
-            if !resident.write_watch.content_has_changed()? {
+            let content_changed = resident.write_watch.content_has_changed()?;
+            if !content_changed {
                 if resident.gpu_written {
                     // A permission-only renewal resets watch generations. Once sparse content
                     // validation proves that guest bytes did not change, move the GPU ownership
                     // boundary into the new generation domain instead of retiring it later.
                     resident.note_gpu_write();
                 }
+                trace_acquire(
+                    resident,
+                    refresh,
+                    if resident.gpu_written { "gpu" } else { "cpu" },
+                    Some(false),
+                    if resident.gpu_written {
+                        "retained-gpu"
+                    } else {
+                        "retained-cpu"
+                    },
+                );
                 continue;
             }
             // When the CPU is already authoritative for the complete resident, an acquire only
@@ -104,6 +189,13 @@ impl MetalPresenter {
             // clean bytes may still exist only in Metal and must be merged by the writeback path.
             if !resident.gpu_written {
                 invalidated_multisample_descriptors.push(descriptor);
+                trace_acquire(
+                    resident,
+                    refresh,
+                    "removed",
+                    Some(true),
+                    "removed-cpu-dirty",
+                );
                 if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
                     trace_resident_texture_removal("acquire-cpu-dirty", &resident);
                 }
@@ -163,6 +255,7 @@ impl MetalPresenter {
             resident.texture = texture;
             resident.component_reorder_view = None;
             resident.gpu_written = false;
+            trace_acquire(resident, refresh, "cpu", Some(true), "gpu-to-cpu-reloaded");
             invalidated_multisample_descriptors.push(resident.descriptor);
         }
         self.multisample_textures.retain(|key, _| {

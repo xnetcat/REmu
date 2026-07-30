@@ -22,7 +22,8 @@ use super::{
     sampled_texture_key, sampled_texture_uses_exact_mode5_mips,
     sampled_texture_uses_exact_mode27_mips, sampler_uses_normalized_coordinates,
     snapshot_watched_sampled_texture_raw, storage_image_requires_mip_hierarchy,
-    texture_element_layout, trace_resident_texture_removal, trace_target_sampling,
+    texture_element_layout, trace_alias_correlated_image_bindings, trace_resident_texture_removal,
+    trace_target_sampling,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
@@ -111,6 +112,7 @@ pub(crate) fn comparison_depth32_upload(
 }
 
 pub(crate) fn upload_image_textures(
+    trace_stage: &'static str,
     device: &Device,
     queue: &metal::CommandQueue,
     evaluation: &ShaderEvaluation,
@@ -123,6 +125,7 @@ pub(crate) fn upload_image_textures(
     next_sampled_texture_use: &mut u64,
     activity_stamp: ResidentTextureActivityStamp,
 ) -> Result<Vec<UploadedImageTexture>, String> {
+    trace_alias_correlated_image_bindings(trace_stage, evaluation, activity_stamp);
     canonical_texture_bindings(evaluation)
         .into_iter()
         .map(|binding| {

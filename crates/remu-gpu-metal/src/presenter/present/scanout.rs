@@ -12,6 +12,7 @@ use super::{
     snapshot_guest_texture_raw, trace_resident_texture_removal, trace_scanout_writes,
     write_resident_texture_contents_to_guest,
 };
+use crate::presenter::completion::command_buffer_failure_message;
 use metal::{
     MTLCommandBufferStatus, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode,
     MTLTextureType, MTLTextureUsage, Texture, TextureDescriptor,
@@ -155,7 +156,13 @@ impl MetalPresenter {
                         .pending_presentations
                         .pop_front()
                         .expect("front presentation exists");
-                    eprintln!("[REMu][METAL] presentation command buffer failed");
+                    eprintln!(
+                        "[REMu][METAL] {}",
+                        command_buffer_failure_message(
+                            "presentation command buffer",
+                            &presentation.command_buffer,
+                        )
+                    );
                     // A terminal presentation failure cannot be retried in place. Complete the
                     // flip after reporting it so the guest does not deadlock on an unavailable
                     // drawable while later frames may still recover.

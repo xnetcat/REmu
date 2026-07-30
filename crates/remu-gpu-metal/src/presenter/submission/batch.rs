@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::{
-    COMMAND_BUFFER_SETTLE_TIMEOUT, settle_timeout_message, wait_until_settled_within,
+    COMMAND_BUFFER_SETTLE_TIMEOUT, command_buffer_failure_message, settle_timeout_message,
+    wait_until_settled_within,
 };
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
@@ -72,10 +73,12 @@ impl MetalPresenter {
                         .committed_guest_batches
                         .pop_front()
                         .expect("front batch exists");
-                    let execution_error = format!(
-                        "Metal guest command batch [{}] ended in {:?}",
-                        describe_guest_batch(&batch.work),
-                        batch.command_buffer.status()
+                    let execution_error = command_buffer_failure_message(
+                        &format!(
+                            "Metal guest command batch [{}]",
+                            describe_guest_batch(&batch.work)
+                        ),
+                        &batch.command_buffer,
                     );
                     let result = self.finish_terminal_guest_batch(&batch, Some(execution_error));
                     self.statistics.gpu_execution_time +=
@@ -262,7 +265,10 @@ fn settle_guest_batch_by(batch: &GuestCommandBatch, deadline: Instant) -> GuestB
     if status == MTLCommandBufferStatus::Completed {
         GuestBatchSettlement::Completed
     } else {
-        GuestBatchSettlement::Failed(format!("{operation} ended in {status:?}"))
+        GuestBatchSettlement::Failed(command_buffer_failure_message(
+            &operation,
+            &batch.command_buffer,
+        ))
     }
 }
 
