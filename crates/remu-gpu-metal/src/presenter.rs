@@ -1055,6 +1055,7 @@ struct MetalPresenter {
     /// instead of being silently dropped after one log line.
     dropped_draw_executions: HashMap<(u64, u64), u64>,
     compiled_compute_pipelines: HashMap<ComputePipelineKey, CompiledComputePipeline>,
+    rectangle_indirect_pipeline: Option<ComputePipelineState>,
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
     /// Compute dispatches whose execution failed, keyed by shader address; same contract as
@@ -1210,6 +1211,7 @@ impl MetalPresenter {
             failed_draw_execution: HashSet::new(),
             dropped_draw_executions: HashMap::new(),
             compiled_compute_pipelines: HashMap::new(),
+            rectangle_indirect_pipeline: None,
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),
             dropped_compute_executions: HashMap::new(),
