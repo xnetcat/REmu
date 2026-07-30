@@ -70,6 +70,25 @@ TASKGRAPH_BREAKPOINT_ADDRESSES = frozenset(
     for phase_breakpoints in BREAKPOINTS.values()
     for address in phase_breakpoints.values()
 )
+# Rosetta occasionally reports a hardware code breakpoint as a trace stop at the
+# instruction immediately after the watched instruction rather than as an LLDB
+# breakpoint stop at the watched address. These fallthrough addresses are fixed
+# instruction-boundary facts for the PPSA10112 code above. They are accepted only
+# by the batch-mode resume filter; correlation callbacks still require the exact
+# breakpoint address.
+TASKGRAPH_TRACE_FALLTHROUGH_ADDRESSES = frozenset(
+    {
+        0x801BE1AFB,  # DISPATCH call completed
+        0x8011C6F21,  # PUBLISH entry push completed
+        0x8011C6C62,  # PUBLISH_RETURN mov completed
+        0x8011C6C74,  # WAKE call completed
+        0x8011C6B5F,  # POP_LOCAL test completed
+        0x8011C6E9B,  # POP_WAIT test completed
+        0x8011C6EEF,  # POP_DRAIN test completed
+        0x8011CD3F1,  # EXECUTE entry push completed
+        0x8011CD41D,  # COMPLETE lea completed
+    }
+)
 
 # These are instruction-boundary facts from the materialized PPSA10112 SELF,
 # decoded by REmu's non-executing ``disassemble`` command:
@@ -122,6 +141,15 @@ def is_taskgraph_breakpoint_address(address: int) -> bool:
     return address in TASKGRAPH_BREAKPOINT_ADDRESSES
 
 
+def is_taskgraph_diagnostic_stop_address(address: int) -> bool:
+    """Accept exact breakpoints and Rosetta's post-instruction trace stops."""
+
+    return (
+        address in TASKGRAPH_BREAKPOINT_ADDRESSES
+        or address in TASKGRAPH_TRACE_FALLTHROUGH_ADDRESSES
+    )
+
+
 def _register(registers: Mapping[str, int], name: str) -> int:
     return registers.get(name, 0) & ((1 << 64) - 1)
 
@@ -166,14 +194,36 @@ class TaskGraphTraceState:
             if self.task == 0:
                 return {DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH]}
             if self.publisher_entry_rsp == 0:
-                return {PUBLISH: BREAKPOINTS[PHASE_PUBLISH][PUBLISH]}
+                return {
+                    DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                    PUBLISH: BREAKPOINTS[PHASE_PUBLISH][PUBLISH],
+                }
             if self.publisher_return_rsp == 0:
                 return {
+                    DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
                     PUBLISH_RETURN: BREAKPOINTS[PHASE_PUBLISH][PUBLISH_RETURN]
                 }
-            return {WAKE: BREAKPOINTS[PHASE_PUBLISH][WAKE]}
+            return {
+                DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                WAKE: BREAKPOINTS[PHASE_PUBLISH][WAKE],
+            }
         if self.phase == PHASE_CONSUME and self.pop_site:
-            return {EXECUTE: BREAKPOINTS[PHASE_CONSUME][EXECUTE]}
+            return {
+                DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                EXECUTE: BREAKPOINTS[PHASE_CONSUME][EXECUTE],
+            }
+        if self.phase == PHASE_CONSUME:
+            return {
+                DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                POP_LOCAL: BREAKPOINTS[PHASE_CONSUME][POP_LOCAL],
+                POP_WAIT: BREAKPOINTS[PHASE_CONSUME][POP_WAIT],
+                POP_DRAIN: BREAKPOINTS[PHASE_CONSUME][POP_DRAIN],
+            }
+        if self.phase == PHASE_COMPLETE:
+            return {
+                DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                COMPLETE: BREAKPOINTS[PHASE_COMPLETE][COMPLETE],
+            }
         return BREAKPOINTS[self.phase]
 
     def _finish(self, reason: str) -> TraceResult:
@@ -211,13 +261,30 @@ class TaskGraphTraceState:
         if label not in self.active_breakpoints():
             return TraceResult(False)
 
+        superseded = None
+        if label == DISPATCH and self.task != 0:
+            superseded = (
+                f"superseded task={self.task:#x} event={self.completion_event:#x} "
+                f"phase={self.phase} published={self.queue != 0} "
+                f"wake={self.wake_event:#x} pop={self.pop_site or 'not-observed'}"
+            )
+            self.phase = PHASE_PUBLISH
+            self._reset_cycle()
+
         if self.phase == PHASE_PUBLISH:
-            return self._observe_publish(label, registers, thread_id, read_u64)
-        if self.phase == PHASE_CONSUME:
-            return self._observe_consume(label, registers)
-        if self.phase == PHASE_COMPLETE:
-            return self._observe_complete(label, registers, read_u64)
-        return TraceResult(False)
+            result = self._observe_publish(label, registers, thread_id, read_u64)
+        elif self.phase == PHASE_CONSUME:
+            result = self._observe_consume(label, registers)
+        elif self.phase == PHASE_COMPLETE:
+            result = self._observe_complete(label, registers, read_u64)
+        else:
+            result = TraceResult(False)
+        if superseded is not None and result.accepted:
+            message = superseded
+            if result.message is not None:
+                message += f" next=({result.message})"
+            return TraceResult(True, message)
+        return result
 
     def _observe_publish(
         self,
@@ -582,6 +649,12 @@ def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
                 if is_taskgraph_breakpoint_address(address):
                     diagnostic_stop = True
                     stop_kind = f"taskgraph-{address:#x}"
+                    break
+            if reason == lldb.eStopReasonTrace:
+                address = frame.GetPCAddress().GetLoadAddress(target)
+                if is_taskgraph_diagnostic_stop_address(address):
+                    diagnostic_stop = True
+                    stop_kind = f"taskgraph-trace-{address:#x}"
                     break
         if not diagnostic_stop:
             break
