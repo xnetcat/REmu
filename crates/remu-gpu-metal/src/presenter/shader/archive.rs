@@ -28,9 +28,26 @@ pub(crate) const METAL_RENDER_PIPELINE_ARCHIVE_FORMAT: &[u8] = b"remu-metal-rend
 
 pub(crate) const SLOW_PIPELINE_ARCHIVE_ADMISSION: Duration = Duration::from_millis(100);
 
+/// Persist enough cold-start progress to make a bounded follow-up run useful.
+///
+/// The runtime's diagnostic watchdog deliberately uses `_exit` as its final backstop, so it
+/// cannot rely on presenter teardown to serialize a newly-created archive. Keep this high enough
+/// to avoid rewriting a growing Unreal archive during the first splash shaders, but below the
+/// number of variants a typical title compiles before its first scene transition.
+pub(crate) const NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS: usize = 64;
+
 pub(crate) const LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS: usize = 2;
 
 impl RenderPipelineArchiveState {
+    fn record_addition_and_take_checkpoint(&mut self, threshold: usize) -> bool {
+        self.additions = self.additions.saturating_add(1);
+        if self.checkpoint_serialized || self.additions < threshold {
+            return false;
+        }
+        self.checkpoint_serialized = true;
+        true
+    }
+
     fn quarantine_once(&mut self) -> bool {
         if self.quarantined {
             return false;
@@ -147,15 +164,9 @@ impl PersistentRenderPipelineArchive {
                                 .state
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            state.additions = state.additions.saturating_add(1);
-                            if !state.checkpoint_serialized
-                                && state.additions >= LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS
-                            {
-                                state.checkpoint_serialized = true;
-                                true
-                            } else {
-                                false
-                            }
+                            state.record_addition_and_take_checkpoint(
+                                LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS,
+                            )
                         };
                         if should_serialize
                             && let Err(error) = self.serialize_or_quarantine_locked()
@@ -195,13 +206,7 @@ impl PersistentRenderPipelineArchive {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.additions = state.additions.saturating_add(1);
-                if !state.checkpoint_serialized && state.additions >= 256 {
-                    state.checkpoint_serialized = true;
-                    true
-                } else {
-                    false
-                }
+                state.record_addition_and_take_checkpoint(NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
             };
             let pipeline = device
                 .new_render_pipeline_state(&descriptor)
@@ -456,6 +461,7 @@ pub(crate) fn metal_render_pipeline_archive_path(device: &Device) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
+        LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS, NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS,
         RenderPipelineArchiveState, archive_serialization_failure_indicates_poison,
         pipeline_archive_quarantine_path, quarantine_pipeline_archive,
     };
@@ -506,6 +512,43 @@ mod tests {
         assert!(state.quarantine_once());
         assert!(!state.quarantine_once());
         assert!(state.quarantined);
+    }
+
+    #[test]
+    fn new_archive_checkpoints_once_after_bounded_cold_start_progress() {
+        let mut state = RenderPipelineArchiveState::default();
+        for _ in 1..NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS {
+            assert!(
+                !state
+                    .record_addition_and_take_checkpoint(NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
+            );
+        }
+        assert!(
+            state.record_addition_and_take_checkpoint(NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
+        );
+        assert!(
+            !state.record_addition_and_take_checkpoint(NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
+        );
+        assert_eq!(
+            state.additions,
+            NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS + 1
+        );
+    }
+
+    #[test]
+    fn loaded_archive_keeps_its_early_scene_variant_checkpoint() {
+        let mut state = RenderPipelineArchiveState::default();
+        assert!(
+            !state
+                .record_addition_and_take_checkpoint(LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
+        );
+        assert!(
+            state.record_addition_and_take_checkpoint(LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
+        );
+        assert!(
+            !state
+                .record_addition_and_take_checkpoint(LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
+        );
     }
 
     #[test]
