@@ -1696,6 +1696,8 @@ struct GuestImportTraceRecord {
     name: String,
     active: AtomicBool,
     phase: AtomicU8,
+    /// Most recently observed dispatcher state. Direct-linked imports do not update these fields,
+    /// so a record in the guest phase must never present them as the currently executing import.
     dispatch_index: AtomicU64,
     guest_return_address: AtomicU64,
     guest_rsp: AtomicU64,
@@ -1861,7 +1863,7 @@ fn start_guest_import_trace_reporter() {
                             record.phase.load(Ordering::Acquire),
                         );
                         eprintln!(
-                            "[REMu][THREAD][STALE] thread={:#x} name={:?} age_ms={} phase={} nid={} import={} return={:#x} rsp={:#x} calls={} transition={transition_sequence}",
+                            "[REMu][THREAD][STALE] thread={:#x} name={:?} age_ms={} phase={} last_nid={} last_import={} last_return={:#x} last_rsp={:#x} calls={} transition={transition_sequence}",
                             record.thread,
                             record.name,
                             age_nanos / 1_000_000,

@@ -46,7 +46,8 @@ use self::event_flag::{
 use self::semaphore::{guest_semaphore_create, guest_semaphore_delete, guest_semaphore_signal};
 use self::state::{
     EVENT_FLAG_SET_SEQUENCE, EVENT_FLAG_WAIT_SEQUENCE, GuestMutexEntry, GuestMutexState,
-    GuestRwlockState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard, guest_mutex_shards,
+    GuestRwlockReaderState, GuestRwlockState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard,
+    guest_mutex_shards,
 };
 
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
