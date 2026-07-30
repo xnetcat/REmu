@@ -121,8 +121,8 @@ use self::readback::{
 use self::sampler::sampler_lod_bias;
 use self::sampler::{
     SAMPLER_ARGUMENT_CACHE_CAPACITY, canonical_sampler_bindings, canonical_texture_bindings,
-    create_global_argument_buffer, create_sampler_argument_buffer, guest_global_buffer_view,
-    metal_buffer_with_bytes, sampled_image_bindings, sampler_uses_normalized_coordinates,
+    create_global_argument_buffer, create_sampler_argument_buffer, metal_buffer_with_bytes,
+    sampled_image_bindings, sampler_uses_normalized_coordinates,
 };
 use self::shader::{
     SHADER_COMPILE_QUEUE_CAPACITY, compile_metal_compute_library, compile_metal_library_with_tools,
@@ -1617,7 +1617,7 @@ struct MetalPresenter {
     depth_stencil_cache: HashMap<(u64, bool), DepthStencilState>,
     global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
     transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
-    guest_global_buffer_cache: HashMap<(u64, usize, GuestSharedMappingIdentity), Buffer>,
+    guest_global_buffer_cache: HashMap<(GuestSharedMappingIdentity, usize), Buffer>,
     guest_global_buffer_cache_bytes: u64,
     global_buffer_cache_bytes: usize,
     index_buffer_cache: HashMap<Vec<u32>, Buffer>,

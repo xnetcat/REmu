@@ -13,12 +13,13 @@ use remu_gpu::{
 };
 use remu_memory::{
     CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
-    GuestProtection,
+    GuestProtection, guest_shared_backing_range,
 };
 use remu_shader::{GlobalMemoryBinding, Program};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::{
     ComputePipelineKey, GLOBAL_UPLOAD_ALIGNMENT, GraphicsDiagnosticPipelineState,
     GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason, GuestCommandBatch,
@@ -456,6 +457,147 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
     ));
     assert_eq!(indexed_draw.offset, 48);
     assert!(!indexed_draw.guest_memory);
+}
+
+#[test]
+fn disjoint_guest_aliases_share_one_coherent_physical_global_buffer() {
+    let mut address_space = GuestAddressSpace::new(10 * GUEST_PAGE_SIZE).unwrap();
+    let base = address_space.base();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let first = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("first disjoint alias");
+    let second = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(
+                base.checked_add(4 * GUEST_PAGE_SIZE)
+                    .expect("second alias address"),
+            ),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .expect("second disjoint alias");
+    let contiguous = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(
+                base.checked_add(7 * GUEST_PAGE_SIZE)
+                    .expect("contiguous alias address"),
+            ),
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("contiguous alias of the same physical range");
+
+    let interior_offset = 128_u64;
+    // SAFETY: the aliases stay live and writable throughout this test.
+    unsafe {
+        ((first.get() + interior_offset) as *mut u8).write(0x11);
+        ((second.get() + interior_offset) as *mut u8).write(0x22);
+    }
+    let requested_bytes =
+        usize::try_from(2 * GUEST_PAGE_SIZE - 2 * interior_offset).expect("request fits usize");
+    let requested_bytes_u64 = u64::try_from(requested_bytes).expect("request fits u64");
+    let disjoint_range =
+        guest_shared_backing_range(first.get() + interior_offset, requested_bytes_u64)
+            .expect("disjoint physical range resolves");
+    let contiguous_range =
+        guest_shared_backing_range(contiguous.get() + interior_offset, requested_bytes_u64)
+            .expect("contiguous physical alias resolves");
+    assert_eq!(
+        disjoint_range.view_identity(),
+        contiguous_range.view_identity(),
+        "physical cache identity is independent of the selected guest alias"
+    );
+    assert_eq!(
+        disjoint_range.view_byte_count(),
+        contiguous_range.view_byte_count()
+    );
+    assert_eq!(disjoint_range.resource_offset(), interior_offset);
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let buffer = metal_buffer_with_guest_backing_range(&device, &disjoint_range)
+        .expect("create the physical no-copy Metal view");
+    drop(disjoint_range);
+    let buffer_offset = usize::try_from(interior_offset).expect("buffer offset fits usize");
+    let page_byte_count = usize::try_from(GUEST_PAGE_SIZE).expect("guest page fits usize");
+    // SAFETY: the Metal buffer contains both backing pages and owns its no-copy mmap.
+    assert_eq!(
+        unsafe { buffer.contents().cast::<u8>().add(buffer_offset).read() },
+        0x11
+    );
+    assert_eq!(
+        unsafe {
+            buffer
+                .contents()
+                .cast::<u8>()
+                .add(buffer_offset + page_byte_count)
+                .read()
+        },
+        0x22
+    );
+
+    // CPU stores through any coherent alias are immediately visible to the shared Metal view.
+    unsafe {
+        ((second.get() + interior_offset) as *mut u8).write(0x7e);
+    }
+    assert_eq!(
+        unsafe {
+            buffer
+                .contents()
+                .cast::<u8>()
+                .add(buffer_offset + page_byte_count)
+                .read()
+        },
+        0x7e
+    );
+
+    // The creator's local mmap owner has already gone out of scope; Metal's deallocator block
+    // retains the mapped storage for the Buffer's complete lifetime.
+    assert_eq!(
+        unsafe { buffer.contents().cast::<u8>().add(buffer_offset).read() },
+        0x11
+    );
+
+    let disjoint_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: first.get() + interior_offset,
+        instruction_pcs: Default::default(),
+        byte_count: requested_bytes,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: false,
+    };
+    let mut contiguous_binding = disjoint_binding.clone();
+    contiguous_binding.base_address = contiguous.get() + interior_offset;
+    let disjoint_upload = presenter
+        .upload_global_buffer(&device, &disjoint_binding)
+        .expect("disjoint aliases upload through one physical view");
+    let contiguous_upload = presenter
+        .upload_global_buffer(&device, &contiguous_binding)
+        .expect("contiguous alias reuses the physical view");
+    assert!(
+        std::ptr::eq(
+            disjoint_upload.buffer.as_ref(),
+            contiguous_upload.buffer.as_ref()
+        ),
+        "physically identical aliases must hit the same cached Metal resource"
+    );
+    assert_eq!(disjoint_upload.offset, contiguous_upload.offset);
 }
 
 #[test]

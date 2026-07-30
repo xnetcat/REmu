@@ -1088,6 +1088,88 @@ fn committed_range_watch_observes_stores_through_alias_segments() {
     );
 }
 
+#[test]
+fn shared_backing_view_is_coherent_across_disjoint_aliases_and_remaps() {
+    let mut memory = GuestAddressSpace::new(10 * GUEST_PAGE_SIZE).unwrap();
+    let base = memory.base();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let first = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let second = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(page(base, 4)),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+    let interior_offset = 128_u64;
+    let requested_bytes = 2 * GUEST_PAGE_SIZE - 2 * interior_offset;
+    let range = guest_shared_backing_range(first.get() + interior_offset, requested_bytes)
+        .expect("the physical range resolves through disjoint CPU aliases");
+    let two_pages = usize::try_from(2 * GUEST_PAGE_SIZE).expect("two pages fit usize");
+    assert_eq!(range.view_identity().backing_id, backing.id());
+    assert_eq!(range.view_identity().backing_offset, 0);
+    assert_eq!(range.resource_offset(), interior_offset);
+    assert_eq!(range.view_byte_count(), two_pages);
+
+    let view = range.map_view().expect("map the complete physical view");
+    assert_eq!(view.byte_count(), two_pages);
+    let second_physical_byte = usize::try_from(range.resource_offset() + GUEST_PAGE_SIZE).unwrap();
+    // SAFETY: the mapped view owns two complete backing pages and the selected byte is interior.
+    unsafe {
+        view.as_ptr()
+            .cast_mut()
+            .cast::<u8>()
+            .add(second_physical_byte)
+            .write(0x5a);
+    }
+    // SAFETY: `second` remains a live writable alias of backing page one.
+    assert_eq!(
+        unsafe { ((second.get() + interior_offset) as *const u8).read() },
+        0x5a
+    );
+
+    memory.unmap(first, GUEST_PAGE_SIZE).unwrap();
+    memory.unmap(second, GUEST_PAGE_SIZE).unwrap();
+    // In-flight users retain the physical mmap independently of retired guest aliases.
+    assert_eq!(
+        unsafe { view.as_ptr().cast::<u8>().add(second_physical_byte).read() },
+        0x5a
+    );
+
+    let replacement = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(first),
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement,
+            0,
+        )
+        .unwrap();
+    let replacement_range =
+        guest_shared_backing_range(first.get() + interior_offset, requested_bytes)
+            .expect("replacement range resolves");
+    assert_ne!(
+        replacement_range.view_identity().backing_id,
+        range.view_identity().backing_id,
+        "a VA remap cannot hit the retired physical-view identity"
+    );
+}
+
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn dropping_address_space_releases_exact_range_for_reuse() {

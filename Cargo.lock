@@ -1482,6 +1482,7 @@ dependencies = [
 name = "remu-gpu-metal"
 version = "0.1.0"
 dependencies = [
+ "block",
  "core-graphics-types 0.2.0",
  "libc",
  "metal",
