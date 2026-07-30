@@ -8,6 +8,7 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
     echo "  hardware code breakpoints. Guest executable bytes are never modified." >&2
     echo "  Defaults: timeout=120, cycles=16, hit-limit=4096." >&2
     echo "  Set REMU_TASKGRAPH_TRACE_PREPARE_ONLY=1 for one persistent breakpoint." >&2
+    echo "  Set REMU_TASKGRAPH_TRACE_TARGET_FOLLOW=1 for caller-filtered stages." >&2
     exit 64
 fi
 
@@ -104,6 +105,14 @@ else
 fi
 
 auto_cross=${REMU_AUTO_CROSS:-}
+target_follow=${REMU_TASKGRAPH_TRACE_TARGET_FOLLOW:-0}
+case "$target_follow" in
+    0 | 1) ;;
+    *)
+        echo "error: REMU_TASKGRAPH_TRACE_TARGET_FOLLOW must be 0 or 1" >&2
+        exit 64
+        ;;
+esac
 prepare_only=${REMU_TASKGRAPH_TRACE_PREPARE_ONLY:-0}
 case "$prepare_only" in
     0 | 1) ;;
@@ -112,6 +121,11 @@ case "$prepare_only" in
         exit 64
         ;;
 esac
+if [ "$target_follow" = 1 ]; then
+    prepare_only=1
+fi
+target_caller=${REMU_TASKGRAPH_TRACE_TARGET_CALLER:-0x801be0507}
+target_parent=${REMU_TASKGRAPH_TRACE_TARGET_PARENT:-0x80101af94}
 disable_cpu_write_watch=${REMU_DISABLE_CPU_WRITE_WATCH:-0}
 if [ "$prepare_only" = 1 ]; then
     # macOS debugserver intercepts deliberate CPU write-watch faults before
@@ -134,6 +148,7 @@ started_at=$(date +%s)
 echo "[REMu] launching bounded TaskGraph LLDB trace; artifacts: $run_dir"
 echo "[REMu] timeout=${timeout_seconds}s cycles=$cycle_limit hit-limit=$hit_limit"
 echo "[REMu] prepare-only=$prepare_only cpu-write-watch-disabled=$disable_cpu_write_watch"
+echo "[REMu] target-follow=$target_follow caller=$target_caller parent=$target_parent"
 set +e
 (
     cd "$launch_working_directory"
@@ -145,6 +160,9 @@ set +e
             REMU_TASKGRAPH_TRACE_CYCLES="$cycle_limit" \
             REMU_TASKGRAPH_TRACE_HITS="$hit_limit" \
             REMU_TASKGRAPH_TRACE_PREPARE_ONLY="$prepare_only" \
+            REMU_TASKGRAPH_TRACE_TARGET_FOLLOW="$target_follow" \
+            REMU_TASKGRAPH_TRACE_TARGET_CALLER="$target_caller" \
+            REMU_TASKGRAPH_TRACE_TARGET_PARENT="$target_parent" \
             REMU_DISABLE_CPU_WRITE_WATCH="$disable_cpu_write_watch" \
             arch -x86_64 /usr/bin/lldb --no-lldbinit -b \
             -o 'process handle SIGALRM -n false -p true -s false' \
@@ -171,7 +189,7 @@ trace_terminal=$(grep '\[REMu\]\[LLDB\]\[TASKGRAPH\].*done reason=' \
     "$run_dir/debugger.log" | tail -n 1 || true)
 trace_last=$(grep '\[REMu\]\[LLDB\]\[TASKGRAPH\]' \
     "$run_dir/debugger.log" | tail -n 1 || true)
-trace_phase=$(grep '\[REMu\]\[LLDB\]\[TASKGRAPH\] armed phase=' \
+trace_phase=$(grep -E '\[REMu\]\[LLDB\]\[TASKGRAPH\] (armed phase=|persistent breakpoints=)' \
     "$run_dir/debugger.log" | tail -n 1 || true)
 if [ -n "$debugger_fault" ]; then
     outcome=debugger-rosetta-fault
@@ -194,6 +212,9 @@ finished_at=$(date +%s)
     echo "cycle_limit=$cycle_limit"
     echo "hit_limit=$hit_limit"
     echo "prepare_only=$prepare_only"
+    echo "target_follow=$target_follow"
+    echo "target_caller=$target_caller"
+    echo "target_parent=$target_parent"
     echo "cpu_write_watch_disabled=$disable_cpu_write_watch"
     echo "elapsed_seconds=$((finished_at - started_at))"
     echo "exit_status=$status"
