@@ -3,14 +3,13 @@
 
 use super::{
     CB_BLEND0_CONTROL, DB_SHADER_CONTROL, DecodedRasterState, DecodedRenderTarget,
-    DepthTargetPipelineState,
-    GraphicsPipelineKey, GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL,
-    PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState,
-    common_render_target_array_length, decode_depth_target, decode_render_targets,
-    fragmentless_pixel_evaluation, fragmentless_pixel_program,
+    DepthTargetPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
+    MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity,
+    RenderTargetPipelineState, common_render_target_array_length, decode_depth_target,
+    decode_render_targets, fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
     ngg_mesh_stage_for_draw, pixel_input_controls, procedural_rectangle_stage_for_draw,
-    program_embeds_global_base, register_value, video_target_binding_summary,
+    program_embeds_global_base, register_value,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
