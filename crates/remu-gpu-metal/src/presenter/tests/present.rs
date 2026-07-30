@@ -11,10 +11,12 @@ use remu_shader::PixelOutputKind;
 use super::{
     DecodedRenderTarget, DisplayConfiguration, GuestTextureDescriptor, MetalPresenter,
     OrderedEventSource, PendingFlip, PresentationResolution, VIDEO_OUT_DISPLAY_TILE_MODE,
-    VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, decode_scanout_target,
-    headless_metal_value_is_enabled, parse_presentation_resolution, presentation_drawable_size,
-    presentation_viewport, process_memory_statistics, process_resident_bytes,
-    raw_video_out_layout_is_linear, raw_video_out_texture_descriptor, read_texture_linear,
+    VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, appkit_persistent_state_is_ignored,
+    clear_appkit_persistent_state_override, decode_scanout_target,
+    disable_appkit_state_restoration, headless_metal_value_is_enabled,
+    parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
+    process_memory_statistics, process_resident_bytes, raw_video_out_layout_is_linear,
+    raw_video_out_texture_descriptor, read_texture_linear,
 };
 
 #[test]
@@ -54,6 +56,17 @@ fn headless_metal_is_an_explicit_opt_in() {
     assert!(headless_metal_value_is_enabled(Some(std::ffi::OsStr::new(
         "1"
     ))));
+}
+
+#[test]
+fn windowed_presenter_disables_appkit_persistent_state() {
+    clear_appkit_persistent_state_override();
+    assert!(!appkit_persistent_state_is_ignored());
+
+    disable_appkit_state_restoration();
+    assert!(appkit_persistent_state_is_ignored());
+
+    clear_appkit_persistent_state_override();
 }
 
 #[test]
