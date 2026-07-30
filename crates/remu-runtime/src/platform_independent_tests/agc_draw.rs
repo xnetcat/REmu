@@ -251,11 +251,11 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
 }
 
 #[test]
-fn executes_nonindexed_indirect_draw_from_the_graphics_set_base() {
+fn executes_nonindexed_indirect_draw_from_a_compute_typed_set_base() {
     let mut arguments = AlignedIndirectArguments([6, 3, 4, 7, 0, 0, 0, 0]);
     let arguments_address = arguments.0.as_ptr().addr() as u64;
     let set_base = [
-        agc_pm4(4, AGC_IT_SET_BASE, 0),
+        agc_pm4(4, AGC_IT_SET_BASE, 0) | (1 << 1),
         1,
         low_u32(arguments_address),
         low_u32(arguments_address >> 32),
@@ -753,7 +753,7 @@ fn preserves_zero_snapshot_indirect_compute_for_ordered_gpu_resolution() {
     let program_address = program.0.as_ptr().addr() as u64;
     let (mut graphics, mut shaders) = compute_graphics_state(program_address);
     let dimensions = AlignedIndirectArguments([0, 8, 1, 0, 0, 0, 0, 0]);
-    graphics.compute_indirect_args_address = dimensions.0.as_ptr().addr() as u64;
+    graphics.indirect_args_address = dimensions.0.as_ptr().addr() as u64;
     let packet = [agc_pm4(3, AGC_IT_DISPATCH_INDIRECT, 0), 0, 0x8041];
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
@@ -842,14 +842,14 @@ fn resolves_base_relative_and_absolute_compute_indirect_dimensions() {
     let arguments = AlignedIndirectArguments([0, 0, 7, 3, 1, 11, 5, 2]);
     let arguments_address = arguments.0.as_ptr().addr() as u64;
     let set_base = [
-        agc_pm4(4, AGC_IT_SET_BASE, 0) | (1 << 1),
+        agc_pm4(4, AGC_IT_SET_BASE, 0),
         1,
         low_u32(arguments_address),
         (arguments_address >> 32) as u32,
     ];
     agc_apply_set_base(set_base.as_ptr().addr() as u64, 4, &mut graphics)
         .expect("compute indirect base");
-    assert_eq!(graphics.compute_indirect_args_address, arguments_address);
+    assert_eq!(graphics.indirect_args_address, arguments_address);
 
     let relative = [agc_pm4(3, AGC_IT_DISPATCH_INDIRECT, 0), 8, 0x8041];
     let relative_dispatch = agc_decode_compute_dispatch(
