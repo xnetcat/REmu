@@ -79,6 +79,7 @@ pub(crate) fn link(path: &Path) -> ExitCode {
     println!("tls.thread_pointer={}", linked.tls.thread_pointer);
     println!("tls.static_block_size=0x{:x}", linked.tls.static_block_size);
     println!("tls.patched_loads={}", linked.tls.patched_loads);
+    println!("tls.patched_stores={}", linked.tls.patched_stores);
     println!("relocations.relative={}", linked.relocation_stats.relative);
     println!("relocations.absolute={}", linked.relocation_stats.absolute);
     println!(
@@ -102,12 +103,13 @@ pub(crate) fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> E
         }
     };
     eprintln!(
-        "[REMu][PROBE] entering {} at {} with {} import stubs, TLS {} ({} patched loads)",
+        "[REMu][PROBE] entering {} at {} with {} import stubs, TLS {} ({} patched loads, {} patched stores)",
         path.display(),
         linked.memory.entry_address(),
         linked.import_stubs.len(),
         linked.tls.thread_pointer,
         linked.tls.patched_loads,
+        linked.tls.patched_stores,
     );
     let image_name = module_report
         .entry_path

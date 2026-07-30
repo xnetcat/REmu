@@ -151,6 +151,7 @@ pub(super) fn map_bundled_modules<'a>(
 pub(super) fn calculate_process_auxiliary_reserve(
     main_dynamic: &DynamicInfo,
     modules: &[(&str, &LoadedExecutable)],
+    tls_store_helper_region_size: u64,
 ) -> Result<u64, LinkError> {
     let mut cursor = 0_u64;
     let mut import_count = main_dynamic.imports.len();
@@ -198,6 +199,9 @@ pub(super) fn calculate_process_auxiliary_reserve(
     cursor = align_up_u64(cursor, 16).ok_or(LinkError::AddressOverflow)?;
     cursor = cursor
         .checked_add(TLS_HELPER_REGION_SIZE)
+        .ok_or(LinkError::AddressOverflow)?;
+    cursor = cursor
+        .checked_add(tls_store_helper_region_size)
         .ok_or(LinkError::AddressOverflow)?;
     cursor = align_up_u64(cursor, MACOS_GUEST_PAGE_ALIGNMENT).ok_or(LinkError::AddressOverflow)?;
     cursor = cursor

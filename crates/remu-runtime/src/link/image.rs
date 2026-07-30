@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use crate::probe_entry;
-use crate::tls::{TlsImageInput, install_tls_support};
+use crate::tls::{TlsImageInput, install_tls_support, scan_tls_immediate_stores};
 use crate::unwind::{GuestUnwindModule, collect_unwind_fdes_at, guest_unwind_module};
 use remu_core::GuestAddress;
 use remu_loader::{LoadedExecutable, resolve_module_dependency_graph};
@@ -23,6 +23,7 @@ pub struct GuestTls {
     pub thread_pointer: GuestAddress,
     pub static_block_size: u64,
     pub patched_loads: usize,
+    pub patched_stores: usize,
 }
 
 #[derive(Debug)]
@@ -133,7 +134,14 @@ impl LinkedImage {
             .dynamic
             .as_ref()
             .ok_or(LinkError::MissingDynamicMetadata)?;
-        let auxiliary_reserve = calculate_process_auxiliary_reserve(dynamic, modules)?;
+        let tls_store_plan = scan_tls_immediate_stores(
+            std::iter::once(executable).chain(modules.iter().map(|(_, executable)| *executable)),
+        )?;
+        let auxiliary_reserve = calculate_process_auxiliary_reserve(
+            dynamic,
+            modules,
+            tls_store_plan.helper_region_size()?,
+        )?;
         let mut memory =
             GuestImage::map_main_with_auxiliary_reserve(executable, auxiliary_reserve)?;
         let linked_modules = map_bundled_modules(&mut memory, modules)?;
@@ -242,7 +250,7 @@ impl LinkedImage {
             module_id: module.tls_module_id,
         }))
         .collect::<Vec<_>>();
-        let tls = install_tls_support(&mut memory, &tls_inputs)?;
+        let tls = install_tls_support(&mut memory, &tls_inputs, &tls_store_plan)?;
         memory.finalize_permissions()?;
         Ok(Self {
             memory,
