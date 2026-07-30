@@ -33,8 +33,8 @@ pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
-    ngg_mesh_export_stage, pixel_interpolation_attribute_mask, pixel_scalars,
-    procedural_rectangle_export_stage, program_embeds_global_base, program_uses_lds,
+    ngg_mesh_draw_supported, ngg_mesh_export_stage, pixel_interpolation_attribute_mask,
+    pixel_scalars, procedural_rectangle_export_stage, program_embeds_global_base, program_uses_lds,
     rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
@@ -246,8 +246,7 @@ impl MetalPresenter {
                 );
             }
         }
-        let uses_mesh_stage =
-            draw.indexed && draw.primitive_type == 4 && ngg_mesh_export_stage(&export.program);
+        let uses_mesh_stage = key.uses_mesh_stage;
         let mut vertex_options = if uses_mesh_stage {
             remu_shader_metal::MetalCompileOptions::mesh(
                 pixel_msl.interpolated_attribute_count,

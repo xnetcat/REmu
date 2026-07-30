@@ -302,6 +302,13 @@ pub struct Instruction {
 pub struct Program {
     pub address: u64,
     pub instructions: Vec<Instruction>,
+    /// Exact guest address for instructions relocated while linking separately allocated shader
+    /// halves into one executable control-flow graph.
+    ///
+    /// Ordinary programs use `address + pc` and leave this map empty. A linked back half has a
+    /// synthetic PC range in the combined graph, but `S_GETPC_B64` must still observe its original
+    /// allocation address.
+    instruction_addresses: BTreeMap<u32, u64>,
     pixel_color_export_masks: u32,
     next_evaluation_instruction_indices: Vec<u32>,
     evaluation_live_scalar_register_indices: Vec<Vec<u8>>,
@@ -495,6 +502,7 @@ impl Program {
         Self {
             address,
             instructions,
+            instruction_addresses: BTreeMap::new(),
             pixel_color_export_masks,
             next_evaluation_instruction_indices,
             evaluation_live_scalar_register_indices,
@@ -505,6 +513,25 @@ impl Program {
             runtime_scalar_register_indices,
             input_scalar_registers,
         }
+    }
+
+    pub(crate) fn new_with_instruction_addresses(
+        address: u64,
+        instructions: Vec<Instruction>,
+        instruction_addresses: BTreeMap<u32, u64>,
+    ) -> Self {
+        let mut program = Self::new(address, instructions);
+        program.instruction_addresses = instruction_addresses;
+        program
+    }
+
+    /// Returns the architectural guest address of an instruction.
+    #[must_use]
+    pub fn instruction_address(&self, pc: u32) -> u64 {
+        self.instruction_addresses
+            .get(&pc)
+            .copied()
+            .unwrap_or_else(|| self.address.wrapping_add(u64::from(pc)))
     }
 
     #[must_use]

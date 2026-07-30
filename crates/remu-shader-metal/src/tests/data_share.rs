@@ -6,6 +6,121 @@
 
 use super::*;
 
+#[allow(clippy::too_many_lines)]
+fn linked_trace_ngg_program() -> Program {
+    let data_share = |pc, opcode, sources, destinations| Instruction {
+        pc,
+        encoding: ShaderEncoding::Ds,
+        opcode: Opcode::Known(opcode),
+        words: vec![0, 0],
+        sources,
+        destinations,
+        control: Some(InstructionControl::DataShare(DataShareControl {
+            offset0: 0,
+            offset1: 0,
+            gds: false,
+        })),
+    };
+    let export = |pc, target, sources| Instruction {
+        pc,
+        encoding: ShaderEncoding::Exp,
+        opcode: Opcode::Known("Exp"),
+        words: vec![0, 0],
+        sources,
+        destinations: Vec::new(),
+        control: Some(InstructionControl::Export(ExportControl {
+            target,
+            enable_mask: if target == 20 { 1 } else { 15 },
+            compressed: false,
+            done: true,
+            valid_mask: false,
+        })),
+    };
+    let front = Program::new(
+        0x0080_0aed_0000,
+        vec![
+            data_share(
+                0,
+                "DsWriteB32",
+                vec![Operand::vector(0), Operand::vector(1)],
+                Vec::new(),
+            ),
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SSetpcB64"),
+                words: vec![0xbe80_2006],
+                sources: vec![Operand::scalar(6)],
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let continuation = Program::new(
+        0x0080_0aee_0000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SGetpcB64"),
+                words: vec![0xbe84_1f00],
+                sources: vec![Operand::source(0, None)],
+                destinations: vec![Operand::scalar(4)],
+                control: None,
+            },
+            data_share(
+                4,
+                "DsReadB32",
+                vec![Operand::vector(0)],
+                vec![Operand::vector(2)],
+            ),
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: vec![0xbf90_0009],
+                sources: vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            export(
+                16,
+                20,
+                vec![
+                    Operand::vector(3),
+                    Operand::vector(3),
+                    Operand::vector(3),
+                    Operand::vector(3),
+                ],
+            ),
+            export(
+                24,
+                12,
+                vec![
+                    Operand::vector(4),
+                    Operand::vector(5),
+                    Operand::vector(6),
+                    Operand::vector(7),
+                ],
+            ),
+            Instruction {
+                pc: 32,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    remu_shader::link_tail_call_programs(&front, &continuation)
+        .expect("traced front and continuation link")
+}
+
 #[test]
 fn lowers_every_decoded_ds_operation_with_architectural_offsets_and_atomics() {
     let program = decoded_ds_program(0x1234, false);
@@ -69,6 +184,44 @@ fn lowers_every_decoded_ds_operation_with_architectural_offsets_and_atomics() {
 }
 
 #[test]
+fn lowers_linked_trace_geometry_handoff_as_one_ngg_mesh_function() {
+    let program = linked_trace_ngg_program();
+    assert_eq!(program.instructions[1].opcode.known_name(), Some("SBranch"));
+    assert!(
+        program
+            .instructions
+            .iter()
+            .any(|instruction| instruction.opcode.is("SSendmsg"))
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::mesh(2, 16 * 1024),
+    )
+    .expect("linked NGG mesh lowering");
+
+    assert_eq!(shader.stage, MetalShaderStage::Mesh);
+    assert!(shader.source.contains("[[mesh]] void remu_main"));
+    assert!(
+        shader
+            .source
+            .contains("threadgroup atomic_uint remu_lds_storage[4096]")
+    );
+    assert!(
+        shader
+            .source
+            .contains("threadgroup_barrier(mem_flags::mem_threadgroup)")
+    );
+    assert!(shader.source.contains("remu_mesh.set_index("));
+    assert!(shader.source.contains("remu_mesh.set_vertex("));
+    assert!(
+        shader.source.contains("0xAEE0004u"),
+        "linked S_GETPC must observe the continuation allocation"
+    );
+    assert!(shader.source.contains("0x80u"));
+}
+
+#[test]
 fn ds_rejects_unrepresentable_resources_instead_of_wrapping_or_privatizing_memory() {
     let memory_program = Program::new(
         0x1000,
@@ -106,6 +259,66 @@ fn ds_rejects_unrepresentable_resources_instead_of_wrapping_or_privatizing_memor
     )
     .expect_err("GDS needs a system-wide resource");
     assert!(gds_error.to_string().contains("system-wide"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn generated_linked_trace_ngg_msl_compiles_with_apple_metal() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn find_metal_compiler() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("REMU_METAL_COMPILER").map(PathBuf::from)
+            && path.is_file()
+        {
+            return Some(path);
+        }
+        let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.remu/toolchains/Metal.xctoolchain/usr/bin/metal");
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+        let output = Command::new("xcrun")
+            .args(["--find", "metal"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+    }
+
+    let Some(compiler) = find_metal_compiler() else {
+        eprintln!("skipping linked NGG Apple Metal compile test: no metal compiler found");
+        return;
+    };
+    let shader = compile_msl(
+        &linked_trace_ngg_program(),
+        &empty_evaluation(),
+        &MetalCompileOptions::mesh(2, 16 * 1024),
+    )
+    .expect("linked NGG mesh lowering");
+    let directory =
+        std::env::temp_dir().join(format!("remu-linked-ngg-metal-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("create linked NGG Metal test directory");
+    let source = directory.join("linked-ngg.metal");
+    let air = directory.join("linked-ngg.air");
+    std::fs::write(&source, &shader.source).expect("write linked NGG mesh MSL");
+    let output = Command::new(compiler)
+        .args(["-c", "-target", "air64-apple-macosx15.0"])
+        .arg("-fmetal-math-mode=safe")
+        .arg("-o")
+        .arg(&air)
+        .arg(&source)
+        .output()
+        .expect("run Apple Metal compiler");
+    assert!(
+        output.status.success(),
+        "linked NGG mesh MSL failed to compile:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(directory).expect("remove linked NGG Metal test directory");
 }
 
 #[test]

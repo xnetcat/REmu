@@ -9,6 +9,7 @@ mod evaluator;
 mod format;
 mod inline_constant;
 mod ir;
+mod link;
 mod metadata;
 mod state;
 
@@ -29,5 +30,6 @@ pub use ir::{
     ShaderEvaluation, ShaderMetadata, ShaderState, VertexInputBinding, Vop3Control, Vop3pControl,
     image_is_comparison,
 };
+pub use link::{ProgramLinkError, link_tail_call_programs};
 pub use metadata::{GuestMemoryReader, MetadataError, read_shader_metadata};
 pub use state::{ShaderStateError, build_shader_state};

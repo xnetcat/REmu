@@ -684,7 +684,29 @@ pub(crate) fn agc_shader_snapshot(
             }
         }
     }
-    let program = Arc::new(programs.remove(0));
+    let leading_program = programs.remove(0);
+    let executable_program = if fused_continuation.is_some() {
+        let Some(continuation_program) = programs.last() else {
+            shaders.decode_failures.insert(address);
+            eprintln!("[REMu][AGC][SHADER] fused entry={address:#x} lost its decoded continuation");
+            return None;
+        };
+        match remu_shader::link_tail_call_programs(&leading_program, continuation_program) {
+            Ok(program) => program,
+            Err(error) => {
+                shaders.decode_failures.insert(address);
+                eprintln!(
+                    "[REMu][AGC][SHADER] fused entry={address:#x} could not link its exact \
+                     continuation at {:#x}: {error}",
+                    continuation_program.address,
+                );
+                return None;
+            }
+        }
+    } else {
+        leading_program
+    };
+    let program = Arc::new(executable_program);
     let supplemental_programs: Arc<[remu_shader::Program]> = programs.into();
     // AGC's fused object is the back descriptor with only its program registers repointed at the
     // front entry point. User-data metadata and output semantics therefore belong to the back

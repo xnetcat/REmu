@@ -6,17 +6,17 @@ use remu_gpu::{GpuRegister, ShaderSnapshot, gpu_event_channel};
 use remu_shader::{
     GlobalMemoryBinding, ImageBinding, ImageControl, Instruction, InstructionControl,
     InterpolationControl, Opcode, Operand, Program, ShaderEncoding, ShaderEvaluation,
-    decode_program,
+    decode_program, link_tail_call_programs,
 };
 use std::sync::Arc;
 
 use super::{
     MetalPresenter, canonical_sampler_bindings, canonical_texture_bindings, compute_launch,
     graphics_shader_resource_key, image_component_class, missing_vertex_parameter_exports,
-    ngg_mesh_export_stage, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
-    rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
-    shader_scalar_metadata, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    ngg_mesh_draw_supported, ngg_mesh_export_stage, procedural_rectangle_export_stage,
+    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
+    sampler_uses_normalized_coordinates, shader_scalar_metadata,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 
 #[test]
@@ -93,6 +93,45 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
         ngg_mesh_export_stage(&program),
         "allocation plus primitive and position exports form an NGG contract even without LDS"
     );
+}
+
+#[test]
+fn accepts_native_ngg_triangle_lists_and_nonindexed_triangle_strips() {
+    let mut draw = super::indexed_draw(0, 0, 6);
+    assert!(ngg_mesh_draw_supported(&draw));
+
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    draw.index_count = 4;
+    assert!(ngg_mesh_draw_supported(&draw));
+
+    draw.primitive_type = 7;
+    assert!(!ngg_mesh_draw_supported(&draw));
+}
+
+#[test]
+fn recognizes_linked_trace_continuation_as_a_nonindexed_ngg_mesh_draw() {
+    let front =
+        decode_program(0x0080_0aed_0000, &[0xbe80_2006]).expect("traced front handoff decodes");
+    let continuation = decode_program(
+        0x0080_0aee_0000,
+        &[
+            0xbf90_0009,
+            0xf800_0941,
+            0x0303_0303,
+            0xf800_08cf,
+            0x0302_0100,
+            0xbf81_0000,
+        ],
+    )
+    .expect("traced continuation exports decode");
+    let linked = link_tail_call_programs(&front, &continuation).expect("traced shader links");
+    let mut draw = super::indexed_draw(0, 0, 4);
+    draw.indexed = false;
+    draw.primitive_type = 6;
+
+    assert!(ngg_mesh_export_stage(&linked));
+    assert!(ngg_mesh_draw_supported(&draw));
 }
 
 #[test]

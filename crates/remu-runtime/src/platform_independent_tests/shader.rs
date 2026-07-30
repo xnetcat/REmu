@@ -311,7 +311,14 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
 #[test]
 fn fused_shader_snapshot_uses_back_descriptor_and_retains_continuation_program() {
     let front_program = [0xbe80_2006_u32]; // s_setpc_b64 s[6:7]
-    let back_program = [0xbf81_0000_u32]; // s_endpgm
+    let back_program = [
+        0xbf90_0009_u32, // s_sendmsg GS allocation
+        0xf800_0941,     // exp primitive
+        0x0303_0303,
+        0xf800_08cf, // exp position
+        0x0302_0100,
+        0xbf81_0000, // s_endpgm
+    ];
     let mut front_header = [0_u8; SHADER_HEADER_SIZE as usize];
     let mut back_header = [0_u8; SHADER_HEADER_SIZE as usize];
     let mut back_user_data = [0_u8; 0x36];
@@ -360,4 +367,32 @@ fn fused_shader_snapshot_uses_back_descriptor_and_retains_continuation_program()
         snapshot.supplemental_programs[0].address,
         back_program_address
     );
+    assert_eq!(snapshot.program.instructions.len(), 5);
+    assert_eq!(
+        snapshot.program.instructions[0].opcode.known_name(),
+        Some("SBranch")
+    );
+    assert_eq!(
+        snapshot.program.instructions[4].opcode.known_name(),
+        Some("SEndpgm")
+    );
+    assert_eq!(
+        snapshot
+            .program
+            .instruction_address(snapshot.program.instructions[1].pc),
+        back_program_address
+    );
+    let export_targets = snapshot
+        .program
+        .instructions
+        .iter()
+        .filter_map(|instruction| {
+            let remu_shader::InstructionControl::Export(export) = instruction.control.as_ref()?
+            else {
+                return None;
+            };
+            Some(export.target)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(export_targets, [20, 12]);
 }

@@ -50,6 +50,60 @@ fn initializes_merged_export_wave_info_before_user_sgprs() {
 }
 
 #[test]
+fn linked_continuation_getpc_uses_its_original_guest_allocation() {
+    let front = Program::new(
+        0x0080_0aed_0000,
+        vec![instruction(
+            0,
+            ShaderEncoding::Sop1,
+            "SSetpcB64",
+            vec![Operand::scalar(6)],
+            Vec::new(),
+            None,
+        )],
+    );
+    let continuation = Program::new(
+        0x0080_0aee_0000,
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SGetpcB64",
+                vec![Operand::source(0, None)],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            end(4),
+        ],
+    );
+    let shader = ShaderState {
+        program: Arc::new(
+            crate::link_tail_call_programs(&front, &continuation)
+                .expect("front and exact continuation link"),
+        ),
+        user_data: Vec::new().into(),
+        compute_system_registers: None,
+        user_data_scalar_register_base: 8,
+    };
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("linked shader evaluation");
+    let architectural_next_pc = continuation.address + 4;
+    assert_eq!(
+        evaluation.scalar_registers[4],
+        u32::try_from(architectural_next_pc & u64::from(u32::MAX)).unwrap()
+    );
+    assert_eq!(
+        evaluation.scalar_registers[5],
+        u32::try_from(architectural_next_pc >> 32).unwrap()
+    );
+}
+
+#[test]
 fn s_bcnt1_i32_b64_counts_the_source_pair_and_updates_scc() {
     let instruction = instruction(
         0,

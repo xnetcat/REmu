@@ -15,7 +15,8 @@ use super::{
     diagnostic_force_visible_clip_depth, diagnostic_video_chain_selected_draw,
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
-    pixel_input_controls, program_embeds_global_base, register_value, video_target_binding_summary,
+    ngg_mesh_draw_supported, ngg_mesh_export_stage, pixel_input_controls,
+    program_embeds_global_base, register_value, video_target_binding_summary,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
@@ -37,6 +38,58 @@ pub(crate) struct PreparedNggMeshlets {
     pub(crate) group_count: u64,
     pub(crate) vertex_references: usize,
     pub(crate) primitive_count: usize,
+}
+
+/// Expands a non-indexed triangle strip into the triangle-list indices consumed by NGG meshlets.
+///
+/// GFX10 alternates strip winding for each new vertex. Metal mesh shaders instead publish an
+/// explicit index triplet per primitive, so odd primitives swap their first two vertices.
+fn expand_nonindexed_triangle_strip(
+    first_vertex: u32,
+    vertex_count: u32,
+) -> Result<Arc<[u32]>, String> {
+    let primitive_count = vertex_count.saturating_sub(2);
+    if primitive_count != 0 {
+        first_vertex
+            .checked_add(vertex_count - 1)
+            .ok_or("triangle-strip vertex ID overflow")?;
+    }
+    let index_count = usize::try_from(primitive_count)
+        .map_err(|_| "triangle-strip primitive count does not fit usize")?
+        .checked_mul(3)
+        .ok_or("triangle-strip index count overflow")?;
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(index_count)
+        .map_err(|_| format!("triangle-strip index allocation failed for {index_count} entries"))?;
+    for primitive in 0..primitive_count {
+        let first = first_vertex
+            .checked_add(primitive)
+            .ok_or("triangle-strip vertex ID overflow")?;
+        let second = first
+            .checked_add(1)
+            .ok_or("triangle-strip vertex ID overflow")?;
+        let third = first
+            .checked_add(2)
+            .ok_or("triangle-strip vertex ID overflow")?;
+        if primitive & 1 == 0 {
+            indices.extend_from_slice(&[first, second, third]);
+        } else {
+            indices.extend_from_slice(&[second, first, third]);
+        }
+    }
+    Ok(indices.into())
+}
+
+/// Prepares the source vertex IDs for a non-indexed NGG triangle-strip draw.
+///
+/// `index_offset` is the guest draw's first vertex; the signed base vertex remains separate in the
+/// mesh-draw metadata and is added by the generated mesh function.
+pub(crate) fn prepare_nonindexed_ngg_indices(draw: &IndexedDraw) -> Result<Arc<[u32]>, String> {
+    if draw.indexed || draw.primitive_type != 6 {
+        return Err("NGG source is not a non-indexed triangle strip".to_owned());
+    }
+    expand_nonindexed_triangle_strip(draw.index_offset, draw.index_count)
 }
 
 /// Builds the GFX10 NGG workgroups consumed by a merged export/geometry shader.
@@ -519,6 +572,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         }),
         sample_count,
         render_target_array_length,
+        uses_mesh_stage: ngg_mesh_draw_supported(draw) && ngg_mesh_export_stage(export_program),
         primitive_topology_class: metal_primitive_topology_class(draw.primitive_type)?,
     })
 }

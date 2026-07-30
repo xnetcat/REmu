@@ -44,7 +44,8 @@ use super::{
     initial_depth_clear_for_target, initial_render_target_clear_color, is_storage_image_opcode,
     is_writable_image_opcode, metal_nonindexed_vertex_count, metal_primitive_type,
     metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, prepare_indexed_primitive,
-    read_draw_indices, read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
+    prepare_nonindexed_ngg_indices, read_draw_indices, read_texture_array_linear,
+    read_texture_linear, read_texture_volume_linear,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
     render_target_cmask_address, render_target_fast_clear_color,
@@ -65,7 +66,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 mod compute;
 mod indirect;
@@ -798,14 +799,21 @@ impl MetalPresenter {
         } else {
             None
         };
-        let ngg_meshlets = if uses_mesh_stage {
-            let (indices, _) = indexed_draw
-                .as_ref()
-                .ok_or("NGG mesh draw requires captured indices")?;
-            Some(self.cached_ngg_meshlets(&device, indices.as_ref())?)
+        let ngg_indices = if uses_mesh_stage {
+            if let Some((indices, _)) = indexed_draw.as_ref() {
+                Some(Arc::clone(indices))
+            } else if !draw.indexed && draw.primitive_type == 6 {
+                Some(prepare_nonindexed_ngg_indices(draw)?)
+            } else {
+                return Err("NGG mesh draw has an unsupported source topology".to_owned());
+            }
         } else {
             None
         };
+        let ngg_meshlets = ngg_indices
+            .as_ref()
+            .map(|indices| self.cached_ngg_meshlets(&device, indices.as_ref()))
+            .transpose()?;
         let scissor = decode_scissor(draw, render_width, render_height)?;
         let diagnostic_force_triangle = diagnostic_disable_combined_raster
             && diagnostic_complex_msaa_raster
@@ -1355,9 +1363,9 @@ impl MetalPresenter {
             }
 
             if uses_mesh_stage {
-                let (indices, _) = indexed_draw
+                let indices = ngg_indices
                     .as_ref()
-                    .ok_or("NGG mesh draw requires captured indices")?;
+                    .expect("NGG indices were prepared before opening the render pass");
                 let meshlets = ngg_meshlets
                     .as_ref()
                     .expect("NGG meshlets were prepared before opening the render pass");
@@ -1383,11 +1391,13 @@ impl MetalPresenter {
                         draw.instance_count,
                     );
                 }
-                encoder.draw_mesh_threadgroups(
-                    MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
-                    MTLSize::new(1, 1, 1),
-                    MTLSize::new(NGG_MESH_THREADS, 1, 1),
-                );
+                if meshlets.group_count != 0 && draw.instance_count != 0 {
+                    encoder.draw_mesh_threadgroups(
+                        MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
+                        MTLSize::new(1, 1, 1),
+                        MTLSize::new(NGG_MESH_THREADS, 1, 1),
+                    );
+                }
             } else if diagnostic_force_triangle {
                 encoder.draw_primitives_instanced(MTLPrimitiveType::Triangle, 0, 3, 1);
             } else if matches!(scissor, GuestScissor::Empty) {
