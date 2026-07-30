@@ -9,7 +9,8 @@ use super::{
     compute_program_can_split_wave64, create_global_argument_buffer, decode_image_descriptor,
     diagnostic_texture_writer_enabled, dump_compute_shader_msl, dump_msl_compute_filter_matches,
     guest_texture_descriptors_overlap, image_resource_descriptor_is_null, is_storage_image_opcode,
-    is_writable_image_opcode, read_texture_linear, rearm_depth_metadata_clear,
+    is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
+    rearm_depth_metadata_clear,
     record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     sampled_image_bindings, shader_scalar_metadata_for_registers,
@@ -421,6 +422,7 @@ impl MetalPresenter {
                 .filter(|binding| binding.writable)
                 .map(|binding| binding.base_address)
             {
+                rearm_color_metadata_clear(&mut self.color_metadata_clears, address);
                 rearm_depth_metadata_clear(&mut self.depth_metadata_clears, address);
             }
         }

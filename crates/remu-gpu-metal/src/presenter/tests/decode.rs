@@ -17,7 +17,8 @@ use super::{
     DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestTextureDescriptor,
     MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0,
     append_color_target_registers, append_depth_target_registers, color_operation_is_raster_noop,
-    common_render_target_array_length, consume_depth_metadata_clear,
+    common_render_target_array_length, consume_color_metadata_clear,
+    consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
     decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
@@ -26,7 +27,8 @@ use super::{
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
     metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, prepare_ngg_meshlets,
-    read_draw_indices, read_texture_array_linear, read_texture_linear, rearm_depth_metadata_clear,
+    read_draw_indices, read_texture_array_linear, read_texture_linear,
+    rearm_color_metadata_clear, rearm_depth_metadata_clear, render_target_cmask_address,
     render_target_fast_clear_color,
 };
 
@@ -240,6 +242,29 @@ fn depth_metadata_clear_is_one_shot_and_can_be_rearmed() {
     assert!(!consume_depth_metadata_clear(&mut states, Some(address)));
     assert!(!rearm_depth_metadata_clear(&mut states, address + 0x100));
     assert!(!consume_depth_metadata_clear(&mut states, None));
+}
+
+#[test]
+fn color_metadata_clear_is_one_shot_per_slice_and_can_be_rearmed() {
+    let address = 0x1234_5600;
+    let mut states = HashMap::new();
+
+    assert!(consume_color_metadata_clear(&mut states, Some(address), 0));
+    assert!(!consume_color_metadata_clear(
+        &mut states,
+        Some(address),
+        0
+    ));
+    assert!(consume_color_metadata_clear(&mut states, Some(address), 1));
+    assert!(rearm_color_metadata_clear(&mut states, address));
+    assert!(consume_color_metadata_clear(&mut states, Some(address), 0));
+    assert!(!rearm_color_metadata_clear(&mut states, address + 0x100));
+    assert!(!consume_color_metadata_clear(&mut states, None, 0));
+    assert!(!consume_color_metadata_clear(
+        &mut states,
+        Some(address),
+        32
+    ));
 }
 
 #[test]
@@ -1041,13 +1066,13 @@ fn first_use_dcc_target_clears_instead_of_loading_compressed_backing() {
         .remove(0);
 
     assert!(
-        initial_render_target_clear_color(&ordinary, &registers, false).is_none(),
+        initial_render_target_clear_color(&ordinary, &registers, false, false).is_none(),
         "ordinary first-use targets preserve their existing load behavior"
     );
 
     let mut dcc = ordinary;
     dcc.dcc_enabled = true;
-    let discarded = initial_render_target_clear_color(&dcc, &registers, false)
+    let discarded = initial_render_target_clear_color(&dcc, &registers, false, false)
         .expect("first-use DCC backing is discarded");
     assert_eq!(
         (
@@ -1059,12 +1084,12 @@ fn first_use_dcc_target_clears_instead_of_loading_compressed_backing() {
         (0.0, 0.0, 0.0, 1.0)
     );
     assert!(
-        initial_render_target_clear_color(&dcc, &registers, true).is_none(),
+        initial_render_target_clear_color(&dcc, &registers, true, false).is_none(),
         "resident DCC targets keep their accumulated Metal contents"
     );
 
     dcc.fast_clear_enabled = true;
-    let programmed = initial_render_target_clear_color(&dcc, &registers, false)
+    let programmed = initial_render_target_clear_color(&dcc, &registers, false, true)
         .expect("programmed DCC fast clear");
     assert!((programmed.red - 16.0 / 255.0).abs() < 0.000_01);
     assert!((programmed.green - 32.0 / 255.0).abs() < 0.000_01);
@@ -1072,12 +1097,20 @@ fn first_use_dcc_target_clears_instead_of_loading_compressed_backing() {
     assert!((programmed.alpha - 128.0 / 255.0).abs() < 0.000_01);
 
     dcc.dcc_enabled = false;
-    let ordinary_fast_clear = initial_render_target_clear_color(&dcc, &registers, false)
+    let ordinary_fast_clear = initial_render_target_clear_color(&dcc, &registers, false, true)
         .expect("ordinary fast clear behavior is preserved");
     assert_eq!(ordinary_fast_clear.red, programmed.red);
     assert_eq!(ordinary_fast_clear.green, programmed.green);
     assert_eq!(ordinary_fast_clear.blue, programmed.blue);
     assert_eq!(ordinary_fast_clear.alpha, programmed.alpha);
+    assert!(
+        initial_render_target_clear_color(&dcc, &registers, false, false).is_none(),
+        "consumed CMASK must not clear an uncompressed first-use target again"
+    );
+    assert_eq!(
+        render_target_cmask_address(&dcc, &registers).unwrap(),
+        Some(0x70_2234_5600),
+    );
 }
 
 #[test]

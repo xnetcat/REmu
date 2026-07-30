@@ -4,7 +4,8 @@
 use super::{
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
     CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1,
-    CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, COLOR_TARGET_COUNT, DB_DEPTH_CLEAR,
+    CB_COLOR0_CMASK, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, COLOR_TARGET_COUNT,
+    DB_DEPTH_CLEAR,
     DB_DEPTH_CONTROL, DB_DEPTH_SIZE, DB_DEPTH_SIZE_XY, DB_DEPTH_SLICE, DB_DEPTH_VIEW,
     DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
     DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, DecodedDepthTarget, DecodedRenderTarget,
@@ -280,18 +281,43 @@ pub(crate) fn initial_render_target_clear_color(
     target: &DecodedRenderTarget,
     context_registers: &[GpuRegister],
     has_resident_storage: bool,
+    metadata_clear_pending: bool,
 ) -> Option<MTLClearColor> {
+    if metadata_clear_pending {
+        return render_target_fast_clear_color(target, context_registers);
+    }
     if has_resident_storage {
         return None;
     }
-    render_target_fast_clear_color(target, context_registers).or_else(|| {
-        // DCC backing memory cannot be decoded as the uncompressed image represented by the
-        // resident Metal texture. Without a programmed fast clear, discard that compressed
-        // first-use content instead of loading its raw bytes through an uncompressed attachment.
-        target
-            .dcc_enabled
-            .then(|| MTLClearColor::new(0.0, 0.0, 0.0, 1.0))
-    })
+    // DCC backing memory cannot be decoded as the uncompressed image represented by the
+    // resident Metal texture. Without a pending fast clear, discard that compressed first-use
+    // content instead of loading its raw bytes through an uncompressed attachment.
+    target
+        .dcc_enabled
+        .then(|| MTLClearColor::new(0.0, 0.0, 0.0, 1.0))
+}
+
+pub(crate) fn render_target_cmask_address(
+    target: &DecodedRenderTarget,
+    context_registers: &[GpuRegister],
+) -> Result<Option<u64>, String> {
+    if !target.fast_clear_enabled {
+        return Ok(None);
+    }
+    let primary = target.guest_slot * CB_COLOR_REGISTER_STRIDE;
+    let base = register_value(context_registers, CB_COLOR0_CMASK + primary).ok_or_else(|| {
+        format!(
+            "fast-clear color target {} has no CB_COLOR_CMASK register",
+            target.guest_slot
+        )
+    })?;
+    if base == 0 {
+        return Err(format!(
+            "fast-clear color target {} has a null CMASK address",
+            target.guest_slot
+        ));
+    }
+    Ok(Some(u64::from(base) << 8))
 }
 
 #[allow(clippy::too_many_arguments)]
