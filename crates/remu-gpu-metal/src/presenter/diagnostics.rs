@@ -10,8 +10,11 @@ use super::{
     is_storage_image_opcode, is_writable_image_opcode, register_value, sampled_image_bindings,
 };
 use metal::MTLPixelFormat;
-use remu_gpu::{ComputeDispatch, GpuMemoryCopy, IndexedDraw};
-use remu_shader::{GlobalMemoryBinding, ImageBinding, ShaderEvaluation, image_is_comparison};
+use remu_gpu::{ComputeDispatch, GpuMemoryCopy, GpuRegister, IndexedDraw, ShaderSnapshot};
+use remu_shader::{
+    GlobalMemoryBinding, ImageBinding, Program, ShaderEvaluation, ShaderMetadata,
+    image_is_comparison,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -603,6 +606,135 @@ pub(super) fn diagnostic_dump_target_pixel_shader() -> Option<u64> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DiagnosticTargetDrawFilter {
+    pixel_shader_address: Option<u64>,
+    target_address: Option<u64>,
+    minimum_draw: u64,
+}
+
+impl DiagnosticTargetDrawFilter {
+    #[must_use]
+    pub(super) const fn matches(
+        self,
+        draw_sequence: u64,
+        pixel_shader_address: u64,
+        target_address: u64,
+        target_width: u32,
+        target_height: u32,
+    ) -> bool {
+        if draw_sequence < self.minimum_draw {
+            return false;
+        }
+        if let Some(expected) = self.pixel_shader_address
+            && pixel_shader_address != expected
+        {
+            return false;
+        }
+        if let Some(expected) = self.target_address {
+            if expected == 0 {
+                if target_width != 1_920 || target_height != 1_080 {
+                    return false;
+                }
+            } else if target_address != expected {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub(super) fn diagnostic_target_draw_filter() -> Option<DiagnosticTargetDrawFilter> {
+    let pixel_shader_address = diagnostic_dump_target_pixel_shader();
+    let target_address = diagnostic_dump_target_address();
+    if pixel_shader_address.is_none() && target_address.is_none() {
+        return None;
+    }
+    Some(DiagnosticTargetDrawFilter {
+        pixel_shader_address,
+        target_address,
+        minimum_draw: diagnostic_dump_target_minimum_draw(),
+    })
+}
+
+const fn is_diagnostic_context_register(offset: u32) -> bool {
+    matches!(
+        offset,
+        0x191..=0x1b0 | 0x1b3 | 0x1b4 | 0x1b6 | 0x291 | 0x29b
+    )
+}
+
+pub(super) fn diagnostic_context_register_snapshot(registers: &[GpuRegister]) -> Vec<GpuRegister> {
+    registers
+        .iter()
+        .copied()
+        .filter(|register| is_diagnostic_context_register(register.offset))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DiagnosticProgramSummary {
+    address: u64,
+    decoded_byte_count: usize,
+    instruction_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DiagnosticShaderSummary {
+    stage: &'static str,
+    bound_address: u64,
+    prefix: [u32; 4],
+    header_address: u64,
+    program: Option<DiagnosticProgramSummary>,
+    supplemental_programs: Vec<DiagnosticProgramSummary>,
+    metadata: Option<ShaderMetadata>,
+}
+
+fn diagnostic_program_summary(program: &Program) -> DiagnosticProgramSummary {
+    let decoded_byte_count = program
+        .instructions
+        .iter()
+        .filter_map(|instruction| {
+            usize::try_from(instruction.pc)
+                .ok()?
+                .checked_add(instruction.words.len().checked_mul(4)?)
+        })
+        .max()
+        .unwrap_or_default();
+    DiagnosticProgramSummary {
+        address: program.address,
+        decoded_byte_count,
+        instruction_count: program.instructions.len(),
+    }
+}
+
+pub(super) fn diagnostic_shader_summary(
+    stage: &'static str,
+    bound_address: u64,
+    prefix: [u32; 4],
+    snapshot: Option<&ShaderSnapshot>,
+) -> DiagnosticShaderSummary {
+    DiagnosticShaderSummary {
+        stage,
+        bound_address,
+        prefix,
+        header_address: snapshot.map_or(0, |snapshot| snapshot.header_address),
+        program: snapshot.map(|snapshot| diagnostic_program_summary(&snapshot.program)),
+        supplemental_programs: snapshot
+            .map(|snapshot| {
+                snapshot
+                    .supplemental_programs
+                    .iter()
+                    .map(diagnostic_program_summary)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        metadata: snapshot
+            .and_then(|snapshot| snapshot.metadata.as_deref())
+            .cloned(),
+    }
+}
+
 pub(super) fn diagnostic_dump_target_pixel_instruction_count() -> Option<usize> {
     static COUNT: OnceLock<Option<usize>> = OnceLock::new();
     *COUNT.get_or_init(|| {
@@ -973,4 +1105,94 @@ pub(super) fn dump_msl_instruction_filter_matches(pixel_instruction_count: usize
         .to_string_lossy()
         .parse::<usize>()
         .is_ok_and(|filter| filter == pixel_instruction_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_target_filter_conjoins_draw_shader_and_target() {
+        let filter = DiagnosticTargetDrawFilter {
+            pixel_shader_address: Some(0x0080_0e73_0000),
+            target_address: Some(0x00ef_c200_0000),
+            minimum_draw: 38,
+        };
+
+        assert!(filter.matches(38, 0x0080_0e73_0000, 0x00ef_c200_0000, 1_920, 1_080));
+        assert!(!filter.matches(37, 0x0080_0e73_0000, 0x00ef_c200_0000, 1_920, 1_080));
+        assert!(!filter.matches(38, 0x0080_0802_0000, 0x00ef_c200_0000, 1_920, 1_080));
+        assert!(!filter.matches(38, 0x0080_0e73_0000, 0x00ef_c000_0000, 1_920, 1_080));
+    }
+
+    #[test]
+    fn automatic_target_filter_selects_only_display_extent() {
+        let filter = DiagnosticTargetDrawFilter {
+            pixel_shader_address: None,
+            target_address: Some(0),
+            minimum_draw: 0,
+        };
+
+        assert!(filter.matches(1, 0x0080_0e73_0000, 0x1234, 1_920, 1_080));
+        assert!(!filter.matches(1, 0x0080_0e73_0000, 0x1234, 1_280, 720));
+    }
+
+    #[test]
+    fn context_snapshot_captures_only_requested_raw_registers() {
+        let registers = [
+            GpuRegister {
+                offset: 0x190,
+                value: 0xaaaa_aaaa,
+            },
+            GpuRegister {
+                offset: 0x191,
+                value: 0x1111_1111,
+            },
+            GpuRegister {
+                offset: 0x1b0,
+                value: 0xb0b0_b0b0,
+            },
+            GpuRegister {
+                offset: 0x1b1,
+                value: 0xbbbb_bbbb,
+            },
+            GpuRegister {
+                offset: 0x1b3,
+                value: 0xb3b3_b3b3,
+            },
+            GpuRegister {
+                offset: 0x1b4,
+                value: 0xb4b4_b4b4,
+            },
+            GpuRegister {
+                offset: 0x1b6,
+                value: 0xb6b6_b6b6,
+            },
+            GpuRegister {
+                offset: 0x291,
+                value: 0x2912_9129,
+            },
+            GpuRegister {
+                offset: 0x29b,
+                value: 0x29b2_9b29,
+            },
+            GpuRegister {
+                offset: 0x29c,
+                value: 0xcccc_cccc,
+            },
+        ];
+
+        assert_eq!(
+            diagnostic_context_register_snapshot(&registers),
+            vec![
+                registers[1],
+                registers[2],
+                registers[4],
+                registers[5],
+                registers[6],
+                registers[7],
+                registers[8],
+            ]
+        );
+    }
 }
