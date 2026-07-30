@@ -41,10 +41,10 @@ pub struct GpuRegister {
 pub struct ShaderSnapshot {
     pub header_address: u64,
     pub program: Arc<Program>,
-    /// Additional independently terminated entry points retained in the same AGC code
-    /// allocation. Merged geometry binaries use these trailing programs for the other hardware
-    /// half; dropping them loses vertex parameters even though the leading program still exports
-    /// position.
+    /// Additional entry points retained in execution order. Independently terminated programs
+    /// from the leading AGC allocation come first. When AGC fuses a separately allocated back
+    /// half, its exact leading program is appended last; a leading `S_SETPC_B64` makes that final
+    /// entry a linked continuation rather than an independent segment.
     pub supplemental_programs: Arc<[Program]>,
     pub metadata: Option<Arc<ShaderMetadata>>,
 }
