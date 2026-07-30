@@ -1096,6 +1096,7 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
             u32::try_from(index).expect("PS input index fits u32")
         }),
         pixel_depth_export: false,
+        ngg_subgroup_limits: None,
         diagnostics: GraphicsDiagnosticPipelineState::default(),
         targets: Vec::new(),
         depth: None,

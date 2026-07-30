@@ -15,14 +15,16 @@ use super::{
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
     ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
     DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestTextureDescriptor,
-    MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0,
+    MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType, NggSubgroupLimits,
+    PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0,
     append_color_target_registers, append_depth_target_registers, color_operation_is_raster_noop,
     common_render_target_array_length, consume_color_metadata_clear,
     consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
     decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
-    decode_render_targets_from_registers, decode_scissor, decode_viewport, effective_linear_pitch,
+    decode_render_targets_from_registers, decode_scissor, decode_ngg_subgroup_limits,
+    decode_viewport, effective_linear_pitch,
     guest_texture_byte_count, guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
@@ -1316,8 +1318,125 @@ fn maps_legacy_and_gen5_triangle_list_codes_to_metal_triangles() {
 }
 
 #[test]
+fn decodes_captured_ngg_subgroup_limits_and_derives_ninety_six_threads() {
+    let limits = decode_ngg_subgroup_limits(&[
+        GpuRegister {
+            offset: 0x1ff,
+            value: 96,
+        },
+        GpuRegister {
+            offset: 0x291,
+            value: 0x0100_2018,
+        },
+        GpuRegister {
+            offset: 0x29b,
+            value: 2,
+        },
+        GpuRegister {
+            offset: 0x2ce,
+            value: 24,
+        },
+        GpuRegister {
+            offset: 0x2d3,
+            value: 24,
+        },
+        GpuRegister {
+            offset: 0x2e4,
+            value: 1 << 2,
+        },
+    ])
+    .expect("captured NGG registers are representable")
+    .expect("captured NGG registers are present");
+
+    assert_eq!(limits.es_vertices_per_subgroup, 24);
+    assert_eq!(limits.gs_primitives_per_subgroup, 4);
+    assert_eq!(limits.gs_instance_primitives_per_subgroup, 4);
+    assert_eq!(limits.gs_instance_count, 1);
+    assert_eq!(limits.gs_max_vertices_out, 24);
+    assert_eq!(limits.max_output_vertices_per_subgroup, 96);
+    assert_eq!(limits.primitive_amplification_factor, 24);
+    assert_eq!(limits.max_output_primitives_per_subgroup, 96);
+    assert_eq!(
+        limits.output_primitive_type,
+        Some(NggOutputPrimitiveType::TriangleStrip)
+    );
+    assert_eq!(limits.threadgroup_threads, 96);
+}
+
+#[test]
+fn ordinary_agc_geometry_defaults_do_not_activate_ngg() {
+    assert_eq!(
+        decode_ngg_subgroup_limits(&[
+            GpuRegister {
+                offset: 0x1ff,
+                value: 0,
+            },
+            GpuRegister {
+                offset: 0x29b,
+                value: 2,
+            },
+            GpuRegister {
+                offset: 0x2ce,
+                value: 0x400,
+            },
+        ]),
+        Ok(None)
+    );
+}
+
+#[test]
+fn rejects_ngg_subgroups_that_exceed_metal_capacity() {
+    let error = NggSubgroupLimits::new(
+        24,
+        16,
+        16,
+        24,
+        257,
+        16,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect_err("257 guest outputs cannot be silently clamped to Metal's limit");
+    assert!(error.contains("exceed Metal's limit"));
+}
+
+#[test]
+fn packs_ngg_inputs_across_more_than_one_guest_wave() {
+    let limits = NggSubgroupLimits::new(
+        96,
+        32,
+        32,
+        3,
+        96,
+        1,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect("96-thread NGG subgroup is representable");
+    let indices = (0_u32..66).collect::<Vec<_>>();
+    let prepared = prepare_ngg_meshlets(&indices, limits);
+
+    assert_eq!(limits.threadgroup_threads, 96);
+    assert_eq!(prepared.group_count, 1);
+    assert_eq!(prepared.vertex_references, 66);
+    assert_eq!(prepared.primitive_count, 22);
+    assert_eq!(prepared.words[0], 66 | (22 << 8));
+}
+
+#[test]
 fn packs_ngg_meshlets_with_shared_vertex_indices() {
-    let prepared = prepare_ngg_meshlets(&[10, 11, 12, 12, 11, 13]);
+    let limits = NggSubgroupLimits::new(
+        24,
+        4,
+        4,
+        24,
+        96,
+        24,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect("captured Silent Hill NGG limits");
+    let prepared = prepare_ngg_meshlets(&[10, 11, 12, 12, 11, 13], limits);
     assert_eq!(prepared.group_count, 1);
     assert_eq!(prepared.vertex_references, 4);
     assert_eq!(prepared.primitive_count, 2);
@@ -1325,33 +1444,55 @@ fn packs_ngg_meshlets_with_shared_vertex_indices() {
     assert_eq!(prepared.words[0], 4 | (2 << 8));
     assert_eq!(prepared.words[1], 0);
     assert_eq!(&prepared.words[2..6], &[10, 11, 12, 13]);
-    assert_eq!(prepared.words[66], 1 << 10 | 2 << 20);
-    assert_eq!(prepared.words[67], 2 | 1 << 10 | 3 << 20);
+    assert_eq!(prepared.words[258], 1 << 10 | 2 << 20);
+    assert_eq!(prepared.words[259], 2 | 1 << 10 | 3 << 20);
 }
 
 #[test]
-fn splits_ngg_meshlets_at_the_architectural_vertex_limit() {
-    let indices = (0_u32..66).collect::<Vec<_>>();
-    let prepared = prepare_ngg_meshlets(&indices);
+fn splits_ngg_meshlets_at_the_guest_programmed_vertex_limit() {
+    let limits = NggSubgroupLimits::new(
+        24,
+        9,
+        9,
+        24,
+        24,
+        1,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect("captured Silent Hill NGG limits");
+    let indices = (0_u32..27).collect::<Vec<_>>();
+    let prepared = prepare_ngg_meshlets(&indices, limits);
     assert_eq!(prepared.group_count, 2);
-    assert_eq!(prepared.vertex_references, 66);
-    assert_eq!(prepared.primitive_count, 22);
+    assert_eq!(prepared.vertex_references, 27);
+    assert_eq!(prepared.primitive_count, 9);
     assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP], 3 | (1 << 8));
-    assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP + 1], 21);
+    assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP + 1], 8);
 }
 
 #[test]
-fn packs_up_to_sixty_four_ngg_primitives_per_meshlet() {
+fn splits_ngg_meshlets_at_the_guest_programmed_primitive_limit() {
+    let limits = NggSubgroupLimits::new(
+        24,
+        4,
+        4,
+        24,
+        96,
+        24,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect("captured Silent Hill NGG limits");
     let mut indices = Vec::new();
-    for primitive in 0_u32..65 {
-        indices.extend_from_slice(&[0, 1, 2 + primitive % 62]);
+    for primitive in 0_u32..5 {
+        indices.extend_from_slice(&[0, 1, 2 + primitive]);
     }
-    let prepared = prepare_ngg_meshlets(&indices);
+    let prepared = prepare_ngg_meshlets(&indices, limits);
     assert_eq!(prepared.group_count, 2);
-    assert_eq!(prepared.primitive_count, 65);
-    assert_eq!(prepared.words[0] >> 8, 64);
+    assert_eq!(prepared.primitive_count, 5);
+    assert_eq!(prepared.words[0] >> 8, 4);
     assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP] >> 8, 1);
-    assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP + 1], 64);
+    assert_eq!(prepared.words[NGG_MESHLET_WORDS_PER_GROUP + 1], 4);
 }
 
 #[test]

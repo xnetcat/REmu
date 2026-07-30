@@ -150,6 +150,15 @@ pub struct MetalCompileOptions {
     pub diagnostic_capture_vertex_position: bool,
     pub diagnostic_capture_pixel_output: bool,
     pub diagnostic_force_pixel_color: bool,
+    /// Maximum vertex and primitive records exposed by a Metal mesh shader.
+    ///
+    /// These are guest NGG subgroup output capacities, not the number of host threads in the
+    /// wave64 threadgroup. They are zero for non-mesh stages.
+    pub mesh_max_vertex_count: u32,
+    pub mesh_max_primitive_count: u32,
+    /// Total Metal threads used to execute one NGG subgroup. Guest wave64 numbering is derived
+    /// from this value, so a 96-thread subgroup executes one full and one partial guest wave.
+    pub mesh_threadgroup_size: u32,
     /// Bytes of guest LDS allocated to each compute workgroup.
     ///
     /// A non-zero, dword-aligned value is required only when the program contains an LDS memory
@@ -188,6 +197,9 @@ impl MetalCompileOptions {
             diagnostic_capture_vertex_position: false,
             diagnostic_capture_pixel_output: false,
             diagnostic_force_pixel_color: false,
+            mesh_max_vertex_count: 0,
+            mesh_max_primitive_count: 0,
+            mesh_threadgroup_size: 0,
             lds_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -216,6 +228,9 @@ impl MetalCompileOptions {
             diagnostic_capture_vertex_position: false,
             diagnostic_capture_pixel_output: false,
             diagnostic_force_pixel_color: false,
+            mesh_max_vertex_count: 0,
+            mesh_max_primitive_count: 0,
+            mesh_threadgroup_size: 0,
             lds_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -240,6 +255,9 @@ impl MetalCompileOptions {
             diagnostic_capture_vertex_position: false,
             diagnostic_capture_pixel_output: false,
             diagnostic_force_pixel_color: false,
+            mesh_max_vertex_count: 0,
+            mesh_max_primitive_count: 0,
+            mesh_threadgroup_size: 0,
             lds_size_bytes,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -264,6 +282,9 @@ impl MetalCompileOptions {
             diagnostic_capture_vertex_position: false,
             diagnostic_capture_pixel_output: false,
             diagnostic_force_pixel_color: false,
+            mesh_max_vertex_count: 0,
+            mesh_max_primitive_count: 0,
+            mesh_threadgroup_size: 0,
             lds_size_bytes,
             wave_lane_count,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -272,11 +293,16 @@ impl MetalCompileOptions {
 
     /// Builds options for one wave64 GFX10 NGG mesh workgroup.
     ///
-    /// The presenter supplies 64 threads. Up to 63 lanes carry triangle-list vertices so every
-    /// workgroup contains 21 whole primitives; the remaining lane participates in wave/LDS
-    /// operations but exports only degenerate initialization data.
+    /// The presenter supplies 64 threads. Guest registers independently determine how many
+    /// input lanes are populated and how many vertex/primitive output records Metal exposes.
     #[must_use]
-    pub const fn mesh(required_vertex_output_count: u32, lds_size_bytes: u32) -> Self {
+    pub const fn mesh(
+        required_vertex_output_count: u32,
+        lds_size_bytes: u32,
+        mesh_max_vertex_count: u32,
+        mesh_max_primitive_count: u32,
+        mesh_threadgroup_size: u32,
+    ) -> Self {
         Self {
             stage: MetalShaderStage::Mesh,
             required_vertex_output_count,
@@ -293,6 +319,9 @@ impl MetalCompileOptions {
             diagnostic_capture_vertex_position: false,
             diagnostic_capture_pixel_output: false,
             diagnostic_force_pixel_color: false,
+            mesh_max_vertex_count,
+            mesh_max_primitive_count,
+            mesh_threadgroup_size,
             lds_size_bytes,
             wave_lane_count: 64,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,

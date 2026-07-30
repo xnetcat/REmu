@@ -240,7 +240,7 @@ fn emits_guest_misc_layer_as_mesh_primitive_output() {
             export(16, 20, 1),
         ],
     );
-    let mut options = MetalCompileOptions::mesh(0, 0);
+    let mut options = MetalCompileOptions::mesh(0, 0, 64, 64, 64);
     options.vertex_output_control = (1 << 18) | (1 << 21);
     options.render_target_array_length = 6;
     let shader = compile_msl(&program, &empty_evaluation(), &options).expect("layered mesh lowers");

@@ -196,7 +196,7 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     let shader = compile_msl(
         &program,
         &empty_evaluation(),
-        &MetalCompileOptions::mesh(2, 16 * 1024),
+        &MetalCompileOptions::mesh(2, 16 * 1024, 96, 96, 96),
     )
     .expect("NGG mesh lowering");
 
@@ -205,7 +205,7 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     assert!(
         shader
             .source
-            .contains("mesh<RemuVsOut, void, 64, 64, topology::triangle>")
+            .contains("mesh<RemuVsOut, void, 96, 96, topology::triangle>")
     );
     assert!(
         shader
@@ -222,12 +222,12 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     assert!(
         shader
             .source
-            .contains("remu_mesh.set_primitive_count(remu_mesh_primitive_count)")
+            .contains("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
     );
     assert!(
         shader
             .source
-            .contains("if (remu_thread_index < remu_mesh_vertex_count) remu_mesh.set_vertex")
+            .contains("if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex")
     );
     assert!(
         shader.source.contains("remu_v_8 = remu_group_id.y"),
@@ -313,6 +313,30 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
         vec![
             Instruction {
                 pc: 0,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SLshlB32"),
+                words: vec![0],
+                sources: vec![
+                    Operand::scalar(107),
+                    Operand {
+                        kind: remu_shader::OperandKind::EncodedConstant,
+                        value: 140,
+                    },
+                ],
+                destinations: vec![Operand::scalar(124)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SOrB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(0), Operand::scalar(124)],
+                destinations: vec![Operand::scalar(124)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
                 encoding: ShaderEncoding::Sopp,
                 opcode: Opcode::Known("SSendmsg"),
                 words: vec![0xbf90_0009],
@@ -324,7 +348,7 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
                 control: None,
             },
             export(
-                4,
+                12,
                 20,
                 vec![
                     Operand::vector(2),
@@ -334,7 +358,7 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
                 ],
             ),
             export(
-                12,
+                20,
                 12,
                 vec![
                     Operand::vector(3),
@@ -344,7 +368,7 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
                 ],
             ),
             export(
-                20,
+                28,
                 32,
                 vec![
                     Operand::vector(7),
@@ -354,7 +378,7 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
                 ],
             ),
             Instruction {
-                pc: 28,
+                pc: 36,
                 encoding: ShaderEncoding::Sopp,
                 opcode: Opcode::END_PROGRAM,
                 words: vec![0xbf81_0000],
@@ -370,7 +394,7 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
     let shader = compile_msl(
         &linked,
         &empty_evaluation(),
-        &MetalCompileOptions::mesh(1, 16 * 1024),
+        &MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96),
     )
     .expect("linked NGG program should lower as one mesh function");
 
@@ -382,6 +406,47 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
             .contains("threadgroup atomic_uint remu_lds_storage[4096]")
     );
     assert!(shader.source.contains("remu_mesh.set_index("));
+    assert!(
+        shader
+            .source
+            .contains("atomic_store_explicit(&remu_mesh_output_vertex_count")
+    );
+    assert!(
+        shader
+            .source
+            .contains("atomic_store_explicit(&remu_mesh_output_primitive_count")
+    );
+    assert!(shader.source.contains("remu_s_124 & 0x7ffu"));
+    assert!(shader.source.contains("(remu_s_124 >> 12u) & 0x7ffu"));
+    assert!(
+        shader
+            .source
+            .contains("remu_mesh.set_index(remu_thread_index * 3u")
+    );
+    assert!(!shader.source.contains("remu_mesh.set_index(remu_wave_lane * 3u"));
+    assert!(
+        shader
+            .source
+            .contains("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
+    );
+    let allocation = shader
+        .source
+        .find("atomic_store_explicit(&remu_mesh_output_vertex_count")
+        .expect("GS_ALLOC_REQ allocation store");
+    let publication = shader
+        .source
+        .rfind("threadgroup_barrier(mem_flags::mem_threadgroup)")
+        .expect("converged output-count publication barrier");
+    let output_count = shader
+        .source
+        .find("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
+        .expect("dynamic Metal primitive count");
+    assert!(allocation < publication && publication < output_count);
+    assert!(
+        shader
+            .source
+            .contains("mesh<RemuVsOut, void, 96, 96, topology::triangle>")
+    );
     assert!(shader.source.contains("remu_out.position = float4("));
     assert!(shader.source.contains("remu_out.param0 = float4("));
     assert!(!shader.source.contains("active = false;"));
