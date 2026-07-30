@@ -104,6 +104,64 @@ fn linked_continuation_getpc_uses_its_original_guest_allocation() {
 }
 
 #[test]
+fn linked_continuation_address_remains_observable_in_six_and_seven() {
+    let front = Program::new(
+        0x0080_0aed_0000,
+        vec![instruction(
+            0,
+            ShaderEncoding::Sop1,
+            "SSetpcB64",
+            vec![Operand::scalar(6)],
+            Vec::new(),
+            None,
+        )],
+    );
+    let continuation = Program::new(
+        0x0080_0aee_1234,
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SMovB32",
+                vec![Operand::scalar(6)],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sop1,
+                "SMovB32",
+                vec![Operand::scalar(7)],
+                vec![Operand::scalar(5)],
+                None,
+            ),
+            end(8),
+        ],
+    );
+    let shader = ShaderState {
+        program: Arc::new(
+            crate::link_tail_call_programs(&front, &continuation)
+                .expect("front and exact continuation link"),
+        ),
+        user_data: Vec::new().into(),
+        compute_system_registers: None,
+        user_data_scalar_register_base: 8,
+    };
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("linked shader evaluation");
+
+    assert_eq!(evaluation.initial_scalar_registers[6], 0x0aee_1234);
+    assert_eq!(evaluation.initial_scalar_registers[7], 0x0000_0080);
+    assert_eq!(evaluation.scalar_registers[4], 0x0aee_1234);
+    assert_eq!(evaluation.scalar_registers[5], 0x0000_0080);
+}
+
+#[test]
 fn s_bcnt1_i32_b64_counts_the_source_pair_and_updates_scc() {
     let instruction = instruction(
         0,

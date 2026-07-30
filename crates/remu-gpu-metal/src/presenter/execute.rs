@@ -43,9 +43,9 @@ use super::{
     guest_texture_descriptors_share_storage, half_float_to_f32, image_resource_descriptor_is_null,
     initial_depth_clear_for_target, initial_render_target_clear_color, is_storage_image_opcode,
     is_writable_image_opcode, metal_nonindexed_vertex_count, metal_primitive_type,
-    metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, prepare_indexed_primitive,
-    prepare_nonindexed_ngg_indices, read_draw_indices, read_texture_array_linear,
-    read_texture_linear, read_texture_volume_linear,
+    metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, ngg_mesh_base_vertex,
+    prepare_indexed_primitive, prepare_nonindexed_ngg_indices, read_draw_indices,
+    read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
     render_target_cmask_address, render_target_fast_clear_color,
@@ -70,6 +70,25 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 mod compute;
 mod indirect;
+
+// metal-rs 0.33 predates the Mesh named constant, but its bitflags retain unknown Apple SDK bits.
+const MTL_RENDER_STAGE_MESH_BITS: u64 = 1 << 4;
+
+pub(super) fn export_resource_render_stage(uses_mesh_stage: bool) -> MTLRenderStages {
+    if uses_mesh_stage {
+        MTLRenderStages::from_bits_retain(MTL_RENDER_STAGE_MESH_BITS)
+    } else {
+        MTLRenderStages::Vertex
+    }
+}
+
+pub(super) const fn ngg_mesh_dispatch_required(
+    scissor: GuestScissor,
+    instance_count: u32,
+    has_meshlets: bool,
+) -> bool {
+    !matches!(scissor, GuestScissor::Empty) && instance_count != 0 && has_meshlets
+}
 
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
@@ -813,7 +832,8 @@ impl MetalPresenter {
         let ngg_meshlets = ngg_indices
             .as_ref()
             .map(|indices| self.cached_ngg_meshlets(&device, indices.as_ref()))
-            .transpose()?;
+            .transpose()?
+            .flatten();
         let scissor = decode_scissor(draw, render_width, render_height)?;
         let diagnostic_force_triangle = diagnostic_disable_combined_raster
             && diagnostic_complex_msaa_raster
@@ -1264,7 +1284,11 @@ impl MetalPresenter {
                     } else {
                         MTLResourceUsage::Read
                     };
-                    encoder.use_resource_at(&buffer.buffer, usage, MTLRenderStages::Vertex);
+                    encoder.use_resource_at(
+                        &buffer.buffer,
+                        usage,
+                        export_resource_render_stage(uses_mesh_stage),
+                    );
                 }
             } else {
                 for (index, buffer) in export_buffer_indices.iter().zip(&export_buffers) {
@@ -1366,32 +1390,35 @@ impl MetalPresenter {
                 let indices = ngg_indices
                     .as_ref()
                     .expect("NGG indices were prepared before opening the render pass");
-                let meshlets = ngg_meshlets
-                    .as_ref()
-                    .expect("NGG meshlets were prepared before opening the render pass");
-                let mesh_draw = [0_u32, 0_u32, draw.base_vertex as u32];
-                encoder.set_mesh_buffer(NGG_MESHLET_BUFFER_INDEX, Some(&meshlets.buffer), 0);
-                encoder.set_mesh_bytes(
-                    NGG_MESH_DRAW_BUFFER_INDEX,
-                    u64::try_from(std::mem::size_of_val(&mesh_draw))
-                        .expect("mesh draw metadata size fits u64"),
-                    mesh_draw.as_ptr().cast::<c_void>(),
-                );
-                static LOGGED_MESH_DRAWS: AtomicUsize = AtomicUsize::new(0);
-                let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
-                if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
-                    eprintln!(
-                        "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} primitives={} packed_vertices={} instances={} groups={}x{}",
-                        draw.sequence,
-                        indices.len(),
-                        meshlets.primitive_count,
-                        meshlets.vertex_references,
-                        draw.instance_count,
-                        meshlets.group_count,
-                        draw.instance_count,
+                if ngg_mesh_dispatch_required(scissor, draw.instance_count, ngg_meshlets.is_some())
+                    && let Some(meshlets) = ngg_meshlets.as_ref()
+                {
+                    let mesh_draw = [
+                        0_u32,
+                        0_u32,
+                        u32::from_ne_bytes(ngg_mesh_base_vertex(draw).to_ne_bytes()),
+                    ];
+                    encoder.set_mesh_buffer(NGG_MESHLET_BUFFER_INDEX, Some(&meshlets.buffer), 0);
+                    encoder.set_mesh_bytes(
+                        NGG_MESH_DRAW_BUFFER_INDEX,
+                        u64::try_from(std::mem::size_of_val(&mesh_draw))
+                            .expect("mesh draw metadata size fits u64"),
+                        mesh_draw.as_ptr().cast::<c_void>(),
                     );
-                }
-                if meshlets.group_count != 0 && draw.instance_count != 0 {
+                    static LOGGED_MESH_DRAWS: AtomicUsize = AtomicUsize::new(0);
+                    let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} primitives={} packed_vertices={} instances={} groups={}x{}",
+                            draw.sequence,
+                            indices.len(),
+                            meshlets.primitive_count,
+                            meshlets.vertex_references,
+                            draw.instance_count,
+                            meshlets.group_count,
+                            draw.instance_count,
+                        );
+                    }
                     encoder.draw_mesh_threadgroups(
                         MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
                         MTLSize::new(1, 1, 1),

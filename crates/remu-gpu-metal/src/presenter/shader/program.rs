@@ -367,9 +367,38 @@ pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
     allocation_message && primitive_export && position_export
 }
 
-/// Returns whether a native draw topology can be represented by the NGG meshlet ABI.
+/// Returns whether a direct native draw can be represented by the CPU-prepared NGG meshlet ABI.
 pub(crate) const fn ngg_mesh_draw_supported(draw: &IndexedDraw) -> bool {
-    (draw.indexed && draw.primitive_type == 4) || (!draw.indexed && draw.primitive_type == 6)
+    draw.indirect_arguments_address.is_none()
+        && ((draw.indexed && draw.primitive_type == 4)
+            || (!draw.indexed && draw.primitive_type == 6))
+}
+
+/// Selects NGG mesh lowering only when the presenter can prepare exact ordered source geometry.
+pub(crate) fn ngg_mesh_stage_for_draw(
+    program: &Program,
+    draw: &IndexedDraw,
+) -> Result<bool, String> {
+    if !ngg_mesh_export_stage(program) {
+        return Ok(false);
+    }
+    if ngg_mesh_draw_supported(draw) {
+        return Ok(true);
+    }
+    if procedural_rectangle_stage_for_draw(program, draw) {
+        return Ok(false);
+    }
+    if draw.indirect_arguments_address.is_some() {
+        return Err(format!(
+            "draw {} uses indirect arguments with an NGG mesh stage; ordered GPU-side mesh \
+             geometry preparation is not implemented",
+            draw.sequence,
+        ));
+    }
+    Err(format!(
+        "draw {} uses unsupported topology {:#x} (indexed={}) with an NGG mesh stage",
+        draw.sequence, draw.primitive_type, draw.indexed,
+    ))
 }
 
 /// Recognizes the position-only AGC primitive stage used for procedural fullscreen rectangles.
@@ -443,6 +472,15 @@ pub(crate) fn procedural_rectangle_export_stage(program: &Program) -> bool {
         && vertex_id_y
         && coordinate_conversions >= 2
         && coordinate_mads >= 2
+}
+
+/// Returns whether this exact draw uses the synthesized procedural-rectangle vertex stage.
+pub(crate) fn procedural_rectangle_stage_for_draw(program: &Program, draw: &IndexedDraw) -> bool {
+    !draw.indexed
+        && draw.indirect_arguments_address.is_none()
+        && draw.index_count == 3
+        && matches!(draw.primitive_type, 7 | 0x11)
+        && procedural_rectangle_export_stage(program)
 }
 
 #[cfg(test)]

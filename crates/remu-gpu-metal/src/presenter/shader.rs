@@ -33,8 +33,9 @@ pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
-    ngg_mesh_draw_supported, ngg_mesh_export_stage, pixel_interpolation_attribute_mask,
-    pixel_scalars, procedural_rectangle_export_stage, program_embeds_global_base, program_uses_lds,
+    ngg_mesh_draw_supported, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    pixel_interpolation_attribute_mask, pixel_scalars, procedural_rectangle_export_stage,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base, program_uses_lds,
     rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
@@ -210,10 +211,7 @@ impl MetalPresenter {
         let pixel_msl =
             remu_shader_metal::compile_msl(&pixel.program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
-        let uses_procedural_rectangle_stage = !draw.indexed
-            && draw.index_count == 3
-            && matches!(draw.primitive_type, 7 | 0x11)
-            && procedural_rectangle_export_stage(&export.program);
+        let uses_procedural_rectangle_stage = key.uses_procedural_rectangle_stage;
         if key.render_target_array_length == 1 {
             let exported_parameters = vertex_parameter_export_mask(&export.program);
             let interpolated_attributes = pixel_interpolation_attribute_mask(&pixel.program);

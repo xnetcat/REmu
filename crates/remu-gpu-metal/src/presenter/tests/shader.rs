@@ -1,7 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use metal::CompileOptions;
+use metal::{CompileOptions, MTLRenderStages};
 use remu_gpu::{GpuRegister, ShaderSnapshot, gpu_event_channel};
 use remu_shader::{
     GlobalMemoryBinding, ImageBinding, ImageControl, Instruction, InstructionControl,
@@ -12,10 +12,11 @@ use std::sync::Arc;
 
 use super::{
     MetalPresenter, canonical_sampler_bindings, canonical_texture_bindings, compute_launch,
-    graphics_shader_resource_key, image_component_class, missing_vertex_parameter_exports,
-    ngg_mesh_draw_supported, ngg_mesh_export_stage, procedural_rectangle_export_stage,
-    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
-    sampler_uses_normalized_coordinates, shader_scalar_metadata,
+    export_resource_render_stage, graphics_shader_resource_key, image_component_class,
+    missing_vertex_parameter_exports, ngg_mesh_draw_supported, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
+    shader_scalar_metadata,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 
@@ -93,6 +94,27 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
         ngg_mesh_export_stage(&program),
         "allocation plus primitive and position exports form an NGG contract even without LDS"
     );
+    let mut draw = super::indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    assert_eq!(
+        ngg_mesh_stage_for_draw(&program, &draw),
+        Ok(false),
+        "the exact three-vertex rectangle retains its synthesized vertex-stage path"
+    );
+    draw.index_count = 4;
+    assert!(
+        ngg_mesh_stage_for_draw(&program, &draw)
+            .expect_err("a non-exact NGG topology cannot silently fall back to vertex lowering")
+            .contains("unsupported topology")
+    );
+    draw.index_count = 3;
+    draw.indirect_arguments_address = Some(0x4000);
+    assert!(
+        ngg_mesh_stage_for_draw(&program, &draw)
+            .expect_err("an indirect count cannot use the exact procedural rectangle path")
+            .contains("ordered GPU-side mesh geometry preparation is not implemented")
+    );
 }
 
 #[test]
@@ -105,6 +127,14 @@ fn accepts_native_ngg_triangle_lists_and_nonindexed_triangle_strips() {
     draw.index_count = 4;
     assert!(ngg_mesh_draw_supported(&draw));
 
+    draw.indirect_arguments_address = Some(0x4000);
+    assert!(!ngg_mesh_draw_supported(&draw));
+
+    draw.indexed = true;
+    draw.primitive_type = 4;
+    assert!(!ngg_mesh_draw_supported(&draw));
+
+    draw.indirect_arguments_address = None;
     draw.primitive_type = 7;
     assert!(!ngg_mesh_draw_supported(&draw));
 }
@@ -132,6 +162,58 @@ fn recognizes_linked_trace_continuation_as_a_nonindexed_ngg_mesh_draw() {
 
     assert!(ngg_mesh_export_stage(&linked));
     assert!(ngg_mesh_draw_supported(&draw));
+    assert_eq!(ngg_mesh_stage_for_draw(&linked, &draw), Ok(true));
+
+    draw.indirect_arguments_address = Some(0x4000);
+    assert!(!ngg_mesh_draw_supported(&draw));
+    assert!(
+        ngg_mesh_stage_for_draw(&linked, &draw)
+            .expect_err("indirect NGG mesh geometry is not CPU-authoritative")
+            .contains("ordered GPU-side mesh geometry preparation is not implemented")
+    );
+
+    draw.indexed = true;
+    draw.primitive_type = 4;
+    assert!(!ngg_mesh_draw_supported(&draw));
+    assert!(
+        ngg_mesh_stage_for_draw(&linked, &draw)
+            .expect_err("indexed indirect NGG geometry is not CPU-authoritative")
+            .contains("ordered GPU-side mesh geometry preparation is not implemented")
+    );
+
+    draw.indirect_arguments_address = None;
+    draw.primitive_type = 6;
+    assert!(
+        ngg_mesh_stage_for_draw(&linked, &draw)
+            .expect_err("an indexed strip cannot silently use conventional vertex lowering")
+            .contains("unsupported topology")
+    );
+}
+
+#[test]
+fn marks_argument_buffer_resources_for_the_stage_that_dereferences_them() {
+    assert_eq!(export_resource_render_stage(false), MTLRenderStages::Vertex);
+    assert_eq!(export_resource_render_stage(true).bits(), 1 << 4);
+    assert!(!export_resource_render_stage(true).is_empty());
+}
+
+#[test]
+fn empty_ngg_geometry_is_a_legal_uncached_no_op() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter
+        .device
+        .as_ref()
+        .expect("presenter retains its Metal device")
+        .clone();
+
+    assert!(
+        presenter
+            .cached_ngg_meshlets(&device, &[])
+            .expect("empty geometry is legal")
+            .is_none()
+    );
+    assert!(presenter.ngg_meshlet_cache.is_empty());
 }
 
 #[test]
@@ -506,6 +588,31 @@ fn live_scalar_metadata_matches_sorted_register_snapshot_values() {
     assert_eq!(expected[0], 0xa500_0000);
     assert_eq!(expected[0x20], 0);
     assert_eq!(expected[63], 0xa500_003f);
+}
+
+#[test]
+fn merged_user_data_refresh_preserves_linked_continuation_registers() {
+    let mut initial = vec![0_u32; 16];
+    initial[6] = 0x0aee_1234;
+    initial[7] = 0x0000_0080;
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: initial.clone().into(),
+        scalar_registers: initial.into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let registers = [GpuRegister {
+        offset: 0x08c,
+        value: 0xfeed_beef,
+    }];
+
+    let metadata = shader_scalar_metadata_for_registers(&evaluation, &registers, 0x08c, 8)
+        .expect("merged scalar metadata fits");
+    assert_eq!(&metadata[6..8], &[0x0aee_1234, 0x0000_0080]);
+    assert_eq!(metadata[8], 0xfeed_beef);
 }
 
 #[test]
