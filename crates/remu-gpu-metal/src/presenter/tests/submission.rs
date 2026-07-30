@@ -18,13 +18,14 @@ use remu_shader::{GlobalMemoryBinding, Program};
 use std::time::Duration;
 
 use super::{
-    GLOBAL_UPLOAD_ALIGNMENT, GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason,
-    GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus,
-    GuestMemoryWaitTracker, GuestMemoryWriteOperation, GuestRenderPassKey, MetalPresenter,
+    GLOBAL_UPLOAD_ALIGNMENT, GraphicsDiagnosticPipelineState, GraphicsPipelineKey,
+    GraphicsShaderResourceKey, GuestBatchFlushReason, GuestCommandBatch, GuestMemoryWaitKey,
+    GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
+    GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor, MetalPresenter,
     OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
     PendingGlobalWriteback, PendingGuestMemoryWrite, QueueBlockReason,
     apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
-    write_back_pending_globals,
+    read_texture_linear, write_back_pending_globals,
 };
 
 fn mapped_test_label() -> (GuestAddressSpace, u64) {
@@ -243,6 +244,84 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
     apply_pending_guest_memory_writes(&committed.memory_writes)
         .expect("completed release publishes its label");
     assert_eq!(read_test_label(release_address), 1);
+}
+
+#[test]
+fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let texture_descriptor = TextureDescriptor::new();
+    texture_descriptor.set_texture_type(MTLTextureType::D2);
+    texture_descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+    texture_descriptor.set_width(4);
+    texture_descriptor.set_height(4);
+    texture_descriptor.set_storage_mode(MTLStorageMode::Private);
+    texture_descriptor.set_usage(MTLTextureUsage::RenderTarget);
+    let texture = device.new_texture(&texture_descriptor);
+    let render_pass = RenderPassDescriptor::new();
+    let attachment = render_pass
+        .color_attachments()
+        .object_at(0)
+        .expect("color attachment zero");
+    attachment.set_texture(Some(&texture));
+    attachment.set_load_action(MTLLoadAction::Clear);
+    attachment.set_store_action(MTLStoreAction::Store);
+    attachment.set_clear_color(MTLClearColor::new(1.0, 0.0, 0.0, 1.0));
+
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let encoder = command_buffer
+        .new_render_command_encoder(render_pass)
+        .to_owned();
+    presenter.open_guest_batch = Some(GuestCommandBatch {
+        command_buffer,
+        work: Vec::new(),
+        global_upload_chunks: Vec::new(),
+        global_writebacks: Vec::new(),
+        guest_write_ranges: Vec::new(),
+        memory_writes: Vec::new(),
+        render_pass: Some(OpenGuestRenderPass {
+            key: GuestRenderPassKey {
+                targets: Vec::new(),
+                depth: None,
+            },
+            encoder,
+        }),
+        completion_sequences: Vec::new(),
+    });
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("synchronous readback wait flushes and retires the active render pass");
+    assert!(presenter.open_guest_batch.is_none());
+    assert!(presenter.committed_guest_batches.is_empty());
+
+    let bytes = read_texture_linear(
+        &device,
+        &queue,
+        &texture,
+        GuestTextureDescriptor {
+            address: 0,
+            width: 4,
+            height: 4,
+            pitch: 4,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        },
+    )
+    .expect("completed render target is readable");
+    assert!(
+        bytes
+            .chunks_exact(4)
+            .all(|pixel| pixel == [u8::MAX, 0, 0, u8::MAX]),
+        "target readback must observe the selected draw's completed render pass"
+    );
 }
 
 #[test]
@@ -1017,12 +1096,20 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
             u32::try_from(index).expect("PS input index fits u32")
         }),
         pixel_depth_export: false,
+        diagnostics: GraphicsDiagnosticPipelineState::default(),
         targets: Vec::new(),
         depth: None,
         sample_count: 1,
         render_target_array_length: 1,
         primitive_topology_class: MTLPrimitiveTopologyClass::Triangle,
     };
+    let mut capture_key = key.clone();
+    capture_key.diagnostics.capture_vertex_position = true;
+    capture_key.diagnostics.capture_pixel_output = true;
+    assert_ne!(
+        key, capture_key,
+        "capture hooks change both Metal function interfaces and must not reuse a hook-free pipeline"
+    );
     let mut draw = indexed_draw(0, 0, 0);
     draw.sequence = 17;
     let mut later_draw = indexed_draw(0, 0, 0);
