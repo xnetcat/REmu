@@ -300,7 +300,10 @@ impl MetalPresenter {
         remu_gpu::record_gpu_wait_producer(address, is_64_bit, value);
     }
 
-    pub(crate) fn record_produced_global_writebacks(&mut self, pending: &[PendingGlobalWriteback]) {
+    pub(crate) fn record_produced_global_writebacks(
+        &mut self,
+        pending: &[&PendingGlobalWriteback],
+    ) {
         for writeback in pending {
             if let Ok(byte_count) = u64::try_from(writeback.byte_count) {
                 self.record_submitted_gpu_waits_in_range(writeback.guest_address, byte_count);

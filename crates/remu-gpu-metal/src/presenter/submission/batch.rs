@@ -19,13 +19,23 @@ use remu_memory::{
     read_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 use remu_shader::ShaderEvaluation;
+use std::io::ErrorKind;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+static DISCARDED_STALE_GLOBAL_WRITEBACKS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, PartialEq, Eq)]
 enum GuestBatchSettlement {
     Completed,
     Failed(String),
     Pending(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobalWritebackOutcome {
+    Applied,
+    DiscardedStale,
 }
 
 impl MetalPresenter {
@@ -106,10 +116,10 @@ impl MetalPresenter {
         let mut result = execution_error.map_or(Ok(()), Err);
         if execution_succeeded {
             let writeback = write_back_pending_globals(&batch.global_writebacks);
-            if writeback.is_ok() {
-                self.record_produced_global_writebacks(&batch.global_writebacks);
+            if let Ok(applied) = &writeback {
+                self.record_produced_global_writebacks(applied);
             }
-            result = merge_guest_batch_result(result, "global writeback", writeback);
+            result = merge_guest_batch_result(result, "global writeback", writeback.map(|_| ()));
         }
         // RELEASE_MEM, WRITE_DATA, and DMA fills are command-processor effects ordered after the
         // native work, not shader results. Once the Metal command buffer reaches either terminal
@@ -742,7 +752,10 @@ fn append_or_replace_guest_write_range(
     }
 }
 
-pub(crate) fn write_back_pending_globals(pending: &[PendingGlobalWriteback]) -> Result<(), String> {
+pub(crate) fn write_back_pending_globals(
+    pending: &[PendingGlobalWriteback],
+) -> Result<Vec<&PendingGlobalWriteback>, String> {
+    let mut applied = Vec::with_capacity(pending.len());
     for writeback in pending {
         if writeback.original_bytes.len() != writeback.byte_count {
             return Err(format!(
@@ -769,10 +782,14 @@ pub(crate) fn write_back_pending_globals(pending: &[PendingGlobalWriteback]) -> 
                 .map_err(|_| "writable global buffer byte count does not fit u64")?;
             let current = guest_shared_backing_identity(writeback.guest_address, byte_count);
             if current != Some(expected) {
-                return Err(format!(
-                    "writable global buffer mapping changed before completion address={:#x} bytes={} expected={expected:?} current={current:?}",
-                    writeback.guest_address, writeback.byte_count
-                ));
+                trace_discarded_stale_global_writeback(
+                    writeback.guest_address,
+                    writeback.byte_count,
+                    "before completion",
+                    expected,
+                    current,
+                );
+                continue;
             }
         }
         let current_bytes = unsafe {
@@ -781,34 +798,56 @@ pub(crate) fn write_back_pending_globals(pending: &[PendingGlobalWriteback]) -> 
                 writeback.byte_count,
             )
         };
-        if writeback.mapping_identity.is_some() {
-            write_changed_global_ranges(writeback, current_bytes)?;
+        let outcome = if writeback.mapping_identity.is_some() {
+            write_changed_global_ranges(writeback, current_bytes)?
         } else if let Some(write_watch) = writeback.write_watch.as_ref() {
-            write_watch
+            match write_watch
                 .with_live_mapping(|| write_changed_global_ranges_direct(writeback, current_bytes))
-                .map_err(|error| {
-                    format!(
-                        "copied writable global mapping changed before completion address={:#x} bytes={}: {error}",
+            {
+                Ok(result) => {
+                    result?;
+                    GlobalWritebackOutcome::Applied
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    trace_discarded_stale_anonymous_global_writeback(
+                        writeback.guest_address,
+                        writeback.byte_count,
+                        &error,
+                    );
+                    GlobalWritebackOutcome::DiscardedStale
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "copied writable global mapping could not be pinned for completion address={:#x} bytes={}: {error}",
                         writeback.guest_address, writeback.byte_count
-                    )
-                })??;
+                    ));
+                }
+            }
         } else {
             #[cfg(test)]
-            write_changed_global_ranges_direct(writeback, current_bytes)?;
+            {
+                write_changed_global_ranges_direct(writeback, current_bytes)?;
+                GlobalWritebackOutcome::Applied
+            }
             #[cfg(not(test))]
-            return Err(format!(
-                "writable global buffer has neither backing identity nor mapping watch address={:#x} bytes={}",
-                writeback.guest_address, writeback.byte_count
-            ));
+            {
+                return Err(format!(
+                    "writable global buffer has neither backing identity nor mapping watch address={:#x} bytes={}",
+                    writeback.guest_address, writeback.byte_count
+                ));
+            }
+        };
+        if outcome == GlobalWritebackOutcome::Applied {
+            applied.push(writeback);
         }
     }
-    Ok(())
+    Ok(applied)
 }
 
 fn write_changed_global_ranges(
     writeback: &PendingGlobalWriteback,
     current_bytes: &[u8],
-) -> Result<(), String> {
+) -> Result<GlobalWritebackOutcome, String> {
     let mut cursor = 0;
     while cursor < current_bytes.len() {
         while cursor < current_bytes.len()
@@ -848,13 +887,54 @@ fn write_changed_global_ranges(
         };
         if !write_guest_shared_backing_if_identity(address, expected, &current_bytes[start..cursor])
         {
+            let byte_count = u64::try_from(cursor - start)
+                .map_err(|_| "writable global buffer changed byte count does not fit u64")?;
+            let current = guest_shared_backing_identity(address, byte_count);
+            if current != Some(expected) {
+                trace_discarded_stale_global_writeback(
+                    address,
+                    cursor - start,
+                    "during completion",
+                    expected,
+                    current,
+                );
+                return Ok(GlobalWritebackOutcome::DiscardedStale);
+            }
             return Err(format!(
-                "writable global buffer backing changed during completion address={address:#x} bytes={}",
+                "writable global buffer backing write failed despite matching identity address={address:#x} bytes={}",
                 cursor - start
             ));
         }
     }
-    Ok(())
+    Ok(GlobalWritebackOutcome::Applied)
+}
+
+fn trace_discarded_stale_global_writeback(
+    address: u64,
+    byte_count: usize,
+    stage: &str,
+    expected: GuestSharedMappingIdentity,
+    current: Option<GuestSharedMappingIdentity>,
+) {
+    let sequence = DISCARDED_STALE_GLOBAL_WRITEBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL] discarded stale writable global writeback sequence={sequence} mapping changed {stage} address={address:#x} bytes={byte_count} expected={expected:?} current={current:?}"
+        );
+    }
+}
+
+fn trace_discarded_stale_anonymous_global_writeback(
+    address: u64,
+    byte_count: usize,
+    error: &std::io::Error,
+) {
+    let sequence = DISCARDED_STALE_GLOBAL_WRITEBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL] discarded stale writable global writeback sequence={sequence} anonymous mapping changed before completion address={address:#x} bytes={byte_count}: {error}"
+        );
+    }
 }
 
 fn write_changed_global_ranges_direct(
