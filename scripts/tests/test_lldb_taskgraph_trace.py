@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "lldb_taskgraph_trace.py"
+PROBE_SCRIPT = Path(__file__).resolve().parents[1] / "probe-taskgraph.sh"
 SPEC = importlib.util.spec_from_file_location("lldb_taskgraph_trace", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 TRACE = importlib.util.module_from_spec(SPEC)
@@ -256,6 +259,9 @@ class TaskGraphTraceTests(unittest.TestCase):
                 queue + 0x118: 0xA1,
                 queue + 0x160: 0xB1,
                 queue + 0x1F8: wrapper,
+                TRACE.TASKGRAPH_NODE_SLAB_POINTERS: 0xD000,
+                0xD000 + 0xA1 * TRACE.TASK_QUEUE_NODE_STRIDE + 8: 0x1110,
+                0xD000 + 0xB1 * TRACE.TASK_QUEUE_NODE_STRIDE + 8: 0x2220,
                 wrapper + 0x10: underlying,
                 underlying + 0x10: 0,
                 0x8000: 0x9000,
@@ -301,6 +307,12 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.memory[queue + 0x1A8] = 0x16 << TRACE.TASK_QUEUE_WAITER_BITS
         self.memory[queue + 0x118] = 0xA2
         self.memory[queue + 0x160] = 0xB2
+        self.memory[
+            0xD000 + 0xA2 * TRACE.TASK_QUEUE_NODE_STRIDE + 8
+        ] = 0x1000
+        self.memory[
+            0xD000 + 0xB2 * TRACE.TASK_QUEUE_NODE_STRIDE + 8
+        ] = 0x3330
         enqueue = state.observe(
             TRACE.PUBLISH_RETURN,
             {"r14": queue_object, "rbx": 0, "rax": 0},
@@ -312,6 +324,8 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertIn("wake_waiter=0", enqueue.message or "")
         self.assertIn("lane1_head=162", enqueue.message or "")
         self.assertIn("lane1_tail=178", enqueue.message or "")
+        self.assertIn("/task=0x1000/target=True", enqueue.message or "")
+        self.assertIn("/task=0x3330/target=False", enqueue.message or "")
 
         self.memory[0xA000 - 0x48] = 1
         self.memory[queue + 0x1A8] |= 1
@@ -348,6 +362,26 @@ class TaskGraphTraceTests(unittest.TestCase):
                 hit_limit=8,
                 queue_handoff=True,
             )
+
+    def test_task_queue_node_decoder_uses_page_and_slot_slab(self) -> None:
+        node_id = (2 << TRACE.TASK_QUEUE_NODE_PAGE_BITS) | 7
+        value = (0x15 << TRACE.TASK_QUEUE_WAITER_BITS) | node_id
+        page_base = 0xD000
+        task = 0x123400
+        memory = {
+            TRACE.TASKGRAPH_NODE_SLAB_POINTERS + 2 * 8: page_base,
+            page_base + 7 * TRACE.TASK_QUEUE_NODE_STRIDE + 8: task,
+        }
+
+        description = TRACE.describe_task_queue_node(
+            value,
+            memory.get,
+            task,
+        )
+
+        self.assertIn(f"{value}/id={node_id:#x}", description)
+        self.assertIn("/page=0x2/slot=0x7/base=0xd000", description)
+        self.assertIn("/task=0x123400/target=True", description)
 
     def test_persistent_breakpoint_planner_adds_without_replacing(self) -> None:
         prepare = {TRACE.PREPARE: TRACE.PREPARE_ADDRESS}
@@ -386,6 +420,138 @@ class TaskGraphTraceTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {name: value}, clear=True):
                     with self.assertRaises(ValueError):
                         TRACE.guest_address_setting(name, 0x801BE0507)
+
+    def test_direct_attach_requires_stopped_process_with_guest_mapping(
+        self,
+    ) -> None:
+        class FakeError:
+            def __init__(self) -> None:
+                self.failed = False
+
+            def Fail(self) -> bool:
+                return self.failed
+
+        class FakeProcess:
+            def __init__(
+                self,
+                *,
+                valid: bool = True,
+                state: int = 5,
+                mapped: bool = True,
+            ) -> None:
+                self.valid = valid
+                self.state = state
+                self.mapped = mapped
+
+            def IsValid(self) -> bool:
+                return self.valid
+
+            def GetState(self) -> int:
+                return self.state
+
+            def ReadMemory(
+                self, address: int, size: int, error: FakeError
+            ) -> bytes:
+                self.testcase.assertEqual(address, TRACE.PREPARE_ADDRESS)
+                self.testcase.assertEqual(size, 1)
+                error.failed = not self.mapped
+                return b"\x90" if self.mapped else b""
+
+        class FakeTarget:
+            def __init__(self, process: FakeProcess) -> None:
+                self.process = process
+                process.testcase = self_test
+
+            def GetProcess(self) -> FakeProcess:
+                return self.process
+
+        self_test = self
+        fake_lldb = SimpleNamespace(eStateStopped=5, SBError=FakeError)
+        with mock.patch.object(TRACE, "lldb", fake_lldb):
+            self.assertEqual(
+                TRACE._direct_attach_error(
+                    FakeTarget(FakeProcess(valid=False))
+                ),
+                "no valid process is attached",
+            )
+            self.assertIn(
+                "must be stopped",
+                TRACE._direct_attach_error(
+                    FakeTarget(FakeProcess(state=4))
+                )
+                or "",
+            )
+            self.assertIn(
+                "has not mapped",
+                TRACE._direct_attach_error(
+                    FakeTarget(FakeProcess(mapped=False))
+                )
+                or "",
+            )
+            self.assertIsNone(
+                TRACE._direct_attach_error(FakeTarget(FakeProcess()))
+            )
+
+    def test_direct_attach_arms_without_a_host_seed_breakpoint(self) -> None:
+        target = mock.Mock()
+        debugger = mock.Mock()
+        debugger.GetSelectedTarget.return_value = target
+        result = mock.Mock()
+        with mock.patch.dict(
+            os.environ,
+            {"REMU_TASKGRAPH_TRACE_ATTACH": "1"},
+            clear=True,
+        ), mock.patch.object(TRACE, "_arm_direct_attach") as arm:
+            TRACE.start_taskgraph_trace(debugger, "", result, {})
+
+        arm.assert_called_once_with(target, result)
+        target.BreakpointCreateByRegex.assert_not_called()
+
+    def test_attach_cleanup_detaches_without_terminating_target(self) -> None:
+        class FakeError:
+            def Fail(self) -> bool:
+                return False
+
+        process = mock.Mock()
+        process.IsValid.return_value = True
+        process.GetState.return_value = 5
+        process.Detach.return_value = FakeError()
+        target = mock.Mock()
+        target.GetProcess.return_value = process
+        debugger = mock.Mock()
+        debugger.GetSelectedTarget.return_value = target
+        result = mock.Mock()
+        fake_lldb = SimpleNamespace(
+            eStateStopped=5,
+            eStateExited=10,
+            eStateDetached=9,
+        )
+
+        with mock.patch.object(TRACE, "lldb", fake_lldb):
+            TRACE.detach_taskgraph_trace(debugger, "", result, {})
+
+        process.Detach.assert_called_once_with(False)
+        result.SetError.assert_not_called()
+        result.AppendMessage.assert_called_once_with(
+            "[REMu][LLDB][TASKGRAPH] detached without terminating target"
+        )
+
+    def test_attach_cli_rejects_non_numeric_pid_before_any_launch(self) -> None:
+        completed = subprocess.run(
+            [
+                "/bin/sh",
+                str(PROBE_SCRIPT),
+                "--attach",
+                "not-a-pid",
+                "/not/used/eboot.bin",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 64)
+        self.assertIn("attach PID must be an integer", completed.stderr)
 
     def test_wake_path_correlates_only_the_exact_task_and_thread(self) -> None:
         dispatch = self.observe(TRACE.DISPATCH, {"rsi": 0x1000, "rdx": 3, "rcx": 2})
