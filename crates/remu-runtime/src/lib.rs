@@ -7115,6 +7115,8 @@ fn probe_entry(
     trace_linked_guest_code(image);
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     invoke_guest_module_initializers(&image.module_initializers, 0, 0);
+    DIAGNOSTIC_TIMEOUT_CANCELLED.store(false, Ordering::Release);
+    DIAGNOSTIC_TIMEOUT_EXPIRED.store(false, Ordering::Release);
     if timeout_seconds != 0 {
         start_diagnostic_timeout(timeout_seconds);
     }
@@ -7171,12 +7173,26 @@ pub fn report_shader_opcode_coverage() {
 /// Set once the guest has returned, so a run that finishes just as its limit expires still
 /// reports the status the guest produced rather than the watchdog's.
 static DIAGNOSTIC_TIMEOUT_CANCELLED: AtomicBool = AtomicBool::new(false);
+static DIAGNOSTIC_TIMEOUT_EXPIRED: AtomicBool = AtomicBool::new(false);
 
 /// The exit status a bounded diagnostic run reports when its time limit expires.
 ///
 /// This matches what the shell reports for a process killed by `SIGALRM`, which is how the limit
 /// used to be enforced, so scripts reading the status keep working.
-const DIAGNOSTIC_TIMEOUT_EXIT_STATUS: i32 = 142;
+pub const DIAGNOSTIC_TIMEOUT_EXIT_STATUS: u8 = 142;
+
+/// Extra time allowed for the presenter owner to drain Metal after a diagnostic limit.
+///
+/// Metal command-buffer synchronization is itself bounded to 30 seconds. Five more seconds let
+/// the owning event loop retire CPU-visible completion labels and return through the CLI before
+/// the watchdog falls back to `_exit`.
+const DIAGNOSTIC_TIMEOUT_HARD_FALLBACK_GRACE: Duration = Duration::from_secs(35);
+
+/// Reports whether this process reached its nonzero diagnostic time limit.
+#[must_use]
+pub fn diagnostic_timeout_expired() -> bool {
+    DIAGNOSTIC_TIMEOUT_EXPIRED.load(Ordering::Acquire)
+}
 
 /// Ends the process once a bounded diagnostic run reaches its time limit.
 ///
@@ -7189,14 +7205,55 @@ fn start_diagnostic_timeout(timeout_seconds: u32) {
     std::thread::Builder::new()
         .name("remu-timeout".to_owned())
         .spawn(move || {
-            std::thread::sleep(limit);
-            if DIAGNOSTIC_TIMEOUT_CANCELLED.load(Ordering::Acquire) {
-                return;
-            }
-            eprintln!("[REMu] diagnostic time limit of {timeout_seconds}s reached");
-            terminate_probe(DIAGNOSTIC_TIMEOUT_EXIT_STATUS);
+            supervise_diagnostic_timeout(
+                limit,
+                DIAGNOSTIC_TIMEOUT_HARD_FALLBACK_GRACE,
+                std::thread::sleep,
+                || DIAGNOSTIC_TIMEOUT_CANCELLED.load(Ordering::Acquire),
+                || {
+                    DIAGNOSTIC_TIMEOUT_EXPIRED.store(true, Ordering::Release);
+                    eprintln!("[REMu] diagnostic time limit of {timeout_seconds}s reached");
+                },
+                remu_gpu::request_presenter_shutdown,
+                || terminate_probe(i32::from(DIAGNOSTIC_TIMEOUT_EXIT_STATUS)),
+            );
         })
         .ok();
+}
+
+/// Applies the bounded diagnostic shutdown policy with injectable effects for exact tests.
+///
+/// A run with a presenter first publishes an out-of-band request. That keeps AppKit and Metal
+/// cleanup on their owning loop even if the ordinary GPU channel is full. A probe without a
+/// presenter, or a presenter which cannot return within `hard_fallback_grace`, retains `_exit` as
+/// the final process-wide backstop.
+fn supervise_diagnostic_timeout<Wait, Cancelled, Expired, Request, HardFallback>(
+    limit: Duration,
+    hard_fallback_grace: Duration,
+    mut wait: Wait,
+    cancelled: Cancelled,
+    mut expired: Expired,
+    mut request_presenter_shutdown: Request,
+    mut hard_fallback: HardFallback,
+) where
+    Wait: FnMut(Duration),
+    Cancelled: Fn() -> bool,
+    Expired: FnMut(),
+    Request: FnMut() -> bool,
+    HardFallback: FnMut(),
+{
+    wait(limit);
+    if cancelled() {
+        return;
+    }
+    expired();
+    if request_presenter_shutdown() {
+        wait(hard_fallback_grace);
+        if cancelled() {
+            return;
+        }
+    }
+    hard_fallback();
 }
 
 fn terminate_probe(code: i32) -> ! {

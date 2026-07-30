@@ -4,7 +4,7 @@ mod channel;
 pub use channel::{
     GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GPU_PENDING_EVENT_CAPACITY,
     acquire_memory, clear_event_sink, emit_event, gpu_event_channel, install_event_sink,
-    pipeline_barrier,
+    pipeline_barrier, request_presenter_shutdown, take_presenter_shutdown_request,
 };
 
 mod compute;

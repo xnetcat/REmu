@@ -775,7 +775,7 @@ impl ApplicationHandler for MetalPresenter {
         match event {
             WindowEvent::CloseRequested => {
                 eprintln!("[REMu][METAL] window close requested by AppKit");
-                self.persist_render_pipeline_archive();
+                self.finish_presenter_shutdown("window close");
                 event_loop.exit();
             }
             WindowEvent::Focused(false) => {

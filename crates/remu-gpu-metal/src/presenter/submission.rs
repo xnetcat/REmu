@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::completion::{COMMAND_BUFFER_SETTLE_TIMEOUT, settle_command_queue_within};
 use super::{
     ActiveGuestMemoryWait, DisplayConfiguration, GLOBAL_UPLOAD_ALIGNMENT,
     GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GlobalUploadChunk, GuestBatchFlushReason,
@@ -25,6 +26,7 @@ use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::GpuEvent;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 mod batch;
 mod events;
 mod memory;
@@ -42,8 +44,50 @@ pub(crate) use self::memory::{apply_pending_guest_memory_writes, pin_guest_memor
 pub(crate) use self::waits::read_guest_memory_wait_value;
 
 impl MetalPresenter {
+    /// Stops accepting work, drains the native queue from its owning thread, then persists state.
+    ///
+    /// One final empty command buffer covers translated batches as well as the native scanout,
+    /// mip-generation and CAMetalLayer command buffers which are intentionally not represented in
+    /// `committed_guest_batches`. All cleanup shares the existing host-watchdog-safe deadline.
+    pub(crate) fn finish_presenter_shutdown(&mut self, reason: &str) {
+        let deadline = Instant::now() + COMMAND_BUFFER_SETTLE_TIMEOUT;
+        if let Err(error) =
+            self.flush_guest_command_batch(false, GuestBatchFlushReason::CpuSynchronization)
+        {
+            eprintln!("[REMu][METAL] {reason} batch submission failed: {error}");
+        }
+        let queue_result = self
+            .command_queue
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Metal command queue is unavailable".to_owned())
+            .and_then(|queue| {
+                settle_command_queue_within(
+                    &queue,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+            });
+        if let Err(error) = queue_result {
+            eprintln!("[REMu][METAL] {reason} queue synchronization failed: {error}");
+        }
+
+        // Once the fence is terminal, every earlier batch is terminal too. Retire with a zero
+        // second secondary budget so CPU-visible labels and flip completions publish without
+        // extending the one shutdown deadline if the queue itself remained stalled.
+        if let Err(error) = self.wait_for_guest_command_batches_within(Duration::ZERO) {
+            eprintln!("[REMu][METAL] {reason} batch finalization failed: {error}");
+        }
+        self.retire_completed_presentations();
+        self.persist_render_pipeline_archive();
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn receive_events(&mut self) -> PresenterFlow {
+        if remu_gpu::take_presenter_shutdown_request() {
+            eprintln!("[REMu][METAL] out-of-band presenter shutdown requested");
+            self.finish_presenter_shutdown("out-of-band shutdown");
+            return PresenterFlow::Shutdown;
+        }
         self.receive_shader_compilations();
         self.retire_completed_guest_batches();
         self.retire_completed_presentations();
@@ -97,10 +141,7 @@ impl MetalPresenter {
                 }
                 OrderedEventPoll::Disconnected => {
                     eprintln!("[REMu][METAL] GPU event channel disconnected; closing presenter");
-                    if let Err(error) = self.wait_for_guest_command_batches() {
-                        eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
-                    }
-                    self.persist_render_pipeline_archive();
+                    self.finish_presenter_shutdown("channel disconnect");
                     return PresenterFlow::Shutdown;
                 }
             };
@@ -433,10 +474,7 @@ impl MetalPresenter {
                 }
                 GpuEvent::Shutdown => {
                     eprintln!("[REMu][METAL] guest runtime requested presenter shutdown");
-                    if let Err(error) = self.wait_for_guest_command_batches() {
-                        eprintln!("[REMu][METAL] shutdown synchronization failed: {error}");
-                    }
-                    self.persist_render_pipeline_archive();
+                    self.finish_presenter_shutdown("guest shutdown");
                     return PresenterFlow::Shutdown;
                 }
             }

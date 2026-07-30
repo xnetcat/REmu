@@ -178,8 +178,13 @@ pub(crate) fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -
     });
 
     let presenter_result = remu_gpu_metal::run_presenter(receiver);
+    let diagnostic_timed_out = remu_runtime::diagnostic_timeout_expired();
     remu_gpu::clear_event_sink();
     remu_runtime::report_shader_opcode_coverage();
+    if diagnostic_timed_out {
+        eprintln!("[REMu] presenter cleanup completed after the diagnostic time limit");
+        return ExitCode::from(remu_runtime::DIAGNOSTIC_TIMEOUT_EXIT_STATUS);
+    }
     if let Err(error) = presenter_result {
         eprintln!("error: {error}");
         return ExitCode::FAILURE;

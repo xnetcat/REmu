@@ -1,7 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use metal::{CommandBufferRef, MTLCommandBufferStatus};
+use metal::{CommandBufferRef, CommandQueueRef, MTLCommandBufferStatus};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::{CStr, c_char};
@@ -89,6 +89,34 @@ pub(crate) fn settle(command_buffer: &CommandBufferRef, operation: &str) -> Resu
     let status = command_buffer.status();
     if status != MTLCommandBufferStatus::Completed {
         return Err(command_buffer_failure_message(operation, command_buffer));
+    }
+    Ok(())
+}
+
+/// Submits an empty fence and waits within `timeout` for every earlier command on `queue`.
+///
+/// The presenter has a few native command buffers outside its translated guest-batch deque:
+/// scanout snapshots, mip generation and CAMetalLayer presentations. Queue ordering makes one
+/// final fence the authoritative shutdown boundary for all of them without installing callbacks
+/// that can race presenter destruction.
+pub(crate) fn settle_command_queue_within(
+    queue: &CommandQueueRef,
+    timeout: Duration,
+) -> Result<(), String> {
+    let command_buffer = queue.new_command_buffer().to_owned();
+    command_buffer.set_label("REMu presenter shutdown fence");
+    command_buffer.commit();
+    if !wait_until_settled_within(&command_buffer, timeout) {
+        return Err(settle_timeout_message(
+            "Metal presenter shutdown fence",
+            &command_buffer,
+        ));
+    }
+    if command_buffer.status() != MTLCommandBufferStatus::Completed {
+        return Err(command_buffer_failure_message(
+            "Metal presenter shutdown fence",
+            &command_buffer,
+        ));
     }
     Ok(())
 }
