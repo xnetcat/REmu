@@ -52,7 +52,10 @@ use self::state::{
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MAIN_CONDITION_NOTIFY_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static NAMED_THREAD_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static NAMED_CONDITION_LIFECYCLE_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LAST_PENDING_RHI_CHAIN_TRACE: AtomicU64 = AtomicU64::new(0);
+// Enough for a bounded launch trace while preventing diagnostics from growing without limit.
+const NAMED_CONDITION_LIFECYCLE_TRACE_LIMIT: u64 = 8_192;
 
 fn trace_read_guest_u32(address: u64) -> u32 {
     try_read_process_guest_u32(address).unwrap_or(0)
@@ -191,6 +194,143 @@ fn traced_main_conditions() -> &'static Mutex<BTreeSet<u64>> {
     CONDITIONS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+fn traced_named_conditions() -> &'static Mutex<BTreeSet<u64>> {
+    static CONDITIONS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
+    CONDITIONS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn named_condition_lifecycle_trace_is_bounded(sequence: u64) -> bool {
+    sequence <= NAMED_CONDITION_LIFECYCLE_TRACE_LIMIT
+}
+
+fn next_named_condition_lifecycle_trace_sequence(condition: u64) -> Option<u64> {
+    if !trace_guest_sync()
+        || !traced_named_conditions()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&condition)
+    {
+        return None;
+    }
+    let sequence = NAMED_CONDITION_LIFECYCLE_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    named_condition_lifecycle_trace_is_bounded(sequence).then_some(sequence)
+}
+
+fn trace_named_condition_wait_call(frame: Option<&ImportCallFrame>, condition: u64, mutex: u64) {
+    let Some(sequence) = next_named_condition_lifecycle_trace_sequence(condition) else {
+        return;
+    };
+    let guest_rsp = frame.map_or(0, |frame| frame.guest_rsp);
+    let stack = trace_guest_words::<16>(guest_rsp);
+    let (waiters, notifies, timeouts) = condition_trace_stats(condition);
+    eprintln!(
+        "[REMu][COND][NAMED-LIFECYCLE] sequence={sequence} event=wait-call thread={:?}/{:#x} return={:#x} rsp={guest_rsp:#x} stack={stack:x?} condition={condition:#x} mutex={mutex:#x} waiters={waiters} notifies={notifies} timeouts={timeouts}",
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+        frame.map_or(0, |frame| frame.guest_return_address),
+    );
+}
+
+pub(super) fn trace_named_condition_wait_registered(condition: u64, mutex: u64, ticket: u64) {
+    let Some(sequence) = next_named_condition_lifecycle_trace_sequence(condition) else {
+        return;
+    };
+    eprintln!(
+        "[REMu][COND][NAMED-LIFECYCLE] sequence={sequence} event=wait-registered thread={:?}/{:#x} condition={condition:#x} mutex={mutex:#x} ticket={ticket}",
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+    );
+}
+
+pub(super) fn trace_named_condition_wait_finished(
+    condition: u64,
+    mutex: u64,
+    ticket: u64,
+    timed_out: bool,
+    interrupted: bool,
+    released_spuriously: bool,
+) {
+    let Some(sequence) = next_named_condition_lifecycle_trace_sequence(condition) else {
+        return;
+    };
+    eprintln!(
+        "[REMu][COND][NAMED-LIFECYCLE] sequence={sequence} event=wait-finished thread={:?}/{:#x} condition={condition:#x} mutex={mutex:#x} ticket={ticket} timed_out={timed_out} interrupted={interrupted} released_spuriously={released_spuriously}",
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+    );
+}
+
+pub(super) fn trace_named_condition_notify_selected(
+    condition: u64,
+    broadcast: bool,
+    selected: &std::collections::VecDeque<u64>,
+) {
+    let Some(sequence) = next_named_condition_lifecycle_trace_sequence(condition) else {
+        return;
+    };
+    let (selected_head, selected_tail) = selected.as_slices();
+    eprintln!(
+        "[REMu][COND][NAMED-LIFECYCLE] sequence={sequence} event=notify-selected thread={:?}/{:#x} condition={condition:#x} broadcast={broadcast} selected={selected_head:?}/{selected_tail:?}",
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+    );
+}
+
+struct NamedConditionNotifyTrace {
+    condition: u64,
+    broadcast: bool,
+    waiters_before: usize,
+    notifies_before: u64,
+    timeouts_before: u64,
+}
+
+fn begin_named_condition_notify_trace(
+    frame: Option<&ImportCallFrame>,
+    condition: u64,
+    broadcast: bool,
+) -> Option<NamedConditionNotifyTrace> {
+    let sequence = next_named_condition_lifecycle_trace_sequence(condition)?;
+    let guest_rsp = frame.map_or(0, |frame| frame.guest_rsp);
+    let stack = trace_guest_words::<16>(guest_rsp);
+    let (waiters_before, notifies_before, timeouts_before) = condition_trace_stats(condition);
+    eprintln!(
+        "[REMu][COND][NAMED-LIFECYCLE] sequence={sequence} event=notify-call thread={:?}/{:#x} return={:#x} rsp={guest_rsp:#x} stack={stack:x?} condition={condition:#x} broadcast={broadcast} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+        frame.map_or(0, |frame| frame.guest_return_address),
+    );
+    Some(NamedConditionNotifyTrace {
+        condition,
+        broadcast,
+        waiters_before,
+        notifies_before,
+        timeouts_before,
+    })
+}
+
+fn finish_named_condition_notify_trace(trace: Option<NamedConditionNotifyTrace>, result: u64) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let Some(sequence) = next_named_condition_lifecycle_trace_sequence(trace.condition) else {
+        return;
+    };
+    let (waiters_after, notifies_after, timeouts_after) = condition_trace_stats(trace.condition);
+    eprintln!(
+        "[REMu][COND][NAMED-LIFECYCLE] sequence={sequence} event=notify-finished thread={:?}/{:#x} condition={:#x} broadcast={} result={result:#x} waiters={}->{} notifies={}->{} timeouts={}->{}",
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+        trace.condition,
+        trace.broadcast,
+        trace.waiters_before,
+        waiters_after,
+        trace.notifies_before,
+        notifies_after,
+        trace.timeouts_before,
+        timeouts_after,
+    );
+}
+
 fn trace_main_condition_notify(frame: Option<&ImportCallFrame>, condition: u64, broadcast: bool) {
     if !trace_guest_sync()
         || !traced_main_conditions()
@@ -245,6 +385,11 @@ fn begin_named_thread_condition_trace(
     if !thread_name.contains("RenderThread") && !thread_name.contains("RHIThread") {
         return None;
     }
+    traced_named_conditions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(condition);
+    trace_named_condition_wait_call(frame, condition, mutex);
     let sequence = NAMED_THREAD_CONDITION_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let rhi_task_graph = trace_rhi_task_graph();
     let new_pending_chain = rhi_task_graph
@@ -620,20 +765,32 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
             result
         }
         "kDh-NfxgMtE" => {
+            let named_trace = begin_named_condition_notify_trace(frame, arguments[0], false);
             trace_main_condition_notify(frame, arguments[0], false);
-            guest_condition_notify(arguments[0], false)
+            let result = guest_condition_notify(arguments[0], false);
+            finish_named_condition_notify_trace(named_trace, result);
+            result
         }
         "2MOy+rUfuhQ" => {
+            let named_trace = begin_named_condition_notify_trace(frame, arguments[0], false);
             trace_main_condition_notify(frame, arguments[0], false);
-            posix_pthread_result(guest_condition_notify(arguments[0], false))
+            let result = guest_condition_notify(arguments[0], false);
+            finish_named_condition_notify_trace(named_trace, result);
+            posix_pthread_result(result)
         }
         "JGgj7Uvrl+A" => {
+            let named_trace = begin_named_condition_notify_trace(frame, arguments[0], true);
             trace_main_condition_notify(frame, arguments[0], true);
-            guest_condition_notify(arguments[0], true)
+            let result = guest_condition_notify(arguments[0], true);
+            finish_named_condition_notify_trace(named_trace, result);
+            result
         }
         "mkx2fVhNMsg" => {
+            let named_trace = begin_named_condition_notify_trace(frame, arguments[0], true);
             trace_main_condition_notify(frame, arguments[0], true);
-            posix_pthread_result(guest_condition_notify(arguments[0], true))
+            let result = guest_condition_notify(arguments[0], true);
+            finish_named_condition_notify_trace(named_trace, result);
+            posix_pthread_result(result)
         }
         "14bOACANTBo" => guest_pthread_once(arguments[0], arguments[1]),
         "Z4QosVuAsA0" => posix_pthread_result(guest_pthread_once(arguments[0], arguments[1])),
@@ -654,7 +811,10 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
 
 #[cfg(test)]
 mod trace_tests {
-    use super::{GraphEventTrace, RhiTaskGraphTrace};
+    use super::{
+        GraphEventTrace, NAMED_CONDITION_LIFECYCLE_TRACE_LIMIT, RhiTaskGraphTrace,
+        named_condition_lifecycle_trace_is_bounded,
+    };
 
     fn graph_event(event: u64, complete: bool) -> GraphEventTrace {
         let mut words = [0; 8];
@@ -715,5 +875,16 @@ mod trace_tests {
             current_and_predecessor.pending_chain_identity()
         );
         assert_eq!(all_complete.pending_chain_identity(), None);
+    }
+
+    #[test]
+    fn named_condition_lifecycle_trace_has_a_hard_event_limit() {
+        assert!(named_condition_lifecycle_trace_is_bounded(1));
+        assert!(named_condition_lifecycle_trace_is_bounded(
+            NAMED_CONDITION_LIFECYCLE_TRACE_LIMIT
+        ));
+        assert!(!named_condition_lifecycle_trace_is_bounded(
+            NAMED_CONDITION_LIFECYCLE_TRACE_LIMIT + 1
+        ));
     }
 }
