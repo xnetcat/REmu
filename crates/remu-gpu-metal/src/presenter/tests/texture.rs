@@ -15,8 +15,8 @@ use super::{
     apply_image_destination_select, comparison_depth32_upload, create_sampled_guest_texture,
     decode_guest_texture_linear_from_raw, decode_image_descriptor, depth_array_face_descriptor,
     depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
-    guest_texture_byte_count,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
+    guest_texture_byte_count, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_storage, guest_texture_raw_matches, guest_texture_raw_range,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
@@ -419,6 +419,23 @@ fn mode27_texture_uses_physically_contiguous_disjoint_cpu_aliases() {
         &raw[usize::try_from(4 * GUEST_PAGE_SIZE).unwrap()
             ..usize::try_from(4 * GUEST_PAGE_SIZE).unwrap() + 32],
         &[0x72; 32]
+    );
+
+    memory
+        .write(second, &[0x73; 32])
+        .expect("change bytes through the disjoint second alias");
+    assert!(
+        watch
+            .content_has_changed()
+            .expect("validate dirty content through disjoint physical aliases"),
+        "batched fingerprinting must preserve physical order across virtual alias seams"
+    );
+    let raw = snapshot_watched_guest_texture_raw(descriptor, &watch)
+        .expect("refresh disjoint-alias fingerprint baseline");
+    assert_eq!(
+        &raw[usize::try_from(4 * GUEST_PAGE_SIZE).unwrap()
+            ..usize::try_from(4 * GUEST_PAGE_SIZE).unwrap() + 32],
+        &[0x73; 32]
     );
 }
 
@@ -1433,8 +1450,7 @@ fn resident_pressure_plan_keeps_overlapping_gpu_versions_indivisible() {
         resident.last_use = ResidentTextureActivityStamp { work, flip: 1 };
     }
 
-    let plan =
-        resident_texture_eviction_plan(&presenter.resident_guest_textures, 0, 2, usize::MAX);
+    let plan = resident_texture_eviction_plan(&presenter.resident_guest_textures, 0, 2, usize::MAX);
     assert!(
         plan.descriptors.is_empty(),
         "an overlapping GPU-owned version cannot be written back independently"
