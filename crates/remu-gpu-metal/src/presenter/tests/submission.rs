@@ -1469,7 +1469,186 @@ fn global_writeback_preserves_cpu_bytes_the_gpu_did_not_change() {
 }
 
 #[test]
-fn anonymous_global_writeback_rejects_replaced_guest_mapping() {
+fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
+    let mut address_space =
+        GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let base = address_space.base();
+    let stale_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("stale backing");
+    let replacement_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement backing");
+    let valid_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("valid backing");
+    let stale_address = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &stale_backing,
+            0,
+        )
+        .expect("stale mapping");
+    let valid_address = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base.checked_add(2 * GUEST_PAGE_SIZE).unwrap()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &valid_backing,
+            0,
+        )
+        .expect("valid mapping");
+    let stale_identity =
+        guest_shared_backing_identity(stale_address.get(), 4).expect("stale mapping identity");
+    let valid_identity =
+        guest_shared_backing_identity(valid_address.get(), 4).expect("valid mapping identity");
+    address_space
+        .unmap(stale_address, GUEST_PAGE_SIZE)
+        .expect("unmap stale allocation");
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(stale_address),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement mapping");
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device");
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let stale_buffer = device.new_buffer_with_data(
+        [1_u8, 2, 3, 4].as_ptr().cast(),
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let valid_buffer = device.new_buffer_with_data(
+        [5_u8, 6, 7, 8].as_ptr().cast(),
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let first_command_buffer = queue.new_command_buffer().to_owned();
+    first_command_buffer.commit();
+    presenter
+        .committed_guest_batches
+        .push_back(GuestCommandBatch {
+            command_buffer: first_command_buffer,
+            work: Vec::new(),
+            committed_at: None,
+            global_upload_chunks: Vec::new(),
+            global_writebacks: vec![
+                PendingGlobalWriteback {
+                    buffer: stale_buffer,
+                    offset: 0,
+                    guest_address: stale_address.get(),
+                    byte_count: 4,
+                    mapping_identity: Some(stale_identity),
+                    write_watch: None,
+                    original_bytes: vec![0; 4],
+                },
+                PendingGlobalWriteback {
+                    buffer: valid_buffer,
+                    offset: 0,
+                    guest_address: valid_address.get(),
+                    byte_count: 4,
+                    mapping_identity: Some(valid_identity),
+                    write_watch: None,
+                    original_bytes: vec![0; 4],
+                },
+            ],
+            guest_write_ranges: Vec::new(),
+            memory_writes: Vec::new(),
+            render_pass: None,
+            completion_sequences: Vec::new(),
+        });
+
+    let (_completion_space, completion_address) = mapped_test_label();
+    let second_command_buffer = queue.new_command_buffer().to_owned();
+    second_command_buffer.commit();
+    presenter
+        .committed_guest_batches
+        .push_back(GuestCommandBatch {
+            command_buffer: second_command_buffer,
+            work: Vec::new(),
+            committed_at: None,
+            global_upload_chunks: Vec::new(),
+            global_writebacks: Vec::new(),
+            guest_write_ranges: Vec::new(),
+            memory_writes: vec![
+                pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+                    address: completion_address,
+                    value: GpuMemoryReleaseValue::Immediate32(9),
+                }))
+                .expect("pin later completion label"),
+            ],
+            render_pass: None,
+            completion_sequences: Vec::new(),
+        });
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("a stale writeback must not fail this or later ordered batches");
+
+    let mut replacement = [0_u8; 4];
+    address_space
+        .read(stale_address, &mut replacement)
+        .expect("read replacement mapping");
+    assert_eq!(
+        replacement, [0; 4],
+        "the retired writeback must never touch replacement storage"
+    );
+    let mut valid = [0_u8; 4];
+    address_space
+        .read(valid_address, &mut valid)
+        .expect("read valid mapping");
+    assert_eq!(
+        valid,
+        [5, 6, 7, 8],
+        "an independent valid writeback in the same batch must complete"
+    );
+    assert_eq!(
+        read_test_label(completion_address),
+        9,
+        "later ordered work must execute after retiring the stale entry"
+    );
+}
+
+#[test]
+fn malformed_global_writeback_remains_fatal() {
+    let device = Device::system_default().expect("Metal device");
+    let buffer = device.new_buffer_with_data(
+        [1_u8, 2, 3, 4].as_ptr().cast(),
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let mut destination = [0_u8; 4];
+    let guest_address =
+        u64::try_from(destination.as_mut_ptr() as usize).expect("host pointer fits u64");
+
+    let error = write_back_pending_globals(&[PendingGlobalWriteback {
+        buffer,
+        offset: 0,
+        guest_address,
+        byte_count: destination.len(),
+        mapping_identity: None,
+        write_watch: None,
+        original_bytes: vec![0; destination.len() - 1],
+    }])
+    .err()
+    .expect("a malformed snapshot must remain fatal");
+
+    assert!(error.contains("snapshot length mismatch"));
+    assert_eq!(destination, [0; 4]);
+}
+
+#[test]
+fn anonymous_global_writeback_discards_replaced_guest_mapping() {
     let mut address_space =
         GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
     let address = address_space
@@ -1512,9 +1691,13 @@ fn anonymous_global_writeback_rejects_replaced_guest_mapping() {
         )
         .expect("replacement guest mapping");
 
-    let error = write_back_pending_globals(&[pending])
-        .expect_err("writeback must reject the replacement mapping");
-    assert!(error.contains("mapping changed before completion"));
+    let pending = [pending];
+    let applied =
+        write_back_pending_globals(&pending).expect("stale anonymous writeback is discarded");
+    assert!(
+        applied.is_empty(),
+        "a discarded writeback must not be published as a producer"
+    );
     let replacement = unsafe { std::slice::from_raw_parts(guest_address as *const u8, 4) }.to_vec();
     assert_eq!(replacement, [0, 0, 0, 0]);
 }
