@@ -377,6 +377,67 @@ pub fn guest_shared_backing_alias_segments(
     (!aliases.is_empty()).then_some(aliases)
 }
 
+/// Returns the written virtual range plus every live VA naming any shared-backing portion of it.
+///
+/// Unlike [`guest_shared_backing_alias_segments`], this accepts a range spanning independent
+/// shared mappings and anonymous gaps. The original VA remains present for gaps, while each shared
+/// subrange expands to all coherent physical aliases.
+pub(crate) fn guest_write_alias_segments(
+    address: u64,
+    byte_count: u64,
+) -> Vec<GuestSharedBackingSegment> {
+    let Some(end) = address.checked_add(byte_count) else {
+        return Vec::new();
+    };
+    if byte_count == 0 {
+        return Vec::new();
+    }
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let written_shared_intervals = mappings
+        .range(..end)
+        .filter_map(|(&mapping_start, record)| {
+            let intersection_start = mapping_start.max(address);
+            let intersection_end = record.end.min(end);
+            if intersection_start >= intersection_end {
+                return None;
+            }
+            let physical_start = record
+                .backing_offset
+                .checked_add(intersection_start.checked_sub(mapping_start)?)?;
+            let physical_end =
+                physical_start.checked_add(intersection_end.checked_sub(intersection_start)?)?;
+            Some((record.backing.id(), physical_start, physical_end))
+        })
+        .collect::<Vec<_>>();
+
+    let mut aliases = vec![GuestSharedBackingSegment {
+        address,
+        byte_count,
+    }];
+    for (backing_id, physical_start, physical_end) in written_shared_intervals {
+        aliases.extend(
+            mappings
+                .iter()
+                .filter(|(_, record)| record.backing.id() == backing_id)
+                .filter_map(|(&mapping_start, record)| {
+                    let mapping_length = record.end.checked_sub(mapping_start)?;
+                    let mapping_physical_end = record.backing_offset.checked_add(mapping_length)?;
+                    let intersection_start = record.backing_offset.max(physical_start);
+                    let intersection_end = mapping_physical_end.min(physical_end);
+                    (intersection_start < intersection_end).then(|| GuestSharedBackingSegment {
+                        address: mapping_start + (intersection_start - record.backing_offset),
+                        byte_count: intersection_end - intersection_start,
+                    })
+                }),
+        );
+    }
+    aliases.sort_unstable_by_key(|segment| (segment.address, segment.byte_count));
+    aliases.dedup();
+    aliases
+}
+
 /// Reports whether two guest ranges name overlapping bytes of one shared physical backing.
 ///
 /// The common case compares physical offsets without allocating an alias list. If the right-hand

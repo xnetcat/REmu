@@ -162,6 +162,7 @@ pub(crate) fn decode_agc_dma_data(
         byte_count,
         source_selection,
         destination_selection,
+        source_snapshot: None,
     })
 }
 

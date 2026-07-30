@@ -3,7 +3,7 @@
 
 use std::io;
 
-use super::{CpuWriteWatch, CpuWriteWatchRetirement};
+use super::{CpuWriteWatch, CpuWriteWatchRetirement, notify_guest_memory_written};
 
 struct TestMapping {
     pointer: *mut u8,
@@ -99,6 +99,105 @@ fn catches_cpu_writes_and_rearms_the_mapping() {
     assert!(watch.consume_dirty());
     assert_eq!(watch.generation(), 2);
     drop(watch);
+}
+
+#[test]
+fn explicit_host_write_notification_tracks_pages_and_generations_exactly() {
+    let page_size = page_size();
+    let mapping = TestMapping::new(3);
+    // SAFETY: the retained mapping contains all three watched pages.
+    let watch = unsafe { CpuWriteWatch::new(mapping.address(), (page_size * 3) as u64).unwrap() };
+
+    assert!(notify_guest_memory_written(
+        mapping.address() + page_size as u64 + 8,
+        16
+    ));
+    assert_eq!(
+        watch.dirty_page_ranges(),
+        vec![(mapping.address() + page_size as u64, page_size as u64)]
+    );
+    assert_eq!(watch.generation(), 1);
+    assert!(watch.consume_dirty());
+
+    // Repeated HLE publication before rearm reasserts range dirtiness without counting the same
+    // dirty page twice.
+    assert!(notify_guest_memory_written(
+        mapping.address() + page_size as u64 + 16,
+        16
+    ));
+    assert!(watch.is_dirty());
+    assert_eq!(watch.generation(), 1);
+    watch.rearm().unwrap();
+
+    assert!(notify_guest_memory_written(
+        mapping.address() + page_size as u64 + 24,
+        16
+    ));
+    assert_eq!(watch.generation(), 2);
+    watch.rearm().unwrap();
+
+    // A direct fault already published this page. The following explicit HLE notification must
+    // not double-count it.
+    // SAFETY: the write targets the live watched mapping.
+    unsafe { mapping.write(page_size + 32, 0x5a) };
+    assert_eq!(watch.generation(), 3);
+    assert!(notify_guest_memory_written(
+        mapping.address() + page_size as u64 + 32,
+        1
+    ));
+    assert_eq!(watch.generation(), 3);
+    assert!(!notify_guest_memory_written(u64::MAX, 2));
+    assert!(!notify_guest_memory_written(mapping.address(), 0));
+    drop(watch);
+}
+
+#[test]
+fn explicit_host_write_notification_reaches_every_physical_alias() {
+    use crate::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let base = memory.base();
+    let first = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("first alias");
+    let second_address = base
+        .checked_add(4 * GUEST_PAGE_SIZE)
+        .expect("second alias address");
+    let second = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(second_address),
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("second alias");
+    // SAFETY: both aliases remain mapped read/write until the watch is dropped.
+    let watched_second =
+        unsafe { CpuWriteWatch::new(second.get(), 2 * GUEST_PAGE_SIZE).expect("alias watch") };
+
+    assert!(notify_guest_memory_written(
+        first.get() + GUEST_PAGE_SIZE + 32,
+        64
+    ));
+    assert_eq!(
+        watched_second.dirty_page_ranges(),
+        vec![(second.get() + GUEST_PAGE_SIZE, GUEST_PAGE_SIZE)]
+    );
+    assert_eq!(watched_second.generation(), 1);
+    drop(watched_second);
 }
 
 #[test]

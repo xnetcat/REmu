@@ -25,6 +25,49 @@ use state::{
     arm_range, remember_writable_range, restore_unowned_pages, retire_overlapping, state,
 };
 
+/// Publishes bytes written directly by an HLE service into guest memory.
+///
+/// Host-side copies can bypass the faulting VA watched by a GPU resource when the same physical
+/// allocation has multiple guest aliases. Mark every live watch intersecting the original range or
+/// any coherent physical alias. Pages remain armed: a later guest store must still fault normally.
+#[must_use]
+pub fn notify_guest_memory_written(address: u64, byte_count: u64) -> bool {
+    let aliases = crate::address_space::guest_write_alias_segments(address, byte_count);
+    if aliases.is_empty() {
+        return false;
+    }
+    let mut notified = false;
+    let state = state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for range in state.ranges.values() {
+        let range_end = range.address.saturating_add(range.byte_count);
+        let mut range_notified = false;
+        for page in &range.pages {
+            let page_end = page.address.saturating_add(host_page_size_infallible());
+            let watched_start = page.address.max(range.address);
+            let watched_end = page_end.min(range_end);
+            if watched_start >= watched_end
+                || !aliases.iter().any(|segment| {
+                    let segment_end = segment.address.saturating_add(segment.byte_count);
+                    segment.address < watched_end && watched_start < segment_end
+                })
+            {
+                continue;
+            }
+            if !page.dirty.swap(true, Ordering::AcqRel) {
+                range.generation.fetch_add(1, Ordering::AcqRel);
+            }
+            range_notified = true;
+        }
+        if range_notified {
+            range.dirty.store(true, Ordering::Release);
+            notified = true;
+        }
+    }
+    notified
+}
+
 /// Why a CPU write watch stopped observing its original mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CpuWriteWatchRetirement {

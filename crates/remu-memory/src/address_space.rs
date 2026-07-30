@@ -34,6 +34,7 @@ pub use protection::{
 };
 
 mod shared;
+pub(crate) use shared::guest_write_alias_segments;
 pub use shared::{
     GuestSharedBackingRange, GuestSharedBackingSegment, GuestSharedMappingIdentity,
     guest_shared_backing_alias_segments, guest_shared_backing_identity, guest_shared_backing_range,

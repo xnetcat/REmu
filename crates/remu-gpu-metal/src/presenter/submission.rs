@@ -203,15 +203,18 @@ impl MetalPresenter {
                         eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
                     }
                 }
-                GpuEvent::MemoryCopy(copy) => match self.execute_guest_memory_copy(copy) {
-                    Ok(()) => self.receiver.retry_guest_memory_waits_overlapping(
-                        copy.destination_address,
-                        copy.byte_count,
-                    ),
-                    Err(error) => {
-                        eprintln!("[REMu][METAL] DMA_DATA synchronization failed: {error}");
+                GpuEvent::MemoryCopy(copy) => {
+                    let destination_address = copy.destination_address;
+                    let byte_count = copy.byte_count;
+                    match self.execute_guest_memory_copy(copy) {
+                        Ok(()) => self
+                            .receiver
+                            .retry_guest_memory_waits_overlapping(destination_address, byte_count),
+                        Err(error) => {
+                            eprintln!("[REMu][METAL] DMA_DATA synchronization failed: {error}");
+                        }
                     }
-                },
+                }
                 GpuEvent::MemoryWrite(write) => match self.execute_guest_memory_write(&write) {
                     Ok(()) => {
                         let byte_count = if write.increment_address {

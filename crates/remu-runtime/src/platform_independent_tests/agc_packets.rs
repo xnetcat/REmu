@@ -184,6 +184,7 @@ fn decodes_native_dma_immediate_fill_without_treating_the_value_as_an_address() 
             byte_count: 8,
             source_selection: 2,
             destination_selection: 3,
+            source_snapshot: None,
         })
     );
 }
@@ -228,7 +229,7 @@ fn draw_before_dma_keeps_the_pre_copy_index_snapshot_and_event_order() {
 
 #[test]
 fn dma_before_draw_shadows_indices_without_executing_the_copy_early() {
-    let source = [9_u16, 8, 7];
+    let mut source = [9_u16, 8, 7];
     let destination = [1_u16, 2, 3];
     let source_address = source.as_ptr().addr() as u64;
     let destination_address = destination.as_ptr().addr() as u64;
@@ -260,11 +261,66 @@ fn dma_before_draw_shadows_indices_without_executing_the_copy_early() {
         panic!("DMA and following draw must retain command order: {events:?}");
     };
     assert_eq!(copy.destination_address, destination_address);
+    let expected_source_bytes = [9_u16, 8, 7]
+        .into_iter()
+        .flat_map(u16::to_ne_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        copy.source_snapshot.as_deref(),
+        Some(expected_source_bytes.as_slice())
+    );
+    source.fill(0xffff);
+    assert_eq!(
+        copy.source_snapshot.as_deref(),
+        Some(expected_source_bytes.as_slice()),
+        "the queued event must retain packet-time bytes after the rotating source is reused"
+    );
     assert_eq!(
         draw.index_snapshot.as_deref(),
         Some([9, 8, 7].as_slice()),
         "following CPU-side draw decoding must observe the staged DMA result"
     );
+}
+
+#[test]
+fn chained_dma_snapshot_includes_earlier_submission_shadow_writes() {
+    let source = [0x11_u8, 0x22, 0x33, 0x44];
+    let intermediate = [0_u8; 4];
+    let destination = [0_u8; 4];
+    let mut commands = Vec::new();
+    append_native_memory_dma(
+        &mut commands,
+        source.as_ptr().addr() as u64,
+        intermediate.as_ptr().addr() as u64,
+        4,
+    );
+    append_native_memory_dma(
+        &mut commands,
+        intermediate.as_ptr().addr() as u64,
+        destination.as_ptr().addr() as u64,
+        4,
+    );
+
+    let events = capture_submission_events(
+        &commands,
+        &mut AgcGraphicsState::default(),
+        &mut AgcShaderRegistry::default(),
+    );
+    let [
+        remu_gpu::GpuEvent::MemoryCopy(first),
+        remu_gpu::GpuEvent::MemoryCopy(second),
+    ] = events.as_slice()
+    else {
+        panic!("two ordered DMA events expected: {events:?}");
+    };
+    assert_eq!(first.source_snapshot.as_deref(), Some(source.as_slice()));
+    assert_eq!(
+        second.source_snapshot.as_deref(),
+        Some(source.as_slice()),
+        "the second packet-time read must include the first DMA's staged bytes"
+    );
+    assert_eq!(intermediate, [0; 4]);
+    assert_eq!(destination, [0; 4]);
 }
 
 #[test]

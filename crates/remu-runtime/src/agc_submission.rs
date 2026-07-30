@@ -402,9 +402,26 @@ pub(crate) fn agc_handle_submission_packet(
         // need to observe this copy before the asynchronous backend reaches it. Stage that view
         // in the submission shadow without changing guest memory; the MemoryCopy event below is
         // the sole authoritative mutation and executes at this exact queue position.
-        let shadowed = stage_agc_memory_copy(&copy);
+        let mut copy = copy;
+        let staged = stage_agc_memory_copy(&copy).map_err(|error| {
+            AgcSubmissionError::MemorySnapshotBudget {
+                requested_bytes: error.requested_bytes,
+                limit_bytes: error.limit_bytes,
+            }
+        })?;
+        copy.source_snapshot = staged.source_snapshot;
         static DMA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static DMA_SNAPSHOT_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static DMA_SNAPSHOT_BYTES: AtomicUsize = AtomicUsize::new(0);
         let sequence = DMA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let snapshot_bytes = copy
+            .source_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.len());
+        if snapshot_bytes != 0 {
+            DMA_SNAPSHOT_COUNT.fetch_add(1, Ordering::Relaxed);
+            DMA_SNAPSHOT_BYTES.fetch_add(snapshot_bytes, Ordering::Relaxed);
+        }
         if trace_guest_sync()
             || trace_agc_programs()
             || sequence <= 32
@@ -414,13 +431,18 @@ pub(crate) fn agc_handle_submission_packet(
                 .contains(&copy.destination_address)
         {
             eprintln!(
-                "[REMu][AGC][DMA] sequence={sequence} packet={packet_address:#x} standard={} src_sel={} dst_sel={} source={:#x} destination={:#x} bytes={:#x} shadowed={shadowed}",
+                "[REMu][AGC][DMA] sequence={sequence} packet={packet_address:#x} standard={} src_sel={} dst_sel={} source={:#x} destination={:#x} bytes={:#x} shadowed={} snapshot_bytes={} snapshot_count={} snapshot_cumulative_bytes={} snapshot_retained={:?}",
                 opcode == AGC_IT_DMA_DATA,
                 copy.source_selection,
                 copy.destination_selection,
                 copy.source_address,
                 copy.destination_address,
                 copy.byte_count,
+                staged.shadowed,
+                snapshot_bytes,
+                DMA_SNAPSHOT_COUNT.load(Ordering::Relaxed),
+                DMA_SNAPSHOT_BYTES.load(Ordering::Relaxed),
+                remu_gpu::gpu_memory_copy_snapshot_statistics(),
             );
         }
         emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryCopy(copy));

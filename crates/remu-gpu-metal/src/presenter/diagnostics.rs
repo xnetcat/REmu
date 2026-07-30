@@ -1112,7 +1112,7 @@ pub(super) fn diagnostic_related_texture_writers(
     writers
 }
 
-pub(super) fn record_diagnostic_memory_copy(copy: GpuMemoryCopy) {
+pub(super) fn record_diagnostic_memory_copy(copy: &GpuMemoryCopy) {
     if !diagnostic_texture_writer_enabled() {
         return;
     }
@@ -1135,7 +1135,14 @@ pub(super) fn record_diagnostic_memory_copy(copy: GpuMemoryCopy) {
     if copies.len() == CAPACITY {
         copies.pop_front();
     }
-    copies.push_back(copy);
+    copies.push_back(GpuMemoryCopy {
+        source_address: copy.source_address,
+        destination_address: copy.destination_address,
+        byte_count: copy.byte_count,
+        source_selection: copy.source_selection,
+        destination_selection: copy.destination_selection,
+        source_snapshot: None,
+    });
 }
 
 pub(super) fn diagnostic_memory_copies() -> &'static Mutex<VecDeque<GpuMemoryCopy>> {
@@ -1163,7 +1170,7 @@ pub(super) fn diagnostic_overlapping_memory_copies(
             )
         })
         .take(16)
-        .copied()
+        .cloned()
         .collect()
 }
 

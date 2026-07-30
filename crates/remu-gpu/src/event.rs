@@ -3,6 +3,14 @@
 //! Ordered guest GPU events and the command payloads they carry.
 
 use crate::{ComputeDispatch, GpuHostImage, IndexedDraw};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const GPU_MEMORY_COPY_SNAPSHOT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+static GPU_MEMORY_COPY_SNAPSHOT_RETAINED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+static GPU_MEMORY_COPY_SNAPSHOT_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GpuEvent {
@@ -110,13 +118,141 @@ pub struct GpuMemoryAcquire {
 }
 
 /// An ordered command-processor byte copy emitted by a Gen5 `DMA_DATA` packet.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct GpuMemoryCopy {
     pub source_address: u64,
     pub destination_address: u64,
     pub byte_count: u64,
     pub source_selection: u32,
     pub destination_selection: u32,
+    /// Immutable CPU-source bytes observed while decoding this packet.
+    ///
+    /// GPU-authored sources ignore this snapshot after their ordered producer completes.
+    pub source_snapshot: Option<GpuMemoryCopySnapshot>,
+}
+
+impl std::fmt::Debug for GpuMemoryCopy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GpuMemoryCopy")
+            .field("source_address", &self.source_address)
+            .field("destination_address", &self.destination_address)
+            .field("byte_count", &self.byte_count)
+            .field("source_selection", &self.source_selection)
+            .field("destination_selection", &self.destination_selection)
+            .field(
+                "source_snapshot_bytes",
+                &self.source_snapshot.as_ref().map(|snapshot| snapshot.len()),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct GpuMemoryCopySnapshotAllocation {
+    bytes: Arc<[u8]>,
+}
+
+impl Drop for GpuMemoryCopySnapshotAllocation {
+    fn drop(&mut self) {
+        GPU_MEMORY_COPY_SNAPSHOT_RETAINED_BYTES.fetch_sub(self.bytes.len(), Ordering::AcqRel);
+    }
+}
+
+/// A globally budgeted immutable DMA source allocation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GpuMemoryCopySnapshot(Arc<GpuMemoryCopySnapshotAllocation>);
+
+impl GpuMemoryCopySnapshot {
+    /// Retains an existing packet-time allocation without copying it.
+    pub fn try_new(bytes: Arc<[u8]>) -> Result<Self, GpuMemoryCopySnapshotBudgetExceeded> {
+        let byte_count = bytes.len();
+        let retained = GPU_MEMORY_COPY_SNAPSHOT_RETAINED_BYTES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+                retained
+                    .checked_add(byte_count)
+                    .filter(|total| *total <= GPU_MEMORY_COPY_SNAPSHOT_BUDGET_BYTES)
+            })
+            .map_err(|retained| GpuMemoryCopySnapshotBudgetExceeded {
+                requested_bytes: retained.saturating_add(byte_count),
+                limit_bytes: GPU_MEMORY_COPY_SNAPSHOT_BUDGET_BYTES,
+            })?
+            .saturating_add(byte_count);
+        GPU_MEMORY_COPY_SNAPSHOT_PEAK_BYTES.fetch_max(retained, Ordering::Relaxed);
+        Ok(Self(Arc::new(GpuMemoryCopySnapshotAllocation { bytes })))
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.bytes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.bytes.is_empty()
+    }
+
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0.bytes.as_ptr()
+    }
+}
+
+impl std::ops::Deref for GpuMemoryCopySnapshot {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.bytes
+    }
+}
+
+impl std::fmt::Debug for GpuMemoryCopySnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GpuMemoryCopySnapshot")
+            .field("bytes", &self.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMemoryCopySnapshotBudgetExceeded {
+    pub requested_bytes: usize,
+    pub limit_bytes: usize,
+}
+
+/// Returns current, peak, and maximum retained DMA source snapshot bytes.
+#[must_use]
+pub fn gpu_memory_copy_snapshot_statistics() -> (usize, usize, usize) {
+    (
+        GPU_MEMORY_COPY_SNAPSHOT_RETAINED_BYTES.load(Ordering::Acquire),
+        GPU_MEMORY_COPY_SNAPSHOT_PEAK_BYTES.load(Ordering::Relaxed),
+        GPU_MEMORY_COPY_SNAPSHOT_BUDGET_BYTES,
+    )
+}
+
+#[cfg(test)]
+mod memory_copy_snapshot_tests {
+    use super::{GpuMemoryCopySnapshot, gpu_memory_copy_snapshot_statistics};
+    use std::sync::Arc;
+
+    #[test]
+    fn snapshot_budget_accounts_one_shared_allocation_until_its_last_owner_drops() {
+        let before = gpu_memory_copy_snapshot_statistics().0;
+        let snapshot = GpuMemoryCopySnapshot::try_new(Arc::<[u8]>::from([1, 2, 3, 4]))
+            .expect("small snapshot fits global budget");
+        assert_eq!(gpu_memory_copy_snapshot_statistics().0, before + 4);
+        let clone = snapshot.clone();
+        assert_eq!(
+            gpu_memory_copy_snapshot_statistics().0,
+            before + 4,
+            "cloning an event must not charge shared bytes twice"
+        );
+        drop(snapshot);
+        assert_eq!(gpu_memory_copy_snapshot_statistics().0, before + 4);
+        drop(clone);
+        assert_eq!(gpu_memory_copy_snapshot_statistics().0, before);
+    }
 }
 
 /// An ordered CPU-visible label write produced by a Gen5 end-of-pipe packet.

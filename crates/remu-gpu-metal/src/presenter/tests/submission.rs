@@ -8,8 +8,8 @@ use metal::{
 };
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuMemoryAcquire,
-    GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier,
-    GpuPipelineStage, gpu_event_channel,
+    GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
+    GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
 };
 use remu_memory::{
     CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -56,6 +56,160 @@ fn mapped_test_label() -> (GuestAddressSpace, u64) {
 fn read_test_label(address: u64) -> u32 {
     // SAFETY: every caller retains the `GuestAddressSpace` returned by `mapped_test_label`.
     unsafe { std::ptr::read_volatile(address as *const u32) }
+}
+
+#[test]
+fn dma_uses_packet_time_cpu_snapshot_after_source_reuse() {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest DMA address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest DMA backing");
+    let base = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest DMA mapping");
+    let source = base.get();
+    let destination_address = base.checked_add(128).expect("destination guest address");
+    let destination = destination_address.get();
+    address_space
+        .write(base, &[1, 2, 3, 4])
+        .expect("initial source");
+    let snapshot = remu_gpu::GpuMemoryCopySnapshot::try_new(Arc::<[u8]>::from([1, 2, 3, 4]))
+        .expect("snapshot budget");
+    address_space
+        .write(base, &[9, 9, 9, 9])
+        .expect("recycled source");
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter
+        .execute_guest_memory_copy(GpuMemoryCopy {
+            source_address: source,
+            destination_address: destination,
+            byte_count: 4,
+            source_selection: 3,
+            destination_selection: 3,
+            source_snapshot: Some(snapshot),
+        })
+        .expect("snapshot DMA");
+    let mut copied = [0_u8; 4];
+    address_space
+        .read(destination_address, &mut copied)
+        .expect("copied destination");
+    assert_eq!(copied, [1, 2, 3, 4]);
+}
+
+#[test]
+fn dma_rejects_a_truncated_packet_time_snapshot() {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest DMA address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest DMA backing");
+    let base = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest DMA mapping");
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let error = presenter
+        .execute_guest_memory_copy(GpuMemoryCopy {
+            source_address: base.get(),
+            destination_address: base.get() + 128,
+            byte_count: 4,
+            source_selection: 3,
+            destination_selection: 3,
+            source_snapshot: Some(
+                remu_gpu::GpuMemoryCopySnapshot::try_new(Arc::<[u8]>::from([1, 2, 3]))
+                    .expect("snapshot budget"),
+            ),
+        })
+        .expect_err("truncated snapshot must fail");
+    assert!(error.contains("snapshot length mismatch"), "{error}");
+}
+
+#[test]
+fn dma_ignores_cpu_snapshot_when_an_ordered_gpu_source_is_authoritative() {
+    let mut address_space =
+        GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest DMA address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest DMA backing");
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(address_space.base()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("GPU producer alias");
+    let source_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(
+                address_space
+                    .base()
+                    .checked_add(2 * GUEST_PAGE_SIZE)
+                    .expect("source alias address"),
+            ),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("DMA source alias");
+    let source = source_alias.get();
+    let destination_address = source_alias
+        .checked_add(128)
+        .expect("destination guest address");
+    address_space
+        .write(source_alias, &[9, 9, 9, 9])
+        .expect("GPU-current source bytes");
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: producer_alias.get(),
+        instruction_pcs: Default::default(),
+        byte_count: 4,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: false,
+    };
+    let _producer = record_zero_copy_guest_writer(&mut presenter, &device, &binding);
+    presenter
+        .execute_guest_memory_copy(GpuMemoryCopy {
+            source_address: source,
+            destination_address: destination_address.get(),
+            byte_count: 4,
+            source_selection: 3,
+            destination_selection: 3,
+            source_snapshot: Some(
+                remu_gpu::GpuMemoryCopySnapshot::try_new(Arc::<[u8]>::from([1, 2, 3, 4]))
+                    .expect("snapshot budget"),
+            ),
+        })
+        .expect("GPU-authoritative DMA");
+    let mut copied = [0_u8; 4];
+    address_space
+        .read(destination_address, &mut copied)
+        .expect("copied destination");
+    assert_eq!(
+        copied,
+        [9, 9, 9, 9],
+        "an ordered GPU producer through a physical alias must win over the earlier CPU snapshot"
+    );
 }
 
 fn evaluation_with_global(binding: GlobalMemoryBinding) -> ShaderEvaluation {

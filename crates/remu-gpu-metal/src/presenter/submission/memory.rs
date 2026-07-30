@@ -17,7 +17,7 @@ use remu_gpu::{
 };
 use remu_memory::{
     CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_mapping_identity,
-    read_guest_shared_backing, write_guest_shared_backing_if_identity,
+    notify_guest_memory_written, read_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -75,7 +75,19 @@ impl MetalPresenter {
         copy.destination_address
             .checked_add(copy.byte_count)
             .ok_or("DMA destination range overflows")?;
-        record_diagnostic_memory_copy(copy);
+        if let Some(snapshot) = copy.source_snapshot.as_ref()
+            && snapshot.len() != byte_count
+        {
+            return Err(format!(
+                "DMA source snapshot length mismatch bytes={} snapshot={}",
+                byte_count,
+                snapshot.len()
+            ));
+        }
+        if copy.source_selection == 2 && copy.source_snapshot.is_some() {
+            return Err("immediate DMA fill unexpectedly retained a source snapshot".to_owned());
+        }
+        record_diagnostic_memory_copy(&copy);
 
         if copy.source_selection == 2 {
             if !copy.destination_address.is_multiple_of(4) || !copy.byte_count.is_multiple_of(4) {
@@ -125,6 +137,7 @@ impl MetalPresenter {
             }) || self.committed_guest_batches.iter().any(|batch| {
                 guest_batch_writes_overlap(batch, copy.source_address, copy.byte_count)
             });
+            let mut authoritative_gpu_source = pending_source_write;
             if !source_descriptors.is_empty() || pending_source_write {
                 self.wait_for_guest_command_batches()?;
             }
@@ -171,6 +184,7 @@ impl MetalPresenter {
                         }
                         continue;
                     }
+                    authoritative_gpu_source = true;
                     let (alias_ranges, content_version) = {
                         let resident = self
                             .resident_guest_textures
@@ -204,16 +218,29 @@ impl MetalPresenter {
                 }
             }
 
-            // SAFETY: the runtime decodes DMA only for bounded non-null guest virtual addresses.
-            // The guest owns these mappings for the lifetime of the ordered GPU event stream.
-            // `copy` intentionally provides memmove semantics for legal overlapping packets.
-            unsafe {
-                std::ptr::copy(
-                    copy.source_address as *const u8,
-                    copy.destination_address as *mut u8,
-                    byte_count,
-                );
+            if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref() {
+                // SAFETY: snapshot validation above proves a complete immutable packet-time
+                // source, and the runtime validated the destination guest mapping.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        snapshot.as_ptr(),
+                        copy.destination_address as *mut u8,
+                        byte_count,
+                    );
+                }
+            } else {
+                // SAFETY: the runtime decodes DMA only for bounded non-null guest virtual
+                // addresses. The guest owns these mappings for the ordered event stream. The live
+                // path intentionally provides memmove semantics for legal overlapping packets.
+                unsafe {
+                    std::ptr::copy(
+                        copy.source_address as *const u8,
+                        copy.destination_address as *mut u8,
+                        byte_count,
+                    );
+                }
             }
+            let _ = notify_guest_memory_written(copy.destination_address, copy.byte_count);
             self.record_submitted_gpu_waits_in_range(copy.destination_address, copy.byte_count);
         }
 

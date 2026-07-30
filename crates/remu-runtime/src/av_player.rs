@@ -6,6 +6,8 @@ use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use remu_memory::notify_guest_memory_written;
+
 use crate::{
     AvPlayerDecoder, AvPlayerDecoderProgress, AvPlayerEventCallback, AvPlayerEventDelivery,
     AvPlayerInstance, AvPlayerTextureDeallocation, PROBE_DISPATCH, ProbeDispatchState,
@@ -1191,6 +1193,7 @@ fn av_player_write_video_frame(
     player.next_video_buffer = (player.next_video_buffer + 1) % 3;
     // SAFETY: the destination is one complete slice of the dedicated three-frame allocation.
     unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), address as *mut u8, frame.len()) };
+    let _ = notify_guest_memory_written(address, u64::try_from(frame.len()).unwrap_or(u64::MAX));
     av_player_write_video_frame_info(
         output,
         address,

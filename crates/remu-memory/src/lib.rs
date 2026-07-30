@@ -13,7 +13,16 @@ use thiserror::Error;
 #[cfg(target_os = "macos")]
 mod write_watch;
 #[cfg(target_os = "macos")]
+pub use write_watch::notify_guest_memory_written;
+#[cfg(target_os = "macos")]
 pub use write_watch::{CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement};
+
+/// Non-macOS builds have no unified-memory write-watch backend to notify.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn notify_guest_memory_written(_address: u64, _byte_count: u64) -> bool {
+    false
+}
 
 #[cfg(target_os = "macos")]
 mod address_space;
