@@ -5,13 +5,13 @@ use super::super::completion::commit_and_settle;
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
-    MultisampleTextureKey, ResidentGuestTexture, ScanoutSnapshotTexture, WriteWatchRefresh,
-    create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
-    decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
-    guest_texture_byte_count, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_storage, initial_depth_clear_for_target,
-    mode27_mip_chain_layout, promote_resident_mip_hierarchy, record_mode27_work_detail,
-    refresh_resident_texture_write_watch, resident_texture_for_sample,
+    MultisampleTextureKey, ResidentGuestTexture, ResidentTextureActivityStamp,
+    ScanoutSnapshotTexture, WriteWatchRefresh, create_mipmapped_guest_texture,
+    decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
+    decode_sampled_texture_linear_from_raw, guest_texture_byte_count,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage,
+    initial_depth_clear_for_target, mode27_mip_chain_layout, promote_resident_mip_hierarchy,
+    record_mode27_work_detail, refresh_resident_texture_write_watch, resident_texture_for_sample,
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
     snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
@@ -186,7 +186,9 @@ impl MetalPresenter {
                 )
                 .ok_or_else(|| "promoted storage hierarchy cannot represent view".to_owned());
             }
-            self.resident_guest_textures.remove(&descriptor.guest);
+            if let Some(resident) = self.resident_guest_textures.remove(&descriptor.guest) {
+                trace_resident_texture_removal("mip-promotion-mapping-replaced", &resident);
+            }
         }
         let needs_clean_promotion = self
             .resident_guest_textures
@@ -252,7 +254,9 @@ impl MetalPresenter {
                 WriteWatchRefresh::Replaced => {}
             }
         }
-        self.resident_guest_textures.remove(&descriptor);
+        if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+            trace_resident_texture_removal("ensure-exact-resident-replaced", &resident);
+        }
         let shared_resident = self
             .resident_guest_textures
             .values()
@@ -273,7 +277,12 @@ impl MetalPresenter {
                 | WriteWatchRefresh::Reprotecting
                 | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
                 WriteWatchRefresh::Replaced => {
-                    self.resident_guest_textures.remove(&shared_resident);
+                    if let Some(resident) = self.resident_guest_textures.remove(&shared_resident) {
+                        trace_resident_texture_removal(
+                            "ensure-shared-resident-mapping-replaced",
+                            &resident,
+                        );
+                    }
                 }
             }
         }
@@ -464,7 +473,9 @@ impl MetalPresenter {
                 .insert(target.texture, promoted);
             return Ok(texture);
         }
-        self.resident_guest_textures.remove(&target.texture);
+        if let Some(resident) = self.resident_guest_textures.remove(&target.texture) {
+            trace_resident_texture_removal("mipmapped-target-resident-replaced", &resident);
+        }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
         let started = Instant::now();
         let layout = mode27_mip_chain_layout(target.texture, target.mip_level_count)?;
@@ -508,6 +519,7 @@ impl MetalPresenter {
                 gpu_written: false,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
+                activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
         Ok(texture)
@@ -572,7 +584,9 @@ impl MetalPresenter {
                 target.texture.address, target.layer_count
             ));
         }
-        self.resident_guest_textures.remove(&target.texture);
+        if let Some(resident) = self.resident_guest_textures.remove(&target.texture) {
+            trace_resident_texture_removal("layered-target-resident-replaced", &resident);
+        }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
         let descriptor = DecodedImageDescriptor {
             guest: target.texture,
@@ -603,6 +617,7 @@ impl MetalPresenter {
                 gpu_written: false,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
+                activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
         Ok(texture)
@@ -797,10 +812,17 @@ impl MetalPresenter {
                     write_resident_texture_contents_to_guest(device, &queue, &resident)?;
                 } else if refresh != WriteWatchRefresh::Replaced {
                     trace_resident_texture_removal("cpu-reused-layered-depth-alias", &resident);
+                } else {
+                    trace_resident_texture_removal(
+                        "layered-depth-alias-mapping-replaced",
+                        &resident,
+                    );
                 }
             }
         }
-        self.resident_guest_textures.remove(&depth.texture);
+        if let Some(resident) = self.resident_guest_textures.remove(&depth.texture) {
+            trace_resident_texture_removal("layered-depth-resident-replaced", &resident);
+        }
 
         let descriptor = DecodedImageDescriptor {
             guest: depth.texture,
@@ -835,6 +857,7 @@ impl MetalPresenter {
                 gpu_written: false,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
+                activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
         Ok(texture)
@@ -964,15 +987,25 @@ impl MetalPresenter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_resident_texture_written(&mut self, descriptor: GuestTextureDescriptor) {
-        self.mark_resident_texture_written_preserving_multisample(descriptor);
+        self.mark_resident_texture_written_at(descriptor, ResidentTextureActivityStamp::default());
+    }
+
+    pub(crate) fn mark_resident_texture_written_at(
+        &mut self,
+        descriptor: GuestTextureDescriptor,
+        activity_stamp: ResidentTextureActivityStamp,
+    ) {
+        self.mark_resident_texture_written_preserving_multisample_at(descriptor, activity_stamp);
         self.multisample_textures
             .retain(|key, _| !guest_texture_descriptors_overlap(key.descriptor, descriptor));
     }
 
-    pub(crate) fn mark_resident_texture_written_preserving_multisample(
+    pub(crate) fn mark_resident_texture_written_preserving_multisample_at(
         &mut self,
         descriptor: GuestTextureDescriptor,
+        activity_stamp: ResidentTextureActivityStamp,
     ) {
         self.resident_content_version = self.resident_content_version.saturating_add(1);
         let resident_descriptor = self
@@ -1011,11 +1044,39 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .get_mut(&resident_descriptor)
                 .expect("selected resident survived clean-alias retirement");
+            if let Some(activity) = resident.activity.as_mut() {
+                activity.note_write(activity_stamp);
+            }
             resident.gpu_written = true;
             resident.content_version = self.resident_content_version;
             resident.note_gpu_write();
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
+    }
+
+    pub(crate) fn note_resident_texture_read_at(
+        &mut self,
+        descriptor: GuestTextureDescriptor,
+        activity_stamp: ResidentTextureActivityStamp,
+    ) {
+        let resident_descriptor = self
+            .resident_guest_textures
+            .contains_key(&descriptor)
+            .then_some(descriptor)
+            .or_else(|| {
+                self.resident_guest_textures
+                    .values()
+                    .find(|resident| {
+                        guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
+                    })
+                    .map(|resident| resident.descriptor)
+            });
+        if let Some(resident) = resident_descriptor.and_then(|resident_descriptor| {
+            self.resident_guest_textures.get_mut(&resident_descriptor)
+        }) && let Some(activity) = resident.activity.as_mut()
+        {
+            activity.note_read(activity_stamp);
+        }
     }
 }
 
@@ -1077,7 +1138,15 @@ pub(crate) fn ensure_resident_texture_in_map(
             WriteWatchRefresh::Replaced => {}
         }
     }
-    resident_guest_textures.remove(&descriptor);
+    if let Some(resident) = resident_guest_textures.remove(&descriptor) {
+        let reason = if resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced)
+        {
+            "ensure-map-mapping-replaced"
+        } else {
+            "ensure-map-incompatible-resident"
+        };
+        trace_resident_texture_removal(reason, &resident);
+    }
     let write_watch = watch_guest_texture(descriptor)?;
     let usage = MTLTextureUsage::RenderTarget
         | MTLTextureUsage::ShaderRead
@@ -1104,6 +1173,7 @@ pub(crate) fn ensure_resident_texture_in_map(
             gpu_written: false,
             content_version: 0,
             gpu_write_watch_generations: Vec::new(),
+            activity: super::super::ResidentTextureActivity::enabled(),
         },
     );
     Ok(texture)

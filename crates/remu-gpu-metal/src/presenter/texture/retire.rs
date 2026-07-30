@@ -21,8 +21,23 @@ pub(crate) fn trace_resident_texture_removal(reason: &str, resident: &ResidentGu
         return;
     }
     let descriptor = resident.descriptor;
+    let activity_stamp = |work: Option<u64>, flip: Option<u64>| {
+        work.zip(flip).map_or_else(
+            || "never".to_owned(),
+            |(work, flip)| format!("{work}@f{flip}"),
+        )
+    };
+    let (last_read, last_write) = resident.activity.map_or_else(
+        || ("disabled".to_owned(), "disabled".to_owned()),
+        |activity| {
+            (
+                activity_stamp(activity.last_read_work, activity.last_read_flip),
+                activity_stamp(activity.last_write_work, activity.last_write_flip),
+            )
+        },
+    );
     eprintln!(
-        "[REMu][METAL][RESIDENCY-REMOVE] reason={reason} texture={:#x}/{}x{}/p{}/{:?}/tile{}/type{}/layers{}/mips{}/gpu{}/v{} dirty={}",
+        "[REMu][METAL][RESIDENCY-REMOVE] reason={reason} texture={:#x}/{}x{}/p{}/{:?}/tile{}/type{}/layers{}/mips{}/gpu{}/v{} dirty={} read={} write={}",
         descriptor.address,
         descriptor.width,
         descriptor.height,
@@ -35,6 +50,8 @@ pub(crate) fn trace_resident_texture_removal(reason: &str, resident: &ResidentGu
         resident.gpu_written,
         resident.content_version,
         resident.write_watch.is_dirty(),
+        last_read,
+        last_write,
     );
 }
 

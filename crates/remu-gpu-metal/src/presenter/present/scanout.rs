@@ -203,7 +203,9 @@ impl MetalPresenter {
         let refresh = refresh_resident_texture_write_watch(resident)?;
         match refresh {
             WriteWatchRefresh::Replaced => {
-                self.resident_guest_textures.remove(&descriptor);
+                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                    trace_resident_texture_removal("scanout-mapping-replaced", &resident);
+                }
                 return Ok(());
             }
             WriteWatchRefresh::Reprotecting => return Ok(()),

@@ -6,14 +6,16 @@ use super::{
     MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS,
     MetalPresenter, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED,
     PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_DRAW_GATES, PresenterFlow, RESIDENT_DEPTH_SAMPLE_HITS,
-    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, SAMPLED_ALIAS_WRITEBACK_BYTES,
-    SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
-    SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
-    SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
-    TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
-    TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
-    TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    describe_guest_batch, presentation_drawable_size, process_resident_bytes,
+    RESIDENT_FLIP_AGE_LABELS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WORK_AGE_LABELS,
+    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
+    SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
+    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, TEXTURE_DIRTY_VALIDATION_BYTES,
+    TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
+    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
+    TEXTURE_SNAPSHOT_NANOSECONDS, describe_guest_batch, presentation_drawable_size,
+    process_resident_bytes, resident_texture_activity_latest_work, resident_texture_activity_stats,
+    resident_texture_backing_overlap_stats, resident_texture_lifetime_diagnostics_enabled,
     resident_texture_ownership_stats, take_mode27_work_details, take_texture_dirty_work_details,
     take_texture_snapshot_work_details,
 };
@@ -454,6 +456,109 @@ impl MetalPresenter {
                 target_ownership.unresolved_backing_bytes as f64 / (1024.0 * 1024.0),
                 largest_targets,
             );
+            if resident_texture_lifetime_diagnostics_enabled() {
+                let current_work = resident_texture_activity_latest_work();
+                let current_flip = self.next_flip_sequence;
+                let activity = resident_texture_activity_stats(
+                    &self.resident_guest_textures,
+                    current_work,
+                    current_flip,
+                );
+                macro_rules! format_age_buckets {
+                    ($labels:expr, $buckets:expr) => {
+                        $labels
+                            .iter()
+                            .zip($buckets.iter())
+                            .map(|(label, bucket)| {
+                                format!(
+                                    "{label}:{}/{:.1}MiB(gpu:{}/{:.1},cpu:{}/{:.1})",
+                                    bucket.resident_count,
+                                    bucket.resident_bytes as f64 / (1024.0 * 1024.0),
+                                    bucket.gpu_owned_count,
+                                    bucket.gpu_owned_bytes as f64 / (1024.0 * 1024.0),
+                                    bucket.cpu_owned_count,
+                                    bucket.cpu_owned_bytes as f64 / (1024.0 * 1024.0),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                }
+                eprintln!(
+                    "[REMu][PERF-METAL-TARGET-ACTIVITY] now=work:{current_work}/flip:{current_flip} read_work=[{}] write_work=[{}] read_flip=[{}] write_flip=[{}]",
+                    format_age_buckets!(RESIDENT_WORK_AGE_LABELS, activity.read_work),
+                    format_age_buckets!(RESIDENT_WORK_AGE_LABELS, activity.write_work),
+                    format_age_buckets!(RESIDENT_FLIP_AGE_LABELS, activity.read_flip),
+                    format_age_buckets!(RESIDENT_FLIP_AGE_LABELS, activity.write_flip),
+                );
+
+                let overlap = resident_texture_backing_overlap_stats(&self.resident_guest_textures);
+                eprintln!(
+                    "[REMu][PERF-METAL-TARGET-OVERLAP] pairs={}/{:.1}MiB residents={}/{:.1}MiB gpu={}/{:.1}MiB cpu={}/{:.1}MiB",
+                    overlap.pair_count,
+                    overlap.pair_overlap_bytes as f64 / (1024.0 * 1024.0),
+                    overlap.resident_count,
+                    overlap.resident_bytes as f64 / (1024.0 * 1024.0),
+                    overlap.gpu_owned_count,
+                    overlap.gpu_owned_bytes as f64 / (1024.0 * 1024.0),
+                    overlap.cpu_owned_count,
+                    overlap.cpu_owned_bytes as f64 / (1024.0 * 1024.0),
+                );
+
+                let mut oldest = self
+                    .resident_guest_textures
+                    .values()
+                    .filter_map(|resident| {
+                        let activity = resident.activity?;
+                        let last_work = activity.last_read_work.max(activity.last_write_work);
+                        let last_flip = activity.last_read_flip.max(activity.last_write_flip);
+                        Some((last_work, last_flip, resident, activity))
+                    })
+                    .collect::<Vec<_>>();
+                oldest.sort_unstable_by_key(|(last_work, last_flip, ..)| {
+                    (
+                        last_work.is_some(),
+                        *last_work,
+                        last_flip.is_some(),
+                        *last_flip,
+                    )
+                });
+                let display_stamp = |work: Option<u64>, flip: Option<u64>| {
+                    work.zip(flip).map_or_else(
+                        || "never".to_owned(),
+                        |(work, flip)| format!("{work}@f{flip}"),
+                    )
+                };
+                let oldest = oldest
+                    .into_iter()
+                    .take(16)
+                    .map(|(last_work, last_flip, resident, activity)| {
+                        format!(
+                            "{:#x}/{}x{}/{:?}/tile{}={:.1}MiB/gpu{}/v{}/r{}/w{}/age{}w+{}f",
+                            resident.descriptor.address,
+                            resident.descriptor.width,
+                            resident.descriptor.height,
+                            resident.descriptor.pixel_format,
+                            resident.descriptor.tile_mode,
+                            texture_allocated_bytes(&resident.texture) as f64 / (1024.0 * 1024.0),
+                            resident.gpu_written,
+                            resident.content_version,
+                            display_stamp(activity.last_read_work, activity.last_read_flip),
+                            display_stamp(activity.last_write_work, activity.last_write_flip),
+                            last_work.map_or_else(
+                                || "never".to_owned(),
+                                |last| current_work.saturating_sub(last).to_string(),
+                            ),
+                            last_flip.map_or_else(
+                                || "never".to_owned(),
+                                |last| current_flip.saturating_sub(last).to_string(),
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                eprintln!("[REMu][PERF-METAL-TARGET-IDLE] oldest=[{oldest}]");
+            }
             eprintln!(
                 "[REMu][PERF-GLOBAL-CACHE] captured={}/{:.1}MiB identity={}/{:.1}MiB",
                 self.global_buffer_cache.len(),
