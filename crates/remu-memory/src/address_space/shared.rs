@@ -357,13 +357,14 @@ pub fn write_guest_shared_backing_if_identity(
     backing.write_all_at(offset, source)
 }
 
-pub(super) fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
+fn unregister_shared_mapping_range_locked(
+    mappings: &mut BTreeMap<u64, SharedMappingRecord>,
+    address: u64,
+    byte_count: u64,
+) {
     let Some(end) = address.checked_add(byte_count) else {
         return;
     };
-    let mut mappings = shared_mappings()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let overlaps = mappings
         .range(..end)
         .filter(|(start, record)| record.end > address && **start < end)
@@ -393,25 +394,96 @@ pub(super) fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
     }
 }
 
+pub(super) fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
+    let mut mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    unregister_shared_mapping_range_locked(&mut mappings, address, byte_count);
+}
+
+fn records_are_physically_contiguous(
+    left_start: u64,
+    left: &SharedMappingRecord,
+    right_start: u64,
+    right: &SharedMappingRecord,
+) -> bool {
+    left.end == right_start
+        && left.backing.id() == right.backing.id()
+        && left
+            .backing_offset
+            .checked_add(left.end - left_start)
+            .is_some_and(|left_backing_end| left_backing_end == right.backing_offset)
+}
+
+fn coalesce_shared_mapping_record(mappings: &mut BTreeMap<u64, SharedMappingRecord>, address: u64) {
+    let mut merged_start = address;
+    let Some(current) = mappings.get(&merged_start).cloned() else {
+        return;
+    };
+    if let Some((&previous_start, previous)) = mappings.range(..merged_start).next_back()
+        && records_are_physically_contiguous(previous_start, previous, merged_start, &current)
+    {
+        let previous = previous.clone();
+        mappings.remove(&previous_start);
+        mappings.remove(&merged_start);
+        mappings.insert(
+            previous_start,
+            SharedMappingRecord {
+                end: current.end,
+                backing: previous.backing,
+                backing_offset: previous.backing_offset,
+            },
+        );
+        merged_start = previous_start;
+    }
+
+    while let Some(current) = mappings.get(&merged_start).cloned() {
+        let Some(next) = mappings.get(&current.end).cloned() else {
+            break;
+        };
+        if !records_are_physically_contiguous(merged_start, &current, current.end, &next) {
+            break;
+        }
+        mappings.remove(&merged_start);
+        mappings.remove(&current.end);
+        mappings.insert(
+            merged_start,
+            SharedMappingRecord {
+                end: next.end,
+                backing: current.backing,
+                backing_offset: current.backing_offset,
+            },
+        );
+    }
+}
+
 pub(super) fn register_shared_mapping_range(
     address: u64,
     byte_count: u64,
     backing: &GuestPhysicalBacking,
     backing_offset: u64,
 ) {
+    if byte_count == 0 {
+        return;
+    }
     let Some(end) = address.checked_add(byte_count) else {
         return;
     };
-    unregister_shared_mapping_range(address, byte_count);
-    shared_mappings()
+    let mut mappings = shared_mappings()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            address,
-            SharedMappingRecord {
-                end,
-                backing: backing.clone(),
-                backing_offset,
-            },
-        );
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    unregister_shared_mapping_range_locked(&mut mappings, address, byte_count);
+    mappings.insert(
+        address,
+        SharedMappingRecord {
+            end,
+            backing: backing.clone(),
+            backing_offset,
+        },
+    );
+    // The VMA layer retains mapping-call boundaries when the guest requests them. The physical
+    // registry does not need those virtual bookkeeping seams: texture snapshots and CPU write
+    // watches care only that adjacent addresses name adjacent bytes of one backing. Coalescing
+    // here turns separately committed pages back into one watchable/copyable physical run.
+    coalesce_shared_mapping_record(&mut mappings, address);
 }

@@ -654,7 +654,7 @@ fn texture_content_validation_survives_write_watch_renewal() {
 }
 
 #[test]
-fn contiguous_texture_access_pins_every_adjacent_mapping_record() {
+fn contiguous_texture_access_coalesces_adjacent_mapping_records() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
         GuestPhysicalBacking, GuestProtection, GuestSharedMapOptions,
@@ -703,10 +703,14 @@ fn contiguous_texture_access_pins_every_adjacent_mapping_record() {
     };
     assert!(guest_shared_mapping_identity(descriptor.address, 4 * GUEST_PAGE_SIZE).is_some());
     let watch = watch_guest_texture(descriptor).expect("adjacent mapping watches");
-    assert_eq!(watch.ranges.len(), 2);
-    assert!(!watch.has_single_covering_mapping(descriptor.address, 4 * GUEST_PAGE_SIZE));
+    assert_eq!(
+        watch.ranges.len(),
+        1,
+        "physical registry seams must not multiply CPU write watches"
+    );
+    assert!(watch.has_single_covering_mapping(descriptor.address, 4 * GUEST_PAGE_SIZE));
     let raw = snapshot_watched_guest_texture_raw(descriptor, &watch)
-        .expect("snapshot uses the coherent physical backing slow path");
+        .expect("snapshot uses the coalesced direct mapping path");
     assert_eq!(raw.len(), usize::try_from(4 * GUEST_PAGE_SIZE).unwrap());
 }
 

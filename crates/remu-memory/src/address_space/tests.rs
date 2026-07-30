@@ -920,9 +920,20 @@ fn separately_committed_adjacent_pages_resolve_as_one_backing_run() {
         "a resource spanning both commits resolves as one physical run"
     );
     assert_eq!(
-        guest_shared_backing_segments(reserved.get(), 4 * GUEST_PAGE_SIZE)
-            .map(|segments| segments.iter().map(|segment| segment.byte_count).sum()),
-        Some(4 * GUEST_PAGE_SIZE)
+        guest_shared_backing_segments(reserved.get(), 4 * GUEST_PAGE_SIZE),
+        Some(vec![GuestSharedBackingSegment {
+            address: reserved.get(),
+            byte_count: 4 * GUEST_PAGE_SIZE,
+        }]),
+        "separate adjacent commits coalesce into one copy/watch segment"
+    );
+    assert_eq!(
+        guest_shared_backing_alias_segments(reserved.get(), 4 * GUEST_PAGE_SIZE),
+        Some(vec![GuestSharedBackingSegment {
+            address: reserved.get(),
+            byte_count: 4 * GUEST_PAGE_SIZE,
+        }]),
+        "separate adjacent commits coalesce into one write-watch alias"
     );
 }
 

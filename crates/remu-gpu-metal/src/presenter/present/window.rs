@@ -329,6 +329,76 @@ impl MetalPresenter {
                 alias_writeback_bytes as f64 / (1024.0 * 1024.0),
                 alias_writeback_nanoseconds as f64 / 1_000_000.0,
             );
+            let texture_allocated_bytes = |texture: &metal::Texture| {
+                u64::try_from(texture.allocated_size()).unwrap_or(u64::MAX)
+            };
+            let resident_target_bytes =
+                self.resident_guest_textures
+                    .values()
+                    .fold(0_u64, |total, resident| {
+                        // A component-reorder texture is a view of this allocation, so count only
+                        // the owning resident texture.
+                        total.saturating_add(texture_allocated_bytes(&resident.texture))
+                    });
+            let depth_array_bytes = self
+                .depth_array_textures
+                .values()
+                .fold(0_u64, |total, resident| {
+                    total.saturating_add(texture_allocated_bytes(&resident.texture))
+                });
+            let direct_scanout_bytes = self
+                .direct_scanout_textures
+                .values()
+                .fold(0_u64, |total, resident| {
+                    total.saturating_add(texture_allocated_bytes(&resident.texture))
+                });
+            let scanout_snapshot_bytes = self
+                .scanout_snapshot_textures
+                .values()
+                .fold(0_u64, |total, resident| {
+                    total.saturating_add(texture_allocated_bytes(&resident.texture))
+                });
+            let multisample_bytes = self
+                .multisample_textures
+                .values()
+                .fold(0_u64, |total, resident| {
+                    total.saturating_add(texture_allocated_bytes(&resident.texture))
+                });
+            let fallback_bytes = self
+                .fallback_texture_cache
+                .values()
+                .fold(0_u64, |total, texture| {
+                    total.saturating_add(texture_allocated_bytes(texture))
+                });
+            let accounted_texture_bytes = sampled_texture_cache_resident_bytes
+                .saturating_add(resident_target_bytes)
+                .saturating_add(depth_array_bytes)
+                .saturating_add(direct_scanout_bytes)
+                .saturating_add(scanout_snapshot_bytes)
+                .saturating_add(multisample_bytes)
+                .saturating_add(fallback_bytes);
+            let metal_allocated_bytes = metal_allocated_mib.saturating_mul(1024 * 1024);
+            let unaccounted_metal_bytes =
+                metal_allocated_bytes.saturating_sub(accounted_texture_bytes);
+            eprintln!(
+                "[REMu][PERF-METAL-RESIDENCY] sampled={}/{:.1}MiB targets={}/{:.1}MiB depth_arrays={}/{:.1}MiB direct_scanout={}/{:.1}MiB scanout_snapshots={}/{:.1}MiB msaa={}/{:.1}MiB fallback={}/{:.1}MiB accounted={:.1}MiB other={:.1}MiB",
+                self.sampled_texture_cache.len(),
+                sampled_texture_cache_resident_bytes as f64 / (1024.0 * 1024.0),
+                self.resident_guest_textures.len(),
+                resident_target_bytes as f64 / (1024.0 * 1024.0),
+                self.depth_array_textures.len(),
+                depth_array_bytes as f64 / (1024.0 * 1024.0),
+                self.direct_scanout_textures.len(),
+                direct_scanout_bytes as f64 / (1024.0 * 1024.0),
+                self.scanout_snapshot_textures.len(),
+                scanout_snapshot_bytes as f64 / (1024.0 * 1024.0),
+                self.multisample_textures.len(),
+                multisample_bytes as f64 / (1024.0 * 1024.0),
+                self.fallback_texture_cache.len(),
+                fallback_bytes as f64 / (1024.0 * 1024.0),
+                accounted_texture_bytes as f64 / (1024.0 * 1024.0),
+                unaccounted_metal_bytes as f64 / (1024.0 * 1024.0),
+            );
             eprintln!(
                 "[REMu][PERF-GLOBAL-CACHE] captured={}/{:.1}MiB identity={}/{:.1}MiB",
                 self.global_buffer_cache.len(),
