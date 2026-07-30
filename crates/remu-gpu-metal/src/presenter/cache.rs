@@ -380,6 +380,19 @@ impl MetalPresenter {
         binding: &GlobalMemoryBinding,
         source: QueuedGlobalReadSource,
     ) -> Result<UploadedGlobalBuffer, String> {
+        if binding.writable {
+            return match source {
+                QueuedGlobalReadSource::Buffer { .. } => Err(
+                    "queued writable global source was not synchronized before staging".to_owned(),
+                ),
+                QueuedGlobalReadSource::Synchronize => {
+                    unreachable!("synchronizing global sources are handled before upload")
+                }
+                QueuedGlobalReadSource::None => {
+                    self.upload_writable_global_buffer_from_packet(device, binding)
+                }
+            };
+        }
         match source {
             QueuedGlobalReadSource::Buffer {
                 buffer,
@@ -411,7 +424,10 @@ impl MetalPresenter {
         // transient constants and small vertex buffers while this presenter is still compiling
         // shaders or draining older events. A queued GPU writer is resolved before this method,
         // because in that case the packet snapshot necessarily predates the producer.
-        if (binding.data.len() != binding.byte_count || binding.writable)
+        if binding.writable {
+            return self.upload_writable_global_buffer_from_packet(device, binding);
+        }
+        if binding.data.len() != binding.byte_count
             && let Some(uploaded) = self.upload_identity_global_buffer(device, binding)?
         {
             return Ok(uploaded);
@@ -427,7 +443,7 @@ impl MetalPresenter {
             base_address: binding.base_address,
             byte_count: binding.data.len(),
         };
-        if binding.writable || binding.data.len() > GLOBAL_BUFFER_CACHE_BYTE_CAPACITY {
+        if binding.data.len() > GLOBAL_BUFFER_CACHE_BYTE_CAPACITY {
             if let Some(cached) = self.transient_global_buffer_cache.get(&key)
                 && cached.bytes == binding.data
             {
@@ -592,11 +608,63 @@ impl MetalPresenter {
         }))
     }
 
+    fn upload_writable_global_buffer_from_packet(
+        &mut self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        if binding.byte_count == 0 {
+            return Err("writable guest global upload is empty".to_owned());
+        }
+        let mut bytes = vec![0; binding.byte_count];
+        if !read_guest_shared_backing(binding.base_address, &mut bytes) {
+            if binding.data.len() != binding.byte_count {
+                return Err(format!(
+                    "writable global binding {:#x}/{} has neither readable guest backing nor a complete packet snapshot",
+                    binding.base_address, binding.byte_count
+                ));
+            }
+            bytes.copy_from_slice(&binding.data);
+        }
+        self.new_exact_writable_global_buffer(device, binding, &bytes)
+    }
+
+    fn new_exact_writable_global_buffer(
+        &self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+        bytes: &[u8],
+    ) -> Result<UploadedGlobalBuffer, String> {
+        if bytes.len() != binding.byte_count {
+            return Err(format!(
+                "writable global snapshot length mismatch bytes={} snapshot={}",
+                binding.byte_count,
+                bytes.len()
+            ));
+        }
+        let byte_count = u64::try_from(binding.byte_count)
+            .map_err(|_| "writable global byte count does not fit Metal")?;
+        let buffer = metal_buffer_with_bytes(device, bytes)?;
+        buffer.set_label(&format!(
+            "REMu exact writable global {:#x}/{:#x}",
+            binding.base_address, byte_count
+        ));
+        Ok(UploadedGlobalBuffer {
+            buffer,
+            offset: 0,
+            guest_memory: false,
+            physical_identity: guest_shared_backing_identity(binding.base_address, byte_count),
+        })
+    }
+
     fn upload_fresh_global_buffer(
         &mut self,
         device: &Device,
         binding: &GlobalMemoryBinding,
     ) -> Result<UploadedGlobalBuffer, String> {
+        if binding.writable {
+            return self.upload_writable_global_buffer_from_packet(device, binding);
+        }
         let (buffer, offset) = self
             .open_guest_batch
             .as_mut()
@@ -620,14 +688,14 @@ impl MetalPresenter {
             let source =
                 queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
             if !matches!(source, QueuedGlobalReadSource::None) {
-                return Ok(source);
+                return Ok(synchronize_writable_global_source(binding, source));
             }
         }
         for batch in self.committed_guest_batches.iter().rev() {
             let source =
                 queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
             if !matches!(source, QueuedGlobalReadSource::None) {
-                return Ok(source);
+                return Ok(synchronize_writable_global_source(binding, source));
             }
         }
         Ok(QueuedGlobalReadSource::None)
@@ -695,6 +763,17 @@ impl MetalPresenter {
         }
         self.ngg_meshlet_cache.insert(cache_key, cached.clone());
         Ok(Some(cached))
+    }
+}
+
+fn synchronize_writable_global_source(
+    binding: &GlobalMemoryBinding,
+    source: QueuedGlobalReadSource,
+) -> QueuedGlobalReadSource {
+    if binding.writable && matches!(source, QueuedGlobalReadSource::Buffer { .. }) {
+        QueuedGlobalReadSource::Synchronize
+    } else {
+        source
     }
 }
 
