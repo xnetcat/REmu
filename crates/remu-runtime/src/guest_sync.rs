@@ -89,36 +89,11 @@ fn trace_graph_event_pointer(pointer_address: u64) -> GraphEventTrace {
 
 #[allow(dead_code)] // Read through the derived Debug implementation in trace-only output.
 #[derive(Debug)]
-struct NamedThreadSlotTrace {
-    id: u32,
-    candidate: u64,
-    words: [u64; 12],
-}
-
-fn trace_named_thread_slot(task_graph: u64, id: u32) -> NamedThreadSlotTrace {
-    // The observed task-graph root stores candidate named-thread entries after its root pointer in
-    // 0x18-byte records in this title. Keep this explicitly labelled as a candidate: the trace is
-    // intended to correlate raw queue state with the exact event pointers below, not to make the
-    // layout part of synchronization behavior.
-    let candidate = if task_graph == 0 || id > 0x1000 {
-        0
-    } else {
-        task_graph.saturating_add(8 + u64::from(id).saturating_mul(0x18))
-    };
-    NamedThreadSlotTrace {
-        id,
-        candidate,
-        words: trace_guest_words(candidate),
-    }
-}
-
-#[allow(dead_code)] // Read through the derived Debug implementation in trace-only output.
-#[derive(Debug)]
 struct RhiTaskGraphTrace {
     task_graph: u64,
     task_graph_words: [u64; 24],
-    render_named_thread: NamedThreadSlotTrace,
-    rhi_named_thread: NamedThreadSlotTrace,
+    render_named_thread: u32,
+    rhi_named_thread: u32,
     command_list_words: [u64; 20],
     dispatch_event: GraphEventTrace,
     completion_event: GraphEventTrace,
@@ -168,8 +143,8 @@ fn trace_rhi_task_graph() -> RhiTaskGraphTrace {
     RhiTaskGraphTrace {
         task_graph,
         task_graph_words: trace_guest_words(task_graph),
-        render_named_thread: trace_named_thread_slot(task_graph, render_named_thread),
-        rhi_named_thread: trace_named_thread_slot(task_graph, rhi_named_thread),
+        render_named_thread,
+        rhi_named_thread,
         command_list_words: trace_guest_words(RHI_COMMAND_LIST),
         dispatch_event: trace_graph_event_pointer(DISPATCH_EVENT_POINTER),
         completion_event: trace_graph_event_pointer(COMPLETION_EVENT_POINTER),
