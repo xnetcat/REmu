@@ -65,7 +65,12 @@ pub(crate) fn agc_apply_set_base(
     }
     let low = read_guest_u32(packet_address + 8) & !0x7;
     let high = read_guest_u32(packet_address + 12) & 0xffff;
-    graphics.indirect_args_address = u64::from(low) | (u64::from(high) << 32);
+    let address = u64::from(low) | (u64::from(high) << 32);
+    if shader_type == 1 {
+        graphics.compute_indirect_args_address = address;
+    } else {
+        graphics.graphics_indirect_args_address = address;
+    }
     Ok(())
 }
 
@@ -87,11 +92,11 @@ pub(crate) fn agc_decode_compute_dispatch(
         let indirect = remu_gpu::decode_compute_dispatch_indirect(&packet)?;
         let dimensions_address = match indirect.dimensions {
             remu_gpu::ComputeIndirectDimensions::BaseOffset(offset) => {
-                if graphics.indirect_args_address == 0 {
+                if graphics.compute_indirect_args_address == 0 {
                     return Err(AgcComputeDispatchError::MissingIndirectBase);
                 }
                 graphics
-                    .indirect_args_address
+                    .compute_indirect_args_address
                     .checked_add(u64::from(offset))
                     .ok_or(AgcComputeDispatchError::IndirectAddressOverflow)?
             }
