@@ -16,7 +16,8 @@ use crate::{
     evaluate_shader_register_snapshot_cached, export_user_data_register, read_guest_u32,
     shader_control_flow_summary, shader_evaluation_worker_request, snapshot_draw_indices,
     snapshot_small_readonly_global_bindings, trace_agc_draws, trace_agc_programs,
-    trace_agc_shader_draw, trace_agc_shaders, trace_agc_target_address, trace_logarithmic_sequence,
+    trace_agc_registers, trace_agc_shader_draw, trace_agc_shaders, trace_agc_target_address,
+    trace_logarithmic_sequence,
 };
 
 fn agc_packet_words(packet_address: u64, length: u32) -> Vec<u32> {
@@ -65,7 +66,16 @@ pub(crate) fn agc_apply_set_base(
     }
     let low = read_guest_u32(packet_address + 8) & !0x7;
     let high = read_guest_u32(packet_address + 12) & 0xffff;
+    let previous = graphics.indirect_args_address;
     graphics.indirect_args_address = u64::from(low) | (u64::from(high) << 32);
+    if trace_agc_registers() {
+        eprintln!(
+            "[REMu][AGC][REG] set-base packet={packet_address:#x} shader_type={shader_type} \
+             base_index={base_index} previous={previous:#x} base={:#x} words={:08x?}",
+            graphics.indirect_args_address,
+            agc_packet_words(packet_address, length),
+        );
+    }
     Ok(())
 }
 
@@ -98,6 +108,14 @@ pub(crate) fn agc_decode_compute_dispatch(
             remu_gpu::ComputeIndirectDimensions::Absolute(address) => address,
         };
         let dimensions = agc_read_compute_dimensions(dimensions_address)?;
+        if trace_agc_registers() {
+            eprintln!(
+                "[REMu][AGC][REG] dispatch-indirect packet={packet_address:#x} \
+                 base={:#x} resolved={dimensions_address:#x} dimensions={dimensions:08x?} \
+                 decoded={indirect:?} words={packet:08x?}",
+                graphics.indirect_args_address,
+            );
+        }
         (
             remu_gpu::ComputeDispatchSource::Indirect { dimensions_address },
             remu_gpu::decode_compute_launch(dimensions, indirect.initiator, &shader_registers)?,
