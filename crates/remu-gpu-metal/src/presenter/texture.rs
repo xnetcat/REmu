@@ -51,7 +51,7 @@ pub(crate) use self::depth_array::resident_is_depth_array_face;
 pub(crate) use self::depth_array::{depth_array_face_descriptor, depth_array_face_set_is_complete};
 pub(crate) use self::lifetime::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, resident_texture_activity_stats,
-    resident_texture_backing_overlap_stats,
+    resident_texture_backing_overlap_stats, resident_texture_eviction_plan,
 };
 pub(crate) use self::mips::{
     create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,

@@ -11,7 +11,8 @@ use super::{
     decode_sampled_texture_linear_from_raw, guest_texture_byte_count,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage,
     initial_depth_clear_for_target, mode27_mip_chain_layout, promote_resident_mip_hierarchy,
-    record_mode27_work_detail, refresh_resident_texture_write_watch, resident_texture_for_sample,
+    record_mode27_work_detail, refresh_resident_texture_write_watch,
+    resident_texture_eviction_plan, resident_texture_for_sample,
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
     snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
@@ -124,6 +125,136 @@ pub(crate) fn resident_texture_ownership_stats(
 }
 
 impl MetalPresenter {
+    pub(crate) fn garbage_collect_resident_textures_to_budget(
+        &mut self,
+        byte_capacity: u64,
+        current_flip: u64,
+        maximum_evictions: usize,
+    ) -> Result<(usize, u64), String> {
+        let plan = resident_texture_eviction_plan(
+            &self.resident_guest_textures,
+            byte_capacity,
+            current_flip,
+            maximum_evictions,
+        );
+        if plan.descriptors.is_empty() {
+            return Ok((0, 0));
+        }
+
+        // End every encoder before observing or replacing resident allocations. Command buffers
+        // retain their bound textures until completion, and the single Metal queue orders the
+        // following readbacks after all producer work.
+        self.wait_for_guest_command_batches()?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
+
+        let mut eviction_count = 0_usize;
+        let mut eviction_bytes = 0_u64;
+        for descriptor in plan.descriptors {
+            let Some(resident) = self.resident_guest_textures.get_mut(&descriptor) else {
+                // Writing back an older overlapping version may already have retired this alias.
+                continue;
+            };
+            let allocated_bytes =
+                u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
+            let refresh = refresh_resident_texture_write_watch(resident)?;
+            if refresh == WriteWatchRefresh::Reprotecting {
+                // A concurrent CPU write is changing watch ownership. Leave this resident in
+                // place and retry at a later flip rather than publishing pixels into that range.
+                continue;
+            }
+            if refresh == WriteWatchRefresh::Replaced {
+                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                    trace_resident_texture_removal("pressure-mapping-replaced", &resident);
+                }
+                eviction_count += 1;
+                eviction_bytes = eviction_bytes.saturating_add(allocated_bytes);
+                continue;
+            }
+
+            let gpu_written = resident.gpu_written;
+            if gpu_written && resident.cpu_write_obsoletes_gpu_writeback(refresh)? {
+                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                    trace_resident_texture_removal("pressure-cpu-reused", &resident);
+                }
+                eviction_count += 1;
+                eviction_bytes = eviction_bytes.saturating_add(allocated_bytes);
+                continue;
+            }
+
+            if gpu_written {
+                let (alias_ranges, content_version) = {
+                    let resident = self
+                        .resident_guest_textures
+                        .get(&descriptor)
+                        .expect("pressure candidate survived watch refresh");
+                    (
+                        resident.write_watch.alias_ranges(),
+                        resident.content_version,
+                    )
+                };
+                // A sampled alias can retain a texture view of the same allocation. Retire every
+                // overlapping interpretation before publishing the authoritative pixels to RAM,
+                // and discard older resident/MSAA versions that the writeback supersedes.
+                retire_sampled_textures_overlapping_writeback(
+                    &mut self.sampled_texture_cache,
+                    &alias_ranges,
+                );
+                retire_resident_textures_overlapping_writeback(
+                    &mut self.resident_guest_textures,
+                    &alias_ranges,
+                    descriptor,
+                    content_version,
+                );
+                retire_multisample_textures_overlapping_writeback(
+                    &mut self.multisample_textures,
+                    &alias_ranges,
+                );
+                let resident = self
+                    .resident_guest_textures
+                    .get(&descriptor)
+                    .expect("pressure source survives overlapping-version retirement");
+                write_resident_texture_contents_to_guest(&device, &queue, resident)?;
+            }
+
+            if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                trace_resident_texture_removal("pressure-lru", &resident);
+            }
+            eviction_count += 1;
+            eviction_bytes = eviction_bytes.saturating_add(allocated_bytes);
+        }
+        if eviction_count != 0 {
+            eprintln!(
+                "[REMu][METAL] resident texture pressure GC evicted {eviction_count} images/{:.1} MiB (resident {:.1} MiB, budget {:.1} MiB)",
+                eviction_bytes as f64 / (1024.0 * 1024.0),
+                plan.resident_bytes as f64 / (1024.0 * 1024.0),
+                byte_capacity as f64 / (1024.0 * 1024.0),
+            );
+        }
+        Ok((eviction_count, eviction_bytes))
+    }
+
+    pub(crate) fn garbage_collect_resident_textures(&mut self, current_flip: u64) {
+        let Some(byte_capacity) = super::super::resident_texture_cache_byte_capacity() else {
+            return;
+        };
+        if let Err(error) = self.garbage_collect_resident_textures_to_budget(
+            byte_capacity,
+            current_flip,
+            super::super::MAX_RESIDENT_TEXTURE_EVICTIONS_PER_FLIP,
+        ) {
+            eprintln!("[REMu][METAL] resident texture pressure GC failed: {error}");
+        }
+    }
+
     pub(crate) fn ensure_mipmapped_storage_texture(
         &mut self,
         device: &Device,
@@ -517,6 +648,7 @@ impl MetalPresenter {
                 gpu_written: false,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
+                last_use: ResidentTextureActivityStamp::default(),
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
@@ -615,6 +747,7 @@ impl MetalPresenter {
                 gpu_written: false,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
+                last_use: ResidentTextureActivityStamp::default(),
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
@@ -855,6 +988,7 @@ impl MetalPresenter {
                 gpu_written: false,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
+                last_use: ResidentTextureActivityStamp::default(),
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
@@ -1042,9 +1176,7 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .get_mut(&resident_descriptor)
                 .expect("selected resident survived clean-alias retirement");
-            if let Some(activity) = resident.activity.as_mut() {
-                activity.note_write(activity_stamp);
-            }
+            resident.note_write(activity_stamp);
             resident.gpu_written = true;
             resident.content_version = self.resident_content_version;
             resident.note_gpu_write();
@@ -1071,9 +1203,8 @@ impl MetalPresenter {
             });
         if let Some(resident) = resident_descriptor.and_then(|resident_descriptor| {
             self.resident_guest_textures.get_mut(&resident_descriptor)
-        }) && let Some(activity) = resident.activity.as_mut()
-        {
-            activity.note_read(activity_stamp);
+        }) {
+            resident.note_read(activity_stamp);
         }
     }
 }
@@ -1132,6 +1263,7 @@ pub(crate) fn ensure_resident_texture_in_map(
             gpu_written: false,
             content_version: 0,
             gpu_write_watch_generations: Vec::new(),
+            last_use: ResidentTextureActivityStamp::default(),
             activity: super::super::ResidentTextureActivity::enabled(),
         },
     );

@@ -157,8 +157,8 @@ use self::texture::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, decode_guest_texture_linear_from_raw,
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_depth_sample_is_eligible, resident_texture_activity_stats,
-    resident_texture_backing_overlap_stats,
-    resident_texture_ownership_stats, retire_multisample_textures_overlapping_writeback,
+    resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
+    retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
     snapshot_watched_guest_range, storage_image_requires_mip_hierarchy,
@@ -174,7 +174,7 @@ use self::texture::{
     depth_array_face_set_is_complete, ensure_mipmapped_resident_texture_in_map,
     guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
-    prepare_sampled_texture_upload, sampled_texture_cache_accepts,
+    prepare_sampled_texture_upload, resident_texture_eviction_plan, sampled_texture_cache_accepts,
     sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
     sampled_texture_key, sampled_texture_raw_range, snapshot_guest_texture_linear,
     snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
@@ -229,6 +229,13 @@ const GUEST_BATCH_WORK_CAPACITY: usize = 32;
 const MAX_COMMITTED_GUEST_BATCHES: usize = 3;
 const SAMPLED_TEXTURE_CACHE_CAPACITY: usize = 2_048;
 const DEFAULT_SAMPLED_TEXTURE_CACHE_MIB: u64 = 1_536;
+/// Persistent GPU-authored render/storage images retain the architectural contents of guest
+/// allocations whose tiled RAM is stale. Pressure collection is deliberately opt-in until title
+/// telemetry establishes a safe working-set policy.
+///
+/// Unlike the sampled-image cache, pressure eviction of a GPU-owned resident first downloads and
+/// retiles its exact contents into guest memory. This is a cache budget, not a correctness cap.
+const MAX_RESIDENT_TEXTURE_EVICTIONS_PER_FLIP: usize = 32;
 const DEFAULT_SHADER_COMPILER_WORKER_COUNT: usize = 4;
 const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
 const NGG_MESHLET_BUFFER_INDEX: u64 = 29;
@@ -244,6 +251,17 @@ fn sampled_texture_cache_byte_capacity() -> Option<u64> {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_SAMPLED_TEXTURE_CACHE_MIB);
         (capacity_mib != 0).then(|| capacity_mib.saturating_mul(1024 * 1024))
+    })
+}
+
+fn resident_texture_cache_byte_capacity() -> Option<u64> {
+    static CAPACITY: OnceLock<Option<u64>> = OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        std::env::var("REMU_RESIDENT_TEXTURE_CACHE_MIB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&capacity_mib| capacity_mib != 0)
+            .map(|capacity_mib| capacity_mib.saturating_mul(1024 * 1024))
     })
 }
 
@@ -739,6 +757,12 @@ struct ResidentGuestTexture {
     /// because both touch the same watched host pages. The monotonically increasing generations
     /// establish the ownership boundary at the actual GPU write.
     gpu_write_watch_generations: Vec<u64>,
+    /// Most recent ordered guest work/flip that read or wrote this Metal allocation.
+    ///
+    /// This stamp is always maintained because pressure eviction must distinguish completed
+    /// render-graph temporaries from resources still participating in the current frame. The
+    /// more detailed per-operation activity counters remain opt-in diagnostics below.
+    last_use: ResidentTextureActivityStamp,
     /// Read/write chronology used only by opt-in texture-lifetime diagnostics.
     ///
     /// Ordinary runs retain no counters and take only the predictable `Option::None` branch at
@@ -801,6 +825,20 @@ impl ResidentGuestTexture {
         // current watch generation domain.
         self.note_gpu_write();
         Ok(false)
+    }
+
+    fn note_read(&mut self, stamp: ResidentTextureActivityStamp) {
+        self.last_use = stamp;
+        if let Some(activity) = self.activity.as_mut() {
+            activity.note_read(stamp);
+        }
+    }
+
+    fn note_write(&mut self, stamp: ResidentTextureActivityStamp) {
+        self.last_use = stamp;
+        if let Some(activity) = self.activity.as_mut() {
+            activity.note_write(stamp);
+        }
     }
 }
 
@@ -1191,11 +1229,12 @@ impl MetalPresenter {
         };
         let shader_compiler_workers = shader_compiler_worker_count();
         eprintln!(
-            "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB",
+            "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB resident texture cache={} MiB",
             SAMPLED_TEXTURE_CACHE_CAPACITY,
             sampled_texture_cache_byte_capacity()
-                .map(|bytes| bytes / (1024 * 1024))
-                .unwrap_or(0),
+                .map_or(0, |bytes| bytes / (1024 * 1024)),
+            resident_texture_cache_byte_capacity()
+                .map_or(0, |bytes| bytes / (1024 * 1024)),
         );
         for worker in 0..shader_compiler_workers {
             let compiler_device = device.clone();

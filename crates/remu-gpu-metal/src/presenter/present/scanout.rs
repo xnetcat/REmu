@@ -46,6 +46,10 @@ impl MetalPresenter {
             };
         self.finalized_flip_sequence = flip.sequence;
         self.redraw_pending = true;
+        // The scanout source has been copied into an immutable snapshot above. This ordered flip
+        // boundary is the first point at which completed-frame render targets can be downloaded
+        // and evicted without racing their producer command buffer.
+        self.garbage_collect_resident_textures(flip.sequence);
         if trace_scanout_writes() {
             eprintln!(
                 "[REMu][METAL][SCANOUT-FLIP] phase=finalize sequence={} buffer={} address={:#x} activation={activation} finalized={} uploaded={} submitted={} pending_queue={:?} target_written={}",

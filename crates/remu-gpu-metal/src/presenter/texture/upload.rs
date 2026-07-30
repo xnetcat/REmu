@@ -342,11 +342,9 @@ pub(crate) fn upload_image_textures(
             };
             if !select_multisample
                 && let Some((resident_descriptor, ..)) = resident_resolve.as_ref()
-                && let Some(activity) = resident_guest_textures
-                    .get_mut(resident_descriptor)
-                    .and_then(|resident| resident.activity.as_mut())
+                && let Some(resident) = resident_guest_textures.get_mut(resident_descriptor)
             {
-                activity.note_read(activity_stamp);
+                resident.note_read(activity_stamp);
             }
             if trace_target_sampling()
                 && descriptor.guest.width == 1_920

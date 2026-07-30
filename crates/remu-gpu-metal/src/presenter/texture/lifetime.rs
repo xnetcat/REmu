@@ -1,7 +1,9 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::{GuestTextureDescriptor, ResidentGuestTexture};
+use super::{
+    GuestTextureDescriptor, ResidentGuestTexture, guest_texture_descriptors_overlap,
+};
 use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
 use std::collections::{HashMap, HashSet};
 
@@ -62,6 +64,97 @@ pub(crate) fn resident_texture_activity_stats(
         stats.write_flip[flip_age_bucket(activity.last_write_flip, current_flip)].record(resident);
     }
     stats
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ResidentTextureEvictionPlan {
+    pub(crate) resident_bytes: u64,
+    pub(crate) planned_bytes: u64,
+    pub(crate) descriptors: Vec<GuestTextureDescriptor>,
+}
+
+/// Select completed-frame residents for pressure eviction without discarding architectural state.
+///
+/// The caller is responsible for downloading GPU-owned candidates before removal. Residents used
+/// by `current_flip` are never selected: their Metal allocation can still be referenced by the
+/// open frame even if a nominal byte budget is exceeded temporarily. Clean (CPU-owned) residents
+/// are preferred because guest RAM is already authoritative, followed by the oldest GPU-owned
+/// allocations.
+pub(crate) fn resident_texture_eviction_plan(
+    residents: &HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    byte_capacity: u64,
+    current_flip: u64,
+    maximum_evictions: usize,
+) -> ResidentTextureEvictionPlan {
+    let resident_bytes = residents.values().fold(0_u64, |total, resident| {
+        total.saturating_add(u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX))
+    });
+    if resident_bytes <= byte_capacity || maximum_evictions == 0 {
+        return ResidentTextureEvictionPlan {
+            resident_bytes,
+            ..ResidentTextureEvictionPlan::default()
+        };
+    }
+
+    let mut candidates = residents
+        .values()
+        .filter(|resident| resident.last_use.flip < current_flip)
+        .filter(|resident| {
+            !resident.gpu_written
+                || !residents.values().any(|other| {
+                    other.descriptor != resident.descriptor
+                        && other.gpu_written
+                        && guest_texture_descriptors_overlap(
+                            resident.descriptor,
+                            other.descriptor,
+                        )
+                })
+        })
+        .map(|resident| {
+            let mapping_replaced =
+                resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced);
+            (
+                // Replaced mappings carry no valid destination for writeback. Clean residents
+                // need no writeback. Retire both before GPU-owned live mappings.
+                !mapping_replaced,
+                resident.gpu_written,
+                resident.last_use.flip,
+                resident.last_use.work,
+                resident.content_version,
+                resident.descriptor,
+                u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(
+        |(live_mapping, gpu_written, flip, work, version, descriptor, _)| {
+            (
+                *live_mapping,
+                *gpu_written,
+                *flip,
+                *work,
+                *version,
+                descriptor.address,
+            )
+        },
+    );
+
+    let mut planned_bytes = 0_u64;
+    let mut descriptors = Vec::new();
+    for (_, _, _, _, _, descriptor, bytes) in candidates {
+        if resident_bytes.saturating_sub(planned_bytes) <= byte_capacity
+            || descriptors.len() == maximum_evictions
+        {
+            break;
+        }
+        planned_bytes = planned_bytes.saturating_add(bytes);
+        descriptors.push(descriptor);
+    }
+    ResidentTextureEvictionPlan {
+        resident_bytes,
+        planned_bytes,
+        descriptors,
+    }
 }
 
 fn work_age_bucket(last: Option<u64>, current: u64) -> usize {
