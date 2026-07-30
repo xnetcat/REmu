@@ -263,6 +263,29 @@ pub(super) fn video_chain_binding_summary(evaluation: &ShaderEvaluation) -> Opti
     (!bindings.is_empty()).then(|| bindings.join("; "))
 }
 
+fn record_diagnostic_video_chain_texture_in(
+    tracked: &mut HashMap<GuestTextureDescriptor, DiagnosticVideoChainProducer>,
+    descriptor: GuestTextureDescriptor,
+    stage: &'static str,
+    sequence: u64,
+    shader: u64,
+    generation: u32,
+) {
+    // A GPU write through one alias makes every overlapping interpretation stale. Mirror the
+    // resident-texture lifetime rule here; otherwise an old exact descriptor can hide the newer
+    // physical producer, or HashMap order can select either one nondeterministically.
+    tracked.retain(|candidate, _| !guest_texture_descriptors_overlap(*candidate, descriptor));
+    tracked.insert(
+        descriptor,
+        DiagnosticVideoChainProducer {
+            stage,
+            sequence,
+            shader,
+            generation,
+        },
+    );
+}
+
 pub(super) fn record_diagnostic_video_chain_texture(
     descriptor: GuestTextureDescriptor,
     stage: &'static str,
@@ -270,18 +293,16 @@ pub(super) fn record_diagnostic_video_chain_texture(
     shader: u64,
     generation: u32,
 ) {
-    diagnostic_video_chain_textures()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            descriptor,
-            DiagnosticVideoChainProducer {
-                stage,
-                sequence,
-                shader,
-                generation,
-            },
-        );
+    record_diagnostic_video_chain_texture_in(
+        &mut diagnostic_video_chain_textures()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        descriptor,
+        stage,
+        sequence,
+        shader,
+        generation,
+    );
 }
 
 pub(super) fn trace_video_target_draw_consumer(draw: &IndexedDraw) {
@@ -1247,6 +1268,52 @@ mod tests {
             )
             .map(|(descriptor, producer)| (descriptor, producer.sequence)),
             Some((sampled, exact_producer.sequence)),
+        );
+    }
+
+    #[test]
+    fn video_chain_write_retires_stale_overlapping_producer() {
+        let old_surface = GuestTextureDescriptor {
+            address: 0x1000,
+            width: 4,
+            height: 4,
+            pitch: 4,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let new_alias = GuestTextureDescriptor {
+            address: 0x1010,
+            width: 1,
+            height: 1,
+            pitch: 1,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::R8Unorm,
+            bytes_per_pixel: 1,
+        };
+        let mut tracked = HashMap::new();
+
+        record_diagnostic_video_chain_texture_in(
+            &mut tracked,
+            old_surface,
+            "compute",
+            10,
+            0x1000,
+            3,
+        );
+        record_diagnostic_video_chain_texture_in(&mut tracked, new_alias, "draw", 20, 0x2000, 1);
+
+        assert!(!tracked.contains_key(&old_surface));
+        assert_eq!(
+            diagnostic_video_chain_match(
+                &tracked
+                    .iter()
+                    .map(|entry| (*entry.0, *entry.1))
+                    .collect::<Vec<_>>(),
+                old_surface,
+            )
+            .map(|(descriptor, producer)| (descriptor, producer.sequence)),
+            Some((new_alias, 20)),
         );
     }
 
