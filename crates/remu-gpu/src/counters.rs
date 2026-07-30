@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::GpuFlipCompletion;
 
@@ -26,6 +27,32 @@ pub(crate) static AUDIO_OUTPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) static AUDIO_UNDERRUN_FRAMES: AtomicU64 = AtomicU64::new(0);
 
+static PROGRESS_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+static GPU_LAST_PROGRESS_MILLIS: AtomicU64 = AtomicU64::new(0);
+
+static AUDIO_LAST_PROGRESS_MILLIS: AtomicU64 = AtomicU64::new(0);
+
+fn progress_timestamp_millis() -> u64 {
+    u64::try_from(
+        PROGRESS_EPOCH
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+    .saturating_add(1)
+}
+
+fn progress_age_millis(timestamp: &AtomicU64) -> Option<u64> {
+    let timestamp = timestamp.load(Ordering::Acquire);
+    (timestamp != 0).then(|| progress_timestamp_millis().saturating_sub(timestamp))
+}
+
+fn record_gpu_progress() {
+    GPU_LAST_PROGRESS_MILLIS.store(progress_timestamp_millis(), Ordering::Release);
+}
+
 /// Returns the number of guest GPU events queued or blocked on the bounded presenter channel.
 #[must_use]
 pub fn gpu_events_in_flight() -> usize {
@@ -37,6 +64,7 @@ pub fn record_gpu_event_consumed() {
     let _ = GPU_EVENTS_IN_FLIGHT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(1))
     });
+    record_gpu_progress();
 }
 
 /// Returns the number of individual GPU work items emitted by the guest but not yet processed by
@@ -60,6 +88,7 @@ pub fn gpu_flips_pending() -> usize {
 /// Records that the presenter finished processing one individual guest GPU work item.
 pub fn record_gpu_work_item_processed() {
     cancel_pending_gpu_work_items(1);
+    record_gpu_progress();
 }
 
 pub(crate) fn cancel_pending_gpu_work_items(count: usize) {
@@ -78,6 +107,9 @@ pub(crate) fn cancel_pending_gpu_flips(count: usize) {
 pub fn report_audio_frames(output_frames: u64, underrun_frames: u64) {
     AUDIO_OUTPUT_FRAMES.fetch_add(output_frames, Ordering::Relaxed);
     AUDIO_UNDERRUN_FRAMES.fetch_add(underrun_frames, Ordering::Relaxed);
+    if output_frames != 0 {
+        AUDIO_LAST_PROGRESS_MILLIS.store(progress_timestamp_millis(), Ordering::Release);
+    }
 }
 
 /// Returns the cumulative number of frames requested by the host audio device while a port was
@@ -91,6 +123,24 @@ pub fn audio_output_frames() -> u64 {
 #[must_use]
 pub fn audio_underrun_frames() -> u64 {
     AUDIO_UNDERRUN_FRAMES.load(Ordering::Relaxed)
+}
+
+/// Returns the age of the most recent host audio callback that requested output frames.
+///
+/// `None` means no audio stream has reached the host callback yet.
+#[must_use]
+pub fn audio_progress_age_millis() -> Option<u64> {
+    progress_age_millis(&AUDIO_LAST_PROGRESS_MILLIS)
+}
+
+/// Returns the age of the most recent presenter ingress, work-item retirement, submission
+/// completion, or flip completion.
+///
+/// This is diagnostic progress, not a completion fence. It lets bounded runs distinguish an idle
+/// guest from a backend which still has outstanding work but has stopped retiring it.
+#[must_use]
+pub fn gpu_progress_age_millis() -> Option<u64> {
+    progress_age_millis(&GPU_LAST_PROGRESS_MILLIS)
 }
 
 /// Returns the numerically newest guest submission observed complete by the backend.
@@ -128,6 +178,7 @@ pub fn record_gpu_submission_completed(sequence: u64) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(sequence);
     let _ = GPU_COMPLETED_SUBMISSION_SEQUENCE.fetch_max(sequence, Ordering::AcqRel);
+    record_gpu_progress();
     notify_gpu_completion_consumer();
 }
 
@@ -152,6 +203,7 @@ pub fn record_gpu_flip_completed(completion: GpuFlipCompletion) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(completion);
+    record_gpu_progress();
     notify_gpu_completion_consumer();
 }
 

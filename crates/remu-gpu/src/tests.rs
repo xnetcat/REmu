@@ -6,12 +6,12 @@ use super::{
     COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER, COMPUTE_START_Z_REGISTER,
     ComputeDispatchDecodeError, ComputeGrid, GPU_EVENT_QUEUE_CAPACITY,
     GPU_EVENT_SUBMISSION_CHUNK_SIZE, GpuEvent, GpuFlipCompletion, GpuHostImage, GpuMemoryAcquire,
-    GpuMemoryWait, GpuRegister, HostPadState, audio_output_frames, audio_underrun_frames,
-    clear_event_sink, compute_program_address, decode_compute_dispatch_direct,
-    decode_compute_dispatch_indirect, decode_compute_launch, decode_compute_system_registers,
-    emit_event, gpu_completed_submission_sequence, gpu_event_channel, gpu_events_in_flight,
-    gpu_work_items_pending, host_pad_state, install_event_sink, install_gpu_completion_notifier,
-    record_gpu_event_consumed,
+    GpuMemoryWait, GpuRegister, HostPadState, audio_output_frames, audio_progress_age_millis,
+    audio_underrun_frames, clear_event_sink, compute_program_address,
+    decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
+    decode_compute_system_registers, emit_event, gpu_completed_submission_sequence,
+    gpu_event_channel, gpu_events_in_flight, gpu_progress_age_millis, gpu_work_items_pending,
+    host_pad_state, install_event_sink, install_gpu_completion_notifier, record_gpu_event_consumed,
     record_gpu_flip_completed, record_gpu_submission_completed, record_gpu_wait_producer,
     record_gpu_work_item_processed, report_audio_frames, set_host_pad_state,
     take_gpu_completed_flips, take_gpu_completed_submission_ids, take_gpu_wait_latch,
@@ -70,6 +70,10 @@ fn runtime_telemetry_tracks_gpu_queue_and_audio_callback_progress() {
     assert_eq!(gpu_work_items_pending(), 1);
     record_gpu_work_item_processed();
     assert_eq!(gpu_work_items_pending(), 0);
+    assert!(
+        gpu_progress_age_millis().is_some_and(|age| age < 1_000),
+        "queue retirement must update the bounded-run GPU progress clock"
+    );
 
     install_gpu_completion_notifier(record_gpu_completion_notification);
     let notifications_before = GPU_COMPLETION_NOTIFICATIONS.load(Ordering::Relaxed);
@@ -95,9 +99,15 @@ fn runtime_telemetry_tracks_gpu_queue_and_audio_callback_progress() {
         notifications_before + 4
     );
 
+    let output_before = audio_output_frames();
+    let underruns_before = audio_underrun_frames();
     report_audio_frames(480, 12);
-    assert_eq!(audio_output_frames(), 480);
-    assert_eq!(audio_underrun_frames(), 12);
+    assert_eq!(audio_output_frames(), output_before + 480);
+    assert_eq!(audio_underrun_frames(), underruns_before + 12);
+    assert!(
+        audio_progress_age_millis().is_some_and(|age| age < 1_000),
+        "host callbacks must update the bounded-run audio progress clock"
+    );
     clear_event_sink();
 }
 

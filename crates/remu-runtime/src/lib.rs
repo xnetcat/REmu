@@ -509,6 +509,14 @@ struct AvPlayerDecoder {
     frames: Mutex<Receiver<Vec<u8>>>,
     cancelled: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    progress: Arc<AvPlayerDecoderProgress>,
+}
+
+#[derive(Debug, Default)]
+struct AvPlayerDecoderProgress {
+    produced_frames: AtomicU64,
+    queue_blocked: AtomicBool,
+    last_progress_millis: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -569,6 +577,7 @@ struct AvPlayerInstance {
     video_buffer_stride: usize,
     next_video_buffer: usize,
     next_video_frame: u64,
+    last_video_delivery: Option<Instant>,
     /// Host media-clock segment established only after the guest has consumed its first decoded
     /// frame. This prevents a long initial shader compile from seeking a short splash straight to
     /// EOF, while still allowing later frames to catch up when emulation runs below movie FPS.
@@ -604,6 +613,7 @@ impl AvPlayerInstance {
         self.video_decoder_drained = false;
         self.audio_decoder_drained = false;
         self.next_video_frame = 0;
+        self.last_video_delivery = None;
         self.video_catch_up_origin = None;
         self.next_audio_frame = 0;
         self.next_video_buffer = 0;
@@ -7160,6 +7170,7 @@ fn probe_entry(
     run_guest_thread_destructors();
     set_current_guest_thread_pointer(0);
     DIAGNOSTIC_TIMEOUT_CANCELLED.store(true, Ordering::Release);
+    DIAGNOSTIC_TIMEOUT_SECONDS.store(0, Ordering::Release);
     let import_hits = IMPORT_TELEMETRY.get().map_or(0, |telemetry| {
         telemetry
             .read()
@@ -7206,11 +7217,119 @@ pub fn report_shader_opcode_coverage() {
 /// reports the status the guest produced rather than the watchdog's.
 static DIAGNOSTIC_TIMEOUT_CANCELLED: AtomicBool = AtomicBool::new(false);
 
+/// Nonzero while a bounded diagnostic probe is active.
+///
+/// Hot-path attribution counters use this as a cheap guard, so regular emulator runs pay no
+/// synchronization or telemetry cost.
+static DIAGNOSTIC_TIMEOUT_SECONDS: AtomicU32 = AtomicU32::new(0);
+
+fn diagnostic_timeout_active() -> bool {
+    DIAGNOSTIC_TIMEOUT_SECONDS.load(Ordering::Acquire) != 0
+        && !DIAGNOSTIC_TIMEOUT_CANCELLED.load(Ordering::Acquire)
+}
+
 /// The exit status a bounded diagnostic run reports when its time limit expires.
 ///
 /// This matches what the shell reports for a process killed by `SIGALRM`, which is how the limit
 /// used to be enforced, so scripts reading the status keep working.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const DIAGNOSTIC_TIMEOUT_EXIT_STATUS: i32 = 142;
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn report_diagnostic_stall_attribution() {
+    const STALE_PROGRESS_MILLIS: u64 = 2_000;
+
+    let wait = guest_sync::main_timed_wait_snapshot();
+    let gpu_events = remu_gpu::gpu_events_in_flight();
+    let gpu_work = remu_gpu::gpu_work_items_pending();
+    let gpu_flips = remu_gpu::gpu_flips_pending();
+    let gpu_completed = remu_gpu::gpu_completed_submission_sequence();
+    let gpu_age = remu_gpu::gpu_progress_age_millis();
+    let audio_frames = remu_gpu::audio_output_frames();
+    let audio_underruns = remu_gpu::audio_underrun_frames();
+    let audio_age = remu_gpu::audio_progress_age_millis();
+    let audio_state = if audio_frames == 0 {
+        "no-callback"
+    } else if audio_age.is_some_and(|age| age >= STALE_PROGRESS_MILLIS) {
+        "callback-stalled"
+    } else {
+        "callback-active"
+    };
+    let gpu_state = if gpu_events == 0 && gpu_work == 0 && gpu_flips == 0 {
+        "drained"
+    } else if gpu_age.is_some_and(|age| age >= STALE_PROGRESS_MILLIS) {
+        "outstanding-stalled"
+    } else {
+        "outstanding-active"
+    };
+    if let Some(wait) = wait {
+        eprintln!(
+            "[REMu][STALL-ATTRIBUTION] main_timed_wait=active condition={:#x} return={:#x} timeout_usec={} consecutive_timeouts={} age_ms={} gpu={gpu_state} events={gpu_events} work={gpu_work} flips={gpu_flips} completed_submission={gpu_completed} progress_age_ms={gpu_age:?} audio={audio_state} frames={audio_frames} underrun_frames={audio_underruns} progress_age_ms={audio_age:?}",
+            wait.condition,
+            wait.return_address,
+            wait.timeout_usec,
+            wait.consecutive_timeouts,
+            wait.age_millis,
+        );
+    } else {
+        eprintln!(
+            "[REMu][STALL-ATTRIBUTION] main_timed_wait=none gpu={gpu_state} events={gpu_events} work={gpu_work} flips={gpu_flips} completed_submission={gpu_completed} progress_age_ms={gpu_age:?} audio={audio_state} frames={audio_frames} underrun_frames={audio_underruns} progress_age_ms={audio_age:?}"
+        );
+    }
+
+    let players = PROBE_DISPATCH
+        .get()
+        .and_then(|dispatch| dispatch.try_read().ok())
+        .map_or_else(Vec::new, |state| {
+            av_player::av_player_stall_snapshots(&state)
+        });
+    if players.is_empty() {
+        eprintln!("[REMu][STALL-AVPLAYER] players=none-or-dispatch-busy");
+    }
+    for player in players {
+        let decoder_state = if !player.active || !player.playing || player.paused {
+            "inactive"
+        } else if !player.decoder_present {
+            "decoder-absent"
+        } else if player.decoder_drained || player.end_of_stream {
+            "drained"
+        } else if player.decoder_queue_blocked
+            && player
+                .video_delivery_age_millis
+                .is_some_and(|age| age >= STALE_PROGRESS_MILLIS)
+        {
+            "consumer-blocked"
+        } else if !player.decoder_queue_blocked
+            && player
+                .decoder_progress_age_millis
+                .is_some_and(|age| age >= STALE_PROGRESS_MILLIS)
+        {
+            "producer-stalled"
+        } else if player.decoder_produced_frames == 0
+            && player.decoder_progress_age_millis.is_none()
+        {
+            "producer-no-progress"
+        } else {
+            "active"
+        };
+        eprintln!(
+            "[REMu][STALL-AVPLAYER] handle={:#x} state={decoder_state} active={} playing={} paused={} eos={} source={:?} delivered={} delivery_age_ms={:?} decoder_present={} decoder_drained={} produced={} decoder_progress_age_ms={:?} queue_blocked={}",
+            player.handle,
+            player.active,
+            player.playing,
+            player.paused,
+            player.end_of_stream,
+            player.source,
+            player.delivered_video_frames,
+            player.video_delivery_age_millis,
+            player.decoder_present,
+            player.decoder_drained,
+            player.decoder_produced_frames,
+            player.decoder_progress_age_millis,
+            player.decoder_queue_blocked,
+        );
+    }
+}
 
 /// Ends the process once a bounded diagnostic run reaches its time limit.
 ///
@@ -7218,7 +7337,10 @@ const DIAGNOSTIC_TIMEOUT_EXIT_STATUS: i32 = 142;
 /// outright: that discarded every end-of-run report, which is most of the reason for bounding a
 /// run in the first place. The thread runs even when every guest thread is wedged, so it remains
 /// a backstop against a hang and not merely a timer.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn start_diagnostic_timeout(timeout_seconds: u32) {
+    DIAGNOSTIC_TIMEOUT_CANCELLED.store(false, Ordering::Release);
+    DIAGNOSTIC_TIMEOUT_SECONDS.store(timeout_seconds, Ordering::Release);
     let limit = Duration::from_secs(u64::from(timeout_seconds));
     std::thread::Builder::new()
         .name("remu-timeout".to_owned())
@@ -7228,6 +7350,7 @@ fn start_diagnostic_timeout(timeout_seconds: u32) {
                 return;
             }
             eprintln!("[REMu] diagnostic time limit of {timeout_seconds}s reached");
+            report_diagnostic_stall_attribution();
             terminate_probe(DIAGNOSTIC_TIMEOUT_EXIT_STATUS);
         })
         .ok();
