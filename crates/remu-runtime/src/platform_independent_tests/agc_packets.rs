@@ -674,10 +674,10 @@ fn decodes_event_writes_without_inventing_completion_notifications() {
         query_results, [0; 16],
         "query results must retire with preceding GPU work instead of changing during decoding"
     );
-    assert_eq!(query_events.len(), 16);
+    assert_eq!(query_events.len(), 32);
     for (event_index, event) in query_events.into_iter().enumerate() {
-        let dump_index = event_index / 8;
-        let pair_index = event_index % 8;
+        let dump_index = event_index / 16;
+        let pair_index = event_index % 16;
         let expected_count = if dump_index == 0 { 0 } else { 0x02ff_ffff };
         assert_eq!(
             event,

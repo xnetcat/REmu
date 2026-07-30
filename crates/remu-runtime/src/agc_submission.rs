@@ -59,8 +59,11 @@ pub(crate) struct AgcSubmissionPacket {
 const INDIRECT_DRAW_REGISTER_UNMAPPED: u32 = 0x280;
 const PIXEL_PIPE_STAT_VALID: u64 = 1 << 63;
 const PIXEL_PIPE_STAT_STEP: u64 = 0x02ff_ffff;
-/// The base Gen5 result block contains eight 16-byte render-backend counter pairs.
-const PIXEL_PIPE_STAT_COUNTER_PAIRS: u64 = 8;
+/// Gen5 result blocks contain sixteen 16-byte render-backend counter pairs.
+///
+/// Native PS5 command streams clear the full 0x100-byte payload before issuing
+/// `PIXEL_PIPE_STAT_DUMP`; every even qword is a counter and every odd qword is padding.
+const PIXEL_PIPE_STAT_COUNTER_PAIRS: u64 = 16;
 
 #[derive(Clone, Copy)]
 struct AgcIndirectDrawArguments {
