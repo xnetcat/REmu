@@ -14,7 +14,7 @@ use super::{
     resident_is_depth_array_face, retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
     sampled_alias_descriptor, texture_element_layout, trace_image_descriptors,
-    trace_resident_texture_removal, trace_target_sampling,
+    trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
     write_resident_texture_contents_to_guest,
 };
 use metal::foreign_types::ForeignType;
@@ -562,10 +562,9 @@ pub(crate) fn create_sampled_guest_texture(
             linear.len()
         ));
     }
-    if trace_image_descriptors()
+    if (trace_image_descriptors() && guest.width >= 700 && guest.height >= 500
+        || trace_video_target_consumers())
         && guest.tile_mode == 0
-        && guest.width >= 700
-        && guest.height >= 500
         && matches!(
             guest.pixel_format,
             MTLPixelFormat::R8Unorm | MTLPixelFormat::RG8Unorm
@@ -590,10 +589,11 @@ pub(crate) fn create_sampled_guest_texture(
             );
             let average = total as f64 / linear.len().max(1) as f64;
             eprintln!(
-                "[REMu][METAL][IMAGE] uploaded linear video plane address={:#x} extent={}x{} format={:?} bytes={} hash={fingerprint:016x} range={minimum}..={maximum} average={average:.1}",
+                "[REMu][METAL][VIDEO-PLANE] uploaded address={:#x} extent={}x{} pitch={} format={:?} bytes={} hash={fingerprint:016x} range={minimum}..={maximum} average={average:.1}",
                 guest.address,
                 guest.width,
                 guest.height,
+                guest.pitch,
                 guest.pixel_format,
                 linear.len(),
             );

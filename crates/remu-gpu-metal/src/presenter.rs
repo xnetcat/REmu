@@ -90,7 +90,7 @@ use self::diagnostics::{
     record_diagnostic_texture_writer, should_record_diagnostic_target_writer,
     trace_image_descriptors, trace_msaa_writes, trace_scanout_writes, trace_target_sampling,
     trace_video_target_compute_consumer, trace_video_target_draw_consumer,
-    video_target_binding_summary,
+    trace_video_target_consumers, video_target_binding_summary,
 };
 use self::format::{
     compressed_texture_block_extent, decode_sampled_texture_format, half_float_to_f32,
