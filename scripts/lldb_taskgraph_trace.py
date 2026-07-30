@@ -6,7 +6,8 @@ REmu executes mapped x86-64 guest code directly.  This diagnostic therefore
 uses LLDB hardware *code* breakpoints: guest bytes are never changed and there
 is no software-breakpoint fallback.  Four x86 debug-register slots are rotated
 through a small state machine so one ``FNullGraphTask`` can be correlated from
-dispatch through queue publication, wake, pop, execution, and completion.
+prerequisite release through queue publication, wake, pop, execution, and
+completion.
 
 Load this file from LLDB, then run ``remu-taskgraph-trace-start`` before
 launching REmu.  ``scripts/probe-taskgraph.sh`` provides the complete bounded
@@ -45,6 +46,7 @@ PHASE_CONSUME = "consume"
 PHASE_COMPLETE = "complete"
 PHASE_DONE = "done"
 
+PREPARE = "prepare-task"
 DISPATCH = "dispatch"
 PUBLISH = "publish-task"
 PUBLISH_RETURN = "publish-return"
@@ -73,10 +75,16 @@ BREAKPOINTS = {
     },
     PHASE_DONE: {},
 }
+PREPARE_ADDRESS = 0x801BE1ADF
 TASKGRAPH_BREAKPOINT_ADDRESSES = frozenset(
-    address
-    for phase_breakpoints in BREAKPOINTS.values()
-    for address in phase_breakpoints.values()
+    {
+        PREPARE_ADDRESS,
+        *(
+            address
+            for phase_breakpoints in BREAKPOINTS.values()
+            for address in phase_breakpoints.values()
+        ),
+    }
 )
 # Rosetta occasionally reports a hardware code breakpoint as a trace stop at the
 # instruction immediately after the watched instruction rather than as an LLDB
@@ -86,6 +94,7 @@ TASKGRAPH_BREAKPOINT_ADDRESSES = frozenset(
 # breakpoint address.
 TASKGRAPH_TRACE_FALLTHROUGH_ADDRESSES = frozenset(
     {
+        0x801BE1AE2,  # PREPARE dependency-count comparison completed
         0x801BE1AFB,  # DISPATCH call completed
         0x8011C6F21,  # PUBLISH entry push completed
         0x8011C6C62,  # PUBLISH_RETURN mov completed
@@ -101,6 +110,11 @@ TASKGRAPH_TRACE_FALLTHROUGH_ADDRESSES = frozenset(
 # These are instruction-boundary facts from the materialized PPSA10112 SELF,
 # decoded by REmu's non-executing ``disassemble`` command:
 #
+# * PREPARE follows the atomic prerequisite-count release in
+#   ``FRenderCommandFence::BeginFence``.  ``rbx`` is the task, ``r12d`` is the
+#   old counter value, and ``eax`` is the release threshold that makes the task
+#   immediately dispatchable.  Unlike DISPATCH, this site is reached even if a
+#   prerequisite prevents the fence task from ever entering a queue.
 # * DISPATCH is the indirect call after ``rsi = rbx`` (task), ``edx =
 #   [rbx+8]`` (target), and ``ecx = [rbp-0x68]`` (current thread).
 # * PUBLISH is a SysV entry: rdi=queue, rsi=task, edx=lane.
@@ -223,6 +237,9 @@ class TaskGraphTraceState:
         self.publish_wait_state_before: int | None = None
         self.wake_event = 0
         self.pop_site = ""
+        self.counter_before_release = 0
+        self.release_threshold = 0
+        self.conditional_dispatch_observed = False
 
     @property
     def done(self) -> bool:
@@ -231,36 +248,42 @@ class TaskGraphTraceState:
     def active_breakpoints(self) -> Mapping[str, int]:
         if self.phase == PHASE_PUBLISH:
             if self.task == 0:
-                return {DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH]}
+                return {
+                    PREPARE: PREPARE_ADDRESS,
+                    DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                }
             if self.publisher_entry_rsp == 0:
                 return {
+                    PREPARE: PREPARE_ADDRESS,
                     DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
                     PUBLISH: BREAKPOINTS[PHASE_PUBLISH][PUBLISH],
                 }
             if self.publisher_return_rsp == 0:
                 return {
+                    PREPARE: PREPARE_ADDRESS,
                     DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
                     PUBLISH_RETURN: BREAKPOINTS[PHASE_PUBLISH][PUBLISH_RETURN]
                 }
             return {
+                PREPARE: PREPARE_ADDRESS,
                 DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
                 WAKE: BREAKPOINTS[PHASE_PUBLISH][WAKE],
             }
         if self.phase == PHASE_CONSUME and self.pop_site:
             return {
-                DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                PREPARE: PREPARE_ADDRESS,
                 EXECUTE: BREAKPOINTS[PHASE_CONSUME][EXECUTE],
             }
         if self.phase == PHASE_CONSUME:
             return {
-                DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                PREPARE: PREPARE_ADDRESS,
                 POP_LOCAL: BREAKPOINTS[PHASE_CONSUME][POP_LOCAL],
                 POP_WAIT: BREAKPOINTS[PHASE_CONSUME][POP_WAIT],
                 POP_DRAIN: BREAKPOINTS[PHASE_CONSUME][POP_DRAIN],
             }
         if self.phase == PHASE_COMPLETE:
             return {
-                DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH],
+                PREPARE: PREPARE_ADDRESS,
                 COMPLETE: BREAKPOINTS[PHASE_COMPLETE][COMPLETE],
             }
         return BREAKPOINTS[self.phase]
@@ -283,6 +306,9 @@ class TaskGraphTraceState:
         self.publish_wait_state_before = None
         self.wake_event = 0
         self.pop_site = ""
+        self.counter_before_release = 0
+        self.release_threshold = 0
+        self.conditional_dispatch_observed = False
 
     def observe(
         self,
@@ -301,11 +327,25 @@ class TaskGraphTraceState:
         if label not in self.active_breakpoints():
             return TraceResult(False)
 
+        candidate_task = (
+            _register(registers, "rbx")
+            if label == PREPARE
+            else _register(registers, "rsi")
+            if label == DISPATCH
+            else 0
+        )
         superseded = None
-        if label == DISPATCH and self.task != 0:
+        if (
+            label in (PREPARE, DISPATCH)
+            and self.task != 0
+            and candidate_task != 0
+            and candidate_task != self.task
+        ):
             superseded = (
                 f"superseded task={self.task:#x} event={self.completion_event:#x} "
                 f"phase={self.phase} published={self.queue != 0} "
+                f"release={self.counter_before_release:#x}/"
+                f"{self.release_threshold:#x} "
                 f"wake={self.wake_event:#x} pop={self.pop_site or 'not-observed'}"
             )
             self.phase = PHASE_PUBLISH
@@ -333,12 +373,46 @@ class TaskGraphTraceState:
         thread_id: int,
         read_u64: ReadU64,
     ) -> TraceResult:
-        if label == DISPATCH:
+        if label == PREPARE:
             if self.task != 0:
                 return TraceResult(False)
             if self.cycles_started >= self.cycle_limit:
                 return self._finish("cycle-limit")
+            task = _register(registers, "rbx")
+            if task == 0:
+                return TraceResult(False)
+            self.task = task
+            self.completion_event = read_u64(task + 0x18) or 0
+            self.counter_before_release = (
+                _register(registers, "r12") & 0xFFFFFFFF
+            )
+            self.release_threshold = _register(registers, "rax") & 0xFFFFFFFF
+            self.cycles_started += 1
+            return TraceResult(
+                True,
+                f"cycle={self.cycles_started} prepare task={task:#x} "
+                f"event={self.completion_event:#x} "
+                f"counter_before_release={self.counter_before_release:#x} "
+                f"release_threshold={self.release_threshold:#x} "
+                "dispatchable="
+                f"{self.counter_before_release == self.release_threshold}",
+            )
+
+        if label == DISPATCH:
             task = _register(registers, "rsi")
+            if self.task != 0:
+                if task != self.task:
+                    return TraceResult(False)
+                self.conditional_dispatch_observed = True
+                return TraceResult(
+                    True,
+                    f"cycle={self.cycles_started} conditional-dispatch "
+                    f"task={task:#x} event={self.completion_event:#x} "
+                    f"target={_register(registers, 'rdx') & 0xffffffff:#x} "
+                    f"current={_register(registers, 'rcx') & 0xffffffff:#x}",
+                )
+            if self.cycles_started >= self.cycle_limit:
+                return self._finish("cycle-limit")
             if task == 0:
                 return TraceResult(False)
             self.task = task
