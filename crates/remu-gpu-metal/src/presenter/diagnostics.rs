@@ -184,6 +184,31 @@ pub(super) fn diagnostic_video_chain_textures()
     TEXTURES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn diagnostic_video_chain_match(
+    tracked: &[(GuestTextureDescriptor, DiagnosticVideoChainProducer)],
+    sampled: GuestTextureDescriptor,
+) -> Option<(GuestTextureDescriptor, DiagnosticVideoChainProducer)> {
+    // HashMap iteration order is intentionally unspecified. Prefer the exact producer before
+    // progressively weaker alias relationships so an overlapping transient allocation cannot
+    // make the diagnostic chain hide a producer for the descriptor that is actually sampled.
+    tracked
+        .iter()
+        .copied()
+        .find(|(candidate, _)| *candidate == sampled)
+        .or_else(|| {
+            tracked
+                .iter()
+                .copied()
+                .find(|(candidate, _)| guest_texture_descriptors_share_storage(*candidate, sampled))
+        })
+        .or_else(|| {
+            tracked
+                .iter()
+                .copied()
+                .find(|(candidate, _)| guest_texture_descriptors_overlap(*candidate, sampled))
+        })
+}
+
 pub(super) fn diagnostic_video_chain_matches(
     evaluation: &ShaderEvaluation,
 ) -> Vec<(
@@ -204,14 +229,8 @@ pub(super) fn diagnostic_video_chain_matches(
         .filter(|binding| !is_writable_image_opcode(binding.opcode))
         .filter_map(|binding| {
             let descriptor = decode_image_descriptor(&binding.resource_descriptor).ok()?;
-            tracked
-                .iter()
-                .find(|(candidate, _)| {
-                    candidate.address == descriptor.guest.address
-                        || guest_texture_descriptors_share_storage(*candidate, descriptor.guest)
-                        || guest_texture_descriptors_overlap(*candidate, descriptor.guest)
-                })
-                .map(|(candidate, producer)| (binding, descriptor, *candidate, *producer))
+            diagnostic_video_chain_match(&tracked, descriptor.guest)
+                .map(|(candidate, producer)| (binding, descriptor, candidate, producer))
         })
         .collect()
 }
@@ -1187,6 +1206,49 @@ pub(super) fn dump_msl_instruction_filter_matches(pixel_instruction_count: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_chain_match_prefers_exact_descriptor_over_earlier_overlap() {
+        let sampled = GuestTextureDescriptor {
+            address: 0x1000,
+            width: 4,
+            height: 4,
+            pitch: 4,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let overlapping = GuestTextureDescriptor {
+            address: 0x1010,
+            width: 1,
+            height: 1,
+            pitch: 1,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::R8Unorm,
+            bytes_per_pixel: 1,
+        };
+        let overlap_producer = DiagnosticVideoChainProducer {
+            stage: "draw",
+            sequence: 20,
+            shader: 0x2000,
+            generation: 1,
+        };
+        let exact_producer = DiagnosticVideoChainProducer {
+            stage: "compute",
+            sequence: 10,
+            shader: 0x1000,
+            generation: 3,
+        };
+
+        assert_eq!(
+            diagnostic_video_chain_match(
+                &[(overlapping, overlap_producer), (sampled, exact_producer)],
+                sampled,
+            )
+            .map(|(descriptor, producer)| (descriptor, producer.sequence)),
+            Some((sampled, exact_producer.sequence)),
+        );
+    }
 
     fn video_plane(
         address: u64,
