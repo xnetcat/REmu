@@ -1408,6 +1408,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     // side means the GPU seam carries a validated, immutable RGBA image instead of a host path
     // whose lifetime or casing the presenter would have to rediscover.
     let system_splash = load_system_splash(game_root);
+    remu_gpu::install_gpu_completion_notifier(notify_kernel_equeue_waiters);
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = state
         .write()
@@ -3370,6 +3371,7 @@ fn kernel_raise_exception(arguments: [u64; 6], state: &ProbeDispatchState) -> u6
             });
         GUEST_EXCEPTION_PENDING.store(true, Ordering::Release);
         guest_sync().1.notify_all();
+        notify_kernel_equeue_waiters();
         eprintln!(
             "[REMu][KERNEL] queued cooperative exception source={source:#x} target={:#x} target_name={:?} type={exception} handler={handler:#x}",
             arguments[0], target_thread.name
@@ -4381,6 +4383,7 @@ fn kernel_delete_equeue(handle: u64, state: &mut ProbeDispatchState) -> u64 {
         .kernel_event_registrations
         .retain(|&(equeue, _, _), _| equeue != handle);
     state.pending_events.retain(|event| event.equeue != handle);
+    notify_kernel_equeue_waiters();
     0
 }
 
@@ -4800,11 +4803,9 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
                 write_guest_u32(timeout_pointer, 0);
                 return sce_kernel_error(SCE_KERNEL_ERROR_TIMED_OUT);
             };
-            remaining.min(Duration::from_millis(1))
+            Some(remaining)
         } else {
-            // Backend submission completion is an atomic published from the presenter. Polling it
-            // at a 1 ms ceiling avoids a cross-crate callback while keeping idle waits parked.
-            Duration::from_millis(1)
+            None
         };
         let wake = kernel_equeue_wake();
         let wake_state = wake
@@ -4814,10 +4815,18 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
         if *wake_state != generation {
             continue;
         }
-        let _ = wake
-            .1
-            .wait_timeout(wake_state, wait_for)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(wait_for) = wait_for {
+            let _ = wake
+                .1
+                .wait_timeout(wake_state, wait_for)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        } else {
+            drop(
+                wake.1
+                    .wait(wake_state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
     }
 }
 
