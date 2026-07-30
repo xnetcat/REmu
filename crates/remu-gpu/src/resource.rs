@@ -84,6 +84,14 @@ pub struct GpuScanoutTarget {
 pub struct IndexedDraw {
     pub sequence: u64,
     pub indexed: bool,
+    /// Guest address of the native draw arguments when this draw came from
+    /// `DRAW_{INDEX_}INDIRECT`.
+    ///
+    /// The scalar count fields below retain the packet-time CPU observation for diagnostics and
+    /// resource-analysis hints. They are not authoritative for an indirect draw because an
+    /// earlier GPU pass can still be producing the argument dwords. Backends must consume this
+    /// buffer in queue order instead.
+    pub indirect_arguments_address: Option<u64>,
     pub instance_count: u32,
     pub index_buffer_address: u64,
     pub index_resource_address: u64,

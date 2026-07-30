@@ -338,9 +338,17 @@ fn dma_shadow_reaches_indirect_draw_arguments_without_executing_the_copy_early()
     assert_eq!(draw.instance_count, 2);
     assert_eq!(draw.index_offset, 1);
     assert_eq!(draw.base_vertex, -3);
-    assert_eq!(graphics.shader_registers.get(&0x08c), Some(&((-3_i32) as u32)));
-    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&1));
-    assert_eq!(graphics.shader_registers.get(&0x08e), Some(&9));
+    assert_eq!(draw.indirect_arguments_address, Some(destination_address));
+    assert_eq!(
+        draw.shader_registers
+            .iter()
+            .find(|register| register.offset == 0x08c)
+            .map(|register| register.value),
+        Some(0)
+    );
+    assert_eq!(graphics.shader_registers.get(&0x08c), None);
+    assert_eq!(graphics.shader_registers.get(&0x08d), None);
+    assert_eq!(graphics.shader_registers.get(&0x08e), None);
 }
 
 #[test]

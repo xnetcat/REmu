@@ -271,6 +271,8 @@ pub(crate) fn describe_guest_batch(work: &[GuestBatchWork]) -> String {
         .map(|item| match item {
             GuestBatchWork::Draw {
                 sequence,
+                indexed,
+                indirect_arguments_address,
                 export,
                 pixel,
                 index_count,
@@ -281,9 +283,15 @@ pub(crate) fn describe_guest_batch(work: &[GuestBatchWork]) -> String {
                 pixel_msl_bytes,
                 export_dispatcher,
                 pixel_dispatcher,
-            } => format!(
-                "draw(seq={sequence},es={export:#x}/{export_msl_bytes}B/dispatcher={export_dispatcher},ps={pixel:#x}/{pixel_msl_bytes}B/dispatcher={pixel_dispatcher},indices={index_count},instances={instance_count},target={target:#x}/{extent:?})"
-            ),
+            } => {
+                let source = indirect_arguments_address.map_or_else(
+                    || "direct".to_owned(),
+                    |address| format!("indirect@{address:#x}"),
+                );
+                format!(
+                    "draw(seq={sequence},indexed={indexed},source={source},es={export:#x}/{export_msl_bytes}B/dispatcher={export_dispatcher},ps={pixel:#x}/{pixel_msl_bytes}B/dispatcher={pixel_dispatcher},indices={index_count},instances={instance_count},target={target:#x}/{extent:?})"
+                )
+            }
             GuestBatchWork::Compute {
                 sequence,
                 shader,
@@ -320,6 +328,8 @@ mod tests {
             },
             GuestBatchWork::Draw {
                 sequence: 23,
+                indexed: true,
+                indirect_arguments_address: Some(0x807d_3600_28),
                 export: 0x80dc_3b00_00,
                 pixel: 0x80dc_4000_00,
                 index_count: 36,
@@ -337,6 +347,7 @@ mod tests {
             "source=Indirect { dimensions_address: 551841103872 },grid=Threadgroups([65535, 4, 1]),local=[8, 8, 1]"
         ));
         assert!(description.contains("cs=0x8008220000/108553B/dispatcher=true"));
+        assert!(description.contains("draw(seq=23,indexed=true,source=indirect@0x807d360028"));
         assert!(description.contains(
             "ps=0x80dc400000/447366B/dispatcher=true,indices=36,instances=1,target=0x8020000000/[1920, 1080]"
         ));

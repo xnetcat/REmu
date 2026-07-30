@@ -28,29 +28,45 @@ enum QueuedGlobalReadSource {
 }
 
 impl MetalPresenter {
-    /// Resolves the three dwords consumed by a native indirect compute dispatch.
+    /// Resolves a guest range consumed by a native indirect GPU command.
     ///
     /// Indirect arguments are commonly produced by an earlier GPU pass. Reading them from guest
     /// memory while parsing the PM4 stream observes stale CPU backing; keep the read on Metal
     /// instead, forwarding the exact pending writeback buffer when one owns this range. The
     /// ordinary global-coherence fallback drains only ambiguous writers before taking a fresh
     /// copy, matching shader global reads.
-    pub(super) fn upload_indirect_dispatch_arguments(
+    pub(super) fn upload_ordered_indirect_arguments(
         &mut self,
         device: &Device,
         address: u64,
+        byte_count: usize,
     ) -> Result<UploadedGlobalBuffer, String> {
-        const INDIRECT_ARGUMENT_BYTE_COUNT: usize = 3 * std::mem::size_of::<u32>();
+        if byte_count == 0 {
+            return Err("indirect argument buffer is empty".to_owned());
+        }
         let binding = GlobalMemoryBinding {
             scalar_address: 0,
             base_address: address,
             instruction_pcs: Default::default(),
-            byte_count: INDIRECT_ARGUMENT_BYTE_COUNT,
+            byte_count,
             data: Vec::new(),
             writable: false,
             write_back_to_guest: false,
         };
         let source = self.queued_global_read_source(&binding)?;
+        static INDIRECT_UPLOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+        let sequence = INDIRECT_UPLOAD_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence <= 16 || sequence.is_power_of_two() {
+            let source_name = match &source {
+                QueuedGlobalReadSource::None => "guest",
+                QueuedGlobalReadSource::Buffer { .. } => "gpu-writeback",
+                QueuedGlobalReadSource::GuestMemory => "ordered-guest",
+                QueuedGlobalReadSource::Synchronize => "synchronize",
+            };
+            eprintln!(
+                "[REMu][METAL][INDIRECT-BUFFER] sequence={sequence} address={address:#x} bytes={byte_count} source={source_name}"
+            );
+        }
         if matches!(source, QueuedGlobalReadSource::Synchronize) {
             let queue = self
                 .command_queue
@@ -62,6 +78,14 @@ impl MetalPresenter {
             return self.upload_fresh_global_buffer(device, &binding);
         }
         self.upload_global_buffer_from_source(device, &binding, source)
+    }
+
+    pub(super) fn upload_indirect_dispatch_arguments(
+        &mut self,
+        device: &Device,
+        address: u64,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        self.upload_ordered_indirect_arguments(device, address, 3 * std::mem::size_of::<u32>())
     }
 
     pub(super) fn cached_sampler_argument_buffer(

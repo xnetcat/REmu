@@ -262,6 +262,7 @@ fn targetless_scanout_test_draw() -> remu_gpu::IndexedDraw {
     remu_gpu::IndexedDraw {
         sequence: 1,
         indexed: false,
+        indirect_arguments_address: None,
         instance_count: 1,
         index_buffer_address: 0,
         index_resource_address: 0,
