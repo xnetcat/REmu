@@ -608,3 +608,41 @@ fn offline_np_service_initializers_retain_context_and_property_ownership() {
         Some("sceNpUniversalDataSystemCreateEventPropertyObject")
     );
 }
+
+/// An ACM context is an opaque handle the guest hands back to the batch entry points. Creating one
+/// must yield a distinct live id and reject a missing output, and destroying an id that was never
+/// issued must not silently succeed.
+#[cfg(target_os = "macos")]
+#[test]
+fn acm_contexts_are_distinct_handles_with_checked_lifetimes() {
+    let mut state = ProbeDispatchState::default();
+    let mut first = 0_u32;
+    let mut second = 0_u32;
+    assert_eq!(
+        crate::acm_context_create([(&raw mut first).addr() as u64, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(
+        crate::acm_context_create([(&raw mut second).addr() as u64, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_ne!(first, 0);
+    assert_ne!(first, second, "each context must be its own handle");
+    assert_eq!(
+        crate::acm_context_create([0, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        crate::acm_context_destroy([u64::from(first), 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(
+        crate::acm_context_destroy([u64::from(first), 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT),
+        "destroying a released context must not report success"
+    );
+    assert_eq!(
+        crate::known_nid_name("ZIXln2K3XMk"),
+        Some("sceAcmContextCreate")
+    );
+}

@@ -434,6 +434,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "WfAiBW8Wcek" => "sceAjmBatchErrorDump",
         "Wi7DtlLV+KI" => "sceAjmModuleUnregister",
         "dl+4eHSzUu4" => "sceAjmInitialize",
+        "ZIXln2K3XMk" => "sceAcmContextCreate",
+        "jBgBjAj02R8" => "sceAcmContextDestroy",
         "ezM2OhNxzck" => "sceAjmBatchJobInitialize",
         "cK6bYHf-Q5E" => "sce::Json::Initializer::Initializer",
         "-hJRce8wn1U" => "sce::Json::MemAllocator::MemAllocator",

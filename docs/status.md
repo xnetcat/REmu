@@ -113,12 +113,22 @@ With those, fiber traffic runs clean — over two thousand transitions in a 45-s
 refused call — and the title reaches its Bink video threads and its `Core.Res` decompressor,
 file-loader, and task-manager pipeline.
 
-It is still not playable and no compatibility is claimed: it submits no draws, and those resource
-threads sit in condition waits. The next unserved imports it reaches are `sceAcmContextCreate`,
-`sceSystemGestureOpen`/`InitializePrimitiveTouchRecognizer`,
-`sceVideoOutColorSettingsSetGamma`, plus the already-listed `sceKernelSetPrtAperture` and
-`sceNetCtlInit`; which of those the stalled resource threads are actually waiting on is not yet
-established and is the next thing to trace.
+The title now runs to roughly ninety thousand imports. It configures its display — 1920x1080
+through `sceVideoOutSetBufferAttribute2` and `sceVideoOutRegisterBuffers2` — and brings up audio.
+
+`sceAcmContextCreate`/`Destroy` are served: an ACM context is an opaque handle the guest hands back
+to the batch entry points, so issuing a distinct live id is that call's whole contract. The
+signal-processing batch entry points stay unimplemented. This removed a spurious failure but was
+not a blocker: the engine creates a context, immediately destroys it, unloads the module, and
+finalizes Ajm either way, which reads as a capability probe rather than a failed path.
+
+It is still not playable and no compatibility is claimed: it submits no draws, and its `Core.Res`
+threads sit in condition waits having never been given work. Why they are never fed is not
+established. The remaining unserved imports it reaches are `sceSystemGestureOpen` and
+`sceSystemGestureInitializePrimitiveTouchRecognizer`, `sceVideoOutColorSettingsSetGamma`,
+`sceKernelSetPrtAperture`, `sceNetCtlInit`, and one NID (`D-CzAxQL0XI`) with no recovered name.
+None of them has been shown to be what the resource threads are waiting on, so serving them is not
+known to be the next step; tracing what feeds those threads is.
 
 The fiber implementation is x86-64 only, because it saves and restores x86-64 register state. On
 any other host the NIDs fall through to the unimplemented path rather than to a stub, so its tests

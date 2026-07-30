@@ -422,6 +422,8 @@ struct ProbeDispatchState {
     installed_exception_handlers: BTreeMap<i32, u64>,
     next_ajm_context: u32,
     ajm_contexts: BTreeMap<u32, AjmContextState>,
+    next_acm_context: u32,
+    acm_contexts: BTreeSet<u32>,
     heap_trace_storage: Vec<u64>,
     guest_mspaces: BTreeMap<u64, GuestMspace>,
     json_runtime: JsonRuntimeState,
@@ -1516,6 +1518,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.installed_exception_handlers.clear();
     state.next_ajm_context = 1;
     state.ajm_contexts.clear();
+    state.next_acm_context = 1;
+    state.acm_contexts.clear();
     *guest_exception_delivery()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -3602,6 +3606,34 @@ fn ajm_initialize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     0
 }
 
+/// `sceAcmContextCreate(contextOut)`.
+///
+/// An ACM context is an opaque identifier: the guest passes it back to the batch entry points and
+/// never inspects it, so handing out a distinct live id is the whole contract of this call. The
+/// signal-processing batch entry points it is used with stay unimplemented, and deliberately so —
+/// this makes the audio engine keep its context instead of tearing its whole stack down at
+/// creation, and moves the loud gap to the calls that would actually have to do the work.
+fn acm_context_create(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let output = arguments[0];
+    if output == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let context = state.next_acm_context.max(1);
+    state.next_acm_context = context.saturating_add(1);
+    state.acm_contexts.insert(context);
+    write_guest_u32(output, context);
+    0
+}
+
+/// `sceAcmContextDestroy(context)`.
+fn acm_context_destroy(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let context = low_u32(arguments[0]);
+    if !state.acm_contexts.remove(&context) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    0
+}
+
 fn ajm_module_register(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let context = low_u32(arguments[0]);
     let codec = low_u32(arguments[1]);
@@ -3915,6 +3947,9 @@ fn dispatch_probe_import(
             0
         }
         "dl+4eHSzUu4" => ajm_initialize(arguments, state),
+        // ACM context handles. The batch/DSP entry points stay unserved.
+        "ZIXln2K3XMk" => acm_context_create(arguments, state),
+        "jBgBjAj02R8" => acm_context_destroy(arguments, state),
         "Q3dyFuwGn64" => ajm_module_register(arguments, state),
         "Wi7DtlLV+KI" => ajm_module_unregister(arguments, state),
         "AxoDrINp4J8" => ajm_instance_create(arguments, state),
