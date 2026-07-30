@@ -14,10 +14,10 @@ use super::{
     TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
     TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, describe_guest_batch, presentation_drawable_size,
-    process_resident_bytes, resident_texture_activity_latest_work, resident_texture_activity_stats,
-    resident_texture_backing_overlap_stats, resident_texture_lifetime_diagnostics_enabled,
-    resident_texture_ownership_stats, take_mode27_work_details, take_texture_dirty_work_details,
-    take_texture_snapshot_work_details,
+    process_memory_statistics, resident_texture_activity_latest_work,
+    resident_texture_activity_stats, resident_texture_backing_overlap_stats,
+    resident_texture_lifetime_diagnostics_enabled, resident_texture_ownership_stats,
+    take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
 use core_graphics_types::geometry::CGSize;
 use metal::{MTLPixelFormat, MetalLayer};
@@ -136,7 +136,7 @@ impl MetalPresenter {
         let guest_batch_rate = f64::from(self.statistics.submitted_guest_batches) / seconds;
         let pipeline_barrier_rate =
             f64::from(self.statistics.coalesced_pipeline_barriers) / seconds;
-        let resident_mib = process_resident_bytes().map(|bytes| bytes.div_ceil(1024 * 1024));
+        let process_memory = process_memory_statistics();
         let audio_output = remu_gpu::audio_output_frames();
         let interval_audio_output =
             audio_output.saturating_sub(self.statistics.last_audio_output_frames);
@@ -151,8 +151,17 @@ impl MetalPresenter {
             let underruns = u32::try_from(interval_underruns).unwrap_or(u32::MAX);
             f64::from(underruns) * 100.0 / f64::from(output)
         };
-        let resident =
-            resident_mib.map_or_else(|| "RSS ?".to_owned(), |mib| format!("RSS {mib} MiB"));
+        let memory = process_memory.map_or_else(
+            || "RSS ? Foot ?".to_owned(),
+            |memory| {
+                format!(
+                    "RSS {} MiB Foot {}/{} MiB",
+                    memory.resident_bytes.div_ceil(1024 * 1024),
+                    memory.physical_footprint_bytes.div_ceil(1024 * 1024),
+                    memory.peak_physical_footprint_bytes.div_ceil(1024 * 1024),
+                )
+            },
+        );
         let sampled_texture_cache_resident_bytes = self
             .sampled_texture_cache
             .values()
@@ -182,7 +191,7 @@ impl MetalPresenter {
         let pending_gpu_events = remu_gpu::gpu_work_items_pending();
         let pending_flips = remu_gpu::gpu_flips_pending();
         let title = format!(
-            "REMu | FPS {flip_rate:.1} ({frame_milliseconds:.1} ms) | Present {present_rate:.1}/s | GPU {gpu_utilization:.0}% Lat {presentation_latency_milliseconds:.1} ms | {resident} MTL {metal_allocated_mib}/{metal_recommended_mib} MiB | Draw {draw_rate:.0}/s RP {render_pass_rate:.0}/s CS {compute_rate:.0}/s | CB {guest_batch_rate:.0}/s PB {pipeline_barrier_rate:.0}/s ({}) | Q W{} P{} F{} | Tex {}/{sampled_texture_cache_mib} MiB | Pipe {}/{} | Audio {audio_output_rate:.0}/s U {audio_underrun_percent:.1}%",
+            "REMu | FPS {flip_rate:.1} ({frame_milliseconds:.1} ms) | Present {present_rate:.1}/s | GPU {gpu_utilization:.0}% Lat {presentation_latency_milliseconds:.1} ms | {memory} MTL {metal_allocated_mib}/{metal_recommended_mib} MiB | Draw {draw_rate:.0}/s RP {render_pass_rate:.0}/s CS {compute_rate:.0}/s | CB {guest_batch_rate:.0}/s PB {pipeline_barrier_rate:.0}/s ({}) | Q W{} P{} F{} | Tex {}/{sampled_texture_cache_mib} MiB | Pipe {}/{} | Audio {audio_output_rate:.0}/s U {audio_underrun_percent:.1}%",
             self.committed_guest_batches.len(),
             pending_gpu_events,
             self.pending_presentations.len(),

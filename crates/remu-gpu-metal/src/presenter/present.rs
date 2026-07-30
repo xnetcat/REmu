@@ -25,7 +25,7 @@ use super::{
     TEXTURE_SNAPSHOT_NANOSECONDS, WriteWatchRefresh, capture_interval,
     compile_metal_library_with_tools, completed_command_buffer_gpu_duration,
     decode_guest_texture_linear_from_raw, describe_guest_batch, diagnostic_scanout_writer,
-    diagnostic_texture_writer, process_resident_bytes, raw_video_out_texture_descriptor,
+    diagnostic_texture_writer, process_memory_statistics, raw_video_out_texture_descriptor,
     read_texture_linear, refresh_resident_texture_write_watch,
     resident_texture_activity_latest_work, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_lifetime_diagnostics_enabled,
