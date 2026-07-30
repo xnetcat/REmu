@@ -70,6 +70,9 @@ VideoOut normally limits translation look-ahead to 64 pending GPU work items and
 not-yet-presented flips. `REMU_FLIP_GPU_EVENT_BACKLOG` and `REMU_FLIP_PRESENT_BACKLOG` override
 those limits; setting either to `0` disables that limit. Wall-clock AVPlayer frame skipping is
 off by default and can be restored for diagnostics with `REMU_AVPLAYER_WALL_CLOCK_CATCH_UP=1`.
+`REMU_TRACE_AVPLAYER_CONTENT=1` logs bounded luma/chroma or PCM content statistics for the first
+four and power-of-two decoded frames, which separates decoder output from downstream texture,
+shader, and host-audio failures without changing media timing.
 
 Enable Apple's in-window Metal Performance HUD with `REMU_METAL_HUD=1`; add
 `REMU_METAL_HUD_LOG=1` to record its metrics. Automated input is disabled by default; opt into a
