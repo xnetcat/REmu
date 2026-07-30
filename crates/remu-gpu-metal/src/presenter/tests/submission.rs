@@ -24,8 +24,8 @@ use super::{
     GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor, MetalPresenter,
     OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
     PendingGlobalWriteback, PendingGuestMemoryWrite, QueueBlockReason,
-    apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
-    read_texture_linear, write_back_pending_globals,
+    apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write, read_texture_linear,
+    write_back_pending_globals,
 };
 
 fn mapped_test_label() -> (GuestAddressSpace, u64) {
@@ -95,6 +95,30 @@ fn native_metal_draw_arguments_match_the_gen5_indirect_layouts() {
     assert_eq!(
         std::mem::offset_of!(MTLDrawIndexedPrimitivesIndirectArguments, baseInstance),
         16
+    );
+}
+
+#[test]
+fn busy_event_loop_retains_batches_but_idle_callbacks_flush() {
+    assert!(!super::super::submission::event_loop_batch_requires_flush(
+        true
+    ));
+    assert!(super::super::submission::event_loop_batch_requires_flush(
+        false
+    ));
+}
+
+#[test]
+fn retained_busy_batch_has_a_finite_submission_completion_bound() {
+    let capacity = super::super::GUEST_BATCH_COMPLETION_CAPACITY;
+    assert!(!super::super::submission::guest_batch_completion_capacity_reached(
+        capacity - 1
+    ));
+    assert!(
+        super::super::submission::guest_batch_completion_capacity_reached(capacity)
+    );
+    assert!(
+        super::super::submission::guest_batch_completion_capacity_reached(capacity + 1)
     );
 }
 

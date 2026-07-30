@@ -3,17 +3,17 @@
 
 use super::{
     ActiveGuestMemoryWait, DisplayConfiguration, GLOBAL_UPLOAD_ALIGNMENT,
-    GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GlobalUploadChunk, GraphicsPipelineKey,
-    GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
-    GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
-    GuestMemoryWriteOperation, MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OrderedEventPoll,
-    OrderedEventSource, OrderedGpuEventReceiver, PIPELINE_DRAW_GATES, PendingFlip,
-    PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange, PresenterFlow,
-    QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer,
-    WriteWatchRefresh, graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
-    guest_texture_byte_count, pixel_scalars, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear,
-    record_diagnostic_memory_copy, refresh_resident_texture_write_watch, register_value,
+    GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GUEST_BATCH_COMPLETION_CAPACITY,
+    GlobalUploadChunk, GraphicsPipelineKey, GuestBatchFlushReason, GuestBatchWork,
+    GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus,
+    GuestMemoryWaitTracker, GuestMemoryWriteOperation, MAX_COMMITTED_GUEST_BATCHES, MetalPresenter,
+    OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PIPELINE_DRAW_GATES,
+    PendingFlip, PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
+    PresenterFlow, QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
+    UploadedGlobalBuffer, WriteWatchRefresh, graphics_pipeline_key, guest_physical_ranges_overlap,
+    guest_ranges_overlap, guest_texture_byte_count, pixel_scalars, rearm_color_metadata_clear,
+    rearm_depth_metadata_clear, record_diagnostic_memory_copy,
+    refresh_resident_texture_write_watch, register_value,
     retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, trace_resident_texture_removal,
@@ -28,6 +28,15 @@ mod batch;
 mod events;
 mod memory;
 mod waits;
+
+pub(super) fn event_loop_batch_requires_flush(has_runnable_events: bool) -> bool {
+    !has_runnable_events
+}
+
+pub(super) fn guest_batch_completion_capacity_reached(completion_count: usize) -> bool {
+    completion_count >= GUEST_BATCH_COMPLETION_CAPACITY
+}
+
 #[cfg(test)]
 pub(crate) use self::batch::write_back_pending_globals;
 pub(crate) use self::batch::{
@@ -390,19 +399,39 @@ impl MetalPresenter {
                     // Batch across guest submissions without losing their individual completion
                     // identities. Graphics and compute queues can retire out of global sequence
                     // order, and the shared completion tracker exposes only the contiguous prefix.
-                    if let Some(batch) = self.open_guest_batch.as_mut() {
-                        batch.completion_sequences.push(sequence);
-                    } else if let Some(batch) = self.committed_guest_batches.back_mut() {
-                        // Empty submissions and boundaries following a forced flush still depend
-                        // on all earlier ordered work. Attaching them to the newest committed
-                        // batch avoids publishing completion before that work reaches Metal.
-                        batch.completion_sequences.push(sequence);
-                    } else {
-                        // No open or committed work remains, so this submission is genuinely
-                        // empty and can complete immediately.
-                        remu_gpu::record_gpu_submission_completed(sequence);
-                    }
+                    let open_batch_reached_completion_capacity =
+                        if let Some(batch) = self.open_guest_batch.as_mut() {
+                            batch.completion_sequences.push(sequence);
+                            guest_batch_completion_capacity_reached(
+                                batch.completion_sequences.len(),
+                            )
+                        } else if let Some(batch) = self.committed_guest_batches.back_mut() {
+                            // Empty submissions and boundaries following a forced flush still depend
+                            // on all earlier ordered work. Attaching them to the newest committed
+                            // batch avoids publishing completion before that work reaches Metal.
+                            batch.completion_sequences.push(sequence);
+                            false
+                        } else {
+                            // No open or committed work remains, so this submission is genuinely
+                            // empty and can complete immediately.
+                            remu_gpu::record_gpu_submission_completed(sequence);
+                            false
+                        };
                     self.finalize_pending_flip_at_submission_boundary(source);
+                    if open_batch_reached_completion_capacity {
+                        // AppKit callback boundaries are host scheduling details, so a busy
+                        // decoded queue may retain its current Metal batch across callbacks.
+                        // Bound guest-visible submission retirement independently: otherwise a
+                        // continuous stream of empty boundaries behind one draw could keep that
+                        // draw and every completion uncommitted indefinitely.
+                        if let Err(error) = self
+                            .flush_guest_command_batch(false, GuestBatchFlushReason::WorkCapacity)
+                        {
+                            eprintln!(
+                                "[REMu][METAL] completion-capacity submission failed: {error}"
+                            );
+                        }
+                    }
                 }
                 GpuEvent::Shutdown => {
                     eprintln!("[REMu][METAL] guest runtime requested presenter shutdown");
@@ -426,6 +455,21 @@ impl MetalPresenter {
             }
         }
         PresenterFlow::Continue
+    }
+
+    /// Commits opportunistic work only when the decoded queue has gone idle.
+    ///
+    /// An AppKit callback boundary is not a guest synchronization point. All guest-visible
+    /// boundaries already commit explicitly (memory waits, command-processor barriers, CPU
+    /// synchronization, flip snapshots), while draw/compute work and submission completions have
+    /// finite per-batch capacities. Retaining a compatible render encoder across a busy callback
+    /// therefore preserves exact order and attachment load/store state while avoiding a redundant
+    /// tile store followed immediately by a reload on the next callback.
+    pub(super) fn flush_idle_event_loop_batch(&mut self) -> Result<(), String> {
+        if !event_loop_batch_requires_flush(self.receiver.has_runnable_events()) {
+            return Ok(());
+        }
+        self.flush_guest_command_batch(false, GuestBatchFlushReason::EventLoop)
     }
 
     pub(super) fn end_guest_pipeline_barrier(&mut self, _barrier: remu_gpu::GpuPipelineBarrier) {

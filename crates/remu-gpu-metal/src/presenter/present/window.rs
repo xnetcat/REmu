@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    EVENT_POLL_INTERVAL, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
+    EVENT_POLL_INTERVAL, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS,
     MetalPresenter, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED,
     PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_DRAW_GATES, PresenterFlow, RESIDENT_DEPTH_SAMPLE_HITS,
@@ -855,8 +855,7 @@ impl ApplicationHandler for MetalPresenter {
             event_loop.exit();
             return;
         }
-        if let Err(error) = self.flush_guest_command_batch(false, GuestBatchFlushReason::EventLoop)
-        {
+        if let Err(error) = self.flush_idle_event_loop_batch() {
             eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
         }
         self.retire_completed_presentations();
@@ -895,7 +894,7 @@ pub(crate) fn run_headless_presenter(receiver: Receiver<GpuEvent>) -> Result<(),
         let (flow, submission) = objc::rc::autoreleasepool(|| {
             let flow = presenter.receive_events();
             let submission = if flow == PresenterFlow::Continue {
-                presenter.flush_guest_command_batch(false, GuestBatchFlushReason::EventLoop)
+                presenter.flush_idle_event_loop_batch()
             } else {
                 Ok(())
             };
