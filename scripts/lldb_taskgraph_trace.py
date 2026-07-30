@@ -16,9 +16,9 @@ hardware breakpoint at the prerequisite-release site and avoid dynamic
 breakpoint rotation while logging every fence.  Set
 ``REMU_TASKGRAPH_TRACE_TARGET_FOLLOW=1`` to log only the configured BeginFence
 caller chain and add persistent publish, execute, and complete breakpoints once
-that task is captured.  Add ``REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF=1`` to discover
-the RenderThread queue before the selected fence and trace that queue's
-post-enqueue state, waiter registration, and underlying event wait entry.
+that task is captured.  Add ``REMU_TASKGRAPH_TRACE_QUEUE_HANDOFF=1`` to derive
+the RenderThread queue when the selected fence is captured and trace that
+queue's post-enqueue state, waiter registration, and event wait entry.
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ MINIMUM_GUEST_EXECUTION_ADDRESS = 0x8_0000_0000
 MAXIMUM_GUEST_EXECUTION_ADDRESS = 0x100_0000_0000
 DEFAULT_TARGET_FENCE_CALLER = 0x801BE0507
 DEFAULT_TARGET_FENCE_PARENT = 0x80101AF94
+TASKGRAPH_SINGLETON_POINTER = 0x807BA35E0
 TASK_QUEUE_WAITER_BITS = 26
 TASK_QUEUE_WAITER_MASK = (1 << TASK_QUEUE_WAITER_BITS) - 1
 
@@ -89,7 +90,6 @@ BREAKPOINTS = {
 PREPARE_ADDRESS = 0x801BE1ADF
 QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS = {
     PREPARE: PREPARE_ADDRESS,
-    PUBLISH: BREAKPOINTS[PHASE_PUBLISH][PUBLISH],
 }
 QUEUE_HANDOFF_BREAKPOINTS = {
     PREPARE: PREPARE_ADDRESS,
@@ -307,7 +307,6 @@ class TaskGraphTraceState:
         self.target_capture_count = 0
         self.target_published = False
         self.target_executed = False
-        self.queue_candidate_task = 0
         self.queue_object = 0
         self.queue_event_wrapper = 0
         self.queue_event_underlying = 0
@@ -550,64 +549,56 @@ class TaskGraphTraceState:
             if task == 0:
                 return TraceResult(False)
             task_word = read_u64(task + 0x8)
-            desired_thread = (
-                task_word & 0xFF if task_word is not None else 0xFF
+            desired_word = (
+                task_word & 0xFFFFFFFF if task_word is not None else 0xFFFFFFFF
             )
+            desired_thread = desired_word & 0xFF
+            queue_index = (desired_word >> 8) & 1
             caller, parent = self._fence_caller_chain(registers, read_u64)
-            messages = []
             if (
-                self.queue == 0
-                and self.queue_candidate_task == 0
-                and desired_thread == 1
+                caller != self.target_caller
+                or parent != self.target_parent
+                or task == self.task
             ):
-                self.queue_candidate_task = task
-                messages.append(
-                    f"queue-candidate task={task:#x} desired={desired_thread:#x}"
-                )
-            if (
-                caller == self.target_caller
-                and parent == self.target_parent
-                and task != self.task
-            ):
-                self.task = task
-                self.completion_event = read_u64(task + 0x18) or 0
-                self.counter_before_release = (
-                    _register(registers, "r12") & 0xFFFFFFFF
-                )
-                self.release_threshold = (
-                    _register(registers, "rax") & 0xFFFFFFFF
-                )
-                self.target_capture_count += 1
-                self.target_published = False
-                self.target_publisher_thread = thread_id
-                messages.append(
-                    f"target={self.target_capture_count} capture task={task:#x} "
-                    f"event={self.completion_event:#x} "
-                    f"desired={desired_thread:#x} "
-                    f"dispatchable="
-                    f"{self.counter_before_release == self.release_threshold} "
-                    f"caller={caller:#x} caller_parent={parent:#x} "
-                    f"publisher_thread={thread_id:#x}"
-                )
-            if not messages:
                 return TraceResult(False)
-            return TraceResult(True, " ".join(messages))
-
-        if label == PUBLISH:
-            if self.queue != 0:
-                return TraceResult(False)
-            task = _register(registers, "rsi")
-            if task != self.queue_candidate_task:
-                return TraceResult(False)
-            self.queue = _register(registers, "rdi")
-            self.queue_object = self.queue - 0x38
-            self.queue_event_wrapper = read_u64(self.queue + 0x1F8) or 0
+            singleton = read_u64(TASKGRAPH_SINGLETON_POINTER) or 0
+            self.queue_object = (
+                read_u64(singleton + desired_thread * 0x18 + 0x8) or 0
+            )
+            self.queue = (
+                self.queue_object + queue_index * 0x200 + 0x38
+                if self.queue_object != 0
+                else 0
+            )
+            self.queue_event_wrapper = (
+                read_u64(self.queue + 0x1F8) or 0
+                if self.queue != 0
+                else 0
+            )
             self.queue_event_underlying = (
                 read_u64(self.queue_event_wrapper + 0x10) or 0
             )
+            self.task = task
+            self.completion_event = read_u64(task + 0x18) or 0
+            self.counter_before_release = (
+                _register(registers, "r12") & 0xFFFFFFFF
+            )
+            self.release_threshold = (
+                _register(registers, "rax") & 0xFFFFFFFF
+            )
+            self.target_capture_count += 1
+            self.target_published = False
+            self.target_publisher_thread = thread_id
             return TraceResult(
                 True,
-                f"queue-discovered task={task:#x} queue={self.queue:#x} "
+                f"target={self.target_capture_count} capture task={task:#x} "
+                f"event={self.completion_event:#x} "
+                f"desired={desired_thread:#x} queue_index={queue_index} "
+                f"dispatchable="
+                f"{self.counter_before_release == self.release_threshold} "
+                f"caller={caller:#x} caller_parent={parent:#x} "
+                f"publisher_thread={thread_id:#x} "
+                f"taskgraph={singleton:#x} queue={self.queue:#x} "
                 f"{self._queue_snapshot(read_u64)} "
                 f"{self._queue_event_description(read_u64)}",
             )

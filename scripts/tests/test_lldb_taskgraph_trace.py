@@ -246,9 +246,12 @@ class TaskGraphTraceTests(unittest.TestCase):
         queue_object = queue - 0x38
         wrapper = 0x4000
         underlying = 0x5000
+        singleton = 0x6000
         self.memory.update(
             {
                 0x1008: 1,
+                TRACE.TASKGRAPH_SINGLETON_POINTER: singleton,
+                singleton + 0x18 + 0x8: queue_object,
                 queue + 0x1A8: (0x15 << TRACE.TASK_QUEUE_WAITER_BITS) | 1,
                 queue + 0x118: 0xA1,
                 queue + 0x160: 0xB1,
@@ -261,31 +264,16 @@ class TaskGraphTraceTests(unittest.TestCase):
             }
         )
 
-        candidate = state.observe(
+        ignored = state.observe(
             TRACE.PREPARE,
             {"rbx": 0x1000, "rbp": 0x7000},
             7,
             self.read_u64,
         )
-        self.assertTrue(candidate.accepted)
-        self.assertIn("queue-candidate", candidate.message or "")
+        self.assertFalse(ignored.accepted)
         self.assertEqual(
             state.active_breakpoints(),
             TRACE.QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS,
-        )
-
-        discovered = state.observe(
-            TRACE.PUBLISH,
-            {"rsi": 0x1000, "rdi": queue},
-            7,
-            self.read_u64,
-        )
-        self.assertTrue(discovered.accepted)
-        self.assertIn("event_condition=0x5028", discovered.message or "")
-        self.assertEqual(state.queue_object, queue_object)
-        self.assertEqual(
-            state.active_breakpoints(),
-            TRACE.QUEUE_HANDOFF_BREAKPOINTS,
         )
 
         self.memory[0x1018] = 0x2100
@@ -302,6 +290,13 @@ class TaskGraphTraceTests(unittest.TestCase):
         )
         self.assertTrue(target.accepted)
         self.assertIn("target=1 capture", target.message or "")
+        self.assertIn("taskgraph=0x6000", target.message or "")
+        self.assertIn("event_condition=0x5028", target.message or "")
+        self.assertEqual(state.queue_object, queue_object)
+        self.assertEqual(
+            state.active_breakpoints(),
+            TRACE.QUEUE_HANDOFF_BREAKPOINTS,
+        )
 
         self.memory[queue + 0x1A8] = 0x16 << TRACE.TASK_QUEUE_WAITER_BITS
         self.memory[queue + 0x118] = 0xA2
