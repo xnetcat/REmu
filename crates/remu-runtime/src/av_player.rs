@@ -1027,11 +1027,16 @@ fn av_player_video_clock_max_lead(frames_per_second: f64) -> Duration {
 /// timestamp advances with host time, as shadPS4 and the console API do. Before the first audio
 /// sample the clock stays at Start/JumpToTime's media position.
 ///
-/// A video-only source intentionally differs from a pure wall clock. REmu may execute a 30 fps
-/// title at substantially less than 30 guest frames per second, so allowing host time to reach the
-/// duration would make the guest terminate a movie after consuming only part of it. Re-anchoring
-/// at every delivered video timestamp and bounding the lead to two frame periods keeps polling
-/// live without skipping the remainder of the stream.
+/// A video-only source in Default sync intentionally differs from a pure wall clock. REmu may
+/// execute a 30 fps title at substantially less than 30 guest frames per second, so allowing host
+/// time to reach the duration would make the guest terminate a movie after consuming only part of
+/// it. Re-anchoring at every delivered video timestamp and bounding the lead to two frame periods
+/// keeps polling live without skipping the remainder of the stream.
+///
+/// None sync hands video selection to the caller, but it does not make dequeued video timestamps
+/// the public clock. Native AvPlayer and shadPS4 keep video-only CurrentTime on the Start/Pause/
+/// Resume wall-clock timeline in both modes. Keeping that clock independent is essential when a
+/// caller drains several decoded frames before submitting the draws which consume them.
 fn av_player_presentation_time_at(player: &mut AvPlayerInstance, now: Instant) -> Duration {
     if player.end_of_stream {
         let completed = if player.duration.is_zero() {
@@ -1043,20 +1048,28 @@ fn av_player_presentation_time_at(player: &mut AvPlayerInstance, now: Instant) -
         return completed;
     }
 
-    let host_delta = player
-        .presentation_anchor_host
-        .map_or(Duration::ZERO, |host| now.saturating_duration_since(host));
-    let scaled_delta = host_delta.mul_f64(f64::from(player.trick_speed_percent) / 100.0);
-    let advance = if player.has_audio {
-        if player.presentation_master_delivered {
-            scaled_delta
-        } else {
-            Duration::ZERO
-        }
+    let speed = f64::from(player.trick_speed_percent) / 100.0;
+    let raw = if !player.has_audio && player.av_sync_mode == 1 {
+        let running_delta = player
+            .playing_since
+            .map_or(Duration::ZERO, |host| now.saturating_duration_since(host));
+        player.elapsed.saturating_add(running_delta.mul_f64(speed))
     } else {
-        scaled_delta.min(av_player_video_clock_max_lead(player.frames_per_second))
+        let host_delta = player
+            .presentation_anchor_host
+            .map_or(Duration::ZERO, |host| now.saturating_duration_since(host));
+        let scaled_delta = host_delta.mul_f64(speed);
+        let advance = if player.has_audio {
+            if player.presentation_master_delivered {
+                scaled_delta
+            } else {
+                Duration::ZERO
+            }
+        } else {
+            scaled_delta.min(av_player_video_clock_max_lead(player.frames_per_second))
+        };
+        player.presentation_anchor_media.saturating_add(advance)
     };
-    let raw = player.presentation_anchor_media.saturating_add(advance);
 
     // Do not expose the exact known duration until the decoder has actually drained. Some guests
     // use CurrentTime == duration to stop calling GetVideoData; returning duration one frame too
@@ -1254,7 +1267,13 @@ pub(crate) fn av_player_pause(handle: u64, state: &mut ProbeDispatchState) -> u6
     let now = Instant::now();
     let presentation_time = av_player_presentation_time_at(player, now);
     if let Some(started) = player.playing_since.take() {
-        player.elapsed += now.saturating_duration_since(started);
+        if !player.has_audio && player.av_sync_mode == 1 {
+            // None mode's clock is the media position sampled above. Preserve that exact
+            // position across Resume, including trick-speed scaling.
+            player.elapsed = presentation_time;
+        } else {
+            player.elapsed += now.saturating_duration_since(started);
+        }
     }
     player.presentation_anchor_media = presentation_time;
     player.presentation_anchor_host = None;
@@ -1576,7 +1595,7 @@ pub(crate) fn av_player_get_video_data(
         .round() as u64;
     player.next_video_frame = player.next_video_frame.saturating_add(1);
     if av_player_write_video_frame(player, arguments[1], timestamp, extended) {
-        if !player.has_audio {
+        if !player.has_audio && player.av_sync_mode == 0 {
             av_player_anchor_presentation(player, Duration::from_millis(timestamp), Instant::now());
         }
         player
