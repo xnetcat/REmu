@@ -509,7 +509,7 @@ struct AvPlayerDecoder {
     frames: Mutex<Receiver<Vec<u8>>>,
     cancelled: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
-    progress: Arc<AvPlayerDecoderProgress>,
+    progress: Option<Arc<AvPlayerDecoderProgress>>,
 }
 
 #[derive(Debug, Default)]
@@ -7171,6 +7171,7 @@ fn probe_entry(
     set_current_guest_thread_pointer(0);
     DIAGNOSTIC_TIMEOUT_CANCELLED.store(true, Ordering::Release);
     DIAGNOSTIC_TIMEOUT_SECONDS.store(0, Ordering::Release);
+    remu_gpu::set_progress_telemetry_enabled(false);
     let import_hits = IMPORT_TELEMETRY.get().map_or(0, |telemetry| {
         telemetry
             .read()
@@ -7219,8 +7220,8 @@ static DIAGNOSTIC_TIMEOUT_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// Nonzero while a bounded diagnostic probe is active.
 ///
-/// Hot-path attribution counters use this as a cheap guard, so regular emulator runs pay no
-/// synchronization or telemetry cost.
+/// Hot-path attribution counters use this as a cheap guard, so regular emulator runs avoid
+/// timestamp sampling and per-event diagnostic state updates.
 static DIAGNOSTIC_TIMEOUT_SECONDS: AtomicU32 = AtomicU32::new(0);
 
 fn diagnostic_timeout_active() -> bool {
@@ -7341,6 +7342,7 @@ fn report_diagnostic_stall_attribution() {
 fn start_diagnostic_timeout(timeout_seconds: u32) {
     DIAGNOSTIC_TIMEOUT_CANCELLED.store(false, Ordering::Release);
     DIAGNOSTIC_TIMEOUT_SECONDS.store(timeout_seconds, Ordering::Release);
+    remu_gpu::set_progress_telemetry_enabled(true);
     let limit = Duration::from_secs(u64::from(timeout_seconds));
     std::thread::Builder::new()
         .name("remu-timeout".to_owned())

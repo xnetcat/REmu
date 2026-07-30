@@ -12,15 +12,24 @@ use super::{
     decode_compute_system_registers, emit_event, gpu_completed_submission_sequence,
     gpu_event_channel, gpu_events_in_flight, gpu_progress_age_millis, gpu_work_items_pending,
     host_pad_state, install_event_sink, install_gpu_completion_notifier, record_gpu_event_consumed,
-    record_gpu_flip_completed, record_gpu_submission_completed, record_gpu_wait_producer,
-    record_gpu_work_item_processed, report_audio_frames, set_host_pad_state,
-    take_gpu_completed_flips, take_gpu_completed_submission_ids, take_gpu_wait_latch,
+    progress_telemetry_enabled, record_gpu_flip_completed, record_gpu_submission_completed,
+    record_gpu_wait_producer, record_gpu_work_item_processed, report_audio_frames,
+    set_host_pad_state, set_progress_telemetry_enabled, take_gpu_completed_flips,
+    take_gpu_completed_submission_ids, take_gpu_wait_latch,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
 static GPU_COMPLETION_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct ProgressTelemetryReset;
+
+impl Drop for ProgressTelemetryReset {
+    fn drop(&mut self) {
+        set_progress_telemetry_enabled(false);
+    }
+}
 
 fn record_gpu_completion_notification() {
     GPU_COMPLETION_NOTIFICATIONS.fetch_add(1, Ordering::Relaxed);
@@ -59,6 +68,34 @@ fn runtime_telemetry_tracks_gpu_queue_and_audio_callback_progress() {
     let _event_guard = EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _progress_reset = ProgressTelemetryReset;
+    set_progress_telemetry_enabled(false);
+    assert!(!progress_telemetry_enabled());
+    assert_eq!(gpu_progress_age_millis(), None);
+    assert_eq!(audio_progress_age_millis(), None);
+
+    let disabled_output_before = audio_output_frames();
+    let disabled_underruns_before = audio_underrun_frames();
+    record_gpu_event_consumed();
+    report_audio_frames(48, 3);
+    assert_eq!(audio_output_frames(), disabled_output_before + 48);
+    assert_eq!(audio_underrun_frames(), disabled_underruns_before + 3);
+    assert_eq!(
+        gpu_progress_age_millis(),
+        None,
+        "ordinary presenter progress must not sample its diagnostic clock"
+    );
+    assert_eq!(
+        audio_progress_age_millis(),
+        None,
+        "ordinary callbacks must retain counters without sampling their diagnostic clock"
+    );
+
+    set_progress_telemetry_enabled(true);
+    assert!(progress_telemetry_enabled());
+    assert_eq!(gpu_progress_age_millis(), None);
+    assert_eq!(audio_progress_age_millis(), None);
+
     let (sender, receiver) = gpu_event_channel();
     install_event_sink(sender);
     assert!(emit_event(GpuEvent::Shutdown));
