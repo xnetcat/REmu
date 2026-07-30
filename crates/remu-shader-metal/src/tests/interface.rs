@@ -336,7 +336,14 @@ fn builds_procedural_rectangle_from_pixel_consumer_parameter_roles() {
     assert!(
         shader
             .source
-            .contains("remu_out.position = float4(remu_uv * 2.0f - 1.0f, 0.0f, 1.0f);")
+            .contains("float2(-1.0f, -1.0f)")
+            && shader.source.contains("float2( 3.0f, -1.0f)")
+            && shader.source.contains("float2(-1.0f,  3.0f)")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_out.position = float4(remu_positions[remu_index], 0.0f, 1.0f);")
     );
     assert!(
         shader

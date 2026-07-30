@@ -22,6 +22,7 @@ use super::{
     decode_image_descriptor, decode_raster_state, decode_render_targets, decode_scissor,
     decode_viewport, diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
     diagnostic_context_register_snapshot, diagnostic_disable_culling, diagnostic_disable_depth,
+    guest_viewport_y_scale_is_negative,
     diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
     diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
@@ -42,8 +43,9 @@ use super::{
     image_resource_descriptor_is_null, initial_depth_clear_for_target,
     initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
     metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_primitive,
-    prepare_nonindexed_ngg_indices, read_draw_indices, read_texture_array_linear,
+    native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
+    prepare_indexed_primitive, prepare_nonindexed_ngg_indices, read_draw_indices,
+    read_texture_array_linear,
     read_texture_linear, read_texture_volume_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_scanout_writer,
     record_diagnostic_texture_writer, register_value, render_target_cmask_address,
@@ -57,7 +59,7 @@ use super::{
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRenderStages, MTLResourceOptions, MTLResourceUsage, MTLSize,
-    MTLStoreAction, MTLTextureType, MTLViewport, RenderPassDescriptor,
+    MTLStoreAction, MTLTextureType, MTLViewport, MTLWinding, RenderPassDescriptor,
 };
 use remu_gpu::IndexedDraw;
 use std::collections::{HashMap, HashSet};
@@ -100,7 +102,16 @@ impl MetalPresenter {
         let trace = draw.sequence <= 4 || draw.sequence.is_power_of_two();
         let targets = decode_render_targets(draw)?;
         let depth = decode_depth_target(draw)?;
-        let raster = decode_raster_state(draw)?;
+        let mut raster = decode_raster_state(draw)?;
+        // Absolute Metal viewport height drops the guest VPORT_YSCALE sign. That sign normally
+        // flips triangle winding in the viewport transform; compensate here so back-face cull
+        // still matches the guest's expected facing for negative-Y viewports.
+        if guest_viewport_y_scale_is_negative(draw) {
+            raster.front_winding = match raster.front_winding {
+                MTLWinding::Clockwise => MTLWinding::CounterClockwise,
+                MTLWinding::CounterClockwise => MTLWinding::Clockwise,
+            };
+        }
         let color_control = register_value(&draw.context_registers, CB_COLOR_CONTROL)
             .unwrap_or(DEFAULT_CB_COLOR_CONTROL);
         let color_operation = decode_color_operation_mode(color_control)?;
@@ -640,6 +651,7 @@ impl MetalPresenter {
             vertex_sampler_buffer_index,
             pixel_sampler_buffer_index,
             uses_mesh_stage,
+            uses_procedural_rectangle_stage,
             vertex_msl_bytes,
             pixel_msl_bytes,
             vertex_dispatcher,
@@ -708,6 +720,7 @@ impl MetalPresenter {
                 compiled.vertex.bindings.sampler_argument_buffer_index,
                 compiled.pixel.bindings.sampler_argument_buffer_index,
                 compiled.uses_mesh_stage,
+                compiled.uses_procedural_rectangle_stage,
                 compiled.vertex.source.len(),
                 compiled.pixel.source.len(),
                 compiled.vertex.source.contains("while (active)"),
@@ -825,6 +838,11 @@ impl MetalPresenter {
             &pixel_buffers,
         )?;
         let mut primitive = metal_primitive_type(draw.primitive_type)?;
+        if uses_procedural_rectangle_stage {
+            // The synthesized covering uses a single oversized triangle; guest strip/rect
+            // topology and base vertex must not reshape that draw.
+            primitive = MTLPrimitiveType::Triangle;
+        }
         let indexed_draw = if draw.indexed && indirect_arguments.is_none() {
             let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
             let prepared = prepare_indexed_primitive(draw, indices)?;
@@ -837,8 +855,12 @@ impl MetalPresenter {
         };
         let ngg_indices = if uses_mesh_stage {
             if let Some((indices, _)) = indexed_draw.as_ref() {
-                Some(Arc::clone(indices))
-            } else if !draw.indexed && draw.primitive_type == 6 {
+                Some(prepare_indexed_ngg_indices(
+                    draw,
+                    Arc::clone(indices),
+                    primitive,
+                )?)
+            } else if !draw.indexed && matches!(draw.primitive_type, 1 | 6) {
                 Some(prepare_nonindexed_ngg_indices(draw)?)
             } else {
                 return Err("NGG mesh draw has an unsupported source topology".to_owned());
@@ -1264,7 +1286,9 @@ impl MetalPresenter {
                 .encoder;
             encoder.set_render_pipeline_state(&pipeline);
             encoder.set_front_facing_winding(raster.front_winding);
-            encoder.set_cull_mode(if diagnostic_disable_culling_for_draw {
+            encoder.set_cull_mode(if diagnostic_disable_culling_for_draw
+                || uses_procedural_rectangle_stage
+            {
                 MTLCullMode::None
             } else {
                 raster.cull_mode
@@ -1435,15 +1459,24 @@ impl MetalPresenter {
                     static LOGGED_MESH_DRAWS: AtomicUsize = AtomicUsize::new(0);
                     let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
                     if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
+                        let unique = {
+                            let mut values = indices.iter().copied().collect::<Vec<_>>();
+                            values.sort_unstable();
+                            values.dedup();
+                            values
+                        };
                         eprintln!(
-                            "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} primitives={} packed_vertices={} instances={} groups={}x{}",
+                            "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} raw={:?} unique={unique:?} primitives={} packed_vertices={} instances={} groups={}x{} cull={:?} winding={:?}",
                             draw.sequence,
                             indices.len(),
+                            &indices[..indices.len().min(12)],
                             meshlets.primitive_count,
                             meshlets.vertex_references,
                             draw.instance_count,
                             meshlets.group_count,
                             draw.instance_count,
+                            raster.cull_mode,
+                            raster.front_winding,
                         );
                     }
                     encoder.draw_mesh_threadgroups(
@@ -1492,6 +1525,21 @@ impl MetalPresenter {
                     u64::from(draw.instance_count),
                     i64::from(draw.base_vertex),
                     0,
+                );
+            } else if uses_procedural_rectangle_stage {
+                static LOGGED_PROCEDURAL_RECTANGLES: AtomicUsize = AtomicUsize::new(0);
+                let sequence = LOGGED_PROCEDURAL_RECTANGLES.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][PROCEDURAL-RECT] sequence={sequence} draw={} guest_count={} guest_primitive={:#x} covering=triangle3",
+                        draw.sequence, draw.index_count, draw.primitive_type,
+                    );
+                }
+                encoder.draw_primitives_instanced(
+                    MTLPrimitiveType::Triangle,
+                    0,
+                    3,
+                    u64::from(draw.instance_count),
                 );
             } else {
                 let first_vertex = i64::from(draw.index_offset) + i64::from(draw.base_vertex);

@@ -18,6 +18,8 @@ pub struct ImageControl {
     pub slc: bool,
     pub a16: bool,
     pub d16: bool,
+    /// When set, resinfo sizes are written as IEEE floats bitcast to VGPR bits.
+    pub unorm: bool,
 }
 
 impl ImageControl {

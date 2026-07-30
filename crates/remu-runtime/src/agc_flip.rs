@@ -89,6 +89,24 @@ pub(crate) fn video_out_add_flip_event(arguments: [u64; 6], state: &mut ProbeDis
     0
 }
 
+pub(crate) fn video_out_add_vblank_event(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let equeue = arguments[0];
+    let handle = low_i32(arguments[1]);
+    if handle != 1 || !state.video_out.is_open {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+    }
+    if equeue == 0 {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
+    }
+    // OrbisVideoOutInternalEventId::Vblank == 1. Flip uses ident 6; keep them distinct so
+    // sceVideoOutGetEventId can classify the queue entry.
+    state.video_out.vblank_events.insert(equeue, arguments[2]);
+    0
+}
+
 pub(crate) fn agc_dcb_set_flip(arguments: [u64; 6]) -> u64 {
     let command_buffer = arguments[0];
     if command_buffer == 0 {
@@ -247,6 +265,31 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
                     pending.handle, pending.completion.buffer_index, pending.completion.address,
                 );
             }
+        }
+        // Flip completion coincides with a display vblank on the console. Wake vblank waiters with
+        // OrbisVideoOutInternalEventId::Vblank (ident=1).
+        let vblank_registrations = state
+            .video_out
+            .vblank_events
+            .iter()
+            .map(|(&equeue, &user_data)| (equeue, user_data))
+            .collect::<Vec<_>>();
+        for (equeue, user_data) in vblank_registrations {
+            queue_kernel_event(
+                state,
+                KernelQueuedEvent {
+                    equeue,
+                    ident: 1,
+                    filter: -13,
+                    flags: 0,
+                    fflags: 0,
+                    data: state.video_out.completed_flip_count,
+                    user_data,
+                    agc_graphics_completions: 0,
+                    agc_user_interrupts: 0,
+                },
+            );
+            queued = true;
         }
     }
     if queued {

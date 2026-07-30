@@ -385,8 +385,27 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
 }
 
 #[test]
-fn accepts_native_ngg_triangle_lists_and_nonindexed_triangle_strips() {
+fn accepts_native_ngg_triangle_lists_and_triangle_strips() {
     let mut draw = super::indexed_draw(0, 0, 6);
+    assert!(ngg_mesh_draw_supported(&draw));
+
+    draw.indexed = true;
+    draw.primitive_type = 6;
+    draw.index_count = 4;
+    assert!(
+        ngg_mesh_draw_supported(&draw),
+        "indexed triangle strips expand into the meshlet triangle ABI"
+    );
+
+    draw.primitive_type = 1;
+    draw.index_count = 2;
+    assert!(
+        ngg_mesh_draw_supported(&draw),
+        "indexed point lists feed one amplified NGG input primitive per point"
+    );
+
+    draw.indexed = false;
+    draw.primitive_type = 1;
     assert!(ngg_mesh_draw_supported(&draw));
 
     draw.indexed = false;
@@ -520,6 +539,7 @@ fn derives_procedural_rectangle_coordinates_from_the_first_sample_inputs() {
             slc: false,
             a16: false,
             d16: false,
+            unorm: false,
         })),
     };
     let program = Program::new(
@@ -619,6 +639,7 @@ fn runtime_upload_representatives_follow_canonical_texture_and_sampler_slots() {
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let binding = |pc, opcode, descriptor: Vec<u32>| ImageBinding {
         pc,
@@ -687,6 +708,7 @@ fn graphics_shader_cache_key_normalizes_dynamic_image_formats_and_swizzles() {
                 slc: false,
                 a16: false,
                 d16: false,
+                unorm: false,
             },
             resource_descriptor: vec![0, unified_format << 20, 0, destination_select].into(),
             sampler_descriptor: vec![0; 4].into(),
@@ -839,6 +861,7 @@ kernel void remu_sampler_cache_test(
                 slc: false,
                 a16: false,
                 d16: false,
+                unorm: false,
             },
             resource_descriptor: vec![0; 8].into(),
             sampler_descriptor: vec![0; 4].into(),

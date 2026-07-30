@@ -197,7 +197,21 @@ pub(crate) fn wave64_split_blockers(program: &Program) -> Vec<String> {
                 // Structured wave64 predication is represented half-locally across the two
                 // Metal SIMD32 groups. These exercised operations consume only the current
                 // architectural half of the mask, so each SIMD32 subgroup computes it exactly.
-                && !matches!(name, "SAndSaveexecB64" | "SOrn2SaveexecB64")
+                && !matches!(
+                    name,
+                    "SAndSaveexecB64"
+                        | "SOrn2SaveexecB64"
+                        | "SAndSaveexecB32"
+                        | "SOrSaveexecB32"
+                        | "SXorSaveexecB32"
+                        | "SAndn2SaveexecB32"
+                        | "SOrn2SaveexecB32"
+                        | "SNandSaveexecB32"
+                        | "SNorSaveexecB32"
+                        | "SXnorSaveexecB32"
+                        | "SAndn1SaveexecB32"
+                        | "SOrn1SaveexecB32"
+                )
         });
         if wave_sensitive {
             blockers.push(format!("{:#x}:{}", instruction.pc, instruction.opcode));
@@ -403,8 +417,15 @@ pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
 /// Returns whether a direct native draw can be represented by the CPU-prepared NGG meshlet ABI.
 pub(crate) const fn ngg_mesh_draw_supported(draw: &IndexedDraw) -> bool {
     draw.indirect_arguments_address.is_none()
-        && ((draw.indexed && draw.primitive_type == 4)
-            || (!draw.indexed && draw.primitive_type == 6))
+        && match (draw.indexed, draw.primitive_type) {
+            // Triangle lists/strips expand into the meshlet triangle ABI.
+            (true, 4 | 6) => true,
+            // Point lists feed one vertex per input primitive; GS/NGG amplification emits triangles.
+            (true, 1) | (false, 1) => true,
+            // Non-indexed strips synthesize consecutive vertex IDs, then expand the same way.
+            (false, 6) => true,
+            _ => false,
+        }
 }
 
 /// Selects NGG mesh lowering only when the presenter can prepare exact ordered source geometry.

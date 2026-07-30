@@ -108,7 +108,29 @@ impl OrderedGpuEventReceiver {
             .values()
             .any(|reason| matches!(reason, QueueBlockReason::GuestMemoryWait(_)))
             || matches!(self.host_block, Some(QueueBlockReason::GuestMemoryWait(_)));
-        has_memory_wait && !self.has_dependency_runnable_events()
+        if !has_memory_wait {
+            return false;
+        }
+        // Usual case: every known front is a memory wait, so pull ahead for a producer queue.
+        if !self.has_dependency_runnable_events() {
+            return true;
+        }
+        // Title-menu case: one queue parks on a label while another still looks runnable. The
+        // ordinary pending cap then withholds a cross-queue RELEASE still sitting in the channel
+        // (`producers=[none-ingested]`). Keep elevated ingress until an ingested producer appears.
+        self.blocked_memory_wait_missing_ingested_producer()
+    }
+
+    fn blocked_memory_wait_missing_ingested_producer(&self) -> bool {
+        self.blocked_queues
+            .values()
+            .chain(self.host_block.iter())
+            .any(|reason| match reason {
+                QueueBlockReason::GuestMemoryWait(wait) => {
+                    self.describe_queued_wait_producers(*wait) == "none-ingested"
+                }
+                _ => false,
+            })
     }
 
     /// Returns whether one current queue front can execute without first polling a memory wait.
@@ -434,14 +456,20 @@ impl OrderedGpuEventReceiver {
         if self.host_block.is_none() && !self.host_events.is_empty() {
             return true;
         }
-        self.queue_order.iter().any(|queue_id| {
+        if self.queue_order.iter().any(|queue_id| {
             !self.blocked_queues.contains_key(queue_id)
                 && self.submissions.get(queue_id).is_some_and(|submissions| {
                     submissions
                         .iter()
                         .any(|submission| !submission.events.is_empty())
                 })
-        })
+        }) {
+            return true;
+        }
+        // Keep AppKit polling while a producerless memory wait may still be satisfied by a
+        // CPU store or a not-yet-ingested cross-queue release. Sleeping on WaitUntil here
+        // turned title-menu fences into multi-second FPS collapses.
+        self.blocked_memory_wait_missing_ingested_producer()
     }
 
     pub(crate) fn block_reason_counts(&self) -> (usize, usize) {

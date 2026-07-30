@@ -367,10 +367,20 @@ pub(crate) fn take_graphics_continuations_before(command_address: u64) -> Vec<u6
 }
 
 pub(crate) fn graphics_continuation_was_consumed(packet: u64) -> bool {
-    CONSUMED_GRAPHICS_CONTINUATIONS
+    // One-shot: the adjacent-tail skip must suppress only the immediate reappearance of a
+    // continuation already applied via take_graphics_continuations_before. Keeping the address
+    // forever poisons recycled command-buffer slots — later legitimate 14-dword INDIRECT_BUFFER
+    // packets at the same address are skipped and their RELEASE producers never emit, which
+    // deadlocks WAIT_REG_MEM with producers=[none-ingested] (Poppy title menu).
+    let mut consumed = CONSUMED_GRAPHICS_CONTINUATIONS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(&packet)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = consumed.iter().rposition(|&candidate| candidate == packet) {
+        consumed.remove(index);
+        true
+    } else {
+        false
+    }
 }
 
 /// Retires constructor-side recovery metadata after the native branch packet itself executes.

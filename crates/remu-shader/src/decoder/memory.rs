@@ -451,6 +451,7 @@ pub(crate) fn decode_image(
         slc: word >> 25 & 1 != 0,
         a16: extra >> 30 & 1 != 0,
         d16,
+        unorm: word >> 12 & 1 != 0,
     })
 }
 

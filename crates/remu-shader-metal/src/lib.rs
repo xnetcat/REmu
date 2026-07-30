@@ -153,11 +153,11 @@ pub struct MetalCompileOptions {
     /// Maximum vertex and primitive records exposed by a Metal mesh shader.
     ///
     /// These are guest NGG subgroup output capacities, not the number of host threads in the
-    /// wave64 threadgroup. They are zero for non-mesh stages.
+    /// mesh threadgroup. They are zero for non-mesh stages.
     pub mesh_max_vertex_count: u32,
     pub mesh_max_primitive_count: u32,
-    /// Total Metal threads used to execute one NGG subgroup. Guest wave64 numbering is derived
-    /// from this value, so a 96-thread subgroup executes one full and one partial guest wave.
+    /// Total Metal threads used to execute one NGG subgroup. Guest wave32 numbering is derived
+    /// from this value, so a 96-thread subgroup executes three architectural waves.
     pub mesh_threadgroup_size: u32,
     /// Bytes of guest LDS allocated to each compute workgroup.
     ///
@@ -291,11 +291,12 @@ impl MetalCompileOptions {
         }
     }
 
-    /// Builds options for one wave64 GFX10 NGG mesh workgroup.
+    /// Builds options for one wave32 GFX10 NGG mesh workgroup.
     ///
     /// The presenter supplies the register-derived subgroup width. Guest registers independently
     /// determine how many input lanes are populated and how many vertex/primitive output records
-    /// Metal exposes.
+    /// Metal exposes. Merged NGG export shaders on Prospero use wave32 lane IDs
+    /// (`v_mbcnt_lo` plus a wave index in `s3[27:24]`), matching `S_AND_SAVEEXEC_B32`.
     #[must_use]
     pub const fn mesh(
         required_vertex_output_count: u32,
@@ -324,7 +325,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count,
             mesh_threadgroup_size,
             lds_size_bytes,
-            wave_lane_count: 64,
+            wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
         }
     }
@@ -479,12 +480,14 @@ pub fn compile_layered_rectangle_vertex(
 ///
 /// The common AGC fullscreen stage emits primitive data and position, but no conventional
 /// `EXP PARAM` instructions. On Prospero those rectangle parameters are generated as part of the
-/// primitive path. Metal exposes no equivalent stage, so emit the complete four-corner strip and
-/// its screen-space parameters directly. The paired pixel shader determines which physical
-/// parameters carry rectangle coordinates; every other missing parameter receives the
-/// architectural unit modulation value. Metal's render-target rows run opposite to the guest
-/// rectangle's interpolated Y coordinate, so coordinate parameters reverse Y while preserving
-/// the strip's position and winding.
+/// primitive path. Metal exposes no equivalent stage, so emit a single oversized triangle that
+/// covers clip space `[-1, 1]^2` (the same covering used by host presentation) and synthesize the
+/// screen-space parameters directly. Drawing one triangle avoids guest triangle-strip / cull
+/// combinations that otherwise survive as a diagonal half-screen. The paired pixel shader
+/// determines which physical parameters carry rectangle coordinates; every other missing
+/// parameter receives the architectural unit modulation value. Metal's render-target rows run
+/// opposite to the guest rectangle's interpolated Y coordinate, so coordinate parameters reverse
+/// Y while the covering triangle keeps a consistent winding.
 #[must_use]
 pub fn compile_procedural_rectangle_vertex(
     interpolated_attribute_count: u32,
@@ -505,9 +508,19 @@ pub fn compile_procedural_rectangle_vertex(
         "};\n\n\
          vertex RemuVsOut remu_main(uint remu_vertex_id [[vertex_id]]) {\n\
          \x20   RemuVsOut remu_out = {};\n\
-         \x20   uint remu_corner = remu_vertex_id & 3u;\n\
-         \x20   float2 remu_uv = float2(float(remu_corner & 1u), float((remu_corner >> 1u) & 1u));\n\
-         \x20   remu_out.position = float4(remu_uv * 2.0f - 1.0f, 0.0f, 1.0f);\n",
+         \x20   constexpr float2 remu_positions[3] = {\n\
+         \x20       float2(-1.0f, -1.0f),\n\
+         \x20       float2( 3.0f, -1.0f),\n\
+         \x20       float2(-1.0f,  3.0f),\n\
+         \x20   };\n\
+         \x20   constexpr float2 remu_uvs[3] = {\n\
+         \x20       float2(0.0f, 0.0f),\n\
+         \x20       float2(2.0f, 0.0f),\n\
+         \x20       float2(0.0f, 2.0f),\n\
+         \x20   };\n\
+         \x20   uint remu_index = min(remu_vertex_id, 2u);\n\
+         \x20   float2 remu_uv = remu_uvs[remu_index];\n\
+         \x20   remu_out.position = float4(remu_positions[remu_index], 0.0f, 1.0f);\n",
     );
     for location in 0..interpolated_attribute_count {
         let value = if coordinate_parameter_mask & (1 << location) != 0 {

@@ -18,7 +18,7 @@ use super::{
     diagnostic_video_chain_selected_draw, evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count, image_component_class,
-    is_storage_image_opcode, ngg_mesh_stage_for_draw, pixel_input_controls,
+    is_storage_image_opcode, ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_input_controls,
     procedural_rectangle_stage_for_draw, program_embeds_global_base, register_value,
     video_target_binding_summary,
 };
@@ -86,15 +86,86 @@ fn expand_nonindexed_triangle_strip(
     Ok(indices.into())
 }
 
+/// Expands indexed triangle-strip indices into the triangle-list form NGG meshlets consume.
+///
+/// Odd primitives reverse the first two vertices to preserve GFX10 strip winding. Segments that
+/// already went through primitive-restart expansion arrive as triangle lists and must not be
+/// expanded again.
+pub(crate) fn expand_triangle_strip_indices(indices: &[u32]) -> Arc<[u32]> {
+    let primitive_count = indices.len().saturating_sub(2);
+    let mut prepared = Vec::with_capacity(primitive_count.saturating_mul(3));
+    for (triangle, vertices) in indices.windows(3).enumerate() {
+        if triangle & 1 == 0 {
+            prepared.extend_from_slice(vertices);
+        } else {
+            prepared.extend_from_slice(&[vertices[1], vertices[0], vertices[2]]);
+        }
+    }
+    prepared.into()
+}
+
+/// Expands a point list into the triangle-shaped meshlet ABI.
+///
+/// Each point becomes one input primitive whose three packed local slots reference the same
+/// vertex. Merged NGG shaders that amplify points into triangles only consume the first vertex of
+/// each input primitive; duplicating the index keeps the existing triangle meshlet packer intact.
+pub(crate) fn expand_point_list_indices(indices: &[u32]) -> Arc<[u32]> {
+    let mut prepared = Vec::with_capacity(indices.len().saturating_mul(3));
+    for &index in indices {
+        prepared.extend_from_slice(&[index, index, index]);
+    }
+    prepared.into()
+}
+
 /// Prepares source vertex IDs for a non-indexed NGG triangle-strip draw.
 ///
 /// `index_offset` is the guest draw's first vertex. `base_vertex` belongs to indexed draws and
 /// does not participate in non-indexed auto-generated vertex IDs.
 pub(crate) fn prepare_nonindexed_ngg_indices(draw: &IndexedDraw) -> Result<Arc<[u32]>, String> {
-    if draw.indexed || draw.primitive_type != 6 {
-        return Err("NGG source is not a non-indexed triangle strip".to_owned());
+    match (draw.indexed, draw.primitive_type) {
+        (false, 6) => expand_nonindexed_triangle_strip(draw.index_offset, draw.index_count),
+        (false, 1) => {
+            let count = usize::try_from(draw.index_count)
+                .map_err(|_| "point-list vertex count does not fit usize")?;
+            let mut indices = Vec::new();
+            indices
+                .try_reserve_exact(count)
+                .map_err(|_| format!("point-list index allocation failed for {count} entries"))?;
+            for offset in 0..draw.index_count {
+                let index = draw
+                    .index_offset
+                    .checked_add(offset)
+                    .ok_or("point-list vertex ID overflow")?;
+                indices.push(index);
+            }
+            Ok(expand_point_list_indices(&indices))
+        }
+        _ => Err("NGG source is not a non-indexed triangle strip or point list".to_owned()),
     }
-    expand_nonindexed_triangle_strip(draw.index_offset, draw.index_count)
+}
+
+/// Prepares triangle-list indices for an indexed NGG mesh draw.
+///
+/// Indexed triangle lists pass through. Indexed triangle strips expand unless
+/// [`prepare_indexed_primitive`] already converted them via primitive restart. Point lists are
+/// triplicated so the triangle meshlet packer can feed one input primitive per point.
+pub(crate) fn prepare_indexed_ngg_indices(
+    draw: &IndexedDraw,
+    indices: Arc<[u32]>,
+    metal_primitive: MTLPrimitiveType,
+) -> Result<Arc<[u32]>, String> {
+    match draw.primitive_type {
+        4 => Ok(indices),
+        1 => Ok(expand_point_list_indices(indices.as_ref())),
+        6 if matches!(metal_primitive, MTLPrimitiveType::Triangle) => Ok(indices),
+        6 if matches!(metal_primitive, MTLPrimitiveType::TriangleStrip) => {
+            Ok(expand_triangle_strip_indices(indices.as_ref()))
+        }
+        _ => Err(format!(
+            "NGG source is not an indexed triangle list/strip/point (topology={:#x}, metal={metal_primitive:?})",
+            draw.primitive_type
+        )),
+    }
 }
 
 /// Returns the signed vertex-ID adjustment consumed by the native mesh ABI.
@@ -463,13 +534,7 @@ pub(crate) fn prepare_indexed_primitive(
         }
         6 => {
             for segment in indices.split(|&index| index == restart) {
-                for (triangle, vertices) in segment.windows(3).enumerate() {
-                    if triangle & 1 == 0 {
-                        prepared.extend_from_slice(vertices);
-                    } else {
-                        prepared.extend_from_slice(&[vertices[1], vertices[0], vertices[2]]);
-                    }
-                }
+                prepared.extend_from_slice(expand_triangle_strip_indices(segment).as_ref());
             }
             MTLPrimitiveType::Triangle
         }
@@ -737,8 +802,11 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             &draw.shader_registers,
             export_user_data_register,
         ),
+        // Fragmentless pixel programs still go through the ordinary Metal lowering path, which
+        // rejects a zero VGPR allocation. Keep one four-register block so depth-only prepasses
+        // (common on Unreal title/menu frames) can compile even though they never touch VGPRs.
         pixel_allocated_vector_register_count: if fragmentless {
-            0
+            4
         } else {
             graphics_allocated_vector_register_count(&draw.shader_registers, 0x00c)
         },
@@ -785,8 +853,36 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         }),
         sample_count,
         render_target_array_length,
-        uses_mesh_stage: ngg_mesh_stage_for_draw(export_program, draw)?,
-        uses_procedural_rectangle_stage: procedural_rectangle_stage_for_draw(export_program, draw),
+        uses_mesh_stage: {
+            // UE fullscreen/UI covers often arrive as NGG-export stages. Three common shapes
+            // currently survive as diagonal half-screens / shards under the meshlet ABI:
+            //   - nonindexed triangle strip count=4
+            //   - indexed triangle list count=6 (two-triangle quad / duplicated cover)
+            //   - indexed triangle list count=3 with sparse VB indices (e.g. [0,4,5])
+            // Prefer the synthesized covering VS whenever the export stage is NGG-shaped.
+            let ngg_fullscreen = draw.indirect_arguments_address.is_none()
+                && ngg_mesh_export_stage(export_program)
+                && ((!draw.indexed && draw.primitive_type == 6 && draw.index_count == 4)
+                    || (draw.indexed
+                        && draw.primitive_type == 4
+                        && matches!(draw.index_count, 3 | 6)
+                        && draw.instance_count == 1));
+            if ngg_fullscreen || procedural_rectangle_stage_for_draw(export_program, draw) {
+                false
+            } else {
+                ngg_mesh_stage_for_draw(export_program, draw)?
+            }
+        },
+        uses_procedural_rectangle_stage: {
+            let ngg_fullscreen = draw.indirect_arguments_address.is_none()
+                && ngg_mesh_export_stage(export_program)
+                && ((!draw.indexed && draw.primitive_type == 6 && draw.index_count == 4)
+                    || (draw.indexed
+                        && draw.primitive_type == 4
+                        && matches!(draw.index_count, 3 | 6)
+                        && draw.instance_count == 1));
+            ngg_fullscreen || procedural_rectangle_stage_for_draw(export_program, draw)
+        },
         primitive_topology_class: metal_primitive_topology_class(draw.primitive_type)?,
     })
 }

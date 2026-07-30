@@ -117,11 +117,25 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
     let mut shard = guest_mutex_shards()[guest_mutex_shard(address)]
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if shard.contains_key(&address) {
-        if guest_object != 0 {
-            guest_free(guest_object);
+    if let Some(existing) = shard.get(&address).cloned() {
+        let mutex = existing
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A prior lock/trylock can auto-create the host entry before scePthreadMutexInit runs.
+        // Replace that placeholder when it is idle; reject a live mutex the way Orbis does.
+        if mutex.owner.is_some() || mutex.waiters != 0 {
+            if guest_object != 0 {
+                guest_free(guest_object);
+            }
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
         }
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        drop(mutex);
+        if let Some(removed) = shard.remove(&address) {
+            if removed.guest_object != 0 {
+                guest_free(removed.guest_object);
+            }
+        }
     }
     shard.insert(
         address,

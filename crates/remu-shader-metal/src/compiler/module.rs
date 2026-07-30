@@ -463,9 +463,12 @@ impl Compiler<'_> {
                 self.emit_compute_system_registers(&mut source);
             }
             MetalShaderStage::Mesh => {
+                // Default w=0 so threads that never EXP are hardware-clipped. The previous
+                // (0,0,0,1) default mapped to NDC center and produced a central additive haze
+                // whenever GS_ALLOC reserved more vertices than lanes that successfully exported.
                 source.push_str(
                     "    RemuVsOut remu_out = {};\n\
-                     \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 1.0f);\n\
+                     \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\
                      \x20   uint remu_meshlet_base = remu_group_id.x * 514u;\n\
                      \x20   uint remu_mesh_counts = remu_meshlets[remu_meshlet_base + 0u];\n\
                      \x20   uint remu_mesh_primitive_base = remu_meshlets[remu_meshlet_base + 1u];\n\
@@ -487,9 +490,15 @@ impl Compiler<'_> {
                         self.options.render_target_array_length - 1
                     );
                 }
-                if contains_register_reference(&self.body, 's', 3) {
-                    source.push_str("    s[3] = remu_mesh_counts;\n");
-                }
+                // GFX10 merged NGG shaders read subgroup lane IDs as
+                // `(s3[27:24] << 5) + v_mbcnt_lo`. Bits [15:0] still carry the meshlet
+                // vertex/primitive counts; pack the wave32 index into [27:24] so amplified
+                // subgroups larger than one wave (e.g. 96 threads) keep unique LDS/export IDs.
+                // Always overwrite s3 for mesh — even shaders that only read the count bits
+                // need a well-defined register, and packing is harmless when unused.
+                source.push_str(
+                    "    s[3] = remu_mesh_counts | (((remu_thread_index >> 5u) & 0xfu) << 24u);\n",
+                );
                 if contains_register_reference(&self.body, 'v', 0) {
                     source.push_str("    v[0] = remu_mesh_primitive;\n");
                 }
