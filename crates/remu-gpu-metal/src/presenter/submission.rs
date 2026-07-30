@@ -46,8 +46,9 @@ impl MetalPresenter {
         self.retire_completed_guest_batches();
         self.retire_completed_presentations();
         // A guest label may have been published by a Metal batch that retired since the previous
-        // AppKit tick. Retry suspended queue fronts once; an unsatisfied wait is re-suspended
-        // without permitting any later event from that queue to overtake it.
+        // AppKit tick. Before clearing the block graph, bounded dependency ingress discovers any
+        // cross-queue producer waiting in later channel chunks. Then retry suspended queue fronts
+        // once; an unsatisfied wait is re-suspended without permitting later work to overtake it.
         self.receiver.retry_guest_memory_waits();
         // Do not pull more guest commands while Metal already owns the bounded in-flight budget.
         // The event loop remains responsive and retries after every retirement tick, while the

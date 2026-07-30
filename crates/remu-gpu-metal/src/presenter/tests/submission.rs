@@ -1105,6 +1105,101 @@ fn blocked_wait_ingests_past_backpressure_only_until_a_runnable_queue_is_found()
 }
 
 #[test]
+fn blocked_wait_dependencies_are_ingested_before_periodic_retry_clears_block_state() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let wait = GpuMemoryWait {
+        address: 0x4a00,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("queue graphics wait");
+    for _ in 0..(remu_gpu::GPU_PENDING_EVENT_CAPACITY / remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE) {
+        sender
+            .send(GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events: vec![
+                    GpuEvent::PipelineBarrier(remu_gpu::GpuPipelineBarrier {
+                        wait_for: remu_gpu::GpuPipelineStage::ComputeShader,
+                    });
+                    remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
+                ],
+            })
+            .expect("queue blocked graphics tail");
+    }
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+                address: wait.address,
+                value: GpuMemoryReleaseValue::Immediate32(1),
+            })],
+        })
+        .expect("queue compute producer behind the ordinary ingress cap");
+
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            source
+        }
+        other => panic!("expected graphics wait, got {other:?}"),
+    };
+    ordered.block_event(
+        source,
+        GpuEvent::MemoryWait(wait),
+        QueueBlockReason::GuestMemoryWait(wait),
+    );
+    assert!(
+        !ordered.submissions.contains_key(&33),
+        "the producer starts behind the ordinary decoded-event cap"
+    );
+
+    // This is the order used by a presenter polling tick. Dependency ingress must observe the
+    // authoritative block graph before periodic label polling makes the wait runnable again.
+    ordered.retry_guest_memory_waits();
+    assert!(
+        ordered.submissions.contains_key(&33),
+        "dependency ingress must discover the independent producer"
+    );
+
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            source
+        }
+        other => panic!("expected periodic wait retry, got {other:?}"),
+    };
+    ordered.block_event(
+        source,
+        GpuEvent::MemoryWait(wait),
+        QueueBlockReason::GuestMemoryWait(wait),
+    );
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Event {
+            source: OrderedEventSource::GuestQueue(33),
+            event: GpuEvent::MemoryRelease(GpuMemoryRelease {
+                address: 0x4a00,
+                value: GpuMemoryReleaseValue::Immediate32(1),
+            }),
+        }
+    ));
+}
+
+#[test]
 fn blocked_wait_dependency_ingress_has_a_finite_pending_event_bound() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let wait = GpuMemoryWait {
