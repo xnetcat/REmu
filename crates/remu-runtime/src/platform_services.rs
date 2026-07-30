@@ -12,9 +12,7 @@
 
 use std::sync::Mutex;
 
-use crate::{
-    SCE_KERNEL_ERROR_INVALID_ARGUMENT, low_i32, low_u32, sce_kernel_error, write_guest_u32,
-};
+use crate::{SCE_KERNEL_ERROR_INVALID_ARGUMENT, low_i32, sce_kernel_error, write_guest_u32};
 
 const SCE_USER_SERVICE_ERROR_INVALID_ARGUMENT: u32 = 0x8096_0005;
 const SCE_USER_SERVICE_ERROR_INVALID_PARAMETER: u32 = 0x8096_0009;
