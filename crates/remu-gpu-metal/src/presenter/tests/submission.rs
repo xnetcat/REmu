@@ -838,6 +838,34 @@ fn ordered_guest_label_writes_publish_only_the_declared_values() {
 }
 
 #[test]
+fn pixel_pipe_release_trace_follows_the_exact_deferred_write_to_publication() {
+    let (_label_space, release_address) = mapped_test_label();
+    let release = GpuMemoryRelease {
+        address: release_address,
+        value: GpuMemoryReleaseValue::Immediate64(0x8000_0000_02ff_ffff),
+    };
+    let trace = remu_gpu::PixelPipeStatReleaseTrace {
+        dump_sequence: 47,
+        pair_index: 15,
+    };
+    remu_gpu::record_pixel_pipe_stat_release_trace(release, trace);
+    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(release))
+        .expect("pin traced pixel-pipe release destination");
+
+    apply_pending_guest_memory_writes(&[pending]).expect("publish traced pixel-pipe release");
+
+    assert_eq!(
+        unsafe { std::ptr::read_volatile(release_address as *const u64) },
+        0x8000_0000_02ff_ffff
+    );
+    assert_eq!(
+        remu_gpu::take_pixel_pipe_stat_release_trace(release),
+        None,
+        "publication consumes the exact trace provenance once"
+    );
+}
+
+#[test]
 fn deferred_shared_guest_write_rejects_reused_mapping() {
     let mut address_space =
         GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");

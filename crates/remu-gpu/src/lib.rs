@@ -24,6 +24,12 @@ pub use event::{
     GpuWaitId,
 };
 
+mod diagnostics;
+pub use diagnostics::{
+    PixelPipeStatReleaseTrace, record_pixel_pipe_stat_release_trace,
+    take_pixel_pipe_stat_release_trace,
+};
+
 mod waits;
 #[cfg(test)]
 use waits::gpu_wait_registry;

@@ -327,13 +327,33 @@ pub(crate) fn agc_handle_submission_packet(
             }
             Some(AgcEventWrite::PixelPipeStatDump { destination }) => {
                 let value = graphics.pixel_pipe_stat_counter | PIXEL_PIPE_STAT_VALID;
+                static PIXEL_PIPE_STAT_TRACE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+                let trace_sequence = trace_guest_sync()
+                    .then(|| PIXEL_PIPE_STAT_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1);
+                let trace_query =
+                    trace_sequence.filter(|sequence| *sequence <= 32 || sequence.is_power_of_two());
+                if let Some(trace_sequence) = trace_query {
+                    eprintln!(
+                        "[REMu][AGC][PIXEL-PIPE][EMIT] sequence={trace_sequence} packet={packet_address:#x} destination={destination:#x} value={value:#018x} pairs={PIXEL_PIPE_STAT_COUNTER_PAIRS}"
+                    );
+                }
                 for pair in 0..PIXEL_PIPE_STAT_COUNTER_PAIRS {
-                    emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(
-                        remu_gpu::GpuMemoryRelease {
-                            address: destination + pair * 16,
-                            value: remu_gpu::GpuMemoryReleaseValue::Immediate64(value),
-                        },
-                    ));
+                    let release = remu_gpu::GpuMemoryRelease {
+                        address: destination + pair * 16,
+                        value: remu_gpu::GpuMemoryReleaseValue::Immediate64(value),
+                    };
+                    if let Some(trace_sequence) = trace_query {
+                        remu_gpu::record_pixel_pipe_stat_release_trace(
+                            release,
+                            remu_gpu::PixelPipeStatReleaseTrace {
+                                dump_sequence: u64::try_from(trace_sequence).unwrap_or(u64::MAX),
+                                pair_index: u8::try_from(pair).expect(
+                                    "pixel-pipe counter-pair count fits the diagnostic index",
+                                ),
+                            },
+                        );
+                    }
+                    emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(release));
                 }
                 graphics.pixel_pipe_stat_counter = graphics
                     .pixel_pipe_stat_counter

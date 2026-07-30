@@ -2419,6 +2419,26 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         terminate_probe(status);
     }
     if nid == "T72hz6ffq08" {
+        static RENDER_THREAD_YIELD_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let thread_name = current_guest_thread_name();
+        if trace_guest_sync() && thread_name.contains("RenderThread") {
+            let sequence = RENDER_THREAD_YIELD_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+            if trace_logarithmic_sequence(sequence, 32) {
+                let stack = std::array::from_fn::<_, 32, _>(|index| {
+                    try_read_process_guest_u64(
+                        frame
+                            .guest_rsp
+                            .saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(8)),
+                    )
+                    .unwrap_or(0)
+                });
+                eprintln!(
+                    "[REMu][PTHREAD][YIELD] sequence={sequence} thread={thread_name:?}/{:#x} return={guest_return_address:#x} rsp={:#x} stack={stack:#x?}",
+                    current_guest_thread_handle(),
+                    frame.guest_rsp,
+                );
+            }
+        }
         std::thread::yield_now();
         return ProbeImportReturn::integer(0);
     }
