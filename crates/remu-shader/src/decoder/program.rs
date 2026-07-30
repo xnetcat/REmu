@@ -8,8 +8,9 @@ use crate::metadata::GuestMemoryReader;
 
 use super::{DecodeError, FALLBACK_MAX_INSTRUCTIONS, create_instruction, decode_frame};
 
-/// Decodes one bounded Gen5/RDNA shader stream. The input must end at an `S_ENDPGM` that is not
-/// before any statically encoded forward branch target; trailing allocation contents are ignored.
+/// Decodes one bounded Gen5/RDNA shader stream. The input must reach an architectural terminal
+/// control transfer that is not before any statically encoded forward branch target; trailing
+/// allocation contents are ignored.
 pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeError> {
     if words.is_empty() {
         return Err(DecodeError::Empty);
@@ -49,7 +50,7 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
             );
         }
         word_index += frame.dwords;
-        let ended = instruction.opcode == Opcode::END_PROGRAM;
+        let ended = instruction_terminates_program(&instruction);
         instructions.push(instruction);
         if ended && furthest_forward_branch_target.is_none_or(|target| pc >= target) {
             let program = Program::new(address, instructions);
@@ -64,10 +65,12 @@ pub fn decode_program(address: u64, words: &[u32]) -> Result<Program, DecodeErro
 
 /// Decodes every adjacent entry point within one exact AGC shader-code allocation.
 ///
-/// Geometry and other merged Gen5 binaries can contain multiple independently terminated
-/// programs in the same allocation. `decode_program` intentionally returns the first entry point;
-/// this variant preserves every `S_ENDPGM`-delimited segment so callers can lower the complete
-/// merged stage instead of silently discarding its trailing producer/consumer half.
+/// Geometry and other merged Gen5 binaries can contain multiple `S_ENDPGM`-delimited programs in
+/// the same allocation. `decode_program` intentionally returns the first entry point; this variant
+/// preserves those adjacent segments so callers can lower the complete merged stage instead of
+/// silently discarding its trailing producer/consumer half. An indirect `S_SETPC_B64` transfer
+/// ends the allocation's statically decodable stream rather than delimiting an adjacent entry
+/// point.
 pub fn decode_program_segments(address: u64, words: &[u32]) -> Result<Vec<Program>, DecodeError> {
     if words.is_empty() {
         return Err(DecodeError::Empty);
@@ -105,7 +108,11 @@ pub fn decode_program_segments(address: u64, words: &[u32]) -> Result<Vec<Progra
         word_index = word_index
             .checked_add(segment_dwords)
             .ok_or(DecodeError::ProgramCounterOverflow)?;
+        let transferred_indirectly = last.opcode.is("SSetpcB64");
         segments.push(segment);
+        if transferred_indirectly {
+            break;
+        }
     }
 
     if segments.is_empty() {
@@ -210,7 +217,7 @@ pub(crate) fn read_program_with_limits(
                 furthest_forward_branch_target.map_or(target, |current: u32| current.max(target)),
             );
         }
-        let ended = frame.opcode == Opcode::END_PROGRAM;
+        let ended = instruction_terminates_program(&instruction);
         raw_words.extend(prefix);
         decoded_instructions += 1;
         if ended && furthest_forward_branch_target.is_none_or(|target| pc >= target) {
@@ -220,6 +227,10 @@ pub(crate) fn read_program_with_limits(
     Err(DecodeError::Unterminated {
         inspected_instructions: decoded_instructions,
     })
+}
+
+fn instruction_terminates_program(instruction: &Instruction) -> bool {
+    instruction.opcode == Opcode::END_PROGRAM || instruction.opcode.is("SSetpcB64")
 }
 
 pub(crate) fn forward_branch_target(instruction: &Instruction) -> Result<Option<u32>, DecodeError> {

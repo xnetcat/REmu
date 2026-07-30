@@ -78,6 +78,73 @@ fn decodes_past_an_early_endpgm_needed_by_a_forward_branch() {
 }
 
 #[test]
+fn indirect_setpc_return_terminates_before_embedded_allocation_metadata() {
+    let words = [
+        0xbf88_0002, // s_cbranch_execz from pc 0 to pc 12
+        0xbf80_0000,
+        0xbf80_0000,
+        0xbf8c_c07f, // branch target: s_waitcnt
+        0xbe80_2006, // s_setpc_b64 s[6:7]
+        0x3030_6c73, // allocation metadata: "sl00"
+        0x0000_023e, // metadata shaped like reserved VOP2 opcode 0
+    ];
+
+    let program = decode_program(0x0080_db6c_0000, &words)
+        .expect("indirect terminal transfer must stop before allocation metadata");
+
+    assert_eq!(program.instructions.len(), 5);
+    assert!(program.instructions.last().unwrap().opcode.is("SSetpcB64"));
+
+    let memory = SliceMemory {
+        base: 0x0080_db6c_0000,
+        words: words.to_vec(),
+    };
+    let program = read_program_bounded(
+        &memory,
+        memory.base,
+        memory.words.len() * std::mem::size_of::<u32>(),
+    )
+    .expect("memory-backed decoder must stop at the indirect terminal transfer");
+    assert_eq!(program.instructions.len(), 5);
+
+    let segments = read_program_segments_bounded(
+        &memory,
+        memory.base,
+        memory.words.len() * std::mem::size_of::<u32>(),
+    )
+    .expect("metadata after an indirect transfer is not an adjacent shader entry point");
+    assert_eq!(segments.len(), 1);
+    assert!(
+        segments[0]
+            .instructions
+            .last()
+            .unwrap()
+            .opcode
+            .is("SSetpcB64")
+    );
+}
+
+#[test]
+fn indirect_setpc_before_a_known_forward_target_does_not_truncate_the_program() {
+    let words = [
+        0xbf88_0003, // s_cbranch_execz from pc 0 to pc 16
+        0xbe80_2006, // fallthrough path transfers indirectly
+        0xbf80_0000,
+        0xbf80_0000,
+        0xbf8c_c07f, // branch target
+        0xbe80_2006, // branch path transfers indirectly
+        0x0000_023e,
+    ];
+
+    let program = decode_program(0x4000, &words)
+        .expect("decoder must retain every statically encoded forward branch target");
+
+    assert_eq!(program.instructions.len(), 6);
+    assert_eq!(program.instructions[4].pc, 16);
+    assert!(program.instructions.last().unwrap().opcode.is("SSetpcB64"));
+}
+
+#[test]
 fn decodes_adjacent_merged_shader_entry_points_within_one_allocation() {
     let words = [
         0xbf80_0000, // first entry point
