@@ -67,6 +67,8 @@ pub(super) const CB_COLOR_CONTROL: u32 = 0x202;
 
 pub(super) const DEFAULT_CB_COLOR_CONTROL: u32 = 0x00cc_0010;
 
+pub(super) const DB_SHADER_CONTROL: u32 = 0x203;
+
 pub(super) const PA_SU_SC_MODE_CNTL: u32 = 0x205;
 
 pub(super) const PA_CL_VS_OUT_CNTL: u32 = 0x207;
