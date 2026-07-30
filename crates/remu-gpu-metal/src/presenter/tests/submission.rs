@@ -1045,6 +1045,68 @@ fn blocked_wait_dependency_ingress_has_a_finite_pending_event_bound() {
 }
 
 #[test]
+fn blocked_wait_diagnostics_report_both_edges_of_a_cross_queue_cycle() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let graphics_wait = GpuMemoryWait {
+        address: 0x4e0,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    let compute_wait = GpuMemoryWait {
+        address: 0x4c0,
+        ..graphics_wait
+    };
+    for (queue_id, wait, producer_address) in [
+        (0, graphics_wait, compute_wait.address),
+        (33, compute_wait, graphics_wait.address),
+    ] {
+        sender
+            .send(GpuEvent::QueueSubmission {
+                queue_id,
+                events: vec![
+                    GpuEvent::MemoryWait(wait),
+                    GpuEvent::MemoryRelease(GpuMemoryRelease {
+                        address: producer_address,
+                        value: GpuMemoryReleaseValue::Immediate32(1),
+                    }),
+                ],
+            })
+            .expect("queue cyclic wait and producer");
+    }
+
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    for expected in [graphics_wait, compute_wait] {
+        let (source, event) = match ordered.try_recv(|_| true) {
+            OrderedEventPoll::Event {
+                source,
+                event: GpuEvent::MemoryWait(actual),
+            } => {
+                assert_eq!(actual, expected);
+                (source, GpuEvent::MemoryWait(actual))
+            }
+            other => panic!("expected cyclic wait, got {other:?}"),
+        };
+        ordered.block_event(source, event, QueueBlockReason::GuestMemoryWait(expected));
+    }
+
+    let dependencies = ordered.blocked_wait_dependency_diagnostics();
+    assert!(
+        dependencies.contains("q0:wait@0x4e0")
+            && dependencies.contains("q33/s0/e1:release@0x4e0=0x1")
+    );
+    assert!(
+        dependencies.contains("q33:wait@0x4c0")
+            && dependencies.contains("q0/s0/e1:release@0x4c0=0x1")
+    );
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Blocked
+    ));
+}
+
+#[test]
 fn ordered_receiver_reports_only_dependency_runnable_work() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut ordered = OrderedGpuEventReceiver::new(receiver);
