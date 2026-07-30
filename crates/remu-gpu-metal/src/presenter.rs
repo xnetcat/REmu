@@ -1174,7 +1174,17 @@ struct GuestMemoryWaitTracker {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GuestRenderPassKey {
-    targets: Vec<(GuestTextureDescriptor, u32, bool, u32, u32, u32, u32, u32)>,
+    targets: Vec<(
+        GuestTextureDescriptor,
+        u32,
+        bool,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        Option<u64>,
+    )>,
     depth: Option<(GuestTextureDescriptor, u32, u32, Option<u32>, Option<u64>)>,
 }
 
@@ -1196,6 +1206,7 @@ enum GuestRenderPassKeyField {
     TargetBaseLayer,
     TargetMipLevel,
     TargetMipLevelCount,
+    TargetClearSequence,
     DepthPresence,
     DepthAddress,
     DepthWidth,
@@ -1230,6 +1241,7 @@ struct GuestRenderPassKeyTransitionStatistics {
     target_base_layer: u32,
     target_mip_level: u32,
     target_mip_level_count: u32,
+    target_clear_sequence: u32,
     depth_presence: u32,
     depth_address: u32,
     depth_width: u32,
@@ -1245,6 +1257,14 @@ struct GuestRenderPassKeyTransitionStatistics {
 }
 
 impl GuestRenderPassKey {
+    fn continuation_after_color_loads(&self) -> Self {
+        let mut continuation = self.clone();
+        for target in &mut continuation.targets {
+            target.8 = None;
+        }
+        continuation
+    }
+
     fn transition_to(&self, next: &Self) -> GuestRenderPassKeyTransition {
         let mut transition = GuestRenderPassKeyTransition::default();
         transition.mark(
@@ -1315,6 +1335,10 @@ impl GuestRenderPassKey {
             transition.mark(
                 GuestRenderPassKeyField::TargetMipLevelCount,
                 current.7 != next.7,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::TargetClearSequence,
+                current.8 != next.8,
             );
         }
         if let (Some(current), Some(next)) = (&self.depth, &next.depth) {
@@ -1410,6 +1434,7 @@ impl GuestRenderPassKeyTransitionStatistics {
             target_base_layer => TargetBaseLayer,
             target_mip_level => TargetMipLevel,
             target_mip_level_count => TargetMipLevelCount,
+            target_clear_sequence => TargetClearSequence,
             depth_presence => DepthPresence,
             depth_address => DepthAddress,
             depth_width => DepthWidth,
@@ -1511,6 +1536,7 @@ struct MetalPresenter {
     /// uncompressed, so attachment begin expands a pending bit through a Metal load clear and a
     /// later EliminateFastClear observes that the bit was already consumed.
     color_metadata_clears: HashMap<u64, u32>,
+    next_color_attachment_clear_sequence: u64,
     next_depth_metadata_clear_sequence: u64,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     sampled_texture_write_watches: HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
@@ -1664,6 +1690,7 @@ impl MetalPresenter {
             multisample_textures: HashMap::new(),
             depth_metadata_clears: HashMap::new(),
             color_metadata_clears: HashMap::new(),
+            next_color_attachment_clear_sequence: 0,
             next_depth_metadata_clear_sequence: 0,
             sampled_texture_cache: HashMap::new(),
             sampled_texture_write_watches: HashMap::new(),
