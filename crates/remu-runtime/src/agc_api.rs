@@ -140,6 +140,7 @@ pub(crate) const AGC_CB_COLOR0_INFO: u32 = 0x31c;
 pub(crate) const AGC_CB_COLOR0_ATTRIB: u32 = 0x31d;
 pub(crate) const AGC_CB_COLOR0_ATTRIB2: u32 = 0x3b0;
 pub(crate) const AGC_CB_COLOR0_ATTRIB3: u32 = 0x3b8;
+pub(crate) const AGC_CB_COLOR0_CMASK: u32 = 0x31f;
 pub(crate) const AGC_COLOR_TARGET_COUNT: u32 = 8;
 pub(crate) const AGC_DB_RENDER_CONTROL: u32 = 0x000;
 pub(crate) const AGC_DB_DEPTH_SIZE_XY: u32 = 0x007;

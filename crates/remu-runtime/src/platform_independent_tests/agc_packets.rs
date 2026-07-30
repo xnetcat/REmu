@@ -1069,6 +1069,75 @@ fn applies_native_gen5_indexed_uconfig_packet() {
 }
 
 #[test]
+fn captures_prospero_color_extent_from_the_trailing_nop() {
+    let hint = (720_u32 << 16) | 1_280;
+    let mut packet = vec![
+        agc_pm4(16, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        crate::AGC_CB_COLOR0_BASE,
+    ];
+    packet.resize(16, 0);
+    packet.extend([0xc000_1000, hint]);
+    let mut graphics = AgcGraphicsState::default();
+    graphics.context_registers.insert(
+        crate::AGC_CB_COLOR0_ATTRIB2,
+        ((2_048 - 1) << 14) | (1_024 - 1),
+    );
+
+    agc_apply_submission_registers(
+        packet.as_ptr().addr() as u64,
+        16,
+        crate::AGC_IT_SET_CONTEXT_REG,
+        0,
+        &mut graphics,
+    )
+    .expect("Prospero color setup packet");
+
+    assert_eq!(graphics.color_target_extent_hints[0], hint);
+
+    let packet_without_hint = [
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        crate::AGC_CB_COLOR0_BASE,
+        0,
+    ];
+    agc_apply_submission_registers(
+        packet_without_hint.as_ptr().addr() as u64,
+        3,
+        crate::AGC_IT_SET_CONTEXT_REG,
+        0,
+        &mut graphics,
+    )
+    .expect("ordinary color setup packet");
+    assert_eq!(graphics.color_target_extent_hints[0], 0);
+}
+
+#[test]
+fn captures_prospero_depth_extent_after_the_fixed_db_setup_sequence() {
+    let hint = (1_080_u32 << 16) | 1_920;
+    let mut packet = vec![
+        agc_pm4(10, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        crate::AGC_DB_Z_INFO,
+    ];
+    packet.resize(22, 0);
+    packet.extend([0xc000_1000, hint]);
+    let mut graphics = AgcGraphicsState::default();
+    graphics.context_registers.insert(
+        crate::AGC_DB_DEPTH_SIZE_XY,
+        ((2_048 - 1) << 16) | (2_048 - 1),
+    );
+
+    agc_apply_submission_registers(
+        packet.as_ptr().addr() as u64,
+        10,
+        crate::AGC_IT_SET_CONTEXT_REG,
+        0,
+        &mut graphics,
+    )
+    .expect("Prospero depth setup packet");
+
+    assert_eq!(graphics.depth_target_extent_hint, hint);
+}
+
+#[test]
 fn clear_state_resets_complete_queue_state_without_discarding_residency() {
     let address = 0x0070_1234_5600_u64;
     let target = remu_gpu::GpuColorTarget {

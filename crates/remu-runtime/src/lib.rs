@@ -64,8 +64,9 @@ use remu_memory::GUEST_EXECUTE;
 static GPU_EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
 pub(crate) use agc_api::{
     AGC_CB_COLOR_REGISTER_STRIDE, AGC_CB_COLOR0_ATTRIB, AGC_CB_COLOR0_ATTRIB2,
-    AGC_CB_COLOR0_ATTRIB3, AGC_CB_COLOR0_BASE, AGC_CB_COLOR0_BASE_EXT, AGC_CB_COLOR0_INFO,
-    AGC_CB_COLOR0_VIEW, AGC_CB_SHADER_MASK, AGC_CB_TARGET_MASK, AGC_COLOR_TARGET_COUNT,
+    AGC_CB_COLOR0_ATTRIB3, AGC_CB_COLOR0_BASE, AGC_CB_COLOR0_BASE_EXT, AGC_CB_COLOR0_CMASK,
+    AGC_CB_COLOR0_INFO, AGC_CB_COLOR0_VIEW, AGC_CB_SHADER_MASK, AGC_CB_TARGET_MASK,
+    AGC_COLOR_TARGET_COUNT,
     AGC_COMPUTE_USER_DATA_0, AGC_DB_DEPTH_CONTROL, AGC_DB_DEPTH_SIZE_XY, AGC_DB_RENDER_CONTROL,
     AGC_DB_Z_INFO, AGC_DB_Z_READ_BASE, AGC_DB_Z_READ_BASE_HI, AGC_DB_Z_WRITE_BASE,
     AGC_DB_Z_WRITE_BASE_HI, AGC_IT_CLEAR_STATE, AGC_IT_COND_EXEC, AGC_IT_DISPATCH_DIRECT,
@@ -987,6 +988,14 @@ struct AgcGraphicsState {
     sampled_texture_addresses: BTreeSet<u64>,
     failed_shader_evaluations: BTreeSet<(u8, u64)>,
     known_color_targets: BTreeMap<u64, remu_gpu::GpuColorTarget>,
+    /// Actual color-image extents carried by Prospero's trailing `0xc0001000` NOP hints.
+    ///
+    /// CB surface registers describe padded allocation geometry. Keep the hints separately until
+    /// the GPU resource model can represent visible and allocation extents independently.
+    color_target_extent_hints: [u32; AGC_COLOR_TARGET_COUNT as usize],
+    /// Actual depth-image extent carried after the fixed Prospero DB setup sequence.
+    depth_target_extent_hint: u32,
+    traced_extent_hints: BTreeSet<(u8, u32, u32)>,
     shader_evaluation_cache: ShaderEvaluationCache,
     shader_evaluation_workers: Option<ShaderEvaluationWorkers>,
 }
@@ -1013,6 +1022,8 @@ impl AgcGraphicsState {
         self.instance_count = 1;
         self.draw_index_offset = 0;
         self.indirect_args_address = 0;
+        self.color_target_extent_hints = [0; AGC_COLOR_TARGET_COUNT as usize];
+        self.depth_target_extent_hint = 0;
     }
 }
 
