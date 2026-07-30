@@ -259,8 +259,12 @@ impl MetalPresenter {
         let indirect_arguments = match (dispatch.source, dispatch.launch.grid) {
             (
                 remu_gpu::ComputeDispatchSource::Indirect { dimensions_address },
-                ComputeGrid::Threadgroups(_),
-            ) => Some(self.upload_indirect_dispatch_arguments(&device, dimensions_address)?),
+                ComputeGrid::Threadgroups(dimensions),
+            ) => Some(self.upload_indirect_dispatch_arguments(
+                &device,
+                dimensions_address,
+                dimensions,
+            )?),
             _ => None,
         };
         let global_argument_buffer = create_global_argument_buffer(
