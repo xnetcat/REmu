@@ -202,13 +202,15 @@ set +e
 if [ "$capture_frames" = 1 ]; then
     (
         cd "$launch_working_directory"
-        env REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \
+        env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME \
+            REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \
             arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
     ) > "$run_dir/guest.log" 2>&1 &
 else
     (
         cd "$launch_working_directory"
-        env -u REMU_CAPTURE_DIR REMU_AUTO_CROSS="$auto_cross" \
+        env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME -u REMU_CAPTURE_DIR \
+            REMU_AUTO_CROSS="$auto_cross" \
             arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
     ) > "$run_dir/guest.log" 2>&1 &
 fi
