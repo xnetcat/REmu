@@ -83,6 +83,43 @@ class TaskGraphStallSnapshotTests(unittest.TestCase):
             )
         )
 
+    def test_decodes_wait_while_main_thread_is_between_import_calls(self) -> None:
+        current_rbp = self.guest_rsp + 0x40
+        self.memory[current_rbp] = self.wait_rbp
+        self.memory[current_rbp + 8] = 0x8012108A1
+
+        candidate = SNAPSHOT.decode_direct_guest_wait(
+            9,
+            0x80121086F,
+            self.guest_rsp,
+            current_rbp,
+            self.read_u64,
+        )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.source, "direct-guest")
+        self.assertEqual(candidate.import_frame, 0)
+        self.assertEqual(candidate.wait_rbp, self.wait_rbp)
+        self.assertEqual(candidate.event, self.event)
+
+    def test_direct_guest_decoder_requires_bounded_monotonic_rbp_chain(
+        self,
+    ) -> None:
+        current_rbp = self.guest_rsp + 0x40
+        self.memory[current_rbp] = current_rbp - 0x10
+        self.memory[current_rbp + 8] = 0x8012108A1
+
+        self.assertIsNone(
+            SNAPSHOT.decode_direct_guest_wait(
+                9,
+                0x80121086F,
+                self.guest_rsp,
+                current_rbp,
+                self.read_u64,
+            )
+        )
+
     def test_selects_nearest_native_import_frame(self) -> None:
         first = SNAPSHOT.decode_wait_candidate(
             self.import_frame, 9, self.native_sp, self.read_u64

@@ -63,9 +63,11 @@ LANE_OFFSETS = (
 
 DEFAULT_CHAIN_LIMIT = 64
 MAXIMUM_CHAIN_LIMIT = 512
-MAXIMUM_NATIVE_THREADS = 128
+MAXIMUM_NATIVE_THREADS = 512
 NATIVE_STACK_SCAN_BYTES = 256 * 1024
 NATIVE_STACK_READ_CHUNK = 32 * 1024
+GUEST_FRAME_CHAIN_LIMIT = 64
+MAXIMUM_GUEST_FRAME_SPAN = 16 * 1024 * 1024
 ALLOCATOR_PAGE_BYTES = 1024 * 1024
 MAXIMUM_ALLOCATOR_SCAN_BYTES = 8 * ALLOCATOR_PAGE_BYTES
 MAXIMUM_ALLOCATOR_MATCHES = 64
@@ -79,14 +81,19 @@ def _words_text(words: Iterable[Optional[int]]) -> str:
     return "[" + ",".join(_optional_hex(word) for word in words) + "]"
 
 
-def plausible_guest_pointer(address: Optional[int]) -> bool:
-    """Return whether a value can be a mapped direct-guest pointer."""
+def plausible_guest_address(address: Optional[int]) -> bool:
+    """Return whether a value lies in REmu's direct-guest address window."""
 
     return (
         address is not None
         and MINIMUM_GUEST_ADDRESS <= address < MAXIMUM_GUEST_ADDRESS
-        and address % 8 == 0
     )
+
+
+def plausible_guest_pointer(address: Optional[int]) -> bool:
+    """Return whether a value can be an aligned direct-guest pointer."""
+
+    return plausible_guest_address(address) and address % 8 == 0
 
 
 @dataclass(frozen=True)
@@ -101,37 +108,28 @@ class WaitCandidate:
     outer_rbp: int
     parent_rbp: int
     event: int
+    source: str = "import-frame"
 
     @property
     def native_distance(self) -> int:
+        if self.source == "direct-guest":
+            return 0
         return self.import_frame - self.native_sp
 
 
-def decode_wait_candidate(
-    import_frame: int,
+def _decode_wait_rbp(
+    wait_rbp: int,
     thread_id: int,
     native_sp: int,
+    import_frame: int,
+    guest_rsp: int,
+    source: str,
     read_u64: ReadU64,
 ) -> Optional[WaitCandidate]:
-    """Validate one possible ImportCallFrame and the exact guest caller chain."""
+    """Validate the fixed frame-pointer chain above GameThreadWaitForTask."""
 
-    if import_frame < native_sp:
-        return None
-    if read_u64(import_frame + IMPORT_FRAME_GUEST_RETURN) != HOST_EVENT_WAIT_RETURN:
-        return None
-    guest_rsp = read_u64(import_frame + IMPORT_FRAME_GUEST_RSP)
-    if not plausible_guest_pointer(guest_rsp):
-        return None
-    assert guest_rsp is not None
-    if (
-        read_u64(guest_rsp + GUEST_RSP_WAIT_RETURN_OFFSET)
-        != GAME_THREAD_WAIT_RETURN
-    ):
-        return None
-    wait_rbp = read_u64(guest_rsp + GUEST_RSP_WAIT_RBP_OFFSET)
     if not plausible_guest_pointer(wait_rbp):
         return None
-    assert wait_rbp is not None
     if read_u64(wait_rbp + 8) != GAME_THREAD_WAIT_RETURN:
         return None
     outer_rbp = read_u64(wait_rbp)
@@ -159,7 +157,89 @@ def decode_wait_candidate(
         outer_rbp=outer_rbp,
         parent_rbp=parent_rbp,
         event=event,
+        source=source,
     )
+
+
+def decode_wait_candidate(
+    import_frame: int,
+    thread_id: int,
+    native_sp: int,
+    read_u64: ReadU64,
+) -> Optional[WaitCandidate]:
+    """Validate one possible ImportCallFrame and the exact guest caller chain."""
+
+    if import_frame < native_sp:
+        return None
+    if read_u64(import_frame + IMPORT_FRAME_GUEST_RETURN) != HOST_EVENT_WAIT_RETURN:
+        return None
+    guest_rsp = read_u64(import_frame + IMPORT_FRAME_GUEST_RSP)
+    if not plausible_guest_pointer(guest_rsp):
+        return None
+    assert guest_rsp is not None
+    if (
+        read_u64(guest_rsp + GUEST_RSP_WAIT_RETURN_OFFSET)
+        != GAME_THREAD_WAIT_RETURN
+    ):
+        return None
+    wait_rbp = read_u64(guest_rsp + GUEST_RSP_WAIT_RBP_OFFSET)
+    if wait_rbp is None:
+        return None
+    return _decode_wait_rbp(
+        wait_rbp,
+        thread_id,
+        native_sp,
+        import_frame,
+        guest_rsp,
+        "import-frame",
+        read_u64,
+    )
+
+
+def decode_direct_guest_wait(
+    thread_id: int,
+    guest_pc: int,
+    guest_rsp: int,
+    guest_rbp: int,
+    read_u64: ReadU64,
+    limit: int = GUEST_FRAME_CHAIN_LIMIT,
+) -> Optional[WaitCandidate]:
+    """Find the same wait while a sampled thread is executing guest code.
+
+    The main loop leaves the timed-wait import roughly every millisecond.  In
+    that interval there is no live ImportCallFrame, but Rosetta exposes the
+    direct guest RSP/RBP in the stopped x86 thread.  Walking only the bounded,
+    monotonic RBP chain keeps this fallback read-only and title-specific.
+    """
+
+    if (
+        not plausible_guest_address(guest_pc)
+        or not plausible_guest_pointer(guest_rsp)
+        or not plausible_guest_pointer(guest_rbp)
+    ):
+        return None
+    frame_rbp = guest_rbp
+    for _ in range(limit):
+        candidate = _decode_wait_rbp(
+            frame_rbp,
+            thread_id,
+            guest_rsp,
+            0,
+            guest_rsp,
+            "direct-guest",
+            read_u64,
+        )
+        if candidate is not None:
+            return candidate
+        next_rbp = read_u64(frame_rbp)
+        if (
+            not plausible_guest_pointer(next_rbp)
+            or next_rbp <= frame_rbp
+            or next_rbp - frame_rbp > MAXIMUM_GUEST_FRAME_SPAN
+        ):
+            return None
+        frame_rbp = next_rbp
+    return None
 
 
 def select_wait_candidate(
@@ -386,21 +466,46 @@ def _read_chunk(process, address: int, size: int) -> Optional[bytes]:
     return bytes(contents)
 
 
+@dataclass(frozen=True)
+class NativeStackScan:
+    candidates: tuple[WaitCandidate, ...]
+    chunks_read: int
+    return_words: int
+
+
+def _direct_thread_wait_candidate(
+    thread,
+    read_u64: ReadU64,
+) -> Optional[WaitCandidate]:
+    frame = thread.GetFrameAtIndex(0)
+    if not frame.IsValid():
+        return None
+    return decode_direct_guest_wait(
+        thread.GetThreadID(),
+        frame.GetPC(),
+        frame.GetSP(),
+        frame.FindRegister("rbp").GetValueAsUnsigned(),
+        read_u64,
+    )
+
+
 def _thread_wait_candidates(
     process,
     thread,
     read_u64: ReadU64,
-) -> tuple[WaitCandidate, ...]:
+) -> NativeStackScan:
     frame = thread.GetFrameAtIndex(0)
     if not frame.IsValid():
-        return ()
+        return NativeStackScan((), 0, 0)
     native_sp = frame.GetSP()
     if native_sp in (0, (1 << 64) - 1):
-        return ()
+        return NativeStackScan((), 0, 0)
     thread_id = thread.GetThreadID()
     needle = HOST_EVENT_WAIT_RETURN.to_bytes(8, "little")
     candidates = []
     seen: set[int] = set()
+    chunks_read = 0
+    return_words = 0
     for offset in range(0, NATIVE_STACK_SCAN_BYTES, NATIVE_STACK_READ_CHUNK):
         address = native_sp + offset
         contents = _read_chunk(
@@ -408,8 +513,10 @@ def _thread_wait_candidates(
         )
         if contents is None:
             break
+        chunks_read += 1
         found = contents.find(needle)
         while found != -1:
+            return_words += 1
             return_word = address + found
             if return_word % 8 == 0 and return_word >= IMPORT_FRAME_GUEST_RETURN:
                 import_frame = return_word - IMPORT_FRAME_GUEST_RETURN
@@ -424,7 +531,11 @@ def _thread_wait_candidates(
                     if candidate is not None:
                         candidates.append(candidate)
             found = contents.find(needle, found + 1)
-    return tuple(candidates)
+    return NativeStackScan(
+        tuple(candidates),
+        chunks_read,
+        return_words,
+    )
 
 
 def _print_lane(snapshot: LaneSnapshot) -> None:
@@ -508,15 +619,57 @@ def snapshot_taskgraph_stall(debugger, _command, result, _internal_dict):
             return
 
         read_u64 = _process_reader(process)
+        threads = list(process)
+        scanned_threads = threads[:MAXIMUM_NATIVE_THREADS]
+        direct_guest_threads = 0
         candidates = []
-        for index, thread in enumerate(process):
-            if index >= MAXIMUM_NATIVE_THREADS:
-                break
-            candidates.extend(
-                _thread_wait_candidates(process, thread, read_u64)
+        for thread in scanned_threads:
+            frame = thread.GetFrameAtIndex(0)
+            if frame.IsValid() and plausible_guest_address(frame.GetPC()):
+                direct_guest_threads += 1
+            candidate = _direct_thread_wait_candidate(thread, read_u64)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        native_chunks = 0
+        native_return_words = 0
+        native_threads_scanned = 0
+        if not candidates:
+            prioritized_threads = sorted(
+                scanned_threads,
+                key=lambda thread: (
+                    0
+                    if thread.GetName() in ("main", "GameThread")
+                    else 1,
+                    thread.GetIndexID(),
+                ),
             )
+            for thread in prioritized_threads:
+                native_threads_scanned += 1
+                scan = _thread_wait_candidates(
+                    process, thread, read_u64
+                )
+                candidates.extend(scan.candidates)
+                native_chunks += scan.chunks_read
+                native_return_words += scan.return_words
+                if scan.candidates:
+                    break
+        print(
+            f"{TAG} scan-stats total_threads={len(threads)} "
+            f"scanned_threads={len(scanned_threads)} "
+            f"direct_guest_threads={direct_guest_threads} "
+            f"native_threads_scanned={native_threads_scanned} "
+            f"native_chunks={native_chunks} "
+            f"native_return_words={native_return_words}",
+            flush=True,
+        )
         unique_candidates = {
-            (candidate.thread_id, candidate.import_frame): candidate
+            (
+                candidate.source,
+                candidate.thread_id,
+                candidate.import_frame,
+                candidate.wait_rbp,
+            ): candidate
             for candidate in candidates
         }
         candidates = list(unique_candidates.values())
@@ -525,7 +678,8 @@ def snapshot_taskgraph_stall(debugger, _command, result, _internal_dict):
             key=lambda item: (item.native_distance, item.thread_id),
         ):
             print(
-                f"{TAG} wait-candidate thread={candidate.thread_id:#x} "
+                f"{TAG} wait-candidate source={candidate.source} "
+                f"thread={candidate.thread_id:#x} "
                 f"native_sp={candidate.native_sp:#x} "
                 f"import_frame={candidate.import_frame:#x} "
                 f"distance={candidate.native_distance:#x} "
@@ -549,7 +703,8 @@ def snapshot_taskgraph_stall(debugger, _command, result, _internal_dict):
             for index in range(TASK_WORD_COUNT)
         )
         print(
-            f"{TAG} selected thread={selected.thread_id:#x} "
+            f"{TAG} selected source={selected.source} "
+            f"thread={selected.thread_id:#x} "
             f"outer_rbp={selected.outer_rbp:#x} "
             f"event={selected.event:#x} "
             f"event_words={_words_text(event_words)}",
