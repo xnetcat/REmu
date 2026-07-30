@@ -3,7 +3,7 @@
 
 use super::{
     CB_BLEND0_CONTROL, CB_TARGET_MASK, DecodedImageDescriptor, DiagnosticScanoutWriter,
-    GuestTextureDescriptor, decode_depth_target, decode_image_descriptor,
+    GuestTextureDescriptor, UploadedGlobalBuffer, decode_depth_target, decode_image_descriptor,
     decode_metal_blend_attachment, decode_raster_state, decode_render_targets, decode_scissor,
     decode_viewport, guest_ranges_overlap, guest_texture_byte_count,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage,
@@ -967,6 +967,70 @@ pub(super) fn diagnostic_global_binding_head(binding: &GlobalMemoryBinding) -> V
     unsafe { std::slice::from_raw_parts(binding.base_address as *const u8, byte_count).to_vec() }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct DiagnosticUploadedGlobalBinding {
+    pub(super) offset: u64,
+    pub(super) buffer_length: u64,
+    pub(super) guest_memory: bool,
+    pub(super) bytes: Result<Vec<u8>, String>,
+}
+
+fn diagnostic_uploaded_global_binding_range(
+    buffer_length: u64,
+    offset: u64,
+    binding_byte_count: usize,
+) -> Result<(usize, usize), String> {
+    let byte_count = binding_byte_count.min(256);
+    let start = usize::try_from(offset)
+        .map_err(|_| format!("Metal buffer offset {offset:#x} does not fit usize"))?;
+    let end = start.checked_add(byte_count).ok_or_else(|| {
+        format!("Metal buffer range offset={offset:#x} bytes={byte_count} overflows")
+    })?;
+    if u64::try_from(end).map_or(true, |end| end > buffer_length) {
+        return Err(format!(
+            "Metal buffer range offset={offset:#x} bytes={byte_count} exceeds length={buffer_length}"
+        ));
+    }
+    Ok((start, byte_count))
+}
+
+/// Captures the bytes from the exact Metal buffer and offset bound for a shader global.
+///
+/// Callers must first complete every command buffer that can produce or consume this binding.
+/// In particular, a forwarded GPU writeback can contain newer data than the packet-time
+/// `GlobalMemoryBinding::data`. Selected target dumps already establish that completion boundary;
+/// keeping the wait at the caller avoids adding stalls to ordinary rendering.
+pub(super) fn diagnostic_uploaded_global_binding_head(
+    binding: &GlobalMemoryBinding,
+    uploaded: &UploadedGlobalBuffer,
+) -> DiagnosticUploadedGlobalBinding {
+    let buffer_length = uploaded.buffer.length();
+    let bytes = diagnostic_uploaded_global_binding_range(
+        buffer_length,
+        uploaded.offset,
+        binding.byte_count,
+    )
+    .and_then(|(start, byte_count)| {
+        if byte_count == 0 {
+            return Ok(Vec::new());
+        }
+        let contents = uploaded.buffer.contents().cast::<u8>();
+        if contents.is_null() {
+            return Err("Metal buffer storage is not CPU-visible".to_owned());
+        }
+        // SAFETY: the range helper proved `start + byte_count <= buffer.length()`. The caller
+        // completed every command buffer that can access this shared/managed resource, and
+        // `contents` was checked for CPU visibility before constructing the slice.
+        Ok(unsafe { std::slice::from_raw_parts(contents.add(start), byte_count) }.to_vec())
+    });
+    DiagnosticUploadedGlobalBinding {
+        offset: uploaded.offset,
+        buffer_length,
+        guest_memory: uploaded.guest_memory,
+        bytes,
+    }
+}
+
 pub(super) fn record_diagnostic_texture_writer(
     descriptor: GuestTextureDescriptor,
     stage: &'static str,
@@ -1227,6 +1291,7 @@ pub(super) fn dump_msl_instruction_filter_matches(pixel_instruction_count: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metal::{Device, MTLResourceOptions};
 
     #[test]
     fn video_chain_match_prefers_exact_descriptor_over_earlier_overlap() {
@@ -1408,6 +1473,64 @@ mod tests {
         assert!(filter.matches_sampled_addresses([0x1234, 0x0080_65b3_0000]));
         assert!(!filter.matches_sampled_addresses([0x0080_65b4_0000]));
         assert!(!filter.matches_sampled_addresses([]));
+    }
+
+    #[test]
+    fn uploaded_global_binding_snapshot_uses_submitted_offset_and_extent() {
+        let device = Device::system_default().expect("Metal device");
+        let buffer = device.new_buffer(24, MTLResourceOptions::StorageModeShared);
+        // SAFETY: the shared test buffer exposes exactly 24 writable bytes.
+        let contents =
+            unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<u8>(), 24) };
+        contents.copy_from_slice(&(0_u8..24).collect::<Vec<_>>());
+        let binding = GlobalMemoryBinding {
+            scalar_address: 4,
+            base_address: 0x10000,
+            instruction_pcs: Default::default(),
+            byte_count: 6,
+            data: vec![0xff; 6],
+            writable: false,
+            write_back_to_guest: false,
+        };
+        let uploaded = UploadedGlobalBuffer {
+            buffer,
+            offset: 9,
+            guest_memory: false,
+        };
+
+        assert_eq!(
+            diagnostic_uploaded_global_binding_head(&binding, &uploaded),
+            DiagnosticUploadedGlobalBinding {
+                offset: 9,
+                buffer_length: 24,
+                guest_memory: false,
+                bytes: Ok(vec![9, 10, 11, 12, 13, 14]),
+            }
+        );
+    }
+
+    #[test]
+    fn uploaded_global_binding_snapshot_rejects_out_of_bounds_extent() {
+        let device = Device::system_default().expect("Metal device");
+        let binding = GlobalMemoryBinding {
+            scalar_address: 4,
+            base_address: 0x10000,
+            instruction_pcs: Default::default(),
+            byte_count: 8,
+            data: vec![0xff; 8],
+            writable: false,
+            write_back_to_guest: false,
+        };
+        let uploaded = UploadedGlobalBuffer {
+            buffer: device.new_buffer(12, MTLResourceOptions::StorageModeShared),
+            offset: 8,
+            guest_memory: true,
+        };
+        let snapshot = diagnostic_uploaded_global_binding_head(&binding, &uploaded);
+
+        assert_eq!(snapshot.offset, 8);
+        assert_eq!(snapshot.buffer_length, 12);
+        assert!(snapshot.bytes.is_err());
     }
 
     #[test]

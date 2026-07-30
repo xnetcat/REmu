@@ -35,16 +35,16 @@ use super::{
     diagnostic_texture_depth_plane_summaries, diagnostic_texture_writer,
     diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
     diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
-    diagnostic_trace_target_stride, diagnostic_use_draw_merged_wave_counts,
-    diagnostic_video_chain_selected_draw, dump_compute_shader_msl, dump_msl_compute_filter_matches,
-    dump_shader_pair_msl, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison, guest_frame_fingerprint,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage, half_float_to_f32,
-    image_resource_descriptor_is_null, initial_depth_clear_for_target,
-    initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
-    metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, prepare_indexed_primitive, read_draw_indices,
-    read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
+    diagnostic_trace_target_stride, diagnostic_uploaded_global_binding_head,
+    diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
+    dump_compute_shader_msl, dump_msl_compute_filter_matches, dump_shader_pair_msl,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
+    guest_frame_fingerprint, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_storage, half_float_to_f32, image_resource_descriptor_is_null,
+    initial_depth_clear_for_target, initial_render_target_clear_color, is_storage_image_opcode,
+    is_writable_image_opcode, metal_nonindexed_vertex_count, metal_primitive_type,
+    metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, prepare_indexed_primitive,
+    read_draw_indices, read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
     render_target_cmask_address, render_target_fast_clear_color,
@@ -2269,7 +2269,7 @@ impl MetalPresenter {
                         ))
                     });
                 eprintln!(
-                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_summaries:x?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals={:x?} pixel_globals={:x?}",
+                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_summaries:x?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals_evaluated={:x?} pixel_globals_evaluated={:x?} vertex_globals_submitted={:x?} pixel_globals_submitted={:x?}",
                     draw.sequence,
                     draw.export_shader_address,
                     draw.pixel_shader_address,
@@ -2311,6 +2311,30 @@ impl MetalPresenter {
                             binding.base_address,
                             binding.byte_count,
                             diagnostic_global_binding_head(binding),
+                        ))
+                        .collect::<Vec<_>>(),
+                    export_evaluation
+                        .global_memory_bindings
+                        .iter()
+                        .zip(&export_buffers)
+                        .map(|(binding, uploaded)| (
+                            binding.scalar_address,
+                            binding.base_address,
+                            binding.byte_count,
+                            binding.writable,
+                            diagnostic_uploaded_global_binding_head(binding, uploaded),
+                        ))
+                        .collect::<Vec<_>>(),
+                    pixel_evaluation
+                        .global_memory_bindings
+                        .iter()
+                        .zip(&pixel_buffers)
+                        .map(|(binding, uploaded)| (
+                            binding.scalar_address,
+                            binding.base_address,
+                            binding.byte_count,
+                            binding.writable,
+                            diagnostic_uploaded_global_binding_head(binding, uploaded),
                         ))
                         .collect::<Vec<_>>(),
                 );
