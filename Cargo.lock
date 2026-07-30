@@ -1524,6 +1524,7 @@ name = "remu-runtime"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "iced-x86",
  "libc",
  "png",
  "remu-core",
