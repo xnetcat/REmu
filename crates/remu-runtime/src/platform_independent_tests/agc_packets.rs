@@ -551,7 +551,7 @@ fn emits_ordered_standard_and_agc_write_data_operations() {
 }
 
 #[test]
-fn decodes_partial_flush_events_without_inventing_completion_notifications() {
+fn decodes_event_writes_without_inventing_completion_notifications() {
     for (event_type, wait_for) in [
         (0x07, remu_gpu::GpuPipelineStage::ComputeShader),
         (0x0f, remu_gpu::GpuPipelineStage::VertexShader),
@@ -643,24 +643,51 @@ fn decodes_partial_flush_events_without_inventing_completion_notifications() {
     assert_eq!(
         crate::decode_agc_event_write(pixel_pipe_stat_dump.as_ptr().addr() as u64, 4)
             .expect("addressed pixel-pipe statistic dump"),
-        None
+        Some(crate::AgcEventWrite::PixelPipeStatDump {
+            destination: query_address,
+        })
     );
-    crate::agc_handle_submission_packet(
-        crate::AgcSubmissionPacket {
-            address: pixel_pipe_stat_dump.as_ptr().addr() as u64,
-            length: 4,
-            opcode: crate::AGC_IT_EVENT_WRITE,
-            register: 0,
-            predicated: false,
-        },
-        &mut graphics,
-        &mut AgcShaderRegistry::default(),
-        &VideoOutState::default(),
-        &mut Vec::new(),
-        &mut notifications,
-        None,
-    )
-    .expect("pixel-pipe statistic dump");
+    let mut shaders = AgcShaderRegistry::default();
+    let mut flips = Vec::new();
+    let (result, query_events) = crate::capture_agc_gpu_events(|| {
+        for _ in 0..2 {
+            crate::agc_handle_submission_packet(
+                crate::AgcSubmissionPacket {
+                    address: pixel_pipe_stat_dump.as_ptr().addr() as u64,
+                    length: 4,
+                    opcode: crate::AGC_IT_EVENT_WRITE,
+                    register: 0,
+                    predicated: false,
+                },
+                &mut graphics,
+                &mut shaders,
+                &VideoOutState::default(),
+                &mut flips,
+                &mut notifications,
+                None,
+            )?;
+        }
+        Ok::<(), crate::AgcSubmissionError>(())
+    });
+    result.expect("pixel-pipe statistic dumps");
+    assert_eq!(
+        query_results, [0; 16],
+        "query results must retire with preceding GPU work instead of changing during decoding"
+    );
+    assert_eq!(query_events.len(), 16);
+    for (event_index, event) in query_events.into_iter().enumerate() {
+        let dump_index = event_index / 8;
+        let pair_index = event_index % 8;
+        let expected_count = if dump_index == 0 { 0 } else { 0x02ff_ffff };
+        assert_eq!(
+            event,
+            remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease {
+                address: query_address
+                    + u64::try_from(pair_index).expect("counter pair index") * 16,
+                value: remu_gpu::GpuMemoryReleaseValue::Immediate64((1_u64 << 63) | expected_count,),
+            })
+        );
+    }
     assert!(
         notifications.is_empty(),
         "occlusion query dumps are not kernel completion interrupts"

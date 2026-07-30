@@ -8,10 +8,16 @@ use crate::{
     trace_guest_sync,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgcEventWrite {
+    PipelineBarrier(remu_gpu::GpuPipelineBarrier),
+    PixelPipeStatDump { destination: u64 },
+}
+
 pub(crate) fn decode_agc_event_write(
     packet_address: u64,
     length: u32,
-) -> Result<Option<remu_gpu::GpuPipelineBarrier>, AgcSubmissionError> {
+) -> Result<Option<AgcEventWrite>, AgcSubmissionError> {
     if length < 2 {
         return Err(AgcSubmissionError::EventWritePacketLength { actual: length });
     }
@@ -19,15 +25,16 @@ pub(crate) fn decode_agc_event_write(
     let event_type = control & 0x3f;
     let event_index = (control >> 8) & 0xf;
     if matches!(event_type, 0x07 | 0x0f | 0x10) {
-        return decode_agc_pipeline_barrier(packet_address, length).map(Some);
+        return decode_agc_pipeline_barrier(packet_address, length)
+            .map(AgcEventWrite::PipelineBarrier)
+            .map(Some);
     }
     // EVENT_TYPE=0x39 is PIXEL_PIPE_STAT_DUMP. AMD assigns it EVENT_INDEX=1 (the
     // ZPASS_DONE/PIXEL_PIPE_STAT group), and the two remaining packet dwords name the qword-aligned
     // occlusion-counter destination. The attached RDNA2 ISA manual covers shader instructions,
     // not PM4, but AMD's packet documentation and Linux's GFX10 `nvd.h` agree on this four-dword
-    // form. KytyPS5 deliberately accepts this event without synthesizing counters; do the same
-    // until Metal visibility-result buffers are wired into guest query memory. Rejecting it is
-    // worse than the documented no-result fallback because Unreal treats a refused DCB as fatal.
+    // form. The command processor must publish a validity bit for every render-backend counter:
+    // Unreal's blocking render-query path yields until those bits appear.
     if event_type == 0x39 {
         if event_index != 1 || length != 4 || control & !0x0000_0f3f != 0 {
             return Err(AgcSubmissionError::UnsupportedEventWrite {
@@ -37,10 +44,14 @@ pub(crate) fn decode_agc_event_write(
             });
         }
         let destination = read_guest_u64(packet_address + 8);
-        if destination == 0 || !destination.is_multiple_of(8) {
+        let result_block_bytes = super::PIXEL_PIPE_STAT_COUNTER_PAIRS * 16;
+        if destination == 0
+            || !destination.is_multiple_of(8)
+            || destination.checked_add(result_block_bytes - 1).is_none()
+        {
             return Err(AgcSubmissionError::InvalidPixelPipeStatAddress(destination));
         }
-        return Ok(None);
+        return Ok(Some(AgcEventWrite::PixelPipeStatDump { destination }));
     }
     // Non-addressed Gen5 events use only EVENT_TYPE. EVENT_INDEX is reserved for the three
     // partial-flush forms above and the addressed pixel-pipe dump handled above; these packets
