@@ -2157,6 +2157,13 @@ fn trace_import_errors() -> bool {
     })
 }
 
+fn trace_dispatch_stalls() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_DISPATCH_STALLS").is_some_and(|value| value == "1")
+    })
+}
+
 /// Reports an import that returned a console error code or a negative status.
 fn report_failed_import(frame: *const ImportCallFrame) -> ProbeImportReturn {
     // SAFETY: the caller supplies one aligned, fully initialized frame that stays live for the
@@ -2611,8 +2618,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-    let trace_lock_stall =
-        std::env::var_os("REMU_TRACE_DISPATCH_STALLS").is_some_and(|value| value == "1");
+    let trace_lock_stall = trace_dispatch_stalls();
     let lock_started = trace_lock_stall.then(Instant::now);
     let mut state = state
         .write()
@@ -3808,6 +3814,10 @@ fn dispatch_probe_import(
     stack_arguments: [u64; 6],
     state: &mut ProbeDispatchState,
 ) -> u64 {
+    // Unit tests call the stateful dispatcher directly to exercise individual handlers. The live
+    // import path already exhausted this table before acquiring `PROBE_DISPATCH`; repeating its
+    // full guaranteed-miss scan here lengthens every stateful critical section.
+    #[cfg(test)]
     if let Some(result) = dispatch_stateless_import(nid, arguments, stack_arguments) {
         return result;
     }
