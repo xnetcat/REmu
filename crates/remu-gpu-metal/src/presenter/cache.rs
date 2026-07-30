@@ -55,16 +55,22 @@ impl MetalPresenter {
         };
         let source = self.queued_global_read_source(&binding)?;
         static INDIRECT_UPLOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static TRACE_ALL_INDIRECT_UPLOADS: OnceLock<bool> = OnceLock::new();
         let sequence = INDIRECT_UPLOAD_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if sequence <= 16 || sequence.is_power_of_two() {
-            let source_name = match &source {
-                QueuedGlobalReadSource::None => "guest",
-                QueuedGlobalReadSource::Buffer { .. } => "gpu-writeback",
-                QueuedGlobalReadSource::GuestMemory => "ordered-guest",
-                QueuedGlobalReadSource::Synchronize => "synchronize",
+        let trace_all = *TRACE_ALL_INDIRECT_UPLOADS
+            .get_or_init(|| std::env::var_os("REMU_TRACE_INDIRECT_BUFFERS").is_some());
+        if trace_all || sequence <= 16 || sequence.is_power_of_two() {
+            let source_detail = match &source {
+                QueuedGlobalReadSource::None => "guest".to_owned(),
+                QueuedGlobalReadSource::Buffer { buffer, offset } => format!(
+                    "gpu-writeback(buffer={:p},offset={offset:#x})",
+                    buffer.as_ptr()
+                ),
+                QueuedGlobalReadSource::GuestMemory => "ordered-guest".to_owned(),
+                QueuedGlobalReadSource::Synchronize => "synchronize".to_owned(),
             };
             eprintln!(
-                "[REMu][METAL][INDIRECT-BUFFER] sequence={sequence} address={address:#x} bytes={byte_count} source={source_name}"
+                "[REMu][METAL][INDIRECT-BUFFER] sequence={sequence} address={address:#x} bytes={byte_count} source={source_detail}"
             );
         }
         if matches!(source, QueuedGlobalReadSource::Synchronize) {
