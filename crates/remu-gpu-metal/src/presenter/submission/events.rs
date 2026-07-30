@@ -111,6 +111,19 @@ impl OrderedGpuEventReceiver {
         has_memory_wait && !self.has_runnable_events()
     }
 
+    /// Pulls bounded channel chunks while the current block graph can still identify them as
+    /// possible cross-queue dependencies.
+    ///
+    /// Periodic wait polling temporarily makes each suspended queue runnable so its label can be
+    /// tested again. Dependency ingress must happen before that reset: otherwise the ordinary
+    /// pending-event cap sees the requeued wait as runnable, leaves the channel full, and can
+    /// indefinitely withhold a producer from another queue.
+    fn ingest_guest_memory_wait_dependencies(&mut self) {
+        if self.needs_dependency_ingress() {
+            self.ingest(GPU_EVENTS_PER_TICK);
+        }
+    }
+
     pub(crate) fn try_recv(
         &mut self,
         pipeline_resolved: impl Fn(&GraphicsPipelineKey) -> bool,
@@ -266,6 +279,7 @@ impl OrderedGpuEventReceiver {
     }
 
     pub(crate) fn retry_guest_memory_waits(&mut self) {
+        self.ingest_guest_memory_wait_dependencies();
         self.blocked_queues
             .retain(|_, reason| !matches!(reason, QueueBlockReason::GuestMemoryWait(_)));
         if matches!(self.host_block, Some(QueueBlockReason::GuestMemoryWait(_))) {
