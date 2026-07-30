@@ -10,7 +10,7 @@ use super::{
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor,
-    GuestTextureOverlapQuery, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_THREADS,
+    GuestTextureOverlapQuery, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX,
     NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0,
     PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, ResidentTextureActivityStamp,
     append_unique_global_writebacks, append_unique_guest_write_ranges, canonical_texture_bindings,
@@ -863,11 +863,14 @@ impl MetalPresenter {
         } else {
             None
         };
-        let ngg_meshlets = ngg_indices
-            .as_ref()
-            .map(|indices| self.cached_ngg_meshlets(&device, indices.as_ref()))
-            .transpose()?
-            .flatten();
+        let ngg_meshlets = if let Some(indices) = ngg_indices.as_ref() {
+            let limits = key
+                .ngg_subgroup_limits
+                .ok_or("NGG mesh draw is missing subgroup sizing registers")?;
+            self.cached_ngg_meshlets(&device, indices.as_ref(), limits)?
+        } else {
+            None
+        };
         let scissor = decode_scissor(draw, render_width, render_height)?;
         let diagnostic_force_triangle = diagnostic_disable_combined_raster
             && diagnostic_complex_msaa_raster
@@ -1486,7 +1489,15 @@ impl MetalPresenter {
                     encoder.draw_mesh_threadgroups(
                         MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
                         MTLSize::new(1, 1, 1),
-                        MTLSize::new(NGG_MESH_THREADS, 1, 1),
+                        MTLSize::new(
+                            u64::from(
+                                key.ngg_subgroup_limits
+                                    .expect("NGG subgroup limits were validated before encoding")
+                                    .threadgroup_threads,
+                            ),
+                            1,
+                            1,
+                        ),
                     );
                 }
             } else if diagnostic_force_triangle {

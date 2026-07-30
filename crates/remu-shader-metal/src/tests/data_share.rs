@@ -196,7 +196,7 @@ fn lowers_linked_trace_geometry_handoff_as_one_ngg_mesh_function() {
     let shader = compile_msl(
         &program,
         &empty_evaluation(),
-        &MetalCompileOptions::mesh(2, 16 * 1024),
+        &MetalCompileOptions::mesh(2, 16 * 1024, 96, 96, 96),
     )
     .expect("linked NGG mesh lowering");
 
@@ -295,7 +295,7 @@ fn generated_linked_trace_ngg_msl_compiles_with_apple_metal() {
     let shader = compile_msl(
         &linked_trace_ngg_program(),
         &empty_evaluation(),
-        &MetalCompileOptions::mesh(2, 16 * 1024),
+        &MetalCompileOptions::mesh(2, 16 * 1024, 96, 96, 96),
     )
     .expect("linked NGG mesh lowering");
     let directory =
@@ -409,7 +409,7 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     let shader = compile_msl(
         &program,
         &empty_evaluation(),
-        &MetalCompileOptions::mesh(2, 16 * 1024),
+        &MetalCompileOptions::mesh(2, 16 * 1024, 96, 96, 96),
     )
     .expect("NGG mesh lowering");
 
@@ -418,7 +418,7 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     assert!(
         shader
             .source
-            .contains("mesh<RemuVsOut, void, 64, 64, topology::triangle>")
+            .contains("mesh<RemuVsOut, void, 96, 96, topology::triangle>")
     );
     assert!(
         shader
@@ -435,12 +435,12 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     assert!(
         shader
             .source
-            .contains("remu_mesh.set_primitive_count(remu_mesh_primitive_count)")
+            .contains("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
     );
     assert!(
         shader
             .source
-            .contains("if (remu_thread_index < remu_mesh_vertex_count) remu_mesh.set_vertex")
+            .contains("if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex")
     );
     assert!(
         shader.source.contains("remu_v_8 = remu_group_id.y"),
@@ -470,6 +470,199 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
         );
         std::fs::remove_dir_all(directory).expect("remove mesh Metal test directory");
     }
+}
+
+#[test]
+fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocation() {
+    const CAPTURED_GS_RSRC2: u32 = 0x00fb_0018;
+    const CAPTURED_LDS_BYTES: u32 = ((CAPTURED_GS_RSRC2 >> 19) & 0xff) * 128 * 4;
+    assert_eq!(CAPTURED_LDS_BYTES, 15_872);
+    assert!(CAPTURED_LDS_BYTES <= 16 * 1024);
+
+    let export = |pc, target, sources| Instruction {
+        pc,
+        encoding: ShaderEncoding::Exp,
+        opcode: Opcode::Known("Exp"),
+        words: vec![0, 0],
+        sources,
+        destinations: Vec::new(),
+        control: Some(InstructionControl::Export(ExportControl {
+            target,
+            enable_mask: if target == 20 { 1 } else { 15 },
+            compressed: false,
+            done: true,
+            valid_mask: false,
+        })),
+    };
+    let front = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Ds,
+                opcode: Opcode::Known("DsWriteB32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(0), Operand::vector(1)],
+                destinations: Vec::new(),
+                control: Some(InstructionControl::DataShare(DataShareControl {
+                    offset0: 0,
+                    offset1: 0,
+                    gds: false,
+                })),
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SSetpcB64"),
+                words: vec![0xbe80_2006],
+                sources: vec![Operand::scalar(6)],
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let continuation = Program::new(
+        0x4000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SLshlB32"),
+                words: vec![0],
+                sources: vec![
+                    Operand::scalar(107),
+                    Operand {
+                        kind: remu_shader::OperandKind::EncodedConstant,
+                        value: 140,
+                    },
+                ],
+                destinations: vec![Operand::scalar(124)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SOrB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(0), Operand::scalar(124)],
+                destinations: vec![Operand::scalar(124)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: vec![0xbf90_0009],
+                sources: vec![Operand {
+                    kind: remu_shader::OperandKind::EncodedConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            export(
+                12,
+                20,
+                vec![
+                    Operand::vector(2),
+                    Operand::vector(2),
+                    Operand::vector(2),
+                    Operand::vector(2),
+                ],
+            ),
+            export(
+                20,
+                12,
+                vec![
+                    Operand::vector(3),
+                    Operand::vector(4),
+                    Operand::vector(5),
+                    Operand::vector(6),
+                ],
+            ),
+            export(
+                28,
+                32,
+                vec![
+                    Operand::vector(7),
+                    Operand::vector(8),
+                    Operand::vector(9),
+                    Operand::vector(10),
+                ],
+            ),
+            Instruction {
+                pc: 36,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let linked = remu_shader::link_tail_call_programs(&front, &continuation)
+        .expect("exact fused front/back pair");
+
+    let shader = compile_msl(
+        &linked,
+        &empty_evaluation(),
+        &MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96),
+    )
+    .expect("linked NGG program should lower as one mesh function");
+
+    assert_eq!(shader.stage, MetalShaderStage::Mesh);
+    assert!(shader.register_footprint.direct_control_flow);
+    assert!(
+        shader
+            .source
+            .contains("threadgroup atomic_uint remu_lds_storage[4096]")
+    );
+    assert!(shader.source.contains("remu_mesh.set_index("));
+    assert!(
+        shader
+            .source
+            .contains("atomic_store_explicit(&remu_mesh_output_vertex_count")
+    );
+    assert!(
+        shader
+            .source
+            .contains("atomic_store_explicit(&remu_mesh_output_primitive_count")
+    );
+    assert!(shader.source.contains("remu_s_124 & 0x7ffu"));
+    assert!(shader.source.contains("(remu_s_124 >> 12u) & 0x7ffu"));
+    assert!(
+        shader
+            .source
+            .contains("remu_mesh.set_index(remu_thread_index * 3u")
+    );
+    assert!(!shader.source.contains("remu_mesh.set_index(remu_wave_lane * 3u"));
+    assert!(
+        shader
+            .source
+            .contains("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
+    );
+    let allocation = shader
+        .source
+        .find("atomic_store_explicit(&remu_mesh_output_vertex_count")
+        .expect("GS_ALLOC_REQ allocation store");
+    let publication = shader
+        .source
+        .rfind("threadgroup_barrier(mem_flags::mem_threadgroup)")
+        .expect("converged output-count publication barrier");
+    let output_count = shader
+        .source
+        .find("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
+        .expect("dynamic Metal primitive count");
+    assert!(allocation < publication && publication < output_count);
+    assert!(
+        shader
+            .source
+            .contains("mesh<RemuVsOut, void, 96, 96, topology::triangle>")
+    );
+    assert!(shader.source.contains("remu_out.position = float4("));
+    assert!(shader.source.contains("remu_out.param0 = float4("));
+    assert!(!shader.source.contains("active = false;"));
 }
 
 #[test]

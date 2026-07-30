@@ -67,6 +67,7 @@ use self::decode::{
     decode_fast_clear_color,
     decode_render_targets_from_registers, decode_scanout_target, graphics_shader_resource_key,
     initial_depth_clear_value, metal_primitive_topology_class, pixel_input_controls,
+    decode_ngg_subgroup_limits,
     raw_video_out_layout_is_linear,
 };
 #[cfg(test)]
@@ -266,7 +267,33 @@ const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
 const NGG_MESHLET_BUFFER_INDEX: u64 = 29;
 const NGG_MESH_DRAW_BUFFER_INDEX: u64 = 30;
 const NGG_MESH_LDS_BYTES: u32 = 16 * 1024;
-const NGG_MESH_THREADS: u64 = 64;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NggOutputPrimitiveType {
+    PointList,
+    LineStrip,
+    TriangleStrip,
+    RectangleList,
+}
+
+/// Guest-programmed GFX10 NGG subgroup geometry limits.
+///
+/// A Metal mesh threadgroup still executes one guest wave64. These values describe how many
+/// lanes of that wave carry input geometry and how much output storage the guest subgroup may
+/// address; they are deliberately independent from the host threadgroup width.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct NggSubgroupLimits {
+    es_vertices_per_subgroup: u32,
+    gs_primitives_per_subgroup: u32,
+    gs_instance_primitives_per_subgroup: u32,
+    gs_instance_count: u32,
+    gs_max_vertices_out: u32,
+    max_output_vertices_per_subgroup: u32,
+    primitive_amplification_factor: u32,
+    max_output_primitives_per_subgroup: u32,
+    output_primitive_type: Option<NggOutputPrimitiveType>,
+    threadgroup_threads: u32,
+}
 
 fn sampled_texture_cache_byte_capacity() -> Option<u64> {
     static CAPACITY: OnceLock<Option<u64>> = OnceLock::new();
@@ -504,6 +531,10 @@ struct GraphicsPipelineKey {
     pixel_allocated_vector_register_count: u32,
     vertex_output_control: u32,
     pixel_input_controls: [u32; 32],
+    /// Live NGG subgroup sizing registers. Non-NGG pipelines leave this absent; NGG compilation
+    /// and meshlet preparation require it rather than assuming that execution wave width is also
+    /// the guest input/output geometry capacity.
+    ngg_subgroup_limits: Option<NggSubgroupLimits>,
     /// `DB_SHADER_CONTROL.Z_EXPORT_ENABLE`, gated by an active depth attachment.
     pixel_depth_export: bool,
     targets: Vec<RenderTargetPipelineState>,
@@ -1613,7 +1644,7 @@ struct MetalPresenter {
     guest_global_buffer_cache_bytes: u64,
     global_buffer_cache_bytes: usize,
     index_buffer_cache: HashMap<Vec<u32>, Buffer>,
-    ngg_meshlet_cache: HashMap<Vec<u32>, CachedNggMeshlets>,
+    ngg_meshlet_cache: HashMap<(NggSubgroupLimits, Vec<u32>), CachedNggMeshlets>,
     diagnostic_vertex_position_buffer: Option<Buffer>,
     diagnostic_pixel_output_buffer: Option<Buffer>,
     resident_content_version: u64,

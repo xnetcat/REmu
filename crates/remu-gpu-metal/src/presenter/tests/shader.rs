@@ -14,9 +14,10 @@ use remu_shader::{
 use std::sync::Arc;
 
 use super::{
-    CompiledComputePipeline, ComputePipelineKey, MetalPresenter, ProgramIdentity,
-    OrderedEventPoll, OrderedGpuEventReceiver, QueueBlockReason, ShaderCompileRequest,
-    ShaderCompileResult, canonical_sampler_bindings, canonical_texture_bindings,
+    CompiledComputePipeline, ComputePipelineKey, MetalPresenter, NggOutputPrimitiveType,
+    NggSubgroupLimits, OrderedEventPoll, OrderedGpuEventReceiver, ProgramIdentity,
+    QueueBlockReason, ShaderCompileRequest, ShaderCompileResult, canonical_sampler_bindings,
+    canonical_texture_bindings,
     compile_shader_request_catching_panics, compute_launch, export_resource_render_stage,
     fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
     image_component_class, missing_vertex_parameter_exports, ngg_mesh_draw_supported,
@@ -477,7 +478,21 @@ fn empty_ngg_geometry_is_a_legal_uncached_no_op() {
 
     assert!(
         presenter
-            .cached_ngg_meshlets(&device, &[])
+            .cached_ngg_meshlets(
+                &device,
+                &[],
+                NggSubgroupLimits::new(
+                    24,
+                    4,
+                    4,
+                    24,
+                    96,
+                    24,
+                    Some(NggOutputPrimitiveType::TriangleStrip),
+                    Some(1),
+                )
+                .expect("captured Silent Hill NGG limits"),
+            )
             .expect("empty geometry is legal")
             .is_none()
     );

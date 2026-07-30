@@ -259,7 +259,8 @@ impl Compiler<'_> {
                     "void"
                 };
                 parameters.push(format!(
-                    "mesh<RemuVsOut, {primitive_type}, 64, 64, topology::triangle> remu_mesh"
+                    "mesh<RemuVsOut, {primitive_type}, {}, {}, topology::triangle> remu_mesh",
+                    self.options.mesh_max_vertex_count, self.options.mesh_max_primitive_count
                 ));
                 parameters.push("const device uint* remu_meshlets [[buffer(29)]]".to_owned());
                 parameters.push("constant uint* remu_draw [[buffer(30)]]".to_owned());
@@ -313,7 +314,22 @@ impl Compiler<'_> {
         if self.options.stage == MetalShaderStage::Mesh
             && self.options.render_target_array_length > 1
         {
-            source.push_str("    threadgroup uint remu_mesh_render_target_indices[64];\n");
+            let _ = writeln!(
+                source,
+                "    threadgroup uint remu_mesh_render_target_indices[{}];",
+                self.options.mesh_max_vertex_count
+            );
+            let _ = writeln!(
+                source,
+                "    threadgroup uint remu_mesh_primitive_source_vertices[{}];",
+                self.options.mesh_max_primitive_count
+            );
+        }
+        if self.options.stage == MetalShaderStage::Mesh {
+            source.push_str(
+                "    threadgroup atomic_uint remu_mesh_output_vertex_count;\n\
+                 \x20   threadgroup atomic_uint remu_mesh_output_primitive_count;\n",
+            );
         }
         if self.split_wave64() {
             source.push_str(
@@ -450,15 +466,19 @@ impl Compiler<'_> {
                 source.push_str(
                     "    RemuVsOut remu_out = {};\n\
                      \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 1.0f);\n\
-                     \x20   uint remu_meshlet_base = remu_group_id.x * 130u;\n\
+                     \x20   uint remu_meshlet_base = remu_group_id.x * 514u;\n\
                      \x20   uint remu_mesh_counts = remu_meshlets[remu_meshlet_base + 0u];\n\
                      \x20   uint remu_mesh_primitive_base = remu_meshlets[remu_meshlet_base + 1u];\n\
-                     \x20   uint remu_mesh_vertex_count = remu_mesh_counts & 0xffu;\n\
-                     \x20   uint remu_mesh_primitive_count = (remu_mesh_counts >> 8u) & 0xffu;\n\
-                     \x20   uint remu_mesh_primitive = remu_meshlets[remu_meshlet_base + 66u + remu_thread_index];\n\
-                     \x20   remu_mesh.set_index(remu_thread_index * 3u + 0u, 0u);\n\
-                     \x20   remu_mesh.set_index(remu_thread_index * 3u + 1u, 0u);\n\
-                     \x20   remu_mesh.set_index(remu_thread_index * 3u + 2u, 0u);\n",
+                     \x20   uint remu_mesh_input_vertex_count_encoded = remu_mesh_counts & 0xffu;\n\
+                     \x20   uint remu_mesh_input_primitive_count_encoded = (remu_mesh_counts >> 8u) & 0xffu;\n\
+                     \x20   uint remu_mesh_input_vertex_count = remu_mesh_input_vertex_count_encoded == 0u ? 256u : remu_mesh_input_vertex_count_encoded;\n\
+                     \x20   uint remu_mesh_input_primitive_count = remu_mesh_input_primitive_count_encoded == 0u ? 256u : remu_mesh_input_primitive_count_encoded;\n\
+                     \x20   uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_meshlets[remu_meshlet_base + 258u + remu_thread_index] : 0x80000000u;\n\
+                     \x20   if (remu_thread_index == 0u) {\n\
+                     \x20       atomic_store_explicit(&remu_mesh_output_vertex_count, 0u, memory_order_relaxed);\n\
+                     \x20       atomic_store_explicit(&remu_mesh_output_primitive_count, 0u, memory_order_relaxed);\n\
+                     \x20   }\n\
+                     \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n",
                 );
                 if self.options.render_target_array_length > 1 {
                     let _ = writeln!(
@@ -481,7 +501,7 @@ impl Compiler<'_> {
                 }
                 if contains_register_reference(&self.body, 'v', 5) {
                     source.push_str(
-                        "    v[5] = remu_thread_index < remu_mesh_vertex_count ? remu_meshlets[remu_meshlet_base + 2u + remu_thread_index] + remu_draw[2] : 0u;\n",
+                        "    v[5] = remu_thread_index < remu_mesh_input_vertex_count ? remu_meshlets[remu_meshlet_base + 2u + remu_thread_index] + remu_draw[2] : 0u;\n",
                     );
                 }
                 if contains_register_reference(&self.body, 'v', 8) {
@@ -649,20 +669,26 @@ impl Compiler<'_> {
             }
             MetalShaderStage::Compute => {}
             MetalShaderStage::Mesh => {
+                let _ = writeln!(
+                    source,
+                    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+                     \x20   uint remu_mesh_output_vertices = min(atomic_load_explicit(&remu_mesh_output_vertex_count, memory_order_relaxed), {}u);\n\
+                     \x20   uint remu_mesh_output_primitives = min(atomic_load_explicit(&remu_mesh_output_primitive_count, memory_order_relaxed), {}u);",
+                    self.options.mesh_max_vertex_count, self.options.mesh_max_primitive_count
+                );
                 if self.options.render_target_array_length > 1 {
                     source.push_str(
-                        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
-                         \x20   if (remu_thread_index < remu_mesh_primitive_count) {\n\
+                        "    if (remu_thread_index < remu_mesh_output_primitives) {\n\
                          \x20       RemuPrimitiveOut remu_primitive_out = {};\n\
-                         \x20       uint remu_primitive_source_vertex = remu_mesh_primitive & 0x1ffu;\n\
+                         \x20       uint remu_primitive_source_vertex = remu_mesh_primitive_source_vertices[remu_thread_index];\n\
                          \x20       remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];\n\
                          \x20       remu_mesh.set_primitive(remu_thread_index, remu_primitive_out);\n\
                          \x20   }\n",
                     );
                 }
                 source.push_str(
-                    "    if (remu_thread_index < remu_mesh_vertex_count) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
-                     \x20   if (remu_thread_index == 0u) remu_mesh.set_primitive_count(remu_mesh_primitive_count);\n",
+                    "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
+                     \x20   if (remu_thread_index == 0u) remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n",
                 );
             }
         }

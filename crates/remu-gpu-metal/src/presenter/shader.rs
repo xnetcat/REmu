@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use super::{
     CompiledComputePipeline, CompiledShaderPair, ComputePipelineKey, GraphicsPipelineKey,
-    MetalPresenter, NGG_MESH_LDS_BYTES, NGG_MESH_THREADS, PIPELINE_COMPILE_COMPLETED,
+    MetalPresenter, NGG_MESH_LDS_BYTES, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PersistentRenderPipelineArchive, PipelineCompileCandidate, ProgramIdentity,
     RenderPipelineArchiveState, ShaderCompileRequest, ShaderCompileResult, ShaderFunctionCache,
@@ -491,9 +491,26 @@ impl MetalPresenter {
         }
         let uses_mesh_stage = key.uses_mesh_stage;
         let mut vertex_options = if uses_mesh_stage {
+            let limits = key
+                .ngg_subgroup_limits
+                .ok_or("NGG mesh shader is missing subgroup sizing registers")?;
+            if limits.output_primitive_type.is_some_and(|primitive| {
+                primitive != NggOutputPrimitiveType::TriangleStrip
+            }) {
+                return Err(format!(
+                    "NGG output primitive {:?} cannot use Metal triangle mesh topology",
+                    limits.output_primitive_type
+                ));
+            }
+            // Triangle-strip GS output cannot produce more primitives than emitted vertices.
+            // Reserve the guest-programmed subgroup output capacity for both Metal arrays. The
+            // host thread count is derived separately from all input and output limits.
             remu_shader_metal::MetalCompileOptions::mesh(
                 pixel_msl.interpolated_attribute_count,
                 NGG_MESH_LDS_BYTES,
+                limits.max_output_vertices_per_subgroup,
+                limits.max_output_primitives_per_subgroup,
+                limits.threadgroup_threads,
             )
         } else {
             remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count)
@@ -652,8 +669,15 @@ impl MetalPresenter {
             descriptor.set_mesh_function(Some(&vertex_function));
             descriptor.set_fragment_function(Some(&pixel_function));
             descriptor.set_raster_sample_count(u64::from(key.sample_count));
-            descriptor.set_max_total_threads_per_mesh_threadgroup(NGG_MESH_THREADS);
-            descriptor.set_mesh_threadgroup_size_is_multiple_of_thread_execution_width(true);
+            let limits = key
+                .ngg_subgroup_limits
+                .expect("mesh pipeline subgroup limits were validated above");
+            descriptor.set_max_total_threads_per_mesh_threadgroup(u64::from(
+                limits.threadgroup_threads,
+            ));
+            descriptor.set_mesh_threadgroup_size_is_multiple_of_thread_execution_width(
+                limits.threadgroup_threads % 32 == 0,
+            );
             for (location, target) in key.targets.iter().enumerate() {
                 let attachment = descriptor
                     .color_attachments()
