@@ -699,7 +699,7 @@ fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
 }
 
 #[test]
-fn accepts_zero_extent_indirect_compute_without_emitting_gpu_work() {
+fn preserves_zero_snapshot_indirect_compute_for_ordered_gpu_resolution() {
     let program = AlignedComputeProgram([0; 4]);
     let program_address = program.0.as_ptr().addr() as u64;
     let (mut graphics, mut shaders) = compute_graphics_state(program_address);
@@ -727,10 +727,19 @@ fn accepts_zero_extent_indirect_compute_without_emitting_gpu_work() {
         )
     });
 
-    result.expect("zero-extent indirect dispatch is valid empty work");
+    result.expect("zero-snapshot indirect dispatch remains valid");
+    let [remu_gpu::GpuEvent::ComputeDispatch(dispatch)] = gpu_events.as_slice() else {
+        panic!("indirect dispatch must reach the backend for ordered argument resolution");
+    };
+    assert_eq!(
+        dispatch.source,
+        remu_gpu::ComputeDispatchSource::Indirect {
+            dimensions_address: dimensions.0.as_ptr().addr() as u64,
+        }
+    );
     assert!(
-        gpu_events.is_empty(),
-        "empty compute must not reach the backend"
+        dispatch.launch.is_empty(),
+        "packet-time snapshot stays diagnostic"
     );
     assert_eq!(graphics.emitted_compute_dispatches, 1);
 }
