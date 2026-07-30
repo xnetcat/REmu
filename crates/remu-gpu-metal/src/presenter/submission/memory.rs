@@ -17,7 +17,7 @@ use remu_gpu::{
 };
 use remu_memory::{
     CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_mapping_identity,
-    write_guest_shared_backing_if_identity,
+    read_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -760,8 +760,16 @@ pub(crate) fn apply_pending_guest_memory_writes(
 ) -> Result<(), String> {
     for pending_write in pending {
         validate_guest_memory_operation(&pending_write.operation)?;
-        if let Some(identity) = pending_write.mapping_identity {
-            apply_guest_memory_operation_shared(&pending_write.operation, identity)?;
+        let pixel_pipe_trace = match pending_write.operation {
+            GuestMemoryWriteOperation::Release(release) => {
+                remu_gpu::take_pixel_pipe_stat_release_trace(release)
+            }
+            GuestMemoryWriteOperation::Write(_) | GuestMemoryWriteOperation::Fill { .. } => None,
+        };
+        let observed_before =
+            pixel_pipe_trace.and_then(|_| observe_pending_guest_memory_release(pending_write));
+        let result = if let Some(identity) = pending_write.mapping_identity {
+            apply_guest_memory_operation_shared(&pending_write.operation, identity)
         } else if let Some(write_watch) = pending_write.write_watch.as_ref() {
             write_watch
                 .with_live_mapping(|| {
@@ -772,13 +780,57 @@ pub(crate) fn apply_pending_guest_memory_writes(
                     format!(
                         "deferred guest memory mapping changed before completion address={address:#x} bytes={byte_count}: {error}"
                     )
-                })??;
+                })
+                .and_then(|result| result)
         } else {
             let (address, byte_count) = pending_write.range();
-            return Err(format!(
+            Err(format!(
                 "deferred guest memory write has no mapping lifetime guard address={address:#x} bytes={byte_count}"
-            ));
+            ))
+        };
+        if let Some(trace) = pixel_pipe_trace {
+            let GuestMemoryWriteOperation::Release(release) = pending_write.operation else {
+                unreachable!("only a release can carry pixel-pipe trace provenance");
+            };
+            let expected = match release.value {
+                GpuMemoryReleaseValue::Immediate64(value) => value,
+                GpuMemoryReleaseValue::Immediate32(_) | GpuMemoryReleaseValue::Timestamp => {
+                    unreachable!("pixel-pipe trace provenance names an immediate 64-bit release")
+                }
+            };
+            let observed_after = observe_pending_guest_memory_release(pending_write);
+            eprintln!(
+                "[REMu][AGC][PIXEL-PIPE][PUBLISH] sequence={} pair={} address={:#x} expected={expected:#018x} observed_before={observed_before:#018x?} observed_after={observed_after:#018x?} success={} error={:?}",
+                trace.dump_sequence,
+                trace.pair_index,
+                release.address,
+                result.is_ok(),
+                result.as_ref().err(),
+            );
         }
+        result?;
     }
     Ok(())
+}
+
+fn observe_pending_guest_memory_release(pending: &PendingGuestMemoryWrite) -> Option<u64> {
+    let GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+        address,
+        value: GpuMemoryReleaseValue::Immediate64(_),
+    }) = pending.operation
+    else {
+        return None;
+    };
+    if pending.mapping_identity.is_some() {
+        let mut bytes = [0_u8; 8];
+        return read_guest_shared_backing(address, &mut bytes).then(|| u64::from_le_bytes(bytes));
+    }
+    let write_watch = pending.write_watch.as_ref()?;
+    write_watch
+        .with_live_mapping(|| {
+            // SAFETY: the write watch pins this aligned eight-byte guest range against replacement
+            // for the complete diagnostic read.
+            unsafe { std::ptr::read_volatile(address as *const u64) }
+        })
+        .ok()
 }
