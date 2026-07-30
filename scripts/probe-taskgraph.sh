@@ -359,6 +359,7 @@ if [ "$attach_mode" -eq 1 ]; then
                 REMU_TASKGRAPH_TRACE_TARGET_PARENT="$target_parent" \
                 REMU_DISABLE_CPU_WRITE_WATCH="$disable_cpu_write_watch" \
                 arch -x86_64 /usr/bin/lldb --no-lldbinit -b \
+                -o 'settings set interpreter.stop-command-source-on-error false' \
                 -o "command script import '$trace_script'" \
                 -o "process attach --pid $attach_pid" \
                 -o 'process handle SIGALRM -n false -p true -s false' \
@@ -367,9 +368,7 @@ if [ "$attach_mode" -eq 1 ]; then
                 -o 'remu-taskgraph-trace-start' \
                 -o 'process continue' \
                 -o 'remu-taskgraph-resume-diagnostic-stops' \
-                -o 'thread backtrace all -c 24' \
-                -o 'register read' \
-                -o 'remu-taskgraph-trace-detach' \
+                -o 'remu-taskgraph-trace-finish' \
                 -o 'quit'
     ) > "$run_dir/debugger.log" 2>&1
 else
