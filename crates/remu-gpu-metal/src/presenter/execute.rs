@@ -37,7 +37,7 @@ use super::{
     diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
     diagnostic_trace_target_stride, diagnostic_uploaded_global_binding_head,
     diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
-    dump_shader_pair_msl, evaluation_samples_large_linear_video,
+    dump_msl_compute_filter_matches, dump_shader_pair_msl, evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, guest_frame_fingerprint,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage, half_float_to_f32,
     image_resource_descriptor_is_null, initial_depth_clear_for_target,
