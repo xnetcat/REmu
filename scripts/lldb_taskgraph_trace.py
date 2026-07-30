@@ -11,7 +11,10 @@ completion.
 
 Load this file from LLDB, then run ``remu-taskgraph-trace-start`` before
 launching REmu.  ``scripts/probe-taskgraph.sh`` provides the complete bounded
-invocation.  Set ``REMU_TASKGRAPH_TRACE_PREPARE_ONLY=1`` to keep one persistent
+invocation.  Its ``--attach PID`` mode instead starts the command after LLDB
+has stopped one explicitly validated, already-running REmu process; guest
+mapping is verified before any hardware breakpoint is armed.  Set
+``REMU_TASKGRAPH_TRACE_PREPARE_ONLY=1`` to keep one persistent
 hardware breakpoint at the prerequisite-release site and avoid dynamic
 breakpoint rotation while logging every fence.  Set
 ``REMU_TASKGRAPH_TRACE_TARGET_FOLLOW=1`` to log only the configured BeginFence
@@ -48,8 +51,12 @@ MAXIMUM_GUEST_EXECUTION_ADDRESS = 0x100_0000_0000
 DEFAULT_TARGET_FENCE_CALLER = 0x801BE0507
 DEFAULT_TARGET_FENCE_PARENT = 0x80101AF94
 TASKGRAPH_SINGLETON_POINTER = 0x807BA35E0
+TASKGRAPH_NODE_SLAB_POINTERS = 0x807BA8C48 + 0x88
 TASK_QUEUE_WAITER_BITS = 26
 TASK_QUEUE_WAITER_MASK = (1 << TASK_QUEUE_WAITER_BITS) - 1
+TASK_QUEUE_NODE_PAGE_BITS = 14
+TASK_QUEUE_NODE_PAGE_MASK = (1 << TASK_QUEUE_NODE_PAGE_BITS) - 1
+TASK_QUEUE_NODE_STRIDE = 24
 
 PHASE_PUBLISH = "publish"
 PHASE_CONSUME = "consume"
@@ -249,6 +256,37 @@ def describe_queue_wait_state(value: Optional[int]) -> str:
     return (
         f"{value:#x}/waiters={value & TASK_QUEUE_WAITER_MASK:#x}"
         f"/generation={value >> TASK_QUEUE_WAITER_BITS:#x}"
+    )
+
+
+def describe_task_queue_node(
+    value: Optional[int],
+    read_u64: ReadU64,
+    target_task: int = 0,
+) -> str:
+    """Resolve a TaskGraph queue cursor through its page/slot node slab."""
+
+    if value is None:
+        return "unreadable"
+    node_id = value & TASK_QUEUE_WAITER_MASK
+    page = node_id >> TASK_QUEUE_NODE_PAGE_BITS
+    slot = node_id & TASK_QUEUE_NODE_PAGE_MASK
+    page_base = read_u64(TASKGRAPH_NODE_SLAB_POINTERS + page * 8)
+    task = (
+        read_u64(page_base + slot * TASK_QUEUE_NODE_STRIDE + 8)
+        if page_base not in (None, 0)
+        else None
+    )
+    page_base_text = (
+        f"{page_base:#x}" if page_base is not None else "unreadable"
+    )
+    task_text = f"{task:#x}" if task is not None else "unreadable"
+    is_target = (
+        target_task != 0 and task is not None and task == target_task
+    )
+    return (
+        f"{value}/id={node_id:#x}/page={page:#x}/slot={slot:#x}/"
+        f"base={page_base_text}/task={task_text}/target={is_target}"
     )
 
 
@@ -530,9 +568,9 @@ class TaskGraphTraceState:
         return (
             f"wait_state={describe_queue_wait_state(wait_state)} "
             f"lane1_head="
-            f"{lane_one_head if lane_one_head is not None else 'unreadable'} "
+            f"{describe_task_queue_node(lane_one_head, read_u64, self.task)} "
             f"lane1_tail="
-            f"{lane_one_tail if lane_one_tail is not None else 'unreadable'}"
+            f"{describe_task_queue_node(lane_one_tail, read_u64, self.task)}"
         )
 
     def _observe_queue_handoff(
@@ -1251,6 +1289,53 @@ def install_taskgraph_trace(frame, breakpoint_location, _internal_dict):
     return False
 
 
+def _direct_attach_error(target) -> Optional[str]:
+    """Validate that a stopped attached process already has guest code mapped."""
+
+    process = target.GetProcess()
+    if not process.IsValid():
+        return "no valid process is attached"
+    if process.GetState() != lldb.eStateStopped:
+        return "attached process must be stopped before arming guest breakpoints"
+    error = lldb.SBError()
+    contents = process.ReadMemory(PREPARE_ADDRESS, 1, error)
+    if error.Fail() or len(contents) != 1:
+        return (
+            "attached process has not mapped the TaskGraph guest code at "
+            f"{PREPARE_ADDRESS:#x}"
+        )
+    return None
+
+
+def _arm_direct_attach(target, result) -> None:
+    """Arm guest hardware breakpoints in a validated late-attach target."""
+
+    global SESSION
+    if SESSION is not None:
+        result.SetError("TaskGraph trace is already active")
+        return
+    error = _direct_attach_error(target)
+    if error is not None:
+        result.SetError(error)
+        return
+    SESSION = LldbTaskGraphTrace(target)
+    print(
+        "[REMu][LLDB][TASKGRAPH] attached guest mapping verified; "
+        f"pid={target.GetProcess().GetProcessID()} "
+        f"cycle_limit={SESSION.state.cycle_limit} "
+        f"hit_limit={SESSION.state.hit_limit} "
+        f"prepare_only={SESSION.state.prepare_only} "
+        f"target_follow={SESSION.state.target_follow} "
+        f"queue_handoff={SESSION.state.queue_handoff} "
+        f"target_caller={SESSION.state.target_caller:#x} "
+        f"target_parent={SESSION.state.target_parent:#x}",
+        flush=True,
+    )
+    if not SESSION.arm_phase():
+        SESSION = None
+        result.SetError("could not arm TaskGraph hardware breakpoints")
+
+
 def trace_breakpoint(frame, breakpoint_location, _internal_dict):
     """Shared callback for every guest hardware breakpoint."""
 
@@ -1260,7 +1345,7 @@ def trace_breakpoint(frame, breakpoint_location, _internal_dict):
 
 
 def start_taskgraph_trace(debugger, _command, result, _internal_dict):
-    """Install one host-code seed breakpoint; guest breakpoints are armed later."""
+    """Arm a late attach directly, or seed launch mode until guest mapping."""
 
     if os.environ.get("REMU_TASKGRAPH_TRACE_TARGET_FOLLOW") == "1":
         try:
@@ -1285,6 +1370,9 @@ def start_taskgraph_trace(debugger, _command, result, _internal_dict):
         )
         return
     target = debugger.GetSelectedTarget()
+    if os.environ.get("REMU_TASKGRAPH_TRACE_ATTACH") == "1":
+        _arm_direct_attach(target, result)
+        return
     seed = target.BreakpointCreateByRegex("remu_runtime::import_dispatch_entry")
     if not seed.IsValid() or seed.GetNumLocations() == 0:
         result.SetError(
@@ -1371,6 +1459,33 @@ def resume_loader_notifications(debugger, command, result, internal_dict):
     resume_diagnostic_stops(debugger, command, result, internal_dict)
 
 
+def detach_taskgraph_trace(debugger, _command, result, _internal_dict):
+    """Detach and resume only a still-live process attached by the diagnostic."""
+
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    if not process.IsValid():
+        result.AppendMessage(
+            "[REMu][LLDB][TASKGRAPH] detach skipped: no valid process"
+        )
+        return
+    if process.GetState() in (lldb.eStateExited, lldb.eStateDetached):
+        result.AppendMessage(
+            "[REMu][LLDB][TASKGRAPH] detach skipped: process already ended"
+        )
+        return
+    error = process.Detach(False)
+    if error.Fail():
+        result.SetError(
+            "could not detach TaskGraph diagnostic: "
+            f"{error.GetCString()}"
+        )
+        return
+    result.AppendMessage(
+        "[REMu][LLDB][TASKGRAPH] detached without terminating target"
+    )
+
+
 def __lldb_init_module(debugger, _internal_dict):
     if lldb is None:
         return
@@ -1383,4 +1498,9 @@ def __lldb_init_module(debugger, _internal_dict):
         "command script add "
         "-f lldb_taskgraph_trace.resume_diagnostic_stops "
         "remu-taskgraph-resume-diagnostic-stops"
+    )
+    debugger.HandleCommand(
+        "command script add "
+        "-f lldb_taskgraph_trace.detach_taskgraph_trace "
+        "remu-taskgraph-trace-detach"
     )
