@@ -151,9 +151,24 @@ fn rwlock_tracks_recursive_read_ownership_and_excludes_writers() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let address = 0x7fff_0000_0080;
+    let guest_thread = 0x1234_5678;
+    crate::set_current_guest_thread_handle(guest_thread);
     assert_eq!(crate::guest_rwlock_init(address), 0);
     assert_eq!(crate::guest_rwlock_lock(address, false, false), 0);
     assert_eq!(crate::guest_rwlock_lock(address, false, false), 0);
+    {
+        let state = crate::guest_sync()
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lock = state.rwlocks.get(&address).expect("initialized rwlock");
+        let reader = lock
+            .readers
+            .get(&std::thread::current().id())
+            .expect("current reader");
+        assert_eq!(reader.guest_thread, guest_thread);
+        assert_eq!(reader.recursion, 2);
+    }
     assert_eq!(
         crate::guest_rwlock_lock(address, true, true),
         u64::from(libc::EBUSY.cast_unsigned())
@@ -165,12 +180,21 @@ fn rwlock_tracks_recursive_read_ownership_and_excludes_writers() {
     assert_eq!(crate::guest_rwlock_unlock(address), 0);
     assert_eq!(crate::guest_rwlock_unlock(address), 0);
     assert_eq!(crate::guest_rwlock_lock(address, true, false), 0);
+    {
+        let state = crate::guest_sync()
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lock = state.rwlocks.get(&address).expect("initialized rwlock");
+        assert_eq!(lock.writer_guest_thread, guest_thread);
+    }
     assert_eq!(
         crate::guest_rwlock_lock(address, false, true),
         u64::from(libc::EBUSY.cast_unsigned())
     );
     assert_eq!(crate::guest_rwlock_unlock(address), 0);
     assert_eq!(crate::guest_rwlock_destroy(address), 0);
+    crate::set_current_guest_thread_handle(0);
 }
 
 #[test]

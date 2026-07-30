@@ -154,11 +154,18 @@ pub(crate) struct GuestMutexEntry {
     pub(crate) guest_object: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct GuestRwlockReaderState {
+    pub(crate) guest_thread: u64,
+    pub(crate) recursion: u32,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct GuestRwlockState {
-    pub(crate) readers: HashMap<ThreadId, u32>,
+    pub(crate) readers: HashMap<ThreadId, GuestRwlockReaderState>,
     pub(crate) reader_total: u32,
     pub(crate) writer: Option<ThreadId>,
+    pub(crate) writer_guest_thread: u64,
     pub(crate) waiting_writers: u32,
 }
 
