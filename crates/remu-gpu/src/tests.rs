@@ -9,17 +9,18 @@ use super::{
     GpuMemoryWait, GpuRegister, HostPadState, audio_output_frames, audio_progress_age_millis,
     audio_underrun_frames, clear_event_sink, compute_program_address,
     decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
-    decode_compute_system_registers, emit_event, gpu_completed_submission_ids_snapshot,
-    gpu_completed_submission_sequence, gpu_event_channel, gpu_events_in_flight,
-    gpu_progress_age_millis, gpu_work_items_pending, host_pad_state, install_event_sink,
-    install_gpu_completion_notifier, progress_telemetry_enabled, record_gpu_event_consumed,
-    record_gpu_flip_completed, record_gpu_submission_completed, record_gpu_wait_producer,
-    record_gpu_work_item_processed, report_audio_frames, set_host_pad_state,
-    set_progress_telemetry_enabled, take_gpu_completed_flips, take_gpu_completed_submission_ids,
-    take_gpu_wait_latch,
+    decode_compute_system_registers, emit_event, emit_event_with_admission,
+    gpu_completed_submission_ids_snapshot, gpu_completed_submission_sequence, gpu_event_channel,
+    gpu_events_in_flight, gpu_progress_age_millis, gpu_work_items_pending, host_pad_state,
+    install_event_sink, install_gpu_completion_notifier, progress_telemetry_enabled,
+    record_gpu_event_consumed, record_gpu_flip_completed, record_gpu_submission_completed,
+    record_gpu_wait_producer, record_gpu_work_item_processed, report_audio_frames,
+    set_host_pad_state, set_progress_telemetry_enabled, take_gpu_completed_flips,
+    take_gpu_completed_submission_ids, take_gpu_wait_latch,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 static EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
 static GPU_COMPLETION_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -258,6 +259,194 @@ fn large_queue_submission_is_chunked_before_bounded_ingress() {
 }
 
 #[test]
+fn independent_queue_is_admitted_while_large_submission_is_backpressured() {
+    let _event_guard = EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (sender, receiver) = gpu_event_channel();
+    install_event_sink(sender.clone());
+    for _ in 0..GPU_EVENT_QUEUE_CAPACITY {
+        sender
+            .try_send(GpuEvent::Shutdown)
+            .expect("filler event fits the bounded channel");
+    }
+
+    let q0_chunk_count = GPU_EVENT_QUEUE_CAPACITY + 2;
+    let q0_events =
+        vec![GpuEvent::SubmissionBoundary(1); q0_chunk_count * GPU_EVENT_SUBMISSION_CHUNK_SIZE];
+    let (q0_admitted, q0_admitted_rx) = std::sync::mpsc::channel();
+    let (q0_done, q0_done_rx) = std::sync::mpsc::channel();
+    let q0_thread = std::thread::spawn(move || {
+        let sent = emit_event_with_admission(
+            GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events: q0_events,
+            },
+            || q0_admitted.send(()).expect("test receiver remains alive"),
+        );
+        q0_done.send(sent).expect("test receiver remains alive");
+    });
+    q0_admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("graphics submission reaches queue admission");
+    assert_eq!(
+        q0_done_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty),
+        "the large graphics submission must retain bounded backpressure"
+    );
+
+    let (q33_admitted, q33_admitted_rx) = std::sync::mpsc::channel();
+    let (q33_done, q33_done_rx) = std::sync::mpsc::channel();
+    let q33_thread = std::thread::spawn(move || {
+        let sent = emit_event_with_admission(
+            GpuEvent::QueueSubmission {
+                queue_id: 33,
+                events: vec![GpuEvent::SubmissionBoundary(2)],
+            },
+            || q33_admitted.send(()).expect("test receiver remains alive"),
+        );
+        q33_done.send(sent).expect("test receiver remains alive");
+    });
+    q33_admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("independent compute queue must be admitted before graphics drains");
+    assert_eq!(
+        q33_done_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty),
+        "the full backend channel still applies bounded backpressure"
+    );
+
+    // The first released slot goes to the publisher already blocked in `send`; the independent
+    // queue was waiting before graphics attempts its next chunk, so the second slot admits q33.
+    for _ in 0..2 {
+        assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
+    }
+    assert_eq!(
+        q33_done_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(true),
+        "compute must enter the channel before the large graphics publication completes"
+    );
+    assert_eq!(
+        q0_done_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty),
+        "graphics still has chunks waiting behind the compute producer"
+    );
+    for _ in 2..GPU_EVENT_QUEUE_CAPACITY {
+        assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
+    }
+
+    let expected_submissions = q0_chunk_count + 1;
+    let mut received_submissions = 0;
+    let mut saw_q33 = false;
+    while received_submissions != expected_submissions {
+        let GpuEvent::QueueSubmission { queue_id, events } =
+            receiver.recv().expect("published queue chunk")
+        else {
+            panic!("only queue submissions remain after the fillers");
+        };
+        if queue_id == 33 {
+            assert_eq!(events, [GpuEvent::SubmissionBoundary(2)]);
+            saw_q33 = true;
+        } else {
+            assert_eq!(queue_id, 0);
+            assert_eq!(events.len(), GPU_EVENT_SUBMISSION_CHUNK_SIZE);
+        }
+        received_submissions += 1;
+    }
+    assert!(saw_q33, "the independent producer must not be lost");
+    assert_eq!(
+        q0_done_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(true),
+        "draining all chunks releases graphics publication"
+    );
+    q0_thread.join().expect("graphics publisher exits cleanly");
+    q33_thread.join().expect("compute publisher exits cleanly");
+    clear_event_sink();
+}
+
+#[test]
+fn same_queue_publications_remain_fifo_across_chunk_yields() {
+    let _event_guard = EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (sender, receiver) = gpu_event_channel();
+    install_event_sink(sender.clone());
+    for _ in 0..GPU_EVENT_QUEUE_CAPACITY {
+        sender
+            .try_send(GpuEvent::Shutdown)
+            .expect("filler event fits the bounded channel");
+    }
+
+    let (first_admitted, first_admitted_rx) = std::sync::mpsc::channel();
+    let first = std::thread::spawn(move || {
+        emit_event_with_admission(
+            GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events: vec![GpuEvent::SubmissionBoundary(1); GPU_EVENT_SUBMISSION_CHUNK_SIZE * 3],
+            },
+            || {
+                first_admitted
+                    .send(())
+                    .expect("test receiver remains alive");
+            },
+        )
+    });
+    first_admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first graphics publication is admitted");
+
+    let (second_admitted, second_admitted_rx) = std::sync::mpsc::channel();
+    let second = std::thread::spawn(move || {
+        emit_event_with_admission(
+            GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events: vec![GpuEvent::SubmissionBoundary(2)],
+            },
+            || {
+                second_admitted
+                    .send(())
+                    .expect("test receiver remains alive");
+            },
+        )
+    });
+    second_admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("later graphics publication enters the same-queue FIFO");
+
+    for _ in 0..GPU_EVENT_QUEUE_CAPACITY {
+        assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
+    }
+    let mut boundaries = Vec::new();
+    for _ in 0..4 {
+        let GpuEvent::QueueSubmission { queue_id, events } =
+            receiver.recv().expect("graphics queue chunk")
+        else {
+            panic!("only graphics submissions remain");
+        };
+        assert_eq!(queue_id, 0);
+        boundaries.push(match events.as_slice() {
+            [GpuEvent::SubmissionBoundary(sequence)] => *sequence,
+            events
+                if events
+                    .iter()
+                    .all(|event| event == &GpuEvent::SubmissionBoundary(1)) =>
+            {
+                1
+            }
+            _ => panic!("unexpected same-queue test payload"),
+        });
+    }
+    assert_eq!(
+        boundaries,
+        [1, 1, 1, 2],
+        "a later submission must not enter between chunks of its same-queue predecessor"
+    );
+    assert!(first.join().expect("first publisher exits cleanly"));
+    assert!(second.join().expect("second publisher exits cleanly"));
+    clear_event_sink();
+}
+
+#[test]
 fn old_producer_does_not_satisfy_a_later_label_generation() {
     let _event_guard = EVENT_SINK_TEST
         .lock()
@@ -318,6 +507,90 @@ fn failed_queue_send_cancels_all_registered_waits() {
             .is_empty()
     );
     assert_eq!(gpu_work_items_pending(), 0);
+    clear_event_sink();
+}
+
+#[test]
+fn partial_queue_send_cancels_only_waits_that_never_reached_the_presenter() {
+    let _event_guard = EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first_wait = GpuMemoryWait {
+        address: 0x7000_2060,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    let last_wait = GpuMemoryWait {
+        address: 0x7000_2080,
+        ..first_wait
+    };
+    let chunk_count = GPU_EVENT_QUEUE_CAPACITY + 2;
+    let mut events =
+        vec![GpuEvent::SubmissionBoundary(1); chunk_count * GPU_EVENT_SUBMISSION_CHUNK_SIZE];
+    events[0] = GpuEvent::MemoryWait(first_wait);
+    events[(chunk_count - 1) * GPU_EVENT_SUBMISSION_CHUNK_SIZE] = GpuEvent::MemoryWait(last_wait);
+
+    let (sender, receiver) = gpu_event_channel();
+    install_event_sink(sender.clone());
+    for _ in 0..GPU_EVENT_QUEUE_CAPACITY {
+        sender
+            .try_send(GpuEvent::Shutdown)
+            .expect("filler event fits the bounded channel");
+    }
+    let (admitted, admitted_rx) = std::sync::mpsc::channel();
+    let publisher = std::thread::spawn(move || {
+        emit_event_with_admission(
+            GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events,
+            },
+            || admitted.send(()).expect("test receiver remains alive"),
+        )
+    });
+    admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("submission registers both waits before ingress");
+
+    // Each removed filler lets q0 place one chunk. After all fillers and the first q0 chunk are
+    // removed, at least that first wait is presenter-owned while the final chunk is still blocked.
+    for _ in 0..GPU_EVENT_QUEUE_CAPACITY {
+        assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
+    }
+    let GpuEvent::QueueSubmission {
+        events: first_chunk,
+        ..
+    } = receiver.recv().expect("first published queue chunk")
+    else {
+        panic!("first published event must be a queue chunk");
+    };
+    let first_id = first_chunk
+        .iter()
+        .find_map(|event| match event {
+            GpuEvent::RegisteredMemoryWait { id, wait } if *wait == first_wait => Some(*id),
+            _ => None,
+        })
+        .expect("first chunk carries its registered wait");
+    drop(receiver);
+    assert!(
+        !publisher.join().expect("publisher exits after disconnect"),
+        "disconnecting before the final chunk must fail the submission"
+    );
+
+    let live_waits = super::gpu_wait_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .waits
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        live_waits,
+        [first_id],
+        "a failed later chunk must not cancel a wait already handed to the presenter"
+    );
+    super::retire_gpu_wait(first_id);
     clear_event_sink();
 }
 

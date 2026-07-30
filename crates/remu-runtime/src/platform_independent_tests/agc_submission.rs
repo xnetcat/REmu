@@ -164,6 +164,202 @@ fn gpu_publication_backpressure_releases_dispatch_state_and_preserves_ticket_ord
 }
 
 #[test]
+fn gpu_publication_tickets_admit_an_independent_queue_before_graphics_drains() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_event_sink(sender.clone());
+    for _ in 0..remu_gpu::GPU_EVENT_QUEUE_CAPACITY {
+        sender
+            .try_send(remu_gpu::GpuEvent::Shutdown)
+            .expect("filler event fits the bounded backend channel");
+    }
+
+    let q0_chunk_count = remu_gpu::GPU_EVENT_QUEUE_CAPACITY + 2;
+    crate::begin_deferred_gpu_publication();
+    assert!(crate::publish_gpu_event(
+        remu_gpu::GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![
+                remu_gpu::GpuEvent::SubmissionBoundary(0xa11);
+                q0_chunk_count * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
+            ],
+        }
+    ));
+    let graphics = crate::take_deferred_gpu_publication();
+    crate::begin_deferred_gpu_publication();
+    assert!(crate::publish_gpu_event(
+        remu_gpu::GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: vec![remu_gpu::GpuEvent::SubmissionBoundary(0xb22)],
+        }
+    ));
+    let compute = crate::take_deferred_gpu_publication();
+
+    let (publication_done, publication_done_rx) = std::sync::mpsc::channel();
+    let (graphics_admitted, graphics_admitted_rx) = std::sync::mpsc::channel();
+    let graphics_done = publication_done.clone();
+    let graphics_thread = std::thread::spawn(move || {
+        graphics_done
+            .send((
+                0,
+                crate::flush_deferred_gpu_publication_with_admission(graphics, || {
+                    graphics_admitted
+                        .send(())
+                        .expect("test receiver remains alive");
+                }),
+            ))
+            .expect("test receiver remains alive");
+    });
+    graphics_admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("graphics receives the first process and queue turn");
+
+    let compute_done = publication_done;
+    let (compute_admitted, compute_admitted_rx) = std::sync::mpsc::channel();
+    let compute_thread = std::thread::spawn(move || {
+        compute_done
+            .send((
+                33,
+                crate::flush_deferred_gpu_publication_with_admission(compute, || {
+                    compute_admitted
+                        .send(())
+                        .expect("test receiver remains alive");
+                }),
+            ))
+            .expect("test receiver remains alive");
+    });
+    compute_admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("compute is admitted while graphics remains backpressured");
+
+    // The fair coordinator owns the send turn explicitly: q0 takes the first released slot, then
+    // yields before attempting another chunk, so q33 deterministically takes the second.
+    for _ in 0..2 {
+        assert_eq!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown));
+    }
+    assert_eq!(
+        publication_done_rx.recv_timeout(Duration::from_secs(1)),
+        Ok((33, true)),
+        "the later compute ticket must publish before the graphics ticket fully drains"
+    );
+
+    let expected_events = remu_gpu::GPU_EVENT_QUEUE_CAPACITY + q0_chunk_count + 1;
+    let mut received_events = 2;
+    while received_events != expected_events {
+        receiver.recv().expect("remaining bounded event");
+        received_events += 1;
+    }
+    assert_eq!(
+        publication_done_rx.recv_timeout(Duration::from_secs(1)),
+        Ok((0, true))
+    );
+    graphics_thread
+        .join()
+        .expect("graphics publisher exits cleanly");
+    compute_thread
+        .join()
+        .expect("compute publisher exits cleanly");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn mixed_gpu_publication_is_a_full_barrier_around_queue_only_work() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_event_sink(sender.clone());
+    for _ in 0..remu_gpu::GPU_EVENT_QUEUE_CAPACITY {
+        sender
+            .try_send(remu_gpu::GpuEvent::HideHostSplash)
+            .expect("filler event fits the bounded backend channel");
+    }
+
+    crate::begin_deferred_gpu_publication();
+    assert!(crate::publish_gpu_event(
+        remu_gpu::GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![
+                remu_gpu::GpuEvent::SubmissionBoundary(1);
+                remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE * 3
+            ],
+        }
+    ));
+    let graphics = crate::take_deferred_gpu_publication();
+    crate::begin_deferred_gpu_publication();
+    assert!(crate::publish_gpu_event(
+        remu_gpu::GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: vec![remu_gpu::GpuEvent::SubmissionBoundary(2)],
+        }
+    ));
+    assert!(crate::publish_gpu_event(remu_gpu::GpuEvent::Shutdown));
+    let mixed = crate::take_deferred_gpu_publication();
+
+    let (graphics_admitted, graphics_admitted_rx) = std::sync::mpsc::channel();
+    let graphics_thread = std::thread::spawn(move || {
+        crate::flush_deferred_gpu_publication_with_admission(graphics, || {
+            graphics_admitted
+                .send(())
+                .expect("test receiver remains alive");
+        })
+    });
+    graphics_admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("graphics is admitted before the full barrier");
+
+    let (mixed_started, mixed_started_rx) = std::sync::mpsc::channel();
+    let (mixed_admitted, mixed_admitted_rx) = std::sync::mpsc::channel();
+    let mixed_thread = std::thread::spawn(move || {
+        mixed_started.send(()).expect("test receiver remains alive");
+        crate::flush_deferred_gpu_publication_with_admission(mixed, || {
+            mixed_admitted
+                .send(())
+                .expect("test receiver remains alive");
+        })
+    });
+    mixed_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("mixed publisher reaches its flush");
+
+    for _ in 0..remu_gpu::GPU_EVENT_QUEUE_CAPACITY {
+        assert_eq!(receiver.recv(), Ok(remu_gpu::GpuEvent::HideHostSplash));
+    }
+    for _ in 0..3 {
+        let remu_gpu::GpuEvent::QueueSubmission { queue_id, events } =
+            receiver.recv().expect("graphics chunk before the barrier")
+        else {
+            panic!("mixed publication overtook active graphics");
+        };
+        assert_eq!(queue_id, 0);
+        assert!(
+            events
+                .iter()
+                .all(|event| event == &remu_gpu::GpuEvent::SubmissionBoundary(1))
+        );
+    }
+    mixed_admitted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("mixed publication enters only after graphics releases its read guard");
+    assert!(matches!(
+        receiver.recv(),
+        Ok(remu_gpu::GpuEvent::QueueSubmission { queue_id: 33, .. })
+    ));
+    assert_eq!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown));
+    assert!(
+        graphics_thread
+            .join()
+            .expect("graphics publisher exits cleanly")
+    );
+    assert!(mixed_thread.join().expect("mixed publisher exits cleanly"));
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
 fn agc_completion_tracking_requires_a_published_queue_submission() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()
