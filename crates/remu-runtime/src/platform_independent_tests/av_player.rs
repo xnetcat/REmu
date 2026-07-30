@@ -683,6 +683,40 @@ fn av_player_video_only_clock_advances_between_frames_without_escaping_media_pro
 }
 
 #[test]
+fn av_player_sync_none_video_only_clock_uses_start_timeline() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.source = Some("video-only.mp4".to_owned());
+        player.has_audio = false;
+        player.duration = Duration::from_secs(9);
+    }
+    assert_eq!(crate::av_player_start(handle, &mut state), 0);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        let four_seconds_ago = Instant::now() - Duration::from_secs(4);
+        player.playing_since = Some(four_seconds_ago);
+        player.presentation_anchor_host = Some(four_seconds_ago);
+    }
+
+    let default_time = crate::av_player_current_time(handle, &mut state);
+    assert!(
+        default_time <= 67,
+        "Default sync retains REmu's bounded video clock, got {default_time}"
+    );
+    assert_eq!(
+        crate::av_player_set_av_sync_mode([handle, 1, 0, 0, 0, 0], &mut state),
+        0
+    );
+    let caller_controlled_time = crate::av_player_current_time(handle, &mut state);
+    assert!(
+        (3_900..4_500).contains(&caller_controlled_time),
+        "None sync must expose the Start wall-clock timeline independently of dequeue, got {caller_controlled_time}"
+    );
+}
+
+#[test]
 fn av_player_audio_master_waits_for_audio_then_tracks_its_timestamp() {
     let mut state = ProbeDispatchState::default();
     let handle = av_player_test_player(&mut state);
@@ -865,7 +899,7 @@ fn av_player_sync_none_hands_video_timing_to_the_caller() {
         player.frames_per_second = 30.0;
         player.active_session = true;
         player.playing_since = Some(Instant::now());
-        player.next_video_frame = 1;
+        player.next_video_frame = 240;
         player.video_decoder = Some(crate::AvPlayerDecoder {
             child: None,
             frames: std::sync::Mutex::new(receiver),
@@ -878,7 +912,7 @@ fn av_player_sync_none_hands_video_timing_to_the_caller() {
     assert_eq!(
         crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, &mut state),
         0,
-        "Default sync must withhold frame 1 before the 33 ms timestamp"
+        "Default sync must withhold frame 240 before its 8000 ms timestamp"
     );
     assert_eq!(
         crate::av_player_set_av_sync_mode([handle, 1, 0, 0, 0, 0], &mut state),
@@ -889,6 +923,13 @@ fn av_player_sync_none_hands_video_timing_to_the_caller() {
         crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, &mut state),
         1,
         "None sync must release an available frame without timestamp gating"
+    );
+    let delivered_timestamp = av_player_frame_timestamp(&frame_info);
+    assert_eq!(delivered_timestamp, 8_000);
+    let current_time = crate::av_player_current_time(handle, &mut state);
+    assert!(
+        current_time < delivered_timestamp,
+        "dequeueing an 8000 ms frame in None mode must not jump the independent public clock, got {current_time}"
     );
     assert_eq!(
         crate::av_player_set_av_sync_mode([handle, 2, 0, 0, 0, 0], &mut state),

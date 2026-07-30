@@ -530,8 +530,9 @@ struct AvPlayerInstance {
     playing_since: Option<Instant>,
     elapsed: Duration,
     /// Media timestamp and host instant which define the public presentation clock. Audio
-    /// delivery owns this anchor when an audio stream exists. Video-only streams re-anchor it
-    /// after every delivered frame so a slow guest cannot complete a movie using host time alone.
+    /// delivery owns this anchor when an audio stream exists. Default-sync video-only streams
+    /// re-anchor it after every delivered frame so a slow guest cannot complete a movie using
+    /// host time alone. None-sync video-only streams retain the independent playback wall clock.
     presentation_anchor_media: Duration,
     presentation_anchor_host: Option<Instant>,
     /// Last value exposed through CurrentTime or used to pace video. Re-anchoring must not make
@@ -549,7 +550,8 @@ struct AvPlayerInstance {
     /// the player media clock, not media timestamps.
     trick_speed_percent: u32,
     /// Native Default mode (0) gates video by the presentation clock. None (1) hands frame
-    /// selection to the caller and releases every decoded frame as soon as it is available.
+    /// selection to the caller and releases every decoded frame as soon as it is available,
+    /// without changing the independent public clock.
     av_sync_mode: u32,
     video_decoder: Option<AvPlayerDecoder>,
     raw_video_frame: Vec<u8>,
