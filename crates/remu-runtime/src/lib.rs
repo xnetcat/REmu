@@ -6191,6 +6191,7 @@ impl DeferredGpuPublication {
 
 static GPU_PUBLICATION_TICKET: AtomicU64 = AtomicU64::new(0);
 static GPU_PUBLICATION_ORDER: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+static GPU_PUBLICATION_BARRIER: OnceLock<RwLock<()>> = OnceLock::new();
 
 fn trace_gpu_publication() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -6222,9 +6223,10 @@ fn take_deferred_gpu_publication() -> DeferredGpuPublication {
 
 /// Publishes an event immediately unless the current import still owns the dispatch-state lock.
 ///
-/// The first deferred event receives a process-order ticket while that lock is held. Publication
-/// then waits for the ticket after dropping the lock, preserving the old total ordering without
-/// making unrelated guest imports wait for a full presenter channel.
+/// The first deferred event receives a process-order ticket while that lock is held. A queue-only
+/// publication releases the ticket after joining its hardware queue's FIFO, so another queue can
+/// publish a producer while this one is backpressured. Host lifecycle and mixed publications keep
+/// the ticket through their full barrier.
 fn publish_gpu_event(event: remu_gpu::GpuEvent) -> bool {
     let mut event = Some(event);
     let deferred = DEFERRED_GPU_PUBLICATION.with_borrow_mut(|publication| {
@@ -6243,8 +6245,16 @@ fn publish_gpu_event(event: remu_gpu::GpuEvent) -> bool {
 }
 
 fn flush_deferred_gpu_publication(publication: DeferredGpuPublication) -> bool {
+    flush_deferred_gpu_publication_with_admission(publication, || {})
+}
+
+fn flush_deferred_gpu_publication_with_admission(
+    publication: DeferredGpuPublication,
+    admitted: impl FnOnce(),
+) -> bool {
     let Some(ticket) = publication.ticket else {
         debug_assert!(publication.events.is_empty());
+        admitted();
         return true;
     };
     let traced = trace_gpu_publication();
@@ -6277,22 +6287,48 @@ fn flush_deferred_gpu_publication(publication: DeferredGpuPublication) -> bool {
         // backend publication.
         eprintln!("[REMu][GPU][PUBLICATION] turn ticket={ticket}");
     }
-    // The ticket value prevents a later publisher from proceeding while this thread blocks in
-    // the bounded channel; the mutex itself need not remain locked.
-    drop(next);
-
+    let queue_only = matches!(
+        publication.events.as_slice(),
+        [remu_gpu::GpuEvent::QueueSubmission { .. }]
+    );
     let mut all_sent = true;
-    for event in publication.events {
-        all_sent &= remu_gpu::emit_event(event);
+    if queue_only {
+        let _queue_publication = GPU_PUBLICATION_BARRIER
+            .get_or_init(|| RwLock::new(()))
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let event = publication
+            .events
+            .into_iter()
+            .next()
+            .expect("queue-only publication owns one event");
+        // Assign the event its queue-local sequence while this process-order turn is still held.
+        // Once assigned, independent hardware queues may enter the bounded channel concurrently;
+        // a later event on this same queue still waits for its FIFO predecessor inside `remu-gpu`.
+        all_sent &= remu_gpu::emit_event_with_admission(event, move || {
+            debug_assert_eq!(*next, ticket);
+            *next = next.saturating_add(1);
+            order.1.notify_all();
+            admitted();
+            if traced {
+                eprintln!("[REMu][GPU][PUBLICATION] admitted ticket={ticket} queue-only=true");
+            }
+        });
+    } else {
+        // Display lifecycle events and any mixed publication are process-wide barriers. They must
+        // neither overtake an active hardware queue nor be overtaken by a later queue.
+        let _full_barrier = GPU_PUBLICATION_BARRIER
+            .get_or_init(|| RwLock::new(()))
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admitted();
+        for event in publication.events {
+            all_sent &= remu_gpu::emit_event(event);
+        }
+        debug_assert_eq!(*next, ticket);
+        *next = next.saturating_add(1);
+        order.1.notify_all();
     }
-
-    let mut next = order
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    debug_assert_eq!(*next, ticket);
-    *next = next.saturating_add(1);
-    order.1.notify_all();
     if let (Some(started), Some(summary)) = (started, summary) {
         eprintln!(
             "[REMu][GPU][PUBLICATION] end ticket={ticket} elapsed_ms={:.3} outer={} work={} queues={:?} success={all_sent}",
