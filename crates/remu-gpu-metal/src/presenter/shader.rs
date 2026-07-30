@@ -13,16 +13,9 @@ use super::{
     NGG_MESH_LDS_BYTES, NGG_MESH_THREADS, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED,
     PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL, PersistentRenderPipelineArchive,
     ProgramIdentity, RenderPipelineArchiveState, ShaderCompileRequest, ShaderFunctionCache,
-    ShaderFunctionCacheEntry, ShaderFunctionStageCache, diagnostic_capture_pixel_output,
-    diagnostic_capture_vertex_position, diagnostic_disable_blending,
-    diagnostic_dump_shadow_consumer, diagnostic_dump_target_pixel_instruction_count,
-    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
-    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
-    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
-    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
-    diagnostic_video_chain_selected_draw, dump_msl_instruction_filter_matches,
-    dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison, image_component_class, metal_color_write_mask,
+    ShaderFunctionCacheEntry, ShaderFunctionStageCache, diagnostic_disable_blending,
+    dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
+    evaluation_samples_large_linear_video, image_component_class, metal_color_write_mask,
     register_value, video_target_binding_summary,
 };
 mod archive;
@@ -212,24 +205,8 @@ impl MetalPresenter {
         pixel_options.pixel_input_controls = key
             .pixel_input_controls
             .map(remu_shader_metal::PixelInputControl::from_register);
-        let selected_diagnostic_shader = diagnostic_dump_target_pixel_shader()
-            == Some(draw.pixel_shader_address)
-            || diagnostic_dump_target_pixel_instruction_count()
-                == Some(pixel.program.instructions.len())
-            || (diagnostic_dump_video_target_consumer()
-                && video_target_binding_summary(pixel_evaluation).is_some())
-            || (diagnostic_dump_video_chain_consumer()
-                && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence)
-            || (diagnostic_dump_shadow_consumer()
-                && evaluation_samples_layered_comparison(pixel_evaluation));
-        pixel_options.diagnostic_force_pixel_color = key.sample_count > 1
-            && pixel.program.instructions.len() > 64
-            && diagnostic_force_msaa_pixel_color();
-        pixel_options.diagnostic_capture_pixel_output = diagnostic_capture_pixel_output()
-            && ((key.sample_count > 1 && pixel.program.instructions.len() == 370)
-                || selected_diagnostic_shader
-                || (diagnostic_dump_video_draw()
-                    && evaluation_samples_large_linear_video(pixel_evaluation)));
+        pixel_options.diagnostic_force_pixel_color = key.diagnostics.force_pixel_color;
+        pixel_options.diagnostic_capture_pixel_output = key.diagnostics.capture_pixel_output;
         let pixel_msl =
             remu_shader_metal::compile_msl(&pixel.program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
@@ -283,16 +260,11 @@ impl MetalPresenter {
         vertex_options.render_target_array_length = key.render_target_array_length;
         vertex_options.vertex_output_control = key.vertex_output_control;
         vertex_options.diagnostic_force_visible_clip_depth =
-            key.sample_count > 1 && diagnostic_force_visible_clip_depth();
-        vertex_options.diagnostic_force_vertex_pattern = diagnostic_force_msaa_vertex_pattern()
-            && (key.sample_count > 1 || selected_diagnostic_shader);
-        vertex_options.diagnostic_force_vertex_fetch_id = diagnostic_force_vertex_fetch_id()
-            && (key.sample_count > 1 || selected_diagnostic_shader);
-        vertex_options.diagnostic_capture_vertex_position = diagnostic_capture_vertex_position()
-            && (key.sample_count > 1
-                || selected_diagnostic_shader
-                || (diagnostic_dump_video_draw()
-                    && evaluation_samples_large_linear_video(pixel_evaluation)));
+            key.diagnostics.force_visible_clip_depth;
+        vertex_options.diagnostic_force_vertex_pattern = key.diagnostics.force_vertex_pattern;
+        vertex_options.diagnostic_force_vertex_fetch_id = key.diagnostics.force_vertex_fetch_id;
+        vertex_options.diagnostic_capture_vertex_position =
+            key.diagnostics.capture_vertex_position;
         let vertex_msl = if uses_mesh_stage {
             remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)
                 .map_err(|error| format!("mesh lowering: {error}"))?

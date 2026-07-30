@@ -3,12 +3,19 @@
 
 use super::{
     CB_BLEND0_CONTROL, DB_SHADER_CONTROL, DecodedRasterState, DecodedRenderTarget,
-    DepthTargetPipelineState,
-    GraphicsPipelineKey, GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL,
-    PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState,
-    common_render_target_array_length, decode_depth_target, decode_render_targets,
+    DepthTargetPipelineState, GraphicsDiagnosticPipelineState, GraphicsPipelineKey,
+    GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL, PA_SU_SC_MODE_CNTL,
+    ProgramIdentity, RenderTargetPipelineState, common_render_target_array_length,
+    decode_depth_target, decode_render_targets, diagnostic_capture_pixel_output,
+    diagnostic_capture_vertex_position, diagnostic_dump_shadow_consumer,
+    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
+    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
+    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
+    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
+    diagnostic_force_visible_clip_depth, diagnostic_video_chain_selected_draw,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
-    pixel_input_controls, program_embeds_global_base, register_value,
+    pixel_input_controls, program_embeds_global_base, register_value, video_target_binding_summary,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
@@ -18,6 +25,7 @@ use remu_gpu::IndexedDraw;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub(crate) const NGG_MESHLET_WORDS_PER_GROUP: usize = 130;
 const NGG_MESHLET_MAX_VERTICES: usize = 64;
@@ -353,6 +361,42 @@ pub(crate) fn pixel_depth_export_enabled(
             .is_some_and(|control| control & 1 != 0)
 }
 
+fn graphics_diagnostic_pipeline_state(
+    draw: &IndexedDraw,
+    pixel_evaluation: &ShaderEvaluation,
+    pixel_program: &remu_shader::Program,
+    sample_count: u32,
+) -> GraphicsDiagnosticPipelineState {
+    let selected_shader = diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address)
+        || diagnostic_dump_target_pixel_instruction_count()
+            == Some(pixel_program.instructions.len())
+        || (diagnostic_dump_video_target_consumer()
+            && video_target_binding_summary(pixel_evaluation).is_some())
+        || (diagnostic_dump_video_chain_consumer()
+            && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence)
+        || (diagnostic_dump_shadow_consumer()
+            && evaluation_samples_layered_comparison(pixel_evaluation));
+    let samples_large_video = diagnostic_dump_video_draw()
+        && evaluation_samples_large_linear_video(pixel_evaluation);
+
+    GraphicsDiagnosticPipelineState {
+        force_pixel_color: sample_count > 1
+            && pixel_program.instructions.len() > 64
+            && diagnostic_force_msaa_pixel_color(),
+        capture_pixel_output: diagnostic_capture_pixel_output()
+            && ((sample_count > 1 && pixel_program.instructions.len() == 370)
+                || selected_shader
+                || samples_large_video),
+        force_visible_clip_depth: sample_count > 1 && diagnostic_force_visible_clip_depth(),
+        force_vertex_pattern: diagnostic_force_msaa_vertex_pattern()
+            && (sample_count > 1 || selected_shader),
+        force_vertex_fetch_id: diagnostic_force_vertex_fetch_id()
+            && (sample_count > 1 || selected_shader),
+        capture_vertex_position: diagnostic_capture_vertex_position()
+            && (sample_count > 1 || selected_shader || samples_large_video),
+    }
+}
+
 pub(crate) fn graphics_pipeline_key_from_targets(
     draw: &IndexedDraw,
     targets: &[DecodedRenderTarget],
@@ -442,6 +486,12 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             .unwrap_or_default(),
         pixel_input_controls: pixel_input_controls(&draw.context_registers),
         pixel_depth_export: pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
+        diagnostics: graphics_diagnostic_pipeline_state(
+            draw,
+            pixel_evaluation,
+            pixel_program,
+            sample_count,
+        ),
         targets: targets
             .iter()
             .map(|target| {

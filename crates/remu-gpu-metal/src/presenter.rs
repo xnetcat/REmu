@@ -459,6 +459,16 @@ struct MetalBlendAttachmentState {
     alpha_operation: MTLBlendOperation,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+struct GraphicsDiagnosticPipelineState {
+    force_pixel_color: bool,
+    capture_pixel_output: bool,
+    force_visible_clip_depth: bool,
+    force_vertex_pattern: bool,
+    force_vertex_fetch_id: bool,
+    capture_vertex_position: bool,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct GraphicsPipelineKey {
     export_shader_address: u64,
@@ -477,6 +487,10 @@ struct GraphicsPipelineKey {
     pixel_input_controls: [u32; 32],
     /// `DB_SHADER_CONTROL.Z_EXPORT_ENABLE`, gated by an active depth attachment.
     pixel_depth_export: bool,
+    /// Diagnostic lowerings alter the generated Metal function body and interface. Keep the
+    /// effective options in the cache key so a shader first seen outside the selected diagnostic
+    /// draw cannot supply a hook-free pipeline to the later capture.
+    diagnostics: GraphicsDiagnosticPipelineState,
     targets: Vec<RenderTargetPipelineState>,
     depth: Option<DepthTargetPipelineState>,
     sample_count: u32,
