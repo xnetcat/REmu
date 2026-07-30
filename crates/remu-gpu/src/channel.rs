@@ -171,17 +171,24 @@ pub fn emit_event(mut event: GpuEvent) -> bool {
         }
     };
     let sent = match event {
-        GpuEvent::QueueSubmission {
-            queue_id,
-            mut events,
-        } if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE => {
+        GpuEvent::QueueSubmission { queue_id, events }
+            if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE =>
+        {
+            // `Vec::split_off(CHUNK_SIZE)` looks attractive here, but it copies the entire
+            // remaining tail into a fresh allocation on every iteration. It also leaves each
+            // tiny published prefix owning the previous tail's capacity. Large guest command
+            // buffers therefore did quadratic host work and retained many submission-sized
+            // allocations while blocked behind the bounded channel.
+            //
+            // Consume the original allocation once and build only fixed-capacity channel chunks.
+            // This keeps publication linear while preserving every event's queue-local order and
+            // the existing decoded-event bound.
+            let mut remaining = events.into_iter();
             let mut all_sent = true;
-            loop {
-                let remaining = if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE {
-                    events.split_off(GPU_EVENT_SUBMISSION_CHUNK_SIZE)
-                } else {
-                    Vec::new()
-                };
+            while !remaining.as_slice().is_empty() {
+                let chunk_size = remaining.len().min(GPU_EVENT_SUBMISSION_CHUNK_SIZE);
+                let mut events = Vec::with_capacity(chunk_size);
+                events.extend(remaining.by_ref().take(chunk_size));
                 let work_item_count = events.len();
                 let flip_count = events
                     .iter()
@@ -200,10 +207,6 @@ pub fn emit_event(mut event: GpuEvent) -> bool {
                     all_sent = false;
                     break;
                 }
-                if remaining.is_empty() {
-                    break;
-                }
-                events = remaining;
             }
             all_sent
         }

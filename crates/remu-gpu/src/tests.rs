@@ -224,19 +224,16 @@ fn large_queue_submission_is_chunked_before_bounded_ingress() {
     let (sender, receiver) = gpu_event_channel();
     install_event_sink(sender);
     let event_count = GPU_EVENT_SUBMISSION_CHUNK_SIZE * 2 + 3;
-    let events = vec![
-        GpuEvent::PipelineBarrier(super::GpuPipelineBarrier {
-            wait_for: super::GpuPipelineStage::PixelShader,
-        });
-        event_count
-    ];
+    let events = (0..event_count)
+        .map(|sequence| GpuEvent::SubmissionBoundary(sequence as u64))
+        .collect();
 
     assert!(emit_event(GpuEvent::QueueSubmission {
         queue_id: 17,
         events,
     }));
 
-    let chunk_lengths = (0..3)
+    let chunks = (0..3)
         .map(|_| {
             let GpuEvent::QueueSubmission { queue_id, events } =
                 receiver.recv().expect("chunked queue submission")
@@ -244,16 +241,41 @@ fn large_queue_submission_is_chunked_before_bounded_ingress() {
                 panic!("queue submission wrapper was lost");
             };
             assert_eq!(queue_id, 17);
-            events.len()
+            let sequences = events
+                .iter()
+                .map(|event| match event {
+                    GpuEvent::SubmissionBoundary(sequence) => *sequence,
+                    other => panic!("unexpected chunk event {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            ((events.len(), events.capacity()), sequences)
         })
         .collect::<Vec<_>>();
+    let chunk_storage = chunks
+        .iter()
+        .map(|(storage, _)| *storage)
+        .collect::<Vec<_>>();
     assert_eq!(
-        chunk_lengths,
+        chunk_storage,
         [
-            GPU_EVENT_SUBMISSION_CHUNK_SIZE,
-            GPU_EVENT_SUBMISSION_CHUNK_SIZE,
-            3
+            (
+                GPU_EVENT_SUBMISSION_CHUNK_SIZE,
+                GPU_EVENT_SUBMISSION_CHUNK_SIZE
+            ),
+            (
+                GPU_EVENT_SUBMISSION_CHUNK_SIZE,
+                GPU_EVENT_SUBMISSION_CHUNK_SIZE
+            ),
+            (3, 3)
         ]
+    );
+    assert_eq!(
+        chunks
+            .into_iter()
+            .flat_map(|(_, sequences)| sequences)
+            .collect::<Vec<_>>(),
+        (0..event_count as u64).collect::<Vec<_>>(),
+        "chunking must preserve the exact queue-local event order"
     );
     assert_eq!(gpu_work_items_pending(), event_count);
     clear_event_sink();
