@@ -209,6 +209,44 @@ fn audio_out2_pcm_attribute_snapshots_each_512_by_8_float_grain() {
 }
 
 #[test]
+fn audio_out2_invalid_pcm_push_releases_its_reserved_queue_slot() {
+    let _serial = AUDIO_OUT2_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reset_audio_out2_test_state();
+    let context = create_audio_out2_test_context(512);
+    let port = create_audio_out2_test_port(context, 0, 0x880);
+    let pcm = SceAudioOut2Pcm { data: 1 };
+    let attribute = SceAudioOut2Attribute {
+        attribute_id: 0,
+        value: std::ptr::addr_of!(pcm) as u64,
+        value_size: std::mem::size_of::<SceAudioOut2Pcm>() as u64,
+        ..SceAudioOut2Attribute::default()
+    };
+    assert_eq!(
+        dispatch_audio_out2_import(
+            "8XTArSPyWHk",
+            [port, std::ptr::addr_of!(attribute) as u64, 1, 0, 0, 0],
+        ),
+        0
+    );
+
+    assert_eq!(
+        dispatch_audio_out2_import("aII9h5nli9U", [context, 0, 0, 0, 0, 0]),
+        sce_kernel_error(super::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+
+    let state = crate::AUDIO_OUT2
+        .get()
+        .expect("the AudioOut2 test state is initialized")
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(state.contexts.get(&context).unwrap().queued, 0);
+    assert_eq!(state.failed_context_pushes, 1);
+    assert!(state.submitted_pcm.is_empty());
+}
+
+#[test]
 fn audio_out2_vibration_pcm_never_enters_the_speaker_backend() {
     let _serial = AUDIO_OUT2_TEST
         .lock()
