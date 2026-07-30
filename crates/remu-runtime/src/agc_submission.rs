@@ -488,7 +488,13 @@ pub(crate) fn agc_handle_submission_packet(
                 dispatch.sequence, dispatch.shader_address,
             );
         }
-        if dispatch.launch.is_empty() {
+        // Direct dimensions are immutable packet data, so a zero extent is genuinely empty.
+        // Indirect dwords can be produced by earlier GPU work and the packet-time CPU snapshot
+        // can still be zero here. Preserve that event so a backend with native indirect dispatch
+        // reads the live dimensions at its ordered execution point.
+        if dispatch.launch.is_empty()
+            && matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct)
+        {
             eprintln!(
                 "[REMu][AGC] skipped empty compute dispatch={} source={:?} grid={:?} base={:?} cs={:#x}",
                 dispatch.sequence,
