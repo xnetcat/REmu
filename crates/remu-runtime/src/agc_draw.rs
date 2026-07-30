@@ -66,13 +66,17 @@ pub(crate) fn agc_apply_set_base(
     }
     let low = read_guest_u32(packet_address + 8) & !0x7;
     let high = read_guest_u32(packet_address + 12) & 0xffff;
-    let previous = graphics.indirect_args_address;
-    graphics.indirect_args_address = u64::from(low) | (u64::from(high) << 32);
+    let address = u64::from(low) | (u64::from(high) << 32);
+    let previous = if shader_type == 1 {
+        std::mem::replace(&mut graphics.compute_indirect_args_address, address)
+    } else {
+        std::mem::replace(&mut graphics.graphics_indirect_args_address, address)
+    };
     if trace_agc_registers() {
         eprintln!(
             "[REMu][AGC][REG] set-base packet={packet_address:#x} shader_type={shader_type} \
              base_index={base_index} previous={previous:#x} base={:#x} words={:08x?}",
-            graphics.indirect_args_address,
+            address,
             agc_packet_words(packet_address, length),
         );
     }
@@ -97,11 +101,11 @@ pub(crate) fn agc_decode_compute_dispatch(
         let indirect = remu_gpu::decode_compute_dispatch_indirect(&packet)?;
         let dimensions_address = match indirect.dimensions {
             remu_gpu::ComputeIndirectDimensions::BaseOffset(offset) => {
-                if graphics.indirect_args_address == 0 {
+                if graphics.compute_indirect_args_address == 0 {
                     return Err(AgcComputeDispatchError::MissingIndirectBase);
                 }
                 graphics
-                    .indirect_args_address
+                    .compute_indirect_args_address
                     .checked_add(u64::from(offset))
                     .ok_or(AgcComputeDispatchError::IndirectAddressOverflow)?
             }
@@ -113,7 +117,7 @@ pub(crate) fn agc_decode_compute_dispatch(
                 "[REMu][AGC][REG] dispatch-indirect packet={packet_address:#x} \
                  base={:#x} resolved={dimensions_address:#x} dimensions={dimensions:08x?} \
                  decoded={indirect:?} words={packet:08x?}",
-                graphics.indirect_args_address,
+                graphics.compute_indirect_args_address,
             );
         }
         (

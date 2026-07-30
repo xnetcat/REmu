@@ -276,7 +276,7 @@ fn dma_shadow_reaches_an_indirect_buffer_dispatch_without_reordering_events() {
     let destination_dimensions = [0_u32; 3];
     let source_address = source_dimensions.as_ptr().addr() as u64;
     let destination_address = destination_dimensions.as_ptr().addr() as u64;
-    graphics.indirect_args_address = destination_address;
+    graphics.compute_indirect_args_address = destination_address;
 
     let indirect = [agc_pm4(3, crate::AGC_IT_DISPATCH_INDIRECT, 0), 0, 0x8041];
     let indirect_address = indirect.as_ptr().addr() as u64;
@@ -330,7 +330,7 @@ fn dma_shadow_reaches_indirect_draw_arguments_without_executing_the_copy_early()
     let indices = [10_u16, 11, 12, 13, 14, 15, 16, 17];
     let index_address = indices.as_ptr().addr() as u64;
     let mut graphics = AgcGraphicsState {
-        indirect_args_address: destination_address,
+        graphics_indirect_args_address: destination_address,
         index_buffer_address: index_address,
         index_resource_address: index_address,
         index_buffer_count: u32::try_from(indices.len()).expect("index count"),
@@ -1091,7 +1091,8 @@ fn clear_state_resets_complete_queue_state_without_discarding_residency() {
     graphics.index_size = 1;
     graphics.instance_count = 7;
     graphics.draw_index_offset = 5;
-    graphics.indirect_args_address = 0x3000;
+    graphics.compute_indirect_args_address = 0x3000;
+    graphics.graphics_indirect_args_address = 0x4000;
     graphics.emitted_draws = 11;
     graphics.known_color_targets.insert(address, target);
 
@@ -1121,7 +1122,8 @@ fn clear_state_resets_complete_queue_state_without_discarding_residency() {
     assert_eq!(graphics.index_size, 0);
     assert_eq!(graphics.instance_count, 1);
     assert_eq!(graphics.draw_index_offset, 0);
-    assert_eq!(graphics.indirect_args_address, 0);
+    assert_eq!(graphics.compute_indirect_args_address, 0);
+    assert_eq!(graphics.graphics_indirect_args_address, 0);
     assert_eq!(graphics.emitted_draws, 11);
     assert_eq!(graphics.known_color_targets.get(&address), Some(&target));
 }
