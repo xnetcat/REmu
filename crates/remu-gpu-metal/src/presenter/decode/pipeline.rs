@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CB_BLEND0_CONTROL, DecodedRasterState, DecodedRenderTarget, DepthTargetPipelineState,
+    CB_BLEND0_CONTROL, DB_SHADER_CONTROL, DecodedRasterState, DecodedRenderTarget,
+    DepthTargetPipelineState,
     GraphicsPipelineKey, GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL,
     PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
@@ -343,6 +344,15 @@ pub(crate) fn graphics_pipeline_key(draw: &IndexedDraw) -> Result<GraphicsPipeli
     graphics_pipeline_key_from_targets(draw, &targets)
 }
 
+pub(crate) fn pixel_depth_export_enabled(
+    context_registers: &[remu_gpu::GpuRegister],
+    has_depth_target: bool,
+) -> bool {
+    has_depth_target
+        && register_value(context_registers, DB_SHADER_CONTROL)
+            .is_some_and(|control| control & 1 != 0)
+}
+
 pub(crate) fn graphics_pipeline_key_from_targets(
     draw: &IndexedDraw,
     targets: &[DecodedRenderTarget],
@@ -431,6 +441,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         vertex_output_control: register_value(&draw.context_registers, PA_CL_VS_OUT_CNTL)
             .unwrap_or_default(),
         pixel_input_controls: pixel_input_controls(&draw.context_registers),
+        pixel_depth_export: pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
         targets: targets
             .iter()
             .map(|target| {
@@ -600,4 +611,28 @@ pub(crate) fn metal_color_write_mask(guest_mask: u32) -> MTLColorWriteMask {
         | u64::from(guest_mask & 4 != 0) << 1
         | u64::from(guest_mask & 8 != 0);
     MTLColorWriteMask::from_bits_retain(metal_mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DB_SHADER_CONTROL, pixel_depth_export_enabled};
+    use remu_gpu::GpuRegister;
+
+    #[test]
+    fn gates_mrtz_depth_output_on_db_shader_control_and_an_active_depth_target() {
+        let registers = [GpuRegister {
+            offset: DB_SHADER_CONTROL,
+            value: 1,
+        }];
+
+        assert!(pixel_depth_export_enabled(&registers, true));
+        assert!(!pixel_depth_export_enabled(&registers, false));
+        assert!(!pixel_depth_export_enabled(
+            &[GpuRegister {
+                offset: DB_SHADER_CONTROL,
+                value: 0,
+            }],
+            true,
+        ));
+    }
 }

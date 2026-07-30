@@ -478,6 +478,8 @@ struct GraphicsPipelineKey {
     pixel_allocated_vector_register_count: u32,
     vertex_output_control: u32,
     pixel_input_controls: [u32; 32],
+    /// `DB_SHADER_CONTROL.Z_EXPORT_ENABLE`, gated by an active depth attachment.
+    pixel_depth_export: bool,
     targets: Vec<RenderTargetPipelineState>,
     depth: Option<DepthTargetPipelineState>,
     sample_count: u32,

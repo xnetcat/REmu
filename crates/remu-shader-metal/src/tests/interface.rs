@@ -47,6 +47,46 @@ fn compile_pixel_export_mask(
 }
 
 #[test]
+fn routes_rdna2_mrtz_component_zero_to_fragment_depth() {
+    // AMD RDNA2 EXP target 8 is Z. Silent Hill's captured gameplay shaders use EN=1,
+    // uncompressed, with VSRC0 carrying the replacement depth.
+    let export_word = 0xf800_0000 | 1 | (8 << 4) | (1 << 11);
+    let program = decode_program(0x1000, &[export_word, 0x0302_0100, 0xbf81_0000])
+        .expect("MRTZ export should decode");
+    let mut options = MetalCompileOptions::pixel(Vec::new(), 0, 0);
+    options.pixel_depth_export = true;
+    let shader =
+        compile_msl(&program, &empty_evaluation(), &options).expect("MRTZ depth should lower");
+
+    assert!(shader.source.contains("float depth [[depth(any)]];"));
+    assert!(shader.source.contains("fragment RemuPsOut remu_main"));
+    assert!(
+        shader
+            .source
+            .contains("remu_out.depth = remu_in.frag_coord.z;")
+    );
+    assert!(
+        shader
+            .source
+            .contains("if (exec) remu_out.depth = as_type<float>(remu_v_0);")
+    );
+    assert!(shader.source.contains("return remu_out;"));
+}
+
+#[test]
+fn leaves_mrtz_inert_when_depth_export_pipeline_state_is_disabled() {
+    let export_word = 0xf800_0000 | 1 | (8 << 4) | (1 << 11);
+    let program = decode_program(0x1000, &[export_word, 0x0302_0100, 0xbf81_0000])
+        .expect("MRTZ export should decode");
+    let options = MetalCompileOptions::pixel(Vec::new(), 0, 0);
+    let shader =
+        compile_msl(&program, &empty_evaluation(), &options).expect("disabled MRTZ should lower");
+
+    assert!(shader.source.contains("fragment void remu_main"));
+    assert!(!shader.source.contains("[[depth("));
+}
+
+#[test]
 fn masked_pixel_export_components_use_gfx_blend_defaults() {
     let float = compile_pixel_export_mask(PixelOutputKind::Float, false, 0x07);
     assert!(
