@@ -218,14 +218,16 @@ fn begin_main_timed_condition_trace(
         trace_read_guest_u64(named_queue_state.saturating_add(0x10))
     };
     // FTaskGraphInterface::WaitUntilTaskCompletes passes an FGraphEventRef wrapper to
-    // GameThreadWaitForTask.  This title's fixed frame stores the referenced event at rbp-0x60
-    // while it pumps the named-thread queue.  The event's +0x10 word contains the completion bit
-    // (0x0400_0000); keeping the surrounding words lets a bounded run distinguish a task that was
-    // never dequeued from one that executed but failed to dispatch its subsequents.
-    let target_graph_event = if event_caller_rbp < 0x60 {
+    // GameThreadWaitForTask.  In this title, the caller at 0x801be0030 keeps that reference at
+    // rbp-0x40 while GameThreadWaitForTask reuses its own rbp-0x60 local for timer state.  Reading
+    // the latter produced packed timer bits that merely resembled a low pointer.  The event's
+    // +0x10 word contains the completion bit (0x0400_0000); keeping the surrounding words lets a
+    // bounded run distinguish a task that was never dequeued from one that executed but failed to
+    // dispatch its subsequents.
+    let target_graph_event = if parent_rbp < 0x40 {
         0
     } else {
-        trace_read_guest_u64(event_caller_rbp - 0x60)
+        trace_read_guest_u64(parent_rbp - 0x40)
     };
     let target_graph_event_words = if target_graph_event == 0 {
         [0; 12]
