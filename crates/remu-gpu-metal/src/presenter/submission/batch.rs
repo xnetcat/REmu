@@ -9,13 +9,13 @@ use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter,
     PendingGlobalWriteback, PendingGuestWriteRange, UploadedGlobalBuffer,
-    guest_physical_ranges_overlap,
+    guest_physical_ranges_overlap, guest_ranges_overlap,
 };
 use metal::foreign_types::ForeignType;
 use metal::{Buffer, CommandBuffer, Device, MTLCommandBufferStatus, MTLResourceOptions};
 use objc::{msg_send, sel, sel_impl};
 use remu_memory::{
-    CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_mapping_identity,
+    CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_backing_identity,
     read_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 use remu_shader::ShaderEvaluation;
@@ -486,16 +486,76 @@ pub(crate) fn guest_batch_writes_overlap(
     address: u64,
     byte_count: u64,
 ) -> bool {
-    batch.guest_write_ranges.iter().any(|range| {
-        guest_physical_ranges_overlap(range.address, range.byte_count, address, byte_count)
-    }) || batch.global_writebacks.iter().any(|writeback| {
-        u64::try_from(writeback.byte_count).is_ok_and(|length| {
-            guest_physical_ranges_overlap(writeback.guest_address, length, address, byte_count)
+    batch
+        .guest_write_ranges
+        .iter()
+        .any(|range| pending_guest_write_range_overlaps(range, address, byte_count))
+        || batch
+            .global_writebacks
+            .iter()
+            .any(|writeback| pending_global_writeback_overlaps(writeback, address, byte_count))
+        || batch.memory_writes.iter().any(|write| {
+            let (write_address, write_bytes) = write.range();
+            guest_physical_ranges_overlap(write_address, write_bytes, address, byte_count)
         })
-    }) || batch.memory_writes.iter().any(|write| {
-        let (write_address, write_bytes) = write.range();
-        guest_physical_ranges_overlap(write_address, write_bytes, address, byte_count)
-    })
+}
+
+fn pending_global_writeback_overlaps(
+    writeback: &PendingGlobalWriteback,
+    address: u64,
+    byte_count: u64,
+) -> bool {
+    let Ok(writeback_byte_count) = u64::try_from(writeback.byte_count) else {
+        return true;
+    };
+    if guest_ranges_overlap(
+        writeback.guest_address,
+        writeback_byte_count,
+        address,
+        byte_count,
+    ) {
+        return true;
+    }
+    let Some(producer_identity) = writeback.mapping_identity else {
+        return guest_physical_ranges_overlap(
+            writeback.guest_address,
+            writeback_byte_count,
+            address,
+            byte_count,
+        );
+    };
+    let Some(read_identity) = guest_shared_backing_identity(address, byte_count) else {
+        return false;
+    };
+    producer_identity.backing_id == read_identity.backing_id
+        && guest_ranges_overlap(
+            producer_identity.backing_offset,
+            writeback_byte_count,
+            read_identity.backing_offset,
+            byte_count,
+        )
+}
+
+fn pending_guest_write_range_overlaps(
+    range: &PendingGuestWriteRange,
+    address: u64,
+    byte_count: u64,
+) -> bool {
+    if guest_ranges_overlap(range.address, range.byte_count, address, byte_count) {
+        return true;
+    }
+    let Some(read_identity) = guest_shared_backing_identity(address, byte_count) else {
+        return false;
+    };
+    if range.physical_identity.backing_id != read_identity.backing_id {
+        return false;
+    }
+    guest_ranges_overlap(
+        range.physical_identity.backing_offset,
+        range.byte_count,
+        read_identity.backing_offset,
+        byte_count,
+    )
 }
 
 pub(crate) fn publish_guest_batch_completion(batch: &GuestCommandBatch) {
@@ -552,7 +612,9 @@ pub(crate) fn collect_pending_global_writebacks(
         }
         let byte_count = u64::try_from(binding.byte_count)
             .map_err(|_| "writable global buffer byte count does not fit u64")?;
-        let mapping_identity = guest_shared_mapping_identity(binding.base_address, byte_count);
+        let mapping_identity = buffer
+            .physical_identity
+            .or_else(|| guest_shared_backing_identity(binding.base_address, byte_count));
         let write_watch = if mapping_identity.is_some() {
             None
         } else {
@@ -613,22 +675,27 @@ pub(crate) fn collect_pending_guest_write_ranges(
     if buffers.len() != evaluation.global_memory_bindings.len() {
         return Err("Metal/global buffer binding count mismatch".to_owned());
     }
-    for (_, binding) in buffers
+    for (buffer, binding) in buffers
         .iter()
         .zip(&evaluation.global_memory_bindings)
-        .filter(|(buffer, binding)| {
-            binding.writable && (buffer.guest_memory || binding.write_back_to_guest)
-        })
+        .filter(|(buffer, binding)| binding.writable && buffer.guest_memory)
     {
         let byte_count = u64::try_from(binding.byte_count)
             .map_err(|_| "writable guest buffer byte count does not fit u64")?;
+        let physical_identity = buffer.physical_identity.ok_or_else(|| {
+                format!(
+                    "zero-copy writable guest buffer has no captured physical identity address={:#x} bytes={byte_count}",
+                    binding.base_address
+                )
+            })?;
         let range = PendingGuestWriteRange {
             address: binding.base_address,
             byte_count,
+            buffer: buffer.buffer.clone(),
+            offset: buffer.offset,
+            physical_identity,
         };
-        if !pending.contains(&range) {
-            pending.push(range);
-        }
+        append_or_replace_guest_write_range(pending, range);
     }
     Ok(())
 }
@@ -655,9 +722,21 @@ pub(crate) fn append_unique_guest_write_ranges(
     source: Vec<PendingGuestWriteRange>,
 ) {
     for range in source {
-        if !destination.contains(&range) {
-            destination.push(range);
-        }
+        append_or_replace_guest_write_range(destination, range);
+    }
+}
+
+fn append_or_replace_guest_write_range(
+    destination: &mut Vec<PendingGuestWriteRange>,
+    range: PendingGuestWriteRange,
+) {
+    if let Some(existing) = destination.iter_mut().find(|existing| {
+        existing.physical_identity == range.physical_identity
+            && existing.byte_count == range.byte_count
+    }) {
+        *existing = range;
+    } else {
+        destination.push(range);
     }
 }
 
@@ -686,7 +765,7 @@ pub(crate) fn write_back_pending_globals(pending: &[PendingGlobalWriteback]) -> 
         if let Some(expected) = writeback.mapping_identity {
             let byte_count = u64::try_from(writeback.byte_count)
                 .map_err(|_| "writable global buffer byte count does not fit u64")?;
-            let current = guest_shared_mapping_identity(writeback.guest_address, byte_count);
+            let current = guest_shared_backing_identity(writeback.guest_address, byte_count);
             if current != Some(expected) {
                 return Err(format!(
                     "writable global buffer mapping changed before completion address={:#x} bytes={} expected={expected:?} current={current:?}",

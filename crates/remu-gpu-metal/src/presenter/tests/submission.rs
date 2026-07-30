@@ -13,13 +13,17 @@ use remu_gpu::{
 };
 use remu_memory::{
     CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
-    GuestProtection, guest_shared_backing_range,
+    GuestProtection, guest_shared_backing_identity, guest_shared_backing_range,
 };
-use remu_shader::{GlobalMemoryBinding, Program};
+use remu_shader::{GlobalMemoryBinding, Program, ShaderEvaluation};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::super::UploadedGlobalBuffer;
 use super::super::cache::metal_buffer_with_guest_backing_range;
+use super::super::submission::{
+    append_unique_guest_write_ranges, collect_pending_guest_write_ranges,
+};
 use super::{
     ComputePipelineKey, GLOBAL_UPLOAD_ALIGNMENT, GraphicsDiagnosticPipelineState,
     GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason, GuestCommandBatch,
@@ -51,6 +55,48 @@ fn mapped_test_label() -> (GuestAddressSpace, u64) {
 fn read_test_label(address: u64) -> u32 {
     // SAFETY: every caller retains the `GuestAddressSpace` returned by `mapped_test_label`.
     unsafe { std::ptr::read_volatile(address as *const u32) }
+}
+
+fn evaluation_with_global(binding: GlobalMemoryBinding) -> ShaderEvaluation {
+    ShaderEvaluation {
+        initial_scalar_registers: Default::default(),
+        scalar_registers: Default::default(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: vec![binding],
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    }
+}
+
+fn record_zero_copy_guest_writer(
+    presenter: &mut MetalPresenter,
+    device: &Device,
+    binding: &GlobalMemoryBinding,
+) -> UploadedGlobalBuffer {
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+    let uploaded = presenter
+        .upload_global_buffer(device, binding)
+        .expect("writable shared guest binding uploads");
+    assert!(uploaded.guest_memory);
+    let evaluation = evaluation_with_global(binding.clone());
+    let mut pending = Vec::new();
+    collect_pending_guest_write_ranges(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
+        .expect("zero-copy producer provenance is recorded");
+    append_unique_guest_write_ranges(
+        &mut presenter
+            .open_guest_batch
+            .as_mut()
+            .expect("open guest batch")
+            .guest_write_ranges,
+        pending,
+    );
+    uploaded
 }
 
 #[test]
@@ -457,6 +503,78 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
 }
 
 #[test]
+fn queued_copied_writer_forwards_across_a_shifted_physical_alias() {
+    let mut address_space = GuestAddressSpace::new(5 * GUEST_PAGE_SIZE).unwrap();
+    let base = address_space.base();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let consumer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base.checked_add(2 * GUEST_PAGE_SIZE).unwrap()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+    let producer = device.new_buffer(512, MTLResourceOptions::StorageModeShared);
+    let producer_address = producer_alias.get() + 128;
+    let producer_bytes = 256_u64;
+    presenter
+        .open_guest_batch
+        .as_mut()
+        .expect("guest batch")
+        .global_writebacks
+        .push(PendingGlobalWriteback {
+            buffer: producer.clone(),
+            offset: 32,
+            guest_address: producer_address,
+            byte_count: usize::try_from(producer_bytes).unwrap(),
+            mapping_identity: guest_shared_backing_identity(producer_address, producer_bytes),
+            write_watch: None,
+            original_bytes: vec![0; usize::try_from(producer_bytes).unwrap()],
+        });
+    let consumer_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: consumer_alias.get() + 160,
+        instruction_pcs: Default::default(),
+        byte_count: 12,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    };
+    let consumer = presenter
+        .upload_global_buffer(&device, &consumer_binding)
+        .expect("copied producer is forwarded through its physical alias");
+    assert!(!consumer.guest_memory);
+    assert!(std::ptr::eq(producer.as_ref(), consumer.buffer.as_ref()));
+    assert_eq!(consumer.offset, 64);
+    assert_eq!(
+        consumer.physical_identity,
+        guest_shared_backing_identity(consumer_binding.base_address, 12)
+    );
+}
+
+#[test]
 fn disjoint_guest_aliases_share_one_coherent_physical_global_buffer() {
     let mut address_space = GuestAddressSpace::new(10 * GUEST_PAGE_SIZE).unwrap();
     let base = address_space.base();
@@ -595,6 +713,302 @@ fn disjoint_guest_aliases_share_one_coherent_physical_global_buffer() {
         "physically identical aliases must hit the same cached Metal resource"
     );
     assert_eq!(disjoint_upload.offset, contiguous_upload.offset);
+}
+
+#[test]
+fn queued_zero_copy_writer_forwards_exact_buffer_across_shifted_aliases_and_eviction() {
+    let mut address_space = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).unwrap();
+    let base = address_space.base();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let consumer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base.checked_add(2 * GUEST_PAGE_SIZE).unwrap()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let third_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base.checked_add(4 * GUEST_PAGE_SIZE).unwrap()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let producer_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: producer_alias.get() + 128,
+        instruction_pcs: Default::default(),
+        byte_count: 256,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: false,
+    };
+    let producer = record_zero_copy_guest_writer(&mut presenter, &device, &producer_binding);
+
+    // Eviction must not let the consumer recreate an aliasing Metal object. The queued producer
+    // retains the exact resource and its mmap independently of the cache entry.
+    presenter.guest_global_buffer_cache.clear();
+    presenter.guest_global_buffer_cache_bytes = 0;
+    let consumer_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: consumer_alias.get() + 192,
+        instruction_pcs: Default::default(),
+        byte_count: 64,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: false,
+    };
+    let consumer = presenter
+        .upload_global_buffer(&device, &consumer_binding)
+        .expect("contained aliased consumer forwards the queued producer");
+    assert!(consumer.guest_memory);
+    assert!(std::ptr::eq(
+        producer.buffer.as_ref(),
+        consumer.buffer.as_ref()
+    ));
+    assert_eq!(consumer.offset, producer.offset + 64);
+
+    let consumer_evaluation = evaluation_with_global(consumer_binding.clone());
+    let mut pending_consumer = Vec::new();
+    collect_pending_guest_write_ranges(
+        std::slice::from_ref(&consumer),
+        &consumer_evaluation,
+        &mut pending_consumer,
+    )
+    .unwrap();
+    append_unique_guest_write_ranges(
+        &mut presenter
+            .open_guest_batch
+            .as_mut()
+            .expect("producer batch stays open")
+            .guest_write_ranges,
+        pending_consumer,
+    );
+
+    let third_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: third_alias.get() + 208,
+        instruction_pcs: Default::default(),
+        byte_count: 8,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    };
+    let third = presenter
+        .upload_global_buffer(&device, &third_binding)
+        .expect("third read forwards the latest writable alias");
+    assert!(third.guest_memory);
+    assert!(std::ptr::eq(
+        producer.buffer.as_ref(),
+        third.buffer.as_ref()
+    ));
+    assert_eq!(third.offset, producer.offset + 80);
+}
+
+#[test]
+fn partially_overlapping_zero_copy_writer_synchronizes_instead_of_aliasing_buffers() {
+    let mut address_space = GuestAddressSpace::new(5 * GUEST_PAGE_SIZE).unwrap();
+    let base = address_space.base();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let consumer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base.checked_add(2 * GUEST_PAGE_SIZE).unwrap()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let producer_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: producer_alias.get() + 128,
+        instruction_pcs: Default::default(),
+        byte_count: 256,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: false,
+    };
+    let producer = record_zero_copy_guest_writer(&mut presenter, &device, &producer_binding);
+    let partial_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: consumer_alias.get() + 64,
+        instruction_pcs: Default::default(),
+        byte_count: 128,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    };
+    let synchronized = presenter
+        .upload_global_buffer(&device, &partial_binding)
+        .expect("partial overlap drains before taking a fresh snapshot");
+    assert!(!synchronized.guest_memory);
+    assert!(!std::ptr::eq(
+        producer.buffer.as_ref(),
+        synchronized.buffer.as_ref()
+    ));
+}
+
+#[test]
+fn ambiguous_zero_copy_writer_resources_synchronize_before_read() {
+    let mut address_space = GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let alias = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let first_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: alias.get() + 128,
+        instruction_pcs: Default::default(),
+        byte_count: 256,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: false,
+    };
+    let first = record_zero_copy_guest_writer(&mut presenter, &device, &first_binding);
+    let first_identity = first
+        .physical_identity
+        .expect("zero-copy upload captures physical identity");
+    let conflicting_buffer =
+        device.new_buffer(GUEST_PAGE_SIZE, MTLResourceOptions::StorageModeShared);
+    presenter
+        .open_guest_batch
+        .as_mut()
+        .expect("producer batch stays open")
+        .guest_write_ranges
+        .push(super::super::PendingGuestWriteRange {
+            address: alias.get() + 160,
+            byte_count: 256,
+            buffer: conflicting_buffer,
+            offset: 160,
+            physical_identity: remu_memory::GuestSharedMappingIdentity {
+                backing_id: first_identity.backing_id,
+                backing_offset: first_identity.backing_offset + 32,
+            },
+        });
+
+    let read_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: alias.get() + 192,
+        instruction_pcs: Default::default(),
+        byte_count: 8,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    };
+    let synchronized = presenter
+        .upload_global_buffer(&device, &read_binding)
+        .expect("ambiguous resources drain before read");
+    assert!(!synchronized.guest_memory);
+    assert!(!std::ptr::eq(
+        first.buffer.as_ref(),
+        synchronized.buffer.as_ref()
+    ));
+}
+
+#[test]
+fn remapped_zero_copy_writer_address_synchronizes_before_reuse() {
+    let mut address_space = GuestAddressSpace::new(3 * GUEST_PAGE_SIZE).unwrap();
+    let base = address_space.base();
+    let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .unwrap();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let producer_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: producer_alias.get() + 128,
+        instruction_pcs: Default::default(),
+        byte_count: 256,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: false,
+    };
+    let producer = record_zero_copy_guest_writer(&mut presenter, &device, &producer_binding);
+
+    address_space
+        .unmap(producer_alias, GUEST_PAGE_SIZE)
+        .unwrap();
+    let replacement_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(producer_alias),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .unwrap();
+    let remapped_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: producer_alias.get() + 160,
+        instruction_pcs: Default::default(),
+        byte_count: 12,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    };
+    let synchronized = presenter
+        .upload_global_buffer(&device, &remapped_binding)
+        .expect("replacement mapping is read only after draining the old producer");
+    assert!(!synchronized.guest_memory);
+    assert!(!std::ptr::eq(
+        producer.buffer.as_ref(),
+        synchronized.buffer.as_ref()
+    ));
 }
 
 #[test]

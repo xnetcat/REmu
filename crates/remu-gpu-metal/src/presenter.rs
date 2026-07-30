@@ -1110,6 +1110,7 @@ struct UploadedGlobalBuffer {
     buffer: Buffer,
     offset: u64,
     guest_memory: bool,
+    physical_identity: Option<GuestSharedMappingIdentity>,
 }
 
 struct PendingGlobalWriteback {
@@ -1214,10 +1215,12 @@ struct GlobalUploadChunk {
     used: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingGuestWriteRange {
     address: u64,
     byte_count: u64,
+    buffer: Buffer,
+    offset: u64,
+    physical_identity: GuestSharedMappingIdentity,
 }
 
 #[derive(Clone, Debug)]
