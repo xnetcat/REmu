@@ -69,6 +69,14 @@ const TASKGRAPH_QUEUE_INDEX_STRIDE: u64 = 0x200;
 const TASKGRAPH_QUEUE_OFFSET: u64 = 0x38;
 const TASKGRAPH_QUEUE_INDEX_COUNT: u64 = 2;
 const TASKGRAPH_QUEUE_LANES: [(u64, u64, u64); 2] = [(0, 0x48, 0x90), (1, 0x118, 0x160)];
+const TASKGRAPH_QUEUE_WAIT_STATE_OFFSET: u64 = 0x1a8;
+const TASKGRAPH_QUEUE_EVENT_WRAPPER_OFFSET: u64 = 0x1f8;
+const TASKGRAPH_QUEUE_WAITER_BITS: u32 = 26;
+const TASKGRAPH_QUEUE_WAITER_MASK: u64 = (1 << TASKGRAPH_QUEUE_WAITER_BITS) - 1;
+const TASKGRAPH_EVENT_UNDERLYING_OFFSET: u64 = 0x10;
+const TASKGRAPH_EVENT_WORD_OFFSET: u64 = 0x10;
+const TASKGRAPH_EVENT_MUTEX_OFFSET: u64 = 0x20;
+const TASKGRAPH_EVENT_CONDITION_OFFSET: u64 = 0x28;
 const TASKGRAPH_NODE_ID_BITS: u32 = 26;
 const TASKGRAPH_NODE_ID_MASK: u64 = (1 << TASKGRAPH_NODE_ID_BITS) - 1;
 const TASKGRAPH_NODE_PAGE_BITS: u32 = 14;
@@ -559,6 +567,54 @@ struct TaskGraphAllocatorMatch {
     words: [Option<u64>; 8],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TaskGraphQueueSyncSnapshot {
+    wait_state: Option<u64>,
+    waiters: Option<u64>,
+    generation: Option<u64>,
+    event_wrapper: Option<u64>,
+    event_underlying: Option<u64>,
+    event_word: Option<u64>,
+    event_mutex: Option<u64>,
+    event_condition: Option<u64>,
+}
+
+fn taskgraph_queue_sync_snapshot(
+    queue: u64,
+    read_u64: &mut impl FnMut(u64) -> Option<u64>,
+) -> TaskGraphQueueSyncSnapshot {
+    let wait_state = queue
+        .checked_add(TASKGRAPH_QUEUE_WAIT_STATE_OFFSET)
+        .and_then(&mut *read_u64);
+    let event_wrapper = queue
+        .checked_add(TASKGRAPH_QUEUE_EVENT_WRAPPER_OFFSET)
+        .and_then(&mut *read_u64)
+        .filter(|pointer| plausible_guest_pointer(*pointer));
+    let event_underlying = event_wrapper
+        .and_then(|wrapper| wrapper.checked_add(TASKGRAPH_EVENT_UNDERLYING_OFFSET))
+        .and_then(&mut *read_u64)
+        .filter(|pointer| plausible_guest_pointer(*pointer));
+    let event_word = event_underlying
+        .and_then(|underlying| underlying.checked_add(TASKGRAPH_EVENT_WORD_OFFSET))
+        .and_then(&mut *read_u64);
+    let event_mutex = event_underlying
+        .and_then(|underlying| underlying.checked_add(TASKGRAPH_EVENT_MUTEX_OFFSET))
+        .filter(|pointer| plausible_guest_pointer(*pointer));
+    let event_condition = event_underlying
+        .and_then(|underlying| underlying.checked_add(TASKGRAPH_EVENT_CONDITION_OFFSET))
+        .filter(|pointer| plausible_guest_pointer(*pointer));
+    TaskGraphQueueSyncSnapshot {
+        wait_state,
+        waiters: wait_state.map(|state| state & TASKGRAPH_QUEUE_WAITER_MASK),
+        generation: wait_state.map(|state| state >> TASKGRAPH_QUEUE_WAITER_BITS),
+        event_wrapper,
+        event_underlying,
+        event_word,
+        event_mutex,
+        event_condition,
+    }
+}
+
 fn resolve_taskgraph_node(
     handle: u64,
     read_u64: &mut impl FnMut(u64) -> Option<u64>,
@@ -788,6 +844,18 @@ fn emit_taskgraph_wait_snapshot(sequence: u64, event: u64) {
         else {
             continue;
         };
+        let sync = taskgraph_queue_sync_snapshot(queue, &mut read_u64);
+        eprintln!(
+            "[REMu][TASKGRAPH][WAIT] sequence={sequence} queue_index={queue_index} queue={queue:#x} wait_state={} waiters={} generation={} event_wrapper={} event_underlying={} event_word={} event_mutex={} event_condition={}",
+            optional_hex(sync.wait_state),
+            optional_hex(sync.waiters),
+            optional_hex(sync.generation),
+            optional_hex(sync.event_wrapper),
+            optional_hex(sync.event_underlying),
+            optional_hex(sync.event_word),
+            optional_hex(sync.event_mutex),
+            optional_hex(sync.event_condition),
+        );
         for (lane, head_offset, tail_offset) in TASKGRAPH_QUEUE_LANES {
             let head = queue.checked_add(head_offset).and_then(&mut read_u64);
             let tail = queue.checked_add(tail_offset).and_then(&mut read_u64);
@@ -1291,10 +1359,11 @@ mod taskgraph_wait_snapshot_tests {
     use super::{
         MAXIMUM_GUEST_ADDRESS, MINIMUM_GUEST_ADDRESS, TASKGRAPH_ALLOCATOR_PAGE_BYTES,
         TASKGRAPH_FENCE_TASK_VPTR, TASKGRAPH_NODE_PAGE_BITS, TASKGRAPH_NODE_PAGE_MASK,
-        TASKGRAPH_NODE_SLAB_POINTERS, TASKGRAPH_NODE_STRIDE, TASKGRAPH_TASK_ALIGNMENT,
+        TASKGRAPH_NODE_SLAB_POINTERS, TASKGRAPH_NODE_STRIDE, TASKGRAPH_QUEUE_EVENT_WRAPPER_OFFSET,
+        TASKGRAPH_QUEUE_WAIT_STATE_OFFSET, TASKGRAPH_TASK_ALIGNMENT,
         TASKGRAPH_WAIT_EVENT_CALLER_RETURN, TASKGRAPH_WAIT_GRANDPARENT_RETURN,
         TASKGRAPH_WAIT_PARENT_RETURN, scan_taskgraph_allocator_pages, taskgraph_allocator_pages,
-        taskgraph_wait_chain_matches, walk_taskgraph_lane,
+        taskgraph_queue_sync_snapshot, taskgraph_wait_chain_matches, walk_taskgraph_lane,
     };
     use std::collections::BTreeMap;
 
@@ -1329,6 +1398,32 @@ mod taskgraph_wait_snapshot_tests {
             TASKGRAPH_WAIT_PARENT_RETURN + 1,
             TASKGRAPH_WAIT_GRANDPARENT_RETURN,
         ));
+    }
+
+    #[test]
+    fn queue_sync_snapshot_names_exact_wait_state_and_event_condition() {
+        let queue = 0x72_e0df_4dc8;
+        let event_wrapper = 0x70_20e1_32c0;
+        let event_underlying = 0x70_40e5_50a0;
+        let wait_state = (0xb13e << 26) | 1;
+        let mut memory = BTreeMap::from([
+            (queue + TASKGRAPH_QUEUE_WAIT_STATE_OFFSET, wait_state),
+            (queue + TASKGRAPH_QUEUE_EVENT_WRAPPER_OFFSET, event_wrapper),
+            (event_wrapper + 0x10, event_underlying),
+            (event_underlying + 0x10, 120_127_489),
+        ]);
+        let mut read_u64 = |address| memory.remove(&address);
+
+        let snapshot = taskgraph_queue_sync_snapshot(queue, &mut read_u64);
+
+        assert_eq!(snapshot.wait_state, Some(wait_state));
+        assert_eq!(snapshot.waiters, Some(1));
+        assert_eq!(snapshot.generation, Some(0xb13e));
+        assert_eq!(snapshot.event_wrapper, Some(event_wrapper));
+        assert_eq!(snapshot.event_underlying, Some(event_underlying));
+        assert_eq!(snapshot.event_word, Some(120_127_489));
+        assert_eq!(snapshot.event_mutex, Some(event_underlying + 0x20));
+        assert_eq!(snapshot.event_condition, Some(event_underlying + 0x28));
     }
 
     #[test]

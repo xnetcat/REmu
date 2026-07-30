@@ -1746,6 +1746,8 @@ struct GuestImportTraceRecord {
     active: AtomicBool,
     phase: AtomicU8,
     dispatch_index: AtomicU64,
+    integer_argument0: AtomicU64,
+    integer_argument1: AtomicU64,
     guest_return_address: AtomicU64,
     guest_rsp: AtomicU64,
     calls: AtomicU64,
@@ -1757,6 +1759,8 @@ struct GuestImportTraceRecord {
 struct GuestImportTraceGuard {
     record: *const GuestImportTraceRecord,
     dispatch_index: u64,
+    integer_argument0: u64,
+    integer_argument1: u64,
     guest_return_address: u64,
     guest_rsp: u64,
 }
@@ -1910,13 +1914,15 @@ fn start_guest_import_trace_reporter() {
                             record.phase.load(Ordering::Acquire),
                         );
                         eprintln!(
-                            "[REMu][THREAD][STALE] thread={:#x} name={:?} age_ms={} phase={} nid={} import={} return={:#x} rsp={:#x} calls={} transition={transition_sequence}",
+                            "[REMu][THREAD][STALE] thread={:#x} name={:?} age_ms={} phase={} nid={} import={} arg0={:#x} arg1={:#x} return={:#x} rsp={:#x} calls={} transition={transition_sequence}",
                             record.thread,
                             record.name,
                             age_nanos / 1_000_000,
                             phase.name(),
                             nid,
                             nid_display_name(nid).unwrap_or("unknown"),
+                            record.integer_argument0.load(Ordering::Acquire),
+                            record.integer_argument1.load(Ordering::Acquire),
                             record.guest_return_address.load(Ordering::Acquire),
                             record.guest_rsp.load(Ordering::Acquire),
                             record.calls.load(Ordering::Acquire),
@@ -1945,6 +1951,8 @@ impl GuestImportTraceGuard {
                 active: AtomicBool::new(true),
                 phase: AtomicU8::new(GuestImportTracePhase::Guest as u8),
                 dispatch_index: AtomicU64::new(0),
+                integer_argument0: AtomicU64::new(0),
+                integer_argument1: AtomicU64::new(0),
                 guest_return_address: AtomicU64::new(0),
                 guest_rsp: AtomicU64::new(0),
                 calls: AtomicU64::new(0),
@@ -1967,6 +1975,12 @@ impl GuestImportTraceGuard {
             .dispatch_index
             .store(frame.dispatch_index, Ordering::Relaxed);
         record
+            .integer_argument0
+            .store(frame.integer_arguments[0], Ordering::Relaxed);
+        record
+            .integer_argument1
+            .store(frame.integer_arguments[1], Ordering::Relaxed);
+        record
             .guest_return_address
             .store(frame.guest_return_address, Ordering::Relaxed);
         record.guest_rsp.store(frame.guest_rsp, Ordering::Relaxed);
@@ -1984,6 +1998,8 @@ impl GuestImportTraceGuard {
         Some(Self {
             record,
             dispatch_index: frame.dispatch_index,
+            integer_argument0: frame.integer_arguments[0],
+            integer_argument1: frame.integer_arguments[1],
             guest_return_address: frame.guest_return_address,
             guest_rsp: frame.guest_rsp,
         })
@@ -1997,6 +2013,12 @@ impl Drop for GuestImportTraceGuard {
         record
             .dispatch_index
             .store(self.dispatch_index, Ordering::Relaxed);
+        record
+            .integer_argument0
+            .store(self.integer_argument0, Ordering::Relaxed);
+        record
+            .integer_argument1
+            .store(self.integer_argument1, Ordering::Relaxed);
         record
             .guest_return_address
             .store(self.guest_return_address, Ordering::Relaxed);
