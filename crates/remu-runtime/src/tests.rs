@@ -11,6 +11,8 @@ use super::{
 
 type TlsHelper = unsafe extern "C" fn() -> u64;
 
+type TlsStoreHelper = unsafe extern "C" fn();
+
 #[test]
 fn av_player_nv12_layout_matches_linear_gpu_texture_pitch() {
     assert_eq!(
@@ -124,10 +126,20 @@ fn links_relative_and_import_relocations_into_fixed_memory() {
     bytes[0x180..0x18d].copy_from_slice(b"\0testNid#A#A\0");
     bytes[0x1d8..0x1dc].copy_from_slice(&1_u32.to_le_bytes());
     bytes[0x1dc] = 0x12;
-    write_relocation(&mut bytes[0x1f0..], 0, 0x4180, 8, 0x1234);
-    write_relocation(&mut bytes[0x1f0..], 1, 0x4188, (1_u64 << 32) | 7, 0);
+    bytes[0x1f0..0x1f4].copy_from_slice(&13_u32.to_le_bytes());
+    bytes[0x1f4] = 0x12;
+    bytes[0x1f6..0x1f8].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[0x1f8..0x200].copy_from_slice(&0x4150_u64.to_le_bytes());
+    bytes[0x200..0x208].copy_from_slice(&13_u64.to_le_bytes());
+    write_relocation(&mut bytes[0x210..], 0, 0x4180, 8, 0x1234);
+    write_relocation(&mut bytes[0x210..], 1, 0x4188, (1_u64 << 32) | 7, 0);
     bytes[0x240..0x249].copy_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+    bytes[0x250..0x25c]
+        .copy_from_slice(&[0x64, 0xc7, 0x04, 0x25, 0x28, 0, 0, 0, 0x0b, 0, 0x02, 0xa0]);
+    bytes[0x25c] = 0xc3;
     bytes[0x260..0x262].copy_from_slice(&[0xaa, 0xbb]);
+    bytes[0x290..0x29c]
+        .copy_from_slice(&[0x64, 0xc7, 0x04, 0x25, 0x28, 0, 0, 0, 0x0b, 0, 0x02, 0xa0]);
     let executable = load_reader(&mut Cursor::new(bytes)).unwrap();
 
     let linked = LinkedImage::link_main(&executable).unwrap();
@@ -136,6 +148,7 @@ fn links_relative_and_import_relocations_into_fixed_memory() {
     assert_eq!(linked.import_stubs.len(), 1);
     assert_eq!(linked.tls.static_block_size, 0x20);
     assert_eq!(linked.tls.patched_loads, 1);
+    assert_eq!(linked.tls.patched_stores, 1);
     let base = linked.memory.image_base().get();
     let mut relative = [0_u8; 8];
     linked
@@ -171,6 +184,40 @@ fn links_relative_and_import_relocations_into_fixed_memory() {
     // SAFETY: The helper takes no arguments and returns the configured pointer in RAX.
     assert_eq!(unsafe { helper() }, 0x1234_5678_9abc_def0);
     set_current_guest_thread_pointer(0);
+    let mut patched_tls_store = [0_u8; 12];
+    linked
+        .memory
+        .read(GuestAddress::new(base + 0x4150), &mut patched_tls_store)
+        .unwrap();
+    assert_eq!(
+        &patched_tls_store[..6],
+        &[0x48, 0x8d, 0x64, 0x24, 0x80, 0xe8]
+    );
+    assert_eq!(&patched_tls_store[10..], &[0x90; 2]);
+    set_current_guest_thread_pointer(linked.tls.thread_pointer.get());
+    // SAFETY: The test fixture emits a TLS store followed by RET, and the linker finalized it.
+    let store_helper: TlsStoreHelper = unsafe { std::mem::transmute(base + 0x4150) };
+    // SAFETY: The rewritten fixture takes no arguments and stores through the configured guest TP.
+    unsafe { store_helper() };
+    set_current_guest_thread_pointer(0);
+    let mut tls_errno = [0_u8; 4];
+    linked
+        .memory
+        .read(
+            GuestAddress::new(linked.tls.thread_pointer.get() + 0x28),
+            &mut tls_errno,
+        )
+        .unwrap();
+    assert_eq!(u32::from_le_bytes(tls_errno), 0xa002_000b);
+    let mut embedded_tls_pattern = [0_u8; 12];
+    linked
+        .memory
+        .read(GuestAddress::new(base + 0x4190), &mut embedded_tls_pattern)
+        .unwrap();
+    assert_eq!(
+        embedded_tls_pattern,
+        [0x64, 0xc7, 0x04, 0x25, 0x28, 0, 0, 0, 0x0b, 0, 0x02, 0xa0]
+    );
     let mut tls_template = [0_u8; 2];
     linked
         .memory
@@ -220,8 +267,8 @@ fn write_dynamic(bytes: &mut [u8]) {
         (5_i64, 0x4080_u64),
         (10, 0x40),
         (6, 0x40c0),
-        (0x6100_003f, 0x30),
-        (7, 0x40f0),
+        (0x6100_003f, 0x48),
+        (7, 0x4110),
         (8, 0x30),
         (0, 0),
     ];

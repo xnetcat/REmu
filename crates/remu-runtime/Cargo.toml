@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+iced-x86.workspace = true
 libc.workspace = true
 remu-core = { path = "../remu-core" }
 remu-gpu = { path = "../remu-gpu" }
