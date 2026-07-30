@@ -143,6 +143,7 @@ impl MetalPresenter {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     for key in self.compiling_shader_pairs.drain() {
+                        PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: compiler worker stopped",
                             key.export_shader_address, key.pixel_shader_address
@@ -150,6 +151,7 @@ impl MetalPresenter {
                         self.failed_shader_pairs.insert(key);
                     }
                     for key in self.compiling_compute_pipelines.drain() {
+                        PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "[REMu][METAL] Gen5 compute program={:#x} failed: compiler worker stopped",
                             key.program_identity.0.address
@@ -191,6 +193,7 @@ impl MetalPresenter {
                             self.compiled_shader_pairs.insert(key, compiled);
                         }
                         Err(error) => {
+                            PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
                             self.failed_shader_pairs.insert(key.clone());
                             eprintln!(
                                 "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
@@ -221,6 +224,7 @@ impl MetalPresenter {
                             self.compiled_compute_pipelines.insert(key, compiled);
                         }
                         Err(error) => {
+                            PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
                             self.failed_compute_pipelines.insert(key);
                             eprintln!(
                                 "[REMu][METAL] Gen5 compute cs={shader_address:#x} failed: {error}"
