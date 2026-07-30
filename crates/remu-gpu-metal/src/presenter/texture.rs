@@ -8,7 +8,7 @@ use super::{
     GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
     MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
     RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
-    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    ResidentTextureActivityStamp, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
@@ -34,6 +34,7 @@ use super::{
 use remu_memory::guest_shared_mapping_identity;
 use remu_memory::{CpuWriteWatchRetirement, read_guest_shared_backing, write_guest_shared_backing};
 mod depth_array;
+mod lifetime;
 mod mips;
 mod residency;
 mod retire;
@@ -43,6 +44,10 @@ mod watch;
 pub(crate) use self::depth_array::resident_is_depth_array_face;
 #[cfg(test)]
 pub(crate) use self::depth_array::{depth_array_face_descriptor, depth_array_face_set_is_complete};
+pub(crate) use self::lifetime::{
+    RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, resident_texture_activity_stats,
+    resident_texture_backing_overlap_stats,
+};
 pub(crate) use self::mips::{
     create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
     create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,

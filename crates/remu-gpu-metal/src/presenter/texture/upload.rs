@@ -5,9 +5,10 @@ use super::super::sampled_texture_cache_byte_capacity;
 use super::{
     CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
     GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    ResidentGuestTexture, SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
-    SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
-    SampledTextureKey, UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
+    ResidentGuestTexture, ResidentTextureActivityStamp, SAMPLED_TEXTURE_CACHE_CAPACITY,
+    SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
+    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey,
+    UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
     create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
     create_sampled_guest_texture, decode_image_descriptor, decode_sampled_texture_linear_from_raw,
     ensure_mipmapped_resident_texture_in_map, ensure_resident_texture_in_map,
@@ -21,7 +22,7 @@ use super::{
     sampled_texture_key, sampled_texture_uses_exact_mode5_mips,
     sampled_texture_uses_exact_mode27_mips, sampler_uses_normalized_coordinates,
     snapshot_watched_sampled_texture_raw, storage_image_requires_mip_hierarchy,
-    texture_element_layout, trace_target_sampling,
+    texture_element_layout, trace_resident_texture_removal, trace_target_sampling,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
@@ -120,6 +121,7 @@ pub(crate) fn upload_image_textures(
     sampled_texture_write_watches: &mut HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
     fallback_texture_cache: &mut HashMap<SampledTextureKey, Texture>,
     next_sampled_texture_use: &mut u64,
+    activity_stamp: ResidentTextureActivityStamp,
 ) -> Result<Vec<UploadedImageTexture>, String> {
     canonical_texture_bindings(evaluation)
         .into_iter()
@@ -245,7 +247,12 @@ pub(crate) fn upload_image_textures(
                     false
                 };
                 if replaced {
-                    resident_guest_textures.remove(&descriptor.guest);
+                    if let Some(resident) = resident_guest_textures.remove(&descriptor.guest) {
+                        trace_resident_texture_removal(
+                            "sample-upload-mapping-replaced",
+                            &resident,
+                        );
+                    }
                 }
             }
             let multisample_resolve = (!comparison && descriptor.texture_type == 9)
@@ -316,7 +323,7 @@ pub(crate) fn upload_image_textures(
                 let resident = resident_guest_textures.get_mut(&resident_descriptor)?;
                 let version = resident.content_version;
                 resident_texture_for_sample(resident, descriptor)
-                    .map(|texture| (version, texture))
+                    .map(|texture| (resident_descriptor, version, texture))
             });
             // A guest descriptor can retain an exact single-sample resident from an earlier
             // render phase while the current frame is produced through a distinct MSAA target
@@ -324,12 +331,20 @@ pub(crate) fn upload_image_textures(
             // whichever compatible GPU image was written most recently. This also naturally
             // retains an exact post-process result when it is newer than the MSAA resolve.
             let select_multisample = match (&resident_resolve, &multisample_resolve) {
-                (Some((resident_version, _)), Some((multisample_version, _, _))) => {
+                (Some((_, resident_version, _)), Some((multisample_version, _, _))) => {
                     multisample_version > resident_version
                 }
                 (None, Some(_)) => true,
                 _ => false,
             };
+            if !select_multisample
+                && let Some((resident_descriptor, ..)) = resident_resolve.as_ref()
+                && let Some(activity) = resident_guest_textures
+                    .get_mut(resident_descriptor)
+                    .and_then(|resident| resident.activity.as_mut())
+            {
+                activity.note_read(activity_stamp);
+            }
             if trace_target_sampling()
                 && descriptor.guest.width == 1_920
                 && descriptor.guest.height == 1_080
@@ -360,7 +375,7 @@ pub(crate) fn upload_image_textures(
             } else {
                 resident_resolve
                     .as_ref()
-                    .map(|(_, texture)| texture.clone())
+                    .map(|(_, _, texture)| texture.clone())
             };
             // A layered depth-sample SRD assembled from resident depth faces is served directly:
             // the assembly ran before this upload pass, inside the guest command batch, so the

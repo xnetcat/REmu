@@ -12,8 +12,9 @@ use super::{
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
     NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_THREADS, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    append_unique_global_writebacks, append_unique_guest_write_ranges, canonical_texture_bindings,
-    capture_guest_frame, capture_target_sample_textures, collect_pending_global_writebacks,
+    ResidentTextureActivityStamp, append_unique_global_writebacks,
+    append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
+    capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, color_operation_is_raster_noop,
     compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
     consume_depth_metadata_clear, create_global_argument_buffer,
@@ -528,6 +529,10 @@ impl MetalPresenter {
         self.prepare_depth_array_textures(&device, &[export_evaluation, pixel_evaluation])?;
         let export_buffers = self.upload_global_buffers(&device, export_evaluation)?;
         let pixel_buffers = self.upload_global_buffers(&device, pixel_evaluation)?;
+        let activity_stamp = ResidentTextureActivityStamp {
+            work: draw.sequence,
+            flip: self.next_flip_sequence,
+        };
         let export_textures = upload_image_textures(
             &device,
             &queue,
@@ -539,6 +544,7 @@ impl MetalPresenter {
             &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
+            activity_stamp,
         )?;
         let pixel_textures = upload_image_textures(
             &device,
@@ -551,6 +557,7 @@ impl MetalPresenter {
             &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
+            activity_stamp,
         )?;
         let (
             pipeline,
@@ -1402,9 +1409,12 @@ impl MetalPresenter {
             } else {
                 if target.sample_count > 1 {
                     self.mark_multisample_texture_initialized(target.texture, target.sample_count);
-                    self.mark_resident_texture_written_preserving_multisample(target.texture);
+                    self.mark_resident_texture_written_preserving_multisample_at(
+                        target.texture,
+                        activity_stamp,
+                    );
                 } else {
-                    self.mark_resident_texture_written(target.texture);
+                    self.mark_resident_texture_written_at(target.texture, activity_stamp);
                 }
             }
             // A flip can arrive before the presenter has translated its render target. Remember
@@ -1441,9 +1451,12 @@ impl MetalPresenter {
             }
             if depth.write_enabled || depth.clear_enabled {
                 if depth.sample_count > 1 {
-                    self.mark_resident_texture_written_preserving_multisample(depth.texture);
+                    self.mark_resident_texture_written_preserving_multisample_at(
+                        depth.texture,
+                        activity_stamp,
+                    );
                 } else {
-                    self.mark_resident_texture_written(depth.texture);
+                    self.mark_resident_texture_written_at(depth.texture, activity_stamp);
                 }
             }
         }
@@ -1475,7 +1488,7 @@ impl MetalPresenter {
                         sampled.clone(),
                     );
                 }
-                self.mark_resident_texture_written(texture.descriptor.guest);
+                self.mark_resident_texture_written_at(texture.descriptor.guest, activity_stamp);
                 self.note_pending_flip_target_write(texture.descriptor.guest);
             }
         }
@@ -2562,6 +2575,11 @@ impl MetalPresenter {
         let source_texture = self.ensure_layered_render_target_texture(&device, source, false)?;
         let destination_texture =
             self.ensure_layered_render_target_texture(&device, destination, true)?;
+        let activity_stamp = ResidentTextureActivityStamp {
+            work: draw.sequence,
+            flip: self.next_flip_sequence,
+        };
+        self.note_resident_texture_read_at(source.texture, activity_stamp);
 
         self.ensure_open_guest_batch(&queue);
         let batch = self
@@ -2601,7 +2619,7 @@ impl MetalPresenter {
             export_dispatcher: false,
             pixel_dispatcher: false,
         });
-        self.mark_resident_texture_written(destination.texture);
+        self.mark_resident_texture_written_at(destination.texture, activity_stamp);
         self.note_pending_flip_target_write(destination.texture);
         Ok((source.texture, destination.texture))
     }
@@ -2618,6 +2636,10 @@ impl MetalPresenter {
     ) -> Result<Option<GuestTextureDescriptor>, String> {
         let Some(target) = decode_color_eliminate_fast_clear_target(draw)? else {
             return Ok(None);
+        };
+        let activity_stamp = ResidentTextureActivityStamp {
+            work: draw.sequence,
+            flip: self.next_flip_sequence,
         };
         if target.texture_type != 9
             || target.layer_count != 1
@@ -2696,9 +2718,12 @@ impl MetalPresenter {
         });
         if target.sample_count > 1 {
             self.mark_multisample_texture_initialized(target.texture, target.sample_count);
-            self.mark_resident_texture_written_preserving_multisample(target.texture);
+            self.mark_resident_texture_written_preserving_multisample_at(
+                target.texture,
+                activity_stamp,
+            );
         } else {
-            self.mark_resident_texture_written(target.texture);
+            self.mark_resident_texture_written_at(target.texture, activity_stamp);
         }
         self.note_pending_flip_target_write(target.texture);
         Ok(Some(target.texture))

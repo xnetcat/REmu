@@ -146,6 +146,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             gpu_written: false,
             content_version: 0,
             gpu_write_watch_generations: Vec::new(),
+            activity: super::super::ResidentTextureActivity::enabled(),
         },
     );
     resident_texture_for_sample(
@@ -321,6 +322,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
         gpu_written: resident.gpu_written,
         content_version: resident.content_version,
         gpu_write_watch_generations,
+        activity: resident.activity,
     })
 }
 

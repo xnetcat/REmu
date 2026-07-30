@@ -3,17 +3,18 @@
 
 use super::{
     CompiledComputePipeline, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork,
-    MetalPresenter, append_unique_global_writebacks, append_unique_guest_write_ranges,
-    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
-    create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
-    dump_compute_shader_msl, dump_msl_compute_filter_matches, guest_texture_descriptors_overlap,
-    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    read_texture_linear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
-    record_diagnostic_texture_writer, resident_color_view_sample_is_eligible,
-    sampled_image_bindings, shader_scalar_metadata_for_registers,
-    storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    MetalPresenter, ResidentTextureActivityStamp, append_unique_global_writebacks,
+    append_unique_guest_write_ranges, collect_pending_global_writebacks,
+    collect_pending_guest_write_ranges, compile_metal_compute_library, compute_pipeline_key,
+    compute_program_can_split_wave64, create_global_argument_buffer, decode_image_descriptor,
+    diagnostic_texture_writer_enabled, dump_compute_shader_msl, dump_msl_compute_filter_matches,
+    guest_texture_descriptors_overlap, image_resource_descriptor_is_null, is_storage_image_opcode,
+    is_writable_image_opcode, read_texture_linear, rearm_depth_metadata_clear,
+    record_diagnostic_global_writers, record_diagnostic_texture_writer,
+    resident_color_view_sample_is_eligible, sampled_image_bindings,
+    shader_scalar_metadata_for_registers, storage_image_requires_mip_hierarchy,
+    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
+    wave64_split_blockers,
 };
 use metal::{MTLResourceUsage, MTLSize};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
@@ -266,6 +267,10 @@ impl MetalPresenter {
             bindings.global_argument_buffer_index,
             &buffers,
         )?;
+        let activity_stamp = ResidentTextureActivityStamp {
+            work: dispatch.sequence,
+            flip: self.next_flip_sequence,
+        };
         let textures = upload_image_textures(
             &device,
             &queue,
@@ -277,6 +282,7 @@ impl MetalPresenter {
             &mut self.sampled_texture_write_watches,
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
+            activity_stamp,
         )?;
         let (sampler_buffer, samplers) = self.cached_sampler_argument_buffer(
             &device,
@@ -438,7 +444,7 @@ impl MetalPresenter {
                         sampled.clone(),
                     );
                 }
-                self.mark_resident_texture_written(texture.descriptor.guest);
+                self.mark_resident_texture_written_at(texture.descriptor.guest, activity_stamp);
                 // Gen5 presentation targets are ordinary guest images and may be completed by a
                 // storage-image compute pass (upscaling, tone mapping, or format conversion)
                 // rather than a color attachment. Treat that write exactly like a render-target

@@ -11,17 +11,18 @@ use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
 
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter,
-    WriteWatchRefresh, apply_image_destination_select, comparison_depth32_upload,
-    create_sampled_guest_texture, decode_image_descriptor, depth_array_face_descriptor,
-    depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
-    guest_texture_byte_count, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_color_view_storage,
+    ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
+    apply_image_destination_select, comparison_depth32_upload, create_sampled_guest_texture,
+    decode_image_descriptor, depth_array_face_descriptor, depth_array_face_set_is_complete,
+    fallback_image_descriptor, guest_shared_mapping_identity, guest_texture_byte_count,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_storage, guest_texture_raw_matches, guest_texture_raw_range,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
     mode27_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
-    render_resolve_candidate_matches, resident_texture_ownership_stats, sampled_alias_descriptor,
-    sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
+    render_resolve_candidate_matches, resident_texture_activity_stats,
+    resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
+    sampled_alias_descriptor, sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
     sampled_texture_cache_requires_eviction, snapshot_guest_texture_raw,
     snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy,
     upload_image_textures, watch_guest_texture, write_watched_guest_texture_linear,
@@ -174,6 +175,7 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
         &mut presenter.sampled_texture_write_watches,
         &mut presenter.fallback_texture_cache,
         &mut presenter.next_sampled_texture_use,
+        ResidentTextureActivityStamp::default(),
     )
     .expect("storage alias upload");
 
@@ -1203,6 +1205,91 @@ fn resident_ownership_stats_distinguish_gpu_state_and_replaced_mappings() {
     assert_eq!(retired.unique_backing_bases, 1);
     assert_eq!(retired.unique_backing_spans, 1);
     assert_eq!(retired.unresolved_backing_count, 0);
+}
+
+#[test]
+fn resident_lifetime_stats_attribute_physical_aliases_and_activity_age() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("target mapping")
+        .get();
+    let first = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let second = GuestTextureDescriptor {
+        address: address + 512,
+        ..first
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, first)
+        .expect("first target resident");
+    presenter
+        .ensure_resident_texture(&device, second)
+        .expect("second target resident");
+    assert_eq!(presenter.resident_guest_textures.len(), 2);
+
+    let first_resident = presenter
+        .resident_guest_textures
+        .get_mut(&first)
+        .expect("first resident");
+    first_resident.gpu_written = true;
+    first_resident.activity = Some(ResidentTextureActivity {
+        last_read_work: Some(100),
+        last_read_flip: Some(10),
+        last_write_work: Some(90),
+        last_write_flip: Some(9),
+    });
+    presenter
+        .resident_guest_textures
+        .get_mut(&second)
+        .expect("second resident")
+        .activity = Some(ResidentTextureActivity {
+        last_read_work: None,
+        last_read_flip: None,
+        last_write_work: Some(10),
+        last_write_flip: Some(1),
+    });
+
+    let overlap = resident_texture_backing_overlap_stats(&presenter.resident_guest_textures);
+    assert_eq!(overlap.pair_count, 1);
+    assert_eq!(overlap.pair_overlap_bytes, 512);
+    assert_eq!(overlap.resident_count, 2);
+    assert_eq!(overlap.gpu_owned_count, 1);
+    assert_eq!(overlap.cpu_owned_count, 1);
+
+    let activity = resident_texture_activity_stats(&presenter.resident_guest_textures, 100, 10);
+    assert_eq!(activity.read_work[0].gpu_owned_count, 1);
+    assert_eq!(activity.read_work[5].cpu_owned_count, 1);
+    assert_eq!(activity.write_work[0].gpu_owned_count, 1);
+    assert_eq!(activity.write_work[1].cpu_owned_count, 1);
+    assert_eq!(activity.read_flip[0].gpu_owned_count, 1);
+    assert_eq!(activity.read_flip[5].cpu_owned_count, 1);
+    assert_eq!(activity.write_flip[1].gpu_owned_count, 1);
+    assert_eq!(activity.write_flip[3].cpu_owned_count, 1);
 }
 
 #[test]

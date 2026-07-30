@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -152,6 +153,18 @@ use self::submission::{
 };
 #[cfg(test)]
 use self::submission::{apply_pending_guest_memory_writes, write_back_pending_globals};
+use self::texture::{
+    RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, decode_guest_texture_linear_from_raw,
+    refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
+    resident_texture_activity_stats, resident_texture_backing_overlap_stats,
+    resident_texture_ownership_stats, retire_multisample_textures_overlapping_writeback,
+    retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
+    retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
+    snapshot_watched_guest_range, storage_image_requires_mip_hierarchy,
+    trace_resident_texture_removal, upload_image_textures,
+    write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
+    write_watched_guest_texture_linear,
+};
 #[cfg(test)]
 use self::texture::{
     apply_image_destination_select, comparison_depth32_upload,
@@ -164,17 +177,6 @@ use self::texture::{
     sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
     sampled_texture_key, sampled_texture_raw_range, snapshot_guest_texture_linear,
     snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
-};
-use self::texture::{
-    decode_guest_texture_linear_from_raw, refresh_resident_texture_write_watch,
-    resident_color_view_sample_is_eligible, resident_texture_ownership_stats,
-    retire_multisample_textures_overlapping_writeback,
-    retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
-    retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
-    snapshot_watched_guest_range, storage_image_requires_mip_hierarchy,
-    trace_resident_texture_removal, upload_image_textures,
-    write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
-    write_watched_guest_texture_linear,
 };
 use self::tiling::{
     GuestTextureOverlapQuery, copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear,
@@ -242,6 +244,19 @@ fn sampled_texture_cache_byte_capacity() -> Option<u64> {
             .unwrap_or(DEFAULT_SAMPLED_TEXTURE_CACHE_MIB);
         (capacity_mib != 0).then(|| capacity_mib.saturating_mul(1024 * 1024))
     })
+}
+
+fn resident_texture_lifetime_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_TEXTURE_LIFETIMES").is_some_and(|value| value != "0")
+    })
+}
+
+static RESIDENT_TEXTURE_ACTIVITY_LATEST_WORK: AtomicU64 = AtomicU64::new(0);
+
+fn resident_texture_activity_latest_work() -> u64 {
+    RESIDENT_TEXTURE_ACTIVITY_LATEST_WORK.load(Ordering::Relaxed)
 }
 
 fn shader_compiler_worker_count() -> usize {
@@ -723,6 +738,43 @@ struct ResidentGuestTexture {
     /// because both touch the same watched host pages. The monotonically increasing generations
     /// establish the ownership boundary at the actual GPU write.
     gpu_write_watch_generations: Vec<u64>,
+    /// Read/write chronology used only by opt-in texture-lifetime diagnostics.
+    ///
+    /// Ordinary runs retain no counters and take only the predictable `Option::None` branch at
+    /// resident sample/write sites.
+    activity: Option<ResidentTextureActivity>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResidentTextureActivity {
+    last_read_work: Option<u64>,
+    last_read_flip: Option<u64>,
+    last_write_work: Option<u64>,
+    last_write_flip: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResidentTextureActivityStamp {
+    work: u64,
+    flip: u64,
+}
+
+impl ResidentTextureActivity {
+    fn enabled() -> Option<Self> {
+        resident_texture_lifetime_diagnostics_enabled().then(Self::default)
+    }
+
+    fn note_read(&mut self, stamp: ResidentTextureActivityStamp) {
+        RESIDENT_TEXTURE_ACTIVITY_LATEST_WORK.fetch_max(stamp.work, Ordering::Relaxed);
+        self.last_read_work = Some(stamp.work);
+        self.last_read_flip = Some(stamp.flip);
+    }
+
+    fn note_write(&mut self, stamp: ResidentTextureActivityStamp) {
+        RESIDENT_TEXTURE_ACTIVITY_LATEST_WORK.fetch_max(stamp.work, Ordering::Relaxed);
+        self.last_write_work = Some(stamp.work);
+        self.last_write_flip = Some(stamp.flip);
+    }
 }
 
 impl ResidentGuestTexture {
