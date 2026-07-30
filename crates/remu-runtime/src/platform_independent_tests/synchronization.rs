@@ -174,6 +174,82 @@ fn rwlock_tracks_recursive_read_ownership_and_excludes_writers() {
 }
 
 #[test]
+fn rwlock_keeps_reader_priority_while_a_writer_is_waiting() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let address = 0x7fff_0000_0180;
+    assert_eq!(crate::guest_rwlock_init(address), 0);
+    assert_eq!(crate::guest_rwlock_lock(address, false, false), 0);
+
+    let (writer_result, receiver) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let result = crate::guest_rwlock_lock(address, true, false);
+        writer_result
+            .send(result)
+            .expect("test receiver remains live");
+        if result == 0 {
+            assert_eq!(crate::guest_rwlock_unlock(address), 0);
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let waiting = crate::guest_sync()
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rwlocks
+            .get(&address)
+            .map_or(0, |lock| lock.waiting_writers);
+        if waiting == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "guest rwlock writer did not block"
+        );
+        std::thread::yield_now();
+    }
+
+    assert_eq!(
+        crate::guest_rwlock_lock(address, false, true),
+        0,
+        "a queued writer must not block a recursive reader"
+    );
+    assert_eq!(crate::guest_rwlock_unlock(address), 0);
+
+    let reader = std::thread::spawn(move || {
+        let result = crate::guest_rwlock_lock(address, false, true);
+        if result == 0 {
+            assert_eq!(crate::guest_rwlock_unlock(address), 0);
+        }
+        result
+    });
+    assert_eq!(
+        reader.join().expect("guest reader thread"),
+        0,
+        "a queued writer must not block a new reader"
+    );
+    assert!(
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "the writer acquired before the active reader released"
+    );
+
+    assert_eq!(crate::guest_rwlock_unlock(address), 0);
+    assert_eq!(
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer acquired after readers released"),
+        0
+    );
+    writer.join().expect("guest writer thread");
+    assert_eq!(crate::guest_rwlock_destroy(address), 0);
+}
+
+#[test]
 fn mutex_types_apply_gen5_same_thread_relock_semantics() {
     let _guard = GUEST_CONDITION_TEST
         .lock()

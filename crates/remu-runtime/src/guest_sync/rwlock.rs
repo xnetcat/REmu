@@ -104,10 +104,12 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
     }
 
     loop {
+        // Gen5 rwlocks are reader-first: only an active writer excludes a reader. Making queued
+        // writers exclusive here can deadlock a reader that recursively acquires the same lock.
         let acquired = state
             .rwlocks
             .get(&address)
-            .is_some_and(|lock| lock.writer.is_none() && lock.waiting_writers == 0);
+            .is_some_and(|lock| lock.writer.is_none());
         if acquired {
             let lock = state
                 .rwlocks
