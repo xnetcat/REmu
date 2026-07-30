@@ -13,19 +13,21 @@ use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter,
     ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
     apply_image_destination_select, comparison_depth32_upload, create_sampled_guest_texture,
-    decode_image_descriptor, depth_array_face_descriptor, depth_array_face_set_is_complete,
-    fallback_image_descriptor, guest_shared_mapping_identity, guest_texture_byte_count,
+    decode_guest_texture_linear_from_raw, decode_image_descriptor, depth_array_face_descriptor,
+    depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
+    guest_texture_byte_count,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_storage, guest_texture_raw_matches, guest_texture_raw_range,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
     mode27_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
     render_resolve_candidate_matches, resident_texture_activity_stats,
-    resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
-    sampled_alias_descriptor, sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
-    sampled_texture_cache_requires_eviction, snapshot_guest_texture_raw,
-    snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy,
-    upload_image_textures, watch_guest_texture, write_watched_guest_texture_linear,
+    resident_texture_backing_overlap_stats, resident_texture_eviction_plan,
+    resident_texture_ownership_stats, sampled_alias_descriptor, sampled_texture_cache_accepts,
+    sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
+    snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
+    storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
+    write_watched_guest_texture_linear,
 };
 
 #[test]
@@ -1291,6 +1293,221 @@ fn resident_lifetime_stats_attribute_physical_aliases_and_activity_age() {
     assert_eq!(activity.read_flip[5].cpu_owned_count, 1);
     assert_eq!(activity.write_flip[1].gpu_owned_count, 1);
     assert_eq!(activity.write_flip[3].cpu_owned_count, 1);
+}
+
+#[test]
+fn resident_pressure_plan_prefers_clean_old_images_and_excludes_the_current_flip() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(3 * GUEST_PAGE_SIZE).expect("guest backing");
+    let mut descriptors = Vec::new();
+    for page_index in 0..3 {
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                page_index * GUEST_PAGE_SIZE,
+            )
+            .expect("resident mapping");
+        descriptors.push(GuestTextureDescriptor {
+            address: address.get(),
+            width: 16,
+            height: 16,
+            pitch: 16,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        });
+    }
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    for descriptor in descriptors.iter().copied() {
+        presenter
+            .ensure_resident_texture(&device, descriptor)
+            .expect("resident texture");
+    }
+    let old_gpu = descriptors[0];
+    let old_clean = descriptors[1];
+    let current_gpu = descriptors[2];
+    {
+        let resident = presenter
+            .resident_guest_textures
+            .get_mut(&old_gpu)
+            .expect("old GPU resident");
+        resident.gpu_written = true;
+        resident.last_use = ResidentTextureActivityStamp { work: 10, flip: 1 };
+    }
+    presenter
+        .resident_guest_textures
+        .get_mut(&old_clean)
+        .expect("old clean resident")
+        .last_use = ResidentTextureActivityStamp { work: 20, flip: 1 };
+    {
+        let resident = presenter
+            .resident_guest_textures
+            .get_mut(&current_gpu)
+            .expect("current GPU resident");
+        resident.gpu_written = true;
+        resident.last_use = ResidentTextureActivityStamp { work: 30, flip: 2 };
+    }
+    let total_bytes = presenter
+        .resident_guest_textures
+        .values()
+        .map(|resident| resident.texture.allocated_size())
+        .sum::<u64>();
+    let clean_bytes = presenter
+        .resident_guest_textures
+        .get(&old_clean)
+        .expect("old clean resident")
+        .texture
+        .allocated_size();
+    let plan = resident_texture_eviction_plan(
+        &presenter.resident_guest_textures,
+        total_bytes.saturating_sub(clean_bytes),
+        2,
+        1,
+    );
+    assert_eq!(plan.descriptors, vec![old_clean]);
+    assert!(!plan.descriptors.contains(&current_gpu));
+}
+
+#[test]
+fn resident_pressure_plan_keeps_overlapping_gpu_versions_indivisible() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("target mapping")
+        .get();
+    let first = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let second = GuestTextureDescriptor {
+        address: address + 512,
+        ..first
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, first)
+        .expect("first resident");
+    presenter
+        .ensure_resident_texture(&device, second)
+        .expect("second resident");
+    for (work, descriptor) in [(10, first), (20, second)] {
+        let resident = presenter
+            .resident_guest_textures
+            .get_mut(&descriptor)
+            .expect("overlap resident");
+        resident.gpu_written = true;
+        resident.content_version = work;
+        resident.last_use = ResidentTextureActivityStamp { work, flip: 1 };
+    }
+
+    let plan =
+        resident_texture_eviction_plan(&presenter.resident_guest_textures, 0, 2, usize::MAX);
+    assert!(
+        plan.descriptors.is_empty(),
+        "an overlapping GPU-owned version cannot be written back independently"
+    );
+}
+
+#[test]
+fn resident_pressure_eviction_retiles_gpu_pixels_before_removal() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+    use std::ffi::c_void;
+
+    let allocation_size = 8 * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            allocation_size,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("resident mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let texture = presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("resident texture");
+    let rendered = (0..64 * 64 * 4)
+        .map(|index| ((index * 37 + index / 11) & 0xff) as u8)
+        .collect::<Vec<_>>();
+    texture.replace_region(
+        MTLRegion::new_2d(0, 0, 64, 64),
+        0,
+        rendered.as_ptr().cast::<c_void>(),
+        64 * 4,
+    );
+    presenter.mark_resident_texture_written_at(
+        descriptor,
+        ResidentTextureActivityStamp { work: 10, flip: 1 },
+    );
+
+    let (count, bytes) = presenter
+        .garbage_collect_resident_textures_to_budget(0, 1, 8)
+        .expect("current-flip pressure pass");
+    assert_eq!((count, bytes), (0, 0));
+    assert!(presenter.resident_guest_textures.contains_key(&descriptor));
+
+    let (count, bytes) = presenter
+        .garbage_collect_resident_textures_to_budget(0, 2, 8)
+        .expect("completed-flip pressure pass");
+    assert_eq!(count, 1);
+    assert!(bytes >= rendered.len() as u64);
+    assert!(!presenter.resident_guest_textures.contains_key(&descriptor));
+    let guest_raw = snapshot_guest_texture_raw(descriptor).expect("snapshotted tiled writeback");
+    let guest_linear =
+        decode_guest_texture_linear_from_raw(descriptor, &guest_raw).expect("detiled writeback");
+    assert_eq!(guest_linear, rendered);
 }
 
 #[test]
