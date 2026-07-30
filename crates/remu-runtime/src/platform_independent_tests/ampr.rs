@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use super::{
     AmprCommandBufferState, ProbeDispatchState, SCE_KERNEL_ERROR_NOT_FOUND,
-    ampr_command_buffer_write_kernel_event_queue, ampr_submit_command_buffer,
-    create_ampr_test_file, dispatch_probe_import, kernel_add_ampr_event, read_guest_u32,
-    sce_kernel_error, set_current_guest_thread_pointer, write_guest_u32,
+    ampr_command_buffer_write_address_on_completion, ampr_command_buffer_write_kernel_event_queue,
+    ampr_submit_command_buffer, create_ampr_test_file, dispatch_probe_import,
+    kernel_add_ampr_event, read_guest_u32, sce_kernel_error, set_current_guest_thread_pointer,
+    write_guest_u32,
 };
 
 #[cfg(target_os = "macos")]
@@ -352,6 +353,9 @@ fn ampr_ordering_classifier_covers_every_stateful_operation() {
         "f12ObAMEi9A",
         "mv0O8Zg0woU",
         "o67gODLFpls",
+        // Recording a completion word mutates the same command-buffer state, so it must not race
+        // a submission of that buffer.
+        "sJXyWHjP-F8",
     ] {
         assert!(
             crate::is_serialized_ampr_import(nid),
@@ -481,6 +485,7 @@ fn ampr_reset_and_destroy_wait_for_the_same_buffer_submission_order() {
             assert_eq!(command.command_count, 0);
             assert!(command.pending_reads.is_empty());
             assert!(command.pending_completions.is_empty());
+            assert!(command.pending_address_writes.is_empty());
         }
     }
 }
@@ -543,5 +548,95 @@ fn ampr_completions_are_announced_by_submission_not_registration() {
         state.pending_events.len(),
         1,
         "reusing the command buffer lost its completion command"
+    );
+}
+
+/// The completion word a guest polls must be written by the submission that does the work, not
+/// when the command is recorded, and must be repeated on every reuse of the program.
+#[test]
+fn ampr_address_completions_are_written_by_submission_and_repeat_on_reuse() {
+    let mut state = ProbeDispatchState::default();
+    let mut buffer = [0_u8; 0x100];
+    let command_buffer = 0x5100_u64;
+    state.ampr_command_buffers.insert(
+        command_buffer,
+        AmprCommandBufferState {
+            buffer: buffer.as_mut_ptr().addr() as u64,
+            size: buffer.len() as u64,
+            ..AmprCommandBufferState::default()
+        },
+    );
+
+    let mut flag = 0_u64;
+    let flag_address = (&raw mut flag).addr() as u64;
+    assert_eq!(
+        ampr_command_buffer_write_address_on_completion(
+            [command_buffer, flag_address, 0xa5, 0, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        flag, 0,
+        "recording the command must not write the completion word"
+    );
+
+    assert_eq!(
+        ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(flag, 0xa5, "submission must write the recorded value");
+
+    // A command buffer is a reusable program, so a second submission repeats the write.
+    flag = 0;
+    assert_eq!(
+        ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(flag, 0xa5, "reusing the program lost its completion write");
+
+    // Resetting the program clears the recorded write along with everything else.
+    assert_eq!(
+        crate::ampr_command_buffer_reset([command_buffer, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    flag = 0;
+    assert_eq!(
+        ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(flag, 0, "a reset program must not still write its old word");
+}
+
+#[test]
+fn ampr_address_completion_rejects_a_missing_buffer_or_address() {
+    let mut state = ProbeDispatchState::default();
+    let mut flag = 0_u64;
+    let flag_address = (&raw mut flag).addr() as u64;
+    assert_eq!(
+        ampr_command_buffer_write_address_on_completion([0, flag_address, 1, 0, 0, 0], &mut state),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        ampr_command_buffer_write_address_on_completion(
+            [0x5200, flag_address, 1, 0, 0, 0],
+            &mut state
+        ),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT),
+        "an unknown command buffer is not recordable"
+    );
+    let mut buffer = [0_u8; 0x100];
+    state.ampr_command_buffers.insert(
+        0x5200,
+        AmprCommandBufferState {
+            buffer: buffer.as_mut_ptr().addr() as u64,
+            size: buffer.len() as u64,
+            ..AmprCommandBufferState::default()
+        },
+    );
+    // A null destination would make the completion write to address zero on every submission.
+    assert_eq!(
+        ampr_command_buffer_write_address_on_completion([0x5200, 0, 1, 0, 0, 0], &mut state),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
     );
 }

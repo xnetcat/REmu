@@ -95,20 +95,35 @@ lifecycle without error: `sceFiberOptParamInitialize`, `_sceFiberInitializeImpl`
 system now runs and reaches asynchronous asset loading, resolving and reading
 `/app0/playgo-chunkdefs.xml` through the AMPR command-buffer path.
 
-The title is still not playable and no compatibility is claimed: it submits no draws. It now stops
-at `sceAmprCommandBufferWriteAddressOnCompletion`, the completion-notification write of the
-asynchronous file path, which is unserved — so the command buffer is submitted but the completion
-word the guest waits on is never written. That write is the next concrete gap for this title, and
-it sits in the asynchronous-file command-buffer family the import-coverage section already names as
-the bulk of the remaining work. `sceKernelSetPrtAperture` and `sceNetCtlInit` are also unserved but
-are not what stalls it.
+Two further defects were then found and fixed, both by tracing rather than inspection:
+
+- `sceAmprCommandBufferWriteAddressOnCompletion` was unserved. It is the polled half of the APR
+  completion contract — a guest that registers no event queue watches a completion word instead —
+  so the buffer was submitted and its transfer performed while the word the guest spun on was
+  never written. It is now recorded like the queue-signal command and published on submission,
+  before any event is announced, so a guest woken by the queue already observes the word.
+- The fiber implementation resolved its per-thread current-fiber slot in a way the compiler could
+  hoist across a context switch. That is sound for ordinary code, where a function cannot change
+  threads midway, but a fiber can: this title parks a fiber on one worker and lets another resume
+  it. The resumed frame then read the *suspending* thread's slot, which by then was cleared, and
+  reported `SCE_FIBER_ERROR_PERMISSION` back into the job system. Forcing the resolution to happen
+  after the resume fixed it, and a test that resumes a fiber on a second thread covers it.
+
+With those, fiber traffic runs clean — over two thousand transitions in a 45-second run with no
+refused call — and the title reaches its Bink video threads and its `Core.Res` decompressor,
+file-loader, and task-manager pipeline.
+
+It is still not playable and no compatibility is claimed: it submits no draws, and those resource
+threads sit in condition waits. The next unserved imports it reaches are `sceAcmContextCreate`,
+`sceSystemGestureOpen`/`InitializePrimitiveTouchRecognizer`,
+`sceVideoOutColorSettingsSetGamma`, plus the already-listed `sceKernelSetPrtAperture` and
+`sceNetCtlInit`; which of those the stalled resource threads are actually waiting on is not yet
+established and is the next thing to trace.
 
 The fiber implementation is x86-64 only, because it saves and restores x86-64 register state. On
 any other host the NIDs fall through to the unimplemented path rather than to a stub, so its tests
-run under `--target x86_64-apple-darwin`. Two limits are deliberate: the attach-and-run/switch
-variants and the context-size-check pair stay unserved until a title needs them, and a fiber
-switched across host threads is refused with `SCE_FIBER_ERROR_PERMISSION` rather than silently
-corrupting state, since a fiber belongs to the thread that ran it.
+run under `--target x86_64-apple-darwin`. The attach-and-run/switch variants and the
+context-size-check pair stay unserved until a title needs them.
 
 ### A run intermittently renders nothing
 

@@ -143,10 +143,11 @@ pub(crate) use ampr_api::{
     ampr_command_buffer_clear_buffer, ampr_command_buffer_constructor,
     ampr_command_buffer_destructor, ampr_command_buffer_get_current_offset,
     ampr_command_buffer_get_size, ampr_command_buffer_read_file_ordered, ampr_command_buffer_reset,
-    ampr_command_buffer_set_buffer, ampr_command_buffer_write_kernel_event_queue,
-    ampr_command_order, ampr_get_file_size, ampr_get_file_stat, ampr_measure_command_size,
-    ampr_resolve_file_paths, ampr_resolve_paths_core, ampr_submit_command_buffer,
-    ampr_submit_command_buffer_ordered, ampr_wait_command_buffer,
+    ampr_command_buffer_set_buffer, ampr_command_buffer_write_address_on_completion,
+    ampr_command_buffer_write_kernel_event_queue, ampr_command_order, ampr_get_file_size,
+    ampr_get_file_stat, ampr_measure_command_size, ampr_resolve_file_paths,
+    ampr_resolve_paths_core, ampr_submit_command_buffer, ampr_submit_command_buffer_ordered,
+    ampr_wait_command_buffer,
 };
 #[cfg(test)]
 pub(crate) use ampr_api::{
@@ -829,6 +830,19 @@ struct AmprCommandBufferState {
     pending_reads: Vec<AmprReadCommand>,
     /// Queue completions recorded into this buffer, announced when it is submitted.
     pending_completions: Vec<AmprCompletion>,
+    /// Completion words recorded into this buffer, written when it is submitted.
+    pending_address_writes: Vec<AmprAddressWrite>,
+}
+
+/// One completion word an APR program publishes after its transfers finish.
+///
+/// This is the other half of the completion contract beside the event queue: a guest that does not
+/// wait on an equeue polls this word instead, so a program that never writes it leaves that guest
+/// waiting forever.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmprAddressWrite {
+    address: u64,
+    value: u64,
 }
 
 /// One deferred APR file transfer.
@@ -2353,6 +2367,7 @@ fn is_serialized_ampr_import(nid: &str) -> bool {
             | "f12ObAMEi9A"
             | "mv0O8Zg0woU"
             | "o67gODLFpls"
+            | "sJXyWHjP-F8"
     )
 }
 
@@ -6529,6 +6544,11 @@ fn trace_agc_programs() -> bool {
 fn trace_guest_time() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_TIME").is_some_and(|value| value == "1"))
+}
+
+fn trace_fiber() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_FIBER").is_some_and(|value| value == "1"))
 }
 
 fn trace_ampr_reads() -> bool {

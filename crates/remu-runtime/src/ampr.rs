@@ -19,9 +19,10 @@
 use crate::{
     AMPR_COMMAND_RECORD_SIZE, ProbeDispatchState, SCE_KERNEL_ERROR_BUSY,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED,
-    ampr_command_buffer_write_kernel_event_queue, ampr_measure_command_size, guest_memset, low_u32,
-    process_guest_range_is_readable, read_guest_bytes, read_guest_u32, read_guest_u64,
-    sce_kernel_error, write_guest_bytes, write_guest_u32,
+    ampr_command_buffer_write_address_on_completion, ampr_command_buffer_write_kernel_event_queue,
+    ampr_measure_command_size, guest_memset, low_u32, process_guest_range_is_readable,
+    read_guest_bytes, read_guest_u32, read_guest_u64, sce_kernel_error, write_guest_bytes,
+    write_guest_u32,
 };
 
 /// Record tag for the command that invalidates a buffer's gather/scatter chain.
@@ -102,6 +103,8 @@ fn dispatch_builder(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchSta
         // The command that signals an event queue on completion is exported under both its
         // current and its original name, and the runtime already builds it.
         "o67gODLFpls" => ampr_command_buffer_write_kernel_event_queue(arguments, state),
+        // The polled half of the same contract: a completion word written to guest memory.
+        "sJXyWHjP-F8" => ampr_command_buffer_write_address_on_completion(arguments, state),
         "RPCAhx-aabE" => buffer_base_address(arguments[0], state),
         "gzndltBEzWc" => num_commands(arguments[0], state),
         _ => return None,
@@ -119,9 +122,11 @@ fn dispatch_command_size(nid: &str, arguments: [u64; 6]) -> Option<u64> {
             measure_marker(arguments[0])
         }
         "pbnNnahE8vk" => MARKER_HEADER_BYTES,
-        // The gather and scatter reads have no builder yet, but their records are the same fixed
-        // stride as every other file command, so their footprint is already settled.
-        "rddQYXM0CjM" | "qesF88X4DRg" | "7nXGDGMXSqo" | "DXmgc5op8Yw" => AMPR_COMMAND_RECORD_SIZE,
+        // The gather and scatter reads have no builder yet, and the completion-word command does,
+        // but every record is the same fixed stride, so their footprints are already settled.
+        "rddQYXM0CjM" | "qesF88X4DRg" | "7nXGDGMXSqo" | "DXmgc5op8Yw" | "C+IEj+BsAFM" => {
+            AMPR_COMMAND_RECORD_SIZE
+        }
         "Zi3dBUjgyXI" => ampr_measure_command_size(),
         _ => return None,
     })

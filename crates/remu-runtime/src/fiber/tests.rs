@@ -470,3 +470,85 @@ unsafe extern "C" fn attempts_nested_run(_initialize: u64, _run_to: u64) {
     return_to_thread([0, 0, 0, 0, 0, 0]);
     unreachable!("the test never resumes this fiber");
 }
+
+/// The fiber a second thread will resume, and the value it reports on that resume.
+static MIGRATED_FIBER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MIGRATED_RESULT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+unsafe extern "C" fn yields_then_reports_resume(
+    _argument_on_initialize: u64,
+    _argument_on_run_to: u64,
+) {
+    // Suspend on the first thread. Whatever resumes this frame may be a different thread.
+    let mut argument_on_run = 0_u64;
+    let result = return_to_thread([0x11, (&raw mut argument_on_run).addr() as u64, 0, 0, 0, 0]);
+    MIGRATED_RESULT.store(result, Ordering::Release);
+    OBSERVED.lock().unwrap().push((result, argument_on_run));
+    return_to_thread([0x22, 0, 0, 0, 0, 0]);
+    OBSERVED.lock().unwrap().push((UNEXPECTED, 0));
+    return_to_thread([0, 0, 0, 0, 0, 0]);
+}
+
+/// A job system parks a fiber on one worker and lets another pick it up, so a suspended frame must
+/// resume correctly on a thread that did not suspend it. This is the case that fails when the
+/// resumed frame reuses a thread-local slot address resolved before the switch: the reader sees the
+/// suspending thread's slot, which by then is null, and the resume reports a permission error.
+#[test]
+fn a_suspended_fiber_resumes_on_a_different_thread() {
+    OBSERVED.lock().unwrap().clear();
+    MIGRATED_RESULT.store(u64::MAX, Ordering::Release);
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(
+        initialize_fiber(&fiber, &stack, yields_then_reports_resume, 0),
+        0
+    );
+    MIGRATED_FIBER.store(fiber.address(), Ordering::Release);
+
+    let mut returned = 0_u64;
+    assert_eq!(
+        run([
+            fiber.address(),
+            0,
+            (&raw mut returned).addr() as u64,
+            0,
+            0,
+            0,
+        ]),
+        0
+    );
+    assert_eq!(returned, 0x11);
+    assert!(fiber_context().is_null());
+
+    // Resume the same fiber from a second thread, which is where the stale-slot defect appears.
+    let resumed = std::thread::spawn(|| {
+        let mut returned = 0_u64;
+        let status = run([
+            MIGRATED_FIBER.load(Ordering::Acquire),
+            0x99,
+            (&raw mut returned).addr() as u64,
+            0,
+            0,
+            0,
+        ]);
+        (status, returned)
+    })
+    .join()
+    .expect("the resuming thread must not panic");
+
+    assert_eq!(resumed.0, 0, "resuming on another thread must succeed");
+    assert_eq!(
+        resumed.1, 0x22,
+        "the resumed fiber must yield again normally"
+    );
+    assert_eq!(
+        MIGRATED_RESULT.load(Ordering::Acquire),
+        0,
+        "the resumed frame must observe the resuming thread's context, not the suspending one"
+    );
+    assert_eq!(
+        OBSERVED.lock().unwrap().as_slice(),
+        &[(0, 0x99)],
+        "the resume must deliver the argument the second thread passed"
+    );
+}

@@ -4,8 +4,8 @@ use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{
-    AMPR_COMMAND_ORDER, AMPR_READ_STAGING_POOL, AmprCommandBufferState, AmprCompletion,
-    AmprReadCommand, KERNEL_EVENT_FILTER_AMPR, KernelQueuedEvent, PROBE_DISPATCH,
+    AMPR_COMMAND_ORDER, AMPR_READ_STAGING_POOL, AmprAddressWrite, AmprCommandBufferState,
+    AmprCompletion, AmprReadCommand, KERNEL_EVENT_FILTER_AMPR, KernelQueuedEvent, PROBE_DISPATCH,
     ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
     SCE_KERNEL_ERROR_NO_SPACE, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
     current_guest_thread_name, guest_memset, kernel_stat_payload_from_metadata, low_u32,
@@ -148,6 +148,8 @@ pub(crate) const AMPR_INVALID_FILE_ID: u32 = 0xffff_ffff;
 pub(crate) const AMPR_COMMAND_RECORD_SIZE: u64 = 0x30;
 /// Record tag for an equeue completion signal.
 const AMPR_COMMAND_WRITE_EVENT_QUEUE: u32 = 2;
+/// Record tag for a completion word written to guest memory.
+const AMPR_COMMAND_WRITE_ADDRESS: u32 = 3;
 
 /// Reports the capacity of the memory attached to a command buffer.
 pub(crate) fn ampr_command_buffer_get_size(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
@@ -227,6 +229,48 @@ pub(crate) fn ampr_command_buffer_write_kernel_event_queue(
     0
 }
 
+/// Records a command that writes `value` to `address` once the buffer's work completes.
+///
+/// This is the polled half of the completion contract: a guest that does not register an event
+/// queue watches this word instead, so the write has to happen on submission, after the transfers,
+/// and has to repeat on every reuse of the program.
+pub(crate) fn ampr_command_buffer_write_address_on_completion(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let command_buffer = arguments[0];
+    let address = arguments[1];
+    let value = arguments[2];
+    // A null destination would make every later submission write to address zero.
+    if command_buffer == 0 || address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(command) = state.ampr_command_buffers.get_mut(&command_buffer) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if command.write_offset > command.size
+        || AMPR_COMMAND_RECORD_SIZE > command.size - command.write_offset
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NO_SPACE);
+    }
+    let record = command.buffer + command.write_offset;
+    guest_memset(record, 0, AMPR_COMMAND_RECORD_SIZE);
+    write_guest_u32(record, AMPR_COMMAND_WRITE_ADDRESS);
+    write_guest_u64(record + 8, address);
+    write_guest_u64(record + 0x10, value);
+    command.write_offset += AMPR_COMMAND_RECORD_SIZE;
+    command.command_count += 1;
+    command
+        .pending_address_writes
+        .push(AmprAddressWrite { address, value });
+    if trace_ampr_reads() {
+        eprintln!(
+            "[REMu][AMPR] record completion word buffer={command_buffer:#x} address={address:#x} value={value:#x}"
+        );
+    }
+    0
+}
+
 /// Releases a command buffer's recorded state without freeing the guest's memory.
 pub(crate) fn ampr_command_buffer_destructor(
     arguments: [u64; 6],
@@ -290,6 +334,7 @@ pub(crate) fn ampr_command_buffer_reset(
     entry.command_count = 0;
     entry.pending_reads.clear();
     entry.pending_completions.clear();
+    entry.pending_address_writes.clear();
     0
 }
 
@@ -788,13 +833,27 @@ pub(crate) fn ampr_submit_command_buffer(
         .get(&arguments[0])
         .map(|command| command.pending_completions.clone())
         .unwrap_or_default();
+    let address_writes = state
+        .ampr_command_buffers
+        .get(&arguments[0])
+        .map(|command| command.pending_address_writes.clone())
+        .unwrap_or_default();
     let announced = !completions.is_empty();
     if trace_ampr_reads() {
         eprintln!(
-            "[REMu][AMPR] submit buffer={:#x} id={id} completions={}",
+            "[REMu][AMPR] submit buffer={:#x} id={id} completions={} words={}",
             arguments[0],
-            completions.len()
+            completions.len(),
+            address_writes.len()
         );
+    }
+    // Publish the polled completion words before announcing any event, so a guest woken by the
+    // queue already observes the word a peer thread may be spinning on.
+    for write in address_writes {
+        if !ampr_destination_has_write_access(state, write.address, 8) {
+            return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+        }
+        write_guest_u64(write.address, write.value);
     }
     // The value recorded with the queue-write command is the event's `data`, which the guest
     // reads back through `sceKernelGetEventData` to identify which request completed. `udata`

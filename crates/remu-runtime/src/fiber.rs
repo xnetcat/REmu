@@ -10,15 +10,40 @@
 //!
 //! The fiber object itself is guest storage: the guest allocates it and passes its address, so its
 //! fields are read and written through the guest accessors rather than held host-side. The only
-//! host-side state is the per-thread record of which fiber is currently running, which is exactly
-//! the console's model — a fiber belongs to one thread for its whole life.
+//! host-side state is the per-thread record of which fiber is currently running.
+//!
+//! A fiber does *not* stay on one thread. An observed job system parks a fiber on one worker and
+//! lets whichever worker picks the job up next resume it, so a suspended frame routinely continues
+//! on a thread that did not suspend it. Everything a resumed frame needs must therefore be read
+//! fresh after the resume rather than carried across it — see [`fiber_context`], where getting
+//! this wrong left the resuming thread reading the suspending thread's already-cleared slot.
 
 mod switch;
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{read_guest_cstring, read_guest_u32, read_guest_u64, write_guest_u32, write_guest_u64};
+use crate::{
+    current_guest_thread_name, read_guest_cstring, read_guest_u32, read_guest_u64, trace_fiber,
+    write_guest_u32, write_guest_u64,
+};
+
+/// Logs one fiber transition when `REMU_TRACE_FIBER=1`.
+///
+/// Fiber calls repeat far too often for the general first-hit import log to show what a job
+/// system is actually doing, and a refused call is invisible there because it still returns.
+fn trace(call: &str, fiber: u64, result: u64) {
+    if trace_fiber() {
+        eprintln!(
+            "[REMu][FIBER] {call} fiber={fiber:#x} result={result:#x} context={:?} slot={:?} host={:?} thread={:?}",
+            fiber_context(),
+            THREAD_FIBER_CONTEXT.with(std::ptr::from_ref),
+            // SAFETY: `pthread_self` is always valid on the calling thread.
+            unsafe { libc::pthread_self() },
+            current_guest_thread_name()
+        );
+    }
+}
 
 const SCE_FIBER_ERROR_NULL: u32 = 0x8059_0001;
 const SCE_FIBER_ERROR_ALIGNMENT: u32 = 0x8059_0002;
@@ -106,10 +131,23 @@ thread_local! {
     static THREAD_FIBER_CONTEXT: Cell<*mut FiberContext> = const { Cell::new(std::ptr::null_mut()) };
 }
 
+/// Reads this thread's current fiber context.
+///
+/// Deliberately never inlined. A fiber suspended on one thread can be resumed on another — job
+/// systems hand a parked fiber to whichever worker picks it up next — so a frame that resumes
+/// after [`switch::fiber_set_jmp`] may be running on a different thread than the one that
+/// suspended it. Thread-local access normally lets the compiler hoist and reuse the resolved slot
+/// address, which is sound only because the thread cannot change mid-function; here it can, and a
+/// hoisted address would read the *suspending* thread's slot, which by then reads null. Keeping
+/// the resolution behind a call that cannot be inlined forces it to happen after the resume, on
+/// the thread that actually continues.
+#[inline(never)]
 fn fiber_context() -> *mut FiberContext {
     THREAD_FIBER_CONTEXT.with(Cell::get)
 }
 
+/// Publishes this thread's current fiber context. Never inlined, for the reason above.
+#[inline(never)]
 fn set_fiber_context(context: *mut FiberContext) {
     THREAD_FIBER_CONTEXT.with(|slot| slot.set(context));
 }
@@ -449,6 +487,11 @@ fn return_to_thread(arguments: [u64; 6]) -> u64 {
 }
 
 /// Shared tail for the two entry points a fiber can be resumed through.
+///
+/// Never inlined: every arrival here is a resume, possibly on a different thread than the one that
+/// suspended the frame, so the thread context has to be resolved fresh rather than reusing
+/// anything the suspending frame had already computed.
+#[inline(never)]
 fn resume_here(argument_on_run: u64) -> u64 {
     // The thread context is re-read rather than reused: this arrival came through a long jump, and
     // the running fiber may have moved on since the value was last loaded.
@@ -528,18 +571,40 @@ fn rename(fiber: u64, name: u64) -> u64 {
 /// This is reached from the stateless dispatch path deliberately: `run` and `switch` execute guest
 /// code that calls further imports, so they must not hold the process dispatch lock.
 pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]) -> Option<u64> {
-    Some(match nid {
-        "asjUJJ+aa8s" => opt_param_initialize(arguments[0]),
-        "hVYD7Ou2pCQ" => initialize(arguments, stack_arguments),
-        "JeNX5F-NzQU" => finalize(arguments[0]),
-        "a0LLrZWac0M" => run(arguments),
-        "PFT2S-tJ7Uk" => switch_fiber(arguments),
-        "B0ZX2hx9DMw" => return_to_thread(arguments),
-        "p+zLIOg27zU" => get_self(arguments[0]),
-        "uq2Y5BFz0PE" => get_info(arguments[0], arguments[1]),
-        "JzyT91ucGDc" => rename(arguments[0], arguments[1]),
+    // A successful switch or return never comes back through this frame, so entry has to be
+    // logged separately from the result or the whole successful path is invisible.
+    if trace_fiber()
+        && matches!(
+            nid,
+            "a0LLrZWac0M" | "PFT2S-tJ7Uk" | "B0ZX2hx9DMw" | "p+zLIOg27zU"
+        )
+    {
+        eprintln!(
+            "[REMu][FIBER] enter nid={nid} arg0={:#x} context={:?} slot={:?} host={:?} thread={:?}",
+            arguments[0],
+            fiber_context(),
+            THREAD_FIBER_CONTEXT.with(std::ptr::from_ref),
+            // SAFETY: `pthread_self` is always valid on the calling thread.
+            unsafe { libc::pthread_self() },
+            current_guest_thread_name()
+        );
+    }
+    let (call, result) = match nid {
+        "asjUJJ+aa8s" => ("opt-param-init", opt_param_initialize(arguments[0])),
+        "hVYD7Ou2pCQ" => ("initialize", initialize(arguments, stack_arguments)),
+        "JeNX5F-NzQU" => ("finalize", finalize(arguments[0])),
+        "a0LLrZWac0M" => ("run", run(arguments)),
+        "PFT2S-tJ7Uk" => ("switch", switch_fiber(arguments)),
+        "B0ZX2hx9DMw" => ("return-to-thread", return_to_thread(arguments)),
+        "p+zLIOg27zU" => ("get-self", get_self(arguments[0])),
+        "uq2Y5BFz0PE" => ("get-info", get_info(arguments[0], arguments[1])),
+        "JzyT91ucGDc" => ("rename", rename(arguments[0], arguments[1])),
         _ => return None,
-    })
+    };
+    // A refused fiber call still returns, so it is invisible in the first-hit import log. Trace
+    // every transition and its result to make a rejected switch or run legible.
+    trace(call, arguments[0], result);
+    Some(result)
 }
 
 #[cfg(test)]
