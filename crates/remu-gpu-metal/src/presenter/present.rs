@@ -61,6 +61,15 @@ impl MetalPresenter {
             .host_splash
             .as_ref()
             .map(|splash| (splash.texture.clone(), splash.width, splash.height));
+        let presentation_source = if host_splash.is_some() {
+            "host-splash"
+        } else if translated_snapshot.is_some() {
+            "translated"
+        } else if guest_frame_texture.is_some() {
+            "raw"
+        } else {
+            "clear"
+        };
         let (frame_texture, source_dimensions) = if let Some((texture, width, height)) = host_splash
         {
             (Some(texture), Some((width, height)))
@@ -70,10 +79,30 @@ impl MetalPresenter {
                 self.display.map(|display| (display.width, display.height)),
             )
         };
+        // Raw VideoOut fallback can be captured immediately before the translated render target
+        // becomes available. Do not let that fallback consume the capture interval: the first
+        // translated snapshot is the authoritative evidence for what Metal is actually about to
+        // present.
+        let first_translated_capture =
+            translated_snapshot.as_ref().is_some_and(|(descriptor, _)| {
+                self.captured_guest_frames.len() < 128
+                    && !self.captured_guest_frames.iter().any(
+                        |(address, width, height, tile_mode, _)| {
+                            *address == descriptor.address
+                                && *width == descriptor.width
+                                && *height == descriptor.height
+                                && *tile_mode == descriptor.tile_mode
+                        },
+                    )
+            });
+        if first_translated_capture {
+            self.last_guest_capture = None;
+        }
         let capture_due = self.capture_directory.is_some()
-            && self
-                .last_guest_capture
-                .is_none_or(|last| last.elapsed() >= capture_interval());
+            && (first_translated_capture
+                || self
+                    .last_guest_capture
+                    .is_none_or(|last| last.elapsed() >= capture_interval()));
         if capture_due
             && let Some((descriptor, texture)) = translated_snapshot.as_ref()
             && matches!(
@@ -103,6 +132,15 @@ impl MetalPresenter {
             return;
         };
         let Some(drawable) = layer.next_drawable() else {
+            if trace_scanout_writes() {
+                eprintln!(
+                    "[REMu][METAL][SCANOUT-PRESENT] outcome=no-drawable source={presentation_source} pending={} finalized={} uploaded={} submitted={}",
+                    self.pending_flip.map_or(0, |flip| flip.sequence),
+                    self.finalized_flip_sequence,
+                    self.uploaded_flip_sequence,
+                    self.submitted_flip_sequence,
+                );
+            }
             return;
         };
         let command_buffer = queue.new_command_buffer().to_owned();
@@ -145,6 +183,18 @@ impl MetalPresenter {
         encoder.end_encoding();
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        if trace_scanout_writes() {
+            eprintln!(
+                "[REMu][METAL][SCANOUT-PRESENT] outcome=committed source={presentation_source} source_size={source_dimensions:?} source_format={:?} drawable={}x{} pending={} finalized={} uploaded={} submitted_before={}",
+                frame_texture.as_ref().map(|texture| texture.pixel_format()),
+                destination_width,
+                destination_height,
+                self.pending_flip.map_or(0, |flip| flip.sequence),
+                self.finalized_flip_sequence,
+                self.uploaded_flip_sequence,
+                self.submitted_flip_sequence,
+            );
+        }
         let flip_completion = self
             .pending_flip
             .filter(|flip| {

@@ -26,21 +26,38 @@ impl MetalPresenter {
         let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
             return;
         };
-        match self.activate_translated_scanout(flip.address, display.width, display.height) {
-            Ok(true) => {
-                self.uploaded_flip_sequence = flip.sequence;
-            }
-            Ok(false) => {
-                if let Err(error) = self.synchronize_flip_target(flip.address) {
-                    eprintln!("[REMu][METAL] flip synchronization failed: {error}");
+        let activation =
+            match self.activate_translated_scanout(flip.address, display.width, display.height) {
+                Ok(true) => {
+                    self.uploaded_flip_sequence = flip.sequence;
+                    "translated"
                 }
-            }
-            Err(error) => {
-                eprintln!("[REMu][METAL] translated scanout synchronization failed: {error}");
-            }
-        }
+                Ok(false) => {
+                    if let Err(error) = self.synchronize_flip_target(flip.address) {
+                        eprintln!("[REMu][METAL] flip synchronization failed: {error}");
+                    }
+                    "raw-pending"
+                }
+                Err(error) => {
+                    eprintln!("[REMu][METAL] translated scanout synchronization failed: {error}");
+                    "translated-error"
+                }
+            };
         self.finalized_flip_sequence = flip.sequence;
         self.redraw_pending = true;
+        if trace_scanout_writes() {
+            eprintln!(
+                "[REMu][METAL][SCANOUT-FLIP] phase=finalize sequence={} buffer={} address={:#x} activation={activation} finalized={} uploaded={} submitted={} pending_queue={:?} target_written={}",
+                flip.sequence,
+                flip.buffer_index,
+                flip.address,
+                self.finalized_flip_sequence,
+                self.uploaded_flip_sequence,
+                self.submitted_flip_sequence,
+                self.pending_flip_queue,
+                self.pending_flip_target_written_since_boundary,
+            );
+        }
     }
 
     pub(crate) fn show_host_splash(&mut self, image: GpuHostImage) -> Result<(), String> {
@@ -349,15 +366,33 @@ impl MetalPresenter {
         command_buffer.commit();
         self.frame_texture = Some(snapshot);
         self.frame_texture_size = (descriptor.width, descriptor.height);
+        let sequence = self
+            .pending_flip
+            .filter(|flip| flip.address == address)
+            .map_or(self.next_flip_sequence, |flip| flip.sequence);
         self.active_translated_scanout = Some(ActiveTranslatedScanout {
             address,
             width,
             height,
-            sequence: self
-                .pending_flip
-                .filter(|flip| flip.address == address)
-                .map_or(self.next_flip_sequence, |flip| flip.sequence),
+            sequence,
         });
+        if trace_scanout_writes() {
+            let selected_state = self
+                .resident_guest_textures
+                .get(&descriptor)
+                .map(|resident| (resident.content_version, resident.gpu_written));
+            eprintln!(
+                "[REMu][METAL][SCANOUT-SNAPSHOT] sequence={sequence} address={address:#x} source={source} descriptor={descriptor:?} selected_state={selected_state:?} source_format={:?} snapshot_format={:?} pending={} finalized={} uploaded={} submitted={}",
+                source_texture.pixel_format(),
+                self.frame_texture
+                    .as_ref()
+                    .map(|texture| texture.pixel_format()),
+                self.pending_flip.map_or(0, |flip| flip.sequence),
+                self.finalized_flip_sequence,
+                self.uploaded_flip_sequence,
+                self.submitted_flip_sequence,
+            );
+        }
         static LOGGED_TRANSLATED_SCANOUTS: OnceLock<Mutex<HashSet<(u64, &'static str)>>> =
             OnceLock::new();
         let first_for_source = LOGGED_TRANSLATED_SCANOUTS
@@ -368,7 +403,7 @@ impl MetalPresenter {
         if first_for_source {
             eprintln!(
                 "[REMu][METAL] snapshotted translated {source} scanout sequence={} at {address:#x} {}x{} format={:?} tile={}",
-                self.next_flip_sequence,
+                sequence,
                 descriptor.width,
                 descriptor.height,
                 descriptor.pixel_format,
