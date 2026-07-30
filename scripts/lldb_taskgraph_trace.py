@@ -151,6 +151,18 @@ class TaskGraphTraceState:
         return self.phase == PHASE_DONE
 
     def active_breakpoints(self) -> Mapping[str, int]:
+        if self.phase == PHASE_PUBLISH:
+            if self.task == 0:
+                return {DISPATCH: BREAKPOINTS[PHASE_PUBLISH][DISPATCH]}
+            if self.publisher_entry_rsp == 0:
+                return {PUBLISH: BREAKPOINTS[PHASE_PUBLISH][PUBLISH]}
+            if self.publisher_return_rsp == 0:
+                return {
+                    PUBLISH_RETURN: BREAKPOINTS[PHASE_PUBLISH][PUBLISH_RETURN]
+                }
+            return {WAKE: BREAKPOINTS[PHASE_PUBLISH][WAKE]}
+        if self.phase == PHASE_CONSUME and self.pop_site:
+            return {EXECUTE: BREAKPOINTS[PHASE_CONSUME][EXECUTE]}
         return BREAKPOINTS[self.phase]
 
     def _finish(self, reason: str) -> TraceResult:
@@ -463,7 +475,7 @@ class LldbTaskGraphTrace:
         thread = frame.GetThread()
         process = thread.GetProcess()
         registers = self._registers(frame)
-        previous_phase = self.state.phase
+        previous_breakpoints = dict(self.state.active_breakpoints())
         result = self.state.observe(
             label,
             registers,
@@ -480,7 +492,7 @@ class LldbTaskGraphTrace:
                 f"pc={address:#x} regs={register_text}",
                 flush=True,
             )
-        if self.state.phase != previous_phase:
+        if dict(self.state.active_breakpoints()) != previous_breakpoints:
             self.arm_phase()
         return False
 

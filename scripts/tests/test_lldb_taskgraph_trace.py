@@ -39,7 +39,9 @@ class TaskGraphTraceTests(unittest.TestCase):
                 for breakpoints in TRACE.BREAKPOINTS.values()
             )
         )
-        self.assertEqual(len(TRACE.BREAKPOINTS[TRACE.PHASE_PUBLISH]), 4)
+        self.assertEqual(self.state.active_breakpoints(), {
+            TRACE.DISPATCH: TRACE.BREAKPOINTS[TRACE.PHASE_PUBLISH][TRACE.DISPATCH]
+        })
         self.assertEqual(len(TRACE.BREAKPOINTS[TRACE.PHASE_CONSUME]), 4)
 
     def test_wake_path_correlates_only_the_exact_task_and_thread(self) -> None:
@@ -47,6 +49,7 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertTrue(dispatch.accepted)
         self.assertEqual(self.state.task, 0x1000)
         self.assertEqual(self.state.completion_event, 0x2000)
+        self.assertEqual(set(self.state.active_breakpoints()), {TRACE.PUBLISH})
 
         other = self.observe(TRACE.PUBLISH, {"rsi": 0x9990, "rdi": 0x3000})
         self.assertFalse(other.accepted)
@@ -58,6 +61,9 @@ class TaskGraphTraceTests(unittest.TestCase):
         )
         self.assertTrue(published.accepted)
         self.assertEqual(self.state.publisher_thread, 7)
+        self.assertEqual(
+            set(self.state.active_breakpoints()), {TRACE.PUBLISH_RETURN}
+        )
 
         wrong_thread = self.observe(
             TRACE.PUBLISH_RETURN, {"rax": 0, "rsp": 0x5008}, thread=8
@@ -76,6 +82,7 @@ class TaskGraphTraceTests(unittest.TestCase):
         )
         self.assertTrue(wake_required.accepted)
         self.assertEqual(self.state.phase, TRACE.PHASE_PUBLISH)
+        self.assertEqual(set(self.state.active_breakpoints()), {TRACE.WAKE})
 
         wrong_wake_frame = self.observe(
             TRACE.WAKE, {"rdi": 0x4000, "rsp": 0x6008}
@@ -86,6 +93,10 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertTrue(wake.accepted)
         self.assertEqual(self.state.wake_event, 0x4000)
         self.assertEqual(self.state.phase, TRACE.PHASE_CONSUME)
+        self.assertEqual(
+            set(self.state.active_breakpoints()),
+            {TRACE.POP_LOCAL, TRACE.POP_WAIT, TRACE.POP_DRAIN, TRACE.EXECUTE},
+        )
 
     def test_negative_publish_result_skips_wake_phase(self) -> None:
         self.observe(TRACE.DISPATCH, {"rsi": 0x1000})
@@ -114,6 +125,7 @@ class TaskGraphTraceTests(unittest.TestCase):
         popped = self.observe(TRACE.POP_DRAIN, {"rax": 0x1000})
         self.assertTrue(popped.accepted)
         self.assertEqual(self.state.pop_site, TRACE.POP_DRAIN)
+        self.assertEqual(set(self.state.active_breakpoints()), {TRACE.EXECUTE})
         self.assertFalse(
             self.observe(TRACE.EXECUTE, {"rdi": 0x9990}).accepted
         )
