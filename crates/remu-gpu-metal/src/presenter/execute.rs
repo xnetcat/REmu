@@ -1361,6 +1361,14 @@ impl MetalPresenter {
         }
         let diagnostic_target = diagnostic_target_draw_filter()
             .and_then(|filter| {
+                if !filter.matches_sampled_addresses(
+                    diagnostic_sampled_storage
+                        .iter()
+                        .flatten()
+                        .map(|descriptor| descriptor.address),
+                ) {
+                    return None;
+                }
                 targets.iter().find(|target| {
                     filter.matches(
                         draw.sequence,

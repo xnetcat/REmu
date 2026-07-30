@@ -606,10 +606,20 @@ pub(super) fn diagnostic_dump_target_pixel_shader() -> Option<u64> {
     })
 }
 
+fn diagnostic_dump_target_sample_address() -> Option<u64> {
+    static ADDRESS: OnceLock<Option<u64>> = OnceLock::new();
+    *ADDRESS.get_or_init(|| {
+        let value = std::env::var("REMU_DUMP_TARGET_SAMPLE_ADDRESS").ok()?;
+        let value = value.strip_prefix("0x").unwrap_or(&value);
+        u64::from_str_radix(value, 16).ok()
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DiagnosticTargetDrawFilter {
     pixel_shader_address: Option<u64>,
     target_address: Option<u64>,
+    sampled_address: Option<u64>,
     minimum_draw: u64,
 }
 
@@ -642,17 +652,27 @@ impl DiagnosticTargetDrawFilter {
         }
         true
     }
+
+    pub(super) fn matches_sampled_addresses(
+        self,
+        addresses: impl IntoIterator<Item = u64>,
+    ) -> bool {
+        self.sampled_address
+            .is_none_or(|expected| addresses.into_iter().any(|address| address == expected))
+    }
 }
 
 pub(super) fn diagnostic_target_draw_filter() -> Option<DiagnosticTargetDrawFilter> {
     let pixel_shader_address = diagnostic_dump_target_pixel_shader();
     let target_address = diagnostic_dump_target_address();
-    if pixel_shader_address.is_none() && target_address.is_none() {
+    let sampled_address = diagnostic_dump_target_sample_address();
+    if pixel_shader_address.is_none() && target_address.is_none() && sampled_address.is_none() {
         return None;
     }
     Some(DiagnosticTargetDrawFilter {
         pixel_shader_address,
         target_address,
+        sampled_address,
         minimum_draw: diagnostic_dump_target_minimum_draw(),
     })
 }
@@ -755,6 +775,7 @@ pub(super) fn diagnostic_texture_writer_enabled() -> bool {
     trace_scanout_writes()
         || diagnostic_dump_target_address().is_some()
         || diagnostic_dump_target_pixel_shader().is_some()
+        || diagnostic_dump_target_sample_address().is_some()
         || diagnostic_dump_target_pixel_instruction_count().is_some()
         || diagnostic_dump_complex_msaa()
         || diagnostic_dump_shadow_consumer()
@@ -1116,6 +1137,7 @@ mod tests {
         let filter = DiagnosticTargetDrawFilter {
             pixel_shader_address: Some(0x0080_0e73_0000),
             target_address: Some(0x00ef_c200_0000),
+            sampled_address: None,
             minimum_draw: 38,
         };
 
@@ -1130,11 +1152,27 @@ mod tests {
         let filter = DiagnosticTargetDrawFilter {
             pixel_shader_address: None,
             target_address: Some(0),
+            sampled_address: None,
             minimum_draw: 0,
         };
 
         assert!(filter.matches(1, 0x0080_0e73_0000, 0x1234, 1_920, 1_080));
         assert!(!filter.matches(1, 0x0080_0e73_0000, 0x1234, 1_280, 720));
+    }
+
+    #[test]
+    fn sampled_address_filter_selects_only_the_source_surface() {
+        let filter = DiagnosticTargetDrawFilter {
+            pixel_shader_address: Some(0x0080_0802_0000),
+            target_address: Some(0x00ef_c000_0000),
+            sampled_address: Some(0x0080_65b3_0000),
+            minimum_draw: 0,
+        };
+
+        assert!(filter.matches_sampled_addresses([0x0080_65b3_0000]));
+        assert!(filter.matches_sampled_addresses([0x1234, 0x0080_65b3_0000]));
+        assert!(!filter.matches_sampled_addresses([0x0080_65b4_0000]));
+        assert!(!filter.matches_sampled_addresses([]));
     }
 
     #[test]
