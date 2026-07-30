@@ -142,10 +142,12 @@ use self::stats::{
     SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, TEXTURE_DIRTY_VALIDATION_BYTES,
     TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
     TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
-    TEXTURE_SNAPSHOT_NANOSECONDS, process_resident_bytes, record_mode27_work_detail,
+    TEXTURE_SNAPSHOT_NANOSECONDS, process_memory_statistics, record_mode27_work_detail,
     record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
     take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
+#[cfg(test)]
+use self::stats::process_resident_bytes;
 use self::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,

@@ -11,6 +11,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProcessMemoryStatistics {
+    pub(super) resident_bytes: u64,
+    pub(super) physical_footprint_bytes: u64,
+    pub(super) peak_physical_footprint_bytes: u64,
+}
+
+unsafe extern "C" {
+    #[link_name = "proc_pid_rusage"]
+    fn process_pid_rusage(
+        pid: libc::c_int,
+        flavor: libc::c_int,
+        buffer: *mut libc::c_void,
+    ) -> libc::c_int;
+}
+
 pub(super) static TEXTURE_SNAPSHOT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static TEXTURE_SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -85,26 +101,32 @@ pub(super) fn record_texture_work(
     );
 }
 
-pub(super) fn process_resident_bytes() -> Option<u64> {
-    let mut task = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
-    let byte_count = std::mem::size_of::<libc::proc_taskinfo>();
-    let byte_count = i32::try_from(byte_count).ok()?;
-    // SAFETY: `task` names writable storage of exactly the size passed to `proc_pidinfo` for the
-    // current process and is read only after libproc reports a complete `PROC_PIDTASKINFO` result.
-    let written = unsafe {
-        libc::proc_pidinfo(
+pub(super) fn process_memory_statistics() -> Option<ProcessMemoryStatistics> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `usage` names writable storage for the RUSAGE_INFO_V4 flavor. A zero result
+    // guarantees that libproc initialized the complete structure before it is read below.
+    let result = unsafe {
+        process_pid_rusage(
             i32::try_from(std::process::id()).ok()?,
-            libc::PROC_PIDTASKINFO,
-            0,
-            task.as_mut_ptr().cast::<c_void>(),
-            byte_count,
+            libc::RUSAGE_INFO_V4,
+            usage.as_mut_ptr().cast::<c_void>(),
         )
     };
-    if written != byte_count {
+    if result != 0 {
         return None;
     }
-    // SAFETY: A complete result initialized every field of `proc_taskinfo` above.
-    Some(unsafe { task.assume_init() }.pti_resident_size)
+    // SAFETY: A successful RUSAGE_INFO_V4 query initialized every field of `usage`.
+    let usage = unsafe { usage.assume_init() };
+    Some(ProcessMemoryStatistics {
+        resident_bytes: usage.ri_resident_size,
+        physical_footprint_bytes: usage.ri_phys_footprint,
+        peak_physical_footprint_bytes: usage.ri_lifetime_max_phys_footprint,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn process_resident_bytes() -> Option<u64> {
+    process_memory_statistics().map(|statistics| statistics.resident_bytes)
 }
 
 pub(super) static MODE27_WORK_DETAILS: OnceLock<
