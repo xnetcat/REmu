@@ -175,11 +175,11 @@ pub(crate) use av_player::{
     av_player_add_source, av_player_add_source_ex, av_player_change_stream, av_player_close,
     av_player_current_time, av_player_get_audio_data, av_player_get_stream_info,
     av_player_get_video_data, av_player_init_ex, av_player_is_active, av_player_jump_to_time,
-    av_player_pause, av_player_post_init, av_player_resume, av_player_set_log_callback,
-    av_player_set_looping, av_player_set_trick_speed, av_player_start, av_player_stop,
-    av_player_stream_count, av_player_validate_handle, invoke_av_player_event_callbacks,
-    invoke_av_player_texture_deallocations, prepare_av_player_video_buffers,
-    take_av_player_calling_thread_callbacks,
+    av_player_pause, av_player_post_init, av_player_resume, av_player_set_av_sync_mode,
+    av_player_set_log_callback, av_player_set_looping, av_player_set_trick_speed, av_player_start,
+    av_player_stop, av_player_stream_count, av_player_validate_handle,
+    invoke_av_player_event_callbacks, invoke_av_player_texture_deallocations,
+    prepare_av_player_video_buffers, take_av_player_calling_thread_callbacks,
 };
 #[cfg(test)]
 pub(crate) use dialog::{
@@ -536,6 +536,9 @@ struct AvPlayerInstance {
     /// Playback-rate percentage from sceAvPlayerSetTrickSpeed; 100 is normal speed. It scales
     /// the player media clock, not media timestamps.
     trick_speed_percent: u32,
+    /// Native Default mode (0) gates video by the presentation clock. None (1) hands frame
+    /// selection to the caller and releases every decoded frame as soon as it is available.
+    av_sync_mode: u32,
     video_decoder: Option<AvPlayerDecoder>,
     raw_video_frame: Vec<u8>,
     padded_video_frame: Vec<u8>,
@@ -3712,7 +3715,8 @@ fn dispatch_probe_import(
         "JdksQu8pNdQ" => av_player_get_video_data(arguments, true, state),
         "d8FcbzfAdQw" => av_player_get_stream_info(arguments, false, state),
         "ctTAcF5DiKQ" => av_player_get_stream_info(arguments, true, state),
-        "ODJK2sn9w4A" | "k-q+xOxdc3E" => av_player_validate_handle(arguments[0], state),
+        "ODJK2sn9w4A" => av_player_validate_handle(arguments[0], state),
+        "k-q+xOxdc3E" => av_player_set_av_sync_mode(arguments, state),
         "hdTyRzCXQeQ" => av_player_stream_count(arguments[0], state),
         // libkernel's APR resolver imports are POSIX-shaped: the SDK wrappers consume `-1` and
         // `errno`, then translate that pair into an SCE kernel error. Returning an SCE error
