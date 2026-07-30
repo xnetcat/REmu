@@ -273,8 +273,89 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
             .source
             .contains("threadgroup_barrier(mem_flags::mem_threadgroup)")
     );
+    assert_eq!(
+        shader
+            .source
+            .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        1,
+        "an acyclic static site does not need a record-reuse barrier"
+    );
     assert!(shader.source.contains("remu_readfirstlane_active"));
     assert!(shader.source.contains("remu_s_44 ="));
+}
+
+#[test]
+fn acyclic_wave64_readfirstlane_sites_use_disjoint_exchange_records() {
+    let instructions = [0_u32, 4]
+        .into_iter()
+        .map(|pc| Instruction {
+            pc,
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VReadfirstlaneB32"),
+            words: vec![0],
+            sources: vec![Operand::vector(4)],
+            destinations: vec![Operand::scalar(44 + pc)],
+            control: None,
+        })
+        .collect();
+    let shader = compile_msl(
+        &Program::new(0x1000, instructions),
+        &empty_evaluation(),
+        &MetalCompileOptions::compute_wave(0, 64),
+    )
+    .expect("acyclic readfirstlane sites should lower with disjoint records");
+
+    assert!(
+        shader
+            .source
+            .contains("threadgroup uint remu_readfirstlane_values[64]")
+    );
+    assert!(shader.source.contains("32u + ((remu_wave_index << 1u)"));
+    assert!(shader.source.contains("32u + (remu_wave_index << 1u)"));
+    assert_eq!(
+        shader
+            .source
+            .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        2,
+        "each static site needs only its producer-consumer barrier"
+    );
+}
+
+#[test]
+fn memory_heavy_acyclic_readfirstlane_retains_shared_records() {
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VReadfirstlaneB32"),
+            words: vec![0],
+            sources: vec![Operand::vector(4)],
+            destinations: vec![Operand::scalar(44)],
+            control: None,
+        }],
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute_wave(32 * 1_024, 64),
+    )
+    .expect("memory-heavy readfirstlane should lower with shared records");
+
+    assert!(
+        shader
+            .source
+            .contains("threadgroup uint remu_readfirstlane_values[32]")
+    );
+    assert_eq!(
+        shader
+            .source
+            .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        2
+    );
 }
 
 #[test]
