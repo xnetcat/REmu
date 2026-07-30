@@ -45,8 +45,9 @@ use self::decode::{
     decode_render_target_format, decode_render_targets, decode_scissor, decode_viewport,
     fallback_image_descriptor, graphics_pipeline_key, image_component_class,
     initial_depth_clear_for_target, initial_render_target_clear_color, metal_color_write_mask,
-    metal_nonindexed_vertex_count, metal_primitive_type, prepare_indexed_primitive,
-    prepare_ngg_meshlets, raw_video_out_texture_descriptor, read_draw_indices, register_value,
+    metal_nonindexed_vertex_count, metal_primitive_type, ngg_mesh_base_vertex,
+    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
+    raw_video_out_texture_descriptor, read_draw_indices, register_value,
     render_target_cmask_address, render_target_fast_clear_color, sampled_alias_descriptor,
 };
 #[cfg(test)]
@@ -94,6 +95,8 @@ use self::diagnostics::{
     trace_scanout_writes, trace_target_sampling, trace_video_target_compute_consumer,
     trace_video_target_consumers, trace_video_target_draw_consumer, video_target_binding_summary,
 };
+#[cfg(test)]
+use self::execute::{export_resource_render_stage, ngg_mesh_dispatch_required};
 use self::format::{
     compressed_texture_block_extent, decode_sampled_texture_format, half_float_to_f32,
     half_float_to_srgb_unorm8, half_float_to_unorm8, linear_unorm8_to_srgb_unorm8,
@@ -124,14 +127,15 @@ use self::shader::{
     compute_pipeline_key, compute_program_can_split_wave64, dump_shader_pair_msl,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, pixel_scalars, program_embeds_global_base,
+    is_storage_image_opcode, is_writable_image_opcode, ngg_mesh_stage_for_draw, pixel_scalars,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
-    missing_vertex_parameter_exports, ngg_mesh_export_stage, procedural_rectangle_export_stage,
-    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
-    shader_scalar_metadata,
+    missing_vertex_parameter_exports, ngg_mesh_draw_supported, ngg_mesh_export_stage,
+    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
 };
 #[cfg(test)]
 use self::stats::process_resident_bytes;
@@ -536,6 +540,13 @@ struct GraphicsPipelineKey {
     depth: Option<DepthTargetPipelineState>,
     sample_count: u32,
     render_target_array_length: u32,
+    /// Shader stage selection depends on draw topology as well as program identity. Keep the
+    /// resolved choice in the pipeline key so asynchronous compilation cannot reuse a vertex
+    /// pipeline for the same NGG program when another draw requires mesh lowering.
+    uses_mesh_stage: bool,
+    /// Procedural rectangles synthesize a different vertex function from ordinary triangles even
+    /// when their guest programs and Metal topology class are otherwise identical.
+    uses_procedural_rectangle_stage: bool,
     primitive_topology_class: MTLPrimitiveTopologyClass,
 }
 

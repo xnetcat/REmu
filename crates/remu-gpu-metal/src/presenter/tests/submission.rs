@@ -1109,6 +1109,8 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
         depth: None,
         sample_count: 1,
         render_target_array_length: 1,
+        uses_mesh_stage: false,
+        uses_procedural_rectangle_stage: false,
         primitive_topology_class: MTLPrimitiveTopologyClass::Triangle,
     };
     let mut capture_key = key.clone();
@@ -1117,6 +1119,18 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
     assert_ne!(
         key, capture_key,
         "capture hooks change both Metal function interfaces and must not reuse a hook-free pipeline"
+    );
+    let mut mesh_key = key.clone();
+    mesh_key.uses_mesh_stage = true;
+    assert_ne!(
+        key, mesh_key,
+        "mesh functions must not alias ordinary vertex pipelines"
+    );
+    let mut procedural_key = key.clone();
+    procedural_key.uses_procedural_rectangle_stage = true;
+    assert_ne!(
+        key, procedural_key,
+        "synthesized rectangle functions must not alias ordinary triangle-class pipelines"
     );
     let mut draw = indexed_draw(0, 0, 0);
     draw.sequence = 17;

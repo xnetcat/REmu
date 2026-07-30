@@ -32,13 +32,16 @@ pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    missing_vertex_parameter_exports, ngg_mesh_export_stage, pixel_interpolation_attribute_mask,
-    pixel_scalars, procedural_rectangle_export_stage, program_embeds_global_base, program_uses_lds,
-    rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
+    missing_vertex_parameter_exports, ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
+    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    program_uses_lds, rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
 #[cfg(test)]
-pub(crate) use self::program::{rectangle_draw_has_incomplete_interface, shader_scalar_metadata};
+pub(crate) use self::program::{
+    ngg_mesh_draw_supported, ngg_mesh_export_stage, procedural_rectangle_export_stage,
+    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
+};
 
 impl MetalPresenter {
     pub(super) fn prefetch_pipeline_compilations(&mut self) {
@@ -428,10 +431,7 @@ impl MetalPresenter {
         let pixel_msl =
             remu_shader_metal::compile_msl(pixel_program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
-        let uses_procedural_rectangle_stage = !draw.indexed
-            && draw.index_count == 3
-            && matches!(draw.primitive_type, 7 | 0x11)
-            && procedural_rectangle_export_stage(&export.program);
+        let uses_procedural_rectangle_stage = key.uses_procedural_rectangle_stage;
         if key.render_target_array_length == 1 {
             let exported_parameters = vertex_parameter_export_mask(&export.program);
             let interpolated_attributes = pixel_interpolation_attribute_mask(pixel_program);
@@ -464,8 +464,7 @@ impl MetalPresenter {
                 );
             }
         }
-        let uses_mesh_stage =
-            draw.indexed && draw.primitive_type == 4 && ngg_mesh_export_stage(&export.program);
+        let uses_mesh_stage = key.uses_mesh_stage;
         let mut vertex_options = if uses_mesh_stage {
             let limits = key
                 .ngg_subgroup_limits

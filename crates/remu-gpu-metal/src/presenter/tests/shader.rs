@@ -1,7 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use metal::CompileOptions;
+use metal::{CompileOptions, MTLRenderStages};
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuRegister,
     ShaderSnapshot, gpu_event_channel,
@@ -17,9 +17,10 @@ use super::{
     CompiledComputePipeline, ComputePipelineKey, MetalPresenter, OrderedEventPoll,
     OrderedGpuEventReceiver, ProgramIdentity, QueueBlockReason, ShaderCompileRequest,
     ShaderCompileResult, canonical_sampler_bindings, canonical_texture_bindings,
-    compile_shader_request_catching_panics, compute_launch, fragmentless_pixel_evaluation,
-    fragmentless_pixel_program, graphics_shader_resource_key, image_component_class,
-    missing_vertex_parameter_exports, ngg_mesh_export_stage, procedural_rectangle_export_stage,
+    compile_shader_request_catching_panics, compute_launch, export_resource_render_stage,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
+    image_component_class, missing_vertex_parameter_exports, ngg_mesh_draw_supported,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
     rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
     sampler_uses_normalized_coordinates, shader_scalar_metadata,
     shader_scalar_metadata_for_registers, speculative_pipeline_compile_in_flight_capacity,
@@ -359,6 +360,59 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
     assert!(
         ngg_mesh_export_stage(&program),
         "allocation plus primitive and position exports form an NGG contract even without LDS"
+    );
+    let mut draw = super::indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    assert_eq!(
+        ngg_mesh_stage_for_draw(&program, &draw),
+        Ok(false),
+        "the exact three-vertex rectangle retains its synthesized vertex-stage path"
+    );
+    draw.index_count = 4;
+    assert!(
+        ngg_mesh_stage_for_draw(&program, &draw)
+            .expect_err("a non-exact NGG topology cannot silently fall back to vertex lowering")
+            .contains("unsupported topology")
+    );
+    draw.index_count = 3;
+    draw.indirect_arguments_address = Some(0x4000);
+    assert!(
+        ngg_mesh_stage_for_draw(&program, &draw)
+            .expect_err("an indirect count cannot use the exact procedural rectangle path")
+            .contains("ordered GPU-side mesh geometry preparation is not implemented")
+    );
+}
+
+#[test]
+fn accepts_native_ngg_triangle_lists_and_nonindexed_triangle_strips() {
+    let mut draw = super::indexed_draw(0, 0, 6);
+    assert!(ngg_mesh_draw_supported(&draw));
+
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    draw.index_count = 4;
+    assert!(ngg_mesh_draw_supported(&draw));
+
+    draw.indirect_arguments_address = Some(0x4000);
+    assert!(!ngg_mesh_draw_supported(&draw));
+
+    draw.indexed = true;
+    draw.primitive_type = 4;
+    assert!(!ngg_mesh_draw_supported(&draw));
+
+    draw.indirect_arguments_address = None;
+    draw.primitive_type = 7;
+    assert!(!ngg_mesh_draw_supported(&draw));
+}
+
+#[test]
+fn selects_mesh_render_stage_for_export_resources() {
+    assert_eq!(export_resource_render_stage(false), MTLRenderStages::Vertex);
+    assert_eq!(
+        export_resource_render_stage(true).bits(),
+        1 << 4,
+        "mesh resources must be declared for the mesh stage rather than the inactive vertex stage"
     );
 }
 
