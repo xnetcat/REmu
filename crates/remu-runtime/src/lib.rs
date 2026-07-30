@@ -3748,6 +3748,8 @@ fn dispatch_stateless_import(
         "0NTHN1NKONI" => guest_kernel_convert_localtime_to_utc(arguments),
         "-o5uEDpN+oY" => guest_kernel_convert_utc_to_localtime(arguments),
         "0-KXaS70xy4" | "eoht7mQOCmo" => pthread_get_specific(low_u32(arguments[0])),
+        "WrOLvHU0yQM" => posix_pthread_result(pthread_set_specific(arguments)),
+        "+BzXYkqYeLE" => pthread_set_specific(arguments),
         _ => return None,
     })
 }
@@ -4061,8 +4063,6 @@ fn dispatch_probe_import(
         "mDmgMOGVUqg" => posix_pthread_result(pthread_mutex_attr_set_type(arguments, state)),
         "mqULNdimTn0" => posix_pthread_result(pthread_key_create(arguments, state)),
         "geDaqgH9lTg" => pthread_key_create(arguments, state),
-        "WrOLvHU0yQM" => posix_pthread_result(pthread_set_specific(arguments, state)),
-        "+BzXYkqYeLE" => pthread_set_specific(arguments, state),
         "PrdHuuDekhY" => pthread_key_delete(low_u32(arguments[0]), state),
         "6BpEZuDT7YI" => posix_pthread_result(pthread_key_delete(low_u32(arguments[0]), state)),
         "nsYoNRywwNg" | "wtkt-teR1so" => {
