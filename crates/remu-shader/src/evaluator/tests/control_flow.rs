@@ -240,7 +240,7 @@ fn linked_setpc_preserves_scalar_state_and_continuation_absolute_pc() {
         ],
     );
     let continuation = Program::new(
-        0x4000,
+        0x800,
         vec![
             instruction(
                 0,
@@ -279,9 +279,9 @@ fn linked_setpc_preserves_scalar_state_and_continuation_absolute_pc() {
     .expect("linked scalar control flow");
 
     assert_eq!(evaluation.scalar_registers[20], 7);
-    assert_eq!(evaluation.scalar_registers[30], 0x4004);
+    assert_eq!(evaluation.scalar_registers[30], 0x804);
     assert_eq!(evaluation.scalar_registers[31], 0);
-    assert_eq!(evaluation.scalar_registers[40], 0x400b);
+    assert_eq!(evaluation.scalar_registers[40], 0x80b);
 }
 
 #[test]
@@ -324,7 +324,7 @@ fn linked_program_resources_keep_distinct_front_and_continuation_pcs() {
             ),
         ],
     );
-    let continuation = Program::new(0x4000, vec![image_instruction(0), end(4)]);
+    let continuation = Program::new(0x800, vec![image_instruction(0), end(4)]);
     let shader = ShaderState {
         program: Arc::new(
             crate::link_program_continuation(&front, &continuation)
@@ -348,6 +348,6 @@ fn linked_program_resources_keep_distinct_front_and_continuation_pcs() {
             .iter()
             .map(|binding| binding.pc)
             .collect::<Vec<_>>(),
-        vec![0, 0x3000]
+        vec![0, 8]
     );
 }

@@ -148,21 +148,32 @@ fn branched_programs_keep_conservative_shader_inputs() {
 }
 
 #[test]
-fn links_setpc_to_the_exact_continuation_pc_namespace() {
+fn links_setpc_to_a_separately_allocated_lower_address() {
     let front = Program::new(
-        0x1000,
-        vec![Instruction {
-            pc: 0,
-            encoding: ShaderEncoding::Sop1,
-            opcode: Opcode::from_static("SSetpcB64"),
-            words: vec![0xbe80_2006],
-            sources: vec![Operand::scalar(6)],
-            destinations: Vec::new(),
-            control: None,
-        }],
+        0x0080_7b55_0000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::from_static("SNop"),
+                words: vec![0xbf80_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 0x16ac,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::from_static("SSetpcB64"),
+                words: vec![0xbe80_2006],
+                sources: vec![Operand::scalar(6)],
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
     );
     let continuation = Program::new(
-        0x4000,
+        0x0080_7b3e_0000,
         vec![
             Instruction {
                 pc: 0,
@@ -188,15 +199,57 @@ fn links_setpc_to_the_exact_continuation_pc_namespace() {
     let linked = link_program_continuation(&front, &continuation).expect("registered continuation");
 
     assert_eq!(linked.address, front.address);
-    assert_eq!(linked.linked_transfer_target(0), Some(0x3000));
-    assert_eq!(linked.instructions[1].pc, 0x3000);
+    assert_eq!(linked.linked_transfer_target(0x16ac), Some(0x16b0));
+    assert_eq!(linked.instructions[2].pc, 0x16b0);
     assert_eq!(
-        linked.address + u64::from(linked.instructions[1].pc),
+        linked.instruction_address(linked.instructions[2].pc),
         continuation.address
+    );
+    assert_eq!(
+        linked.instruction_address(linked.instructions[3].pc),
+        continuation.address + 4
     );
     assert_ne!(
         front, linked,
         "a linked program has a distinct cache identity"
+    );
+}
+
+#[test]
+fn refuses_physically_overlapping_linked_allocations() {
+    let front = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sop1,
+            opcode: Opcode::from_static("SSetpcB64"),
+            words: vec![0xbe80_2006],
+            sources: vec![Operand::scalar(6)],
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let continuation = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0xbf81_0000],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+
+    assert_eq!(
+        link_program_continuation(&front, &continuation),
+        Err(ProgramLinkError::OverlappingPrograms {
+            front_start: 0x1000,
+            front_end: 0x1004,
+            continuation_start: 0x1000,
+            continuation_end: 0x1004,
+        })
     );
 }
 

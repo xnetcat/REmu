@@ -310,20 +310,20 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
 
 #[test]
 fn fused_shader_snapshot_uses_back_descriptor_and_retains_continuation_program() {
-    // Keep both allocations in one ascending test buffer because the linked PC namespace
-    // preserves their real address delta.
+    // The back allocation intentionally precedes the front allocation. Shader heaps recycle
+    // independent blocks in either order; their guest addresses do not describe execution order.
     let program_words = [
-        0xbe80_2006_u32, // s_setpc_b64 s[6:7]
+        0xbf81_0000_u32, // back: s_endpgm
         0,
         0,
         0,
-        0xbf81_0000_u32, // s_endpgm
+        0xbe80_2006_u32, // front: s_setpc_b64 s[6:7]
     ];
     let mut front_header = [0_u8; SHADER_HEADER_SIZE as usize];
     let mut back_header = [0_u8; SHADER_HEADER_SIZE as usize];
     let mut back_user_data = [0_u8; 0x36];
-    let front_program_address = program_words.as_ptr().addr() as u64;
-    let back_program_address = program_words[4..].as_ptr().addr() as u64;
+    let front_program_address = program_words[4..].as_ptr().addr() as u64;
+    let back_program_address = program_words.as_ptr().addr() as u64;
     let front_header_address = front_header.as_mut_ptr().addr() as u64;
     let back_header_address = back_header.as_mut_ptr().addr() as u64;
     write_guest_u64(
@@ -363,7 +363,13 @@ fn fused_shader_snapshot_uses_back_descriptor_and_retains_continuation_program()
     assert_eq!(snapshot.program.instructions.len(), 2);
     assert_eq!(
         snapshot.program.linked_transfer_target(0),
-        Some(u32::try_from(back_program_address - front_program_address).unwrap())
+        Some(u32::try_from(std::mem::size_of::<u32>()).unwrap())
+    );
+    assert_eq!(
+        snapshot
+            .program
+            .instruction_address(u32::try_from(std::mem::size_of::<u32>()).unwrap()),
+        back_program_address
     );
     assert_eq!(snapshot.header_address, back_header_address);
     assert!(snapshot.metadata.is_some());

@@ -217,9 +217,9 @@ fn linked_setpc_lowers_real_continuation_param_exports() {
 
 #[test]
 fn linked_continuation_getpc_uses_its_original_absolute_address() {
-    let front = Program::new(0x1000, vec![setpc(0)]);
+    let front = Program::new(0x4000, vec![setpc(0)]);
     let continuation = Program::new(
-        0x4000,
+        0x1000,
         vec![
             Instruction {
                 pc: 0,
@@ -260,7 +260,7 @@ fn linked_continuation_getpc_uses_its_original_absolute_address() {
     )
     .expect("linked GETPC should lower");
 
-    assert!(shader.source.contains("remu_s_20 = 0x4004u;"));
+    assert!(shader.source.contains("remu_s_20 = 0x1004u;"));
 }
 
 #[test]
