@@ -309,6 +309,8 @@ pub struct Program {
     /// synthetic PC range in the combined graph, but `S_GETPC_B64` must still observe its original
     /// allocation address.
     instruction_addresses: BTreeMap<u32, u64>,
+    /// Exact allocation supplied in s[6:7] when AGC enters a separately allocated fused front.
+    linked_continuation_address: Option<u64>,
     pixel_color_export_masks: u32,
     next_evaluation_instruction_indices: Vec<u32>,
     evaluation_live_scalar_register_indices: Vec<Vec<u8>>,
@@ -503,6 +505,7 @@ impl Program {
             address,
             instructions,
             instruction_addresses: BTreeMap::new(),
+            linked_continuation_address: None,
             pixel_color_export_masks,
             next_evaluation_instruction_indices,
             evaluation_live_scalar_register_indices,
@@ -519,9 +522,11 @@ impl Program {
         address: u64,
         instructions: Vec<Instruction>,
         instruction_addresses: BTreeMap<u32, u64>,
+        linked_continuation_address: Option<u64>,
     ) -> Self {
         let mut program = Self::new(address, instructions);
         program.instruction_addresses = instruction_addresses;
+        program.linked_continuation_address = linked_continuation_address;
         program
     }
 
@@ -532,6 +537,12 @@ impl Program {
             .get(&pc)
             .copied()
             .unwrap_or_else(|| self.address.wrapping_add(u64::from(pc)))
+    }
+
+    /// Returns the fused continuation allocation preloaded in s[6:7], when linked.
+    #[must_use]
+    pub const fn linked_continuation_address(&self) -> Option<u64> {
+        self.linked_continuation_address
     }
 
     #[must_use]

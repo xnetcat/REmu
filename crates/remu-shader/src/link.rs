@@ -108,6 +108,7 @@ pub fn link_tail_call_programs(
         front.address,
         instructions,
         instruction_addresses,
+        Some(continuation.address),
     ))
 }
 
@@ -190,6 +191,10 @@ mod tests {
         assert_eq!(
             linked.instruction_address(linked.instructions[1].pc),
             continuation.address
+        );
+        assert_eq!(
+            linked.linked_continuation_address(),
+            Some(continuation.address)
         );
         let targets = linked
             .instructions

@@ -533,13 +533,13 @@ impl MetalPresenter {
         &mut self,
         device: &Device,
         indices: &[u32],
-    ) -> Result<CachedNggMeshlets, String> {
+    ) -> Result<Option<CachedNggMeshlets>, String> {
         if let Some(cached) = self.ngg_meshlet_cache.get(indices) {
-            return Ok(cached.clone());
+            return Ok(Some(cached.clone()));
         }
         let prepared = prepare_ngg_meshlets(indices);
         if prepared.group_count == 0 {
-            return Err("NGG triangle draw contains no complete primitive".to_owned());
+            return Ok(None);
         }
         let byte_count = prepared
             .words
@@ -561,7 +561,7 @@ impl MetalPresenter {
         }
         self.ngg_meshlet_cache
             .insert(indices.to_vec(), cached.clone());
-        Ok(cached)
+        Ok(Some(cached))
     }
 }
 

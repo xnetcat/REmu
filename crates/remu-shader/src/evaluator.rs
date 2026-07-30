@@ -185,6 +185,12 @@ pub fn evaluate_shader(
     if state.user_data_scalar_register_base == 8 {
         registers[3] = MERGED_EXPORT_WAVE_INFO;
     }
+    if let Some(continuation_address) = state.program.linked_continuation_address() {
+        registers[6] = u32::try_from(continuation_address & u64::from(u32::MAX))
+            .expect("masked continuation address fits u32");
+        registers[7] =
+            u32::try_from(continuation_address >> 32).expect("high continuation address fits u32");
+    }
     if let Some(system_registers) = state.compute_system_registers {
         system_registers.clear_static_values(&mut registers);
     }
