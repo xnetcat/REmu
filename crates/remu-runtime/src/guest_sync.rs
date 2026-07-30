@@ -52,6 +52,7 @@ use self::state::{
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MAIN_CONDITION_NOTIFY_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static NAMED_THREAD_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LAST_PENDING_RHI_CHAIN_TRACE: AtomicU64 = AtomicU64::new(0);
 
 fn trace_read_guest_u32(address: u64) -> u32 {
     try_read_process_guest_u32(address).unwrap_or(0)
@@ -79,6 +80,14 @@ struct GraphEventTrace {
     words: [u64; 8],
 }
 
+impl GraphEventTrace {
+    fn is_pending(&self) -> bool {
+        const GRAPH_EVENT_COMPLETE: u64 = 0x0400_0000;
+
+        self.event != 0 && self.words[2] & GRAPH_EVENT_COMPLETE == 0
+    }
+}
+
 fn trace_graph_event_pointer(pointer_address: u64) -> GraphEventTrace {
     let event = trace_read_guest_u64(pointer_address);
     GraphEventTrace {
@@ -102,6 +111,27 @@ struct RhiTaskGraphTrace {
     prerequisite_control: u32,
     prerequisite_storage: u64,
     prerequisites: Vec<GraphEventTrace>,
+}
+
+impl RhiTaskGraphTrace {
+    fn pending_chain_identity(&self) -> Option<u64> {
+        let events = [
+            &self.completion_event,
+            &self.submit_event,
+            &self.dispatch_event,
+        ];
+        let mut identity = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut pending = false;
+        for (index, event) in events.into_iter().enumerate() {
+            if event.is_pending() {
+                pending = true;
+                identity ^= event
+                    .event
+                    .rotate_left(u32::try_from(index * 21).unwrap_or(0));
+            }
+        }
+        pending.then_some(identity.max(1))
+    }
 }
 
 fn trace_rhi_task_graph() -> RhiTaskGraphTrace {
@@ -216,15 +246,20 @@ fn begin_named_thread_condition_trace(
         return None;
     }
     let sequence = NAMED_THREAD_CONDITION_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-    if sequence > 32 && !sequence.is_power_of_two() {
+    let rhi_task_graph = trace_rhi_task_graph();
+    let new_pending_chain = rhi_task_graph
+        .pending_chain_identity()
+        .is_some_and(|identity| {
+            LAST_PENDING_RHI_CHAIN_TRACE.swap(identity, Ordering::Relaxed) != identity
+        });
+    if sequence > 32 && !sequence.is_power_of_two() && !new_pending_chain {
         return None;
     }
     let guest_rsp = frame.map_or(0, |frame| frame.guest_rsp);
     let stack = trace_guest_words::<24>(guest_rsp);
     let (waiters, notifies, timeouts) = condition_trace_stats(condition);
-    let rhi_task_graph = trace_rhi_task_graph();
     eprintln!(
-        "[REMu][COND][NAMED-WAIT] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} stack={stack:x?} condition={condition:#x} mutex={mutex:#x} waiters={waiters} notifies={notifies} timeouts={timeouts} rhi_task_graph={rhi_task_graph:x?}",
+        "[REMu][COND][NAMED-WAIT] enter sequence={sequence} new_pending_rhi_chain={new_pending_chain} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} stack={stack:x?} condition={condition:#x} mutex={mutex:#x} waiters={waiters} notifies={notifies} timeouts={timeouts} rhi_task_graph={rhi_task_graph:x?}",
         current_guest_thread_handle(),
         frame.map_or(0, |frame| frame.guest_return_address),
     );
@@ -614,5 +649,71 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         "JTvBflhYazQ" => guest_event_flag_wait(arguments),
         "PZku4ZrXJqg" => guest_event_flag_cancel(arguments),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::{GraphEventTrace, RhiTaskGraphTrace};
+
+    fn graph_event(event: u64, complete: bool) -> GraphEventTrace {
+        let mut words = [0; 8];
+        if complete {
+            words[2] = 0x0400_0000;
+        }
+        GraphEventTrace { event, words }
+    }
+
+    fn rhi_trace(
+        completion_event: GraphEventTrace,
+        submit_event: GraphEventTrace,
+        dispatch_event: GraphEventTrace,
+    ) -> RhiTaskGraphTrace {
+        RhiTaskGraphTrace {
+            task_graph: 0,
+            task_graph_words: [0; 24],
+            render_named_thread: 0,
+            rhi_named_thread: 0,
+            command_list_words: [0; 20],
+            dispatch_event,
+            completion_event,
+            submit_event,
+            prerequisite_count: 0,
+            prerequisite_control: 0,
+            prerequisite_storage: 0,
+            prerequisites: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn graph_event_pending_matches_guest_completion_bit() {
+        assert!(!graph_event(0, false).is_pending());
+        assert!(graph_event(0x1000, false).is_pending());
+        assert!(!graph_event(0x1000, true).is_pending());
+    }
+
+    #[test]
+    fn pending_rhi_chain_identity_includes_the_unfinished_predecessor() {
+        let current_only = rhi_trace(
+            graph_event(0x1000, false),
+            graph_event(0x2000, true),
+            graph_event(0, false),
+        );
+        let current_and_predecessor = rhi_trace(
+            graph_event(0x1000, false),
+            graph_event(0x2000, false),
+            graph_event(0, false),
+        );
+        let all_complete = rhi_trace(
+            graph_event(0x1000, true),
+            graph_event(0x2000, true),
+            graph_event(0, false),
+        );
+
+        assert_ne!(
+            current_only.pending_chain_identity(),
+            current_and_predecessor.pending_chain_identity()
+        );
+        assert_eq!(all_complete.pending_chain_identity(), None);
     }
 }
