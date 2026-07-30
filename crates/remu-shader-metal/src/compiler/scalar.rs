@@ -97,10 +97,14 @@ impl Compiler<'_> {
             return Ok(());
         }
         if name == "SGetpcB64" {
-            let address = self.program.address
-                + u64::from(instruction.pc)
-                + u64::try_from(instruction.words.len() * 4)
-                    .map_err(|_| "instruction size overflow".to_owned())?;
+            let address = self
+                .program
+                .instruction_address(instruction.pc)
+                .checked_add(
+                    u64::try_from(instruction.words.len() * 4)
+                        .map_err(|_| "instruction size overflow".to_owned())?,
+                )
+                .ok_or_else(|| "instruction address overflow".to_owned())?;
             let low = u32::try_from(address & u64::from(u32::MAX))
                 .expect("masked address low half fits u32");
             let high = u32::try_from(address >> 32).expect("address high half fits u32");

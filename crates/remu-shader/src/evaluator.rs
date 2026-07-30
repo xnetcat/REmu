@@ -405,7 +405,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 }
                 execute_scalar_alu(
                     instruction,
-                    self.state.program.address,
+                    self.state.program.instruction_address(instruction.pc),
                     &mut path.registers,
                     &mut path.exec_mask,
                     &mut path.scalar_condition,

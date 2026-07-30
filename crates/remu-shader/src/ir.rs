@@ -303,6 +303,12 @@ pub struct Program {
     pub address: u64,
     pub instructions: Vec<Instruction>,
     linked_transfer_targets: BTreeMap<u32, u32>,
+    /// Original guest addresses for instructions placed in a synthetic linked-PC range.
+    ///
+    /// Ordinary decoded programs use `address + pc` and need no entries. A separately allocated
+    /// continuation can precede its front allocation, so its monotonically increasing compiler PC
+    /// cannot also encode its absolute guest address.
+    linked_instruction_addresses: BTreeMap<u32, u64>,
     pixel_color_export_masks: u32,
     next_evaluation_instruction_indices: Vec<u32>,
     evaluation_live_scalar_register_indices: Vec<Vec<u8>>,
@@ -325,9 +331,15 @@ pub enum ProgramLinkError {
     #[error("shader program is already linked")]
     AlreadyLinked,
     #[error(
-        "continuation at {continuation:#x} overlaps or precedes front program end {front_end:#x}"
+        "front shader range {front_start:#x}..{front_end:#x} overlaps continuation range \
+         {continuation_start:#x}..{continuation_end:#x}"
     )]
-    OverlappingPrograms { front_end: u64, continuation: u64 },
+    OverlappingPrograms {
+        front_start: u64,
+        front_end: u64,
+        continuation_start: u64,
+        continuation_end: u64,
+    },
     #[error("linked shader address arithmetic overflowed")]
     AddressOverflow,
     #[error("linked shader span exceeds the 32-bit architectural PC range")]
@@ -520,6 +532,7 @@ impl Program {
             address,
             instructions,
             linked_transfer_targets: BTreeMap::new(),
+            linked_instruction_addresses: BTreeMap::new(),
             pixel_color_export_masks,
             next_evaluation_instruction_indices,
             evaluation_live_scalar_register_indices,
@@ -540,6 +553,19 @@ impl Program {
     #[must_use]
     pub fn linked_transfer_target(&self, pc: u32) -> Option<u32> {
         self.linked_transfer_targets.get(&pc).copied()
+    }
+
+    /// Returns the original guest address of an instruction.
+    ///
+    /// Linked programs use a compact, ascending PC namespace for control-flow analysis. This
+    /// accessor preserves architectural addresses for `S_GETPC_B64` even when a separately
+    /// allocated continuation is below or more than 4 GiB away from the front allocation.
+    #[must_use]
+    pub fn instruction_address(&self, pc: u32) -> u64 {
+        self.linked_instruction_addresses
+            .get(&pc)
+            .copied()
+            .unwrap_or_else(|| self.address.wrapping_add(u64::from(pc)))
     }
 
     #[must_use]
@@ -608,11 +634,11 @@ impl Program {
 
 /// Joins one exact registered `S_SETPC_B64` continuation into a single shader program.
 ///
-/// The continuation's PCs are rebased by its real allocation-address delta rather than placed in
-/// an invented namespace. Consequently `program.address + instruction.pc` remains the original
-/// absolute guest address in both halves, preserving `S_GETPC_B64` and giving resource bindings
-/// from each allocation distinct instruction identities. Every front `S_SETPC_B64` edge targets
-/// the continuation entry; callers must only invoke this after proving the exact fused pair.
+/// The continuation's PCs are rebased into an adjacent synthetic range. Its original instruction
+/// addresses remain available through [`Program::instruction_address`], preserving `S_GETPC_B64`
+/// even when the independently allocated continuation precedes the front program or lies more
+/// than 4 GiB away. Every front `S_SETPC_B64` edge targets the continuation entry; callers must
+/// only invoke this after proving the exact fused pair.
 ///
 /// # Errors
 ///
@@ -642,36 +668,32 @@ pub fn link_program_continuation(
         return Err(ProgramLinkError::MissingSetpc);
     }
 
+    let front_end = decoded_program_end_address(front)?;
+    let continuation_end = decoded_program_end_address(continuation)?;
+    if front.address < continuation_end && continuation.address < front_end {
+        return Err(ProgramLinkError::OverlappingPrograms {
+            front_start: front.address,
+            front_end,
+            continuation_start: continuation.address,
+            continuation_end,
+        });
+    }
     let front_last = front
         .instructions
         .last()
         .ok_or(ProgramLinkError::EmptyFront)?;
-    let front_last_bytes = u64::try_from(
+    let front_last_bytes = u32::try_from(
         front_last
             .words
             .len()
             .checked_mul(size_of::<u32>())
-            .ok_or(ProgramLinkError::AddressOverflow)?,
+            .ok_or(ProgramLinkError::ProgramCounterOverflow)?,
     )
-    .map_err(|_| ProgramLinkError::AddressOverflow)?;
-    let front_end = front
-        .address
-        .checked_add(u64::from(front_last.pc))
-        .and_then(|address| address.checked_add(front_last_bytes))
-        .ok_or(ProgramLinkError::AddressOverflow)?;
-    if continuation.address < front_end {
-        return Err(ProgramLinkError::OverlappingPrograms {
-            front_end,
-            continuation: continuation.address,
-        });
-    }
-    let continuation_offset = continuation
-        .address
-        .checked_sub(front.address)
-        .ok_or(ProgramLinkError::AddressOverflow)
-        .and_then(|offset| {
-            u32::try_from(offset).map_err(|_| ProgramLinkError::ProgramCounterOverflow)
-        })?;
+    .map_err(|_| ProgramLinkError::ProgramCounterOverflow)?;
+    let continuation_offset = front_last
+        .pc
+        .checked_add(front_last_bytes)
+        .ok_or(ProgramLinkError::ProgramCounterOverflow)?;
     let continuation_entry = continuation_offset
         .checked_add(continuation.instructions[0].pc)
         .ok_or(ProgramLinkError::ProgramCounterOverflow)?;
@@ -692,12 +714,45 @@ pub fn link_program_continuation(
         .into_iter()
         .map(|pc| (pc, continuation_entry))
         .collect();
+    linked.linked_instruction_addresses = continuation
+        .instructions
+        .iter()
+        .map(|instruction| {
+            let linked_pc = continuation_offset
+                .checked_add(instruction.pc)
+                .ok_or(ProgramLinkError::ProgramCounterOverflow)?;
+            let address = continuation
+                .address
+                .checked_add(u64::from(instruction.pc))
+                .ok_or(ProgramLinkError::AddressOverflow)?;
+            Ok((linked_pc, address))
+        })
+        .collect::<Result<_, _>>()?;
     linked.evaluation_live_scalar_register_indices = evaluation_scalar_liveness(
         &linked.instructions,
         &linked.next_evaluation_instruction_indices,
         &linked.linked_transfer_targets,
     );
     Ok(linked)
+}
+
+fn decoded_program_end_address(program: &Program) -> Result<u64, ProgramLinkError> {
+    let last = program
+        .instructions
+        .last()
+        .ok_or(ProgramLinkError::EmptyFront)?;
+    let last_bytes = u64::try_from(
+        last.words
+            .len()
+            .checked_mul(size_of::<u32>())
+            .ok_or(ProgramLinkError::AddressOverflow)?,
+    )
+    .map_err(|_| ProgramLinkError::AddressOverflow)?;
+    program
+        .address
+        .checked_add(u64::from(last.pc))
+        .and_then(|address| address.checked_add(last_bytes))
+        .ok_or(ProgramLinkError::AddressOverflow)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

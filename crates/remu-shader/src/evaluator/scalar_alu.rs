@@ -36,7 +36,7 @@ pub(crate) fn scalar_destination(instruction: &Instruction) -> Result<u32, Evalu
 #[allow(clippy::too_many_lines)]
 pub(crate) fn execute_scalar_alu(
     instruction: &Instruction,
-    program_address: u64,
+    instruction_address: u64,
     registers: &mut [u32; SCALAR_REGISTER_COUNT],
     exec_mask: &mut u64,
     scalar_condition: &mut bool,
@@ -62,8 +62,7 @@ pub(crate) fn execute_scalar_alu(
         return Ok(());
     }
     if instruction.opcode.is("SGetpcB64") {
-        let pc = program_address
-            .wrapping_add(u64::from(instruction.pc))
+        let pc = instruction_address
             .wrapping_add(u64::try_from(instruction.words.len() * 4).unwrap_or_default());
         write_scalar_pair(registers, destination, pc, exec_mask);
         return Ok(());
