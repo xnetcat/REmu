@@ -133,6 +133,9 @@ status=$?
 set -e
 
 process_result=$(grep -E 'Process [0-9]+ (exited|stopped)' "$run_dir/debugger.log" | tail -n 1 || true)
+debugger_fault=$(grep -hE \
+    'debugserver requesting translation removal|gTaskSuspended == true|rosetta error: received an un(ex|pex)cted watchpoint exception' \
+    "$run_dir/debugger.log" "$run_dir/guest.stderr" | tail -n 1 || true)
 trace_lines=$(grep -c '\[REMu\]\[LLDB\]\[TASKGRAPH\]' "$run_dir/debugger.log" || true)
 trace_terminal=$(grep '\[REMu\]\[LLDB\]\[TASKGRAPH\].*done reason=' \
     "$run_dir/debugger.log" | tail -n 1 || true)
@@ -140,7 +143,9 @@ trace_last=$(grep '\[REMu\]\[LLDB\]\[TASKGRAPH\]' \
     "$run_dir/debugger.log" | tail -n 1 || true)
 trace_phase=$(grep '\[REMu\]\[LLDB\]\[TASKGRAPH\] armed phase=' \
     "$run_dir/debugger.log" | tail -n 1 || true)
-if [ "$status" -eq 124 ]; then
+if [ -n "$debugger_fault" ]; then
+    outcome=debugger-rosetta-fault
+elif [ "$status" -eq 124 ]; then
     outcome=external-watchdog-timeout
 elif printf '%s\n' "$process_result" | grep -q 'exited with status = 142'; then
     outcome=diagnostic-timeout
@@ -162,6 +167,7 @@ finished_at=$(date +%s)
     echo "exit_status=$status"
     echo "outcome=$outcome"
     echo "process_result=$process_result"
+    echo "debugger_fault=$debugger_fault"
     echo "trace_lines=$trace_lines"
     echo "trace_terminal=$trace_terminal"
     echo "trace_phase=$trace_phase"
