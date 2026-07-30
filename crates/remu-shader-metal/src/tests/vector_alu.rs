@@ -186,6 +186,69 @@ fn lowers_observed_rdna2_half_float_arithmetic() {
 }
 
 #[test]
+fn ordinary_f16_inline_constants_use_their_f16_values() {
+    let inline = compile_vector_instruction(
+        Instruction {
+            pc: 0x54c,
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known("VSubF16"),
+            words: vec![0, 0],
+            sources: vec![
+                Operand::source(242, None),
+                Operand::vector(4),
+                Operand::source(128, None),
+            ],
+            destinations: vec![Operand::vector(4)],
+            control: Some(InstructionControl::Vop3(remu_shader::Vop3Control {
+                absolute_mask: 0,
+                negate_mask: 0,
+                output_modifier: 0,
+                clamp: false,
+                // Inline constants are scalar F16 values, so OPSEL must not turn 1.0 into
+                // the zero-filled upper half of an implementation-side packed value.
+                operand_select: 0b0001,
+                scalar_destination: None,
+            })),
+        },
+        MetalShaderStage::Pixel,
+    );
+    assert!(
+        inline
+            .source
+            .contains("remu_f16_to_f32_bits(((0x3C00u) >> 0u)")
+    );
+    assert!(
+        !inline
+            .source
+            .contains("remu_f16_to_f32_bits(((0x3F800000u)")
+    );
+    assert!(!inline.source.contains("0x3C00u) >> 16u"));
+
+    let inline_half = compile_vector_instruction(
+        Instruction {
+            pc: 0x5a4,
+            encoding: ShaderEncoding::Vop2,
+            opcode: Opcode::Known("VMulF16"),
+            words: vec![0],
+            sources: vec![Operand::source(240, None), Operand::vector(5)],
+            destinations: vec![Operand::vector(5)],
+            control: None,
+        },
+        MetalShaderStage::Pixel,
+    );
+    assert!(
+        inline_half
+            .source
+            .contains("remu_f16_to_f32_bits(((0x3800u) >> 0u)")
+    );
+    assert!(
+        !inline_half
+            .source
+            .contains("remu_f16_to_f32_bits(((0x3F000000u)")
+    );
+}
+
+#[test]
 fn lowers_observed_rdna2_half_rsqrt_compare_and_integer_folds() {
     let rsqrt = compile_vector_instruction(
         Instruction {

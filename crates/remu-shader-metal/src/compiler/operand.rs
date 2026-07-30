@@ -4,7 +4,10 @@
 //! Operand sourcing: raw, 64-bit, float and half-float source expressions,
 //! the SDWA and VOP3 modifiers applied to them, and result clamping.
 
-use remu_shader::{Instruction, InstructionControl, OperandKind, decode_inline_constant};
+use remu_shader::{
+    Instruction, InstructionControl, OperandKind, decode_inline_constant,
+    decode_v2f16_inline_constant,
+};
 
 use crate::{
     Compiler, EXEC_HI, EXEC_LO, SCALAR_REGISTER_COUNT, VCC_HI, VCC_LO, VECTOR_REGISTER_COUNT,
@@ -211,14 +214,38 @@ impl Compiler<'_> {
         instruction: &Instruction,
         index: usize,
     ) -> Result<String, String> {
-        let raw = self.raw_source_with_sdwa_modifiers(instruction, index, false)?;
-        let shift = match instruction.control.as_ref() {
-            Some(InstructionControl::Vop3(control))
-                if control.operand_select & (1 << index) != 0 =>
-            {
-                16
+        let operand = instruction
+            .sources
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("missing half-float source operand {index}"))?;
+        let (raw, shift) = match operand.kind {
+            // Ordinary F16 instructions receive inline floating-point constants already
+            // converted to F16. They are scalar values rather than packed register operands, so
+            // OPSEL does not select a half of the ordinary FP32 inline-constant representation.
+            OperandKind::EncodedConstant => {
+                let raw = match operand.value {
+                    251..=253 => self.raw_source_with_sdwa_modifiers(instruction, index, false)?,
+                    encoded => decode_v2f16_inline_constant(encoded)
+                        .map(format_u32)
+                        .ok_or_else(|| {
+                            format!("unsupported half-float encoded constant {encoded}")
+                        })?,
+                };
+                (raw, 0)
             }
-            _ => 0,
+            _ => {
+                let raw = self.raw_source_with_sdwa_modifiers(instruction, index, false)?;
+                let shift = match instruction.control.as_ref() {
+                    Some(InstructionControl::Vop3(control))
+                        if control.operand_select & (1 << index) != 0 =>
+                    {
+                        16
+                    }
+                    _ => 0,
+                };
+                (raw, shift)
+            }
         };
         let mut value =
             format!("as_type<float>(remu_f16_to_f32_bits((({raw}) >> {shift}u) & 0xFFFFu))");
