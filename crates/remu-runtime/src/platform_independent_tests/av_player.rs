@@ -816,6 +816,138 @@ fn av_player_actual_eof_exposes_duration_and_queues_one_controller_stop() {
 }
 
 #[test]
+fn av_player_multiplexed_source_waits_for_video_and_audio_to_drain() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    let (video_sender, video_frames) = std::sync::mpsc::sync_channel(1);
+    let (audio_sender, audio_frames) = std::sync::mpsc::sync_channel(1);
+    drop(video_sender);
+    drop(audio_sender);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.source = Some("audio-video.mp4".to_owned());
+        player.has_audio = true;
+        player.duration = Duration::from_secs(4);
+        player.active_session = true;
+        player.playing_since = Some(Instant::now());
+        player.event_callback = 0x1234;
+        player.event_object = 0x5678;
+        player.video_decoder = Some(crate::AvPlayerDecoder {
+            child: None,
+            frames: std::sync::Mutex::new(video_frames),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker: None,
+        });
+        player.audio_decoder = Some(crate::AvPlayerDecoder {
+            child: None,
+            frames: std::sync::Mutex::new(audio_frames),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker: None,
+        });
+    }
+
+    let mut video_info = [0_u8; 112];
+    assert_eq!(
+        crate::av_player_get_video_data(
+            [handle, video_info.as_mut_ptr().addr() as u64, 0, 0, 0, 0,],
+            true,
+            &mut state,
+        ),
+        0
+    );
+    {
+        let player = &state.av_player.players[&handle];
+        assert!(player.video_decoder_drained);
+        assert!(!player.audio_decoder_drained);
+        assert!(player.active_session);
+        assert!(!player.end_of_stream);
+    }
+    assert!(
+        state.av_player.pending_callbacks.is_empty(),
+        "video EOF alone must not advance a multiplexed cutscene"
+    );
+
+    let mut audio_info = [0_u8; 40];
+    assert_eq!(
+        crate::av_player_get_audio_data(
+            [handle, audio_info.as_mut_ptr().addr() as u64, 0, 0, 0, 0,],
+            &mut state,
+        ),
+        0
+    );
+    let player = &state.av_player.players[&handle];
+    assert!(player.video_decoder_drained);
+    assert!(player.audio_decoder_drained);
+    assert!(!player.active_session);
+    assert!(player.end_of_stream);
+    assert_eq!(state.av_player.pending_callbacks.len(), 1);
+    assert_eq!(
+        state.av_player.pending_callbacks[0].delivery,
+        crate::AvPlayerEventDelivery::Controller
+    );
+}
+
+#[test]
+fn av_player_loop_restarts_only_after_every_enabled_stream_drains() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    let (video_sender, video_frames) = std::sync::mpsc::sync_channel(1);
+    let (audio_sender, audio_frames) = std::sync::mpsc::sync_channel(1);
+    drop(video_sender);
+    drop(audio_sender);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.source = Some("audio-video.mp4".to_owned());
+        player.has_audio = true;
+        player.active_session = true;
+        player.playing_since = Some(Instant::now());
+        player.looping = true;
+        player.video_decoder = Some(crate::AvPlayerDecoder {
+            child: None,
+            frames: std::sync::Mutex::new(video_frames),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker: None,
+        });
+        player.audio_decoder = Some(crate::AvPlayerDecoder {
+            child: None,
+            frames: std::sync::Mutex::new(audio_frames),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker: None,
+        });
+    }
+
+    let mut video_info = [0_u8; 112];
+    assert_eq!(
+        crate::av_player_get_video_data(
+            [handle, video_info.as_mut_ptr().addr() as u64, 0, 0, 0, 0,],
+            true,
+            &mut state,
+        ),
+        0
+    );
+    assert!(
+        state.av_player.players[&handle].video_decoder_drained,
+        "video EOF must remain visible while audio drains"
+    );
+
+    let mut audio_info = [0_u8; 40];
+    assert_eq!(
+        crate::av_player_get_audio_data(
+            [handle, audio_info.as_mut_ptr().addr() as u64, 0, 0, 0, 0,],
+            &mut state,
+        ),
+        0
+    );
+    let player = &state.av_player.players[&handle];
+    assert!(player.active_session);
+    assert!(player.playing_since.is_some());
+    assert!(!player.end_of_stream);
+    assert!(!player.video_decoder_drained);
+    assert!(!player.audio_decoder_drained);
+    assert!(state.av_player.pending_callbacks.is_empty());
+}
+
+#[test]
 fn av_player_jump_to_time_seeks_the_decoder_instead_of_replaying_from_zero() {
     let Some(root) = av_player_generate_test_clip("jump-to-time") else {
         return;

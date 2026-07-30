@@ -374,6 +374,7 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             trick_speed_percent: 100,
             av_sync_mode: 0,
             video_decoder: None,
+            video_decoder_drained: false,
             raw_video_frame: Vec::new(),
             padded_video_frame: Vec::new(),
             video_buffer_base: 0,
@@ -383,6 +384,7 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             next_video_frame: 0,
             video_catch_up_origin: None,
             audio_decoder: None,
+            audio_decoder_drained: false,
             raw_audio_frame: Vec::new(),
             audio_buffer_base: 0,
             next_audio_buffer: 0,
@@ -806,14 +808,34 @@ fn av_player_read_audio_frame(player: &mut AvPlayerInstance) -> AvPlayerFrameSta
     }
 }
 
-fn av_player_finish_stream(player: &mut AvPlayerInstance) -> Option<(u64, u64)> {
+/// Completes one playback cycle after every enabled stream has drained.
+///
+/// The demuxer reaches EOF before its per-stream decoder queues do. shadPS4 consequently keeps a
+/// source active until both audio and video queues are empty, then emits one controller-thread
+/// Stop event. REmu uses independent ffmpeg workers, so the equivalent boundary is the point where
+/// every worker has disconnected after its public frame queue was consumed. Finishing on video EOF
+/// alone truncates the tail of an audio track and can advance a cutscene state machine while its
+/// narration is still queued.
+fn av_player_finish_stream_if_drained(
+    handle: u64,
+    player: &mut AvPlayerInstance,
+) -> Option<(u64, u64)> {
+    if !player.video_decoder_drained || (player.has_audio && !player.audio_decoder_drained) {
+        return None;
+    }
     if player.looping {
+        eprintln!(
+            "[REMu][AVPLAYER] completed playback cycle handle={handle:#x}; restarting because looping=true"
+        );
         player.reset_playback();
         let now = Instant::now();
         player.playing_since = Some(now);
         player.presentation_anchor_host = Some(now);
         None
     } else {
+        eprintln!(
+            "[REMu][AVPLAYER] completed source handle={handle:#x} after video/audio drain; queuing controller Stop"
+        );
         let started = player.playing_since.take();
         player.stop_decoders();
         player.active_session = false;
@@ -827,6 +849,37 @@ fn av_player_finish_stream(player: &mut AvPlayerInstance) -> Option<(u64, u64)> 
         }
         player.presentation_anchor_host = None;
         Some((player.event_callback, player.event_object))
+    }
+}
+
+fn av_player_mark_decoder_drained(player: &mut AvPlayerInstance, audio: bool) {
+    let decoder = if audio {
+        if player.audio_decoder_drained {
+            return;
+        }
+        player.audio_decoder_drained = true;
+        player.audio_decoder.take()
+    } else {
+        if player.video_decoder_drained {
+            return;
+        }
+        player.video_decoder_drained = true;
+        player.video_decoder.take()
+    };
+    if let Some(decoder) = decoder {
+        decoder.retire();
+    }
+}
+
+fn av_player_queue_natural_stop(callback: Option<(u64, u64)>, state: &mut ProbeDispatchState) {
+    if let Some((function, object)) = callback {
+        av_player_queue_event(
+            function,
+            object,
+            1,
+            AvPlayerEventDelivery::Controller,
+            state,
+        );
     }
 }
 
@@ -1194,7 +1247,7 @@ fn av_player_trace_current_time(handle: u64, player: &AvPlayerInstance, current:
         !player.duration.is_zero() && current == player.duration && *previous != current;
     if *count <= 8 || count.is_power_of_two() || first_at_duration {
         eprintln!(
-            "[REMu][AVPLAYER][TRACE] handle={handle:#x} current-time count={count} value_ms={} anchor_ms={} anchor_age_ms={} duration_ms={} active={} playing={} paused={} eos={} master_delivered={} next_video_frame={} video_decoder={}",
+            "[REMu][AVPLAYER][TRACE] handle={handle:#x} current-time count={count} value_ms={} anchor_ms={} anchor_age_ms={} duration_ms={} active={} playing={} paused={} eos={} master_delivered={} next_video_frame={} video_decoder={} video_drained={} audio_decoder={} audio_drained={}",
             current.as_millis(),
             player.presentation_anchor_media.as_millis(),
             player
@@ -1208,6 +1261,9 @@ fn av_player_trace_current_time(handle: u64, player: &AvPlayerInstance, current:
             player.presentation_master_delivered,
             player.next_video_frame,
             player.video_decoder.is_some(),
+            player.video_decoder_drained,
+            player.audio_decoder.is_some(),
+            player.audio_decoder_drained,
         );
     }
     *previous = current;
@@ -1404,7 +1460,12 @@ pub(crate) fn av_player_set_looping(arguments: [u64; 6], state: &mut ProbeDispat
     let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
-    player.looping = arguments[1] & 1 != 0;
+    let looping = arguments[1] & 1 != 0;
+    eprintln!(
+        "[REMu][AVPLAYER] looping handle={:#x} enabled={looping} previous={}",
+        arguments[0], player.looping
+    );
+    player.looping = looping;
     0
 }
 
@@ -1509,6 +1570,12 @@ pub(crate) fn av_player_get_video_data(
         av_player_trace_zero_return(arguments[0], "video", "end-of-stream");
         return 0;
     }
+    if player.video_decoder_drained {
+        let callback = av_player_finish_stream_if_drained(arguments[0], player);
+        av_player_queue_natural_stop(callback, state);
+        av_player_trace_zero_return(arguments[0], "video", "decoder-drained");
+        return 0;
+    }
     if !av_player_start_decoder(player, false) {
         av_player_trace_zero_return(arguments[0], "video", "no-decoder");
         return 0;
@@ -1549,16 +1616,9 @@ pub(crate) fn av_player_get_video_data(
                 return 0;
             }
             AvPlayerFrameStatus::Finished => {
-                let callback = av_player_finish_stream(player);
-                if let Some((function, object)) = callback {
-                    av_player_queue_event(
-                        function,
-                        object,
-                        1,
-                        AvPlayerEventDelivery::Controller,
-                        state,
-                    );
-                }
+                av_player_mark_decoder_drained(player, false);
+                let callback = av_player_finish_stream_if_drained(arguments[0], player);
+                av_player_queue_natural_stop(callback, state);
                 return 0;
             }
         }
@@ -1578,16 +1638,9 @@ pub(crate) fn av_player_get_video_data(
             return 0;
         }
         AvPlayerFrameStatus::Finished => {
-            let callback = av_player_finish_stream(player);
-            if let Some((function, object)) = callback {
-                av_player_queue_event(
-                    function,
-                    object,
-                    1,
-                    AvPlayerEventDelivery::Controller,
-                    state,
-                );
-            }
+            av_player_mark_decoder_drained(player, false);
+            let callback = av_player_finish_stream_if_drained(arguments[0], player);
+            av_player_queue_natural_stop(callback, state);
             return 0;
         }
     }
@@ -1637,6 +1690,12 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
         av_player_trace_zero_return(arguments[0], "audio", "end-of-stream");
         return 0;
     }
+    if player.audio_decoder_drained {
+        let callback = av_player_finish_stream_if_drained(arguments[0], player);
+        av_player_queue_natural_stop(callback, state);
+        av_player_trace_zero_return(arguments[0], "audio", "decoder-drained");
+        return 0;
+    }
     if !av_player_start_decoder(player, true) {
         av_player_trace_zero_return(arguments[0], "audio", "no-decoder");
         return 0;
@@ -1648,6 +1707,9 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
             return 0;
         }
         AvPlayerFrameStatus::Finished => {
+            av_player_mark_decoder_drained(player, true);
+            let callback = av_player_finish_stream_if_drained(arguments[0], player);
+            av_player_queue_natural_stop(callback, state);
             av_player_trace_zero_return(arguments[0], "audio", "decoder-drained");
             return 0;
         }

@@ -554,6 +554,9 @@ struct AvPlayerInstance {
     /// without changing the independent public clock.
     av_sync_mode: u32,
     video_decoder: Option<AvPlayerDecoder>,
+    /// The video decoder reached EOF and its guest-visible frame queue has been drained. A
+    /// multiplexed source remains active until every enabled stream reaches this state.
+    video_decoder_drained: bool,
     raw_video_frame: Vec<u8>,
     padded_video_frame: Vec<u8>,
     video_buffer_base: u64,
@@ -566,6 +569,8 @@ struct AvPlayerInstance {
     /// EOF, while still allowing later frames to catch up when emulation runs below movie FPS.
     video_catch_up_origin: Option<(Instant, u64)>,
     audio_decoder: Option<AvPlayerDecoder>,
+    /// The audio decoder reached EOF and its guest-visible frame queue has been drained.
+    audio_decoder_drained: bool,
     raw_audio_frame: Vec<u8>,
     audio_buffer_base: u64,
     next_audio_buffer: usize,
@@ -591,6 +596,8 @@ impl AvPlayerInstance {
         self.presentation_clock_reported = Duration::ZERO;
         self.presentation_master_delivered = false;
         self.end_of_stream = false;
+        self.video_decoder_drained = false;
+        self.audio_decoder_drained = false;
         self.next_video_frame = 0;
         self.video_catch_up_origin = None;
         self.next_audio_frame = 0;
