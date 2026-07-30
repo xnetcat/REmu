@@ -13,7 +13,10 @@ use crate::{
     stall_report_interval, trace_guest_sync, trace_logarithmic_sequence,
 };
 
-use super::{guest_mutex_entry, guest_sync};
+use super::{
+    guest_mutex_entry, guest_sync, trace_named_condition_notify_selected,
+    trace_named_condition_wait_finished, trace_named_condition_wait_registered,
+};
 
 pub(crate) fn guest_condition_init(address: u64) -> u64 {
     if address == 0 {
@@ -90,6 +93,7 @@ where
     let Some(waiter) = state.register_condition_waiter(condition, mutex_address) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
+    trace_named_condition_wait_registered(condition, mutex_address, waiter);
     if trace_guest_sync() && trace_logarithmic_sequence(waiter, 8) {
         eprintln!(
             "[REMu][COND] wait ticket={waiter} thread={} condition={condition:#x} mutex={mutex_address:#x} recursion={released_recursion} timeout_usec={timeout_usec:?}",
@@ -220,6 +224,14 @@ where
             );
         }
     }
+    trace_named_condition_wait_finished(
+        condition,
+        mutex_address,
+        waiter,
+        timed_out,
+        interrupted,
+        released_spuriously,
+    );
     state.finish_condition_wait(
         condition,
         waiter,
@@ -286,6 +298,7 @@ pub(crate) fn guest_condition_notify(condition: u64, broadcast: bool) -> u64 {
             .expect("pending condition waiter exists")
             .released = true;
     }
+    trace_named_condition_notify_selected(condition, broadcast, &selected);
     if trace_guest_sync() && trace_logarithmic_sequence(notify_sequence, 8) {
         eprintln!(
             "[REMu][COND] notify sequence={notify_sequence} condition={condition:#x} broadcast={broadcast} pending={pending_before} selected={selected:?}"
