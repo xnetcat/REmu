@@ -7,6 +7,7 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
     echo "  Traces one RenderThread fence task at a time with at most four LLDB" >&2
     echo "  hardware code breakpoints. Guest executable bytes are never modified." >&2
     echo "  Defaults: timeout=120, cycles=16, hit-limit=4096." >&2
+    echo "  Set REMU_TASKGRAPH_TRACE_PREPARE_ONLY=1 for one persistent breakpoint." >&2
     exit 64
 fi
 
