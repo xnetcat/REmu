@@ -718,7 +718,7 @@ fn av_player_audio_master_waits_for_audio_then_tracks_its_timestamp() {
 }
 
 #[test]
-fn av_player_actual_eof_exposes_the_exact_known_duration() {
+fn av_player_actual_eof_exposes_duration_and_queues_one_controller_stop() {
     let mut state = ProbeDispatchState::default();
     let handle = av_player_test_player(&mut state);
     let (sender, frames) = std::sync::mpsc::sync_channel(1);
@@ -732,6 +732,8 @@ fn av_player_actual_eof_exposes_the_exact_known_duration() {
         player.presentation_anchor_media = Duration::from_millis(9_000);
         player.presentation_anchor_host = Some(Instant::now());
         player.presentation_clock_reported = Duration::from_millis(9_000);
+        player.event_callback = 0x1234;
+        player.event_object = 0x5678;
         player.video_decoder = Some(crate::AvPlayerDecoder {
             child: None,
             frames: std::sync::Mutex::new(frames),
@@ -742,14 +744,7 @@ fn av_player_actual_eof_exposes_the_exact_known_duration() {
     let mut frame_info = [0_u8; 112];
     assert_eq!(
         crate::av_player_get_video_data(
-            [
-                handle,
-                frame_info.as_mut_ptr().addr() as u64,
-                0,
-                0,
-                0,
-                0,
-            ],
+            [handle, frame_info.as_mut_ptr().addr() as u64, 0, 0, 0, 0],
             true,
             &mut state,
         ),
@@ -757,10 +752,32 @@ fn av_player_actual_eof_exposes_the_exact_known_duration() {
         "a disconnected decoder reports EOF rather than a frame"
     );
     assert!(state.av_player.players[&handle].end_of_stream);
+    assert_eq!(state.av_player.pending_callbacks.len(), 1);
+    assert_eq!(state.av_player.pending_callbacks[0].event, 1);
+    assert_eq!(state.av_player.pending_callbacks[0].function, 0x1234);
+    assert_eq!(state.av_player.pending_callbacks[0].object, 0x5678);
+    assert_eq!(
+        state.av_player.pending_callbacks[0].delivery,
+        crate::AvPlayerEventDelivery::Controller,
+        "natural EOF is reported asynchronously by the controller"
+    );
     assert_eq!(
         crate::av_player_current_time(handle, &mut state),
         9_109,
         "decoder EOF, unlike a running clock, must expose the exact duration"
+    );
+    assert_eq!(
+        crate::av_player_get_video_data(
+            [handle, frame_info.as_mut_ptr().addr() as u64, 0, 0, 0, 0],
+            true,
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        state.av_player.pending_callbacks.len(),
+        1,
+        "later polls must not queue duplicate EOF Stop events"
     );
 }
 
