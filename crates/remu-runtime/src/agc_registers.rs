@@ -818,6 +818,8 @@ pub(crate) enum AgcSubmissionError {
     ClearStatePacketLength { actual: u32 },
     #[error("CLEAR_STATE control has unsupported bits 0x{0:08X}")]
     UnsupportedClearStateControl(u32),
+    #[error("PFP_SYNC_ME packet has {actual} dwords, expected 2")]
+    PfpSyncMePacketLength { actual: u32 },
     #[error("EVENT_WRITE packet has {actual} dwords, expected at least 2")]
     EventWritePacketLength { actual: u32 },
     #[error("partial-flush EVENT_WRITE control has unsupported bits 0x{0:08X}")]

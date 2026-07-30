@@ -277,6 +277,7 @@ impl PresenterStatistics {
             batch_flushes_for_blocked_wait: 0,
             batch_flushes_for_flip_snapshot: 0,
             batch_flushes_for_work_capacity: 0,
+            batch_flushes_for_command_processor_barrier: 0,
             batch_flushes_for_cpu_synchronization: 0,
             gpu_execution_time: Duration::ZERO,
             presentation_queue_latency: Duration::ZERO,

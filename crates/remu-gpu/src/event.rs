@@ -37,6 +37,11 @@ pub enum GpuEvent {
         pixel_format: u64,
         tiling_mode: u32,
     },
+    /// A `PFP_SYNC_ME` command-processor dependency.
+    ///
+    /// Following parser-front-end work, especially indirect argument fetches, must not overtake
+    /// preceding micro-engine work which can produce those arguments.
+    CommandProcessorBarrier,
     PipelineBarrier(GpuPipelineBarrier),
     MemoryAcquire(GpuMemoryAcquire),
     MemoryCopy(GpuMemoryCopy),

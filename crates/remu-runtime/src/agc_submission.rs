@@ -7,15 +7,16 @@ use crate::{
     AGC_IT_DRAW_INDEX_2, AGC_IT_DRAW_INDEX_AUTO, AGC_IT_DRAW_INDEX_INDIRECT,
     AGC_IT_DRAW_INDEX_INDIRECT_MULTI, AGC_IT_DRAW_INDEX_OFFSET, AGC_IT_DRAW_INDIRECT,
     AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_INDEX_TYPE, AGC_IT_NOP,
-    AGC_IT_NUM_INSTANCES, AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE, AGC_IT_WAIT_REG_MEM,
-    AGC_IT_WRITE_DATA, AGC_R_ACB_RESET, AGC_R_ACQUIRE_MEM, AGC_R_DMA_DATA, AGC_R_DRAW_INDEX_AUTO,
-    AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64,
-    AGC_R_WRITE_DATA, AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget,
-    ProcessGuestMemory, VideoOutState, agc_apply_set_base, agc_apply_submission_registers,
-    agc_decode_compute_dispatch, agc_emit_draw, agc_emit_draw_with_indirect_arguments,
-    agc_emit_indexed_draw, agc_image_binding_address, agc_submit_ordered_video_out_flip,
-    emit_agc_gpu_event, read_guest_u32, read_guest_u64, trace_agc_programs, trace_agc_registers,
-    trace_agc_shaders, trace_guest_sync, trace_logarithmic_sequence,
+    AGC_IT_NUM_INSTANCES, AGC_IT_PFP_SYNC_ME, AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE,
+    AGC_IT_WAIT_REG_MEM, AGC_IT_WRITE_DATA, AGC_R_ACB_RESET, AGC_R_ACQUIRE_MEM, AGC_R_DMA_DATA,
+    AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_WAIT_MEM_32,
+    AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA, AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError,
+    AgcVideoOutTarget, ProcessGuestMemory, VideoOutState, agc_apply_set_base,
+    agc_apply_submission_registers, agc_decode_compute_dispatch, agc_emit_draw,
+    agc_emit_draw_with_indirect_arguments, agc_emit_indexed_draw, agc_image_binding_address,
+    agc_submit_ordered_video_out_flip, emit_agc_gpu_event, read_guest_u32, read_guest_u64,
+    trace_agc_programs, trace_agc_registers, trace_agc_shaders, trace_guest_sync,
+    trace_logarithmic_sequence,
 };
 mod decode;
 mod driver;
@@ -309,6 +310,15 @@ pub(crate) fn agc_handle_submission_packet(
     agc_apply_submission_registers(packet_address, length, opcode, register, graphics)?;
     if opcode == AGC_IT_SET_BASE {
         agc_apply_set_base(packet_address, length, graphics)?;
+    }
+    if opcode == AGC_IT_PFP_SYNC_ME {
+        if length != 2 {
+            return Err(AgcSubmissionError::PfpSyncMePacketLength { actual: length });
+        }
+        // AMD's parser front end can fetch indirect arguments before earlier micro-engine work
+        // has produced them unless this packet stalls it. Preserve that dependency in the ordered
+        // backend stream; it is a GPU queue barrier, not a CPU-visible completion.
+        emit_agc_gpu_event(remu_gpu::GpuEvent::CommandProcessorBarrier);
     }
     if opcode == AGC_IT_EVENT_WRITE {
         match decode_agc_event_write(packet_address, length)? {
