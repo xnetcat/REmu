@@ -205,7 +205,6 @@ pub(crate) fn execute_scalar_alu(
             (u64::MAX >> (64 - width)) << offset
         };
         write_scalar_pair(registers, destination, result, exec_mask);
-        *scalar_condition = result != 0;
         return Ok(());
     }
 
@@ -493,7 +492,7 @@ pub(crate) fn execute_scalar_binary(
             *scalar_condition = wide > u64::from(u32::MAX);
             low_u32(wide)
         }
-        Some("SPackLlB32B16") => (left & 0xffff) | (right << 16),
+        Some("SPackLlB32B16") => (left & 0xffff) | ((right & 0xffff) << 16),
         Some("SPackLhB32B16") => (left & 0xffff) | (right & 0xffff_0000),
         Some("SPackHhB32B16") => (left >> 16) | (right & 0xffff_0000),
         Some("SMulHiU32") => ((u64::from(left) * u64::from(right)) >> 32) as u32,

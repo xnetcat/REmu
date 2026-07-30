@@ -741,6 +741,32 @@ fn decodes_s_bcnt1_i32_b64_from_the_silent_hill_word() {
 }
 
 #[test]
+fn decodes_scalar_b64_mask_and_low_half_pack_sop2_words() {
+    let program = decode_program(
+        0x1000,
+        &[
+            0x9294_0c0a, // s_bfm_b64 s[20:21], s10, s12
+            0x9914_0c0a, // s_pack_ll_b32_b16 s20, s10, s12
+            0xbf81_0000,
+        ],
+    )
+    .expect("well-formed scalar SOP2 program");
+
+    for (instruction, name) in [
+        (&program.instructions[0], "SBfmB64"),
+        (&program.instructions[1], "SPackLlB32B16"),
+    ] {
+        assert_eq!(instruction.encoding, ShaderEncoding::Sop2);
+        assert!(instruction.opcode.is(name));
+        assert_eq!(
+            instruction.sources,
+            [Operand::scalar(10), Operand::scalar(12)]
+        );
+        assert_eq!(instruction.destinations, [Operand::scalar(20)]);
+    }
+}
+
+#[test]
 fn records_all_mimg_nsa_address_registers() {
     // IMAGE_LOAD with NSA=2 carries eight additional byte-packed VGPR indices.
     let word = 0xf000_0004;

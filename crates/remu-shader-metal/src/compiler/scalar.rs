@@ -121,6 +121,14 @@ impl Compiler<'_> {
             self.line(3, &format!("scc = {result} != 0u;"));
             return Ok(());
         }
+        if name == "SBfmB64" {
+            let width = self.raw_source(instruction, 0)?;
+            let offset = self.raw_source(instruction, 1)?;
+            let mask = self.temp("ulong", &format!("(1ul << ({width} & 63u)) - 1ul"));
+            let result = self.temp("ulong", &format!("{mask} << ({offset} & 63u)"));
+            self.store_scalar_pair(destination, &result);
+            return Ok(());
+        }
         if name.ends_with("B64") || matches!(name, "SBfeU64" | "SBfeI64") {
             return self.emit_scalar64(instruction, name, destination);
         }
@@ -258,6 +266,10 @@ impl Compiler<'_> {
                 let shift = name.as_bytes()[5] - b'0';
                 (format!("(({left} << {shift}) + {right})"), None)
             }
+            "SPackLlB32B16" => (
+                format!("(({left} & 0xFFFFu) | (({right} & 0xFFFFu) << 16))"),
+                None,
+            ),
             _ => return Err(format!("unsupported scalar opcode {name}")),
         };
         let result = self.temp("uint", &expression);
