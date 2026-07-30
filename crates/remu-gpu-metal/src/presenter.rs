@@ -122,6 +122,7 @@ use self::sampler::{
 use self::shader::{
     SHADER_COMPILE_QUEUE_CAPACITY, compile_metal_compute_library, compile_metal_library_with_tools,
     compute_pipeline_key, compute_program_can_split_wave64, dump_shader_pair_msl,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, pixel_scalars, program_embeds_global_base,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,

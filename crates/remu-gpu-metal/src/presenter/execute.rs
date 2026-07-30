@@ -37,7 +37,7 @@ use super::{
     diagnostic_trace_target_stride, diagnostic_uploaded_global_binding_head,
     diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
     dump_msl_compute_filter_matches, dump_shader_pair_msl, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison, guest_frame_fingerprint,
+    evaluation_samples_layered_comparison, fragmentless_pixel_evaluation, guest_frame_fingerprint,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage, half_float_to_f32,
     image_resource_descriptor_is_null, initial_depth_clear_for_target,
     initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
@@ -294,10 +294,25 @@ impl MetalPresenter {
             .export_shader_evaluation
             .as_ref()
             .ok_or("draw has no export resource evaluation")?;
-        let pixel_evaluation = draw
-            .pixel_shader_evaluation
-            .as_ref()
-            .ok_or("draw has no pixel resource evaluation")?;
+        let pixel_evaluation = match (
+            draw.pixel_shader.as_ref(),
+            draw.pixel_shader_evaluation.as_ref(),
+        ) {
+            (Some(_), Some(evaluation)) => evaluation.as_ref(),
+            (None, None) if targets.is_empty() && depth.is_some() => {
+                fragmentless_pixel_evaluation()
+            }
+            (None, None) => {
+                return Err(
+                    "fragmentless draw requires an active depth target and no color targets"
+                        .to_owned(),
+                );
+            }
+            (Some(_), None) => return Err("draw has no pixel resource evaluation".to_owned()),
+            (None, Some(_)) => {
+                return Err("draw has pixel resources but no decoded pixel shader".to_owned());
+            }
+        };
         if trace_msaa_writes() && draw.sequence >= diagnostic_dump_target_minimum_draw() {
             static LOGGED_MULTISAMPLE_WRITES: AtomicUsize = AtomicUsize::new(0);
             for target in targets.iter().filter(|target| target.sample_count > 1) {
