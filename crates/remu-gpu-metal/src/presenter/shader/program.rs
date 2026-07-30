@@ -341,14 +341,15 @@ pub(crate) fn missing_vertex_parameter_exports(
 
 /// Recognizes a fused GFX10 NGG export/geometry program that requires a Metal mesh stage.
 ///
-/// These programs allocate primitive output, exchange records through general LDS, then publish
-/// both primitive connectivity and position. Lane-private ADDTID compiler spills alone do not
-/// qualify: ordinary vertex/pixel lowering already preserves those without a mesh pipeline.
+/// The allocation message and primitive export are the architectural contract that distinguishes
+/// an NGG geometry stage from an ordinary vertex stage. General LDS traffic is optional: compact
+/// pass-through stages can publish connectivity and position directly from their merged-wave
+/// inputs without staging records through LDS. Lowering those stages as ordinary Metal vertices
+/// loses the merged-wave system values and can collapse every output position to zero.
 pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
     let mut allocation_message = false;
     let mut primitive_export = false;
     let mut position_export = false;
-    let mut general_lds = false;
     for instruction in &program.instructions {
         if instruction.opcode.is("SSendmsg")
             && instruction
@@ -362,16 +363,8 @@ pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
             primitive_export |= export.target == 20 && export.enable_mask != 0;
             position_export |= export.target == 12 && export.enable_mask != 0;
         }
-        if matches!(instruction.control, Some(InstructionControl::DataShare(_)))
-            && !matches!(
-                instruction.opcode.known_name(),
-                Some("DsSwizzleB32" | "DsWriteAddtidB32" | "DsReadAddtidB32")
-            )
-        {
-            general_lds = true;
-        }
     }
-    allocation_message && primitive_export && position_export && general_lds
+    allocation_message && primitive_export && position_export
 }
 
 /// Recognizes the position-only AGC primitive stage used for procedural fullscreen rectangles.

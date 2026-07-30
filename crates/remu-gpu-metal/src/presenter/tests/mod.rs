@@ -50,6 +50,7 @@ use super::{
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_mip_chain_layout,
     mode27_source_byte_offset, mode27_surface_z_xor, mode27_within_block_byte_offset,
     mode27_within_block_byte_offset_for_format, native_texture_capture_to_bgra,
+    ngg_mesh_export_stage,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view, parse_diagnostic_hex_address,
     parse_presentation_resolution, pixel_input_controls, prepare_indexed_primitive,
     prepare_ngg_meshlets, prepare_sampled_texture_upload, presentation_drawable_size,
