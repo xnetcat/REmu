@@ -1,8 +1,8 @@
 use crate::{
     ImportCallFrame, PthreadMutexAttrState, current_guest_thread_handle, current_guest_thread_name,
-    deliver_pending_guest_exception_at_import, kernel_process_time, low_u32, posix_pthread_result,
-    relative_microseconds_until, trace_guest_sync, try_read_process_guest_u32,
-    try_read_process_guest_u64,
+    deliver_pending_guest_exception_at_import, diagnostic_timeout_active, guest_import_trace_nanos,
+    kernel_process_time, low_u32, posix_pthread_result, relative_microseconds_until,
+    trace_guest_sync, try_read_process_guest_u32, try_read_process_guest_u64,
 };
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,6 +51,87 @@ use self::state::{
 
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MAIN_CONDITION_NOTIFY_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static MAIN_TIMED_WAIT_CONDITION: AtomicU64 = AtomicU64::new(0);
+static MAIN_TIMED_WAIT_RETURN: AtomicU64 = AtomicU64::new(0);
+static MAIN_TIMED_WAIT_TIMEOUT_USEC: AtomicU64 = AtomicU64::new(0);
+static MAIN_TIMED_WAIT_TIMEOUT_STREAK: AtomicU64 = AtomicU64::new(0);
+static MAIN_TIMED_WAIT_STREAK_STARTED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MainTimedWaitSnapshot {
+    pub(crate) condition: u64,
+    pub(crate) return_address: u64,
+    pub(crate) timeout_usec: u64,
+    pub(crate) consecutive_timeouts: u64,
+    pub(crate) age_millis: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MainTimedWaitObservation {
+    condition: u64,
+    return_address: u64,
+    timeout_usec: u64,
+}
+
+fn begin_main_timed_wait_observation(
+    frame: Option<&ImportCallFrame>,
+    condition: u64,
+    timeout_usec: u64,
+) -> Option<MainTimedWaitObservation> {
+    if !diagnostic_timeout_active() {
+        return None;
+    }
+    let thread_name = current_guest_thread_name();
+    if thread_name != "main" && !thread_name.contains("GameThread") {
+        return None;
+    }
+    Some(MainTimedWaitObservation {
+        condition,
+        return_address: frame.map_or(0, |frame| frame.guest_return_address),
+        timeout_usec,
+    })
+}
+
+fn finish_main_timed_wait_observation(observation: Option<MainTimedWaitObservation>, result: u64) {
+    let Some(observation) = observation else {
+        return;
+    };
+    if low_u32(result) != libc::ETIMEDOUT.cast_unsigned() {
+        MAIN_TIMED_WAIT_TIMEOUT_STREAK.store(0, Ordering::Release);
+        MAIN_TIMED_WAIT_STREAK_STARTED_NANOS.store(0, Ordering::Release);
+        return;
+    }
+    let previous_condition =
+        MAIN_TIMED_WAIT_CONDITION.swap(observation.condition, Ordering::AcqRel);
+    let previous_return = MAIN_TIMED_WAIT_RETURN.swap(observation.return_address, Ordering::AcqRel);
+    MAIN_TIMED_WAIT_TIMEOUT_USEC.store(observation.timeout_usec, Ordering::Release);
+    if previous_condition != observation.condition
+        || previous_return != observation.return_address
+        || MAIN_TIMED_WAIT_TIMEOUT_STREAK.load(Ordering::Acquire) == 0
+    {
+        MAIN_TIMED_WAIT_STREAK_STARTED_NANOS.store(guest_import_trace_nanos(), Ordering::Release);
+        MAIN_TIMED_WAIT_TIMEOUT_STREAK.store(1, Ordering::Release);
+    } else {
+        MAIN_TIMED_WAIT_TIMEOUT_STREAK.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn main_timed_wait_snapshot() -> Option<MainTimedWaitSnapshot> {
+    let consecutive_timeouts = MAIN_TIMED_WAIT_TIMEOUT_STREAK.load(Ordering::Acquire);
+    if consecutive_timeouts == 0 {
+        return None;
+    }
+    let started = MAIN_TIMED_WAIT_STREAK_STARTED_NANOS.load(Ordering::Acquire);
+    Some(MainTimedWaitSnapshot {
+        condition: MAIN_TIMED_WAIT_CONDITION.load(Ordering::Acquire),
+        return_address: MAIN_TIMED_WAIT_RETURN.load(Ordering::Acquire),
+        timeout_usec: MAIN_TIMED_WAIT_TIMEOUT_USEC.load(Ordering::Acquire),
+        consecutive_timeouts,
+        age_millis: guest_import_trace_nanos().saturating_sub(started) / 1_000_000,
+    })
+}
 
 fn trace_read_guest_u32(address: u64) -> u32 {
     try_read_process_guest_u32(address).unwrap_or(0)
@@ -404,6 +485,7 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         // relative microsecond count. Convert against the same realtime clock the deadline names.
         "27bAgiJmOh0" => {
             let timeout_usec = relative_microseconds_until(arguments[2]);
+            let observation = begin_main_timed_wait_observation(frame, arguments[0], timeout_usec);
             let trace = begin_main_timed_condition_trace(
                 frame,
                 arguments[0],
@@ -421,6 +503,7 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
                     }
                 },
             ));
+            finish_main_timed_wait_observation(observation, result);
             finish_main_timed_condition_trace(trace, result);
             result
         }

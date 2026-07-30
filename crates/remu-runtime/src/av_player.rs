@@ -7,9 +7,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::{
-    AvPlayerDecoder, AvPlayerEventCallback, AvPlayerEventDelivery, AvPlayerInstance,
-    AvPlayerTextureDeallocation, PROBE_DISPATCH, ProbeDispatchState, current_guest_thread_handle,
-    current_guest_thread_name, guest_aligned_alloc, guest_memset,
+    AvPlayerDecoder, AvPlayerDecoderProgress, AvPlayerEventCallback, AvPlayerEventDelivery,
+    AvPlayerInstance, AvPlayerTextureDeallocation, PROBE_DISPATCH, ProbeDispatchState,
+    current_guest_thread_handle, current_guest_thread_name, guest_aligned_alloc, guest_memset,
     process_guest_range_has_read_access, process_guest_range_is_readable, read_guest_cstring,
     read_guest_u8, read_guest_u32, read_guest_u64, resolve_guest_path, sce_kernel_error,
     write_guest_u8, write_guest_u16, write_guest_u32, write_guest_u64,
@@ -30,6 +30,81 @@ enum AvPlayerFrameStatus {
     Ready,
     Pending,
     Finished,
+}
+
+static AV_PLAYER_PROGRESS_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn av_player_progress_millis() -> u64 {
+    u64::try_from(
+        AV_PLAYER_PROGRESS_EPOCH
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+    .saturating_add(1)
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AvPlayerStallSnapshot {
+    pub(crate) handle: u64,
+    pub(crate) source: Option<String>,
+    pub(crate) active: bool,
+    pub(crate) playing: bool,
+    pub(crate) paused: bool,
+    pub(crate) end_of_stream: bool,
+    pub(crate) delivered_video_frames: u64,
+    pub(crate) video_delivery_age_millis: Option<u64>,
+    pub(crate) decoder_present: bool,
+    pub(crate) decoder_drained: bool,
+    pub(crate) decoder_produced_frames: u64,
+    pub(crate) decoder_progress_age_millis: Option<u64>,
+    pub(crate) decoder_queue_blocked: bool,
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn av_player_progress_age_millis(timestamp: u64, now: u64) -> Option<u64> {
+    (timestamp != 0).then(|| now.saturating_sub(timestamp))
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn av_player_stall_snapshots(state: &ProbeDispatchState) -> Vec<AvPlayerStallSnapshot> {
+    let now = av_player_progress_millis();
+    state
+        .av_player
+        .players
+        .iter()
+        .map(|(&handle, player)| {
+            let decoder = player.video_decoder.as_ref();
+            let decoder_progress = decoder.map(|decoder| &decoder.progress);
+            AvPlayerStallSnapshot {
+                handle,
+                source: player.source.clone(),
+                active: player.active_session,
+                playing: player.playing_since.is_some(),
+                paused: player.paused,
+                end_of_stream: player.end_of_stream,
+                delivered_video_frames: player.next_video_frame,
+                video_delivery_age_millis: player
+                    .last_video_delivery
+                    .map(|last| u64::try_from(last.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                decoder_present: decoder.is_some(),
+                decoder_drained: player.video_decoder_drained,
+                decoder_produced_frames: decoder_progress.map_or(0, |progress| {
+                    progress.produced_frames.load(Ordering::Acquire)
+                }),
+                decoder_progress_age_millis: decoder_progress.and_then(|progress| {
+                    av_player_progress_age_millis(
+                        progress.last_progress_millis.load(Ordering::Acquire),
+                        now,
+                    )
+                }),
+                decoder_queue_blocked: decoder_progress
+                    .is_some_and(|progress| progress.queue_blocked.load(Ordering::Acquire)),
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +172,7 @@ impl AvPlayerDecoder {
 
     pub(crate) fn retire(mut self) {
         self.cancelled.store(true, Ordering::Release);
+        self.progress.queue_blocked.store(false, Ordering::Release);
         if let Some(child) = self.child.as_mut() {
             // Closing the process side of the pipe makes a decoder worker blocked in read_exact
             // return immediately. Child collection and the host-thread join happen on the
@@ -111,6 +187,7 @@ impl AvPlayerDecoder {
 
     fn reap(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+        self.progress.queue_blocked.store(false, Ordering::Release);
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -137,15 +214,24 @@ fn av_player_send_decoded_frame(
     mut frame: Vec<u8>,
     kind: &'static str,
     decoded_frame: u64,
+    progress: &AvPlayerDecoderProgress,
 ) -> bool {
     let mut queue_full_since: Option<Instant> = None;
     let mut next_backpressure_report = Some(Duration::from_secs(1));
     loop {
         if cancelled.load(Ordering::Acquire) {
+            progress.queue_blocked.store(false, Ordering::Release);
             return false;
         }
         match sender.try_send(frame) {
             Ok(()) => {
+                progress
+                    .produced_frames
+                    .store(decoded_frame, Ordering::Release);
+                progress
+                    .last_progress_millis
+                    .store(av_player_progress_millis(), Ordering::Release);
+                progress.queue_blocked.store(false, Ordering::Release);
                 if av_player_trace_enabled()
                     && let Some(queue_full_since) = queue_full_since
                     && queue_full_since.elapsed() >= Duration::from_secs(1)
@@ -159,6 +245,7 @@ fn av_player_send_decoded_frame(
             }
             Err(TrySendError::Full(returned)) => {
                 frame = returned;
+                progress.queue_blocked.store(true, Ordering::Release);
                 let queue_full_since = queue_full_since.get_or_insert_with(Instant::now);
                 if av_player_trace_enabled()
                     && let Some(report_after) = next_backpressure_report
@@ -173,7 +260,10 @@ fn av_player_send_decoded_frame(
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Disconnected(_)) => {
+                progress.queue_blocked.store(false, Ordering::Release);
+                return false;
+            }
         }
     }
 }
@@ -189,6 +279,7 @@ fn av_player_decoder_worker(
     sender: SyncSender<Vec<u8>>,
     cancelled: Arc<AtomicBool>,
     kind: &'static str,
+    progress: Arc<AvPlayerDecoderProgress>,
 ) {
     let mut decoded_frame = 0_u64;
     while !cancelled.load(Ordering::Acquire) {
@@ -197,10 +288,12 @@ fn av_player_decoder_worker(
             break;
         }
         decoded_frame = decoded_frame.saturating_add(1);
-        if !av_player_send_decoded_frame(&sender, &cancelled, frame, kind, decoded_frame) {
+        if !av_player_send_decoded_frame(&sender, &cancelled, frame, kind, decoded_frame, &progress)
+        {
             break;
         }
     }
+    progress.queue_blocked.store(false, Ordering::Release);
 }
 
 pub(crate) fn av_player_tool(name: &str, environment: &str) -> Option<PathBuf> {
@@ -452,6 +545,7 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             video_buffer_stride: 0,
             next_video_buffer: 0,
             next_video_frame: 0,
+            last_video_delivery: None,
             video_catch_up_origin: None,
             audio_decoder: None,
             audio_decoder_drained: false,
@@ -818,11 +912,20 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
     let (sender, frames) = mpsc::sync_channel(if audio { 8 } else { 4 });
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
+    let progress = Arc::new(AvPlayerDecoderProgress::default());
+    let worker_progress = Arc::clone(&progress);
     let kind = if audio { "audio" } else { "video" };
     let Ok(worker) = std::thread::Builder::new()
         .name(format!("REMu AVPlayer {kind}"))
         .spawn(move || {
-            av_player_decoder_worker(output, frame_bytes, sender, worker_cancelled, kind);
+            av_player_decoder_worker(
+                output,
+                frame_bytes,
+                sender,
+                worker_cancelled,
+                kind,
+                worker_progress,
+            );
         })
     else {
         let _ = child.kill();
@@ -834,6 +937,7 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
         frames: std::sync::Mutex::new(frames),
         cancelled,
         worker: Some(worker),
+        progress,
     };
     if audio {
         player.raw_audio_frame.resize(frame_bytes, 0);
@@ -1793,6 +1897,7 @@ pub(crate) fn av_player_get_video_data(
     player.next_video_frame = player.next_video_frame.saturating_add(1);
     av_player_trace_video_content(arguments[0], player.next_video_frame, player);
     if av_player_write_video_frame(player, arguments[1], timestamp, extended) {
+        player.last_video_delivery = Some(Instant::now());
         if !player.has_audio && player.av_sync_mode == 0 {
             av_player_anchor_presentation(player, Duration::from_millis(timestamp), Instant::now());
         }

@@ -450,6 +450,57 @@ fn av_player_test_player(state: &mut ProbeDispatchState) -> u64 {
     handle
 }
 
+#[test]
+fn av_player_stall_snapshot_distinguishes_decoder_and_guest_progress() {
+    use std::sync::atomic::Ordering;
+
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    let (sender, frames) = std::sync::mpsc::sync_channel(1);
+    sender.try_send(vec![0x80; 16]).unwrap();
+    let progress = std::sync::Arc::new(crate::AvPlayerDecoderProgress::default());
+    progress.produced_frames.store(17, Ordering::Release);
+    progress.last_progress_millis.store(1, Ordering::Release);
+    progress.queue_blocked.store(true, Ordering::Release);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.source = Some("diagnostic.mp4".to_owned());
+        player.active_session = true;
+        player.playing_since = Some(Instant::now());
+        player.next_video_frame = 4;
+        player.last_video_delivery = Some(Instant::now());
+        player.video_decoder = Some(crate::AvPlayerDecoder {
+            child: None,
+            frames: std::sync::Mutex::new(frames),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker: None,
+            progress,
+        });
+    }
+
+    let snapshots = crate::av_player::av_player_stall_snapshots(&state);
+    assert_eq!(snapshots.len(), 1);
+    let snapshot = &snapshots[0];
+    assert_eq!(snapshot.handle, handle);
+    assert_eq!(snapshot.source.as_deref(), Some("diagnostic.mp4"));
+    assert!(snapshot.active);
+    assert!(snapshot.playing);
+    assert_eq!(snapshot.delivered_video_frames, 4);
+    assert!(
+        snapshot
+            .video_delivery_age_millis
+            .is_some_and(|age| age < 1_000)
+    );
+    assert!(snapshot.decoder_present);
+    assert_eq!(snapshot.decoder_produced_frames, 17);
+    assert!(
+        snapshot
+            .decoder_progress_age_millis
+            .is_some_and(|age| age < 1_000)
+    );
+    assert!(snapshot.decoder_queue_blocked);
+}
+
 /// Generates a two-second 128x96 test clip (mpeg4 video + AAC sine audio) with the same ffmpeg
 /// binary the runtime decoder requires. Returns None — after logging loudly — when the tools
 /// are unavailable, mirroring the accepted environmental-skip pattern.
@@ -817,6 +868,7 @@ fn av_player_actual_eof_exposes_duration_and_queues_one_controller_stop() {
             frames: std::sync::Mutex::new(frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
+            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
         });
     }
     let mut frame_info = [0_u8; 112];
@@ -881,12 +933,14 @@ fn av_player_multiplexed_source_waits_for_video_and_audio_to_drain() {
             frames: std::sync::Mutex::new(video_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
+            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
         });
         player.audio_decoder = Some(crate::AvPlayerDecoder {
             child: None,
             frames: std::sync::Mutex::new(audio_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
+            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
         });
     }
 
@@ -951,12 +1005,14 @@ fn av_player_loop_restarts_only_after_every_enabled_stream_drains() {
             frames: std::sync::Mutex::new(video_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
+            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
         });
         player.audio_decoder = Some(crate::AvPlayerDecoder {
             child: None,
             frames: std::sync::Mutex::new(audio_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
+            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
         });
     }
 
@@ -1081,6 +1137,7 @@ fn av_player_sync_none_hands_video_timing_to_the_caller() {
             frames: std::sync::Mutex::new(receiver),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
+            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
         });
     }
     let mut frame_info = [0_u8; 112];
