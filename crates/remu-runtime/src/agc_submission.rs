@@ -26,7 +26,8 @@ mod shadow;
 #[cfg(test)]
 pub(crate) use self::decode::decode_agc_pipeline_barrier;
 pub(crate) use self::decode::{
-    decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire, decode_agc_memory_wait,
+    AgcEventWrite, decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire,
+    decode_agc_memory_wait,
 };
 pub(crate) use self::driver::{
     agc_driver_submit_acb, agc_driver_submit_dcb, agc_driver_submit_multi_acbs,
@@ -56,6 +57,10 @@ pub(crate) struct AgcSubmissionPacket {
 }
 
 const INDIRECT_DRAW_REGISTER_UNMAPPED: u32 = 0x280;
+const PIXEL_PIPE_STAT_VALID: u64 = 1 << 63;
+const PIXEL_PIPE_STAT_STEP: u64 = 0x02ff_ffff;
+/// The base Gen5 result block contains eight 16-byte render-backend counter pairs.
+const PIXEL_PIPE_STAT_COUNTER_PAIRS: u64 = 8;
 
 #[derive(Clone, Copy)]
 struct AgcIndirectDrawArguments {
@@ -303,8 +308,26 @@ pub(crate) fn agc_handle_submission_packet(
         agc_apply_set_base(packet_address, length, graphics)?;
     }
     if opcode == AGC_IT_EVENT_WRITE {
-        if let Some(barrier) = decode_agc_event_write(packet_address, length)? {
-            emit_agc_gpu_event(remu_gpu::GpuEvent::PipelineBarrier(barrier));
+        match decode_agc_event_write(packet_address, length)? {
+            Some(AgcEventWrite::PipelineBarrier(barrier)) => {
+                emit_agc_gpu_event(remu_gpu::GpuEvent::PipelineBarrier(barrier));
+            }
+            Some(AgcEventWrite::PixelPipeStatDump { destination }) => {
+                let value = graphics.pixel_pipe_stat_counter | PIXEL_PIPE_STAT_VALID;
+                for pair in 0..PIXEL_PIPE_STAT_COUNTER_PAIRS {
+                    emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(
+                        remu_gpu::GpuMemoryRelease {
+                            address: destination + pair * 16,
+                            value: remu_gpu::GpuMemoryReleaseValue::Immediate64(value),
+                        },
+                    ));
+                }
+                graphics.pixel_pipe_stat_counter = graphics
+                    .pixel_pipe_stat_counter
+                    .wrapping_add(PIXEL_PIPE_STAT_STEP)
+                    & !PIXEL_PIPE_STAT_VALID;
+            }
+            None => {}
         }
         // EVENT_WRITE performs a cache or pipeline action. It is not an end-of-pipe interrupt;
         // completion notifications come from RELEASE_MEM interrupt selectors or the driver's

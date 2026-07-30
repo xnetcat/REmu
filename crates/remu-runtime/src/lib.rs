@@ -128,8 +128,8 @@ pub(crate) use agc_submission::{
 };
 #[cfg(test)]
 pub(crate) use agc_submission::{
-    AgcSubmissionPacket, agc_handle_submission_packet, agc_parse_submission, decode_agc_dma_data,
-    decode_agc_event_write, decode_agc_memory_acquire, decode_agc_memory_wait,
+    AgcEventWrite, AgcSubmissionPacket, agc_handle_submission_packet, agc_parse_submission,
+    decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire, decode_agc_memory_wait,
 };
 #[cfg(test)]
 pub(crate) use agc_submission::{agc_future_scanout_targets, decode_agc_pipeline_barrier};
@@ -967,6 +967,12 @@ struct AgcGraphicsState {
     draw_index_offset: u32,
     graphics_indirect_args_address: u64,
     compute_indirect_args_address: u64,
+    /// Synthetic cumulative pixel count published by `PIXEL_PIPE_STAT_DUMP`.
+    ///
+    /// Gen5 exposes one cumulative counter per render backend. Keeping the sequence in the
+    /// graphics command-processor state makes successive start/end query dumps differ while the
+    /// high validity bit tells the guest that the ordered GPU write has retired.
+    pixel_pipe_stat_counter: u64,
     emitted_draws: u64,
     emitted_compute_dispatches: u64,
     traced_shader_pairs: BTreeSet<(u64, u64)>,
