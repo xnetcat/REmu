@@ -365,6 +365,10 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             end_of_stream: false,
             playing_since: None,
             elapsed: Duration::ZERO,
+            presentation_anchor_media: Duration::ZERO,
+            presentation_anchor_host: None,
+            presentation_clock_reported: Duration::ZERO,
+            presentation_master_delivered: false,
             looping: false,
             decoder_seek: Duration::ZERO,
             trick_speed_percent: 100,
@@ -619,7 +623,10 @@ pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatc
     player.active_session = true;
     player.paused = false;
     if player.auto_start {
-        player.playing_since = Some(Instant::now());
+        let now = Instant::now();
+        player.playing_since = Some(now);
+        player.presentation_anchor_media = player.elapsed;
+        player.presentation_anchor_host = Some(now);
     }
     let callback = (
         player.event_callback,
@@ -802,7 +809,9 @@ fn av_player_read_audio_frame(player: &mut AvPlayerInstance) -> AvPlayerFrameSta
 fn av_player_finish_stream(player: &mut AvPlayerInstance) {
     if player.looping {
         player.reset_playback();
-        player.playing_since = Some(Instant::now());
+        let now = Instant::now();
+        player.playing_since = Some(now);
+        player.presentation_anchor_host = Some(now);
     } else {
         let started = player.playing_since.take();
         player.stop_decoders();
@@ -811,6 +820,11 @@ fn av_player_finish_stream(player: &mut AvPlayerInstance) {
         if let Some(started) = started {
             player.elapsed += started.elapsed();
         }
+        if !player.duration.is_zero() {
+            player.presentation_anchor_media = player.duration;
+            player.presentation_clock_reported = player.duration;
+        }
+        player.presentation_anchor_host = None;
     }
 }
 
@@ -993,6 +1007,82 @@ pub(crate) fn av_player_video_frame_is_due(
     timestamp <= media_clock
 }
 
+/// Maximum distance a video-only presentation clock may run ahead of the last frame consumed by
+/// the guest. Two frame periods are enough to make the next frame due despite millisecond
+/// timestamp rounding, while keeping a below-realtime guest tied to media progress.
+fn av_player_video_clock_max_lead(frames_per_second: f64) -> Duration {
+    let rate = if frames_per_second.is_finite() && frames_per_second > 0.0 {
+        frames_per_second
+    } else {
+        30.0
+    };
+    Duration::from_secs_f64(2.0 / rate)
+}
+
+/// Samples the presentation clock at a caller-provided host instant.
+///
+/// Audio is the native clock master whenever it exists: after an audio sample is delivered its
+/// timestamp advances with host time, as shadPS4 and the console API do. Before the first audio
+/// sample the clock stays at Start/JumpToTime's media position.
+///
+/// A video-only source intentionally differs from a pure wall clock. REmu may execute a 30 fps
+/// title at substantially less than 30 guest frames per second, so allowing host time to reach the
+/// duration would make the guest terminate a movie after consuming only part of it. Re-anchoring
+/// at every delivered video timestamp and bounding the lead to two frame periods keeps polling
+/// live without skipping the remainder of the stream.
+fn av_player_presentation_time_at(player: &mut AvPlayerInstance, now: Instant) -> Duration {
+    if player.end_of_stream {
+        let completed = if player.duration.is_zero() {
+            player.presentation_clock_reported
+        } else {
+            player.duration
+        };
+        player.presentation_clock_reported = completed;
+        return completed;
+    }
+
+    let host_delta = player
+        .presentation_anchor_host
+        .map_or(Duration::ZERO, |host| now.saturating_duration_since(host));
+    let scaled_delta = host_delta.mul_f64(f64::from(player.trick_speed_percent) / 100.0);
+    let advance = if player.has_audio {
+        if player.presentation_master_delivered {
+            scaled_delta
+        } else {
+            Duration::ZERO
+        }
+    } else {
+        scaled_delta.min(av_player_video_clock_max_lead(player.frames_per_second))
+    };
+    let raw = player.presentation_anchor_media.saturating_add(advance);
+
+    // Do not expose the exact known duration until the decoder has actually drained. Some guests
+    // use CurrentTime == duration to stop calling GetVideoData; returning duration one frame too
+    // early would recreate the no-dequeue/EOF circular wait.
+    let running_limit = if player.duration.is_zero() {
+        None
+    } else {
+        Some(player.duration.saturating_sub(Duration::from_millis(1)))
+    };
+    let limited = running_limit.map_or(raw, |limit| raw.min(limit));
+    let reported = running_limit.map_or(player.presentation_clock_reported, |limit| {
+        player.presentation_clock_reported.min(limit)
+    });
+    let current = limited.max(reported);
+    player.presentation_clock_reported = current;
+    current
+}
+
+fn av_player_anchor_presentation(
+    player: &mut AvPlayerInstance,
+    media_time: Duration,
+    now: Instant,
+) {
+    player.presentation_anchor_media = media_time;
+    player.presentation_anchor_host = player.playing_since.is_some().then_some(now);
+    player.presentation_master_delivered = true;
+}
+
 pub(crate) fn av_player_video_catch_up_target(
     origin: Option<(Instant, u64)>,
     next_video_frame: u64,
@@ -1089,14 +1179,18 @@ fn av_player_trace_current_time(handle: u64, player: &AvPlayerInstance, current:
         !player.duration.is_zero() && current == player.duration && *previous != current;
     if *count <= 8 || count.is_power_of_two() || first_at_duration {
         eprintln!(
-            "[REMu][AVPLAYER][TRACE] handle={handle:#x} current-time count={count} value_ms={} raw_ms={} duration_ms={} active={} playing={} paused={} eos={} next_video_frame={} video_decoder={}",
+            "[REMu][AVPLAYER][TRACE] handle={handle:#x} current-time count={count} value_ms={} anchor_ms={} anchor_age_ms={} duration_ms={} active={} playing={} paused={} eos={} master_delivered={} next_video_frame={} video_decoder={}",
             current.as_millis(),
-            player.media_clock_elapsed().as_millis(),
+            player.presentation_anchor_media.as_millis(),
+            player
+                .presentation_anchor_host
+                .map_or(0, |host| host.elapsed().as_millis()),
             player.duration.as_millis(),
             player.active_session,
             player.playing_since.is_some(),
             player.paused,
             player.end_of_stream,
+            player.presentation_master_delivered,
             player.next_video_frame,
             player.video_decoder.is_some(),
         );
@@ -1127,21 +1221,11 @@ pub(crate) fn av_player_close(handle: u64, state: &mut ProbeDispatchState) -> u6
     0
 }
 
-pub(crate) fn av_player_current_time(handle: u64, state: &ProbeDispatchState) -> u64 {
-    let Some(player) = state.av_player.players.get(&handle) else {
+pub(crate) fn av_player_current_time(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&handle) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
-    // CurrentTime is the playback clock, not the timestamp of the last frame the guest happened
-    // to dequeue. Video-only clients use this clock to decide when to poll GetVideoData; tying it
-    // to delivered video creates a circular wait when the render-side poller is initially idle.
-    // Bound a running clock by the known source duration, matching the native end-of-stream
-    // contract while leaving sources with an unknown duration unbounded.
-    let elapsed = player.media_clock_elapsed();
-    let current = if player.duration.is_zero() {
-        elapsed
-    } else {
-        elapsed.min(player.duration)
-    };
+    let current = av_player_presentation_time_at(player, Instant::now());
     av_player_trace_current_time(handle, player, current);
     u64::try_from(current.as_millis()).unwrap_or(u64::MAX)
 }
@@ -1165,9 +1249,13 @@ pub(crate) fn av_player_pause(handle: u64, state: &mut ProbeDispatchState) -> u6
     if player.paused || player.playing_since.is_none() {
         return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
     }
+    let now = Instant::now();
+    let presentation_time = av_player_presentation_time_at(player, now);
     if let Some(started) = player.playing_since.take() {
-        player.elapsed += started.elapsed();
+        player.elapsed += now.saturating_duration_since(started);
     }
+    player.presentation_anchor_media = presentation_time;
+    player.presentation_anchor_host = None;
     player.paused = true;
     player.video_catch_up_origin = None;
     let callback = (player.event_callback, player.event_object);
@@ -1192,7 +1280,12 @@ pub(crate) fn av_player_start(handle: u64, state: &mut ProbeDispatchState) -> u6
     player.active_session = true;
     player.end_of_stream = false;
     player.video_catch_up_origin = None;
-    player.playing_since.get_or_insert_with(Instant::now);
+    if player.playing_since.is_none() {
+        let now = Instant::now();
+        player.playing_since = Some(now);
+        player.presentation_anchor_media = player.elapsed;
+        player.presentation_anchor_host = Some(now);
+    }
     let callback = (player.event_callback, player.event_object);
     eprintln!("[REMu][AVPLAYER] started handle={handle:#x}");
     av_player_queue_event(
@@ -1215,7 +1308,9 @@ pub(crate) fn av_player_resume(handle: u64, state: &mut ProbeDispatchState) -> u
     player.paused = false;
     player.active_session = true;
     player.video_catch_up_origin = None;
-    player.playing_since = Some(Instant::now());
+    let now = Instant::now();
+    player.playing_since = Some(now);
+    player.presentation_anchor_host = Some(now);
     let callback = (player.event_callback, player.event_object);
     eprintln!("[REMu][AVPLAYER] resumed handle={handle:#x}");
     av_player_queue_event(
@@ -1243,6 +1338,10 @@ pub(crate) fn av_player_jump_to_time(arguments: [u64; 6], state: &mut ProbeDispa
     player.decoder_seek = target;
     player.active_session = true;
     player.elapsed = target;
+    player.presentation_anchor_media = target;
+    player.presentation_anchor_host = None;
+    player.presentation_clock_reported = target;
+    player.presentation_master_delivered = false;
     player.end_of_stream = false;
     player.next_video_frame = (target.as_secs_f64() * player.frames_per_second).round() as u64;
     player.video_catch_up_origin = None;
@@ -1251,7 +1350,9 @@ pub(crate) fn av_player_jump_to_time(arguments: [u64; 6], state: &mut ProbeDispa
         .saturating_mul(48_000)
         / (1024 * 1_000);
     if was_playing {
-        player.playing_since = Some(Instant::now());
+        let now = Instant::now();
+        player.playing_since = Some(now);
+        player.presentation_anchor_host = Some(now);
     }
     eprintln!(
         "[REMu][AVPLAYER] jump handle={:#x} target_ms={} video_frame={} audio_frame={} playing={was_playing} paused={}",
@@ -1391,15 +1492,16 @@ pub(crate) fn av_player_get_video_data(
         av_player_trace_zero_return(arguments[0], "video", "no-decoder");
         return 0;
     }
-    if player.av_sync_mode == 0
-        && !av_player_video_frame_is_due(
+    if player.av_sync_mode == 0 {
+        let presentation_time = av_player_presentation_time_at(player, Instant::now());
+        if !av_player_video_frame_is_due(
             player.next_video_frame,
             player.frames_per_second,
-            player.media_clock_elapsed(),
-        )
-    {
-        av_player_trace_zero_return(arguments[0], "video", "clock-not-reached");
-        return 0;
+            presentation_time,
+        ) {
+            av_player_trace_zero_return(arguments[0], "video", "clock-not-reached");
+            return 0;
+        }
     }
     // Completed VideoOut flips are the emulated media clock. Wall-clock catch-up is useful only
     // when translation already sustains realtime; below that rate it discarded nearly every
@@ -1454,6 +1556,9 @@ pub(crate) fn av_player_get_video_data(
         .round() as u64;
     player.next_video_frame = player.next_video_frame.saturating_add(1);
     if av_player_write_video_frame(player, arguments[1], timestamp, extended) {
+        if !player.has_audio {
+            av_player_anchor_presentation(player, Duration::from_millis(timestamp), Instant::now());
+        }
         player
             .video_catch_up_origin
             .get_or_insert((Instant::now(), player.next_video_frame));
@@ -1538,6 +1643,7 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
     write_guest_u16(arguments[1] + 24, CHANNELS as u16);
     write_guest_u32(arguments[1] + 28, SAMPLE_RATE);
     write_guest_u32(arguments[1] + 32, FRAME_BYTES as u32);
+    av_player_anchor_presentation(player, Duration::from_millis(timestamp), Instant::now());
     1
 }
 
