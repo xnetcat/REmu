@@ -51,6 +51,7 @@ use self::state::{
 
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MAIN_CONDITION_NOTIFY_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static NAMED_THREAD_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn trace_read_guest_u32(address: u64) -> u32 {
     try_read_process_guest_u32(address).unwrap_or(0)
@@ -58,6 +59,126 @@ fn trace_read_guest_u32(address: u64) -> u32 {
 
 fn trace_read_guest_u64(address: u64) -> u64 {
     try_read_process_guest_u64(address).unwrap_or(0)
+}
+
+fn trace_guest_words<const N: usize>(address: u64) -> [u64; N] {
+    if address == 0 {
+        return [0; N];
+    }
+    std::array::from_fn(|index| {
+        trace_read_guest_u64(
+            address.saturating_add(u64::try_from(index).unwrap_or(0).saturating_mul(8)),
+        )
+    })
+}
+
+#[allow(dead_code)] // Read through the derived Debug implementation in trace-only output.
+#[derive(Debug)]
+struct GraphEventTrace {
+    event: u64,
+    words: [u64; 8],
+}
+
+fn trace_graph_event_pointer(pointer_address: u64) -> GraphEventTrace {
+    let event = trace_read_guest_u64(pointer_address);
+    GraphEventTrace {
+        event,
+        words: trace_guest_words(event),
+    }
+}
+
+#[allow(dead_code)] // Read through the derived Debug implementation in trace-only output.
+#[derive(Debug)]
+struct NamedThreadSlotTrace {
+    id: u32,
+    candidate: u64,
+    words: [u64; 12],
+}
+
+fn trace_named_thread_slot(task_graph: u64, id: u32) -> NamedThreadSlotTrace {
+    // The observed task-graph root stores candidate named-thread entries after its root pointer in
+    // 0x18-byte records in this title. Keep this explicitly labelled as a candidate: the trace is
+    // intended to correlate raw queue state with the exact event pointers below, not to make the
+    // layout part of synchronization behavior.
+    let candidate = if task_graph == 0 || id > 0x1000 {
+        0
+    } else {
+        task_graph.saturating_add(8 + u64::from(id).saturating_mul(0x18))
+    };
+    NamedThreadSlotTrace {
+        id,
+        candidate,
+        words: trace_guest_words(candidate),
+    }
+}
+
+#[allow(dead_code)] // Read through the derived Debug implementation in trace-only output.
+#[derive(Debug)]
+struct RhiTaskGraphTrace {
+    task_graph: u64,
+    task_graph_words: [u64; 24],
+    render_named_thread: NamedThreadSlotTrace,
+    rhi_named_thread: NamedThreadSlotTrace,
+    command_list_words: [u64; 20],
+    dispatch_event: GraphEventTrace,
+    completion_event: GraphEventTrace,
+    submit_event: GraphEventTrace,
+    prerequisite_count: u32,
+    prerequisite_control: u32,
+    prerequisite_storage: u64,
+    prerequisites: Vec<GraphEventTrace>,
+}
+
+fn trace_rhi_task_graph() -> RhiTaskGraphTrace {
+    const TASK_GRAPH_POINTER: u64 = 0x807_ba3_5e0;
+    const RENDER_NAMED_THREAD: u64 = 0x807_b20_9d0;
+    const RHI_NAMED_THREAD: u64 = 0x807_b20_9d4;
+    const RHI_COMMAND_LIST: u64 = 0x807_c90_838;
+    const PREREQUISITE_INLINE: u64 = 0x807_c92_cc8;
+    const PREREQUISITE_HEAP_POINTER: u64 = 0x807_c92_ce8;
+    const PREREQUISITE_COUNT: u64 = 0x807_c92_cf0;
+    const PREREQUISITE_CONTROL: u64 = 0x807_c92_cf4;
+    const COMPLETION_EVENT_POINTER: u64 = 0x807_c92_cf8;
+    const SUBMIT_EVENT_POINTER: u64 = 0x807_c92_d00;
+    const DISPATCH_EVENT_POINTER: u64 = 0x807_c92_d08;
+
+    let task_graph = trace_read_guest_u64(TASK_GRAPH_POINTER);
+    let render_named_thread = trace_read_guest_u32(RENDER_NAMED_THREAD);
+    let rhi_named_thread = trace_read_guest_u32(RHI_NAMED_THREAD);
+    let prerequisite_count = trace_read_guest_u32(PREREQUISITE_COUNT);
+    let prerequisite_control = trace_read_guest_u32(PREREQUISITE_CONTROL);
+    let prerequisite_heap = trace_read_guest_u64(PREREQUISITE_HEAP_POINTER);
+    let prerequisite_storage = if prerequisite_heap == 0 {
+        PREREQUISITE_INLINE
+    } else {
+        prerequisite_heap
+    };
+    let prerequisites = (0..prerequisite_count.min(16))
+        .map(|index| {
+            let event = trace_read_guest_u64(
+                prerequisite_storage.saturating_add(u64::from(index).saturating_mul(8)),
+            );
+            GraphEventTrace {
+                event,
+                words: trace_guest_words(event),
+            }
+        })
+        .collect();
+
+    RhiTaskGraphTrace {
+        task_graph,
+        task_graph_words: trace_guest_words(task_graph),
+        render_named_thread: trace_named_thread_slot(task_graph, render_named_thread),
+        rhi_named_thread: trace_named_thread_slot(task_graph, rhi_named_thread),
+        command_list_words: trace_guest_words(RHI_COMMAND_LIST),
+        dispatch_event: trace_graph_event_pointer(DISPATCH_EVENT_POINTER),
+        completion_event: trace_graph_event_pointer(COMPLETION_EVENT_POINTER),
+        submit_event: trace_graph_event_pointer(SUBMIT_EVENT_POINTER),
+        prerequisite_count,
+        prerequisite_control,
+        prerequisite_storage,
+        prerequisites,
+    }
 }
 
 fn traced_main_conditions() -> &'static Mutex<BTreeSet<u64>> {
@@ -97,6 +218,60 @@ fn trace_main_condition_notify(frame: Option<&ImportCallFrame>, condition: u64, 
         stack[3],
         stack[4],
         stack[5],
+    );
+}
+
+struct NamedThreadConditionTrace {
+    sequence: u64,
+    started: Instant,
+    thread_name: String,
+    condition: u64,
+}
+
+fn begin_named_thread_condition_trace(
+    frame: Option<&ImportCallFrame>,
+    condition: u64,
+    mutex: u64,
+) -> Option<NamedThreadConditionTrace> {
+    if !trace_guest_sync() {
+        return None;
+    }
+    let thread_name = current_guest_thread_name();
+    if !thread_name.contains("RenderThread") && !thread_name.contains("RHIThread") {
+        return None;
+    }
+    let sequence = NAMED_THREAD_CONDITION_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence > 32 && !sequence.is_power_of_two() {
+        return None;
+    }
+    let guest_rsp = frame.map_or(0, |frame| frame.guest_rsp);
+    let stack = trace_guest_words::<24>(guest_rsp);
+    let (waiters, notifies, timeouts) = condition_trace_stats(condition);
+    let rhi_task_graph = trace_rhi_task_graph();
+    eprintln!(
+        "[REMu][COND][NAMED-WAIT] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} stack={stack:x?} condition={condition:#x} mutex={mutex:#x} waiters={waiters} notifies={notifies} timeouts={timeouts} rhi_task_graph={rhi_task_graph:x?}",
+        current_guest_thread_handle(),
+        frame.map_or(0, |frame| frame.guest_return_address),
+    );
+    Some(NamedThreadConditionTrace {
+        sequence,
+        started: Instant::now(),
+        thread_name,
+        condition,
+    })
+}
+
+fn finish_named_thread_condition_trace(trace: Option<NamedThreadConditionTrace>, result: u64) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let (waiters, notifies, timeouts) = condition_trace_stats(trace.condition);
+    eprintln!(
+        "[REMu][COND][NAMED-WAIT] exit sequence={} thread={:?} result={result:#x} elapsed_us={} condition={:#x} waiters={waiters} notifies={notifies} timeouts={timeouts}",
+        trace.sequence,
+        trace.thread_name,
+        trace.started.elapsed().as_micros(),
+        trace.condition,
     );
 }
 
@@ -240,6 +415,7 @@ fn begin_main_timed_condition_trace(
         })
     };
     let render_named_thread = trace_read_guest_u32(0x807_b20_9d0);
+    let rhi_task_graph = trace_rhi_task_graph();
     let parent_locals = if parent_rbp < 0x80 {
         [0; 16]
     } else {
@@ -253,7 +429,7 @@ fn begin_main_timed_condition_trace(
     };
     let (waiters_before, notifies_before, timeouts_before) = condition_trace_stats(condition);
     eprintln!(
-        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} ancestors={parent_return:#x}/rbp:{parent_rbp:#x},{grandparent_return:#x}/rbp:{grandparent_rbp:#x},{great_grandparent_return:#x}/rbp:{great_grandparent_rbp:#x} graph_event={target_graph_event:#x}/words:{target_graph_event_words:#x?} render_named_thread={render_named_thread:#x} parent_locals={parent_locals:#x?} named_queue={named_queue:#x}/index:{named_queue_index}/state:{named_queue_state:#x}/flags:{named_queue_flags:#x} limiter_start={:#018x}/{:.9} limiter_target={:#018x}/{:.9} limiter_globals={limiter_wait_millis}/{limiter_target_millis} process_counter={process_counter} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
+        "[REMu][COND][TIMED] enter sequence={sequence} thread={thread_name:?}/{:#x} return={:#x} rsp={guest_rsp:#x} event_caller={event_caller_return:#x}/rbp:{event_caller_rbp:#x} ancestors={parent_return:#x}/rbp:{parent_rbp:#x},{grandparent_return:#x}/rbp:{grandparent_rbp:#x},{great_grandparent_return:#x}/rbp:{great_grandparent_rbp:#x} graph_event={target_graph_event:#x}/words:{target_graph_event_words:#x?} render_named_thread={render_named_thread:#x} rhi_task_graph={rhi_task_graph:x?} parent_locals={parent_locals:#x?} named_queue={named_queue:#x}/index:{named_queue_index}/state:{named_queue_state:#x}/flags:{named_queue_flags:#x} limiter_start={:#018x}/{:.9} limiter_target={:#018x}/{:.9} limiter_globals={limiter_wait_millis}/{limiter_target_millis} process_counter={process_counter} condition={condition:#x} mutex={mutex:#x} deadline={deadline:#x} timespec={deadline_seconds}s/{deadline_nanoseconds}ns valid_nsec={} timeout_usec={timeout_usec} waiters={waiters_before} notifies={notifies_before} timeouts={timeouts_before}",
         current_guest_thread_handle(),
         frame.map_or(0, |frame| frame.guest_return_address),
         clock_start_bits,
@@ -374,22 +550,31 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         "g+PZd2hiacg" => guest_condition_destroy(arguments[0]),
         "RXXqi4CtF8w" => posix_pthread_result(guest_condition_destroy(arguments[0])),
         "WKAXJ4XBPQ4" => {
-            guest_condition_wait_with_interrupt(arguments[0], arguments[1], None, || {
-                if let Some(frame) = frame {
-                    deliver_pending_guest_exception_at_import(frame);
-                }
-            })
+            let trace = begin_named_thread_condition_trace(frame, arguments[0], arguments[1]);
+            let result =
+                guest_condition_wait_with_interrupt(arguments[0], arguments[1], None, || {
+                    if let Some(frame) = frame {
+                        deliver_pending_guest_exception_at_import(frame);
+                    }
+                });
+            finish_named_thread_condition_trace(trace, result);
+            result
         }
-        "Op8TBGY5KHg" => posix_pthread_result(guest_condition_wait_with_interrupt(
-            arguments[0],
-            arguments[1],
-            None,
-            || {
-                if let Some(frame) = frame {
-                    deliver_pending_guest_exception_at_import(frame);
-                }
-            },
-        )),
+        "Op8TBGY5KHg" => {
+            let trace = begin_named_thread_condition_trace(frame, arguments[0], arguments[1]);
+            let result = posix_pthread_result(guest_condition_wait_with_interrupt(
+                arguments[0],
+                arguments[1],
+                None,
+                || {
+                    if let Some(frame) = frame {
+                        deliver_pending_guest_exception_at_import(frame);
+                    }
+                },
+            ));
+            finish_named_thread_condition_trace(trace, result);
+            result
+        }
         "BmMjYxmew1w" => guest_condition_wait_with_interrupt(
             arguments[0],
             arguments[1],
