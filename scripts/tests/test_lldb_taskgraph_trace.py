@@ -269,6 +269,39 @@ class TaskGraphTraceTests(unittest.TestCase):
             TRACE.is_taskgraph_diagnostic_stop_address(0x200D91D61)
         )
 
+    def test_guest_bad_access_filter_passes_only_direct_guest_execution(self) -> None:
+        self.assertTrue(
+            TRACE.is_guest_bad_access_stop(
+                0x804F9CF72,
+                "EXC_BAD_ACCESS (code=2, address=0x8002ee0120)",
+            )
+        )
+        self.assertTrue(
+            TRACE.is_guest_bad_access_stop(
+                TRACE.MAXIMUM_GUEST_EXECUTION_ADDRESS - 1,
+                "EXC_BAD_ACCESS",
+            )
+        )
+        self.assertFalse(
+            TRACE.is_guest_bad_access_stop(
+                TRACE.MINIMUM_GUEST_EXECUTION_ADDRESS - 1,
+                "EXC_BAD_ACCESS (code=1, address=0x0)",
+            )
+        )
+        self.assertFalse(
+            TRACE.is_guest_bad_access_stop(
+                TRACE.MAXIMUM_GUEST_EXECUTION_ADDRESS,
+                "EXC_BAD_ACCESS (code=2, address=0x1)",
+            )
+        )
+        self.assertFalse(
+            TRACE.is_guest_bad_access_stop(
+                0x804F9CF72,
+                "EXC_BREAKPOINT (code=1, subcode=0x0)",
+            )
+        )
+        self.assertFalse(TRACE.is_guest_bad_access_stop(0x804F9CF72, None))
+
 
 if __name__ == "__main__":
     unittest.main()
