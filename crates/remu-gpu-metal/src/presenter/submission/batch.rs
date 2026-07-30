@@ -276,8 +276,13 @@ pub(crate) fn describe_guest_batch(work: &[GuestBatchWork]) -> String {
                 index_count,
                 instance_count,
                 target,
+                extent,
+                export_msl_bytes,
+                pixel_msl_bytes,
+                export_dispatcher,
+                pixel_dispatcher,
             } => format!(
-                "draw(seq={sequence},es={export:#x},ps={pixel:#x},indices={index_count},instances={instance_count},target={target:#x})"
+                "draw(seq={sequence},es={export:#x}/{export_msl_bytes}B/dispatcher={export_dispatcher},ps={pixel:#x}/{pixel_msl_bytes}B/dispatcher={pixel_dispatcher},indices={index_count},instances={instance_count},target={target:#x}/{extent:?})"
             ),
             GuestBatchWork::Compute {
                 sequence,
@@ -285,12 +290,57 @@ pub(crate) fn describe_guest_batch(work: &[GuestBatchWork]) -> String {
                 source,
                 grid,
                 threads_per_group,
+                msl_bytes,
+                dispatcher,
             } => format!(
-                "compute(seq={sequence},cs={shader:#x},source={source:?},grid={grid:?},local={threads_per_group:?})"
+                "compute(seq={sequence},cs={shader:#x}/{msl_bytes}B/dispatcher={dispatcher},source={source:?},grid={grid:?},local={threads_per_group:?})"
             ),
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GuestBatchWork, describe_guest_batch};
+
+    #[test]
+    fn batch_diagnostics_retain_indirect_geometry_and_dispatcher_cost() {
+        let description = describe_guest_batch(&[
+            GuestBatchWork::Compute {
+                sequence: 17,
+                shader: 0x8008_2200_00,
+                source: remu_gpu::ComputeDispatchSource::Indirect {
+                    dimensions_address: 0x807c_4b00_00,
+                },
+                grid: remu_gpu::ComputeGrid::Threadgroups([65_535, 4, 1]),
+                threads_per_group: [8, 8, 1],
+                msl_bytes: 108_553,
+                dispatcher: true,
+            },
+            GuestBatchWork::Draw {
+                sequence: 23,
+                export: 0x80dc_3b00_00,
+                pixel: 0x80dc_4000_00,
+                index_count: 36,
+                instance_count: 1,
+                target: 0x8020_0000_00,
+                extent: [1_920, 1_080],
+                export_msl_bytes: 83_048,
+                pixel_msl_bytes: 447_366,
+                export_dispatcher: false,
+                pixel_dispatcher: true,
+            },
+        ]);
+
+        assert!(description.contains(
+            "source=Indirect { dimensions_address: 551841103872 },grid=Threadgroups([65535, 4, 1]),local=[8, 8, 1]"
+        ));
+        assert!(description.contains("cs=0x8008220000/108553B/dispatcher=true"));
+        assert!(description.contains(
+            "ps=0x80dc400000/447366B/dispatcher=true,indices=36,instances=1,target=0x8020000000/[1920, 1080]"
+        ));
+    }
 }
 
 pub(crate) fn merge_guest_batch_result(

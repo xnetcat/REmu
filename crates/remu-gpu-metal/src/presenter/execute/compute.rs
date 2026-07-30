@@ -142,6 +142,8 @@ impl MetalPresenter {
         let pipeline = compiled.pipeline.clone();
         let function = compiled.function.clone();
         let bindings = compiled.shader.bindings.clone();
+        let msl_bytes = compiled.shader.source.len();
+        let dispatcher = compiled.shader.source.contains("while (active)");
         let execution_width = u32::try_from(pipeline.thread_execution_width())
             .map_err(|_| "Metal compute execution width does not fit u32")?;
         let dynamic_lds = bindings.threadgroup_memory_bytes;
@@ -316,6 +318,8 @@ impl MetalPresenter {
                 source: dispatch.source,
                 grid: dispatch.launch.grid,
                 threads_per_group: dispatch.launch.threads_per_group,
+                msl_bytes,
+                dispatcher,
             });
             append_unique_global_writebacks(&mut batch.global_writebacks, pending_writebacks);
             append_unique_guest_write_ranges(
