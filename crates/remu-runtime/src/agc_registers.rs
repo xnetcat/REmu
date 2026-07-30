@@ -451,13 +451,24 @@ fn shader_decode_error_pc(error: &remu_shader::DecodeError) -> Option<u32> {
     }
 }
 
+fn shader_decode_context_pc(
+    error: &remu_shader::DecodeError,
+    code_size: Option<u32>,
+) -> Option<u32> {
+    shader_decode_error_pc(error).or_else(|| {
+        matches!(error, remu_shader::DecodeError::Unterminated { .. })
+            .then(|| code_size?.checked_sub(4))
+            .flatten()
+    })
+}
+
 fn shader_decode_failure_window(
     memory: &impl GuestMemoryReader,
     address: u64,
     code_size: Option<u32>,
     error: &remu_shader::DecodeError,
 ) -> Option<ShaderDecodeFailureWindow> {
-    let pc = shader_decode_error_pc(error)?;
+    let pc = shader_decode_context_pc(error, code_size)?;
     let offset = pc.saturating_sub(SHADER_DECODE_FAILURE_PREFIX_BYTES) & !3;
     let requested_end = offset.saturating_add(SHADER_DECODE_FAILURE_WINDOW_BYTES);
     let end = code_size.map_or(requested_end, |size| requested_end.min(size));
@@ -527,7 +538,7 @@ fn trace_shader_decode_failure(
         eprintln!("[REMu][AGC][SHADER] could not create decode failure dump directory: {error}");
         return;
     }
-    let pc = shader_decode_error_pc(error).unwrap_or_default();
+    let pc = shader_decode_context_pc(error, code_size).unwrap_or_default();
     let stem = format!("{address:016x}-failed-pc-{pc:08x}");
     if let Err(error) = std::fs::write(directory.join(format!("{stem}-window.bin")), &window.bytes)
     {
@@ -872,5 +883,27 @@ mod tests {
         assert_eq!(&window.bytes[0x34..0x38], &0xdead_beef_u32.to_le_bytes());
         assert_eq!(&window.bytes[0x40..0x44], &0x0000_023e_u32.to_le_bytes());
         assert_eq!(window.bytes.last(), Some(&0));
+    }
+
+    #[test]
+    fn unterminated_shader_decode_failure_window_captures_registered_tail() {
+        let base = 0x0080_4eaa_0000;
+        let code_size = 0xb90_u32;
+        let bytes = vec![0xff_u8; usize::try_from(code_size).expect("test code size fits")];
+        let memory = SliceMemory { base, bytes };
+        let error = remu_shader::DecodeError::Unterminated {
+            inspected_instructions: 370,
+        };
+
+        let window = shader_decode_failure_window(&memory, base, Some(code_size), &error)
+            .expect("registered extent gives an unterminated shader a tail window");
+
+        assert_eq!(
+            shader_decode_context_pc(&error, Some(code_size)),
+            Some(0xb8c)
+        );
+        assert_eq!(window.offset, 0xb4c);
+        assert_eq!(window.bytes.len(), 0x44);
+        assert!(window.bytes.iter().all(|byte| *byte == 0xff));
     }
 }

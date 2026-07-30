@@ -1,8 +1,8 @@
 use crate::{
-    ProbeDispatchState, agc_command_abi, guest_calloc, guest_free, guest_memcpy, low_i32, low_u32,
-    patch_agc_shader_program_registers, read_guest_u8, read_guest_u16, read_guest_u32,
-    read_guest_u64, relocate_guest_pointer, trace_agc_programs, trace_agc_registers,
-    write_guest_u8, write_guest_u32, write_guest_u64,
+    ProbeDispatchState, agc_command_abi, agc_shader_prefix_snapshot, guest_calloc, guest_free,
+    guest_memcpy, low_i32, low_u32, patch_agc_shader_program_registers, read_guest_u8,
+    read_guest_u16, read_guest_u32, read_guest_u64, relocate_guest_pointer, trace_agc_programs,
+    trace_agc_registers, write_guest_u8, write_guest_u32, write_guest_u64,
 };
 
 pub(crate) fn agc_register_defaults(
@@ -211,8 +211,9 @@ pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchSt
             .filter(|_| output_semantics_address != 0)
             .map(|index| read_guest_u32(output_semantics_address + u64::from(index) * 4))
             .collect::<Vec<_>>();
+        let code_prefix = agc_shader_prefix_snapshot(code);
         eprintln!(
-            "[REMu][AGC][SHADER] registered code={code:#x} size={} header={header:#x} type={} user_data={:#x} specials={:#x} inputs={input_semantics_count}@{input_semantics_address:#x}/{input_semantics:x?} outputs={output_semantics_count}@{output_semantics_address:#x}/{output_semantics:x?}",
+            "[REMu][AGC][SHADER] registered code={code:#x} size={} prefix={code_prefix:x?} header={header:#x} type={} user_data={:#x} specials={:#x} inputs={input_semantics_count}@{input_semantics_address:#x}/{input_semantics:x?} outputs={output_semantics_count}@{output_semantics_address:#x}/{output_semantics:x?}",
             read_guest_u32(header + AGC_SHADER_SIZE_OFFSET),
             read_guest_u8(header + AGC_SHADER_TYPE_OFFSET),
             read_guest_u64(header + AGC_SHADER_USER_DATA_OFFSET),
