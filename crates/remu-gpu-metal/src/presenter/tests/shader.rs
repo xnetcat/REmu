@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::CompileOptions;
-use remu_gpu::{GpuRegister, ShaderSnapshot, gpu_event_channel};
+use remu_gpu::{
+    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuRegister,
+    ShaderSnapshot, gpu_event_channel,
+};
 use remu_shader::{
     GlobalMemoryBinding, ImageBinding, ImageControl, Instruction, InstructionControl,
     InterpolationControl, Opcode, Operand, Program, ShaderEncoding, ShaderEvaluation,
@@ -11,13 +14,103 @@ use remu_shader::{
 use std::sync::Arc;
 
 use super::{
-    MetalPresenter, canonical_sampler_bindings, canonical_texture_bindings, compute_launch,
-    graphics_shader_resource_key, image_component_class, missing_vertex_parameter_exports,
-    ngg_mesh_export_stage, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    CompiledComputePipeline, ComputePipelineKey, MetalPresenter, ProgramIdentity,
+    ShaderCompileRequest, ShaderCompileResult, canonical_sampler_bindings,
+    canonical_texture_bindings, compute_launch, graphics_shader_resource_key,
+    image_component_class, missing_vertex_parameter_exports, ngg_mesh_export_stage,
+    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
     rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
-    shader_scalar_metadata, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    shader_scalar_metadata, shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
+    wave64_split_blockers,
 };
+
+fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
+    let dispatch = ComputeDispatch {
+        sequence: 41,
+        source: ComputeDispatchSource::Direct,
+        launch: ComputeLaunch {
+            grid: ComputeGrid::Threadgroups([1, 1, 1]),
+            group_count: [1, 1, 1],
+            base_group: [0, 0, 0],
+            threads_per_group: [8, 8, 1],
+            wave_lane_count: 64,
+            lds_size_bytes: 0,
+            initiator: 1,
+        },
+        shader_address: 0x5000,
+        shader_prefix: [0; 4],
+        shader: None,
+        shader_evaluation: None,
+        shader_registers: Vec::new(),
+    };
+    let program = Arc::new(Program::new(dispatch.shader_address, Vec::new()));
+    let key = ComputePipelineKey {
+        program_identity: ProgramIdentity(program),
+        lds_size_bytes: 0,
+        wave_lane_count: 64,
+        allocated_vector_register_count: 4,
+        compute_system_registers: None,
+        initial_scalar_count: 0,
+        global_bindings: Vec::new(),
+        image_bindings: Vec::new(),
+    };
+    (dispatch, key)
+}
+
+#[test]
+fn duplicate_compute_pipeline_compile_requests_are_coalesced() {
+    let (_gpu_sender, gpu_receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
+    let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(4);
+    presenter.shader_compile_sender = request_sender;
+    let (dispatch, key) = pending_compute_pipeline();
+
+    presenter.compile_compute_shader(&dispatch, &key);
+    presenter.compile_compute_shader(&dispatch, &key);
+
+    match request_receiver
+        .try_recv()
+        .expect("first compile request is queued")
+    {
+        ShaderCompileRequest::Compute {
+            key: actual_key,
+            dispatch: actual_dispatch,
+        } => {
+            assert_eq!(actual_key, key);
+            assert_eq!(actual_dispatch, dispatch);
+        }
+        ShaderCompileRequest::Graphics { .. } => panic!("expected compute compile request"),
+    }
+    assert!(matches!(
+        request_receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(presenter.compiling_compute_pipelines.len(), 1);
+    assert!(presenter.compiling_compute_pipelines.contains(&key));
+}
+
+#[test]
+fn failed_compute_pipeline_compile_is_terminal_and_observable() {
+    let (_gpu_sender, gpu_receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
+    let (result_sender, result_receiver) = std::sync::mpsc::channel();
+    presenter.shader_compile_receiver = result_receiver;
+    let (dispatch, key) = pending_compute_pipeline();
+    presenter.compiling_compute_pipelines.insert(key.clone());
+    result_sender
+        .send(ShaderCompileResult::Compute {
+            key: key.clone(),
+            shader_address: dispatch.shader_address,
+            threads_per_group: dispatch.launch.threads_per_group,
+            compiled: Err::<CompiledComputePipeline, _>("test compiler failure".to_owned()),
+        })
+        .expect("queue failed compile result");
+
+    presenter.receive_shader_compilations();
+
+    assert!(!presenter.compiling_compute_pipelines.contains(&key));
+    assert!(presenter.failed_compute_pipelines.contains(&key));
+}
 
 #[test]
 fn decodes_force_unnormalized_sampler_coordinates() {
