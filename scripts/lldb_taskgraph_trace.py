@@ -27,6 +27,7 @@ queue's post-enqueue state, waiter registration, and event wait entry.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 
@@ -42,6 +43,7 @@ DEFAULT_CYCLE_LIMIT = 16
 DEFAULT_HIT_LIMIT = 4096
 MAXIMUM_CYCLE_LIMIT = 64
 MAXIMUM_HIT_LIMIT = 100_000
+MAXIMUM_ATTACH_DURATION_SECONDS = 3600
 # REmu executes PS5 code directly in low canonical host mappings.  The main
 # image starts at 0x8_0000_0000, while guest modules, heaps, and direct-memory
 # aliases observed by the runtime remain below one tebibyte.  Native macOS
@@ -57,6 +59,7 @@ TASK_QUEUE_WAITER_MASK = (1 << TASK_QUEUE_WAITER_BITS) - 1
 TASK_QUEUE_NODE_PAGE_BITS = 14
 TASK_QUEUE_NODE_PAGE_MASK = (1 << TASK_QUEUE_NODE_PAGE_BITS) - 1
 TASK_QUEUE_NODE_STRIDE = 24
+TASK_QUEUE_CHAIN_LIMIT = 64
 
 PHASE_PUBLISH = "publish"
 PHASE_CONSUME = "consume"
@@ -99,15 +102,20 @@ QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS = {
     PREPARE: PREPARE_ADDRESS,
 }
 QUEUE_HANDOFF_BREAKPOINTS = {
-    PREPARE: PREPARE_ADDRESS,
+    PUBLISH: BREAKPOINTS[PHASE_PUBLISH][PUBLISH],
     PUBLISH_RETURN: BREAKPOINTS[PHASE_PUBLISH][PUBLISH_RETURN],
     QUEUE_REGISTER: 0x8011C4C00,
     EVENT_WAIT_ENTRY: 0x801210940,
+}
+QUEUE_HANDOFF_POST_PUBLISH_BREAKPOINTS = {
+    QUEUE_REGISTER: QUEUE_HANDOFF_BREAKPOINTS[QUEUE_REGISTER],
+    EVENT_WAIT_ENTRY: QUEUE_HANDOFF_BREAKPOINTS[EVENT_WAIT_ENTRY],
 }
 TASKGRAPH_BREAKPOINT_ADDRESSES = frozenset(
     {
         PREPARE_ADDRESS,
         *QUEUE_HANDOFF_BREAKPOINTS.values(),
+        *QUEUE_HANDOFF_POST_PUBLISH_BREAKPOINTS.values(),
         *(
             address
             for phase_breakpoints in BREAKPOINTS.values()
@@ -259,6 +267,45 @@ def describe_queue_wait_state(value: Optional[int]) -> str:
     )
 
 
+@dataclass(frozen=True)
+class TaskQueueNodeSnapshot:
+    """Raw queue handle, resolved slot, and all three slot qwords."""
+
+    handle: int
+    slot: int
+    words: tuple[Optional[int], ...]
+
+
+@dataclass(frozen=True)
+class TaskQueueChainSnapshot:
+    """One bounded traversal of a paged TaskGraph queue node chain."""
+
+    termination: str
+    handles: tuple[int, ...]
+    nodes: tuple[TaskQueueNodeSnapshot, ...] = ()
+    target_handle: int = 0
+    target_slot: int = 0
+    target_slot_words: tuple[Optional[int], ...] = ()
+    target_words: tuple[Optional[int], ...] = ()
+
+
+def _task_queue_node_slot(
+    handle: int,
+    read_u64: ReadU64,
+) -> Optional[int]:
+    node_id = handle & TASK_QUEUE_WAITER_MASK
+    page = node_id >> TASK_QUEUE_NODE_PAGE_BITS
+    slot = node_id & TASK_QUEUE_NODE_PAGE_MASK
+    page_base = read_u64(TASKGRAPH_NODE_SLAB_POINTERS + page * 8)
+    if page_base in (None, 0):
+        return None
+    return page_base + slot * TASK_QUEUE_NODE_STRIDE
+
+
+def _optional_hex(value: Optional[int]) -> str:
+    return f"{value:#x}" if value is not None else "unreadable"
+
+
 def describe_task_queue_node(
     value: Optional[int],
     read_u64: ReadU64,
@@ -271,10 +318,15 @@ def describe_task_queue_node(
     node_id = value & TASK_QUEUE_WAITER_MASK
     page = node_id >> TASK_QUEUE_NODE_PAGE_BITS
     slot = node_id & TASK_QUEUE_NODE_PAGE_MASK
-    page_base = read_u64(TASKGRAPH_NODE_SLAB_POINTERS + page * 8)
+    slot_address = _task_queue_node_slot(value, read_u64)
+    page_base = (
+        slot_address - slot * TASK_QUEUE_NODE_STRIDE
+        if slot_address is not None
+        else None
+    )
     task = (
-        read_u64(page_base + slot * TASK_QUEUE_NODE_STRIDE + 8)
-        if page_base not in (None, 0)
+        read_u64(slot_address + 8)
+        if slot_address is not None
         else None
     )
     page_base_text = (
@@ -287,6 +339,107 @@ def describe_task_queue_node(
     return (
         f"{value}/id={node_id:#x}/page={page:#x}/slot={slot:#x}/"
         f"base={page_base_text}/task={task_text}/target={is_target}"
+    )
+
+
+def inspect_task_queue_chain(
+    head: Optional[int],
+    target_task: int,
+    read_u64: ReadU64,
+    limit: int = TASK_QUEUE_CHAIN_LIMIT,
+) -> TaskQueueChainSnapshot:
+    """Walk queue node handles without following unreadable or cyclic links."""
+
+    target_words = tuple(
+        read_u64(target_task + index * 8) for index in range(4)
+    ) if target_task != 0 else ()
+    if head is None:
+        return TaskQueueChainSnapshot("unreadable-head", (), target_words=target_words)
+    handle = head
+    handles = []
+    nodes = []
+    seen_node_ids = set()
+    for _ in range(limit):
+        if handle == 0:
+            return TaskQueueChainSnapshot(
+                "null",
+                tuple(handles),
+                nodes=tuple(nodes),
+                target_words=target_words,
+            )
+        node_id = handle & TASK_QUEUE_WAITER_MASK
+        if node_id in seen_node_ids:
+            return TaskQueueChainSnapshot(
+                "cycle",
+                tuple(handles),
+                nodes=tuple(nodes),
+                target_words=target_words,
+            )
+        seen_node_ids.add(node_id)
+        handles.append(handle)
+        slot_address = _task_queue_node_slot(handle, read_u64)
+        if slot_address is None:
+            return TaskQueueChainSnapshot(
+                "unreadable-node",
+                tuple(handles),
+                nodes=tuple(nodes),
+                target_words=target_words,
+            )
+        slot_words = tuple(
+            read_u64(slot_address + index * 8) for index in range(3)
+        )
+        nodes.append(
+            TaskQueueNodeSnapshot(handle, slot_address, slot_words)
+        )
+        if target_task != 0 and slot_words[1] == target_task:
+            return TaskQueueChainSnapshot(
+                "linked",
+                tuple(handles),
+                nodes=tuple(nodes),
+                target_handle=handle,
+                target_slot=slot_address,
+                target_slot_words=slot_words,
+                target_words=target_words,
+            )
+        next_handle = slot_words[0]
+        if next_handle is None:
+            return TaskQueueChainSnapshot(
+                "unreadable-next",
+                tuple(handles),
+                nodes=tuple(nodes),
+                target_words=target_words,
+            )
+        handle = next_handle
+    return TaskQueueChainSnapshot(
+        "limit",
+        tuple(handles),
+        nodes=tuple(nodes),
+        target_words=target_words,
+    )
+
+
+def describe_task_queue_chain(snapshot: TaskQueueChainSnapshot) -> str:
+    """Format full handles and target/node memory needed for reachability."""
+
+    handles = ",".join(f"{handle:#x}" for handle in snapshot.handles)
+    nodes = ";".join(
+        f"{node.handle:#x}@{node.slot:#x}:["
+        f"{','.join(_optional_hex(value) for value in node.words)}]"
+        for node in snapshot.nodes
+    )
+    slot_words = ",".join(
+        _optional_hex(value) for value in snapshot.target_slot_words
+    )
+    target_words = ",".join(
+        _optional_hex(value) for value in snapshot.target_words
+    )
+    return (
+        f"chain={snapshot.termination} depth={len(snapshot.handles)} "
+        f"handles=[{handles}] nodes=[{nodes}] "
+        f"target_handle={snapshot.target_handle:#x} "
+        f"target_slot={snapshot.target_slot:#x} "
+        f"target_slot_words=[{slot_words}] "
+        f"target_words=[{target_words}]"
     )
 
 
@@ -348,7 +501,12 @@ class TaskGraphTraceState:
         self.queue_object = 0
         self.queue_event_wrapper = 0
         self.queue_event_underlying = 0
+        self.target_queue_node_handle = 0
+        self.target_queue_node_slot = 0
+        self.target_queue_node_initial_words: tuple[Optional[int], ...] = ()
         self.target_publisher_thread = 0
+        self.target_publisher_entry_rsp = 0
+        self.target_publisher_return_rsp = 0
         self.queue_transitions = 0
         self.phase = PHASE_PUBLISH
         self.hits = 0
@@ -377,6 +535,8 @@ class TaskGraphTraceState:
         if self.queue_handoff:
             if self.queue == 0:
                 return QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS
+            if self.target_published:
+                return QUEUE_HANDOFF_POST_PUBLISH_BREAKPOINTS
             return QUEUE_HANDOFF_BREAKPOINTS
         if self.target_follow:
             breakpoints = {PREPARE: PREPARE_ADDRESS}
@@ -565,12 +725,49 @@ class TaskGraphTraceState:
         wait_state = read_u64(self.queue + 0x1A8)
         lane_one_head = read_u64(self.queue + 0x118)
         lane_one_tail = read_u64(self.queue + 0x160)
+        chain = inspect_task_queue_chain(
+            lane_one_head,
+            self.task,
+            read_u64,
+        )
+        if (
+            chain.target_slot != 0
+            and self.target_queue_node_slot == 0
+        ):
+            self.target_queue_node_handle = chain.target_handle
+            self.target_queue_node_slot = chain.target_slot
+            self.target_queue_node_initial_words = chain.target_slot_words
+        known_words = (
+            tuple(
+                read_u64(self.target_queue_node_slot + index * 8)
+                for index in range(3)
+            )
+            if self.target_queue_node_slot != 0
+            else ()
+        )
+        known_initial = ",".join(
+            _optional_hex(value)
+            for value in self.target_queue_node_initial_words
+        )
+        known_current = ",".join(
+            _optional_hex(value) for value in known_words
+        )
+        known_mutated = (
+            bool(known_words)
+            and known_words != self.target_queue_node_initial_words
+        )
         return (
             f"wait_state={describe_queue_wait_state(wait_state)} "
             f"lane1_head="
             f"{describe_task_queue_node(lane_one_head, read_u64, self.task)} "
             f"lane1_tail="
-            f"{describe_task_queue_node(lane_one_tail, read_u64, self.task)}"
+            f"{describe_task_queue_node(lane_one_tail, read_u64, self.task)} "
+            f"{describe_task_queue_chain(chain)} "
+            f"known_target_handle={self.target_queue_node_handle:#x} "
+            f"known_target_slot={self.target_queue_node_slot:#x} "
+            f"known_target_initial=[{known_initial}] "
+            f"known_target_current=[{known_current}] "
+            f"known_target_mutated={known_mutated}"
         )
 
     def _observe_queue_handoff(
@@ -600,6 +797,9 @@ class TaskGraphTraceState:
             ):
                 return TraceResult(False)
             singleton = read_u64(TASKGRAPH_SINGLETON_POINTER) or 0
+            self.target_queue_node_handle = 0
+            self.target_queue_node_slot = 0
+            self.target_queue_node_initial_words = ()
             self.queue_object = (
                 read_u64(singleton + desired_thread * 0x18 + 0x8) or 0
             )
@@ -626,7 +826,9 @@ class TaskGraphTraceState:
             )
             self.target_capture_count += 1
             self.target_published = False
-            self.target_publisher_thread = thread_id
+            self.target_publisher_thread = 0
+            self.target_publisher_entry_rsp = 0
+            self.target_publisher_return_rsp = 0
             return TraceResult(
                 True,
                 f"target={self.target_capture_count} capture task={task:#x} "
@@ -635,7 +837,7 @@ class TaskGraphTraceState:
                 f"dispatchable="
                 f"{self.counter_before_release == self.release_threshold} "
                 f"caller={caller:#x} caller_parent={parent:#x} "
-                f"publisher_thread={thread_id:#x} "
+                f"capture_thread={thread_id:#x} "
                 f"taskgraph={singleton:#x} queue={self.queue:#x} "
                 f"{self._queue_snapshot(read_u64)} "
                 f"{self._queue_event_description(read_u64)}",
@@ -643,28 +845,52 @@ class TaskGraphTraceState:
 
         if self.queue == 0:
             return TraceResult(False)
+        if label == PUBLISH:
+            if (
+                self.target_publisher_entry_rsp != 0
+                or _register(registers, "rsi") != self.task
+                or _register(registers, "rdi") != self.queue
+            ):
+                return TraceResult(False)
+            self.target_publisher_thread = thread_id
+            self.target_publisher_entry_rsp = _register(registers, "rsp")
+            self.target_publisher_return_rsp = (
+                self.target_publisher_entry_rsp + 8
+            ) & ((1 << 64) - 1)
+            return TraceResult(
+                True,
+                f"target-publish-entry task={self.task:#x} "
+                f"queue={self.queue:#x} "
+                f"priority={_register(registers, 'rdx') & 0xffffffff} "
+                f"entry_rsp={self.target_publisher_entry_rsp:#x} "
+                f"return_rsp={self.target_publisher_return_rsp:#x} "
+                f"thread={thread_id:#x} "
+                f"{self._queue_snapshot(read_u64)}",
+            )
         if label == PUBLISH_RETURN:
             queue = (
                 _register(registers, "r14")
                 + _register(registers, "rbx")
                 + 0x38
             )
-            if queue != self.queue:
+            if (
+                queue != self.queue
+                or self.target_publisher_entry_rsp == 0
+                or thread_id != self.target_publisher_thread
+                or _register(registers, "rsp")
+                != self.target_publisher_return_rsp
+            ):
                 return TraceResult(False)
             self.queue_transitions += 1
             result = signed_u32(_register(registers, "rax"))
-            target = (
-                self.task != 0
-                and not self.target_published
-                and thread_id == self.target_publisher_thread
-            )
-            if target:
-                self.target_published = True
+            self.target_published = True
             return TraceResult(
                 True,
-                f"post-enqueue transition={self.queue_transitions} "
-                f"queue={queue:#x} target={target} "
+                f"target-post-enqueue transition={self.queue_transitions} "
+                f"task={self.task:#x} queue={queue:#x} target=True "
                 f"wake_waiter={result} "
+                f"entry_rsp={self.target_publisher_entry_rsp:#x} "
+                f"return_rsp={_register(registers, 'rsp'):#x} "
                 f"{self._queue_snapshot(read_u64)} "
                 f"{self._queue_event_description(read_u64)} "
                 f"thread={thread_id:#x}",
@@ -695,6 +921,14 @@ class TaskGraphTraceState:
         if underlying != self.queue_event_underlying:
             return TraceResult(False)
         self.queue_transitions += 1
+        terminal = self.target_published
+        if terminal:
+            self.phase = PHASE_DONE
+        terminal_text = (
+            " done reason=decisive-queue-wait"
+            if terminal
+            else ""
+        )
         return TraceResult(
             True,
             f"event-wait-entry transition={self.queue_transitions} "
@@ -702,7 +936,8 @@ class TaskGraphTraceState:
             f"condition={underlying + 0x28:#x} "
             f"{self._queue_snapshot(read_u64)} "
             f"{self._queue_event_description(read_u64)} "
-            f"thread={thread_id:#x}",
+            f"thread={thread_id:#x}"
+            f"{terminal_text}",
         )
 
     def _observe_target_follow(
@@ -1118,6 +1353,8 @@ class LldbTaskGraphTrace:
             queue_handoff=queue_handoff,
         )
         self.enabled_breakpoints = {}
+        self.attach_timer: Optional[threading.Timer] = None
+        self.attach_timeout_requested = False
 
     def _command(self, command: str):
         result = lldb.SBCommandReturnObject()
@@ -1128,6 +1365,44 @@ class LldbTaskGraphTrace:
         for breakpoint in self.enabled_breakpoints.values():
             breakpoint.SetEnabled(False)
         self.enabled_breakpoints = {}
+
+    def start_attach_timeout(self) -> None:
+        """Interrupt a late-attached target early enough to detach cleanly."""
+
+        duration = _positive_limit(
+            "REMU_TASKGRAPH_TRACE_ATTACH_DURATION_SECONDS",
+            0,
+            MAXIMUM_ATTACH_DURATION_SECONDS,
+        )
+        if duration == 0:
+            return
+        process = self.target.GetProcess()
+
+        def interrupt_for_detach() -> None:
+            state = process.GetState() if process.IsValid() else None
+            if (
+                state is None
+                or state in (lldb.eStateExited, lldb.eStateDetached)
+                or state != lldb.eStateRunning
+            ):
+                return
+            self.attach_timeout_requested = True
+            print(
+                "[REMu][LLDB][TASKGRAPH] attach duration reached; "
+                "interrupting target for clean detach",
+                flush=True,
+            )
+            process.SendAsyncInterrupt()
+
+        self.attach_timer = threading.Timer(duration, interrupt_for_detach)
+        self.attach_timer.daemon = True
+        self.attach_timer.start()
+
+    def cancel_attach_timeout(self) -> None:
+        timer = self.attach_timer
+        self.attach_timer = None
+        if timer is not None:
+            timer.cancel()
 
     def _install_breakpoint(self, label: str, address: int):
         result = self._command(
@@ -1258,7 +1533,10 @@ class LldbTaskGraphTrace:
             )
         if dict(self.state.active_breakpoints()) != previous_breakpoints:
             self.arm_phase()
-        return False
+        keep_stopped = self.state.done
+        if keep_stopped:
+            self.cancel_attach_timeout()
+        return keep_stopped
 
 
 SESSION: LldbTaskGraphTrace | None = None
@@ -1334,6 +1612,8 @@ def _arm_direct_attach(target, result) -> None:
     if not SESSION.arm_phase():
         SESSION = None
         result.SetError("could not arm TaskGraph hardware breakpoints")
+        return
+    SESSION.start_attach_timeout()
 
 
 def trace_breakpoint(frame, breakpoint_location, _internal_dict):
@@ -1392,6 +1672,20 @@ def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
 
     target = debugger.GetSelectedTarget()
     process = target.GetProcess()
+    if SESSION is not None and (
+        SESSION.state.done or SESSION.attach_timeout_requested
+    ):
+        SESSION.cancel_attach_timeout()
+        reason = (
+            "terminal trace observation"
+            if SESSION.state.done
+            else "attach duration"
+        )
+        result.AppendMessage(
+            "[REMu][LLDB][TASKGRAPH] holding stopped process for detach: "
+            f"{reason}"
+        )
+        return
     write_watch_enabled = os.environ.get("REMU_DISABLE_CPU_WRITE_WATCH") != "1"
     resumed = 0
     while process.GetState() == lldb.eStateStopped:
@@ -1464,6 +1758,8 @@ def detach_taskgraph_trace(debugger, _command, result, _internal_dict):
 
     target = debugger.GetSelectedTarget()
     process = target.GetProcess()
+    if SESSION is not None:
+        SESSION.cancel_attach_timeout()
     if not process.IsValid():
         result.AppendMessage(
             "[REMu][LLDB][TASKGRAPH] detach skipped: no valid process"
