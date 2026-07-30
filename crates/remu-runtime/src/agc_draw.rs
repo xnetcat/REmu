@@ -57,22 +57,18 @@ pub(crate) fn agc_apply_set_base(
     if base_index != 1 {
         return Err(AgcSubmissionError::UnsupportedBaseIndex(base_index));
     }
-    let header = read_guest_u32(packet_address);
-    let shader_type = (header >> 1) & 0x3;
+    let shader_type = (read_guest_u32(packet_address) >> 1) & 0x3;
     if shader_type > 1 {
         return Err(AgcSubmissionError::UnsupportedSetBaseShaderType(
             shader_type,
         ));
     }
-    if shader_type == 1 {
-        let low = read_guest_u32(packet_address + 8) & !0x7;
-        let high = read_guest_u32(packet_address + 12) & 0xffff;
-        graphics.compute_indirect_args_address = u64::from(low) | (u64::from(high) << 32);
-    } else {
-        let low = read_guest_u32(packet_address + 8) & !0x7;
-        let high = read_guest_u32(packet_address + 12) & 0xffff;
-        graphics.graphics_indirect_args_address = u64::from(low) | (u64::from(high) << 32);
-    }
+    // SET_BASE index 1 selects one DrawIndexIndirPatchTable base. The shader-type bit routes the
+    // packet through the graphics or compute processor; it does not select a second base register.
+    // Both base-relative dispatches and indirect draws consume the most recently programmed base.
+    let low = read_guest_u32(packet_address + 8) & !0x7;
+    let high = read_guest_u32(packet_address + 12) & 0xffff;
+    graphics.indirect_args_address = u64::from(low) | (u64::from(high) << 32);
     Ok(())
 }
 
@@ -94,11 +90,11 @@ pub(crate) fn agc_decode_compute_dispatch(
         let indirect = remu_gpu::decode_compute_dispatch_indirect(&packet)?;
         let dimensions_address = match indirect.dimensions {
             remu_gpu::ComputeIndirectDimensions::BaseOffset(offset) => {
-                if graphics.compute_indirect_args_address == 0 {
+                if graphics.indirect_args_address == 0 {
                     return Err(AgcComputeDispatchError::MissingIndirectBase);
                 }
                 graphics
-                    .compute_indirect_args_address
+                    .indirect_args_address
                     .checked_add(u64::from(offset))
                     .ok_or(AgcComputeDispatchError::IndirectAddressOverflow)?
             }

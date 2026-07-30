@@ -965,8 +965,7 @@ struct AgcGraphicsState {
     index_size: u32,
     instance_count: u32,
     draw_index_offset: u32,
-    graphics_indirect_args_address: u64,
-    compute_indirect_args_address: u64,
+    indirect_args_address: u64,
     /// Synthetic cumulative pixel count published by `PIXEL_PIPE_STAT_DUMP`.
     ///
     /// Gen5 exposes one cumulative counter per render backend. Keeping the sequence in the
@@ -1008,8 +1007,7 @@ impl AgcGraphicsState {
         self.index_size = 0;
         self.instance_count = 1;
         self.draw_index_offset = 0;
-        self.graphics_indirect_args_address = 0;
-        self.compute_indirect_args_address = 0;
+        self.indirect_args_address = 0;
     }
 }
 
