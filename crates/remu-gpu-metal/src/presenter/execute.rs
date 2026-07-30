@@ -558,6 +558,7 @@ impl MetalPresenter {
             flip: self.next_flip_sequence,
         };
         let export_textures = upload_image_textures(
+            "vertex",
             &device,
             &queue,
             export_evaluation,
@@ -571,6 +572,7 @@ impl MetalPresenter {
             activity_stamp,
         )?;
         let pixel_textures = upload_image_textures(
+            "pixel",
             &device,
             &queue,
             pixel_evaluation,

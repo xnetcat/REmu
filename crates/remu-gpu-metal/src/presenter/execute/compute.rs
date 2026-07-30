@@ -274,6 +274,7 @@ impl MetalPresenter {
             flip: self.next_flip_sequence,
         };
         let textures = upload_image_textures(
+            "compute",
             &device,
             &queue,
             evaluation,

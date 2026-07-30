@@ -165,6 +165,7 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
         vertex_inputs: Vec::new(),
     };
     let uploaded = upload_image_textures(
+        "test",
         &device,
         &queue,
         &evaluation,
