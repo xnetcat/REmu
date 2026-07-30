@@ -95,7 +95,12 @@ impl Compiler<'_> {
             let lane = self.temp("uint", &format!("{active} == 0u ? 0u : ctz({active})"));
             let mut selected = self.temp("uint", &format!("simd_shuffle({value}, (ushort){lane})"));
             if self.split_wave64() {
-                let slot = self.temp("uint", "(remu_wave_index << 1u) | remu_wave_half");
+                let site_base = self.disjoint_readfirstlane_site_base(instruction.pc);
+                let slot_expression = site_base.map_or_else(
+                    || "(remu_wave_index << 1u) | remu_wave_half".to_owned(),
+                    |base| format!("{base}u + ((remu_wave_index << 1u) | remu_wave_half)"),
+                );
+                let slot = self.temp("uint", &slot_expression);
                 self.line(
                     3,
                     &format!(
@@ -103,14 +108,20 @@ impl Compiler<'_> {
                     ),
                 );
                 self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
-                let low_slot = self.temp("uint", "remu_wave_index << 1u");
+                let low_slot_expression = site_base.map_or_else(
+                    || "remu_wave_index << 1u".to_owned(),
+                    |base| format!("{base}u + (remu_wave_index << 1u)"),
+                );
+                let low_slot = self.temp("uint", &low_slot_expression);
                 selected = self.temp(
                     "uint",
                     &format!(
                         "remu_readfirstlane_active[{low_slot}] != 0u ? remu_readfirstlane_values[{low_slot}] : (remu_readfirstlane_active[{low_slot} + 1u] != 0u ? remu_readfirstlane_values[{low_slot} + 1u] : remu_readfirstlane_values[{low_slot}])"
                     ),
                 );
-                self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
+                if site_base.is_none() {
+                    self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
+                }
             }
             self.store_scalar(destination, &selected);
             return Ok(());

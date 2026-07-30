@@ -375,6 +375,17 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
             scalar_destination: Some(20),
         })),
     });
+    for destination in [44, 45] {
+        instructions.push(Instruction {
+            pc: u32::try_from(instructions.len() * 8).expect("small readfirstlane test program"),
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VReadfirstlaneB32"),
+            words: vec![0],
+            sources: vec![Operand::vector(4)],
+            destinations: vec![Operand::scalar(destination)],
+            control: None,
+        });
+    }
     let program = Program::new(0x1000, instructions);
     let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
@@ -415,7 +426,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 diagnostic_capture_pixel_output: false,
                 diagnostic_force_pixel_color: false,
                 lds_size_bytes: 0,
-                wave_lane_count: 32,
+                wave_lane_count: 64,
                 allocated_vector_register_count: 256,
             },
             MetalShaderStage::Mesh => MetalCompileOptions::mesh(0, 16 * 1024),

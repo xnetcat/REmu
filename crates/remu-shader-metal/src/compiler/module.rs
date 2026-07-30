@@ -325,12 +325,18 @@ impl Compiler<'_> {
                 .iter()
                 .any(|instruction| instruction.opcode.is("VReadfirstlaneB32"))
             {
-                // A Metal threadgroup can contain at most 1,024 threads, or sixteen guest
-                // wave64s. Each wave owns two half-wave records used to select the first live
-                // architectural lane across both SIMD32 groups.
-                source.push_str(
-                    "    threadgroup uint remu_readfirstlane_values[32];\n\
-                     \x20   threadgroup uint remu_readfirstlane_active[32];\n",
+                // A Metal threadgroup can contain at most 1,024 threads, or 32 SIMD32 halves.
+                // Acyclic programs use disjoint records per static site so they need no reuse
+                // barrier. Cyclic programs and memory-heavy acyclic programs retain 32 shared
+                // records and the conservative two-barrier protocol.
+                let slot_count = self.disjoint_readfirstlane_slot_count().unwrap_or(32);
+                let _ = writeln!(
+                    source,
+                    "    threadgroup uint remu_readfirstlane_values[{slot_count}];"
+                );
+                let _ = writeln!(
+                    source,
+                    "    threadgroup uint remu_readfirstlane_active[{slot_count}];"
                 );
             }
             if self

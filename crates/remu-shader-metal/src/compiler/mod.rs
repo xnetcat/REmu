@@ -30,6 +30,10 @@ pub(crate) mod prelude;
 pub(crate) mod scalar;
 pub(crate) mod vector;
 
+const MAX_METAL_THREADGROUP_THREADS: usize = 1_024;
+const METAL_THREADGROUP_MEMORY_LIMIT_BYTES: usize = 32 * 1_024;
+const SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP: usize = MAX_METAL_THREADGROUP_THREADS / 32;
+
 pub(crate) struct Compiler<'a> {
     program: &'a Program,
     evaluation: &'a ShaderEvaluation,
@@ -54,6 +58,64 @@ impl Compiler<'_> {
 
     fn split_wave64(&self) -> bool {
         self.is_threadgroup_stage() && self.options.wave_lane_count == 64
+    }
+
+    fn readfirstlane_site_count(&self) -> usize {
+        self.program
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.opcode.is("VReadfirstlaneB32"))
+            .count()
+    }
+
+    /// Returns the number of half-wave exchange records when every static `V_READFIRSTLANE` owns
+    /// disjoint storage.
+    ///
+    /// Direct and forward-only control flow is acyclic, so an invocation can execute each static
+    /// instruction at most once. Giving every site its own records removes the second whole-group
+    /// barrier which otherwise protects a reused record from the next instruction. Dispatcher
+    /// shaders can revisit a site and must retain the reused-record protocol.
+    fn disjoint_readfirstlane_slot_count(&self) -> Option<usize> {
+        if !self.split_wave64() || matches!(self.control_flow, ControlFlowLowering::Dispatcher) {
+            return None;
+        }
+        let site_count = self.readfirstlane_site_count();
+        let slot_count = site_count.checked_mul(SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP)?;
+        let readfirstlane_bytes = slot_count.checked_mul(2 * size_of::<u32>())?;
+        let readlane_bytes = if self
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| instruction.opcode.is("VReadlaneB32"))
+        {
+            MAX_METAL_THREADGROUP_THREADS * size_of::<u32>()
+        } else {
+            0
+        };
+        let mesh_layer_bytes = if self.options.stage == MetalShaderStage::Mesh
+            && self.options.render_target_array_length > 1
+        {
+            64 * size_of::<u32>()
+        } else {
+            0
+        };
+        let total_bytes = usize::try_from(self.options.lds_size_bytes)
+            .ok()?
+            .checked_add(readfirstlane_bytes)?
+            .checked_add(readlane_bytes)?
+            .checked_add(mesh_layer_bytes)?;
+        (site_count != 0 && total_bytes <= METAL_THREADGROUP_MEMORY_LIMIT_BYTES)
+            .then_some(slot_count)
+    }
+
+    fn disjoint_readfirstlane_site_base(&self, pc: u32) -> Option<usize> {
+        self.disjoint_readfirstlane_slot_count()?;
+        self.program
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.opcode.is("VReadfirstlaneB32"))
+            .position(|instruction| instruction.pc == pc)
+            .and_then(|site| site.checked_mul(SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP))
     }
 
     fn uses_lds_memory(&self) -> bool {

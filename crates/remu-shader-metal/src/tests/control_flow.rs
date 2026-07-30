@@ -413,6 +413,61 @@ fn backward_conditional_control_flow_keeps_the_bounded_dispatcher() {
 }
 
 #[test]
+fn cyclic_wave64_readfirstlane_retains_shared_records_and_reuse_barrier() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VReadfirstlaneB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(4)],
+                destinations: vec![Operand::scalar(44)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SCbranchScc1"),
+                words: vec![0xfffe],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute_wave(0, 64),
+    )
+    .expect("cyclic readfirstlane should retain shared exchange records");
+
+    assert!(
+        shader
+            .source
+            .contains("threadgroup uint remu_readfirstlane_values[32]")
+    );
+    assert_eq!(
+        shader
+            .source
+            .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn rejects_branches_to_non_instruction_boundaries() {
     let program = Program::new(
         0x1000,
