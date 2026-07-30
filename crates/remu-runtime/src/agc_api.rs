@@ -1,8 +1,9 @@
 use crate::{
-    ProbeDispatchState, agc_command_abi, agc_shader_prefix_snapshot, guest_calloc, guest_free,
-    guest_memcpy, low_i32, low_u32, patch_agc_shader_program_registers, read_guest_u8,
-    read_guest_u16, read_guest_u32, read_guest_u64, relocate_guest_pointer, trace_agc_programs,
-    trace_agc_registers, write_guest_u8, write_guest_u32, write_guest_u64,
+    ProbeDispatchState, ProcessGuestMemory, agc_command_abi, agc_shader_code_fingerprint,
+    agc_shader_prefix_snapshot, guest_calloc, guest_free, guest_memcpy, low_i32, low_u32,
+    patch_agc_shader_program_registers, read_guest_u8, read_guest_u16, read_guest_u32,
+    read_guest_u64, relocate_guest_pointer, trace_agc_programs, trace_agc_registers,
+    write_guest_u8, write_guest_u32, write_guest_u64,
 };
 
 pub(crate) fn agc_register_defaults(
@@ -194,6 +195,8 @@ pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchSt
     if !patch_agc_shader_program_registers(header, code) {
         return u64::MAX;
     }
+    let code_size = read_guest_u32(header + AGC_SHADER_SIZE_OFFSET);
+    let mut registration_code_fingerprint = None;
     if trace_agc_programs() {
         let input_semantics_address = read_guest_u64(header + AGC_SHADER_INPUT_SEMANTICS_OFFSET);
         let input_semantics_count = u32::from(read_guest_u16(
@@ -212,19 +215,31 @@ pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchSt
             .map(|index| read_guest_u32(output_semantics_address + u64::from(index) * 4))
             .collect::<Vec<_>>();
         let code_prefix = agc_shader_prefix_snapshot(code);
+        registration_code_fingerprint =
+            agc_shader_code_fingerprint(&ProcessGuestMemory, code, code_size);
         eprintln!(
-            "[REMu][AGC][SHADER] registered code={code:#x} size={} prefix={code_prefix:x?} header={header:#x} type={} user_data={:#x} specials={:#x} inputs={input_semantics_count}@{input_semantics_address:#x}/{input_semantics:x?} outputs={output_semantics_count}@{output_semantics_address:#x}/{output_semantics:x?}",
-            read_guest_u32(header + AGC_SHADER_SIZE_OFFSET),
+            "[REMu][AGC][SHADER] registered code={code:#x} size={code_size} fingerprint={registration_code_fingerprint:x?} prefix={code_prefix:x?} header={header:#x} type={} user_data={:#x} specials={:#x} inputs={input_semantics_count}@{input_semantics_address:#x}/{input_semantics:x?} outputs={output_semantics_count}@{output_semantics_address:#x}/{output_semantics:x?}",
             read_guest_u8(header + AGC_SHADER_TYPE_OFFSET),
             read_guest_u64(header + AGC_SHADER_USER_DATA_OFFSET),
             read_guest_u64(header + AGC_SHADER_SPECIALS_OFFSET),
         );
     }
     state.agc_shader_registry.headers.insert(code, header);
-    state
-        .agc_shader_registry
-        .code_sizes
-        .insert(code, read_guest_u32(header + AGC_SHADER_SIZE_OFFSET));
+    state.agc_shader_registry.code_sizes.insert(code, code_size);
+    match registration_code_fingerprint {
+        Some(fingerprint) => {
+            state
+                .agc_shader_registry
+                .registration_code_fingerprints
+                .insert(code, fingerprint);
+        }
+        None => {
+            state
+                .agc_shader_registry
+                .registration_code_fingerprints
+                .remove(&code);
+        }
+    }
     state.agc_shader_registry.snapshots.remove(&code);
     state.agc_shader_registry.decode_failures.remove(&code);
     if destination != 0 {

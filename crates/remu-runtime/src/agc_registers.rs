@@ -427,6 +427,20 @@ pub(crate) fn agc_shader_prefix_snapshot(address: u64) -> [u32; 4] {
     })
 }
 
+pub(crate) fn agc_shader_code_fingerprint(
+    memory: &impl GuestMemoryReader,
+    address: u64,
+    code_size: u32,
+) -> Option<u64> {
+    let mut bytes = vec![0_u8; usize::try_from(code_size).ok()?];
+    if bytes.is_empty() || !memory.read(address, &mut bytes) {
+        return None;
+    }
+    Some(bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    }))
+}
+
 const SHADER_DECODE_FAILURE_WINDOW_BYTES: u32 = 128;
 const SHADER_DECODE_FAILURE_PREFIX_BYTES: u32 = 64;
 
@@ -495,6 +509,7 @@ fn trace_shader_decode_failure(
     address: u64,
     header_address: u64,
     code_size: Option<u32>,
+    registration_code_fingerprint: Option<u64>,
     error: &remu_shader::DecodeError,
 ) {
     let dump_directory = std::env::var_os("REMU_DUMP_MSL_DIR").map(PathBuf::from);
@@ -511,6 +526,11 @@ fn trace_shader_decode_failure(
     };
 
     if trace_agc_programs() {
+        let current_code_fingerprint =
+            code_size.and_then(|size| agc_shader_code_fingerprint(memory, address, size));
+        let fingerprint_changed = registration_code_fingerprint
+            .zip(current_code_fingerprint)
+            .map(|(registered, current)| registered != current);
         let words = window
             .bytes
             .chunks_exact(4)
@@ -525,7 +545,7 @@ fn trace_shader_decode_failure(
             })
             .collect::<Vec<_>>();
         eprintln!(
-            "[REMu][AGC][SHADER][DECODE-CONTEXT] code={address:#x} header={header_address:#x} registered_code_size={code_size:x?} window_offset={:#x} window_bytes={} words={words:x?}",
+            "[REMu][AGC][SHADER][DECODE-CONTEXT] code={address:#x} header={header_address:#x} registered_code_size={code_size:x?} registration_fingerprint={registration_code_fingerprint:x?} current_fingerprint={current_code_fingerprint:x?} fingerprint_changed={fingerprint_changed:?} window_offset={:#x} window_bytes={} words={words:x?}",
             window.offset,
             window.bytes.len(),
         );
@@ -589,6 +609,10 @@ pub(crate) fn agc_shader_snapshot(
                 address,
                 shaders.headers.get(&address).copied().unwrap_or_default(),
                 shaders.code_sizes.get(&address).copied(),
+                shaders
+                    .registration_code_fingerprints
+                    .get(&address)
+                    .copied(),
                 &error,
             );
             return None;
@@ -905,5 +929,26 @@ mod tests {
         assert_eq!(window.offset, 0xb4c);
         assert_eq!(window.bytes.len(), 0x44);
         assert!(window.bytes.iter().all(|byte| *byte == 0xff));
+    }
+
+    #[test]
+    fn shader_code_fingerprint_covers_the_registered_tail() {
+        let base = 0x0080_4eaa_0000;
+        let code_size = 0xb90_u32;
+        let mut first = vec![0xff_u8; usize::try_from(code_size).expect("test code size fits")];
+        let first_memory = SliceMemory {
+            base,
+            bytes: first.clone(),
+        };
+        let first_fingerprint = agc_shader_code_fingerprint(&first_memory, base, code_size)
+            .expect("registered shader extent is readable");
+
+        *first.last_mut().expect("shader extent is nonempty") = 0;
+        let changed_memory = SliceMemory { base, bytes: first };
+        let changed_fingerprint = agc_shader_code_fingerprint(&changed_memory, base, code_size)
+            .expect("changed shader extent is readable");
+
+        assert_ne!(first_fingerprint, changed_fingerprint);
+        assert_eq!(agc_shader_code_fingerprint(&changed_memory, base, 0), None);
     }
 }
