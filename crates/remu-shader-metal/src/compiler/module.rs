@@ -274,7 +274,9 @@ impl Compiler<'_> {
         }
         let signature = match self.options.stage {
             MetalShaderStage::Vertex => "vertex RemuVsOut remu_main",
-            MetalShaderStage::Pixel if self.options.pixel_outputs.is_empty() => {
+            MetalShaderStage::Pixel
+                if self.options.pixel_outputs.is_empty() && !self.options.pixel_depth_export =>
+            {
                 "fragment void remu_main"
             }
             MetalShaderStage::Pixel => "fragment RemuPsOut remu_main",
@@ -413,7 +415,7 @@ impl Compiler<'_> {
                 }
             }
             MetalShaderStage::Pixel => {
-                if !self.options.pixel_outputs.is_empty() {
+                if !self.options.pixel_outputs.is_empty() || self.options.pixel_depth_export {
                     source.push_str("    RemuPsOut remu_out = {};\n");
                     // GFX color exports supply architectural defaults for components that the
                     // shader masks out: RGB are zero and alpha is one. The alpha default is
@@ -429,6 +431,9 @@ impl Compiler<'_> {
                         };
                         let _ =
                             writeln!(source, "    remu_out.mrt{} = {default};", output.guest_slot);
+                    }
+                    if self.options.pixel_depth_export {
+                        source.push_str("    remu_out.depth = remu_in.frag_coord.z;\n");
                     }
                 }
                 self.emit_pixel_input_state(&mut source);
@@ -637,6 +642,7 @@ impl Compiler<'_> {
                 }
                 if self.options.stage == MetalShaderStage::Vertex
                     || !self.options.pixel_outputs.is_empty()
+                    || self.options.pixel_depth_export
                 {
                     source.push_str("    return remu_out;\n");
                 }

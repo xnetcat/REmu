@@ -208,6 +208,7 @@ impl MetalPresenter {
         );
         pixel_options.allocated_vector_register_count = key.pixel_allocated_vector_register_count;
         pixel_options.render_target_array_length = key.render_target_array_length;
+        pixel_options.pixel_depth_export = key.pixel_depth_export;
         pixel_options.pixel_input_controls = key
             .pixel_input_controls
             .map(remu_shader_metal::PixelInputControl::from_register);

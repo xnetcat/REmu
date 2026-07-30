@@ -155,6 +155,9 @@ impl Compiler<'_> {
                 output.guest_slot, output.host_location
             );
         }
+        if self.options.pixel_depth_export {
+            source.push_str("    float depth [[depth(any)]];\n");
+        }
         source.push_str("};\n\n");
     }
 

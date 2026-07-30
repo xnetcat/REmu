@@ -172,6 +172,7 @@ fn compile_vector_instruction(instruction: Instruction, stage: MetalShaderStage)
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
+            pixel_depth_export: false,
             pixel_input_enable: 0,
             pixel_input_address: 0,
             pixel_input_controls: identity_pixel_input_controls(),

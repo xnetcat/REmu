@@ -129,6 +129,12 @@ pub struct MetalCompileOptions {
     /// layer; procedural volume draws fall back to their instance index.
     pub render_target_array_length: u32,
     pub pixel_outputs: Vec<PixelOutputBinding>,
+    /// `DB_SHADER_CONTROL.Z_EXPORT_ENABLE`: the pixel shader's MRTZ component zero replaces the
+    /// fixed-function fragment depth.
+    ///
+    /// This is pipeline state rather than shader-code state on RDNA2, so callers must include it
+    /// in their pipeline key before enabling it here.
+    pub pixel_depth_export: bool,
     pub pixel_input_enable: u32,
     pub pixel_input_address: u32,
     /// Logical-to-physical fragment input mapping from `SPI_PS_INPUT_CNTL_0..31`.
@@ -172,6 +178,7 @@ impl MetalCompileOptions {
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
+            pixel_depth_export: false,
             pixel_input_enable: 0,
             pixel_input_address: 0,
             pixel_input_controls: identity_pixel_input_controls(),
@@ -199,6 +206,7 @@ impl MetalCompileOptions {
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs,
+            pixel_depth_export: false,
             pixel_input_enable,
             pixel_input_address,
             pixel_input_controls: identity_pixel_input_controls(),
@@ -222,6 +230,7 @@ impl MetalCompileOptions {
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
+            pixel_depth_export: false,
             pixel_input_enable: 0,
             pixel_input_address: 0,
             pixel_input_controls: identity_pixel_input_controls(),
@@ -245,6 +254,7 @@ impl MetalCompileOptions {
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
+            pixel_depth_export: false,
             pixel_input_enable: 0,
             pixel_input_address: 0,
             pixel_input_controls: identity_pixel_input_controls(),
@@ -273,6 +283,7 @@ impl MetalCompileOptions {
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
+            pixel_depth_export: false,
             pixel_input_enable: 0,
             pixel_input_address: 0,
             pixel_input_controls: identity_pixel_input_controls(),
