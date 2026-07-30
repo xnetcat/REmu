@@ -648,7 +648,7 @@ pub(crate) fn agc_shader_snapshot(
             return None;
         }
     };
-    if let Some(continuation) = fused_continuation {
+    let continuation_program = if let Some(continuation) = fused_continuation {
         let back_program = usize::try_from(continuation.back_code_size)
             .map_err(|_| remu_shader::DecodeError::InvalidCodeSize { bytes: usize::MAX })
             .and_then(|code_size| {
@@ -659,10 +659,9 @@ pub(crate) fn agc_shader_snapshot(
                 )
             });
         match back_program {
-            // Keep the front allocation's own segments first and append only the exact
-            // continuation entry point selected by this fuse operation. Trailing entry points in
-            // the back allocation are not targets of the front program's S_SETPC edge.
-            Ok(back_program) => programs.push(back_program),
+            // Only the exact leading entry point selected by this fuse operation is a transfer
+            // target. Trailing entry points in the back allocation remain unrelated.
+            Ok(back_program) => Some(back_program),
             Err(error) => {
                 shaders.decode_failures.insert(address);
                 eprintln!(
@@ -683,8 +682,32 @@ pub(crate) fn agc_shader_snapshot(
                 return None;
             }
         }
-    }
-    let program = Arc::new(programs.remove(0));
+    } else {
+        None
+    };
+    let leading_program = programs.remove(0);
+    let program = if let Some(back_program) = continuation_program {
+        let linked_program = match remu_shader::link_program_continuation(
+            &leading_program,
+            &back_program,
+        ) {
+            Ok(program) => program,
+            Err(error) => {
+                shaders.decode_failures.insert(address);
+                eprintln!(
+                    "[REMu][AGC][SHADER] fused continuation link failed entry={address:#x} continuation={:#x}: {error}",
+                    back_program.address,
+                );
+                return None;
+            }
+        };
+        // Keep the raw continuation after the front allocation's independent supplemental
+        // segments for diagnostics. Execution and cache identity use only the linked composite.
+        programs.push(back_program);
+        Arc::new(linked_program)
+    } else {
+        Arc::new(leading_program)
+    };
     let supplemental_programs: Arc<[remu_shader::Program]> = programs.into();
     // AGC's fused object is the back descriptor with only its program registers repointed at the
     // front entry point. User-data metadata and output semantics therefore belong to the back

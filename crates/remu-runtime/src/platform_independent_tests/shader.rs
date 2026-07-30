@@ -310,13 +310,20 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
 
 #[test]
 fn fused_shader_snapshot_uses_back_descriptor_and_retains_continuation_program() {
-    let front_program = [0xbe80_2006_u32]; // s_setpc_b64 s[6:7]
-    let back_program = [0xbf81_0000_u32]; // s_endpgm
+    // Keep both allocations in one ascending test buffer because the linked PC namespace
+    // preserves their real address delta.
+    let program_words = [
+        0xbe80_2006_u32, // s_setpc_b64 s[6:7]
+        0,
+        0,
+        0,
+        0xbf81_0000_u32, // s_endpgm
+    ];
     let mut front_header = [0_u8; SHADER_HEADER_SIZE as usize];
     let mut back_header = [0_u8; SHADER_HEADER_SIZE as usize];
     let mut back_user_data = [0_u8; 0x36];
-    let front_program_address = front_program.as_ptr().addr() as u64;
-    let back_program_address = back_program.as_ptr().addr() as u64;
+    let front_program_address = program_words.as_ptr().addr() as u64;
+    let back_program_address = program_words[4..].as_ptr().addr() as u64;
     let front_header_address = front_header.as_mut_ptr().addr() as u64;
     let back_header_address = back_header.as_mut_ptr().addr() as u64;
     write_guest_u64(
@@ -333,11 +340,11 @@ fn fused_shader_snapshot_uses_back_descriptor_and_retains_continuation_program()
         .insert(back_program_address, back_header_address);
     shaders.code_sizes.insert(
         front_program_address,
-        u32::try_from(std::mem::size_of_val(&front_program)).unwrap(),
+        u32::try_from(std::mem::size_of::<u32>()).unwrap(),
     );
     shaders.code_sizes.insert(
         back_program_address,
-        u32::try_from(std::mem::size_of_val(&back_program)).unwrap(),
+        u32::try_from(std::mem::size_of::<u32>()).unwrap(),
     );
     shaders
         .fused_continuations
@@ -347,12 +354,17 @@ fn fused_shader_snapshot_uses_back_descriptor_and_retains_continuation_program()
             front_header_address,
             back_header_address,
             back_program_address,
-            back_code_size: u32::try_from(std::mem::size_of_val(&back_program)).unwrap(),
+            back_code_size: u32::try_from(std::mem::size_of::<u32>()).unwrap(),
         });
 
     let snapshot = crate::agc_shader_snapshot(&mut shaders, front_program_address)
         .expect("both exact fused programs decode");
     assert_eq!(snapshot.program.address, front_program_address);
+    assert_eq!(snapshot.program.instructions.len(), 2);
+    assert_eq!(
+        snapshot.program.linked_transfer_target(0),
+        Some(u32::try_from(back_program_address - front_program_address).unwrap())
+    );
     assert_eq!(snapshot.header_address, back_header_address);
     assert!(snapshot.metadata.is_some());
     assert_eq!(snapshot.supplemental_programs.len(), 1);
