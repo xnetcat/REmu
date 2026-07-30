@@ -1026,6 +1026,44 @@ fn av_player_trace_zero_return(handle: u64, kind: &'static str, reason: &'static
     }
 }
 
+/// Samples the public media clock without making high-frequency ticker calls dominate a trace.
+///
+/// In addition to the usual logarithmic call counts, report the exact call that first reaches the
+/// known duration. That distinguishes a guest which stops polling because its clock completed
+/// from one which stopped while the public clock was still progressing.
+fn av_player_trace_current_time(handle: u64, player: &AvPlayerInstance, current: Duration) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    if !av_player_trace_enabled() {
+        return;
+    }
+    static STATES: OnceLock<Mutex<HashMap<u64, (u64, Duration)>>> = OnceLock::new();
+    let mut states = STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (count, previous) = states.entry(handle).or_default();
+    *count += 1;
+    let first_at_duration =
+        !player.duration.is_zero() && current == player.duration && *previous != current;
+    if *count <= 8 || count.is_power_of_two() || first_at_duration {
+        eprintln!(
+            "[REMu][AVPLAYER][TRACE] handle={handle:#x} current-time count={count} value_ms={} raw_ms={} duration_ms={} active={} playing={} paused={} eos={} next_video_frame={} video_decoder={}",
+            current.as_millis(),
+            player.media_clock_elapsed().as_millis(),
+            player.duration.as_millis(),
+            player.active_session,
+            player.playing_since.is_some(),
+            player.paused,
+            player.end_of_stream,
+            player.next_video_frame,
+            player.video_decoder.is_some(),
+        );
+    }
+    *previous = current;
+}
+
 pub(crate) fn av_player_close(handle: u64, state: &mut ProbeDispatchState) -> u64 {
     let Some(mut player) = state.av_player.players.remove(&handle) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
@@ -1064,6 +1102,7 @@ pub(crate) fn av_player_current_time(handle: u64, state: &ProbeDispatchState) ->
     } else {
         elapsed.min(player.duration)
     };
+    av_player_trace_current_time(handle, player, current);
     u64::try_from(current.as_millis()).unwrap_or(u64::MAX)
 }
 
