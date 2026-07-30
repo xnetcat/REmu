@@ -20,6 +20,7 @@ fn module_unwind_query_writes_the_gen5_metadata_layout() {
         eh_frame_header: 0x7000,
         eh_frame: 0x5000,
         eh_frame_size: 0x2000,
+        segments: Vec::new(),
     });
     let mut output = vec![0xcc_u8; 0x130];
     let output_address = output.as_mut_ptr().addr() as u64;
@@ -35,6 +36,39 @@ fn module_unwind_query_writes_the_gen5_metadata_layout() {
     assert_eq!(crate::read_guest_u64(output_address + 0x118), 0x2000);
     assert_eq!(crate::read_guest_u64(output_address + 0x120), 0x1000);
     assert_eq!(crate::read_guest_u64(output_address + 0x128), 0x8000);
+}
+
+#[test]
+fn module_info_from_addr_writes_the_extended_layout_with_segments() {
+    let mut state = ProbeDispatchState::default();
+    state.unwind_modules.push(crate::GuestUnwindModule {
+        name: "eboot.bin".to_owned(),
+        base: 0x1000,
+        end: 0x9000,
+        eh_frame_header: 0x7000,
+        eh_frame: 0x5000,
+        eh_frame_size: 0x2000,
+        segments: vec![crate::GuestModuleSegment {
+            address: 0x1000,
+            size: 0x8000,
+            protection: 5,
+        }],
+    });
+    let mut output = vec![0xcc_u8; 0x1a8];
+    let output_address = output.as_mut_ptr().addr() as u64;
+    crate::write_guest_u64(output_address, 0x1a8);
+    assert_eq!(
+        crate::kernel_module_info_from_addr([0x1234, 2, output_address, 0, 0, 0], &state),
+        0
+    );
+    assert_eq!(crate::read_guest_u64(output_address), 0x1a8);
+    assert_eq!(&output[8..17], b"eboot.bin");
+    assert_eq!(crate::read_guest_u64(output_address + 0x148), 0x7000);
+    assert_eq!(crate::read_guest_u64(output_address + 0x150), 0x5000);
+    assert_eq!(crate::read_guest_u64(output_address + 0x160), 0x1000);
+    assert_eq!(crate::read_guest_u32(output_address + 0x168), 0x8000);
+    assert_eq!(crate::read_guest_u32(output_address + 0x16c), 5);
+    assert_eq!(crate::read_guest_u32(output_address + 0x1a0), 1);
 }
 
 #[test]

@@ -21,6 +21,7 @@ fn preserves_initial_image_descriptors_for_statically_inactive_blocks() {
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let mut branch = instruction(
         4,
@@ -299,6 +300,7 @@ fn linked_program_resources_keep_distinct_front_and_continuation_pcs() {
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let image_instruction = |pc| {
         instruction(

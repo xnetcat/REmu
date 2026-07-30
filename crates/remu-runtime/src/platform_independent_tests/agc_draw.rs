@@ -481,6 +481,7 @@ fn targetless_scanout_resolution_requires_complete_unambiguous_draw_state() {
                 slc: false,
                 a16: false,
                 d16: false,
+                unorm: false,
             },
             resource_descriptor: vec![1, 0, 0, 0].into(),
             sampler_descriptor: vec![0; 4].into(),

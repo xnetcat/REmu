@@ -83,6 +83,9 @@ impl Compiler<'_> {
         if name.starts_with("ImageStore") {
             return self.emit_image_store(image, name, binding_index);
         }
+        if name == "ImageGetResinfo" {
+            return self.emit_image_get_resinfo(image, binding_index);
+        }
         let gather = name.starts_with("ImageGather4");
         if !name.starts_with("ImageSample") && !gather {
             return Err(format!("unsupported image opcode {name}"));
@@ -123,6 +126,62 @@ impl Compiler<'_> {
             };
             self.store_vector(image.vector_data + output, &raw);
             output += 1;
+        }
+        Ok(())
+    }
+
+    fn emit_image_get_resinfo(
+        &mut self,
+        image: &ImageControl,
+        binding_index: usize,
+    ) -> Result<(), String> {
+        let mip = self.temp("uint", &self.image_uint_address(image, 0));
+        let kind = self.image_kinds[binding_index];
+        let width = self.temp("uint", &format!("tex{binding_index}.get_width({mip})"));
+        let height = self.temp("uint", &format!("tex{binding_index}.get_height({mip})"));
+        // AMD Z is depth for 3D, otherwise array/cube layer count (or 1 for plain 2D).
+        let depth = if kind.texture_type == 10 || kind.dimension == 2 {
+            self.temp("uint", &format!("tex{binding_index}.get_depth({mip})"))
+        } else if kind.dimension == 3 || image.is_array {
+            self.temp("uint", &format!("tex{binding_index}.get_array_size()"))
+        } else {
+            self.temp("uint", "1u")
+        };
+        let levels = self.temp(
+            "uint",
+            &format!("tex{binding_index}.get_num_mip_levels()"),
+        );
+        let components = [width, height, depth, levels];
+        let mut values = Vec::with_capacity(4);
+        for (component, value) in components.iter().enumerate() {
+            if image.dmask & (1 << component) == 0 {
+                continue;
+            }
+            if image.unorm {
+                values.push(format!("as_type<uint>((float){value})"));
+            } else {
+                values.push(value.clone());
+            }
+        }
+        if image.d16 {
+            for (index, pair) in values.chunks(2).enumerate() {
+                let low = &pair[0];
+                let high = pair.get(1).map_or("0u", String::as_str);
+                let packed = self.pack_image_d16("uint", low, high);
+                self.store_vector(
+                    image.vector_data
+                        + u32::try_from(index).map_err(|_| "D16 resinfo output overflow")?,
+                    &packed,
+                );
+            }
+        } else {
+            for (index, raw) in values.iter().enumerate() {
+                self.store_vector(
+                    image.vector_data
+                        + u32::try_from(index).map_err(|_| "resinfo output overflow")?,
+                    raw,
+                );
+            }
         }
         Ok(())
     }

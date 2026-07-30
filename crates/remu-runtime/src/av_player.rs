@@ -479,6 +479,92 @@ pub(crate) fn av_player_set_log_callback(
     0
 }
 
+pub(crate) fn av_player_init(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    // Legacy `sceAvPlayerInit(AvPlayerInitData*)` returns the player handle in RAX. Gen5 still
+    // ships this NID beside InitEx; Poppy calls it during boot before PostInit.
+    const INIT_DATA_SIZE: usize = 0x80;
+    let parameter = arguments[0];
+    if parameter == 0 {
+        eprintln!("[REMu][AVPLAYER] Init rejected null parameter");
+        return 0;
+    }
+    if !process_guest_range_has_read_access(parameter, INIT_DATA_SIZE) {
+        eprintln!("[REMu][AVPLAYER] Init rejected unreadable parameter={parameter:#x}");
+        return 0;
+    }
+    let allocator_callbacks = [8_u64, 16, 24, 32].map(|offset| read_guest_u64(parameter + offset));
+    if allocator_callbacks.contains(&0) {
+        eprintln!(
+            "[REMu][AVPLAYER] Init rejected allocator callbacks={allocator_callbacks:#x?}"
+        );
+        return 0;
+    }
+    // SAFETY: AvPlayerInitData is a fixed caller-owned structure of known minimum size.
+    let initialization =
+        unsafe { std::slice::from_raw_parts(parameter as *const u8, INIT_DATA_SIZE).to_vec() };
+    let handle = state.av_player.next_handle.max(1);
+    state.av_player.next_handle = handle.saturating_add(1);
+    // EventReplacement follows MemAllocator (0x28) and FileReplacement (0x28): object@0x50, cb@0x58.
+    // auto_start sits after debug_level/base_priority/num_framebuffers (0x60+0xc = 0x6c).
+    state.av_player.players.insert(
+        handle,
+        AvPlayerInstance {
+            _initialization: initialization,
+            allocator_object: read_guest_u64(parameter),
+            allocate_texture_callback: read_guest_u64(parameter + 24),
+            deallocate_texture_callback: read_guest_u64(parameter + 32),
+            event_object: read_guest_u64(parameter + 0x50),
+            event_callback: read_guest_u64(parameter + 0x58),
+            source: None,
+            auto_start: read_guest_u8(parameter + 0x6c) != 0,
+            width: 0,
+            height: 0,
+            frames_per_second: 30.0,
+            duration: Duration::ZERO,
+            has_audio: false,
+            active_session: false,
+            paused: false,
+            end_of_stream: false,
+            playing_since: None,
+            elapsed: Duration::ZERO,
+            presentation_anchor_media: Duration::ZERO,
+            presentation_anchor_host: None,
+            presentation_clock_reported: Duration::ZERO,
+            presentation_master_delivered: false,
+            looping: false,
+            decoder_seek: Duration::ZERO,
+            trick_speed_percent: 100,
+            av_sync_mode: 0,
+            video_decoder: None,
+            video_decoder_drained: false,
+            raw_video_frame: Vec::new(),
+            padded_video_frame: Vec::new(),
+            video_buffer_base: 0,
+            video_buffers: [0; 3],
+            video_buffer_stride: 0,
+            next_video_buffer: 0,
+            next_video_frame: 0,
+            last_video_delivery: None,
+            video_catch_up_origin: None,
+            audio_decoder: None,
+            audio_decoder_drained: false,
+            raw_audio_frame: Vec::new(),
+            audio_buffer_base: 0,
+            next_audio_buffer: 0,
+            next_audio_frame: 0,
+        },
+    );
+    let player = &state.av_player.players[&handle];
+    eprintln!(
+        "[REMu][AVPLAYER] initialized (Init) handle={handle:#x} texture_alloc={:#x}/{:#x} event={:#x}/{:#x}",
+        player.allocator_object,
+        player.allocate_texture_callback,
+        player.event_object,
+        player.event_callback
+    );
+    handle
+}
+
 pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     const MINIMUM_INITIALIZATION_SIZE: usize = 48;
     const MAXIMUM_INITIALIZATION_SIZE: usize = 0x400;
@@ -1858,11 +1944,20 @@ pub(crate) fn av_player_get_video_data(
     }
     if player.av_sync_mode == 0 {
         let presentation_time = av_player_presentation_time_at(player, Instant::now());
-        if !av_player_video_frame_is_due(
+        let frame_due = av_player_video_frame_is_due(
             player.next_video_frame,
             player.frames_per_second,
             presentation_time,
-        ) {
+        );
+        // CurrentTime is intentionally capped at duration-1ms until both decoders drain. The next
+        // frame after a complete stream therefore never becomes "due", which used to return here
+        // forever and skip the Finished poll that marks video EOF / emits Stop.
+        let past_known_stream = !player.duration.is_zero()
+            && Duration::from_millis(
+                ((player.next_video_frame as f64) * 1_000.0 / player.frames_per_second.max(1.0))
+                    .round() as u64,
+            ) >= player.duration;
+        if !frame_due && !past_known_stream {
             av_player_trace_zero_return(arguments[0], "video", "clock-not-reached");
             return 0;
         }

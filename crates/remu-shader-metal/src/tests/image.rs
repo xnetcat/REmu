@@ -21,6 +21,7 @@ fn sampled_images_apply_dynamic_descriptor_component_selection_in_the_shader() {
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let instruction = Instruction {
         pc: 0,
@@ -72,6 +73,7 @@ fn zero_lod_gather_returns_four_neighbor_values_from_the_selected_component() {
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let instruction = Instruction {
         pc: 0,
@@ -130,6 +132,7 @@ fn canonicalizes_silent_hill_scale_image_uses_below_the_direct_texture_limit() {
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let mut instructions = Vec::with_capacity(IMAGE_INSTRUCTION_COUNT);
     let mut evaluation = empty_evaluation();
@@ -198,6 +201,7 @@ fn comparison_gather_uses_distinct_depth_resources_and_gather_compare_codegen() 
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let comparison_control = ImageControl {
         address_registers: vec![0, 1, 2],
@@ -356,6 +360,7 @@ fn comparison_samples_use_depth_texture_typing_and_the_z_reference_operand() {
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let instruction = Instruction {
         pc: 0,
@@ -415,6 +420,7 @@ fn cube_image_control(address_registers: Vec<u32>, vector_data: u32) -> ImageCon
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     }
 }
 
@@ -539,4 +545,101 @@ fn cube_gradient_samples_pass_2d_face_gradients_to_the_array_sampler() {
     assert!(shader.source.contains("gradient2d("));
     assert!(!shader.source.contains("gradientcube"));
     assert!(shader.source.contains(".xy,"));
+}
+
+#[test]
+fn image_get_resinfo_queries_mip_relative_dimensions() {
+    let control = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0],
+        vector_data: 4,
+        scalar_resource: 0,
+        scalar_sampler: 0,
+        dimension: 1,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageGetResinfo"),
+        words: vec![0, 0],
+        sources: vec![Operand::vector(0), Operand::scalar(0)],
+        destinations: (4..8).map(Operand::vector).collect(),
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let mut evaluation = empty_evaluation();
+    evaluation.image_bindings.push(ImageBinding {
+        pc: 0,
+        opcode: Opcode::Known("ImageGetResinfo"),
+        control: control.clone(),
+        resource_descriptor: vec![0; 8].into(),
+        sampler_descriptor: Vec::new().into(),
+        mip_level: None,
+    });
+    let shader = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("ImageGetResinfo should lower");
+    assert!(shader.source.contains("tex0.get_width("));
+    assert!(shader.source.contains("tex0.get_height("));
+    assert!(shader.source.contains("tex0.get_num_mip_levels()"));
+    assert!(shader.source.contains("if (exec) remu_v_4 ="));
+    assert!(shader.source.contains("if (exec) remu_v_5 ="));
+    assert!(shader.source.contains("if (exec) remu_v_6 ="));
+    assert!(shader.source.contains("if (exec) remu_v_7 ="));
+    assert!(!shader.source.contains("as_type<uint>((float)"));
+}
+
+#[test]
+fn image_get_resinfo_unorm_writes_float_bitcasts() {
+    let control = ImageControl {
+        dmask: 0x3,
+        vector_address: 0,
+        address_registers: vec![0],
+        vector_data: 2,
+        scalar_resource: 0,
+        scalar_sampler: 0,
+        dimension: 1,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: true,
+    };
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageGetResinfo"),
+        words: vec![0, 0],
+        sources: vec![Operand::vector(0), Operand::scalar(0)],
+        destinations: (2..4).map(Operand::vector).collect(),
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let mut evaluation = empty_evaluation();
+    evaluation.image_bindings.push(ImageBinding {
+        pc: 0,
+        opcode: Opcode::Known("ImageGetResinfo"),
+        control,
+        resource_descriptor: vec![0; 8].into(),
+        sampler_descriptor: Vec::new().into(),
+        mip_level: None,
+    });
+    let shader = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("unorm ImageGetResinfo should lower");
+    assert!(shader.source.contains("as_type<uint>((float)"));
+    assert!(shader.source.contains("tex0.get_width("));
+    assert!(shader.source.contains("tex0.get_height("));
 }

@@ -115,6 +115,9 @@ impl Compiler<'_> {
         if name.ends_with("SaveexecB64") {
             return self.emit_saveexec64(instruction, name, destination);
         }
+        if name.ends_with("SaveexecB32") {
+            return self.emit_saveexec32(instruction, name, destination);
+        }
         if name == "SBcnt1I32B64" {
             let source = self.temp("ulong", &self.raw_source64(instruction, 0)?);
             let result = self.temp(
@@ -327,6 +330,39 @@ impl Compiler<'_> {
             self.lane_mask_predicate(&format!("(uint){new}"), &format!("(uint)({new} >> 32)"));
         self.line(3, &format!("exec = {exec};"));
         self.line(3, &format!("scc = {new} != 0ul;"));
+        Ok(())
+    }
+
+    fn emit_saveexec32(
+        &mut self,
+        instruction: &Instruction,
+        name: &str,
+        destination: u32,
+    ) -> Result<(), String> {
+        let source = self.raw_source(instruction, 0)?;
+        // Wave32 saveexec only updates EXEC_LO. Preserve the active SIMD32 ballot as the old mask
+        // so later EXEC restores remain exact for GFX10 wave32 programs.
+        let old = self.temp("uint", "(uint)(uint64_t)simd_ballot(exec)");
+        let expression = match name {
+            "SAndSaveexecB32" => format!("({old} & {source})"),
+            "SOrSaveexecB32" => format!("({old} | {source})"),
+            "SXorSaveexecB32" => format!("({old} ^ {source})"),
+            "SAndn1SaveexecB32" => format!("(~{source} & {old})"),
+            "SAndn2SaveexecB32" => format!("({source} & ~{old})"),
+            "SOrn1SaveexecB32" => format!("(~{source} | {old})"),
+            "SOrn2SaveexecB32" => format!("({source} | ~{old})"),
+            "SNandSaveexecB32" => format!("~({source} & {old})"),
+            "SNorSaveexecB32" => format!("~({source} | {old})"),
+            "SXnorSaveexecB32" => format!("~({source} ^ {old})"),
+            _ => return Err(format!("unsupported 32-bit saveexec opcode {name}")),
+        };
+        let new = self.temp("uint", &expression);
+        self.store_scalar(destination, &old);
+        self.line(3, &format!("s[{EXEC_LO}] = {new};"));
+        self.line(3, &format!("s[{EXEC_HI}] = 0u;"));
+        let exec = self.lane_mask_predicate(&new, "0u");
+        self.line(3, &format!("exec = {exec};"));
+        self.line(3, &format!("scc = {new} != 0u;"));
         Ok(())
     }
 

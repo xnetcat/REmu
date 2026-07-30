@@ -355,6 +355,7 @@ fn resolves_image_descriptors_without_executing_vector_math() {
         slc: false,
         a16: false,
         d16: false,
+        unorm: false,
     };
     let shader = state(
         vec![
@@ -423,6 +424,7 @@ fn canonicalizes_repeated_image_descriptors_without_merging_type_or_access() {
                 slc: false,
                 a16: false,
                 d16: false,
+                unorm: false,
             })),
         )
     };

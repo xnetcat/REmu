@@ -124,6 +124,7 @@ pub(super) fn video_out_close(arguments: [u64; 6], state: &mut ProbeDispatchStat
     }
     state.video_out.is_open = false;
     state.video_out.flip_events.clear();
+    state.video_out.vblank_events.clear();
     state.video_out.display_buffers.clear();
     state.video_out.display_buffer_attributes.clear();
     video_out_reset_display_clock();

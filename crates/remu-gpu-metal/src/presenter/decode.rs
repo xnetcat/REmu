@@ -17,9 +17,10 @@ use super::{
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
-    is_storage_image_opcode, ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw,
-    program_embeds_global_base, tiled_block_dimensions, trace_image_descriptors,
-    trace_target_sampling, unsigned_float_to_f32, video_target_binding_summary,
+    is_storage_image_opcode, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base, tiled_block_dimensions,
+    trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
+    video_target_binding_summary,
 };
 use metal::{MTLScissorRect, MTLViewport};
 use remu_gpu::{GpuRegister, IndexedDraw};
@@ -36,8 +37,8 @@ pub(crate) use self::pipeline::{
     ColorOperationMode, color_operation_is_raster_noop, decode_color_operation_mode,
     decode_metal_blend_attachment, decode_raster_state, graphics_pipeline_key,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
-    ngg_mesh_base_vertex, prepare_indexed_primitive, prepare_ngg_meshlets,
-    prepare_nonindexed_ngg_indices,
+    ngg_mesh_base_vertex, prepare_indexed_ngg_indices, prepare_indexed_primitive,
+    prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{
@@ -260,6 +261,12 @@ pub(super) fn intersect_scissor_pair(
     bounds[3] = bounds[3].min(pair[3]);
 }
 
+pub(super) fn guest_viewport_y_scale_is_negative(draw: &IndexedDraw) -> bool {
+    register_value(&draw.context_registers, 0x111)
+        .map(f32::from_bits)
+        .is_some_and(|y_scale| y_scale.is_finite() && y_scale < 0.0)
+}
+
 pub(super) fn decode_viewport(
     draw: &IndexedDraw,
     target_width: u32,
@@ -289,6 +296,8 @@ pub(super) fn decode_viewport(
     {
         let mut origin_y = y_offset - y_scale;
         let mut height = y_scale * 2.0;
+        // Absolute Metal height: guest VPORT_YSCALE < 0 still maps NDC+Y to the top of the
+        // target after this conversion. Passing a signed height inverted the image on Metal.
         if height < 0.0 {
             origin_y += height;
             height = -height;

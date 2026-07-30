@@ -79,6 +79,8 @@ fn records_a_branch_target_that_stitches_into_the_next_dcb() {
     assert_eq!(take_graphics_continuations_before(next_dcb), vec![command]);
     assert!(take_graphics_continuations_before(next_dcb).is_empty());
     assert!(graphics_continuation_was_consumed(command));
+    // One-shot: a recycled packet address must not stay consumed across later frames.
+    assert!(!graphics_continuation_was_consumed(command));
 }
 
 #[test]

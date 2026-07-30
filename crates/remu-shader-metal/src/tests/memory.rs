@@ -209,6 +209,7 @@ fn complete_memory_program() -> (Program, ShaderEvaluation) {
         slc: true,
         a16: false,
         d16: false,
+        unorm: false,
     };
     instructions.push(Instruction {
         pc: image_pc,

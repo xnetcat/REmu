@@ -22,6 +22,15 @@ pub(crate) struct GuestUnwindModule {
     pub(crate) eh_frame_header: u64,
     pub(crate) eh_frame: u64,
     pub(crate) eh_frame_size: u64,
+    /// Program-header load segments for `sceKernelGetModuleInfoFromAddr`.
+    pub(crate) segments: Vec<GuestModuleSegment>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GuestModuleSegment {
+    pub(crate) address: u64,
+    pub(crate) size: u32,
+    pub(crate) protection: u32,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -191,6 +200,7 @@ pub(crate) fn guest_unwind_module(
 ) -> Result<GuestUnwindModule, LinkError> {
     let mut base = u64::MAX;
     let mut end = 0_u64;
+    let mut segments = Vec::new();
     for segment in &executable.load_segments {
         if segment.memory_size == 0 {
             continue;
@@ -208,6 +218,13 @@ pub(crate) fn guest_unwind_module(
                 .checked_add(segment.memory_size)
                 .ok_or(LinkError::AddressOverflow)?,
         );
+        let size = u32::try_from(segment.memory_size.min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        segments.push(GuestModuleSegment {
+            address: start,
+            size,
+            // ELF p_flags: PF_X=1, PF_W=2, PF_R=4. Pass through unchanged for ModuleInfoEx.
+            protection: segment.flags,
+        });
     }
     if base == u64::MAX || end <= base {
         return Err(LinkError::Mapping(MappingError::NoLoadSegments));
@@ -220,6 +237,7 @@ pub(crate) fn guest_unwind_module(
         eh_frame_header: 0,
         eh_frame: 0,
         eh_frame_size: 0,
+        segments,
     };
     let Some(header) = executable.info.elf.as_ref().and_then(|elf| {
         elf.program_headers

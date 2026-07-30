@@ -43,10 +43,12 @@ use self::decode::{
     decode_color_operation_mode, decode_color_resolve_targets, decode_depth_target,
     decode_image_descriptor, decode_metal_blend_attachment, decode_raster_state,
     decode_render_target_format, decode_render_targets, decode_scissor, decode_viewport,
-    fallback_image_descriptor, graphics_pipeline_key, image_component_class,
+    fallback_image_descriptor, graphics_pipeline_key, guest_viewport_y_scale_is_negative,
+    image_component_class,
     initial_depth_clear_for_target, initial_render_target_clear_color, metal_color_write_mask,
     metal_nonindexed_vertex_count, metal_primitive_type, ngg_mesh_base_vertex,
-    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
+    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_indexed_ngg_indices,
+    prepare_nonindexed_ngg_indices,
     raw_video_out_texture_descriptor, read_draw_indices, register_value,
     render_target_cmask_address, render_target_fast_clear_color, sampled_alias_descriptor,
 };
@@ -129,15 +131,15 @@ use self::shader::{
     compute_pipeline_key, compute_program_can_split_wave64, dump_shader_pair_msl,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, ngg_mesh_stage_for_draw, pixel_scalars,
-    procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    is_storage_image_opcode, is_writable_image_opcode, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
-    missing_vertex_parameter_exports, ngg_mesh_draw_supported, ngg_mesh_export_stage,
-    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
-    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
+    missing_vertex_parameter_exports, ngg_mesh_draw_supported, procedural_rectangle_export_stage,
+    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
+    shader_scalar_metadata,
 };
 #[cfg(test)]
 use self::stats::process_resident_bytes;
@@ -688,6 +690,7 @@ struct CompiledShaderPair {
     function_duration: Duration,
     pipeline_duration: Duration,
     uses_mesh_stage: bool,
+    uses_procedural_rectangle_stage: bool,
 }
 
 struct CompiledComputePipeline {

@@ -41,6 +41,9 @@ mod np_api;
 mod pad;
 mod playgo;
 mod pthread;
+mod random;
+mod rtld_atexit;
+mod sha_ni;
 mod save_data;
 mod shader_cache;
 mod shader_eval;
@@ -117,7 +120,7 @@ pub(crate) use agc_flip::{
     agc_submit_ordered_video_out_flip, agc_video_out_target, agc_video_out_target_for_address,
     queue_agc_event_write, queue_video_out_flip, refresh_completed_video_out_flips,
     request_agc_compute_submission_completion, request_agc_submission_completion,
-    video_out_add_flip_event, video_out_register_buffers2,
+    video_out_add_flip_event, video_out_add_vblank_event, video_out_register_buffers2,
 };
 pub(crate) use agc_registers::{
     AgcColorTargetState, AgcComputeDispatchError, AgcSubmissionError,
@@ -181,12 +184,13 @@ pub(crate) use av_player::{
 pub(crate) use av_player::{
     av_player_add_source, av_player_add_source_ex, av_player_change_stream, av_player_close,
     av_player_current_time, av_player_get_audio_data, av_player_get_stream_info,
-    av_player_get_video_data, av_player_init_ex, av_player_is_active, av_player_jump_to_time,
-    av_player_pause, av_player_post_init, av_player_resume, av_player_set_av_sync_mode,
-    av_player_set_log_callback, av_player_set_looping, av_player_set_trick_speed, av_player_start,
-    av_player_stop, av_player_stream_count, av_player_validate_handle,
-    invoke_av_player_event_callbacks, invoke_av_player_texture_deallocations,
-    prepare_av_player_video_buffers, take_av_player_calling_thread_callbacks,
+    av_player_get_video_data, av_player_init, av_player_init_ex, av_player_is_active,
+    av_player_jump_to_time, av_player_pause, av_player_post_init, av_player_resume,
+    av_player_set_av_sync_mode, av_player_set_log_callback, av_player_set_looping,
+    av_player_set_trick_speed, av_player_start, av_player_stop, av_player_stream_count,
+    av_player_validate_handle, invoke_av_player_event_callbacks,
+    invoke_av_player_texture_deallocations, prepare_av_player_video_buffers,
+    take_av_player_calling_thread_callbacks,
 };
 #[cfg(test)]
 pub(crate) use dialog::{
@@ -336,7 +340,7 @@ pub(crate) use link::{
     subtract_address, write_u64,
 };
 use tls::{GUEST_TLS_PREFIX_SIZE, GUEST_TLS_TCB_SIZE, tls_dtv_entry_offset};
-use unwind::GuestUnwindModule;
+use unwind::{GuestModuleSegment, GuestUnwindModule};
 #[cfg(target_arch = "x86_64")]
 use unwind::register_guest_unwind_frames;
 #[cfg(test)]
@@ -416,6 +420,11 @@ struct ProbeDispatchState {
     thread_atexit_count_callback: u64,
     thread_atexit_report_callback: u64,
     thread_dtors_callback: u64,
+    /// Pending `__cxa_thread_atexit` destructor references keyed by module base.
+    ///
+    /// `_sceKernelRtldThreadAtexitIncrement` acquires one when the CRT registers a TLS dtor;
+    /// `Decrement` releases it. Nonzero counts must keep the module mapped.
+    module_tls_destructor_refs: BTreeMap<u64, u64>,
     application_heap_api_address: u64,
     bundled_modules: Vec<LinkedGuestModule>,
     unwind_modules: Vec<GuestUnwindModule>,
@@ -964,6 +973,8 @@ struct VideoOutState {
     display_buffers: Vec<u64>,
     display_buffer_attributes: Vec<Option<VideoOutBufferAttributes>>,
     flip_events: BTreeMap<u64, u64>,
+    /// Equeues registered with `sceVideoOutAddVblankEvent`, keyed by queue handle.
+    vblank_events: BTreeMap<u64, u64>,
     completed_flip_count: u64,
 }
 
@@ -1512,6 +1523,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.thread_atexit_count_callback = 0;
     state.thread_atexit_report_callback = 0;
     state.thread_dtors_callback = 0;
+    state.module_tls_destructor_refs.clear();
     state.application_heap_api_address = 0;
     state.bundled_modules.clone_from(&image.bundled_modules);
     state.unwind_modules.clone_from(&image.unwind_modules);
@@ -2611,13 +2623,15 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             let state = state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pthread_mutex_attr_state(call_args[1], &state)
+            // Missing attr objects fall back to Gen5 defaults. Titles sometimes pass a stack
+            // attribute that was never routed through scePthreadMutexattrInit (zero-init / copy).
+            Some(
+                pthread_mutex_attr_state(call_args[1], &state)
+                    .unwrap_or_default(),
+            )
         } else {
             None
         };
-        if is_mutex_init && call_args[1] != 0 && mutex_attributes.is_none() {
-            return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
-        }
         let result =
             dispatch_guest_sync_import_at_import(nid, call_args, mutex_attributes, Some(frame));
         // A kernel exception can interrupt a thread parked inside a synchronization import. The
@@ -3461,6 +3475,83 @@ fn kernel_module_info_for_unwind(arguments: [u64; 6], state: &ProbeDispatchState
     0
 }
 
+/// `sceKernelGetModuleInfoFromAddr(addr, flags, SceKernelModuleInfoEx *info)`.
+///
+/// libc's TLS destructor path calls this with `flags == 2` immediately after
+/// `_sceKernelRtldThreadAtexitIncrement` to recover the owning module's PHDRs.
+fn kernel_module_info_from_addr(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    const MODULE_INFO_EX_SIZE: u64 = 0x1a8;
+    const MAX_SEGMENTS: usize = 4;
+    let queried_address = arguments[0];
+    let flags = low_i32(arguments[1]);
+    let output = arguments[2];
+    if output == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    }
+    if !(0..3).contains(&flags) {
+        guest_memset(output, 0, MODULE_INFO_EX_SIZE);
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    if read_guest_u64(output) != MODULE_INFO_EX_SIZE {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(module) = state
+        .unwind_modules
+        .iter()
+        .find(|module| (module.base..module.end).contains(&queried_address))
+    else {
+        guest_memset(output, 0, MODULE_INFO_EX_SIZE);
+        write_guest_u64(output, MODULE_INFO_EX_SIZE);
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    let handle = state
+        .bundled_modules
+        .iter()
+        .find(|bundled| {
+            bundled.name == module.name
+                || Path::new(&bundled.name)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == module.name)
+        })
+        .map_or(0, |bundled| bundled.handle);
+
+    guest_memset(output, 0, MODULE_INFO_EX_SIZE);
+    write_guest_u64(output, MODULE_INFO_EX_SIZE);
+    let name = module.name.as_bytes();
+    let name_length = name.len().min(0xff);
+    write_guest_bytes(output + 8, &name[..name_length]);
+    write_guest_u32(output + 0x108, handle);
+    write_guest_u64(output + 0x148, module.eh_frame_header);
+    write_guest_u64(output + 0x150, module.eh_frame);
+    write_guest_u32(output + 0x158, 0);
+    write_guest_u32(
+        output + 0x15c,
+        u32::try_from(module.eh_frame_size.min(u64::from(u32::MAX))).unwrap_or(u32::MAX),
+    );
+
+    let mut segments = module.segments.clone();
+    if segments.is_empty() {
+        // Fallback when segment metadata was unavailable at link time: one aggregate R+X range.
+        let size = u32::try_from((module.end - module.base).min(u64::from(u32::MAX)))
+            .unwrap_or(u32::MAX);
+        segments.push(GuestModuleSegment {
+            address: module.base,
+            size,
+            protection: 5,
+        });
+    }
+    let segment_count = segments.len().min(MAX_SEGMENTS);
+    for (index, segment) in segments.into_iter().take(segment_count).enumerate() {
+        let base = output + 0x160 + (index as u64) * 16;
+        write_guest_u64(base, segment.address);
+        write_guest_u32(base + 8, segment.size);
+        write_guest_u32(base + 12, segment.protection);
+    }
+    write_guest_u32(output + 0x1a0, segment_count as u32);
+    0
+}
+
 extern "C" fn scripting_get_mem(alignment: u64, size: u64) -> u64 {
     guest_aligned_alloc(alignment, size)
 }
@@ -3927,6 +4018,7 @@ fn dispatch_stateless_import(
     Some(match nid {
         "bnZxYgAFeA0" => sanitizer_new_replace_external(),
         "vNe1w4diLCs" => guest_tls_get_addr(arguments[0]),
+        "PI7jIZj4pcE" => random::sce_random_get_random_number(arguments),
         "aI+OeCz8xrQ" | "EotR8a3ASf4" => current_guest_thread_handle(),
         "pO96TwzOm5E" => 16 * 1024 * 1024 * 1024,
         "8zTFvBIAIN8" => guest_memset(arguments[0], arguments[1], arguments[2]),
@@ -4115,6 +4207,9 @@ fn dispatch_probe_import(
             state.thread_atexit_report_callback = arguments[0];
             0
         }
+        // Pin/unpin the module that owns a pending TLS destructor (`__dso_handle` address).
+        "Tz4RNUCBbGI" => rtld_atexit::rtld_thread_atexit_increment(arguments[0], state),
+        "8OnWXlgQlvo" => rtld_atexit::rtld_thread_atexit_decrement(arguments[0], state),
         "959qrazPIrg" => state.process_param_address,
         "p5EcQeEeJAE" => {
             state.application_heap_api_address = arguments[0];
@@ -4186,6 +4281,7 @@ fn dispatch_probe_import(
         "IXW-z8pggfg" | "Cxwy7wHq4J0" => json_initializer_initialize(arguments, state),
         "PR5k1penBLM" => json_initializer_terminate(arguments, state),
         "eBTreZ84JFY" => av_player_set_log_callback(arguments, state),
+        "aS66RI0gGgo" => av_player_init(arguments, state),
         "o9eWRkSL+M4" => av_player_init_ex(arguments, state),
         "HD1YKVU26-M" => av_player_post_init(arguments, state),
         "KMcEa+rHsIo" => av_player_add_source(arguments, state),
@@ -4486,6 +4582,7 @@ fn dispatch_probe_import(
         "PjS5uASwcV8" => video_out_set_buffer_attribute2(arguments, state),
         "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
         "HXzjK9yI30k" => video_out_add_flip_event(arguments, state),
+        "Xru92wHJRmg" => video_out_add_vblank_event(arguments, state),
         "w0hLuNarQxY" => (low_i32(arguments[0]) == 1)
             .then_some(0)
             .unwrap_or_else(|| sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE)),
@@ -4508,6 +4605,7 @@ fn dispatch_probe_import(
         "rPo6tV8D9bM" => system_service_get_status(arguments),
         "fZo48un7LK4" => system_service_param_get_int(arguments),
         "RpQJJVKTiFM" | "4fU5yvOkVG4" => kernel_module_info_for_unwind(arguments, state),
+        "f7KBOafysXo" => kernel_module_info_from_addr(arguments, state),
         "crb5j7mkk1c" | "OMDRKKAZ8I4" => 0,
         "Vo5V8KAwCmk" => system_service_hide_splash(state),
         // REmu presents in standard dynamic range, so tone mapping reports the SDR reference
@@ -7579,6 +7677,9 @@ fn probe_entry(
         );
     }
     configure_probe_dispatch(image, game_root, maximum_import_hits);
+    if let Err(error) = sha_ni::install_sha_ni_sigill_recovery() {
+        eprintln!("[REMu] warning: SHA-NI SIGILL recovery unavailable: {error}");
+    }
     trace_linked_guest_code(image);
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     invoke_guest_module_initializers(&image.module_initializers, 0, 0);
@@ -7592,6 +7693,10 @@ fn probe_entry(
     ) as i32;
     run_guest_thread_destructors();
     set_current_guest_thread_pointer(0);
+    let recovered = sha_ni::recovered_sha_ni_count();
+    if recovered != 0 {
+        eprintln!("[REMu][CPU] recovered {recovered} SHA-NI instructions via SIGILL emulation");
+    }
     DIAGNOSTIC_TIMEOUT_CANCELLED.store(true, Ordering::Release);
     DIAGNOSTIC_TIMEOUT_SECONDS.store(0, Ordering::Release);
     remu_gpu::set_progress_telemetry_enabled(false);

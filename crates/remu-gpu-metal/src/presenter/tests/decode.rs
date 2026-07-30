@@ -71,6 +71,10 @@ fn accepts_fragmentless_depth_only_pipeline() {
         fragmentless_pixel_program()
     ));
     assert!(!key.pixel_depth_export);
+    assert_eq!(
+        key.pixel_allocated_vector_register_count, 4,
+        "fragmentless pixel lowering still requires a non-zero VGPR allocation"
+    );
     assert_eq!(key.pixel_resources.initial_scalar_count, 1);
     assert!(key.pixel_resources.global_bindings.is_empty());
     assert!(key.pixel_resources.image_bindings.is_empty());
