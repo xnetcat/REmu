@@ -354,8 +354,8 @@ fn av_player_gen5_extended_stream_info_preserves_size_and_reports_frame_rate() {
 fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
     assert_eq!(
         crate::av_player::av_player_nv12_layout(378, 150, true),
-        Some((384, 92_160)),
-        "the extended ABI uses the native 64-pixel pitch and 16-row NV12 storage alignment"
+        Some((512, 115_200)),
+        "the Gen5 extended ABI uses a 256-byte row alignment"
     );
     let mut frame_info = [0xab_u8; 112];
     crate::av_player_write_video_frame_info(
@@ -364,7 +364,7 @@ fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
         4_238,
         378,
         150,
-        384,
+        512,
         29.97,
         true,
     );
@@ -379,11 +379,11 @@ fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[24..28].try_into().unwrap()),
-        384
+        512
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[28..32].try_into().unwrap()),
-        160
+        150
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[44..48].try_into().unwrap()),
@@ -391,7 +391,7 @@ fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[48..52].try_into().unwrap()),
-        6
+        134
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[52..56].try_into().unwrap()),
@@ -399,11 +399,11 @@ fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[56..60].try_into().unwrap()),
-        10
+        0
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[60..64].try_into().unwrap()),
-        384
+        512
     );
     assert_eq!(&frame_info[64..67], &[8, 8, 0]);
     assert_eq!(
