@@ -4,7 +4,7 @@ use crate::{
     kernel_process_time, low_u32, posix_pthread_result, relative_microseconds_until,
     trace_guest_sync, try_read_process_guest_u32, try_read_process_guest_u64,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -56,6 +56,347 @@ static MAIN_TIMED_WAIT_RETURN: AtomicU64 = AtomicU64::new(0);
 static MAIN_TIMED_WAIT_TIMEOUT_USEC: AtomicU64 = AtomicU64::new(0);
 static MAIN_TIMED_WAIT_TIMEOUT_STREAK: AtomicU64 = AtomicU64::new(0);
 static MAIN_TIMED_WAIT_STREAK_STARTED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+const CONDITION_LIFECYCLE_TRACE_CAPACITY: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConditionWaitCallTrace {
+    call_sequence: u64,
+    started_nanos: u64,
+    thread: u64,
+    thread_name: String,
+    return_address: u64,
+    condition: u64,
+    mutex: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConditionWaitReturnTrace {
+    call: ConditionWaitCallTrace,
+    return_sequence: u64,
+    finished_nanos: u64,
+    result: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConditionNotifyCallTrace {
+    call_sequence: u64,
+    started_nanos: u64,
+    thread: u64,
+    thread_name: String,
+    return_address: u64,
+    condition: u64,
+    broadcast: bool,
+    waiters_before: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConditionNotifyReturnTrace {
+    call: ConditionNotifyCallTrace,
+    return_sequence: u64,
+    finished_nanos: u64,
+    waiters_after: usize,
+    result: u64,
+}
+
+#[derive(Debug)]
+struct ConditionLifecycleTrace {
+    capacity: usize,
+    next_sequence: u64,
+    active_waits: BTreeMap<u64, ConditionWaitCallTrace>,
+    active_notifies: BTreeMap<u64, ConditionNotifyCallTrace>,
+    recent_wait_returns: VecDeque<ConditionWaitReturnTrace>,
+    recent_notifies: VecDeque<ConditionNotifyReturnTrace>,
+    dropped_active_waits: u64,
+    dropped_active_notifies: u64,
+}
+
+impl ConditionLifecycleTrace {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            next_sequence: 0,
+            active_waits: BTreeMap::new(),
+            active_notifies: BTreeMap::new(),
+            recent_wait_returns: VecDeque::new(),
+            recent_notifies: VecDeque::new(),
+            dropped_active_waits: 0,
+            dropped_active_notifies: 0,
+        }
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        self.next_sequence = self.next_sequence.wrapping_add(1).max(1);
+        self.next_sequence
+    }
+
+    fn begin_wait(
+        &mut self,
+        started_nanos: u64,
+        thread: u64,
+        thread_name: String,
+        return_address: u64,
+        condition: u64,
+        mutex: u64,
+    ) -> Option<ConditionWaitCallTrace> {
+        if self.capacity == 0 || self.active_waits.len() >= self.capacity {
+            self.dropped_active_waits = self.dropped_active_waits.saturating_add(1);
+            return None;
+        }
+        let call = ConditionWaitCallTrace {
+            call_sequence: self.next_sequence(),
+            started_nanos,
+            thread,
+            thread_name,
+            return_address,
+            condition,
+            mutex,
+        };
+        self.active_waits.insert(call.call_sequence, call.clone());
+        Some(call)
+    }
+
+    fn finish_wait(&mut self, call: ConditionWaitCallTrace, finished_nanos: u64, result: u64) {
+        if self.active_waits.remove(&call.call_sequence).is_none() {
+            return;
+        }
+        let return_sequence = self.next_sequence();
+        self.recent_wait_returns.retain(|previous| {
+            previous.call.thread != call.thread || previous.call.condition != call.condition
+        });
+        self.recent_wait_returns
+            .push_back(ConditionWaitReturnTrace {
+                call,
+                return_sequence,
+                finished_nanos,
+                result,
+            });
+        while self.recent_wait_returns.len() > self.capacity {
+            self.recent_wait_returns.pop_front();
+        }
+    }
+
+    fn has_active_wait(&self, condition: u64) -> bool {
+        self.active_waits
+            .values()
+            .any(|wait| wait.condition == condition)
+    }
+
+    fn begin_notify(
+        &mut self,
+        started_nanos: u64,
+        thread: u64,
+        thread_name: String,
+        return_address: u64,
+        condition: u64,
+        broadcast: bool,
+        waiters_before: usize,
+    ) -> Option<ConditionNotifyCallTrace> {
+        if self.capacity == 0 || self.active_notifies.len() >= self.capacity {
+            self.dropped_active_notifies = self.dropped_active_notifies.saturating_add(1);
+            return None;
+        }
+        let call = ConditionNotifyCallTrace {
+            call_sequence: self.next_sequence(),
+            started_nanos,
+            thread,
+            thread_name,
+            return_address,
+            condition,
+            broadcast,
+            waiters_before,
+        };
+        self.active_notifies
+            .insert(call.call_sequence, call.clone());
+        Some(call)
+    }
+
+    fn finish_notify(
+        &mut self,
+        call: ConditionNotifyCallTrace,
+        finished_nanos: u64,
+        waiters_after: usize,
+        result: u64,
+    ) {
+        if self.active_notifies.remove(&call.call_sequence).is_none() {
+            return;
+        }
+        let return_sequence = self.next_sequence();
+        self.recent_notifies
+            .retain(|previous| previous.call.condition != call.condition);
+        self.recent_notifies.push_back(ConditionNotifyReturnTrace {
+            call,
+            return_sequence,
+            finished_nanos,
+            waiters_after,
+            result,
+        });
+        while self.recent_notifies.len() > self.capacity {
+            self.recent_notifies.pop_front();
+        }
+    }
+
+    fn last_wait_return(&self, thread: u64, condition: u64) -> Option<&ConditionWaitReturnTrace> {
+        self.recent_wait_returns
+            .iter()
+            .rev()
+            .find(|wait| wait.call.thread == thread && wait.call.condition == condition)
+    }
+
+    fn last_notify(&self, condition: u64) -> Option<&ConditionNotifyReturnTrace> {
+        self.recent_notifies
+            .iter()
+            .rev()
+            .find(|notify| notify.call.condition == condition)
+    }
+}
+
+fn condition_lifecycle_trace() -> &'static Mutex<ConditionLifecycleTrace> {
+    static TRACE: OnceLock<Mutex<ConditionLifecycleTrace>> = OnceLock::new();
+    TRACE.get_or_init(|| {
+        Mutex::new(ConditionLifecycleTrace::new(
+            CONDITION_LIFECYCLE_TRACE_CAPACITY,
+        ))
+    })
+}
+
+fn begin_condition_wait_observation(
+    frame: Option<&ImportCallFrame>,
+    condition: u64,
+    mutex: u64,
+    timeout_usec: Option<u64>,
+) -> Option<ConditionWaitCallTrace> {
+    if timeout_usec.is_some() || !diagnostic_timeout_active() {
+        return None;
+    }
+    condition_lifecycle_trace()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .begin_wait(
+            guest_import_trace_nanos(),
+            current_guest_thread_handle(),
+            current_guest_thread_name(),
+            frame.map_or(0, |frame| frame.guest_return_address),
+            condition,
+            mutex,
+        )
+}
+
+fn finish_condition_wait_observation(observation: Option<ConditionWaitCallTrace>, result: u64) {
+    let Some(observation) = observation else {
+        return;
+    };
+    condition_lifecycle_trace()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish_wait(observation, guest_import_trace_nanos(), result);
+}
+
+fn begin_condition_notify_observation(
+    frame: Option<&ImportCallFrame>,
+    condition: u64,
+    broadcast: bool,
+) -> Option<ConditionNotifyCallTrace> {
+    if !diagnostic_timeout_active()
+        || !condition_lifecycle_trace()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_active_wait(condition)
+    {
+        return None;
+    }
+    let waiters_before = condition_trace_stats(condition).0;
+    condition_lifecycle_trace()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .begin_notify(
+            guest_import_trace_nanos(),
+            current_guest_thread_handle(),
+            current_guest_thread_name(),
+            frame.map_or(0, |frame| frame.guest_return_address),
+            condition,
+            broadcast,
+            waiters_before,
+        )
+}
+
+fn finish_condition_notify_observation(observation: Option<ConditionNotifyCallTrace>, result: u64) {
+    let Some(observation) = observation else {
+        return;
+    };
+    let waiters_after = condition_trace_stats(observation.condition).0;
+    condition_lifecycle_trace()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish_notify(
+            observation,
+            guest_import_trace_nanos(),
+            waiters_after,
+            result,
+        );
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn report_condition_stall_attribution() {
+    let now = guest_import_trace_nanos();
+    let trace = condition_lifecycle_trace()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    eprintln!(
+        "[REMu][STALL-COND] active_waits={} active_notifies={} recent_returns={} recent_notifies={} dropped_waits={} dropped_notifies={}",
+        trace.active_waits.len(),
+        trace.active_notifies.len(),
+        trace.recent_wait_returns.len(),
+        trace.recent_notifies.len(),
+        trace.dropped_active_waits,
+        trace.dropped_active_notifies,
+    );
+    for wait in trace.active_waits.values() {
+        let age_millis = now.saturating_sub(wait.started_nanos) / 1_000_000;
+        let last_return = trace.last_wait_return(wait.thread, wait.condition);
+        let last_notify = trace.last_notify(wait.condition);
+        eprintln!(
+            "[REMu][STALL-COND] active_wait call={} age_ms={age_millis} thread={:?}/{:#x} return={:#x} condition={:#x} mutex={:#x} last_return={:?} last_notify={:?}",
+            wait.call_sequence,
+            wait.thread_name,
+            wait.thread,
+            wait.return_address,
+            wait.condition,
+            wait.mutex,
+            last_return.map(|last| (
+                last.call.call_sequence,
+                last.return_sequence,
+                now.saturating_sub(last.finished_nanos) / 1_000_000,
+                last.result,
+            )),
+            last_notify.map(|last| (
+                last.call.call_sequence,
+                last.return_sequence,
+                now.saturating_sub(last.finished_nanos) / 1_000_000,
+                last.call.thread_name.as_str(),
+                last.call.thread,
+                last.call.return_address,
+                last.call.broadcast,
+                last.call.waiters_before,
+                last.waiters_after,
+                last.result,
+            )),
+        );
+    }
+    for notify in trace.active_notifies.values() {
+        eprintln!(
+            "[REMu][STALL-COND] active_notify call={} age_ms={} thread={:?}/{:#x} return={:#x} condition={:#x} broadcast={} waiters_before={}",
+            notify.call_sequence,
+            now.saturating_sub(notify.started_nanos) / 1_000_000,
+            notify.thread_name,
+            notify.thread,
+            notify.return_address,
+            notify.condition,
+            notify.broadcast,
+            notify.waiters_before,
+        );
+    }
+}
 
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -455,32 +796,46 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         "g+PZd2hiacg" => guest_condition_destroy(arguments[0]),
         "RXXqi4CtF8w" => posix_pthread_result(guest_condition_destroy(arguments[0])),
         "WKAXJ4XBPQ4" => {
-            guest_condition_wait_with_interrupt(arguments[0], arguments[1], None, || {
-                if let Some(frame) = frame {
-                    deliver_pending_guest_exception_at_import(frame);
-                }
-            })
+            let observation =
+                begin_condition_wait_observation(frame, arguments[0], arguments[1], None);
+            let result =
+                guest_condition_wait_with_interrupt(arguments[0], arguments[1], None, || {
+                    if let Some(frame) = frame {
+                        deliver_pending_guest_exception_at_import(frame);
+                    }
+                });
+            finish_condition_wait_observation(observation, result);
+            result
         }
-        "Op8TBGY5KHg" => posix_pthread_result(guest_condition_wait_with_interrupt(
-            arguments[0],
-            arguments[1],
-            None,
-            || {
-                if let Some(frame) = frame {
-                    deliver_pending_guest_exception_at_import(frame);
-                }
-            },
-        )),
-        "BmMjYxmew1w" => guest_condition_wait_with_interrupt(
-            arguments[0],
-            arguments[1],
-            Some(u64::from(low_u32(arguments[2]))),
-            || {
-                if let Some(frame) = frame {
-                    deliver_pending_guest_exception_at_import(frame);
-                }
-            },
-        ),
+        "Op8TBGY5KHg" => {
+            let observation =
+                begin_condition_wait_observation(frame, arguments[0], arguments[1], None);
+            let result =
+                guest_condition_wait_with_interrupt(arguments[0], arguments[1], None, || {
+                    if let Some(frame) = frame {
+                        deliver_pending_guest_exception_at_import(frame);
+                    }
+                });
+            finish_condition_wait_observation(observation, result);
+            posix_pthread_result(result)
+        }
+        "BmMjYxmew1w" => {
+            let timeout_usec = Some(u64::from(low_u32(arguments[2])));
+            let observation =
+                begin_condition_wait_observation(frame, arguments[0], arguments[1], timeout_usec);
+            let result = guest_condition_wait_with_interrupt(
+                arguments[0],
+                arguments[1],
+                timeout_usec,
+                || {
+                    if let Some(frame) = frame {
+                        deliver_pending_guest_exception_at_import(frame);
+                    }
+                },
+            );
+            finish_condition_wait_observation(observation, result);
+            result
+        }
         // The POSIX form takes an absolute deadline as a timespec; the console form takes a
         // relative microsecond count. Convert against the same realtime clock the deadline names.
         "27bAgiJmOh0" => {
@@ -508,20 +863,32 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
             result
         }
         "kDh-NfxgMtE" => {
+            let observation = begin_condition_notify_observation(frame, arguments[0], false);
             trace_main_condition_notify(frame, arguments[0], false);
-            guest_condition_notify(arguments[0], false)
+            let result = guest_condition_notify(arguments[0], false);
+            finish_condition_notify_observation(observation, result);
+            result
         }
         "2MOy+rUfuhQ" => {
+            let observation = begin_condition_notify_observation(frame, arguments[0], false);
             trace_main_condition_notify(frame, arguments[0], false);
-            posix_pthread_result(guest_condition_notify(arguments[0], false))
+            let result = guest_condition_notify(arguments[0], false);
+            finish_condition_notify_observation(observation, result);
+            posix_pthread_result(result)
         }
         "JGgj7Uvrl+A" => {
+            let observation = begin_condition_notify_observation(frame, arguments[0], true);
             trace_main_condition_notify(frame, arguments[0], true);
-            guest_condition_notify(arguments[0], true)
+            let result = guest_condition_notify(arguments[0], true);
+            finish_condition_notify_observation(observation, result);
+            result
         }
         "mkx2fVhNMsg" => {
+            let observation = begin_condition_notify_observation(frame, arguments[0], true);
             trace_main_condition_notify(frame, arguments[0], true);
-            posix_pthread_result(guest_condition_notify(arguments[0], true))
+            let result = guest_condition_notify(arguments[0], true);
+            finish_condition_notify_observation(observation, result);
+            posix_pthread_result(result)
         }
         "14bOACANTBo" => guest_pthread_once(arguments[0], arguments[1]),
         "Z4QosVuAsA0" => posix_pthread_result(guest_pthread_once(arguments[0], arguments[1])),
@@ -537,5 +904,132 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         "JTvBflhYazQ" => guest_event_flag_wait(arguments),
         "PZku4ZrXJqg" => guest_event_flag_cancel(arguments),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod condition_lifecycle_trace_tests {
+    use super::ConditionLifecycleTrace;
+
+    fn begin_wait(
+        trace: &mut ConditionLifecycleTrace,
+        started_nanos: u64,
+        thread: u64,
+        condition: u64,
+    ) -> super::ConditionWaitCallTrace {
+        trace
+            .begin_wait(
+                started_nanos,
+                thread,
+                format!("thread-{thread}"),
+                0x8000_0000 + thread,
+                condition,
+                condition + 8,
+            )
+            .expect("trace has room for a wait")
+    }
+
+    fn begin_notify(
+        trace: &mut ConditionLifecycleTrace,
+        started_nanos: u64,
+        thread: u64,
+        condition: u64,
+        waiters_before: usize,
+    ) -> super::ConditionNotifyCallTrace {
+        trace
+            .begin_notify(
+                started_nanos,
+                thread,
+                format!("thread-{thread}"),
+                0x9000_0000 + thread,
+                condition,
+                false,
+                waiters_before,
+            )
+            .expect("trace has room for a notification")
+    }
+
+    #[test]
+    fn condition_lifecycle_orders_notify_wake_and_repark() {
+        let mut trace = ConditionLifecycleTrace::new(4);
+        let first_wait = begin_wait(&mut trace, 10, 3, 0x1000);
+        assert!(trace.has_active_wait(0x1000));
+
+        let notify = begin_notify(&mut trace, 20, 1, 0x1000, 1);
+        trace.finish_notify(notify, 30, 0, 0);
+        trace.finish_wait(first_wait, 40, 0);
+        let second_wait = begin_wait(&mut trace, 50, 3, 0x1000);
+
+        let last_notify = trace.last_notify(0x1000).expect("notify is retained");
+        let last_return = trace
+            .last_wait_return(3, 0x1000)
+            .expect("wake return is retained");
+        assert!(last_notify.return_sequence < last_return.return_sequence);
+        assert!(last_return.return_sequence < second_wait.call_sequence);
+        assert_eq!(last_notify.call.thread, 1);
+        assert_eq!(last_notify.call.waiters_before, 1);
+        assert_eq!(last_notify.waiters_after, 0);
+        assert_eq!(last_return.result, 0);
+    }
+
+    #[test]
+    fn condition_lifecycle_retains_latest_producer_per_condition() {
+        let mut trace = ConditionLifecycleTrace::new(4);
+        let _wait = begin_wait(&mut trace, 10, 3, 0x1000);
+        for (nanos, thread) in [(20, 1), (30, 2), (40, 4)] {
+            let notify = begin_notify(&mut trace, nanos, thread, 0x1000, 1);
+            trace.finish_notify(notify, nanos + 1, 0, 0);
+        }
+
+        assert_eq!(trace.recent_notifies.len(), 1);
+        assert_eq!(
+            trace
+                .last_notify(0x1000)
+                .expect("latest notify is retained")
+                .call
+                .thread,
+            4
+        );
+    }
+
+    #[test]
+    fn condition_lifecycle_has_fixed_active_and_history_capacity() {
+        let mut trace = ConditionLifecycleTrace::new(2);
+        let first = begin_wait(&mut trace, 10, 1, 0x1000);
+        let second = begin_wait(&mut trace, 20, 2, 0x2000);
+        assert!(
+            trace
+                .begin_wait(30, 3, "thread-3".to_owned(), 0x8000_0003, 0x3000, 0x3008)
+                .is_none()
+        );
+        assert_eq!(trace.dropped_active_waits, 1);
+
+        trace.finish_wait(first, 40, 0);
+        trace.finish_wait(second, 50, 0);
+        for (nanos, thread, condition) in [(60, 4, 0x4000), (70, 5, 0x5000), (80, 6, 0x6000)] {
+            let wait = begin_wait(&mut trace, nanos, thread, condition);
+            trace.finish_wait(wait, nanos + 1, 0);
+        }
+
+        assert_eq!(trace.active_waits.len(), 0);
+        assert_eq!(trace.recent_wait_returns.len(), 2);
+        assert_eq!(
+            trace
+                .recent_wait_returns
+                .front()
+                .expect("bounded tail has a first record")
+                .call
+                .thread,
+            5
+        );
+        assert_eq!(
+            trace
+                .recent_wait_returns
+                .back()
+                .expect("bounded tail has a final record")
+                .call
+                .thread,
+            6
+        );
     }
 }

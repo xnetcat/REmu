@@ -7277,6 +7277,7 @@ fn report_diagnostic_stall_attribution() {
             "[REMu][STALL-ATTRIBUTION] main_timed_wait=none gpu={gpu_state} events={gpu_events} work={gpu_work} flips={gpu_flips} completed_submission={gpu_completed} progress_age_ms={gpu_age:?} audio={audio_state} frames={audio_frames} underrun_frames={audio_underruns} progress_age_ms={audio_age:?}"
         );
     }
+    guest_sync::report_condition_stall_attribution();
 
     let players = PROBE_DISPATCH
         .get()
