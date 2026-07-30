@@ -484,11 +484,17 @@ fn ampr_resolve_one_path(
     if sizes != 0 {
         write_guest_u64(sizes + index * 8, metadata.len());
     }
-    eprintln!(
-        "[REMu][AMPR] resolved guest={guest_path:?} host={:?} id={file_id:#x} size={:#x}",
-        host_path.display(),
-        metadata.len()
-    );
+    // Success is the common case by orders of magnitude: a title that indexes its whole asset
+    // database resolves hundreds of thousands of paths during startup, and logging each one cost
+    // more than the resolution itself. Failures above stay unconditional, because they are rare
+    // and are what a bring-up needs to see.
+    if trace_ampr_reads() {
+        eprintln!(
+            "[REMu][AMPR] resolved guest={guest_path:?} host={:?} id={file_id:#x} size={:#x}",
+            host_path.display(),
+            metadata.len()
+        );
+    }
     0
 }
 

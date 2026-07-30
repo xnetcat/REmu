@@ -122,13 +122,29 @@ signal-processing batch entry points stay unimplemented. This removed a spurious
 not a blocker: the engine creates a context, immediately destroys it, unloads the module, and
 finalizes Ajm either way, which reads as a capability probe rather than a failed path.
 
-It is still not playable and no compatibility is claimed: it submits no draws, and its `Core.Res`
-threads sit in condition waits having never been given work. Why they are never fed is not
-established. The remaining unserved imports it reaches are `sceSystemGestureOpen` and
+One APR defect was a REmu performance bug rather than a missing ABI. The successful branch of
+path resolution logged unconditionally while every other trace in that module is gated. A title
+that indexes its whole asset database resolves hundreds of thousands of paths at startup, so the
+log dominated the work: one run wrote 80 MiB across 252,127 lines, of which 251,741 were that
+single call. Gating it left 196 KiB. Failed resolutions stay unconditional, since they are rare and
+are what a bring-up needs. With it gated the title reports its own timings and finishes indexing:
+`RecordResourceDependencies() took 4.7787s`, `GatherResourceFileInfo() took 28.2511s` over 222,670
+distinct files, including its startup script.
+
+It is still not playable and no compatibility is claimed. After indexing it reaches a steady state
+and stays there for the rest of a five-minute run: all thirteen `BPE JobWorkerThread`s spin in a
+tight guest loop around `0x80086ee30`, and every other guest thread — the four `BinkAsy` threads,
+the three `Core.Res` threads, `NexusRevolution Event` — is parked on a condition or semaphore.
+Nothing produces work. No draw is submitted and no flip requested, though the display is fully
+configured.
+
+What the spinning scheduler polls for is not established, and that is the next thing to find; it
+needs the guest loop at that address read, not more imports served. Ruled out so far: the startup
+script resolves (`/app0/scripts/cp11/_cmn/cp11main.cgpr`), no path resolution fails anywhere in a
+run, and the remaining unserved imports (`sceSystemGestureOpen`,
 `sceSystemGestureInitializePrimitiveTouchRecognizer`, `sceVideoOutColorSettingsSetGamma`,
-`sceKernelSetPrtAperture`, `sceNetCtlInit`, and one NID (`D-CzAxQL0XI`) with no recovered name.
-None of them has been shown to be what the resource threads are waiting on, so serving them is not
-known to be the next step; tracing what feeds those threads is.
+`sceKernelSetPrtAperture`, `sceNetCtlInit`, and `D-CzAxQL0XI`, which has no recovered name) are all
+reached and returned from before the plateau, so none is where it stops.
 
 The fiber implementation is x86-64 only, because it saves and restores x86-64 register state. On
 any other host the NIDs fall through to the unimplemented path rather than to a stub, so its tests
