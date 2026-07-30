@@ -477,13 +477,20 @@ pub(crate) fn pthread_key_delete(key: u32, state: &mut ProbeDispatchState) -> u6
     0
 }
 
-pub(crate) fn pthread_set_specific(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+pub(crate) fn pthread_set_specific(arguments: [u64; 6]) -> u64 {
     let key = low_u32(arguments[0]);
-    let Some(key_state) = state.pthread_keys.get(&key) else {
+    let Some(&generation) = pthread_key_generations()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key as usize)
+    else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
+    if generation == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
-        values.insert(key, (key_state.generation, arguments[1]));
+        values.insert(key, (generation, arguments[1]));
     });
     0
 }
