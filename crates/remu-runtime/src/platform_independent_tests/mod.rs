@@ -70,6 +70,7 @@ mod services;
 mod shader;
 mod synchronization;
 mod time;
+mod timeout;
 
 fn reset_audio_out2_test_state() {
     *super::AUDIO_OUT2

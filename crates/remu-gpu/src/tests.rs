@@ -12,10 +12,12 @@ use super::{
     emit_event, gpu_completed_submission_sequence, gpu_event_channel, gpu_events_in_flight,
     gpu_work_items_pending, host_pad_state, install_event_sink, record_gpu_event_consumed,
     record_gpu_flip_completed, record_gpu_submission_completed, record_gpu_wait_producer,
-    record_gpu_work_item_processed, report_audio_frames, set_host_pad_state,
-    take_gpu_completed_flips, take_gpu_completed_submission_ids, take_gpu_wait_latch,
+    record_gpu_work_item_processed, report_audio_frames, request_presenter_shutdown,
+    set_host_pad_state, take_gpu_completed_flips, take_gpu_completed_submission_ids,
+    take_gpu_wait_latch, take_presenter_shutdown_request,
 };
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 static EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
 
@@ -45,6 +47,73 @@ fn gpu_event_channel_applies_bounded_backpressure() {
     sender
         .try_send(GpuEvent::Shutdown)
         .expect("receiver progress releases producer backpressure");
+}
+
+#[test]
+fn out_of_band_presenter_shutdown_coalesces_without_entering_the_full_queue() {
+    let _event_guard = EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    clear_event_sink();
+    assert!(
+        !request_presenter_shutdown(),
+        "a probe without a presenter must retain the hard timeout path"
+    );
+
+    let (sender, receiver) = gpu_event_channel();
+    install_event_sink(sender.clone());
+    for _ in 0..GPU_EVENT_QUEUE_CAPACITY {
+        sender
+            .try_send(GpuEvent::Shutdown)
+            .expect("fill bounded queue");
+    }
+
+    let blocked_producer = std::thread::spawn(|| emit_event(GpuEvent::Shutdown));
+    let producer_deadline = Instant::now() + Duration::from_secs(1);
+    while gpu_events_in_flight() == 0 {
+        assert!(
+            Instant::now() < producer_deadline,
+            "real event producer did not enter its blocking send"
+        );
+        std::thread::yield_now();
+    }
+
+    let (request_result_sender, request_result_receiver) = std::sync::mpsc::channel();
+    let requester = std::thread::spawn(move || {
+        let started = Instant::now();
+        let installed = request_presenter_shutdown();
+        request_result_sender
+            .send((installed, started.elapsed()))
+            .expect("request result receiver remains alive");
+    });
+    let request_result = request_result_receiver.recv_timeout(Duration::from_millis(500));
+
+    // Always release the real producer before asserting the timeout result. That makes a
+    // regression fail cleanly instead of leaving both test threads deadlocked on the sink mutex.
+    assert_eq!(receiver.recv(), Ok(GpuEvent::Shutdown));
+    assert!(
+        blocked_producer
+            .join()
+            .expect("blocked event producer completes after queue progress")
+    );
+    requester.join().expect("shutdown requester completes");
+    let (installed, request_duration) =
+        request_result.expect("out-of-band request must not wait for the event-sink mutex");
+    assert!(installed);
+    assert!(
+        request_duration < Duration::from_millis(100),
+        "out-of-band request took {request_duration:?} while the event-sink mutex was held"
+    );
+    assert!(request_presenter_shutdown());
+    assert!(
+        take_presenter_shutdown_request(),
+        "the owning presenter observes one pending publication"
+    );
+    assert!(
+        !take_presenter_shutdown_request(),
+        "repeated requests must coalesce instead of publishing twice"
+    );
+    clear_event_sink();
 }
 
 #[test]

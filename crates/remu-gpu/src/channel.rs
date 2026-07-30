@@ -3,7 +3,7 @@
 //! The bounded, ordered guest GPU event channel and its process-global sink.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock};
 
@@ -35,6 +35,8 @@ pub const GPU_EVENT_SUBMISSION_CHUNK_SIZE: usize = 32;
 pub const GPU_PENDING_EVENT_CAPACITY: usize = 256;
 
 static GPU_EVENT_SINK: OnceLock<Mutex<Option<SyncSender<GpuEvent>>>> = OnceLock::new();
+static PRESENTER_INSTALLED: AtomicBool = AtomicBool::new(false);
+static PRESENTER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Creates the bounded, ordered event channel used by the guest GPU command processor.
 #[must_use]
@@ -43,6 +45,7 @@ pub fn gpu_event_channel() -> (SyncSender<GpuEvent>, Receiver<GpuEvent>) {
 }
 
 pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
+    PRESENTER_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
     GPU_WORK_ITEMS_PENDING.store(0, Ordering::Relaxed);
     GPU_FLIPS_PENDING.store(0, Ordering::Relaxed);
@@ -68,9 +71,12 @@ pub fn install_event_sink(sender: SyncSender<GpuEvent>) {
     AUDIO_OUTPUT_FRAMES.store(0, Ordering::Relaxed);
     AUDIO_UNDERRUN_FRAMES.store(0, Ordering::Relaxed);
     *sink = Some(sender);
+    PRESENTER_INSTALLED.store(true, Ordering::Release);
 }
 
 pub fn clear_event_sink() {
+    PRESENTER_INSTALLED.store(false, Ordering::Release);
+    PRESENTER_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     GPU_EVENTS_IN_FLIGHT.store(0, Ordering::Relaxed);
     GPU_WORK_ITEMS_PENDING.store(0, Ordering::Relaxed);
     GPU_FLIPS_PENDING.store(0, Ordering::Relaxed);
@@ -106,6 +112,38 @@ pub fn clear_event_sink() {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
+}
+
+/// Requests shutdown without entering the bounded guest event channel.
+///
+/// The diagnostic watchdog can run while that channel is full behind a stalled native command
+/// buffer. Sending [`GpuEvent::Shutdown`] there would block the watchdog itself, while touching
+/// AppKit or Metal from the watchdog thread would violate their owning-thread requirements. This
+/// out-of-band flag is consumed by the presenter loop before it ingests more guest work.
+///
+/// Returns whether a presenter sink is currently installed. Repeated requests coalesce into one
+/// pending publication.
+pub fn request_presenter_shutdown() -> bool {
+    if !PRESENTER_INSTALLED.load(Ordering::Acquire) {
+        return false;
+    }
+    PRESENTER_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+    if PRESENTER_INSTALLED.load(Ordering::Acquire) {
+        true
+    } else {
+        // Teardown won the race after the first presence check. Do not leave a request for a
+        // later presenter installation; the diagnostic hard fallback still bounds this race.
+        PRESENTER_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        false
+    }
+}
+
+/// Takes one pending out-of-band shutdown request.
+///
+/// Backends call this only from their event-loop owner. The swap makes multiple watchdog or host
+/// requests one shutdown publication rather than a stream of synthetic queue events.
+pub fn take_presenter_shutdown_request() -> bool {
+    PRESENTER_SHUTDOWN_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
 /// Publishes one decoded GPU event to the installed bounded presenter channel.
