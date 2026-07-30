@@ -470,6 +470,17 @@ fn av_player_wait_for_video_frame(handle: u64, output: u64, state: &mut ProbeDis
     }
 }
 
+fn av_player_wait_for_audio_frame(handle: u64, output: u64, state: &mut ProbeDispatchState) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let result = crate::av_player_get_audio_data([handle, output, 0, 0, 0, 0], state);
+        if result != 0 || Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
     let Some(root) = av_player_generate_test_clip("prepare-pattern") else {
@@ -496,7 +507,7 @@ fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
         1,
         "first video frame must be delivered"
     );
-    let time_before_pause = crate::av_player_current_time(handle, &state);
+    let time_before_pause = crate::av_player_current_time(handle, &mut state);
     let frames_before_pause = {
         let player = &state.av_player.players[&handle];
         (player.next_video_frame, player.next_audio_frame)
@@ -539,13 +550,18 @@ fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
         "a paused player is still an active playback session"
     );
     assert_eq!(
-        crate::av_player_current_time(handle, &state),
+        crate::av_player_current_time(handle, &mut state),
         time_before_pause,
         "CurrentTime must remain frozen throughout Pause"
     );
 
     // Resume: delivery continues, frames stay monotonic, and the player clock advances.
     assert_eq!(crate::av_player_resume(handle, &mut state), 0);
+    assert_eq!(
+        av_player_wait_for_audio_frame(handle, audio_output, &mut state),
+        1,
+        "audio must establish the clock master after Resume"
+    );
     std::thread::sleep(Duration::from_millis(40));
     let mut last_timestamp = av_player_frame_timestamp(&frame_info);
     let mut resumed_frames = 0_u64;
@@ -564,7 +580,7 @@ fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
         resumed_frames >= 1,
         "resumed playback must deliver more video frames"
     );
-    let resumed_time = crate::av_player_current_time(handle, &state);
+    let resumed_time = crate::av_player_current_time(handle, &mut state);
     assert!(
         resumed_time >= time_before_pause,
         "CurrentTime must be monotonic"
@@ -574,7 +590,7 @@ fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
 }
 
 #[test]
-fn av_player_current_time_advances_before_video_is_dequeued() {
+fn av_player_video_only_clock_advances_before_dequeue_but_stays_bounded() {
     let mut state = ProbeDispatchState::default();
     let handle = av_player_test_player(&mut state);
     {
@@ -584,12 +600,11 @@ fn av_player_current_time_advances_before_video_is_dequeued() {
         player.duration = Duration::from_secs(9);
     }
     assert_eq!(crate::av_player_start(handle, &mut state), 0);
-    state
-        .av_player
-        .players
-        .get_mut(&handle)
-        .unwrap()
-        .playing_since = Some(Instant::now() - Duration::from_millis(4_250));
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.playing_since = Some(Instant::now() - Duration::from_millis(4_250));
+        player.presentation_anchor_host = Some(Instant::now() - Duration::from_millis(4_250));
+    }
 
     let player = &state.av_player.players[&handle];
     assert_eq!(
@@ -597,20 +612,155 @@ fn av_player_current_time_advances_before_video_is_dequeued() {
         "the regression requires that no video frame has been dequeued"
     );
     assert!(
-        crate::av_player_current_time(handle, &state) >= 4_200,
-        "CurrentTime must drive the render-side video poller before its first frame"
+        (1..=67).contains(&crate::av_player_current_time(handle, &mut state)),
+        "the start anchor must advance enough to wake the poller but by no more than two frames"
     );
 
-    state
-        .av_player
-        .players
-        .get_mut(&handle)
-        .unwrap()
-        .playing_since = Some(Instant::now() - Duration::from_secs(30));
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.presentation_anchor_media = Duration::from_millis(4_238);
+        player.presentation_anchor_host = Some(Instant::now() - Duration::from_secs(30));
+        player.presentation_clock_reported = Duration::from_millis(4_238);
+        player.presentation_master_delivered = true;
+        player.next_video_frame = 128;
+    }
+    let current = crate::av_player_current_time(handle, &mut state);
+    assert!(
+        (4_238..=4_305).contains(&current),
+        "a 30 second host stall at frame 128 must remain near its 4238 ms media timestamp, got {current}"
+    );
+    assert_ne!(
+        current, 9_000,
+        "host time alone must not complete a slow video-only stream"
+    );
+}
+
+#[test]
+fn av_player_video_only_clock_advances_between_frames_without_escaping_media_progress() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.source = Some("video-only.mp4".to_owned());
+        player.has_audio = false;
+        player.duration = Duration::from_millis(9_109);
+    }
+    assert_eq!(crate::av_player_start(handle, &mut state), 0);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.presentation_anchor_media = Duration::from_millis(4_238);
+        player.presentation_anchor_host = Some(Instant::now() - Duration::from_millis(20));
+        player.presentation_clock_reported = Duration::from_millis(4_238);
+        player.presentation_master_delivered = true;
+    }
+    let between_frames = crate::av_player_current_time(handle, &mut state);
+    assert!(
+        (4_238..=4_305).contains(&between_frames) && between_frames > 4_238,
+        "host elapsed time must advance the clock between video deliveries, got {between_frames}"
+    );
+
+    // Delivering the next 30 fps timestamp re-anchors the host segment. The public result remains
+    // monotonic, while an arbitrarily long subsequent stall is still bounded to two frame times.
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.presentation_anchor_media = Duration::from_millis(4_271);
+        player.presentation_anchor_host = Some(Instant::now() - Duration::from_millis(10));
+    }
+    let reanchored = crate::av_player_current_time(handle, &mut state);
+    assert!(reanchored >= between_frames);
+    {
+        state
+            .av_player
+            .players
+            .get_mut(&handle)
+            .unwrap()
+            .presentation_anchor_host = Some(Instant::now() - Duration::from_secs(30));
+    }
+    assert!(
+        crate::av_player_current_time(handle, &mut state) <= 4_338,
+        "video-only clock may lead the 4271 ms frame by at most two frame periods"
+    );
+}
+
+#[test]
+fn av_player_audio_master_waits_for_audio_then_tracks_its_timestamp() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.source = Some("audio-video.mp4".to_owned());
+        player.has_audio = true;
+        player.duration = Duration::from_secs(9);
+    }
+    assert_eq!(crate::av_player_start(handle, &mut state), 0);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.presentation_anchor_host = Some(Instant::now() - Duration::from_secs(4));
+    }
     assert_eq!(
-        crate::av_player_current_time(handle, &state),
-        9_000,
-        "a running clock must not advance beyond the known source duration"
+        crate::av_player_current_time(handle, &mut state),
+        0,
+        "an audio source has no running master clock before its first audio sample"
+    );
+
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.presentation_anchor_media = Duration::from_millis(2_000);
+        player.presentation_anchor_host = Some(Instant::now() - Duration::from_millis(100));
+        player.presentation_master_delivered = true;
+        player.next_video_frame = 240;
+    }
+    let audio_time = crate::av_player_current_time(handle, &mut state);
+    assert!(
+        (2_000..3_000).contains(&audio_time),
+        "audio PTS plus host elapsed must master CurrentTime, got {audio_time}"
+    );
+}
+
+#[test]
+fn av_player_actual_eof_exposes_the_exact_known_duration() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    let (sender, frames) = std::sync::mpsc::sync_channel(1);
+    drop(sender);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.source = Some("video-only.mp4".to_owned());
+        player.duration = Duration::from_millis(9_109);
+        player.active_session = true;
+        player.playing_since = Some(Instant::now());
+        player.presentation_anchor_media = Duration::from_millis(9_000);
+        player.presentation_anchor_host = Some(Instant::now());
+        player.presentation_clock_reported = Duration::from_millis(9_000);
+        player.video_decoder = Some(crate::AvPlayerDecoder {
+            child: None,
+            frames: std::sync::Mutex::new(frames),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker: None,
+        });
+    }
+    let mut frame_info = [0_u8; 112];
+    assert_eq!(
+        crate::av_player_get_video_data(
+            [
+                handle,
+                frame_info.as_mut_ptr().addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            true,
+            &mut state,
+        ),
+        0,
+        "a disconnected decoder reports EOF rather than a frame"
+    );
+    assert!(state.av_player.players[&handle].end_of_stream);
+    assert_eq!(
+        crate::av_player_current_time(handle, &mut state),
+        9_109,
+        "decoder EOF, unlike a running clock, must expose the exact duration"
     );
 }
 
@@ -656,7 +806,7 @@ fn av_player_jump_to_time_seeks_the_decoder_instead_of_replaying_from_zero() {
         (967..=1_034).contains(&timestamp),
         "expected the first frame near 1000 ms, got {timestamp}"
     );
-    assert!(crate::av_player_current_time(handle, &state) >= 1_000);
+    assert!(crate::av_player_current_time(handle, &mut state) >= 1_000);
     assert_eq!(crate::av_player_close(handle, &mut state), 0);
     std::fs::remove_dir_all(&root).ok();
 }

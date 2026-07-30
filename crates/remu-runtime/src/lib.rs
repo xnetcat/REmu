@@ -529,6 +529,18 @@ struct AvPlayerInstance {
     end_of_stream: bool,
     playing_since: Option<Instant>,
     elapsed: Duration,
+    /// Media timestamp and host instant which define the public presentation clock. Audio
+    /// delivery owns this anchor when an audio stream exists. Video-only streams re-anchor it
+    /// after every delivered frame so a slow guest cannot complete a movie using host time alone.
+    presentation_anchor_media: Duration,
+    presentation_anchor_host: Option<Instant>,
+    /// Last value exposed through CurrentTime or used to pace video. Re-anchoring must not make
+    /// the public clock move backwards, even when the guest consumes media below real time.
+    presentation_clock_reported: Duration,
+    /// Whether the selected clock master has delivered a sample since Start or JumpToTime.
+    /// Audio sources remain at their start/seek position until their first audio sample, matching
+    /// native audio-master behavior. Video-only sources use the bounded start anchor immediately.
+    presentation_master_delivered: bool,
     looping: bool,
     /// Media position freshly started decoders begin at. JumpToTime sets it so the ffmpeg
     /// processes are launched with an input-side seek instead of replaying from byte zero.
@@ -572,6 +584,10 @@ impl AvPlayerInstance {
     fn reset_playback(&mut self) {
         self.stop_decoders();
         self.elapsed = Duration::ZERO;
+        self.presentation_anchor_media = Duration::ZERO;
+        self.presentation_anchor_host = None;
+        self.presentation_clock_reported = Duration::ZERO;
+        self.presentation_master_delivered = false;
         self.end_of_stream = false;
         self.next_video_frame = 0;
         self.video_catch_up_origin = None;
@@ -584,11 +600,6 @@ impl AvPlayerInstance {
     fn playback_elapsed(&self) -> Duration {
         self.playing_since
             .map_or(self.elapsed, |started| self.elapsed + started.elapsed())
-    }
-
-    fn media_clock_elapsed(&self) -> Duration {
-        self.playback_elapsed()
-            .mul_f64(f64::from(self.trick_speed_percent) / 100.0)
     }
 }
 
