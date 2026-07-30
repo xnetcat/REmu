@@ -407,14 +407,19 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     audio.initialize();
-                    match audio.open([
-                        0,
-                        0,
-                        0,
-                        u64::from(context.grain_frames),
-                        frequency,
-                        raw_format,
-                    ]) {
+                    // An AudioOut2 port is a mixer voice, not one of the eight hardware outputs
+                    // `sceAudioOutOpen` rations, so it is opened against the voice budget.
+                    match audio.open_within(
+                        [
+                            0,
+                            0,
+                            0,
+                            u64::from(context.grain_frames),
+                            frequency,
+                            raw_format,
+                        ],
+                        audio::AudioOutState::MIXER_VOICE_BUDGET,
+                    ) {
                         Ok(handle) => Ok(handle),
                         Err(error) => Err(audio_out_error(error)),
                     }

@@ -434,6 +434,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "WfAiBW8Wcek" => "sceAjmBatchErrorDump",
         "Wi7DtlLV+KI" => "sceAjmModuleUnregister",
         "dl+4eHSzUu4" => "sceAjmInitialize",
+        "3cAg7xN995U" => "sceAjmBatchJobGetStatistics",
         "ZIXln2K3XMk" => "sceAcmContextCreate",
         "BohYr-F7-is" => "sceKernelSetPrtAperture",
         "D-CzAxQL0XI" => "sceUserServiceGetPlatformPrivacySetting",

@@ -163,10 +163,23 @@ and finalizes Ajm, having issued zero batch calls. Every one of those batch and 
 unserved here.
 
 This corrects an earlier reading recorded in this file: the create-then-destroy sequence was
-described as a capability probe. It is not. It is a failure path, and the title abandons its audio
-stack down it. What is not yet explained is *why* it abandons it: no import is unimplemented
-between the create and the destroy, so the engine is reacting to a value REmu returns rather than
-to a missing call. Finding that value, then serving the ACM batch family, is the next step.
+described as a capability probe. It is not. It is a failure path.
+
+`REMU_TRACE_IMPORT_ERRORS=1` found the value the engine was reacting to. Six imports failed in a
+whole run, and one was `sceAudioOut2PortCreate` returning `PortFull`. AudioOut2 ports were being
+opened through the `sceAudioOutOpen` path and charged against that API's eight-port budget — which
+is correct for AudioOut1, whose ports are hardware outputs, and wrong for AudioOut2, which is a
+software mixer whose ports are voices. The SharpEmu trace shows this title holding more than forty
+at once. The ninth was refused, its audio engine could not build, and it unwound the whole stack.
+
+AudioOut2 now opens against a separate voice budget. The teardown is gone: a run no longer calls
+`sceAjmFinalize` at all, and the title proceeds to submit audio-job batches. `sceAjmBatchJobGetStatistics`
+is served — the append into the caller's batch arena is real, while the counters it reports are
+zero, because no decode work runs on a coprocessor here and invented figures would be worse than
+none.
+
+The title still submits no draws. It now stops at `sceAjmBatchStart`, which is unserved: it has
+built a batch and is trying to run it.
 
 Note for whoever picks this up: `scripts/audit-import-coverage.py` under-reports. It walks modules
 from `lib.rs` and does not recognise every dispatch shape, so it lists NIDs as unserved that

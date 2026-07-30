@@ -351,7 +351,29 @@ impl AudioOutState {
         }
     }
 
+    /// Ports one process may hold through `sceAudioOutOpen`.
+    ///
+    /// This is that API's own budget: its ports are hardware outputs and the console bounds them.
+    pub(crate) const HARDWARE_PORT_BUDGET: usize = 8;
+
+    /// Backend voices AudioOut2 may hold.
+    ///
+    /// AudioOut2 is a software mixer whose ports are voices rather than hardware outputs, so the
+    /// hardware budget above does not apply to it — an observed title holds more than forty at
+    /// once, and charging those against eight made its audio engine fail to build and tear its
+    /// whole stack down. This bound exists only so a runaway caller cannot grow the table without
+    /// limit; it is not an ABI limit and nothing reports it to the guest.
+    pub(crate) const MIXER_VOICE_BUDGET: usize = 256;
+
     pub(crate) fn open(&mut self, arguments: [u64; 6]) -> Result<u64, AudioOutError> {
+        self.open_within(arguments, Self::HARDWARE_PORT_BUDGET)
+    }
+
+    pub(crate) fn open_within(
+        &mut self,
+        arguments: [u64; 6],
+        budget: usize,
+    ) -> Result<u64, AudioOutError> {
         if !self.initialized {
             return Err(AudioOutError::NotOpened);
         }
@@ -373,7 +395,7 @@ impl AudioOutState {
         if format.buffer_bytes(buffer_frames).is_none() {
             return Err(AudioOutError::OutOfMemory);
         }
-        if self.ports.len() >= 8 {
+        if self.ports.len() >= budget {
             return Err(AudioOutError::PortFull);
         }
         self.next_handle = self.next_handle.saturating_add(1).max(1);

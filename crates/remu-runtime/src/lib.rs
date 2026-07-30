@@ -3549,6 +3549,49 @@ const _: () = {
     assert!(std::mem::offset_of!(SceAjmBatchInfo, last_good_job_return_address) == 0x20);
 };
 
+/// Bytes one `sceAjmBatchJobGetStatistics` job occupies in a batch arena.
+const AJM_JOB_GET_STATISTICS_SIZE: u64 = 88;
+/// Bytes the statistics result object occupies.
+const AJM_STATISTICS_RESULT_SIZE: usize = 48;
+
+/// `sceAjmBatchJobGetStatistics(info, result)`.
+///
+/// Appends one statistics job to the caller's batch arena and clears the result object. The
+/// counters this host can honestly report are all zero: no decode work runs on a coprocessor here,
+/// so there is no elapsed time or job count to report, and reporting invented figures would be
+/// worse than reporting none. The append itself is real, because the guest reads the arena cursor
+/// back and builds the rest of its batch from it.
+fn ajm_batch_job_get_statistics(arguments: [u64; 6]) -> u64 {
+    let info = arguments[0];
+    let result = arguments[1];
+    if info == 0 || guest_output_pointer(info, std::mem::size_of::<SceAjmBatchInfo>()).is_none() {
+        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+    }
+    // SAFETY: the complete cursor object was validated immediately above.
+    let mut batch_info = unsafe { std::ptr::read_unaligned(info as *const SceAjmBatchInfo) };
+    let Some(end) = batch_info.offset.checked_add(AJM_JOB_GET_STATISTICS_SIZE) else {
+        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+    };
+    if end > batch_info.size {
+        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+    }
+    let job = batch_info.buffer.wrapping_add(batch_info.offset);
+    if result != 0 {
+        if guest_output_pointer(result, AJM_STATISTICS_RESULT_SIZE).is_none() {
+            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+        }
+        guest_memset(result, 0, AJM_STATISTICS_RESULT_SIZE as u64);
+    }
+    guest_memset(job, 0, AJM_JOB_GET_STATISTICS_SIZE);
+    batch_info.offset = end;
+    batch_info.last_good_job = job;
+    // SAFETY: the same validated cursor object.
+    unsafe {
+        std::ptr::write_unaligned(info as *mut SceAjmBatchInfo, batch_info);
+    }
+    0
+}
+
 fn ajm_batch_initialize(arguments: [u64; 6]) -> u64 {
     let batch = arguments[0];
     let size = arguments[1];
@@ -3960,6 +4003,7 @@ fn dispatch_probe_import(
         "ZIXln2K3XMk" => acm_context_create(arguments, state),
         "jBgBjAj02R8" => acm_context_destroy(arguments, state),
         "Q3dyFuwGn64" => ajm_module_register(arguments, state),
+        "3cAg7xN995U" => ajm_batch_job_get_statistics(arguments),
         "Wi7DtlLV+KI" => ajm_module_unregister(arguments, state),
         "AxoDrINp4J8" => ajm_instance_create(arguments, state),
         "RbLbuKv8zho" => ajm_instance_destroy(arguments, state),

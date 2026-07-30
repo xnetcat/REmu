@@ -564,3 +564,33 @@ fn audio_out2_speaker_info_reports_the_complete_stereo_topology() {
     assert_eq!(&storage[..0x10], &[0xa5; 0x10]);
     assert_eq!(&storage[0x50..], &[0xa5; 0x10]);
 }
+
+/// AudioOut2 ports are mixer voices, not the eight hardware outputs `sceAudioOutOpen` rations. An
+/// observed title holds more than forty at once; charging those against the hardware budget made
+/// its ninth port fail and its audio engine tear the whole stack down.
+#[test]
+fn audio_out2_voices_are_not_charged_against_the_hardware_port_budget() {
+    let mut audio = crate::audio::AudioOutState::default();
+    audio.use_timed_sink_for_test();
+    audio.initialize();
+    let voice = [0_u64, 0, 0, 256, 48_000, 0];
+    for index in 0..crate::audio::AudioOutState::HARDWARE_PORT_BUDGET * 4 {
+        assert!(
+            audio
+                .open_within(voice, crate::audio::AudioOutState::MIXER_VOICE_BUDGET)
+                .is_ok(),
+            "voice {index} was refused below the voice budget"
+        );
+    }
+    // The hardware path keeps its own, much smaller budget.
+    let mut hardware = crate::audio::AudioOutState::default();
+    hardware.use_timed_sink_for_test();
+    hardware.initialize();
+    for _ in 0..crate::audio::AudioOutState::HARDWARE_PORT_BUDGET {
+        assert!(hardware.open(voice).is_ok());
+    }
+    assert!(
+        hardware.open(voice).is_err(),
+        "sceAudioOutOpen must still ration its hardware ports"
+    );
+}
