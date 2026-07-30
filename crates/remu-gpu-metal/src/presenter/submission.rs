@@ -3,14 +3,15 @@
 
 use super::{
     ActiveGuestMemoryWait, DisplayConfiguration, GLOBAL_UPLOAD_ALIGNMENT,
-    GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GlobalUploadChunk, GraphicsPipelineKey,
-    GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
+    GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GlobalUploadChunk, GuestBatchFlushReason,
+    GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
     GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
     GuestMemoryWriteOperation, MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OrderedEventPoll,
-    OrderedEventSource, OrderedGpuEventReceiver, PIPELINE_DRAW_GATES, PendingFlip,
-    PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange, PresenterFlow,
-    QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer,
-    WriteWatchRefresh, graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
+    OrderedEventSource, OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES,
+    PendingFlip, PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
+    PipelineCompileCandidate, PresenterFlow, QueueBlockReason, ScheduledGpuSubmission,
+    ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh, compute_pipeline_key,
+    graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
     guest_texture_byte_count, pixel_scalars, rearm_color_metadata_clear,
     rearm_depth_metadata_clear,
     record_diagnostic_memory_copy, refresh_resident_texture_write_watch, register_value,
@@ -58,37 +59,37 @@ impl MetalPresenter {
             return PresenterFlow::Continue;
         }
         // Feed the existing compile workers from bounded ordered lookahead even while the current
-        // queue front is runnable. Waiting until a cold draw becomes the blocked front serialized
-        // multi-second first-scene Metal compilation behind the warning/movie UI. This only
-        // snapshots immutable draw descriptions and schedules deduplicated pipeline keys; event
-        // execution and every queue-local dependency remain in their original order.
-        for draw in self.receiver.prefetch_draws(512, 128) {
-            if let Ok(key) = graphics_pipeline_key(&draw) {
-                self.compile_draw_shaders(&draw, &key);
-            }
-        }
+        // queue front is runnable. Waiting until a cold draw or compute dispatch becomes the
+        // blocked front serialized multi-second first-scene Metal compilation behind the
+        // warning/movie UI. This only snapshots immutable work descriptions and schedules
+        // deduplicated pipeline keys; event execution and every queue-local dependency remain in
+        // their original order.
+        self.prefetch_pipeline_compilations();
         // A bounded batch prevents a continuously producing guest from starving redraw and input
         // delivery. Queue-local shader and memory waits leave independent guest queues runnable.
         for _ in 0..GPU_EVENTS_PER_TICK {
-            // A bounded drain can still spend several seconds preparing hundreds of large draws.
+            // A bounded drain can still spend several seconds preparing hundreds of large shaders.
             // Compiler workers publish into an independent result channel during that time.
             // Refresh before every readiness decision so a pipeline that completed during this
             // callback immediately releases its queue-local gate instead of remaining falsely
             // "active" until the next AppKit callback.
             self.receive_shader_compilations();
-            let (source, event) = match self.receiver.try_recv(|key| {
-                self.compiled_shader_pairs.contains_key(key)
-                    || self.failed_shader_pairs.contains(key)
+            let (source, event) = match self.receiver.try_recv(|reason| match reason {
+                QueueBlockReason::GraphicsPipeline(key) => {
+                    self.compiled_shader_pairs.contains_key(key)
+                        || self.failed_shader_pairs.contains(key)
+                }
+                QueueBlockReason::ComputePipeline(key) => {
+                    self.compiled_compute_pipelines.contains_key(key)
+                        || self.failed_compute_pipelines.contains(key)
+                }
+                QueueBlockReason::GuestMemoryWait(_) => false,
             }) {
                 OrderedEventPoll::Event { source, event } => (source, event),
                 OrderedEventPoll::Blocked => {
                     // Look ahead far enough to feed all compiler workers while memory-wait queues
                     // remain suspended. Prefetching never executes or reorders an event.
-                    for draw in self.receiver.prefetch_draws(512, 128) {
-                        if let Ok(key) = graphics_pipeline_key(&draw) {
-                            self.compile_draw_shaders(&draw, &key);
-                        }
-                    }
+                    self.prefetch_pipeline_compilations();
                     return PresenterFlow::Continue;
                 }
                 OrderedEventPoll::Empty => {
@@ -281,6 +282,32 @@ impl MetalPresenter {
                 }
                 GpuEvent::ComputeDispatch(dispatch) => {
                     trace_video_target_compute_consumer(&dispatch);
+                    if let (Some(snapshot), Some(evaluation)) = (
+                        dispatch.shader.as_ref(),
+                        dispatch.shader_evaluation.as_ref(),
+                    ) {
+                        let key = compute_pipeline_key(&dispatch, evaluation, &snapshot.program);
+                        self.compile_compute_shader(&dispatch, &key);
+                        if !self.compiled_compute_pipelines.contains_key(&key)
+                            && !self.failed_compute_pipelines.contains(&key)
+                        {
+                            PIPELINE_COMPUTE_GATES.fetch_add(1, Ordering::Relaxed);
+                            static LOGGED_COMPUTE_PIPELINE_GATES: AtomicUsize =
+                                AtomicUsize::new(0);
+                            if LOGGED_COMPUTE_PIPELINE_GATES.fetch_add(1, Ordering::Relaxed) < 16 {
+                                eprintln!(
+                                    "[REMu][METAL] preserving cold compute={} cs={:#x} while its pipeline compiles",
+                                    dispatch.sequence, dispatch.shader_address,
+                                );
+                            }
+                            self.receiver.block_event(
+                                source,
+                                GpuEvent::ComputeDispatch(dispatch),
+                                QueueBlockReason::ComputePipeline(key),
+                            );
+                            return PresenterFlow::Continue;
+                        }
+                    }
                     match self.execute_compute_dispatch(&dispatch) {
                         Ok(()) => {
                             self.statistics.encoded_compute_dispatches =

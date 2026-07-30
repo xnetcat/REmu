@@ -2,19 +2,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{Device, MeshRenderPipelineDescriptor, RenderPipelineDescriptor};
-use remu_gpu::IndexedDraw;
+use remu_gpu::{ComputeDispatch, IndexedDraw};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{TryRecvError, TrySendError};
 use std::time::Instant;
 
 use super::{
-    CompiledShaderPair, ComputePipelineKey, GraphicsPipelineKey, MetalPresenter,
-    NGG_MESH_LDS_BYTES, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED,
-    PIPELINE_COMPILE_ENQUEUED,
-    PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL, PersistentRenderPipelineArchive,
-    ProgramIdentity, RenderPipelineArchiveState, ShaderCompileRequest, ShaderFunctionCache,
+    CompiledComputePipeline, CompiledShaderPair, ComputePipelineKey, GraphicsPipelineKey,
+    MetalPresenter, NGG_MESH_LDS_BYTES, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED,
+    PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
+    PersistentRenderPipelineArchive, PipelineCompileCandidate, ProgramIdentity,
+    RenderPipelineArchiveState, ShaderCompileRequest, ShaderCompileResult, ShaderFunctionCache,
     ShaderFunctionCacheEntry, ShaderFunctionStageCache, diagnostic_disable_blending,
+    dump_msl_compute_filter_matches,
     dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
     evaluation_samples_large_linear_video, image_component_class, metal_color_write_mask,
     register_value, video_target_binding_summary,
@@ -41,6 +42,28 @@ pub(crate) use self::program::{
 };
 
 impl MetalPresenter {
+    pub(super) fn prefetch_pipeline_compilations(&mut self) {
+        let candidates = self.receiver.prefetch_pipeline_work(512, 128);
+        for candidate in candidates {
+            match candidate {
+                PipelineCompileCandidate::Graphics(draw) => {
+                    if let Ok(key) = super::graphics_pipeline_key(&draw) {
+                        self.compile_draw_shaders(&draw, &key);
+                    }
+                }
+                PipelineCompileCandidate::Compute(dispatch) => {
+                    if let (Some(snapshot), Some(evaluation)) = (
+                        dispatch.shader.as_ref(),
+                        dispatch.shader_evaluation.as_ref(),
+                    ) {
+                        let key = compute_pipeline_key(&dispatch, evaluation, &snapshot.program);
+                        self.compile_compute_shader(&dispatch, &key);
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn compile_draw_shaders(&mut self, draw: &IndexedDraw, key: &GraphicsPipelineKey) {
         if self.compiled_shader_pairs.contains_key(key)
             || self.compiling_shader_pairs.contains(key)
@@ -48,7 +71,7 @@ impl MetalPresenter {
         {
             return;
         }
-        let request = ShaderCompileRequest {
+        let request = ShaderCompileRequest::Graphics {
             key: key.clone(),
             draw: draw.clone(),
         };
@@ -71,6 +94,40 @@ impl MetalPresenter {
         }
     }
 
+    pub(super) fn compile_compute_shader(
+        &mut self,
+        dispatch: &ComputeDispatch,
+        key: &ComputePipelineKey,
+    ) {
+        if self.compiled_compute_pipelines.contains_key(key)
+            || self.compiling_compute_pipelines.contains(key)
+            || self.failed_compute_pipelines.contains(key)
+        {
+            return;
+        }
+        let request = ShaderCompileRequest::Compute {
+            key: key.clone(),
+            dispatch: dispatch.clone(),
+        };
+        match self.shader_compile_sender.try_send(request) {
+            Ok(()) => {
+                PIPELINE_COMPILE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+                self.compiling_compute_pipelines.insert(key.clone());
+            }
+            Err(TrySendError::Full(_)) => {
+                PIPELINE_COMPILE_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
+                self.failed_compute_pipelines.insert(key.clone());
+                eprintln!(
+                    "[REMu][METAL] Gen5 compute cs={:#x} failed: compiler worker stopped",
+                    dispatch.shader_address
+                );
+            }
+        }
+    }
+
     pub(super) fn receive_shader_compilations(&mut self) {
         loop {
             let result = match self.shader_compile_receiver.try_recv() {
@@ -84,46 +141,147 @@ impl MetalPresenter {
                         );
                         self.failed_shader_pairs.insert(key);
                     }
+                    for key in self.compiling_compute_pipelines.drain() {
+                        eprintln!(
+                            "[REMu][METAL] Gen5 compute program={:#x} failed: compiler worker stopped",
+                            key.program_identity.0.address
+                        );
+                        self.failed_compute_pipelines.insert(key);
+                    }
                     break;
                 }
             };
-            self.compiling_shader_pairs.remove(&result.key);
-            match result.compiled {
-                Ok(compiled) => {
-                    PIPELINE_COMPILE_COMPLETED.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "[REMu][METAL] compiled Gen5 shader pair es={:#x} ps={:#x} stage={} MSL={vertex_bytes}/{pixel_bytes} bytes time={:.1}/{:.1}/{:.1}ms lower/function/pipeline reuse={vertex_reuse}/{pixel_reuse} diagnostic={vertex_pattern}/{pixel_color}",
-                        result.key.export_shader_address,
-                        result.key.pixel_shader_address,
-                        if compiled.uses_mesh_stage {
-                            "mesh"
-                        } else {
-                            "vertex"
-                        },
-                        compiled.lowering_duration.as_secs_f64() * 1_000.0,
-                        compiled.function_duration.as_secs_f64() * 1_000.0,
-                        compiled.pipeline_duration.as_secs_f64() * 1_000.0,
-                        vertex_bytes = compiled.vertex.source.len(),
-                        pixel_bytes = compiled.pixel.source.len(),
-                        vertex_reuse = compiled.reused_vertex_function,
-                        pixel_reuse = compiled.reused_pixel_function,
-                        vertex_pattern = compiled.vertex.source.contains("remu_diagnostic_vertex"),
-                        pixel_color = compiled
-                            .pixel
-                            .source
-                            .contains("float4(1.0f, 0.0f, 1.0f, 1.0f)"),
-                    );
-                    self.compiled_shader_pairs.insert(result.key, compiled);
+            match result {
+                ShaderCompileResult::Graphics { key, compiled } => {
+                    self.compiling_shader_pairs.remove(&key);
+                    match compiled {
+                        Ok(compiled) => {
+                            PIPELINE_COMPILE_COMPLETED.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[REMu][METAL] compiled Gen5 shader pair es={:#x} ps={:#x} stage={} MSL={vertex_bytes}/{pixel_bytes} bytes time={:.1}/{:.1}/{:.1}ms lower/function/pipeline reuse={vertex_reuse}/{pixel_reuse} diagnostic={vertex_pattern}/{pixel_color}",
+                                key.export_shader_address,
+                                key.pixel_shader_address,
+                                if compiled.uses_mesh_stage {
+                                    "mesh"
+                                } else {
+                                    "vertex"
+                                },
+                                compiled.lowering_duration.as_secs_f64() * 1_000.0,
+                                compiled.function_duration.as_secs_f64() * 1_000.0,
+                                compiled.pipeline_duration.as_secs_f64() * 1_000.0,
+                                vertex_bytes = compiled.vertex.source.len(),
+                                pixel_bytes = compiled.pixel.source.len(),
+                                vertex_reuse = compiled.reused_vertex_function,
+                                pixel_reuse = compiled.reused_pixel_function,
+                                vertex_pattern =
+                                    compiled.vertex.source.contains("remu_diagnostic_vertex"),
+                                pixel_color = compiled
+                                    .pixel
+                                    .source
+                                    .contains("float4(1.0f, 0.0f, 1.0f, 1.0f)"),
+                            );
+                            self.compiled_shader_pairs.insert(key, compiled);
+                        }
+                        Err(error) => {
+                            self.failed_shader_pairs.insert(key.clone());
+                            eprintln!(
+                                "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
+                                key.export_shader_address, key.pixel_shader_address
+                            );
+                        }
+                    }
                 }
-                Err(error) => {
-                    self.failed_shader_pairs.insert(result.key.clone());
-                    eprintln!(
-                        "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
-                        result.key.export_shader_address, result.key.pixel_shader_address
-                    );
+                ShaderCompileResult::Compute {
+                    key,
+                    shader_address,
+                    threads_per_group,
+                    compiled,
+                } => {
+                    self.compiling_compute_pipelines.remove(&key);
+                    match compiled {
+                        Ok(compiled) => {
+                            PIPELINE_COMPILE_COMPLETED.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[REMu][METAL] compiled Gen5 compute cs={shader_address:#x} MSL={} bytes time={:.1}/{:.1}/{:.1}ms lower/function/pipeline local={:?} LDS={} bytes",
+                                compiled.shader.source.len(),
+                                compiled.lowering_duration.as_secs_f64() * 1_000.0,
+                                compiled.function_duration.as_secs_f64() * 1_000.0,
+                                compiled.pipeline_duration.as_secs_f64() * 1_000.0,
+                                threads_per_group,
+                                compiled.shader.bindings.threadgroup_memory_bytes,
+                            );
+                            self.compiled_compute_pipelines.insert(key, compiled);
+                        }
+                        Err(error) => {
+                            self.failed_compute_pipelines.insert(key);
+                            eprintln!(
+                                "[REMu][METAL] Gen5 compute cs={shader_address:#x} failed: {error}"
+                            );
+                        }
+                    }
                 }
             }
         }
+    }
+
+    pub(super) fn compile_compute_pipeline(
+        device: &Device,
+        dispatch: &ComputeDispatch,
+        key: &ComputePipelineKey,
+    ) -> Result<CompiledComputePipeline, String> {
+        let snapshot = dispatch
+            .shader
+            .as_ref()
+            .ok_or("dispatch has no decoded compute shader")?;
+        let evaluation = dispatch
+            .shader_evaluation
+            .as_ref()
+            .ok_or("dispatch has no evaluated compute resources")?;
+        let mut options = remu_shader_metal::MetalCompileOptions::compute_wave(
+            dispatch.launch.lds_size_bytes,
+            dispatch.launch.wave_lane_count,
+        );
+        options.allocated_vector_register_count = key.allocated_vector_register_count;
+        let lowering_started = Instant::now();
+        let lowered = remu_shader_metal::compile_msl(&snapshot.program, evaluation, &options)
+            .map_err(|error| format!("compute lowering: {error}"))?;
+        let lowering_duration = lowering_started.elapsed();
+        if lowered.stage != remu_shader_metal::MetalShaderStage::Compute {
+            return Err("compute lowering returned a non-compute Metal stage".to_owned());
+        }
+        if let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR")
+            && dump_msl_compute_filter_matches(dispatch.shader_address)
+            && let Err(error) = dump_compute_shader_msl(
+                Path::new(&directory),
+                dispatch.shader_address,
+                &snapshot.program.instructions,
+                &lowered.source,
+            )
+        {
+            eprintln!(
+                "[REMu][METAL] could not dump compute shader cs={:#x}: {error}",
+                dispatch.shader_address
+            );
+        }
+        let function_started = Instant::now();
+        let library = compile_metal_compute_library(device, &lowered.source)?;
+        let function = library
+            .get_function(&lowered.entry_point, None)
+            .map_err(|error| format!("Metal compute function: {error}"))?;
+        let function_duration = function_started.elapsed();
+        let pipeline_started = Instant::now();
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|error| format!("Metal compute pipeline: {error}"))?;
+        let pipeline_duration = pipeline_started.elapsed();
+        Ok(CompiledComputePipeline {
+            pipeline,
+            function,
+            shader: lowered,
+            lowering_duration,
+            function_duration,
+            pipeline_duration,
+        })
     }
 
     pub(super) fn compile_draw_shader_pair(
