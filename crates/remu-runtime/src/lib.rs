@@ -966,13 +966,11 @@ struct AgcGraphicsState {
     index_size: u32,
     instance_count: u32,
     draw_index_offset: u32,
-    /// Active patch-table base programmed by a graphics-typed `SET_BASE`.
+    /// Active `SET_BASE` address for graphics-queue indirect draws and dispatches.
     ///
-    /// AMD's PM4 state keeps the compute patch-table base separate even though every other
-    /// `SET_BASE` index is shared between graphics and compute.
-    graphics_indirect_args_address: u64,
-    /// Active patch-table base programmed by a compute-typed `SET_BASE`.
-    compute_indirect_args_address: u64,
+    /// This is command-processor state, not shader-stage state: the shader-type bit in a PM4
+    /// header selects how the packet is decoded, but does not create a second indirect base.
+    indirect_args_address: u64,
     /// Synthetic cumulative pixel count published by `PIXEL_PIPE_STAT_DUMP`.
     ///
     /// Gen5 exposes one cumulative counter per render backend. Keeping the sequence in the
@@ -1014,8 +1012,7 @@ impl AgcGraphicsState {
         self.index_size = 0;
         self.instance_count = 1;
         self.draw_index_offset = 0;
-        self.graphics_indirect_args_address = 0;
-        self.compute_indirect_args_address = 0;
+        self.indirect_args_address = 0;
     }
 }
 
