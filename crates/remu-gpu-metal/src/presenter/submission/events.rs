@@ -9,6 +9,17 @@ use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, IndexedDraw};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+/// Extra decoded-event storage used only to discover an independent queue behind blocked tails.
+///
+/// Two complete bounded-channel windows cover a producer which was blocked while the receiver
+/// filled its ordinary pending budget, plus the next window made available by draining it. This is
+/// deliberately finite: a malformed or genuinely cyclic stream containing only more work for
+/// blocked queues must retain backpressure instead of moving an unbounded command stream into the
+/// presenter.
+const BLOCKED_DEPENDENCY_LOOKAHEAD_CAPACITY: usize = remu_gpu::GPU_EVENT_QUEUE_CAPACITY
+    * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
+    * 2;
+
 impl OrderedGpuEventReceiver {
     pub(crate) fn new(receiver: Receiver<GpuEvent>) -> Self {
         Self {
@@ -30,9 +41,14 @@ impl OrderedGpuEventReceiver {
             return;
         }
         for _ in 0..receive_limit {
+            let pending_capacity = if self.needs_dependency_ingress() {
+                remu_gpu::GPU_PENDING_EVENT_CAPACITY
+                    .saturating_add(BLOCKED_DEPENDENCY_LOOKAHEAD_CAPACITY)
+            } else {
+                remu_gpu::GPU_PENDING_EVENT_CAPACITY
+            };
             if self.pending_event_count()
-                > remu_gpu::GPU_PENDING_EVENT_CAPACITY
-                    .saturating_sub(remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE)
+                > pending_capacity.saturating_sub(remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE)
             {
                 break;
             }
@@ -70,6 +86,29 @@ impl OrderedGpuEventReceiver {
                 }),
             }
         }
+    }
+
+    /// Returns whether the normal decoded-event cap is withholding the only queue which can
+    /// satisfy an already-ingested guest-memory wait.
+    ///
+    /// Large submissions are split into bounded channel chunks. A wait near the beginning of one
+    /// chunk can therefore park every queue currently known to the receiver while the producer's
+    /// queue is still behind later chunks in the channel. Stopping ingress at the ordinary
+    /// backlog cap in that state creates a host-only deadlock: the blocked queue cannot consume
+    /// its tail, and the producer cannot become visible.
+    ///
+    /// Move a finite reserve of already-decoded chunks into queue FIFOs only while every known
+    /// guest queue is memory-wait blocked. As soon as one newly discovered queue is runnable, the
+    /// next loop iteration restores the normal cap. If no runnable queue is found within the
+    /// reserve, ingress stops with backpressure intact. No event executes out of order, and a
+    /// blocked queue's tail remains behind its wait.
+    fn needs_dependency_ingress(&self) -> bool {
+        let has_memory_wait = self
+            .blocked_queues
+            .values()
+            .any(|reason| matches!(reason, QueueBlockReason::GuestMemoryWait(_)))
+            || matches!(self.host_block, Some(QueueBlockReason::GuestMemoryWait(_)));
+        has_memory_wait && !self.has_runnable_events()
     }
 
     pub(crate) fn try_recv(
