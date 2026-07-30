@@ -35,9 +35,51 @@ fi
 # second argument wins, then the environment override, and zero deliberately disables the
 # watchdog for an unbounded interactive session.
 timeout_seconds=${2:-${REMU_GAME_TIMEOUT_SECONDS:-60}}
+watchdog_slack_seconds=${REMU_WATCHDOG_SLACK_SECONDS:-5}
+watchdog_termination_grace_seconds=${REMU_WATCHDOG_TERMINATION_GRACE_SECONDS:-2}
+for value in "$timeout_seconds" "$watchdog_slack_seconds" "$watchdog_termination_grace_seconds"; do
+    case "$value" in
+        '' | *[!0-9]*)
+            echo "error: timeout and watchdog durations must be non-negative integer seconds" >&2
+            exit 64
+            ;;
+    esac
+done
+if [ "$timeout_seconds" -gt 0 ]; then
+    # The in-process deadline produces the normal end-of-run reports. The independent shell
+    # deadline is deliberately later: it exists for dyld/Rosetta hangs before Rust `main` and for
+    # kernel teardown that never returns, neither of which can reach the runtime watchdog.
+    watchdog_timeout_seconds=$((timeout_seconds + watchdog_slack_seconds))
+else
+    watchdog_timeout_seconds=0
+fi
 if [ ! -f "$game_path" ]; then
     echo "error: game executable not found: $game_path" >&2
     exit 66
+fi
+# Do not stack another translated game on an existing emulator. In particular, Darwin can retain
+# a Rosetta process forever in uninterruptible U state while entering or leaving dyld; no signal
+# can reclaim that process, and another launch puts additional pressure on the same kernel/driver
+# path. This guard never kills an existing game. An expert can opt into deliberate concurrency.
+if [ "${REMU_ALLOW_CONCURRENT_GAMES:-0}" != 1 ]; then
+    active_game_processes=
+    for pid in $(pgrep -x remu 2>/dev/null || true); do
+        command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        case "$command" in
+            *" run --timeout-seconds "*)
+                state=$(ps -p "$pid" -o state= 2>/dev/null | tr -d '[:space:]')
+                active_game_processes="${active_game_processes}${active_game_processes:+
+}pid=$pid state=${state:-unknown} command=$command"
+                ;;
+        esac
+    done
+    if [ -n "$active_game_processes" ]; then
+        echo "error: refusing to launch while another REmu game process exists:" >&2
+        printf '%s\n' "$active_game_processes" >&2
+        echo "wait for it to exit; if it remains in U state, restart macOS before another safe launch" >&2
+        echo "set REMU_ALLOW_CONCURRENT_GAMES=1 only for an intentional concurrent run" >&2
+        exit 75
+    fi
 fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -173,8 +215,9 @@ child_pid=
 # shellcheck disable=SC2329
 cleanup() {
     if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
+        # `child_pid` is the external watchdog wrapper. It owns bounded TERM/KILL escalation for
+        # the emulator and remains alive if this script itself is forcefully terminated.
         kill "$child_pid" 2>/dev/null || true
-        wait "$child_pid" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT HUP INT TERM
@@ -188,6 +231,7 @@ if [ "${REMU_HEADLESS_METAL:-0}" != 1 ]; then
 fi
 if [ "$timeout_seconds" -gt 0 ] 2>/dev/null; then
     echo "[REMu] automatic shutdown after ${timeout_seconds}s (pass 0 to disable)"
+    echo "[REMu] external launch watchdog after ${watchdog_timeout_seconds}s"
 fi
 if [ -n "${REMU_METAL_COMPILER:-}" ]; then
     echo "[REMu] using offline Metal compiler: $REMU_METAL_COMPILER"
@@ -205,16 +249,20 @@ set +e
 if [ "$capture_frames" = 1 ]; then
     (
         cd "$launch_working_directory"
-        env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME \
-            REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \
-            arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
+        "$script_dir/run-with-watchdog.sh" \
+            "$watchdog_timeout_seconds" "$watchdog_termination_grace_seconds" -- \
+            env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME \
+                REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \
+                arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
     ) > "$run_dir/guest.log" 2>&1 &
 else
     (
         cd "$launch_working_directory"
-        env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME -u REMU_CAPTURE_DIR \
-            REMU_AUTO_CROSS="$auto_cross" \
-            arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
+        "$script_dir/run-with-watchdog.sh" \
+            "$watchdog_timeout_seconds" "$watchdog_termination_grace_seconds" -- \
+            env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME -u REMU_CAPTURE_DIR \
+                REMU_AUTO_CROSS="$auto_cross" \
+                arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
     ) > "$run_dir/guest.log" 2>&1 &
 fi
 child_pid=$!
@@ -229,9 +277,15 @@ case "$status" in
         runner_status=0
         ;;
     142)
-        # The runtime uses SIGALRM to end intentionally bounded sessions on macOS.
+        # The in-process diagnostic watchdog preserves the historical SIGALRM-style status.
         outcome=timeout
         runner_status=0
+        ;;
+    124)
+        # The independent wrapper reached its later deadline. This means the in-process watchdog
+        # never started or process teardown did not complete, so keep the run visibly failed.
+        outcome=external-watchdog-timeout
+        runner_status=$status
         ;;
     *)
         outcome=guest-failure
