@@ -11,6 +11,7 @@ use super::{
 };
 use metal::MTLPixelFormat;
 use remu_gpu::{ComputeDispatch, GpuMemoryCopy, GpuRegister, IndexedDraw, ShaderSnapshot};
+use remu_memory::{guest_shared_backing_identity, guest_shared_backing_ranges_overlap};
 use remu_shader::{
     GlobalMemoryBinding, ImageBinding, Program, ShaderEvaluation, ShaderMetadata,
     image_is_comparison,
@@ -873,6 +874,7 @@ pub(super) fn diagnostic_dump_complex_msaa() -> bool {
 
 pub(super) fn diagnostic_texture_writer_enabled() -> bool {
     trace_scanout_writes()
+        || diagnostic_guest_write_trace_range().is_some()
         || diagnostic_dump_target_address().is_some()
         || diagnostic_dump_target_pixel_shader().is_some()
         || diagnostic_dump_target_sample_address().is_some()
@@ -1041,6 +1043,15 @@ pub(super) fn record_diagnostic_texture_writer(
     if !diagnostic_texture_writer_enabled() {
         return;
     }
+    if let Some(byte_count) = guest_texture_byte_count(descriptor)
+        && let Some(overlap) = diagnostic_guest_write_overlap(descriptor.address, byte_count)
+    {
+        eprintln!(
+            "[REMu][METAL][GUEST-WRITE] kind=texture-encode overlap={overlap} stage={stage} sequence={sequence} shader={shader:#x} address={:#x} bytes={byte_count:#x} identity={:?} descriptor={descriptor:?}",
+            descriptor.address,
+            guest_shared_backing_identity(descriptor.address, byte_count),
+        );
+    }
     diagnostic_texture_writers()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1104,6 +1115,18 @@ pub(super) fn diagnostic_related_texture_writers(
 pub(super) fn record_diagnostic_memory_copy(copy: GpuMemoryCopy) {
     if !diagnostic_texture_writer_enabled() {
         return;
+    }
+    if let Some(overlap) = diagnostic_guest_write_overlap(copy.destination_address, copy.byte_count)
+    {
+        eprintln!(
+            "[REMu][METAL][GUEST-WRITE] kind=dma overlap={overlap} source={:#x} destination={:#x} bytes={:#x} source-selection={} destination-selection={} destination-identity={:?}",
+            copy.source_address,
+            copy.destination_address,
+            copy.byte_count,
+            copy.source_selection,
+            copy.destination_selection,
+            guest_shared_backing_identity(copy.destination_address, copy.byte_count),
+        );
     }
     const CAPACITY: usize = 8_192;
     let mut copies = diagnostic_memory_copies()
@@ -1177,13 +1200,14 @@ pub(super) fn record_diagnostic_global_writers(
                 address: binding.base_address,
                 byte_count: u64::try_from(binding.byte_count).ok()?,
             };
-            if trace_range.is_some_and(|(address, byte_count)| {
-                guest_ranges_overlap(address, byte_count, writer.address, writer.byte_count)
-            }) {
+            if let Some(overlap) =
+                diagnostic_guest_write_overlap(writer.address, writer.byte_count)
+            {
                 eprintln!(
-                    "[REMu][METAL][GUEST-WRITE] stage={stage} sequence={sequence} shader={shader:#x} address={:#x} bytes={} snapshot={} writeback={} pcs={:x?}",
+                    "[REMu][METAL][GUEST-WRITE] kind=global-encode overlap={overlap} stage={stage} sequence={sequence} shader={shader:#x} address={:#x} bytes={} identity={:?} snapshot={} writeback={} pcs={:x?}",
                     binding.base_address,
                     binding.byte_count,
+                    guest_shared_backing_identity(writer.address, writer.byte_count),
                     binding.data.len() == binding.byte_count,
                     binding.write_back_to_guest,
                     binding.instruction_pcs,
@@ -1216,6 +1240,25 @@ pub(super) fn diagnostic_guest_write_trace_range() -> Option<(u64, u64)> {
         let end = parse_diagnostic_hex_address(end)?;
         (end > start).then_some((start, end - start))
     })
+}
+
+fn diagnostic_guest_write_overlap(address: u64, byte_count: u64) -> Option<&'static str> {
+    let (trace_address, trace_byte_count) = diagnostic_guest_write_trace_range()?;
+    if guest_ranges_overlap(trace_address, trace_byte_count, address, byte_count) {
+        return Some("virtual");
+    }
+    guest_shared_backing_ranges_overlap(trace_address, trace_byte_count, address, byte_count)
+        .then_some("physical-alias")
+}
+
+pub(super) fn trace_diagnostic_guest_write(kind: &'static str, address: u64, byte_count: u64) {
+    let Some(overlap) = diagnostic_guest_write_overlap(address, byte_count) else {
+        return;
+    };
+    eprintln!(
+        "[REMu][METAL][GUEST-WRITE] kind={kind} overlap={overlap} address={address:#x} bytes={byte_count:#x} identity={:?}",
+        guest_shared_backing_identity(address, byte_count),
+    );
 }
 
 pub(super) fn diagnostic_global_writers() -> &'static Mutex<VecDeque<DiagnosticGlobalWriter>> {

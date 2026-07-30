@@ -11,6 +11,7 @@ use super::{
     retire_sampled_textures_overlapping_writeback, trace_resident_texture_removal,
     write_resident_texture_contents_to_guest,
 };
+use crate::presenter::diagnostics::trace_diagnostic_guest_write;
 use remu_gpu::{
     GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
 };
@@ -42,6 +43,15 @@ impl MetalPresenter {
             return Err("release destination is null".to_owned());
         }
         validate_guest_memory_release(release)?;
+        trace_diagnostic_guest_write(
+            "release",
+            release.address,
+            if matches!(release.value, GpuMemoryReleaseValue::Immediate32(_)) {
+                4
+            } else {
+                8
+            },
+        );
         self.queue_pending_guest_memory_write(GuestMemoryWriteOperation::Release(release))
     }
 
@@ -264,6 +274,14 @@ impl MetalPresenter {
             ));
         }
         validate_guest_memory_write(write)?;
+        let byte_count = if write.increment_address {
+            u64::try_from(write.values.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(4)
+        } else {
+            4
+        };
+        trace_diagnostic_guest_write("write-data", write.address, byte_count);
         self.queue_pending_guest_memory_write(GuestMemoryWriteOperation::Write(write.clone()))
     }
 

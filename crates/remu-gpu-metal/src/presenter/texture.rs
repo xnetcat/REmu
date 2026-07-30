@@ -216,6 +216,11 @@ pub(super) fn write_watched_guest_texture_linear(
     }
     let byte_count = guest_texture_byte_count(descriptor)
         .ok_or("guest texture byte count overflows the host address space")?;
+    crate::presenter::diagnostics::trace_diagnostic_guest_write(
+        "texture-writeback",
+        descriptor.address,
+        byte_count,
+    );
     let destination_length =
         usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
     let raw = write_watch
