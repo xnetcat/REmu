@@ -172,6 +172,18 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertEqual(TRACE.signed_u32(1 << 31), -(1 << 31))
         self.assertEqual(TRACE.signed_u32((1 << 64) - 1), -1)
 
+    def test_loader_notification_filter_is_exact_to_dyld_trace_symbol(self) -> None:
+        self.assertTrue(
+            TRACE.is_loader_notification_symbol("dyld`lldb_image_notifier")
+        )
+        self.assertTrue(
+            TRACE.is_loader_notification_symbol("lldb_image_notifier_sim_trap")
+        )
+        self.assertFalse(TRACE.is_loader_notification_symbol(None))
+        self.assertFalse(
+            TRACE.is_loader_notification_symbol("libsystem`pthread_wqthread")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

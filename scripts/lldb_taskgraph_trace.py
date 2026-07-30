@@ -105,6 +105,12 @@ def signed_u32(value: int) -> int:
     return value - (1 << 32) if value & (1 << 31) else value
 
 
+def is_loader_notification_symbol(symbol: Optional[str]) -> bool:
+    """Return whether LLDB stopped in dyld's private image notification trap."""
+
+    return symbol is not None and "lldb_image_notifier" in symbol
+
+
 def _register(registers: Mapping[str, int], name: str) -> int:
     return registers.get(name, 0) & ((1 << 64) - 1)
 
@@ -527,6 +533,45 @@ def start_taskgraph_trace(debugger, _command, result, _internal_dict):
     )
 
 
+def resume_loader_notifications(debugger, _command, result, _internal_dict):
+    """Continue only LLDB's spurious dyld image-notification trace stops."""
+
+    process = debugger.GetSelectedTarget().GetProcess()
+    resumed = 0
+    while process.GetState() == lldb.eStateStopped:
+        loader_notification = False
+        for thread in process:
+            if thread.GetStopReason() != lldb.eStopReasonTrace:
+                continue
+            frame = thread.GetFrameAtIndex(0)
+            symbol = frame.GetFunctionName()
+            if symbol is None and frame.GetSymbol().IsValid():
+                symbol = frame.GetSymbol().GetName()
+            if is_loader_notification_symbol(symbol):
+                loader_notification = True
+                break
+        if not loader_notification:
+            break
+        resumed += 1
+        print(
+            "[REMu][LLDB][TASKGRAPH] resuming dyld loader notification "
+            f"count={resumed}",
+            flush=True,
+        )
+        error = process.Continue()
+        if error.Fail():
+            result.SetError(
+                "could not resume dyld loader notification: "
+                f"{error.GetCString()}"
+            )
+            return
+    if resumed:
+        result.AppendMessage(
+            "[REMu][LLDB][TASKGRAPH] resumed "
+            f"{resumed} dyld loader notification(s)"
+        )
+
+
 def __lldb_init_module(debugger, _internal_dict):
     if lldb is None:
         return
@@ -534,4 +579,9 @@ def __lldb_init_module(debugger, _internal_dict):
         "command script add "
         "-f lldb_taskgraph_trace.start_taskgraph_trace "
         "remu-taskgraph-trace-start"
+    )
+    debugger.HandleCommand(
+        "command script add "
+        "-f lldb_taskgraph_trace.resume_loader_notifications "
+        "remu-taskgraph-resume-loader-notifications"
     )

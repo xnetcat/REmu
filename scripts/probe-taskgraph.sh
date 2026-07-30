@@ -123,6 +123,7 @@ set +e
             -o "command script import '$trace_script'" \
             -o 'remu-taskgraph-trace-start' \
             -o "process launch -o '$run_dir/guest.stdout' -e '$run_dir/guest.stderr'" \
+            -o 'remu-taskgraph-resume-loader-notifications' \
             -o 'thread backtrace all -c 24' \
             -o 'register read' \
             -o 'quit' \
