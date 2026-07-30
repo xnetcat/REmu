@@ -12,8 +12,8 @@ use super::{
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
     NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_THREADS, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    append_unique_global_writebacks, append_unique_guest_write_ranges, capture_guest_frame,
-    capture_target_sample_textures, collect_pending_global_writebacks,
+    append_unique_global_writebacks, append_unique_guest_write_ranges, canonical_texture_bindings,
+    capture_guest_frame, capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, color_operation_is_raster_noop,
     compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
     consume_depth_metadata_clear, create_global_argument_buffer,
@@ -21,15 +21,16 @@ use super::{
     decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
     decode_raster_state, decode_render_targets, decode_scissor, decode_viewport,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
-    diagnostic_disable_culling, diagnostic_disable_depth, diagnostic_disable_depth_and_culling,
-    diagnostic_dump_complex_msaa, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
-    diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_match_index,
-    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
-    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
-    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
-    diagnostic_force_msaa_vertex_pattern, diagnostic_global_binding_head,
-    diagnostic_overlapping_global_writers, diagnostic_overlapping_memory_copies,
-    diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
+    diagnostic_context_register_snapshot, diagnostic_disable_culling, diagnostic_disable_depth,
+    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
+    diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
+    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
+    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
+    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_vertex_pattern,
+    diagnostic_global_binding_head, diagnostic_overlapping_global_writers,
+    diagnostic_overlapping_memory_copies, diagnostic_overlapping_texture_writers,
+    diagnostic_related_texture_writers, diagnostic_shader_summary, diagnostic_target_draw_filter,
     diagnostic_texture_writer, diagnostic_texture_writer_enabled,
     diagnostic_trace_all_target_contents, diagnostic_trace_target_contents,
     diagnostic_trace_target_maximum_draw, diagnostic_trace_target_stride,
@@ -1354,9 +1355,18 @@ impl MetalPresenter {
                 self.note_pending_flip_target_write(texture.descriptor.guest);
             }
         }
-        let diagnostic_target = diagnostic_dump_target_pixel_shader()
-            .filter(|&pixel| pixel == draw.pixel_shader_address)
-            .and_then(|_| targets.first())
+        let diagnostic_target = diagnostic_target_draw_filter()
+            .and_then(|filter| {
+                targets.iter().find(|target| {
+                    filter.matches(
+                        draw.sequence,
+                        draw.pixel_shader_address,
+                        target.texture.address,
+                        target.texture.width,
+                        target.texture.height,
+                    )
+                })
+            })
             .or_else(|| {
                 diagnostic_dump_target_pixel_instruction_count()
                     .filter(|&count| {
@@ -1382,16 +1392,6 @@ impl MetalPresenter {
                     && evaluation_samples_layered_comparison(pixel_evaluation))
                 .then(|| targets.first())
                 .flatten()
-            })
-            .or_else(|| {
-                let address = diagnostic_dump_target_address()?;
-                targets.iter().find(|target| {
-                    if address == 0 {
-                        target.texture.width == 1_920 && target.texture.height == 1_080
-                    } else {
-                        target.texture.address == address
-                    }
-                })
             })
             .or_else(|| {
                 (diagnostic_dump_video_draw()
@@ -1452,9 +1452,43 @@ impl MetalPresenter {
                     .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
             {
+                let context_registers =
+                    diagnostic_context_register_snapshot(&draw.context_registers);
+                let shaders = [
+                    diagnostic_shader_summary(
+                        "export",
+                        draw.export_shader_address,
+                        draw.export_shader_prefix,
+                        draw.export_shader.as_ref(),
+                    ),
+                    diagnostic_shader_summary(
+                        "pixel",
+                        draw.pixel_shader_address,
+                        draw.pixel_shader_prefix,
+                        draw.pixel_shader.as_ref(),
+                    ),
+                ];
                 eprintln!(
                     "[REMu][METAL][TARGET-MATCH] index={target_match} draw={} es={:#x} ps={:#x} target={:?}",
                     draw.sequence, draw.export_shader_address, draw.pixel_shader_address, target,
+                );
+                eprintln!(
+                    "[REMu][METAL][TARGET-DRAW-STATE] draw={} indexed={} count={} instances={} primitive={:#x} color_target={:#x} scanout_target={:?} context={context_registers:08x?} shaders={shaders:08x?} shader_registers={:08x?} user_config_registers={:08x?} vs_out={:#010x} resolved_ps_inputs={:08x?} hooks=(pre_target_ps={:x?},post_target=true,vertex_output={},pixel_output={},sample_textures={})",
+                    draw.sequence,
+                    draw.indexed,
+                    draw.index_count,
+                    draw.instance_count,
+                    draw.primitive_type,
+                    draw.color_target_address,
+                    draw.scanout_target,
+                    draw.shader_registers,
+                    draw.user_config_registers,
+                    key.vertex_output_control,
+                    key.pixel_input_controls,
+                    diagnostic_dump_target_before_pixel_shader(),
+                    diagnostic_capture_vertex_position(),
+                    diagnostic_capture_pixel_output(),
+                    capture_target_sample_textures(),
                 );
                 self.wait_for_guest_command_batches()?;
                 let descriptor = target.texture;
@@ -1490,6 +1524,83 @@ impl MetalPresenter {
                     .as_ref()
                     .ok_or("Metal command queue is unavailable")?
                     .clone();
+                let texture_summaries = canonical_texture_bindings(pixel_evaluation)
+                    .into_iter()
+                    .zip(&pixel_textures)
+                    .take(4)
+                    .enumerate()
+                    .map(|(slot, (binding, uploaded))| {
+                        // Keep the guest descriptor and the exact native view together. Component
+                        // reordered aliases intentionally have different guest/native formats.
+                        let readback_descriptor = GuestTextureDescriptor {
+                            pixel_format: uploaded.texture.pixel_format(),
+                            bytes_per_pixel: metal_uncompressed_bytes_per_pixel(
+                                uploaded.texture.pixel_format(),
+                            )
+                            .unwrap_or(uploaded.descriptor.guest.bytes_per_pixel),
+                            ..uploaded.descriptor.guest
+                        };
+                        let native_source = match uploaded.texture.texture_type() {
+                            MTLTextureType::D3 => read_texture_volume_linear(
+                                &device,
+                                &queue,
+                                &uploaded.texture,
+                                readback_descriptor,
+                            ),
+                            MTLTextureType::D2Array => read_texture_array_linear(
+                                &device,
+                                &queue,
+                                &uploaded.texture,
+                                readback_descriptor,
+                            ),
+                            _ => read_texture_linear(
+                                &device,
+                                &queue,
+                                &uploaded.texture,
+                                readback_descriptor,
+                            ),
+                        }
+                        .map(|bytes| {
+                            (
+                                bytes.len(),
+                                bytes.iter().filter(|&&value| value != 0).count(),
+                                guest_frame_fingerprint(&bytes),
+                                bytes.get(..bytes.len().min(32)).unwrap_or(&[]).to_vec(),
+                            )
+                        });
+                        let guest_source = snapshot_guest_texture_raw(uploaded.descriptor.guest)
+                            .map(|bytes| {
+                                (
+                                    bytes.len(),
+                                    bytes.iter().filter(|&&value| value != 0).count(),
+                                    guest_frame_fingerprint(&bytes),
+                                    bytes.get(..bytes.len().min(32)).unwrap_or(&[]).to_vec(),
+                                )
+                            });
+                        (
+                            slot,
+                            binding.pc,
+                            binding.opcode,
+                            binding.resource_descriptor.clone(),
+                            binding.sampler_descriptor.clone(),
+                            uploaded.descriptor,
+                            (
+                                uploaded.texture.texture_type(),
+                                uploaded.texture.width(),
+                                uploaded.texture.height(),
+                                uploaded.texture.depth(),
+                                uploaded.texture.array_length(),
+                                uploaded.texture.pixel_format(),
+                            ),
+                            native_source,
+                            guest_source,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[REMu][METAL][TARGET-DRAW-TEXTURES] draw={} tex0_3={texture_summaries:x?}",
+                    draw.sequence,
+                );
                 let bytes = match texture.texture_type() {
                     MTLTextureType::D3 => {
                         read_texture_volume_linear(&device, &queue, &texture, descriptor)?
