@@ -39,6 +39,7 @@ pub(crate) use self::program::{
 };
 pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
     ngg_mesh_export_stage, pixel_interpolation_attribute_mask, pixel_scalars,
@@ -302,30 +303,44 @@ impl MetalPresenter {
             .export_shader
             .as_ref()
             .ok_or("draw has no decoded export shader")?;
-        let pixel = draw
-            .pixel_shader
-            .as_ref()
-            .ok_or("draw has no decoded pixel shader")?;
         let export_evaluation = draw
             .export_shader_evaluation
             .as_ref()
             .ok_or("draw has no evaluated export shader resources")?;
-        let pixel_evaluation = draw
-            .pixel_shader_evaluation
-            .as_ref()
-            .ok_or("draw has no evaluated pixel shader resources")?;
+        let (pixel_program, pixel_evaluation) = match (
+            draw.pixel_shader.as_ref(),
+            draw.pixel_shader_evaluation.as_ref(),
+        ) {
+            (Some(pixel), Some(evaluation)) => (pixel.program.as_ref(), evaluation.as_ref()),
+            (None, None) if key.targets.is_empty() && key.depth.is_some() => (
+                fragmentless_pixel_program().as_ref(),
+                fragmentless_pixel_evaluation(),
+            ),
+            (None, None) => {
+                return Err(
+                    "fragmentless draw requires an active depth target and no color targets"
+                        .to_owned(),
+                );
+            }
+            (Some(_), None) => {
+                return Err("draw has no evaluated pixel shader resources".to_owned());
+            }
+            (None, Some(_)) => {
+                return Err("draw has pixel resources but no decoded pixel shader".to_owned());
+            }
+        };
         // Emit decoded IR before either stage is lowered. Keeping this ahead of `compile_msl`
         // makes the one-shot dump useful for precisely the shaders that fail translation instead
         // of only recording pairs that already compiled successfully.
         if let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR")
             && dump_msl_pixel_filter_matches(draw.pixel_shader_address)
-            && dump_msl_instruction_filter_matches(pixel.program.instructions.len())
+            && dump_msl_instruction_filter_matches(pixel_program.instructions.len())
             && let Err(error) = dump_shader_pair_ir(
                 Path::new(&directory),
                 draw.export_shader_address,
                 draw.pixel_shader_address,
                 &export.program.instructions,
-                &pixel.program.instructions,
+                &pixel_program.instructions,
             )
         {
             eprintln!(
@@ -334,13 +349,13 @@ impl MetalPresenter {
             );
         }
         if let Some(directory) = std::env::var_os("REMU_DUMP_GRAPHICS_LDS_IR_DIR")
-            && (program_uses_lds(&export.program) || program_uses_lds(&pixel.program))
+            && (program_uses_lds(&export.program) || program_uses_lds(pixel_program))
             && let Err(error) = dump_shader_pair_ir(
                 Path::new(&directory),
                 draw.export_shader_address,
                 draw.pixel_shader_address,
                 &export.program.instructions,
-                &pixel.program.instructions,
+                &pixel_program.instructions,
             )
         {
             eprintln!(
@@ -373,7 +388,7 @@ impl MetalPresenter {
         let selected_diagnostic_shader = diagnostic_dump_target_pixel_shader()
             == Some(draw.pixel_shader_address)
             || diagnostic_dump_target_pixel_instruction_count()
-                == Some(pixel.program.instructions.len())
+                == Some(pixel_program.instructions.len())
             || (diagnostic_dump_video_target_consumer()
                 && video_target_binding_summary(pixel_evaluation).is_some())
             || (diagnostic_dump_video_chain_consumer()
@@ -381,15 +396,15 @@ impl MetalPresenter {
             || (diagnostic_dump_shadow_consumer()
                 && evaluation_samples_layered_comparison(pixel_evaluation));
         pixel_options.diagnostic_force_pixel_color = key.sample_count > 1
-            && pixel.program.instructions.len() > 64
+            && pixel_program.instructions.len() > 64
             && diagnostic_force_msaa_pixel_color();
         pixel_options.diagnostic_capture_pixel_output = diagnostic_capture_pixel_output()
-            && ((key.sample_count > 1 && pixel.program.instructions.len() == 370)
+            && ((key.sample_count > 1 && pixel_program.instructions.len() == 370)
                 || selected_diagnostic_shader
                 || (diagnostic_dump_video_draw()
                     && evaluation_samples_large_linear_video(pixel_evaluation)));
         let pixel_msl =
-            remu_shader_metal::compile_msl(&pixel.program, pixel_evaluation, &pixel_options)
+            remu_shader_metal::compile_msl(pixel_program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
         let uses_procedural_rectangle_stage = !draw.indexed
             && draw.index_count == 3
@@ -397,7 +412,7 @@ impl MetalPresenter {
             && procedural_rectangle_export_stage(&export.program);
         if key.render_target_array_length == 1 {
             let exported_parameters = vertex_parameter_export_mask(&export.program);
-            let interpolated_attributes = pixel_interpolation_attribute_mask(&pixel.program);
+            let interpolated_attributes = pixel_interpolation_attribute_mask(pixel_program);
             let missing = missing_vertex_parameter_exports(
                 exported_parameters,
                 interpolated_attributes,
@@ -461,7 +476,7 @@ impl MetalPresenter {
             )
         } else if uses_procedural_rectangle_stage {
             let coordinate_parameter_mask =
-                rectangle_coordinate_parameter_mask(&pixel.program, &key.pixel_input_controls)
+                rectangle_coordinate_parameter_mask(pixel_program, &key.pixel_input_controls)
                     .unwrap_or_else(|| {
                         // A sample-free procedural consumer has no data-flow evidence for
                         // parameter roles. Preserve the previous convention for that unrelated
@@ -483,7 +498,7 @@ impl MetalPresenter {
         let lowering_duration = lowering_started.elapsed();
         if let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR")
             && dump_msl_pixel_filter_matches(draw.pixel_shader_address)
-            && dump_msl_instruction_filter_matches(pixel.program.instructions.len())
+            && dump_msl_instruction_filter_matches(pixel_program.instructions.len())
         {
             let directory = Path::new(&directory);
             if let Err(error) = dump_shader_pair_msl(

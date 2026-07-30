@@ -12,12 +12,28 @@ use std::sync::Arc;
 
 use super::{
     MetalPresenter, canonical_sampler_bindings, canonical_texture_bindings, compute_launch,
-    graphics_shader_resource_key, image_component_class, missing_vertex_parameter_exports,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
+    image_component_class, missing_vertex_parameter_exports,
     ngg_mesh_export_stage, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
     rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
     shader_scalar_metadata, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, wave64_split_blockers,
 };
+
+#[test]
+fn lowers_fragmentless_pixel_state_to_a_void_fragment_function() {
+    let lowered = remu_shader_metal::compile_msl(
+        fragmentless_pixel_program(),
+        fragmentless_pixel_evaluation(),
+        &remu_shader_metal::MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("fragmentless pixel state lowers");
+
+    assert_eq!(lowered.stage, remu_shader_metal::MetalShaderStage::Pixel);
+    assert!(lowered.source.contains("fragment void remu_main"));
+    assert!(!lowered.source.contains("return remu_out"));
+    assert_eq!(lowered.bindings.texture_count, 0);
+}
 
 #[test]
 fn decodes_force_unnormalized_sampler_coordinates() {

@@ -7,6 +7,7 @@ use super::{
     GraphicsPipelineKey, GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL,
     PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
     pixel_input_controls, program_embeds_global_base, register_value,
 };
@@ -367,20 +368,31 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         .export_shader_evaluation
         .as_ref()
         .ok_or("draw has no export resource evaluation")?;
-    let pixel_evaluation = draw
-        .pixel_shader_evaluation
-        .as_ref()
-        .ok_or("draw has no pixel resource evaluation")?;
     let export_program = &draw
         .export_shader
         .as_ref()
         .ok_or("draw has no decoded export shader")?
         .program;
-    let pixel_program = &draw
-        .pixel_shader
-        .as_ref()
-        .ok_or("draw has no decoded pixel shader")?
-        .program;
+    let (pixel_program, pixel_evaluation, fragmentless) = match (
+        draw.pixel_shader.as_ref(),
+        draw.pixel_shader_evaluation.as_ref(),
+    ) {
+        (Some(pixel), Some(evaluation)) => (&pixel.program, evaluation.as_ref(), false),
+        (None, None) if targets.is_empty() && depth.is_some() => (
+            fragmentless_pixel_program(),
+            fragmentless_pixel_evaluation(),
+            true,
+        ),
+        (None, None) => {
+            return Err(
+                "fragmentless draw requires an active depth target and no color targets".to_owned(),
+            );
+        }
+        (Some(_), None) => return Err("draw has no pixel resource evaluation".to_owned()),
+        (None, Some(_)) => {
+            return Err("draw has pixel resources but no decoded pixel shader".to_owned());
+        }
+    };
     let sample_count = targets
         .first()
         .map(|target| target.sample_count)
@@ -434,14 +446,20 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             &draw.shader_registers,
             export_user_data_register,
         ),
-        pixel_allocated_vector_register_count: graphics_allocated_vector_register_count(
-            &draw.shader_registers,
-            0x00c,
-        ),
+        pixel_allocated_vector_register_count: if fragmentless {
+            0
+        } else {
+            graphics_allocated_vector_register_count(&draw.shader_registers, 0x00c)
+        },
         vertex_output_control: register_value(&draw.context_registers, PA_CL_VS_OUT_CNTL)
             .unwrap_or_default(),
-        pixel_input_controls: pixel_input_controls(&draw.context_registers),
-        pixel_depth_export: pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
+        pixel_input_controls: if fragmentless {
+            [0; 32]
+        } else {
+            pixel_input_controls(&draw.context_registers)
+        },
+        pixel_depth_export: !fragmentless
+            && pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
         targets: targets
             .iter()
             .map(|target| {
