@@ -894,6 +894,11 @@ enum GuestBatchWork {
         index_count: u32,
         instance_count: u32,
         target: u64,
+        extent: [u32; 2],
+        export_msl_bytes: usize,
+        pixel_msl_bytes: usize,
+        export_dispatcher: bool,
+        pixel_dispatcher: bool,
     },
     Compute {
         sequence: u64,
@@ -901,6 +906,8 @@ enum GuestBatchWork {
         source: remu_gpu::ComputeDispatchSource,
         grid: remu_gpu::ComputeGrid,
         threads_per_group: [u32; 3],
+        msl_bytes: usize,
+        dispatcher: bool,
     },
 }
 

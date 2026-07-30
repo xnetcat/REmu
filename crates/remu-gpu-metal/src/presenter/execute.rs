@@ -561,6 +561,10 @@ impl MetalPresenter {
             vertex_sampler_buffer_index,
             pixel_sampler_buffer_index,
             uses_mesh_stage,
+            vertex_msl_bytes,
+            pixel_msl_bytes,
+            vertex_dispatcher,
+            pixel_dispatcher,
         ) = {
             let compiled = self
                 .compiled_shader_pairs
@@ -625,6 +629,10 @@ impl MetalPresenter {
                 compiled.vertex.bindings.sampler_argument_buffer_index,
                 compiled.pixel.bindings.sampler_argument_buffer_index,
                 compiled.uses_mesh_stage,
+                compiled.vertex.source.len(),
+                compiled.pixel.source.len(),
+                compiled.vertex.source.contains("while (active)"),
+                compiled.pixel.source.contains("while (active)"),
             )
         };
         let (export_sampler_buffer, export_samplers) = self.cached_sampler_argument_buffer(
@@ -1032,6 +1040,11 @@ impl MetalPresenter {
                 index_count: draw.index_count,
                 instance_count: draw.instance_count,
                 target: draw.color_target_address,
+                extent: [render_width, render_height],
+                export_msl_bytes: vertex_msl_bytes,
+                pixel_msl_bytes,
+                export_dispatcher: vertex_dispatcher,
+                pixel_dispatcher,
             });
             append_unique_global_writebacks(&mut batch.global_writebacks, pending_writebacks);
             append_unique_guest_write_ranges(
@@ -2444,6 +2457,11 @@ impl MetalPresenter {
             index_count: draw.index_count,
             instance_count: draw.instance_count,
             target: draw.color_target_address,
+            extent: [destination.texture.width, destination.texture.height],
+            export_msl_bytes: 0,
+            pixel_msl_bytes: 0,
+            export_dispatcher: false,
+            pixel_dispatcher: false,
         });
         self.mark_resident_texture_written(destination.texture);
         self.note_pending_flip_target_write(destination.texture);
@@ -2530,6 +2548,11 @@ impl MetalPresenter {
             index_count: draw.index_count,
             instance_count: draw.instance_count,
             target: draw.color_target_address,
+            extent: [target.texture.width, target.texture.height],
+            export_msl_bytes: 0,
+            pixel_msl_bytes: 0,
+            export_dispatcher: false,
+            pixel_dispatcher: false,
         });
         if target.sample_count > 1 {
             self.mark_multisample_texture_initialized(target.texture, target.sample_count);
