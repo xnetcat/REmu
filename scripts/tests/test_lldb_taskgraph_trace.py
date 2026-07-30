@@ -49,7 +49,9 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertTrue(dispatch.accepted)
         self.assertEqual(self.state.task, 0x1000)
         self.assertEqual(self.state.completion_event, 0x2000)
-        self.assertEqual(set(self.state.active_breakpoints()), {TRACE.PUBLISH})
+        self.assertEqual(
+            set(self.state.active_breakpoints()), {TRACE.DISPATCH, TRACE.PUBLISH}
+        )
 
         other = self.observe(TRACE.PUBLISH, {"rsi": 0x9990, "rdi": 0x3000})
         self.assertFalse(other.accepted)
@@ -62,7 +64,8 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertTrue(published.accepted)
         self.assertEqual(self.state.publisher_thread, 7)
         self.assertEqual(
-            set(self.state.active_breakpoints()), {TRACE.PUBLISH_RETURN}
+            set(self.state.active_breakpoints()),
+            {TRACE.DISPATCH, TRACE.PUBLISH_RETURN},
         )
 
         wrong_thread = self.observe(
@@ -82,7 +85,9 @@ class TaskGraphTraceTests(unittest.TestCase):
         )
         self.assertTrue(wake_required.accepted)
         self.assertEqual(self.state.phase, TRACE.PHASE_PUBLISH)
-        self.assertEqual(set(self.state.active_breakpoints()), {TRACE.WAKE})
+        self.assertEqual(
+            set(self.state.active_breakpoints()), {TRACE.DISPATCH, TRACE.WAKE}
+        )
 
         wrong_wake_frame = self.observe(
             TRACE.WAKE, {"rdi": 0x4000, "rsp": 0x6008}
@@ -95,7 +100,7 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertEqual(self.state.phase, TRACE.PHASE_CONSUME)
         self.assertEqual(
             set(self.state.active_breakpoints()),
-            {TRACE.POP_LOCAL, TRACE.POP_WAIT, TRACE.POP_DRAIN, TRACE.EXECUTE},
+            {TRACE.DISPATCH, TRACE.POP_LOCAL, TRACE.POP_WAIT, TRACE.POP_DRAIN},
         )
 
     def test_negative_publish_result_skips_wake_phase(self) -> None:
@@ -125,7 +130,9 @@ class TaskGraphTraceTests(unittest.TestCase):
         popped = self.observe(TRACE.POP_DRAIN, {"rax": 0x1000})
         self.assertTrue(popped.accepted)
         self.assertEqual(self.state.pop_site, TRACE.POP_DRAIN)
-        self.assertEqual(set(self.state.active_breakpoints()), {TRACE.EXECUTE})
+        self.assertEqual(
+            set(self.state.active_breakpoints()), {TRACE.DISPATCH, TRACE.EXECUTE}
+        )
         self.assertFalse(
             self.observe(TRACE.EXECUTE, {"rdi": 0x9990}).accepted
         )
@@ -144,6 +151,52 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertEqual(self.state.phase, TRACE.PHASE_PUBLISH)
         self.assertEqual(self.state.task, 0)
 
+    def test_new_fence_dispatch_supersedes_a_task_that_was_never_popped(self) -> None:
+        self.observe(TRACE.DISPATCH, {"rsi": 0x1000})
+        self.observe(
+            TRACE.PUBLISH, {"rsi": 0x1000, "rdi": 0x3000, "rsp": 0x5000}
+        )
+        self.observe(
+            TRACE.PUBLISH_RETURN,
+            {"rax": (1 << 64) - 1, "rsp": 0x5008},
+        )
+
+        self.memory[0x3018] = 0x4000
+        replacement = self.observe(
+            TRACE.DISPATCH, {"rsi": 0x3000, "rdx": 3, "rcx": 2}
+        )
+
+        self.assertTrue(replacement.accepted)
+        self.assertIn("superseded task=0x1000", replacement.message or "")
+        self.assertIn("phase=consume", replacement.message or "")
+        self.assertIn("next=(cycle=2 dispatch", replacement.message or "")
+        self.assertEqual(self.state.task, 0x3000)
+        self.assertEqual(self.state.completion_event, 0x4000)
+        self.assertEqual(self.state.cycles_started, 2)
+        self.assertEqual(self.state.cycles_completed, 0)
+
+    def test_new_fence_dispatch_supersedes_a_task_after_execute_before_complete(
+        self,
+    ) -> None:
+        self.observe(TRACE.DISPATCH, {"rsi": 0x1000})
+        self.observe(
+            TRACE.PUBLISH, {"rsi": 0x1000, "rdi": 0x3000, "rsp": 0x5000}
+        )
+        self.observe(
+            TRACE.PUBLISH_RETURN,
+            {"rax": (1 << 64) - 1, "rsp": 0x5008},
+        )
+        self.observe(TRACE.POP_WAIT, {"rax": 0x1000})
+        self.observe(TRACE.EXECUTE, {"rdi": 0x1000})
+
+        self.memory[0x3018] = 0x4000
+        replacement = self.observe(TRACE.DISPATCH, {"rsi": 0x3000})
+
+        self.assertTrue(replacement.accepted)
+        self.assertIn("phase=complete", replacement.message or "")
+        self.assertEqual(self.state.task, 0x3000)
+        self.assertEqual(self.state.phase, TRACE.PHASE_PUBLISH)
+
     def test_cycle_limit_finishes_after_bounded_completions(self) -> None:
         state = TRACE.TaskGraphTraceState(cycle_limit=1, hit_limit=16)
         state.observe(TRACE.DISPATCH, {"rsi": 0x1000}, 7, self.read_u64)
@@ -159,6 +212,7 @@ class TaskGraphTraceTests(unittest.TestCase):
             7,
             self.read_u64,
         )
+        state.observe(TRACE.POP_WAIT, {"rax": 0x1000}, 7, self.read_u64)
         state.observe(TRACE.EXECUTE, {"rdi": 0x1000}, 7, self.read_u64)
         result = state.observe(
             TRACE.COMPLETE, {"r14": 0x1000}, 7, self.read_u64
@@ -200,8 +254,20 @@ class TaskGraphTraceTests(unittest.TestCase):
         for phase_breakpoints in TRACE.BREAKPOINTS.values():
             for address in phase_breakpoints.values():
                 self.assertTrue(TRACE.is_taskgraph_breakpoint_address(address))
+                self.assertTrue(
+                    TRACE.is_taskgraph_diagnostic_stop_address(address)
+                )
         self.assertFalse(TRACE.is_taskgraph_breakpoint_address(0x801BE1AF9))
+        self.assertFalse(
+            TRACE.is_taskgraph_diagnostic_stop_address(0x801BE1AF9)
+        )
+        for address in TRACE.TASKGRAPH_TRACE_FALLTHROUGH_ADDRESSES:
+            self.assertFalse(TRACE.is_taskgraph_breakpoint_address(address))
+            self.assertTrue(TRACE.is_taskgraph_diagnostic_stop_address(address))
         self.assertFalse(TRACE.is_taskgraph_breakpoint_address(0x200D91D61))
+        self.assertFalse(
+            TRACE.is_taskgraph_diagnostic_stop_address(0x200D91D61)
+        )
 
 
 if __name__ == "__main__":
