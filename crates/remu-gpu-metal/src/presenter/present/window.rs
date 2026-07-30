@@ -21,8 +21,8 @@ use super::{
 };
 use core_graphics_types::geometry::CGSize;
 use metal::{MTLPixelFormat, MetalLayer};
-use objc::runtime::{Object, YES};
-use objc::{msg_send, sel, sel_impl};
+use objc::runtime::{NO, Object, YES};
+use objc::{class, msg_send, sel, sel_impl};
 use remu_gpu::{
     GpuEvent, HostPadState, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
     PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2,
@@ -75,6 +75,14 @@ impl MetalPresenter {
                 return Err("winit did not create an AppKit window".to_owned());
             };
             let view = appkit.ns_view.as_ptr().cast::<Object>();
+            let appkit_window: *mut Object = msg_send![view, window];
+            if appkit_window.is_null() {
+                return Err("winit's AppKit view is not attached to a window".to_owned());
+            }
+            // A presenter is rebuilt from the current guest run and has no UI state worth
+            // restoring. Titled NSWindows are restorable by default, so opt this window out
+            // explicitly before it is ordered onscreen.
+            let _: () = msg_send![appkit_window, setRestorable: NO];
             let _: () = msg_send![view, setWantsLayer: YES];
             let _: () = msg_send![view, setLayer: layer.as_mut()];
         }
@@ -774,6 +782,49 @@ impl MetalPresenter {
 
 pub(crate) fn headless_metal_value_is_enabled(value: Option<&OsStr>) -> bool {
     value.is_some_and(|value| value == "1")
+}
+
+const APPKIT_PERSISTENCE_IGNORE_STATE_KEY: &std::ffi::CStr = c"ApplePersistenceIgnoreState";
+
+pub(crate) fn disable_appkit_state_restoration() {
+    // AppKit consults this per-application default while handling its initial reopen Apple event.
+    // Set it before winit creates NSApplication so crash history from an earlier forced shutdown
+    // cannot open a modal persistent-state prompt before ApplicationHandler::resumed. The
+    // presenter window is also marked non-restorable when it is created, which prevents new
+    // restoration archives from being produced.
+    objc::rc::autoreleasepool(|| unsafe {
+        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: APPKIT_PERSISTENCE_IGNORE_STATE_KEY.as_ptr()
+        ];
+        let _: () = msg_send![defaults, setBool: YES forKey: key];
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn appkit_persistent_state_is_ignored() -> bool {
+    objc::rc::autoreleasepool(|| unsafe {
+        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: APPKIT_PERSISTENCE_IGNORE_STATE_KEY.as_ptr()
+        ];
+        let ignored: objc::runtime::BOOL = msg_send![defaults, boolForKey: key];
+        ignored == YES
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn clear_appkit_persistent_state_override() {
+    objc::rc::autoreleasepool(|| unsafe {
+        let defaults: *mut Object = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: APPKIT_PERSISTENCE_IGNORE_STATE_KEY.as_ptr()
+        ];
+        let _: () = msg_send![defaults, removeObjectForKey: key];
+    });
 }
 
 pub(crate) fn headless_metal_requested() -> bool {

@@ -102,13 +102,15 @@ use self::format::{
     half_float_to_srgb_unorm8, half_float_to_unorm8, linear_unorm8_to_srgb_unorm8,
     texture_element_layout, unsigned_float_to_f32, unsigned_float_to_srgb_unorm8,
 };
-use self::present::{
-    create_presentation_resources, headless_metal_requested, run_headless_presenter,
-};
 #[cfg(test)]
 use self::present::{
+    appkit_persistent_state_is_ignored, clear_appkit_persistent_state_override,
     headless_metal_value_is_enabled, parse_presentation_resolution, presentation_drawable_size,
     presentation_viewport,
+};
+use self::present::{
+    create_presentation_resources, disable_appkit_state_restoration, headless_metal_requested,
+    run_headless_presenter,
 };
 use self::readback::{
     capture_guest_frame, diagnostic_texture_depth_plane_summaries, guest_frame_fingerprint,
@@ -1828,6 +1830,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     if headless_metal_requested() {
         return run_headless_presenter(receiver);
     }
+    disable_appkit_state_restoration();
     eprintln!("[REMu][METAL] starting AppKit event loop");
     let mut presenter = MetalPresenter::new(receiver)?;
     let mut builder = EventLoop::builder();

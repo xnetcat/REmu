@@ -39,8 +39,13 @@ use super::{
 mod scanout;
 mod window;
 #[cfg(test)]
-pub(crate) use self::window::headless_metal_value_is_enabled;
-pub(crate) use self::window::{headless_metal_requested, run_headless_presenter};
+pub(crate) use self::window::{
+    appkit_persistent_state_is_ignored, clear_appkit_persistent_state_override,
+    headless_metal_value_is_enabled,
+};
+pub(crate) use self::window::{
+    disable_appkit_state_restoration, headless_metal_requested, run_headless_presenter,
+};
 
 impl MetalPresenter {
     pub(super) fn render(&mut self) {
