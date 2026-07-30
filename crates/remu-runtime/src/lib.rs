@@ -2601,6 +2601,12 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     if nid == "AEJdIVZTEmo" {
         return ProbeImportReturn::integer(guest_qsort(call_args));
     }
+    if nid == "DYhhWbJSeRg" {
+        return ProbeImportReturn::integer(platform_services::video_out_color_settings_set_gamma(
+            call_args[0],
+            low_f32(float_argument0),
+        ));
+    }
     if nid == "dhK16CKwhQg" {
         return ProbeImportReturn::integer(u64::from(float_argument0.is_finite()));
     }
@@ -3748,6 +3754,9 @@ fn dispatch_stateless_import(
     // locked path: holding the process dispatch lock across a fiber entry would deadlock it.
     #[cfg(target_arch = "x86_64")]
     if let Some(result) = fiber::dispatch(nid, arguments, stack_arguments) {
+        return Some(result);
+    }
+    if let Some(result) = platform_services::dispatch(nid, arguments) {
         return Some(result);
     }
     Some(match nid {
@@ -7656,6 +7665,7 @@ fn terminate_probe(code: i32) -> ! {
 
 #[cfg(test)]
 mod platform_independent_tests;
+mod platform_services;
 
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 mod tests;

@@ -138,13 +138,26 @@ the three `Core.Res` threads, `NexusRevolution Event` — is parked on a conditi
 Nothing produces work. No draw is submitted and no flip requested, though the display is fully
 configured.
 
-What the spinning scheduler polls for is not established, and that is the next thing to find; it
-needs the guest loop at that address read, not more imports served. Ruled out so far: the startup
-script resolves (`/app0/scripts/cp11/_cmn/cp11main.cgpr`), no path resolution fails anywhere in a
-run, and the remaining unserved imports (`sceSystemGestureOpen`,
-`sceSystemGestureInitializePrimitiveTouchRecognizer`, `sceVideoOutColorSettingsSetGamma`,
-`sceKernelSetPrtAperture`, `sceNetCtlInit`, and `D-CzAxQL0XI`, which has no recovered name) are all
-reached and returned from before the plateau, so none is where it stops.
+Every import this title reaches is now served: a run reports zero unimplemented NIDs. Nine were
+added, each one unblocking the next: `sceKernelSetPrtAperture` (which records an aperture over the
+partially-resident-texture window and is real bookkeeping, not a stub),
+`sceUserServiceGetPlatformPrivacySetting`, `sceVideoOutColorSettingsSetGamma_` (whose value arrives
+in the first floating-point register), `sceSystemGestureOpen`,
+`sceSystemGestureInitializePrimitiveTouchRecognizer`, `sceSystemGestureCreateTouchRecognizer`,
+`sceNetCtlInit`, `sceNetCtlGetState`, and `sceNpRegisterStateCallbackA`. The last five model
+hardware this host does not have; each reports the state that is actually true here — no touch
+occurs, no network link exists — rather than a placeholder, and that is recorded on each call.
+
+The title still submits no draws, and it plateaus in the same place. That is the useful result: the
+remaining defect is a behavioural difference, not a missing ABI. Something REmu returns or does
+differs from what the engine expects, and no further import coverage will find it. SharpEmu is
+reported to reach menus, intro video, and gameplay on this title, so a working reference exists to
+difference against; that comparison is the next step.
+
+Note for whoever picks this up: `scripts/audit-import-coverage.py` under-reports. It walks modules
+from `lib.rs` and does not recognise every dispatch shape, so it lists NIDs as unserved that
+demonstrably run — the whole fiber family, for instance. Its "unserved" count is an upper bound
+with a measurement artifact in it, not a work list.
 
 The fiber implementation is x86-64 only, because it saves and restores x86-64 register state. On
 any other host the NIDs fall through to the unimplemented path rather than to a stub, so its tests
