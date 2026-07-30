@@ -11,6 +11,7 @@ remu-shader = { path = "../remu-shader" }
 remu-shader-metal = { path = "../remu-shader-metal" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block.workspace = true
 core-graphics-types.workspace = true
 libc.workspace = true
 metal.workspace = true
