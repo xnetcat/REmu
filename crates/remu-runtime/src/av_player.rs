@@ -101,15 +101,42 @@ fn av_player_send_decoded_frame(
     sender: &SyncSender<Vec<u8>>,
     cancelled: &AtomicBool,
     mut frame: Vec<u8>,
+    kind: &'static str,
+    decoded_frame: u64,
 ) -> bool {
+    let mut queue_full_since: Option<Instant> = None;
+    let mut next_backpressure_report = Some(Duration::from_secs(1));
     loop {
         if cancelled.load(Ordering::Acquire) {
             return false;
         }
         match sender.try_send(frame) {
-            Ok(()) => return true,
+            Ok(()) => {
+                if av_player_trace_enabled()
+                    && let Some(queue_full_since) = queue_full_since
+                    && queue_full_since.elapsed() >= Duration::from_secs(1)
+                {
+                    eprintln!(
+                        "[REMu][AVPLAYER][TRACE] {kind} decoder queue resumed decoded_frame={decoded_frame} blocked_ms={}",
+                        queue_full_since.elapsed().as_millis(),
+                    );
+                }
+                return true;
+            }
             Err(TrySendError::Full(returned)) => {
                 frame = returned;
+                let queue_full_since = queue_full_since.get_or_insert_with(Instant::now);
+                if av_player_trace_enabled()
+                    && let Some(report_after) = next_backpressure_report
+                    && queue_full_since.elapsed() >= report_after
+                {
+                    eprintln!(
+                        "[REMu][AVPLAYER][TRACE] {kind} decoder queue full decoded_frame={decoded_frame} blocked_ms={} waiting_for_consumer=true",
+                        queue_full_since.elapsed().as_millis(),
+                    );
+                    next_backpressure_report =
+                        av_player_next_backpressure_report(Some(report_after));
+                }
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(TrySendError::Disconnected(_)) => return false,
@@ -117,17 +144,26 @@ fn av_player_send_decoded_frame(
     }
 }
 
+pub(crate) fn av_player_next_backpressure_report(previous: Option<Duration>) -> Option<Duration> {
+    let previous = previous?;
+    (previous < Duration::from_secs(64)).then(|| previous.saturating_mul(2))
+}
+
 fn av_player_decoder_worker(
     mut output: std::process::ChildStdout,
     frame_bytes: usize,
     sender: SyncSender<Vec<u8>>,
     cancelled: Arc<AtomicBool>,
+    kind: &'static str,
 ) {
+    let mut decoded_frame = 0_u64;
     while !cancelled.load(Ordering::Acquire) {
         let mut frame = vec![0_u8; frame_bytes];
-        if output.read_exact(&mut frame).is_err()
-            || !av_player_send_decoded_frame(&sender, &cancelled, frame)
-        {
+        if output.read_exact(&mut frame).is_err() {
+            break;
+        }
+        decoded_frame = decoded_frame.saturating_add(1);
+        if !av_player_send_decoded_frame(&sender, &cancelled, frame, kind, decoded_frame) {
             break;
         }
     }
@@ -752,7 +788,7 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
     let Ok(worker) = std::thread::Builder::new()
         .name(format!("REMu AVPlayer {kind}"))
         .spawn(move || {
-            av_player_decoder_worker(output, frame_bytes, sender, worker_cancelled);
+            av_player_decoder_worker(output, frame_bytes, sender, worker_cancelled, kind);
         })
     else {
         let _ = child.kill();
@@ -1656,8 +1692,10 @@ pub(crate) fn av_player_get_video_data(
             .get_or_insert((Instant::now(), player.next_video_frame));
         if player.next_video_frame <= 4 || player.next_video_frame.is_power_of_two() {
             eprintln!(
-                "[REMu][AVPLAYER] video frame={} timestamp_ms={timestamp} extended={extended}",
-                player.next_video_frame
+                "[REMu][AVPLAYER] video frame={} timestamp_ms={timestamp} extended={extended} thread={:?}/{:#x}",
+                player.next_video_frame,
+                current_guest_thread_name(),
+                current_guest_thread_handle(),
             );
         }
         1

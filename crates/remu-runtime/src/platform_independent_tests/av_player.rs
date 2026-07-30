@@ -6,6 +6,26 @@ use std::time::{Duration, Instant};
 use super::{ProbeDispatchState, sce_kernel_error};
 
 #[test]
+fn av_player_decoder_backpressure_trace_schedule_is_bounded() {
+    assert_eq!(
+        crate::av_player::av_player_next_backpressure_report(Some(Duration::from_secs(1))),
+        Some(Duration::from_secs(2))
+    );
+    assert_eq!(
+        crate::av_player::av_player_next_backpressure_report(Some(Duration::from_secs(32))),
+        Some(Duration::from_secs(64))
+    );
+    assert_eq!(
+        crate::av_player::av_player_next_backpressure_report(Some(Duration::from_secs(64))),
+        None
+    );
+    assert_eq!(
+        crate::av_player::av_player_next_backpressure_report(None),
+        None
+    );
+}
+
+#[test]
 fn av_player_resolves_relative_file_urls_inside_app0_case_insensitively() {
     let root = std::env::temp_dir().join(format!("remu-avplayer-path-{}", std::process::id()));
     std::fs::remove_dir_all(&root).ok();
