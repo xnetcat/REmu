@@ -33,23 +33,39 @@ impl Compiler<'_> {
     ) -> Result<(), String> {
         if export.target == 20 {
             let primitive = self.temp("uint", &self.raw_source(instruction, 0)?);
-            let lane = self.architectural_lane();
             self.line(
                 3,
-                &format!("if (exec && ({primitive} & 0x80000000u) == 0u) {{"),
+                &format!(
+                    "if (exec && remu_thread_index < {}u && ({primitive} & 0x80000000u) == 0u) {{",
+                    self.options.mesh_max_primitive_count
+                ),
             );
             self.line(
                 4,
-                &format!("remu_mesh.set_index({lane} * 3u + 0u, ({primitive} >> 0u) & 0x1ffu);"),
+                &format!(
+                    "remu_mesh.set_index(remu_thread_index * 3u + 0u, ({primitive} >> 0u) & 0x1ffu);"
+                ),
             );
             self.line(
                 4,
-                &format!("remu_mesh.set_index({lane} * 3u + 1u, ({primitive} >> 10u) & 0x1ffu);"),
+                &format!(
+                    "remu_mesh.set_index(remu_thread_index * 3u + 1u, ({primitive} >> 10u) & 0x1ffu);"
+                ),
             );
             self.line(
                 4,
-                &format!("remu_mesh.set_index({lane} * 3u + 2u, ({primitive} >> 20u) & 0x1ffu);"),
+                &format!(
+                    "remu_mesh.set_index(remu_thread_index * 3u + 2u, ({primitive} >> 20u) & 0x1ffu);"
+                ),
             );
+            if self.options.render_target_array_length > 1 {
+                self.line(
+                    4,
+                    &format!(
+                        "remu_mesh_primitive_source_vertices[remu_thread_index] = {primitive} & 0x1ffu;"
+                    ),
+                );
+            }
             self.line(3, "}");
             return Ok(());
         }
@@ -106,15 +122,21 @@ impl Compiler<'_> {
         }
         let values = self.export_float_values(instruction, export)?;
         let maximum_layer = self.options.render_target_array_length - 1;
-        let destination = match self.options.stage {
-            MetalShaderStage::Vertex => "remu_out.render_target_array_index",
-            MetalShaderStage::Mesh => "remu_mesh_render_target_indices[remu_thread_index]",
+        let (destination, lane_guard) = match self.options.stage {
+            MetalShaderStage::Vertex => ("remu_out.render_target_array_index", String::new()),
+            MetalShaderStage::Mesh => (
+                "remu_mesh_render_target_indices[remu_thread_index]",
+                format!(
+                    " && remu_thread_index < {}u",
+                    self.options.mesh_max_vertex_count
+                ),
+            ),
             _ => return Ok(()),
         };
         self.line(
             3,
             &format!(
-                "if (exec) {destination} = min(as_type<uint>({}), {maximum_layer}u);",
+                "if (exec{lane_guard}) {destination} = min(as_type<uint>({}), {maximum_layer}u);",
                 values[2]
             ),
         );

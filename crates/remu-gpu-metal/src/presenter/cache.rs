@@ -3,7 +3,8 @@
 
 use super::{
     CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
-    GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, PendingGlobalWriteback,
+    GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, NggSubgroupLimits,
+    PendingGlobalWriteback,
     SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey, UploadedGlobalBuffer,
     canonical_sampler_bindings, create_sampler_argument_buffer, guest_batch_writes_overlap,
     guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
@@ -536,11 +537,13 @@ impl MetalPresenter {
         &mut self,
         device: &Device,
         indices: &[u32],
+        limits: NggSubgroupLimits,
     ) -> Result<Option<CachedNggMeshlets>, String> {
-        if let Some(cached) = self.ngg_meshlet_cache.get(indices) {
+        let cache_key = (limits, indices.to_vec());
+        if let Some(cached) = self.ngg_meshlet_cache.get(&cache_key) {
             return Ok(Some(cached.clone()));
         }
-        let prepared = prepare_ngg_meshlets(indices);
+        let prepared = prepare_ngg_meshlets(indices, limits);
         if prepared.group_count == 0 {
             return Ok(None);
         }
@@ -563,7 +566,7 @@ impl MetalPresenter {
             self.ngg_meshlet_cache.clear();
         }
         self.ngg_meshlet_cache
-            .insert(indices.to_vec(), cached.clone());
+            .insert(cache_key, cached.clone());
         Ok(Some(cached))
     }
 }

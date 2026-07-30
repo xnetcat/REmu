@@ -426,11 +426,14 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 diagnostic_capture_vertex_position: false,
                 diagnostic_capture_pixel_output: false,
                 diagnostic_force_pixel_color: false,
+                mesh_max_vertex_count: 0,
+                mesh_max_primitive_count: 0,
+                mesh_threadgroup_size: 0,
                 lds_size_bytes: 0,
                 wave_lane_count: 64,
                 allocated_vector_register_count: 256,
             },
-            MetalShaderStage::Mesh => MetalCompileOptions::mesh(0, 16 * 1024),
+            MetalShaderStage::Mesh => MetalCompileOptions::mesh(0, 16 * 1024, 64, 64, 64),
         };
         let shader = compile_msl(&program, &empty_evaluation(), &options)
             .expect("VOP3P, conversion, lane, and integer program should lower");
