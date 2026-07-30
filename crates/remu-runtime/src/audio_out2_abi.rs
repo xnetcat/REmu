@@ -16,6 +16,7 @@ use crate::{process_guest_range_is_readable, read_guest_u32, read_guest_u64};
 #[derive(Debug, Default)]
 pub(crate) struct AudioOut2State {
     pub(crate) next_handle: u64,
+    pub(crate) next_port_id: u64,
     pub(crate) contexts: BTreeMap<u64, AudioOut2ContextState>,
     pub(crate) users: BTreeSet<u64>,
     pub(crate) ports: BTreeMap<u64, AudioOut2PortRuntimeState>,
@@ -168,6 +169,8 @@ pub(crate) const AUDIO_OUT2_PORT_STATE_SIZE: u64 =
 /// guess overwrote the next sixteen bytes of its stack frame.
 pub(crate) const AUDIO_OUT2_SPEAKER_INFO_SIZE: u64 = 0x40;
 pub(crate) const AUDIO_OUT2_PORT_TYPE_VIBRATION: u16 = 6;
+/// Fixed tag every AudioOut2 port handle carries in its high bits.
+pub(crate) const AUDIO_OUT2_PORT_HANDLE_TAG: u64 = 0x2000_0000;
 pub(crate) const SCE_AUDIO_OUT2_ERROR_NOT_READY: u32 = 0x8026_8008;
 
 pub(crate) const fn decode_audio_out2_channel_format(format: u32) -> Option<(u8, u64)> {
@@ -573,5 +576,17 @@ impl AudioOut2State {
         let handle = self.next_handle.max(1);
         self.next_handle = handle.saturating_add(1);
         handle
+    }
+
+    /// Builds a port handle in the layout the console hands out.
+    ///
+    /// A port handle is not an opaque counter: it carries a fixed tag, the low byte of the port
+    /// type, and a per-port identifier. Titles derive from that structure rather than treating the
+    /// value as a token — one audio engine here reads a port back out of it and asserts when the
+    /// arithmetic lands somewhere impossible, which is what plain sequential handles produced.
+    pub(crate) fn allocate_port_handle(&mut self, port_type: u16) -> u64 {
+        let port_id = self.next_port_id.max(1);
+        self.next_port_id = port_id.saturating_add(1);
+        AUDIO_OUT2_PORT_HANDLE_TAG | (u64::from(port_type & 0xff) << 16) | (port_id & 0xffff)
     }
 }

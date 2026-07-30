@@ -8,6 +8,9 @@ use super::{
     rtc_get_current_tick, rtc_get_tick, rtc_set_tick, unix_days_from_civil,
 };
 
+/// The console kernel is FreeBSD-derived and its clock identifiers are FreeBSD's. Answering every
+/// one of them with calendar time was wrong for the clocks whose whole promise is that they never
+/// step backwards, which is what a game engine times frames against.
 #[test]
 fn process_clock_is_monotonic() {
     let mut previous = process_clock_nanos();
@@ -34,20 +37,47 @@ fn process_time_preserves_nanosecond_scaling_and_saturates() {
 }
 
 #[test]
-fn translates_console_clock_ids_to_realtime() {
+fn console_clock_ids_select_calendar_or_monotonic_time() {
+    let read = |clock_id: u64| {
+        let mut output = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            guest_clock_gettime(clock_id, (&raw mut output).addr() as u64),
+            0
+        );
+        assert!((0..1_000_000_000).contains(&output.tv_nsec));
+        u64::try_from(output.tv_sec).unwrap()
+    };
     let before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let mut output = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    assert_eq!(guest_clock_gettime(4, (&raw mut output).addr() as u64), 0);
-    let seconds = u64::try_from(output.tv_sec).unwrap();
-    assert!(seconds >= before);
-    assert!(seconds <= before + 2);
-    assert!((0..1_000_000_000).contains(&output.tv_nsec));
+
+    // CLOCK_REALTIME and its precise, fast, and coarse spellings all report calendar time.
+    for realtime in [0, 9, 10, 13] {
+        let seconds = read(realtime);
+        assert!(seconds >= before, "clock {realtime} reported before now");
+        assert!(
+            seconds <= before + 2,
+            "clock {realtime} reported the future"
+        );
+    }
+
+    // CLOCK_MONOTONIC and CLOCK_UPTIME count from an unspecified origin, not the epoch, and must
+    // never run backwards.
+    for monotonic in [4, 5, 7, 8, 11, 12] {
+        let seconds = read(monotonic);
+        assert!(
+            seconds < before,
+            "clock {monotonic} reported calendar time instead of a monotonic origin"
+        );
+        assert!(
+            read(monotonic) >= seconds,
+            "clock {monotonic} stepped backwards"
+        );
+    }
 }
 
 #[test]

@@ -9402,26 +9402,51 @@ fn guest_kernel_sleep(seconds: u64) -> u64 {
     0
 }
 
+/// Translates a guest clock identifier to the host clock that answers it.
+///
+/// The console kernel is FreeBSD-derived and its clock identifiers are FreeBSD's, which do not
+/// share Darwin's numbering. Answering every one of them with wall-clock time was wrong in the way
+/// that matters most to a game engine: a monotonic or uptime clock must never step backwards, and
+/// calendar time does whenever the host clock is adjusted. The precise and fast variants differ
+/// only in the cost the console pays to read them, so they map to the same host clock here.
+const fn host_clock_for_guest_clock(clock_id: u64) -> libc::clockid_t {
+    match clock_id {
+        // CLOCK_MONOTONIC, _PRECISE, _FAST.
+        4 | 11 | 12 => libc::CLOCK_MONOTONIC,
+        // CLOCK_UPTIME, _PRECISE, _FAST. Darwin's raw uptime excludes clock adjustment, which is
+        // what an uptime clock promises.
+        5 | 7 | 8 => libc::CLOCK_UPTIME_RAW,
+        // CLOCK_THREAD_CPUTIME_ID.
+        14 => libc::CLOCK_THREAD_CPUTIME_ID,
+        // CLOCK_VIRTUAL and CLOCK_PROF measure process time; CLOCK_PROCESS_CPUTIME_ID names it.
+        1 | 2 | 15 => libc::CLOCK_PROCESS_CPUTIME_ID,
+        // CLOCK_REALTIME, _PRECISE, _FAST, and CLOCK_SECOND, which is coarse calendar time.
+        _ => libc::CLOCK_REALTIME,
+    }
+}
+
 fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
     if output == 0 {
         return u64::MAX;
     }
-    // Console clock ids do not share Darwin's numeric constants. This POSIX compatibility export
-    // returns wall-clock time, matching the console runtime's observable calendar-time contract.
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let seconds = elapsed.as_secs();
-    let nanoseconds = u64::from(elapsed.subsec_nanos());
-    write_guest_u64(output, seconds);
-    write_guest_u64(output + 8, nanoseconds);
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: timestamp is a valid writable host timespec.
+    let status =
+        unsafe { libc::clock_gettime(host_clock_for_guest_clock(clock_id), &raw mut timestamp) };
+    if status == 0 {
+        write_guest_u64(output, u64::try_from(timestamp.tv_sec).unwrap_or(0));
+        write_guest_u64(output + 8, u64::try_from(timestamp.tv_nsec).unwrap_or(0));
+    }
     if trace_guest_time() {
         eprintln!(
-            "[REMu][TIME] clock_gettime id={} output={output:#x} status=0 sec={} nsec={}",
-            clock_id, seconds, nanoseconds
+            "[REMu][TIME] clock_gettime id={} output={output:#x} status={status} sec={} nsec={}",
+            clock_id, timestamp.tv_sec, timestamp.tv_nsec
         );
     }
-    0
+    signed_i32_return(status)
 }
 
 fn guest_kernel_gettimeofday(output: u64) -> u64 {
