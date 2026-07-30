@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-use super::GuestPhysicalBacking;
+use super::{GuestPhysicalBacking, GuestSharedBackingView, align_up, host_page_size, host_size};
 
 #[derive(Clone, Debug)]
 struct SharedMappingRecord {
@@ -26,6 +26,44 @@ pub struct GuestSharedMappingIdentity {
 pub struct GuestSharedBackingSegment {
     pub address: u64,
     pub byte_count: u64,
+}
+
+/// A live guest range resolved to one page-aligned physical-backing view.
+///
+/// The range carries a backing clone but does not map it until [`Self::map_view`] is called. This
+/// lets GPU caches look up an existing identity view without paying for a redundant mmap.
+#[derive(Clone, Debug)]
+pub struct GuestSharedBackingRange {
+    backing: GuestPhysicalBacking,
+    view_identity: GuestSharedMappingIdentity,
+    view_byte_count: usize,
+    resource_offset: u64,
+}
+
+impl GuestSharedBackingRange {
+    /// Identity of the first byte in the page-aligned backing view.
+    #[must_use]
+    pub const fn view_identity(&self) -> GuestSharedMappingIdentity {
+        self.view_identity
+    }
+
+    #[must_use]
+    pub const fn view_byte_count(&self) -> usize {
+        self.view_byte_count
+    }
+
+    /// Offset of the requested guest byte range inside the page-aligned view.
+    #[must_use]
+    pub const fn resource_offset(&self) -> u64 {
+        self.resource_offset
+    }
+
+    /// Maps the resolved backing interval read-write for a coherent CPU/GPU shared view.
+    #[must_use]
+    pub fn map_view(&self) -> Option<GuestSharedBackingView> {
+        self.backing
+            .map_shared_view(self.view_identity.backing_offset, self.view_byte_count)
+    }
 }
 
 static SHARED_MAPPINGS: OnceLock<Mutex<BTreeMap<u64, SharedMappingRecord>>> = OnceLock::new();
@@ -138,6 +176,46 @@ pub fn guest_shared_backing_identity(
             backing_offset: physical_start,
         },
     )
+}
+
+/// Resolves an exact live guest range to a lazily mapped, page-aligned backing view.
+///
+/// Unlike a no-copy view over the guest VA, this remains contiguous when consecutive physical
+/// pages are exposed through unrelated CPU aliases. Only the requested physical bytes require
+/// live guest mapping coverage; page padding is mapped directly from the same backing object.
+#[must_use]
+pub fn guest_shared_backing_range(
+    address: u64,
+    byte_count: u64,
+) -> Option<GuestSharedBackingRange> {
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backing, physical_start, physical_end) =
+        resolve_shared_backing_range(&mappings, address, byte_count)?;
+    drop(mappings);
+
+    let page_size = host_page_size().ok()?;
+    let view_start = physical_start - physical_start % page_size;
+    let resource_offset = physical_start.checked_sub(view_start)?;
+    let requested_bytes = physical_end.checked_sub(physical_start)?;
+    let view_byte_count = resource_offset
+        .checked_add(requested_bytes)
+        .and_then(|length| align_up(length, page_size).ok())
+        .and_then(|length| host_size(length).ok())?;
+    view_start
+        .checked_add(u64::try_from(view_byte_count).ok()?)
+        .filter(|end| *end <= backing.size())?;
+
+    Some(GuestSharedBackingRange {
+        view_identity: GuestSharedMappingIdentity {
+            backing_id: backing.id(),
+            backing_offset: view_start,
+        },
+        backing,
+        view_byte_count,
+        resource_offset,
+    })
 }
 
 fn ranges_overlap(left: u64, left_end: u64, right: u64, right_end: u64) -> bool {

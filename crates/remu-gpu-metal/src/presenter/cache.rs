@@ -6,15 +6,16 @@ use super::{
     GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, NggSubgroupLimits,
     PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey,
     UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
-    describe_guest_batch, guest_batch_writes_overlap, guest_global_buffer_view,
-    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
+    describe_guest_batch, guest_batch_writes_overlap, guest_physical_ranges_overlap,
+    metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
+use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
 use metal::{
     Buffer, DepthStencilDescriptor, DepthStencilState, Device, Function, MTLCompareFunction,
     MTLResourceOptions, SamplerState,
 };
-use remu_memory::{guest_shared_mapping_identity, read_guest_shared_backing};
+use remu_memory::{GuestSharedBackingRange, guest_shared_backing_range, read_guest_shared_backing};
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -78,6 +79,28 @@ fn indirect_producer_overlap_summary(
             .then(|| format!("memory-write@{write_address:#x}/{write_byte_count:#x}"))
     }));
     overlaps.join(",")
+}
+
+pub(super) fn metal_buffer_with_guest_backing_range(
+    device: &Device,
+    backing_range: &GuestSharedBackingRange,
+) -> Option<Buffer> {
+    let backing_view = backing_range.map_view()?;
+    let backing_pointer = backing_view.as_ptr();
+    let view_byte_count = u64::try_from(backing_view.byte_count()).ok()?;
+    let deallocator = ConcreteBlock::new(move |_bytes: *const c_void, _length: u64| {
+        // Metal invokes this callback only when the final Buffer reference is released.
+        // Capturing the mmap owner keeps the no-copy storage alive for cached and in-flight
+        // command-buffer references alike.
+        let _ = &backing_view;
+    })
+    .copy();
+    Some(device.new_buffer_with_bytes_no_copy(
+        backing_pointer,
+        view_byte_count,
+        MTLResourceOptions::StorageModeShared,
+        Some(&deallocator),
+    ))
 }
 
 impl MetalPresenter {
@@ -502,72 +525,53 @@ impl MetalPresenter {
         device: &Device,
         binding: &GlobalMemoryBinding,
     ) -> Result<Option<UploadedGlobalBuffer>, String> {
-        let Some((page_address, page_byte_count, offset)) = guest_global_buffer_view(binding)?
-        else {
-            return Ok(None);
-        };
-        let page_byte_count_u64 = u64::try_from(page_byte_count)
-            .map_err(|_| "page-aligned guest global size does not fit u64")?;
-        if page_byte_count_u64 > GUEST_GLOBAL_BUFFER_MAX_ZERO_COPY_BYTES {
+        if binding.byte_count == 0
+            || binding.base_address < 0x10_000
+            || !binding.base_address.is_multiple_of(4)
+        {
             return Ok(None);
         }
-        // `new_buffer_with_bytes_no_copy` needs every page in the outward-aligned host range.
-        // Validating only the shader's interior binding left the first/last page able to cross a
-        // retired mapping, which macOS reports as IOGPUSysMemory::memoryDescriptorWithClientBuffer
-        // failure and can leave waitUntilCompleted blocked indefinitely.
-        let Some(mapping_identity) =
-            guest_shared_mapping_identity(page_address, page_byte_count_u64)
+        let byte_count = u64::try_from(binding.byte_count)
+            .map_err(|_| "guest global byte count does not fit u64")?;
+        let Some(backing_range) = guest_shared_backing_range(binding.base_address, byte_count)
         else {
             return Ok(None);
         };
-        let key = (page_address, page_byte_count, mapping_identity);
+        let view_byte_count_u64 = u64::try_from(backing_range.view_byte_count())
+            .map_err(|_| "page-aligned guest global size does not fit u64")?;
+        if view_byte_count_u64 > GUEST_GLOBAL_BUFFER_MAX_ZERO_COPY_BYTES {
+            return Ok(None);
+        }
+        let view_identity = backing_range.view_identity();
+        let key = (view_identity, backing_range.view_byte_count());
         let buffer = if let Some(buffer) = self.guest_global_buffer_cache.get(&key) {
             buffer.clone()
         } else {
-            // Drop a cached view when the same VA is rebound to a different physical allocation.
-            // In-flight command batches retain their own Buffer clones until completion.
-            let mut retired_bytes = 0_u64;
-            self.guest_global_buffer_cache
-                .retain(|(cached_address, cached_bytes, _), buffer| {
-                    let retain =
-                        *cached_address != page_address || *cached_bytes != page_byte_count;
-                    if !retain {
-                        retired_bytes = retired_bytes.saturating_add(buffer.length());
-                    }
-                    retain
-                });
-            self.guest_global_buffer_cache_bytes = self
-                .guest_global_buffer_cache_bytes
-                .saturating_sub(retired_bytes);
             if self.guest_global_buffer_cache.len() >= GUEST_GLOBAL_BUFFER_CACHE_CAPACITY
                 || self
                     .guest_global_buffer_cache_bytes
-                    .saturating_add(page_byte_count_u64)
+                    .saturating_add(view_byte_count_u64)
                     > GUEST_GLOBAL_BUFFER_CACHE_BYTE_CAPACITY
             {
                 self.guest_global_buffer_cache.clear();
                 self.guest_global_buffer_cache_bytes = 0;
             }
-            let buffer = device.new_buffer_with_bytes_no_copy(
-                usize::try_from(page_address)
-                    .map_err(|_| "guest global address does not fit the host pointer")?
-                    as *const c_void,
-                page_byte_count_u64,
-                MTLResourceOptions::StorageModeShared,
-                None,
-            );
+            let Some(buffer) = metal_buffer_with_guest_backing_range(device, &backing_range) else {
+                return Ok(None);
+            };
             buffer.set_label(&format!(
-                "REMu zero-copy guest global {page_address:#x}/{page_byte_count}"
+                "REMu zero-copy guest global backing={:#x}+{:#x}/{view_byte_count_u64}",
+                view_identity.backing_id, view_identity.backing_offset
             ));
             self.guest_global_buffer_cache.insert(key, buffer.clone());
             self.guest_global_buffer_cache_bytes = self
                 .guest_global_buffer_cache_bytes
-                .saturating_add(page_byte_count_u64);
+                .saturating_add(view_byte_count_u64);
             buffer
         };
         Ok(Some(UploadedGlobalBuffer {
             buffer,
-            offset,
+            offset: backing_range.resource_offset(),
             guest_memory: true,
         }))
     }

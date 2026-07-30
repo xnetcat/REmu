@@ -6,7 +6,7 @@ use metal::{
     Buffer, Device, Function, MTLCompareFunction, MTLResourceOptions, MTLSamplerAddressMode,
     MTLSamplerMinMagFilter, MTLSamplerMipFilter, SamplerDescriptor, SamplerState,
 };
-use remu_shader::{GlobalMemoryBinding, ImageBinding, ShaderEvaluation, image_is_comparison};
+use remu_shader::{ImageBinding, ShaderEvaluation, image_is_comparison};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -26,46 +26,6 @@ pub(super) fn metal_buffer_with_bytes(device: &Device, bytes: &[u8]) -> Result<B
         length,
         MTLResourceOptions::StorageModeShared,
     ))
-}
-
-pub(super) fn guest_global_buffer_view(
-    binding: &GlobalMemoryBinding,
-) -> Result<Option<(u64, usize, u64)>, String> {
-    if binding.byte_count == 0
-        || binding.base_address < 0x10_000
-        || !binding.base_address.is_multiple_of(4)
-    {
-        return Ok(None);
-    }
-    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-    let page_size = *PAGE_SIZE.get_or_init(|| {
-        // SAFETY: sysconf is side-effect free for this process-wide constant.
-        let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        usize::try_from(value)
-            .ok()
-            .filter(|value| value.is_power_of_two())
-            .unwrap_or(16 * 1024)
-    });
-    let base = usize::try_from(binding.base_address)
-        .map_err(|_| "guest global address does not fit the host pointer")?;
-    let end = base
-        .checked_add(binding.byte_count)
-        .ok_or("guest global byte range overflows")?;
-    let page_base = base & !(page_size - 1);
-    let page_end = end
-        .checked_add(page_size - 1)
-        .map(|value| value & !(page_size - 1))
-        .ok_or("page-aligned guest global byte range overflows")?;
-    let page_byte_count = page_end
-        .checked_sub(page_base)
-        .ok_or("page-aligned guest global byte range underflows")?;
-    let offset = u64::try_from(base - page_base)
-        .map_err(|_| "guest global page offset does not fit Metal")?;
-    Ok(Some((
-        u64::try_from(page_base).map_err(|_| "guest global page address does not fit u64")?,
-        page_byte_count,
-        offset,
-    )))
 }
 
 pub(super) fn sampler_address_mode(value: u32) -> MTLSamplerAddressMode {

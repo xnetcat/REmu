@@ -174,6 +174,38 @@ pub struct GuestPhysicalBacking {
     pub(super) inner: Arc<BackingInner>,
 }
 
+/// One page-aligned writable mapping of a shared guest physical backing.
+///
+/// This mapping is independent of the guest virtual aliases which exposed the backing range.
+/// Consumers may retain it while asynchronous GPU work is in flight; dropping it releases the
+/// host virtual mapping without changing the backing object or any guest alias.
+#[derive(Debug)]
+pub struct GuestSharedBackingView {
+    address: usize,
+    byte_count: usize,
+}
+
+impl GuestSharedBackingView {
+    #[must_use]
+    pub const fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.address as *const std::ffi::c_void
+    }
+
+    #[must_use]
+    pub const fn byte_count(&self) -> usize {
+        self.byte_count
+    }
+}
+
+impl Drop for GuestSharedBackingView {
+    fn drop(&mut self) {
+        // SAFETY: this object owns the complete mmap interval and releases it exactly once.
+        unsafe {
+            libc::munmap(self.address as *mut libc::c_void, self.byte_count);
+        }
+    }
+}
+
 impl GuestPhysicalBacking {
     pub fn new(size: u64) -> Result<Self, AddressSpaceError> {
         if size == 0 {
@@ -240,6 +272,38 @@ impl GuestPhysicalBacking {
     #[must_use]
     pub fn size(&self) -> u64 {
         self.inner.size
+    }
+
+    pub(super) fn map_shared_view(
+        &self,
+        backing_offset: u64,
+        byte_count: usize,
+    ) -> Option<GuestSharedBackingView> {
+        if byte_count == 0
+            || backing_offset.checked_add(u64::try_from(byte_count).ok()?)? > self.size()
+        {
+            return None;
+        }
+        let file_offset = libc::off_t::try_from(backing_offset).ok()?;
+        // SAFETY: the shared-range resolver validated the interval against this live backing.
+        // The returned owner keeps the mapping alive until its eventual Drop.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte_count,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                self.inner.descriptor,
+                file_offset,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return None;
+        }
+        Some(GuestSharedBackingView {
+            address: mapping as usize,
+            byte_count,
+        })
     }
 
     pub(super) fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> bool {
