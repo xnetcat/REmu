@@ -806,12 +806,13 @@ fn av_player_read_audio_frame(player: &mut AvPlayerInstance) -> AvPlayerFrameSta
     }
 }
 
-fn av_player_finish_stream(player: &mut AvPlayerInstance) {
+fn av_player_finish_stream(player: &mut AvPlayerInstance) -> Option<(u64, u64)> {
     if player.looping {
         player.reset_playback();
         let now = Instant::now();
         player.playing_since = Some(now);
         player.presentation_anchor_host = Some(now);
+        None
     } else {
         let started = player.playing_since.take();
         player.stop_decoders();
@@ -825,6 +826,7 @@ fn av_player_finish_stream(player: &mut AvPlayerInstance) {
             player.presentation_clock_reported = player.duration;
         }
         player.presentation_anchor_host = None;
+        Some((player.event_callback, player.event_object))
     }
 }
 
@@ -1528,7 +1530,16 @@ pub(crate) fn av_player_get_video_data(
                 return 0;
             }
             AvPlayerFrameStatus::Finished => {
-                av_player_finish_stream(player);
+                let callback = av_player_finish_stream(player);
+                if let Some((function, object)) = callback {
+                    av_player_queue_event(
+                        function,
+                        object,
+                        1,
+                        AvPlayerEventDelivery::Controller,
+                        state,
+                    );
+                }
                 return 0;
             }
         }
@@ -1548,7 +1559,16 @@ pub(crate) fn av_player_get_video_data(
             return 0;
         }
         AvPlayerFrameStatus::Finished => {
-            av_player_finish_stream(player);
+            let callback = av_player_finish_stream(player);
+            if let Some((function, object)) = callback {
+                av_player_queue_event(
+                    function,
+                    object,
+                    1,
+                    AvPlayerEventDelivery::Controller,
+                    state,
+                );
+            }
             return 0;
         }
     }
