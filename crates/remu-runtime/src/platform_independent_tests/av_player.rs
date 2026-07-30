@@ -146,6 +146,11 @@ fn av_player_source_is_active_while_ready_before_start_and_inactive_after_stop()
     let mut state = ProbeDispatchState::default();
     state.game_root = root.clone();
     let handle = av_player_test_player(&mut state);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.event_callback = 0x1234;
+        player.event_object = 0x5678;
+    }
     let source = b"/app0/media/clip.mp4\0";
     assert_eq!(
         crate::av_player_add_source(
@@ -154,6 +159,14 @@ fn av_player_source_is_active_while_ready_before_start_and_inactive_after_stop()
         ),
         0
     );
+    assert_eq!(state.av_player.pending_callbacks.len(), 1);
+    assert_eq!(state.av_player.pending_callbacks[0].event, 2);
+    assert_eq!(
+        state.av_player.pending_callbacks[0].delivery,
+        crate::AvPlayerEventDelivery::Controller,
+        "Ready is an asynchronous controller-thread notification"
+    );
+    state.av_player.pending_callbacks.clear();
     assert_eq!(
         crate::av_player_is_active(handle, &state),
         1,
@@ -173,6 +186,45 @@ fn av_player_source_is_active_while_ready_before_start_and_inactive_after_stop()
     );
     assert_eq!(crate::av_player_close(handle, &mut state), 0);
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn av_player_playback_events_stay_on_the_initiating_guest_thread() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.event_callback = 0x1234;
+        player.event_object = 0x5678;
+        player.source = Some("test-source".to_owned());
+    }
+
+    for (operation, expected_event) in [
+        (
+            crate::av_player_start as fn(u64, &mut ProbeDispatchState) -> u64,
+            3,
+        ),
+        (crate::av_player_pause, 4),
+        (crate::av_player_resume, 3),
+        (crate::av_player_stop, 1),
+    ] {
+        assert_eq!(operation(handle, &mut state), 0);
+        let callbacks = crate::take_av_player_calling_thread_callbacks(&mut state);
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].event, expected_event);
+        assert_eq!(callbacks[0].function, 0x1234);
+        assert_eq!(callbacks[0].object, 0x5678);
+        assert_eq!(
+            callbacks[0].delivery,
+            crate::AvPlayerEventDelivery::CallingThread
+        );
+        assert!(
+            state.av_player.pending_callbacks.is_empty(),
+            "a synchronous state notification must not be stealable by a later importer"
+        );
+    }
+
+    assert_eq!(crate::av_player_close(handle, &mut state), 0);
 }
 
 #[test]

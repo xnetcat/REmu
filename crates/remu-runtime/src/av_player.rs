@@ -7,8 +7,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::{
-    AvPlayerDecoder, AvPlayerEventCallback, AvPlayerInstance, AvPlayerTextureDeallocation,
-    PROBE_DISPATCH, ProbeDispatchState, guest_aligned_alloc, guest_memset,
+    AvPlayerDecoder, AvPlayerEventCallback, AvPlayerEventDelivery, AvPlayerInstance,
+    AvPlayerTextureDeallocation, PROBE_DISPATCH, ProbeDispatchState, current_guest_thread_handle,
+    current_guest_thread_name, guest_aligned_alloc, guest_memset,
     process_guest_range_has_read_access, process_guest_range_is_readable, read_guest_cstring,
     read_guest_u8, read_guest_u32, read_guest_u64, resolve_guest_path, sce_kernel_error,
     write_guest_u8, write_guest_u16, write_guest_u32, write_guest_u64,
@@ -404,7 +405,13 @@ pub(crate) fn av_player_post_init(arguments: [u64; 6], state: &ProbeDispatchStat
     0
 }
 
-fn av_player_queue_event(function: u64, object: u64, event: u64, state: &mut ProbeDispatchState) {
+fn av_player_queue_event(
+    function: u64,
+    object: u64,
+    event: u64,
+    delivery: AvPlayerEventDelivery,
+    state: &mut ProbeDispatchState,
+) {
     if function == 0 {
         eprintln!("[REMu][AVPLAYER] skipped event={event} without callback");
         return;
@@ -416,7 +423,23 @@ fn av_player_queue_event(function: u64, object: u64, event: u64, state: &mut Pro
             function,
             object,
             event,
+            delivery,
         });
+}
+
+pub(crate) fn take_av_player_calling_thread_callbacks(
+    state: &mut ProbeDispatchState,
+) -> Vec<AvPlayerEventCallback> {
+    let mut calling_thread = Vec::new();
+    state.av_player.pending_callbacks.retain(|callback| {
+        if callback.delivery == AvPlayerEventDelivery::CallingThread {
+            calling_thread.push(*callback);
+            false
+        } else {
+            true
+        }
+    });
+    calling_thread
 }
 
 pub(crate) fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallback>) {
@@ -436,8 +459,11 @@ pub(crate) fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallb
         // SAFETY: The callback ABI is `(object, event, source_id, event_data)`.
         unsafe { function(callback.object, callback.event, 0, 0) };
         eprintln!(
-            "[REMu][AVPLAYER] delivered event={} callback={:#x}",
-            callback.event, callback.function
+            "[REMu][AVPLAYER] delivered event={} callback={:#x} thread={:?}/{:#x}",
+            callback.event,
+            callback.function,
+            current_guest_thread_name(),
+            current_guest_thread_handle(),
         );
     }
 }
@@ -609,9 +635,22 @@ pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatc
         player.has_audio,
         player.auto_start,
     );
-    av_player_queue_event(callback.0, callback.1, 2, state);
+    av_player_queue_event(
+        callback.0,
+        callback.1,
+        2,
+        AvPlayerEventDelivery::Controller,
+        state,
+    );
     if callback.2 {
-        av_player_queue_event(callback.0, callback.1, 3, state);
+        // Auto-start is performed as part of the controller's Ready transition.
+        av_player_queue_event(
+            callback.0,
+            callback.1,
+            3,
+            AvPlayerEventDelivery::Controller,
+            state,
+        );
     }
     0
 }
@@ -1131,7 +1170,13 @@ pub(crate) fn av_player_pause(handle: u64, state: &mut ProbeDispatchState) -> u6
     player.paused = true;
     player.video_catch_up_origin = None;
     let callback = (player.event_callback, player.event_object);
-    av_player_queue_event(callback.0, callback.1, 4, state);
+    av_player_queue_event(
+        callback.0,
+        callback.1,
+        4,
+        AvPlayerEventDelivery::CallingThread,
+        state,
+    );
     0
 }
 
@@ -1149,7 +1194,13 @@ pub(crate) fn av_player_start(handle: u64, state: &mut ProbeDispatchState) -> u6
     player.playing_since.get_or_insert_with(Instant::now);
     let callback = (player.event_callback, player.event_object);
     eprintln!("[REMu][AVPLAYER] started handle={handle:#x}");
-    av_player_queue_event(callback.0, callback.1, 3, state);
+    av_player_queue_event(
+        callback.0,
+        callback.1,
+        3,
+        AvPlayerEventDelivery::CallingThread,
+        state,
+    );
     0
 }
 
@@ -1166,7 +1217,13 @@ pub(crate) fn av_player_resume(handle: u64, state: &mut ProbeDispatchState) -> u
     player.playing_since = Some(Instant::now());
     let callback = (player.event_callback, player.event_object);
     eprintln!("[REMu][AVPLAYER] resumed handle={handle:#x}");
-    av_player_queue_event(callback.0, callback.1, 3, state);
+    av_player_queue_event(
+        callback.0,
+        callback.1,
+        3,
+        AvPlayerEventDelivery::CallingThread,
+        state,
+    );
     0
 }
 
@@ -1210,7 +1267,13 @@ pub(crate) fn av_player_stop(handle: u64, state: &mut ProbeDispatchState) -> u64
     player.active_session = false;
     player.paused = false;
     let callback = (player.event_callback, player.event_object);
-    av_player_queue_event(callback.0, callback.1, 1, state);
+    av_player_queue_event(
+        callback.0,
+        callback.1,
+        1,
+        AvPlayerEventDelivery::CallingThread,
+        state,
+    );
     0
 }
 
