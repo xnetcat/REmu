@@ -108,7 +108,40 @@ impl OrderedGpuEventReceiver {
             .values()
             .any(|reason| matches!(reason, QueueBlockReason::GuestMemoryWait(_)))
             || matches!(self.host_block, Some(QueueBlockReason::GuestMemoryWait(_)));
-        has_memory_wait && !self.has_runnable_events()
+        has_memory_wait && !self.has_dependency_runnable_events()
+    }
+
+    /// Returns whether one current queue front can execute without first polling a memory wait.
+    ///
+    /// A wait is popped before the presenter can prove it unsatisfied and reinsert it with a
+    /// block reason. Because processing stops at that point, two queues whose fronts are waits
+    /// alternate between "blocked" and "not yet polled" on successive AppKit ticks. Treating the
+    /// latter as runnable prevents dependency ingress forever once the ordinary pending cap is
+    /// full, even when a third queue containing the producer is already waiting in the channel.
+    ///
+    /// Only the front event of each queue is relevant. Work in later submissions cannot overtake
+    /// a front wait and therefore cannot make progress or satisfy another queue.
+    fn has_dependency_runnable_events(&self) -> bool {
+        if self.host_block.is_none()
+            && self
+                .host_events
+                .front()
+                .is_some_and(|host| !event_is_memory_wait(&host.event))
+        {
+            return true;
+        }
+        self.queue_order.iter().any(|queue_id| {
+            !self.blocked_queues.contains_key(queue_id)
+                && self
+                    .submissions
+                    .get(queue_id)
+                    .and_then(|submissions| {
+                        submissions
+                            .iter()
+                            .find_map(|submission| submission.events.front())
+                    })
+                    .is_some_and(|event| !event_is_memory_wait(event))
+        })
     }
 
     /// Pulls bounded channel chunks while the current block graph can still identify them as
@@ -645,6 +678,13 @@ fn event_has_pipeline_work(event: &GpuEvent) -> bool {
     matches!(
         event,
         GpuEvent::IndexedDraw(_) | GpuEvent::ComputeDispatch(_)
+    )
+}
+
+fn event_is_memory_wait(event: &GpuEvent) -> bool {
+    matches!(
+        event,
+        GpuEvent::MemoryWait(_) | GpuEvent::RegisteredMemoryWait { .. }
     )
 }
 
