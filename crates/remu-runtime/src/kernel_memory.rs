@@ -13,6 +13,14 @@ use remu_memory::{
 use thiserror::Error;
 
 pub(super) const DIRECT_MEMORY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+/// Size of the flexible-memory pool the guest may map without owning direct memory.
+///
+/// Flexible memory is a separate, much smaller budget than direct memory: the kernel commits it
+/// on demand and charges every flexible mapping against this total. The figure pairs with the
+/// 16 GiB direct-memory total above and matches SharpEmu, whose PS5 kernel surface uses the same
+/// pair. A title may override its own budget through `mem_param->flexible_memory_size` in its
+/// process parameters; that override is not read yet, and no title exercised here sets it.
+pub(super) const FLEXIBLE_MEMORY_SIZE: u64 = 448 * 1024 * 1024;
 /// Size of the managed guest virtual address space.
 ///
 /// This is address space, not memory: the host reservation is one `PROT_NONE` mapping and pages
@@ -233,6 +241,56 @@ impl DirectMemory {
             })
             .flatten()
     }
+
+    /// Reports the largest unallocated span inside `[search_start, search_end)` whose base meets
+    /// `alignment`, as `(start, size)`.
+    ///
+    /// This is the query side of [`Self::allocate`] and must stay consistent with it: a guest
+    /// asks how much direct memory is left and then allocates exactly that, so a span reported
+    /// here that `allocate` would refuse corrupts the guest's own accounting.
+    fn available(&self, search_start: u64, search_end: u64, alignment: u64) -> Option<(u64, u64)> {
+        let mut best: Option<(u64, u64)> = None;
+        let mut cursor = search_start;
+        for allocation in self.allocations.values() {
+            if allocation.end <= cursor {
+                continue;
+            }
+            if allocation.start >= search_end {
+                break;
+            }
+            if cursor < allocation.start {
+                best = larger_aligned_span(best, cursor, allocation.start, alignment);
+            }
+            cursor = allocation.end;
+            if cursor >= search_end {
+                return best;
+            }
+        }
+        larger_aligned_span(best, cursor, search_end, alignment)
+    }
+}
+
+/// Keeps whichever is larger of `best` and the aligned remainder of `[hole_start, hole_end)`.
+fn larger_aligned_span(
+    best: Option<(u64, u64)>,
+    hole_start: u64,
+    hole_end: u64,
+    alignment: u64,
+) -> Option<(u64, u64)> {
+    // Alignment can consume the whole hole, and an alignment near u64::MAX can overflow the
+    // rounding itself. Neither is an error; the hole simply offers nothing, and an earlier hole
+    // that did offer something must survive.
+    let Some(base) = align_up(hole_start, alignment) else {
+        return best;
+    };
+    if base >= hole_end {
+        return best;
+    }
+    let size = hole_end - base;
+    match best {
+        Some((_, best_size)) if best_size >= size => best,
+        _ => Some((base, size)),
+    }
 }
 
 #[derive(Debug)]
@@ -333,6 +391,25 @@ impl KernelMemory {
         ranges
     }
 
+    /// Returns the number of bytes currently mapped as flexible memory.
+    ///
+    /// This is derived from the live mappings rather than kept in a running counter, so every
+    /// unmap, partial unmap, replacement, and failed-mapping rollback is accounted for by
+    /// construction instead of by remembering to adjust a total on each path.
+    pub fn flexible_usage(&self) -> u64 {
+        self.virtual_memory
+            .vmas()
+            .into_iter()
+            .filter(|mapping| mapping.metadata & FLEXIBLE_METADATA_BIT != 0)
+            .map(|mapping| mapping.size)
+            .sum()
+    }
+
+    /// Returns the flexible-memory bytes the guest may still map.
+    pub fn available_flexible(&self) -> u64 {
+        FLEXIBLE_MEMORY_SIZE.saturating_sub(self.flexible_usage())
+    }
+
     pub fn allocate_direct(
         &mut self,
         search_start: u64,
@@ -343,6 +420,16 @@ impl KernelMemory {
     ) -> Result<u64, KernelMemoryError> {
         self.direct_memory
             .allocate(search_start, search_end, size, alignment, memory_type)
+    }
+
+    pub fn available_direct(
+        &self,
+        search_start: u64,
+        search_end: u64,
+        alignment: u64,
+    ) -> Option<(u64, u64)> {
+        self.direct_memory
+            .available(search_start, search_end, alignment)
     }
 
     pub fn query_direct(&self, offset: u64, find_next: bool) -> Option<KernelDirectAllocation> {
@@ -648,6 +735,120 @@ mod tests {
             .allocate_direct(0, 8 * GUEST_PAGE_SIZE, GUEST_PAGE_SIZE, GUEST_PAGE_SIZE, 11)
             .unwrap();
         assert_eq!(reused, GUEST_PAGE_SIZE);
+    }
+
+    #[test]
+    fn available_direct_reports_the_largest_free_aligned_span() {
+        let mut memory = KernelMemory::new().unwrap();
+        // An untouched pool offers all of itself.
+        assert_eq!(
+            memory.available_direct(0, DIRECT_MEMORY_SIZE, GUEST_PAGE_SIZE),
+            Some((0, DIRECT_MEMORY_SIZE))
+        );
+        let carved = memory
+            .allocate_direct(
+                2 * GUEST_PAGE_SIZE,
+                3 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                12,
+            )
+            .unwrap();
+        assert_eq!(carved, 2 * GUEST_PAGE_SIZE);
+        // Of the two holes the allocation leaves, the larger one is reported.
+        assert_eq!(
+            memory.available_direct(0, 8 * GUEST_PAGE_SIZE, GUEST_PAGE_SIZE),
+            Some((3 * GUEST_PAGE_SIZE, 5 * GUEST_PAGE_SIZE))
+        );
+        // The search window clips a hole at both ends.
+        assert_eq!(
+            memory.available_direct(0, 2 * GUEST_PAGE_SIZE, GUEST_PAGE_SIZE),
+            Some((0, 2 * GUEST_PAGE_SIZE))
+        );
+        // Alignment moves a hole's base up and shortens what it can offer, which can change
+        // which hole wins.
+        assert_eq!(
+            memory.available_direct(0, 8 * GUEST_PAGE_SIZE, 4 * GUEST_PAGE_SIZE),
+            Some((4 * GUEST_PAGE_SIZE, 4 * GUEST_PAGE_SIZE))
+        );
+        // A window covered entirely by one allocation has nothing to offer.
+        assert_eq!(
+            memory.available_direct(2 * GUEST_PAGE_SIZE, 3 * GUEST_PAGE_SIZE, GUEST_PAGE_SIZE),
+            None
+        );
+    }
+
+    #[test]
+    fn an_available_span_is_allocatable_in_full() {
+        let mut memory = KernelMemory::new().unwrap();
+        // The shape the failing title uses: reserve its tracking overhead at the top of the pool,
+        // ask what is left, then pre-allocate exactly that.
+        const OVERHEAD: u64 = 0x26_0000;
+        const ALIGNMENT: u64 = 0x1_0000;
+        let tracking = memory
+            .allocate_direct(
+                DIRECT_MEMORY_SIZE - OVERHEAD,
+                DIRECT_MEMORY_SIZE,
+                OVERHEAD,
+                ALIGNMENT,
+                12,
+            )
+            .unwrap();
+        assert_eq!(tracking, DIRECT_MEMORY_SIZE - OVERHEAD);
+        let (start, size) = memory
+            .available_direct(0, DIRECT_MEMORY_SIZE, ALIGNMENT)
+            .unwrap();
+        assert_eq!((start, size), (0, DIRECT_MEMORY_SIZE - OVERHEAD));
+        // A reported span the allocator then refuses would put the guest's own accounting into
+        // exactly the negative-size state this query exists to prevent.
+        assert_eq!(
+            memory
+                .allocate_direct(start, start + size, size, ALIGNMENT, 12)
+                .unwrap(),
+            start
+        );
+    }
+
+    #[test]
+    fn flexible_usage_follows_live_mappings_in_both_directions() {
+        let mut memory = KernelMemory::new().unwrap();
+        assert_eq!(memory.flexible_usage(), 0);
+        let first = memory
+            .map_flexible(
+                GuestMapPlacement::Anywhere,
+                4 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x03,
+            )
+            .unwrap();
+        assert_eq!(memory.flexible_usage(), 4 * GUEST_PAGE_SIZE);
+        memory
+            .map_flexible(
+                GuestMapPlacement::Anywhere,
+                2 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x03,
+            )
+            .unwrap();
+        assert_eq!(memory.flexible_usage(), 6 * GUEST_PAGE_SIZE);
+        // Usage is derived from the mappings themselves, so a partial unmap is accounted for
+        // without any separate counter to keep in step.
+        memory.unmap(first, 2 * GUEST_PAGE_SIZE).unwrap();
+        assert_eq!(memory.flexible_usage(), 4 * GUEST_PAGE_SIZE);
+        // Direct memory is a different pool and must not be counted against the flexible budget.
+        memory
+            .allocate_direct(0, DIRECT_MEMORY_SIZE, GUEST_PAGE_SIZE, GUEST_PAGE_SIZE, 12)
+            .unwrap();
+        memory
+            .map_direct(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                0x33,
+                0,
+            )
+            .unwrap();
+        assert_eq!(memory.flexible_usage(), 4 * GUEST_PAGE_SIZE);
     }
 
     #[test]

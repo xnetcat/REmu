@@ -93,6 +93,22 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   REmu independently assigns private identities only to guest no-coalesce mappings, preserves those
   identities through VMA surgery, and removes every overlapping virtual alias before released
   physical pages can be reused. No upstream source was copied.
+- The direct- and flexible-memory availability queries (`sceKernelAvailableDirectMemorySize`
+  `C0f7TJcbfac`, `sceKernelAvailableFlexibleMemorySize` `aNz11fnnzi4`) had their argument order and
+  result shape confirmed against three independent implementations before being written: shadPS4
+  snapshot `4c72de0732ce7443a1631bf190e2606294f58f65`
+  (`src/core/libraries/kernel/memory.cpp` and `MemoryManager::DirectQueryAvailable` in
+  `src/core/memory.cpp`), SharpEmu snapshot `ada67a19` (`KernelMemoryCompatExports.cs`), and fpPS4
+  (`kernel/ps4_map_mm.pas`). All three agree that the direct query reports the largest aligned free
+  span within the requested window rather than a running total. REmu's implementations are its own:
+  the free-span scan reuses the existing direct allocator's records and normalizes its arguments
+  through the same path as `sceKernelAllocateDirectMemory`, so a reported span is allocatable by
+  construction; flexible usage is derived from live flexible mappings rather than a running counter,
+  so partial unmaps and rollbacks stay accounted for. The 448 MiB flexible pool pairs with the
+  16 GiB direct total already in tree and matches SharpEmu, which uses the same pair for its PS5
+  kernel surface. A title may override its own budget through `mem_param->flexible_memory_size` in
+  its process parameters (shadPS4 `src/core/linker.cpp`); that override is not read yet, and the
+  titles exercised here leave the pointer null. No upstream source was copied.
 - AMD64 DTV slot layout and `__tls_get_addr` (`vNe1w4diLCs`) were cross-checked against FreeBSD src
   snapshot `afa048d159f64e1c609475314e19fb030ffd595f` (`sys/x86/include/tls.h` and
   `libexec/rtld-elf/rtld.c`), shadPS4 snapshot

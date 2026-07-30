@@ -11,10 +11,10 @@ use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapCoalescing, GuestM
 #[cfg(target_os = "macos")]
 use crate::{
     KERNEL_MEMORY_READABLE_RANGES, KERNEL_MEMORY_READABLE_RANGES_GENERATION,
-    MACOS_GUEST_PAGE_ALIGNMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_PERMISSION_DENIED,
-    SCE_KERNEL_ERROR_TRY_AGAIN, align_up_u64, guest_memset, kernel_memory, low_i32, read_guest_u8,
-    read_guest_u32, read_guest_u64, trace_guest_vm, write_guest_u8, write_guest_u32,
-    write_guest_u64,
+    MACOS_GUEST_PAGE_ALIGNMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
+    SCE_KERNEL_ERROR_PERMISSION_DENIED, SCE_KERNEL_ERROR_TRY_AGAIN, align_up_u64, guest_memset,
+    kernel_memory, low_i32, read_guest_u8, read_guest_u32, read_guest_u64, trace_guest_vm,
+    write_guest_u8, write_guest_u32, write_guest_u64,
 };
 use crate::{
     ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NAME_TOO_LONG,
@@ -136,6 +136,107 @@ pub(crate) fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispa
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn allocate_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+/// `sceKernelAvailableDirectMemorySize(searchStart, searchEnd, alignment, *start, *size)`.
+///
+/// Reports the largest aligned free direct-memory span in the requested window. Console memory
+/// allocators call this before reserving their pool, so the arguments are normalized exactly as
+/// [`allocate_direct_memory`] normalizes its own: whatever this reports, the caller's next
+/// allocation of that span has to succeed.
+#[cfg(target_os = "macos")]
+pub(crate) fn available_direct_memory_size(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    const DIRECT_MEMORY_SIZE: u64 = kernel_memory::DIRECT_MEMORY_SIZE;
+    let search_start = i64::from_ne_bytes(arguments[0].to_ne_bytes())
+        .max(0)
+        .cast_unsigned();
+    let raw_search_end = i64::from_ne_bytes(arguments[1].to_ne_bytes());
+    let alignment = if arguments[2] == 0 {
+        MACOS_GUEST_PAGE_ALIGNMENT
+    } else {
+        arguments[2]
+    };
+    let start_output = arguments[3];
+    let size_output = arguments[4];
+    // Both outputs are mandatory. Returning an error while leaving them untouched is precisely
+    // what makes a caller read a stale stack slot as the answer and size its pool from garbage.
+    if start_output == 0
+        || size_output == 0
+        || !alignment.is_power_of_two()
+        || alignment < GUEST_PAGE_SIZE
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let search_end = if raw_search_end <= 0 {
+        DIRECT_MEMORY_SIZE
+    } else {
+        raw_search_end.cast_unsigned().min(DIRECT_MEMORY_SIZE)
+    };
+    let search_start = if search_start >= search_end {
+        0
+    } else {
+        search_start
+    };
+    let memory = match kernel_memory_mut(state) {
+        Ok(memory) => memory,
+        Err(error) => return kernel_memory_error(&error),
+    };
+    let Some((start, size)) = memory.available_direct(search_start, search_end, alignment) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_OUT_OF_MEMORY);
+    };
+    write_guest_u64(start_output, start);
+    write_guest_u64(size_output, size);
+    if trace_guest_vm() {
+        eprintln!(
+            "[REMu][VM] available direct start={start:#x} size={size:#x} alignment={alignment:#x}"
+        );
+    }
+    0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn available_direct_memory_size(
+    _arguments: [u64; 6],
+    _state: &mut ProbeDispatchState,
+) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+/// `sceKernelAvailableFlexibleMemorySize(*size)`.
+///
+/// Reports how much of the flexible-memory budget the guest has not mapped yet. Engines read this
+/// once to size their own flexible pool and again while mapping into it, so it has to fall as
+/// mappings are made rather than report a fixed total.
+#[cfg(target_os = "macos")]
+pub(crate) fn available_flexible_memory_size(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let size_output = arguments[0];
+    if size_output == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let memory = match kernel_memory_mut(state) {
+        Ok(memory) => memory,
+        Err(error) => return kernel_memory_error(&error),
+    };
+    let available = memory.available_flexible();
+    write_guest_u64(size_output, available);
+    if trace_guest_vm() {
+        eprintln!("[REMu][VM] available flexible size={available:#x}");
+    }
+    0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn available_flexible_memory_size(
+    _arguments: [u64; 6],
+    _state: &mut ProbeDispatchState,
+) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 

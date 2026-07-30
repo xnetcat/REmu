@@ -69,6 +69,30 @@ GPU-to-guest writebacks into such storage could not land — but it is not proof
 recorded consumer sites remain the checklist: this entry closes when sustained interactive
 progress shows none of them faulting, not because the crash stopped appearing in short runs.
 
+### The Bluepoint title idles at startup without its fiber ABI
+
+A third title (Bluepoint's BPE engine) previously aborted about three seconds into startup, inside
+its own `PS5PlatformPageAllocator`. Three unserved imports caused it, each one a call whose result
+the engine consumes directly:
+
+- `sceKernelAvailableDirectMemorySize` (`C0f7TJcbfac`) left both output parameters untouched, so
+  the engine read an available size of zero, computed `0 - trackingOverhead` as its pre-allocation
+  size, and failed its own allocation verify at `PS5PlatformPageAllocator.cpp:383`.
+- `sceKernelAvailableFlexibleMemorySize` (`aNz11fnnzi4`) failed the same way at line 450.
+- `scePthreadRwlockRdlock`/`Wrlock` (`Ox9i0c7L5w0`, `mqdNorrB+gI`) were the only members of the
+  console-named reader/writer lock family not routed to the implementation the POSIX-named
+  spellings already used, so Dantelion2's `DLReadWriteLock` took a not-implemented return as a
+  fatal error rather than as contention.
+
+With those served, the title reaches its own subsystem initialization, opens the presenter, and
+runs to the diagnostic timer without faulting. It is not playable and no compatibility is claimed:
+it submits no draws, because its job system is built on the fiber ABI and `_sceFiberInitializeImpl`,
+`sceFiberOptParamInitialize`, `sceFiberRun`, `sceFiberGetInfo`, and `sceFiberRename` are all
+unserved. `sceFiberRun` returning not-implemented means the job that drives startup never runs, and
+the title then blocks in `sceKernelWaitEventFlag` for the rest of the run. The fiber entry points
+are the next concrete gap for this title; `sceKernelSetPrtAperture` and `sceNetCtlInit` are also
+unserved but are not what stalls it.
+
 ### A run intermittently renders nothing
 
 Roughly every other launch of the working test title produces `FPS 0.0`, `Draw 0/s` and

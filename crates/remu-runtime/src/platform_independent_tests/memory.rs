@@ -3,8 +3,9 @@
 
 use super::{
     BATCH_MAP_OPERATION_MAP_DIRECT, ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
-    SCE_KERNEL_ERROR_NOT_FOUND, allocate_direct_memory, batch_map_entry, kernel_batch_map,
-    kernel_release_direct_memory, kernel_virtual_query, sce_kernel_error,
+    SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY, allocate_direct_memory,
+    available_direct_memory_size, available_flexible_memory_size, batch_map_entry,
+    kernel_batch_map, kernel_release_direct_memory, kernel_virtual_query, sce_kernel_error,
 };
 
 #[cfg(target_os = "macos")]
@@ -250,6 +251,203 @@ fn mspace_allocates_inside_named_flexible_memory_and_reuses_freed_blocks() {
     assert_eq!(
         crate::known_nid_name("OJjm-QOIHlI"),
         Some("sceLibcMspaceMalloc")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn available_direct_memory_size_reports_a_span_the_allocator_grants() {
+    let mut state = ProbeDispatchState::default();
+    // The failing title reserves its allocator tracking overhead at the top of the pool, asks how
+    // much direct memory is left, and pre-allocates exactly that. Reporting nothing here left it
+    // computing a negative pre-allocation size and aborting in its own page allocator.
+    const OVERHEAD: u64 = 0x26_0000;
+    const ALIGNMENT: u64 = 0x1_0000;
+    const POOL: u64 = 0x4_0000_0000;
+    let mut tracking = 0_u64;
+    assert_eq!(
+        allocate_direct_memory(
+            [
+                POOL - OVERHEAD,
+                POOL,
+                OVERHEAD,
+                ALIGNMENT,
+                12,
+                (&raw mut tracking).addr() as u64,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(tracking, POOL - OVERHEAD);
+    let mut physical = u64::MAX;
+    let mut size = u64::MAX;
+    assert_eq!(
+        available_direct_memory_size(
+            [
+                0,
+                POOL,
+                ALIGNMENT,
+                (&raw mut physical).addr() as u64,
+                (&raw mut size).addr() as u64,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(physical, 0);
+    assert_eq!(size, POOL - OVERHEAD);
+    let mut preallocated = 0_u64;
+    assert_eq!(
+        allocate_direct_memory(
+            [
+                physical,
+                physical + size,
+                size,
+                ALIGNMENT,
+                12,
+                (&raw mut preallocated).addr() as u64,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(preallocated, 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn available_direct_memory_size_rejects_missing_outputs_and_an_exhausted_window() {
+    let mut state = ProbeDispatchState::default();
+    let mut value = 0_u64;
+    // Both outputs are mandatory: a caller that cannot receive the span must not read a stale
+    // stack slot as if it were an answer.
+    assert_eq!(
+        available_direct_memory_size(
+            [
+                0,
+                0x4_0000_0000,
+                0x1_0000,
+                0,
+                (&raw mut value).addr() as u64,
+                0
+            ],
+            &mut state,
+        ),
+        sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        available_direct_memory_size(
+            [
+                0,
+                0x4_0000_0000,
+                0x1_0000,
+                (&raw mut value).addr() as u64,
+                0,
+                0
+            ],
+            &mut state,
+        ),
+        sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    // An alignment that is not a page-aligned power of two cannot describe a real span.
+    assert_eq!(
+        available_direct_memory_size(
+            [
+                0,
+                0x4_0000_0000,
+                0x3000,
+                (&raw mut value).addr() as u64,
+                (&raw mut value).addr() as u64,
+                0,
+            ],
+            &mut state,
+        ),
+        sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    let mut physical = 0_u64;
+    assert_eq!(
+        allocate_direct_memory(
+            [
+                0,
+                0x4_0000,
+                0x4_0000,
+                0x4000,
+                12,
+                (&raw mut physical).addr() as u64
+            ],
+            &mut state,
+        ),
+        0
+    );
+    // A window with no free bytes left reports exhaustion rather than a zero-length span.
+    let mut size = u64::MAX;
+    assert_eq!(
+        available_direct_memory_size(
+            [
+                0,
+                0x4_0000,
+                0x4000,
+                (&raw mut physical).addr() as u64,
+                (&raw mut size).addr() as u64,
+                0,
+            ],
+            &mut state,
+        ),
+        sce_kernel_error(SCE_KERNEL_ERROR_OUT_OF_MEMORY)
+    );
+    assert_eq!(size, u64::MAX);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn available_flexible_memory_size_shrinks_as_flexible_memory_is_mapped() {
+    let mut state = ProbeDispatchState::default();
+    let mut available = 0_u64;
+    assert_eq!(
+        available_flexible_memory_size(
+            [(&raw mut available).addr() as u64, 0, 0, 0, 0, 0],
+            &mut state
+        ),
+        0
+    );
+    let unused = available;
+    assert_ne!(unused, 0);
+    let mut mapped = 0_u64;
+    let name = b"flexpool\0";
+    assert_eq!(
+        crate::map_named_flexible_memory(
+            [
+                (&raw mut mapped).addr() as u64,
+                0x8_0000,
+                0x02,
+                0,
+                name.as_ptr().addr() as u64,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    // The budget has to reflect what the guest actually took, or a caller that maps until the
+    // pool is empty never terminates.
+    assert_eq!(
+        available_flexible_memory_size(
+            [(&raw mut available).addr() as u64, 0, 0, 0, 0, 0],
+            &mut state
+        ),
+        0
+    );
+    assert_eq!(available, unused - 0x8_0000);
+    // The output pointer is mandatory.
+    assert_eq!(
+        available_flexible_memory_size([0, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        crate::known_nid_name("aNz11fnnzi4"),
+        Some("sceKernelAvailableFlexibleMemorySize")
     );
 }
 

@@ -1,7 +1,9 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::{GUEST_CONDITION_TEST, sce_kernel_error, wait_for_guest_condition_waiters};
+use super::{
+    GUEST_CONDITION_TEST, ProbeDispatchState, sce_kernel_error, wait_for_guest_condition_waiters,
+};
 
 #[test]
 fn semaphore_wait_honors_timeouts_and_rejects_impossible_counts() {
@@ -171,6 +173,42 @@ fn rwlock_tracks_recursive_read_ownership_and_excludes_writers() {
     );
     assert_eq!(crate::guest_rwlock_unlock(address), 0);
     assert_eq!(crate::guest_rwlock_destroy(address), 0);
+}
+
+#[test]
+fn console_named_rwlock_entry_points_reach_the_same_lock() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = ProbeDispatchState::default();
+    let address = 0x7fff_0000_00c0;
+    let call = |nid: &str, state: &mut ProbeDispatchState| {
+        crate::kernel_api::dispatch(nid, [address, 0, 0, 0, 0, 0], state)
+            .unwrap_or_else(|| panic!("{nid} is not served by the kernel ABI"))
+    };
+    assert_eq!(call("6ULAa0fq4jA", &mut state), 0);
+    // The blocking acquires are the pair Dantelion2 uses; a missing one is an unimplemented
+    // return that its DLReadWriteLock treats as a fatal error rather than as contention.
+    assert_eq!(call("mqdNorrB+gI", &mut state), 0);
+    // A console-named writer must exclude a POSIX-named reader: both spellings are one object.
+    assert_eq!(
+        crate::guest_rwlock_lock(address, false, true),
+        u64::from(libc::EBUSY.cast_unsigned())
+    );
+    assert_eq!(call("+L98PIbGttk", &mut state), 0);
+    assert_eq!(call("Ox9i0c7L5w0", &mut state), 0);
+    assert_eq!(call("Ox9i0c7L5w0", &mut state), 0);
+    assert_eq!(
+        call("bIHoZCTomsI", &mut state),
+        u64::from(libc::EBUSY.cast_unsigned())
+    );
+    assert_eq!(call("+L98PIbGttk", &mut state), 0);
+    assert_eq!(call("+L98PIbGttk", &mut state), 0);
+    assert_eq!(call("BB+kb08Tl9A", &mut state), 0);
+    assert_eq!(
+        crate::known_nid_name("mqdNorrB+gI"),
+        Some("scePthreadRwlockWrlock")
+    );
 }
 
 #[test]

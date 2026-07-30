@@ -233,11 +233,12 @@ pub(crate) use guest_sync::{
 #[cfg(test)]
 pub(crate) use memory::BATCH_MAP_OPERATION_MAP_DIRECT;
 pub(crate) use memory::{
-    allocate_direct_memory, allocate_main_direct_memory, direct_memory_query, kernel_batch_map,
-    kernel_batch_map_2, kernel_checked_release_direct_memory, kernel_mprotect, kernel_mtypeprotect,
-    kernel_munmap, kernel_release_direct_memory, kernel_reserve_virtual_range,
-    kernel_set_virtual_range_name, kernel_virtual_query, map_direct_memory, map_direct_memory_2,
-    map_flexible_memory_core, map_named_flexible_memory,
+    allocate_direct_memory, allocate_main_direct_memory, available_direct_memory_size,
+    available_flexible_memory_size, direct_memory_query, kernel_batch_map, kernel_batch_map_2,
+    kernel_checked_release_direct_memory, kernel_mprotect, kernel_mtypeprotect, kernel_munmap,
+    kernel_release_direct_memory, kernel_reserve_virtual_range, kernel_set_virtual_range_name,
+    kernel_virtual_query, map_direct_memory, map_direct_memory_2, map_flexible_memory_core,
+    map_named_flexible_memory,
 };
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 pub(crate) use memory::{host_protection_from_guest, process_mapping_contains};
@@ -3898,6 +3899,10 @@ fn dispatch_probe_import(
         "pO96TwzOm5E" => 16 * 1024 * 1024 * 1024,
         // sceKernelAllocateDirectMemory
         "rTXw65xmLIA" => allocate_direct_memory(arguments, state),
+        // sceKernelAvailableDirectMemorySize
+        "C0f7TJcbfac" => available_direct_memory_size(arguments, state),
+        // sceKernelAvailableFlexibleMemorySize
+        "aNz11fnnzi4" => available_flexible_memory_size(arguments, state),
         "B+vc2AO2Zrc" => allocate_main_direct_memory(arguments, state),
         "BHouLQzh0X0" => direct_memory_query(arguments, state),
         // sceKernelMapDirectMemory

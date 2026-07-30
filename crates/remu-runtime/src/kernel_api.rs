@@ -180,6 +180,8 @@ fn dispatch_thread(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchStat
         // the guest-synchronisation table with the entry points already exported for it.
         "6ULAa0fq4jA" => guest_rwlock_init(arguments[0]),
         "BB+kb08Tl9A" => guest_rwlock_destroy(arguments[0]),
+        "Ox9i0c7L5w0" => guest_rwlock_lock(arguments[0], false, false),
+        "mqdNorrB+gI" => guest_rwlock_lock(arguments[0], true, false),
         "XD3mDeybCnk" => guest_rwlock_lock(arguments[0], false, true),
         "bIHoZCTomsI" => guest_rwlock_lock(arguments[0], true, true),
         "+L98PIbGttk" => guest_rwlock_unlock(arguments[0]),
