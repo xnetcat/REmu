@@ -376,11 +376,39 @@ impl<'a> Compiler<'a> {
                 );
                 return Ok(());
             }
-            // These operations order or provision guest hardware. MSL executes the translated
-            // operations in program order, and NGG exports are emitted directly, so they require
-            // no host instruction and retain their full architectural effect.
+            "SSendmsg" => {
+                let message = instruction
+                    .sources
+                    .first()
+                    .filter(|source| source.kind == OperandKind::EncodedConstant)
+                    .map(|source| source.value)
+                    .ok_or("S_SENDMSG requires an encoded message immediate")?;
+                if message == 9 {
+                    if self.options.stage != MetalShaderStage::Mesh {
+                        return Err(
+                            "GS_ALLOC_REQ can only be represented by a Metal mesh stage".to_owned()
+                        );
+                    }
+                    // GFX10 GS_ALLOC_REQ is issued by subgroup zero. M0 carries the actual
+                    // allocation: vertices[10:0], primitives[22:12]. Capture it once for the
+                    // whole Metal threadgroup; a final converged barrier publishes it to every
+                    // exporter lane.
+                    self.line(3, "if (remu_thread_index == 0u) {");
+                    self.line(
+                        4,
+                        "atomic_store_explicit(&remu_mesh_output_vertex_count, s[124] & 0x7ffu, memory_order_relaxed);",
+                    );
+                    self.line(
+                        4,
+                        "atomic_store_explicit(&remu_mesh_output_primitive_count, (s[124] >> 12u) & 0x7ffu, memory_order_relaxed);",
+                    );
+                    self.line(3, "}");
+                }
+            }
+            // These operations order guest hardware. MSL executes translated memory operations
+            // in program order, so they require no separate host instruction.
             "SNop" | "SWaitcnt" | "SWaitcntDepctr" | "SInstPrefetch" | "STtraceData"
-            | "SClause" | "SSendmsg" | "VNop" => {}
+            | "SClause" | "VNop" => {}
             "SBarrier" => {
                 if !self.is_threadgroup_stage() {
                     return Err(
@@ -450,6 +478,18 @@ fn validate_interface(options: &MetalCompileOptions) -> Result<(), MetalCompileE
         return Err(MetalCompileError::InvalidInterface(
             "Metal supports at most eight color outputs".into(),
         ));
+    }
+    if options.stage == MetalShaderStage::Mesh
+        && (!(1..=256).contains(&options.mesh_max_vertex_count)
+            || !(1..=256).contains(&options.mesh_max_primitive_count)
+            || !(1..=256).contains(&options.mesh_threadgroup_size))
+    {
+        return Err(MetalCompileError::InvalidInterface(format!(
+            "Metal mesh vertex/primitive/thread capacities {}/{}/{} are outside 1..=256",
+            options.mesh_max_vertex_count,
+            options.mesh_max_primitive_count,
+            options.mesh_threadgroup_size
+        )));
     }
     let mut guest_slots = BTreeSet::new();
     let mut host_locations = BTreeSet::new();

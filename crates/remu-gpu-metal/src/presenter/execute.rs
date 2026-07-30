@@ -10,7 +10,7 @@ use super::{
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
-    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_THREADS, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
+    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
     ResidentTextureActivityStamp, append_unique_global_writebacks,
     append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
@@ -806,7 +806,10 @@ impl MetalPresenter {
             let (indices, _) = indexed_draw
                 .as_ref()
                 .ok_or("NGG mesh draw requires captured indices")?;
-            Some(self.cached_ngg_meshlets(&device, indices.as_ref())?)
+            let limits = key
+                .ngg_subgroup_limits
+                .ok_or("NGG mesh draw is missing subgroup sizing registers")?;
+            Some(self.cached_ngg_meshlets(&device, indices.as_ref(), limits)?)
         } else {
             None
         };
@@ -1397,7 +1400,15 @@ impl MetalPresenter {
                 encoder.draw_mesh_threadgroups(
                     MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
                     MTLSize::new(1, 1, 1),
-                    MTLSize::new(NGG_MESH_THREADS, 1, 1),
+                    MTLSize::new(
+                        u64::from(
+                            key.ngg_subgroup_limits
+                                .expect("NGG subgroup limits were validated before encoding")
+                                .threadgroup_threads,
+                        ),
+                        1,
+                        1,
+                    ),
                 );
             } else if diagnostic_force_triangle {
                 encoder.draw_primitives_instanced(MTLPrimitiveType::Triangle, 0, 3, 1);

@@ -5,8 +5,9 @@ use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRasterState, DecodedRenderTarget,
     DepthTargetPipelineState, DisplayConfiguration, GraphicsPipelineKey, GraphicsShaderResourceKey,
     GraphicsDiagnosticPipelineState, GuestScissor, GuestTextureDescriptor,
-    MetalBlendAttachmentState, ProgramIdentity, RenderTargetFormat, RenderTargetPipelineState,
-    decode_sampled_texture_format, diagnostic_capture_pixel_output,
+    MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, ProgramIdentity,
+    RenderTargetFormat, RenderTargetPipelineState, decode_sampled_texture_format,
+    diagnostic_capture_pixel_output,
     diagnostic_capture_vertex_position, diagnostic_dump_shadow_consumer,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
     diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
@@ -38,7 +39,8 @@ pub(crate) use self::pipeline::{
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{
-    NGG_MESHLET_WORDS_PER_GROUP, graphics_shader_resource_key, metal_primitive_topology_class,
+    NGG_MESHLET_WORDS_PER_GROUP, decode_ngg_subgroup_limits, graphics_shader_resource_key,
+    metal_primitive_topology_class,
 };
 #[cfg(test)]
 pub(crate) use self::scanout::{
@@ -81,6 +83,24 @@ pub(super) const DB_SHADER_CONTROL: u32 = 0x203;
 pub(super) const PA_SU_SC_MODE_CNTL: u32 = 0x205;
 
 pub(super) const PA_CL_VS_OUT_CNTL: u32 = 0x207;
+
+/// GFX10 `GE_MAX_OUTPUT_PER_SUBGROUP`.
+pub(super) const GE_MAX_OUTPUT_PER_SUBGROUP: u32 = 0x1ff;
+
+/// GFX10 `VGT_GS_ONCHIP_CNTL`.
+pub(super) const VGT_GS_ONCHIP_CNTL: u32 = 0x291;
+
+/// GFX10 `VGT_GS_OUT_PRIM_TYPE`.
+pub(super) const VGT_GS_OUT_PRIM_TYPE: u32 = 0x29b;
+
+/// GFX10 `VGT_GS_MAX_VERT_OUT`.
+pub(super) const VGT_GS_MAX_VERT_OUT: u32 = 0x2ce;
+
+/// GFX10 `GE_NGG_SUBGRP_CNTL`.
+pub(super) const GE_NGG_SUBGRP_CNTL: u32 = 0x2d3;
+
+/// GFX10 `VGT_GS_INSTANCE_CNT`.
+pub(super) const VGT_GS_INSTANCE_CNT: u32 = 0x2e4;
 
 pub(super) const CB_COLOR0_BASE: u32 = 0x318;
 

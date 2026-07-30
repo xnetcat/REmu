@@ -4,9 +4,12 @@
 use super::{
     CB_BLEND0_CONTROL, DB_SHADER_CONTROL, DecodedRasterState, DecodedRenderTarget,
     DepthTargetPipelineState, GraphicsDiagnosticPipelineState, GraphicsPipelineKey,
-    GraphicsShaderResourceKey, MetalBlendAttachmentState, PA_CL_VS_OUT_CNTL, PA_SU_SC_MODE_CNTL,
-    ProgramIdentity, RenderTargetPipelineState, common_render_target_array_length,
-    decode_depth_target, decode_render_targets, diagnostic_capture_pixel_output,
+    GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL, GraphicsShaderResourceKey,
+    MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, PA_CL_VS_OUT_CNTL,
+    PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState, VGT_GS_INSTANCE_CNT,
+    VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
+    common_render_target_array_length, decode_depth_target, decode_render_targets,
+    diagnostic_capture_pixel_output,
     diagnostic_capture_vertex_position, diagnostic_dump_shadow_consumer,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
     diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
@@ -27,9 +30,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-pub(crate) const NGG_MESHLET_WORDS_PER_GROUP: usize = 130;
-const NGG_MESHLET_MAX_VERTICES: usize = 64;
-const NGG_MESHLET_MAX_PRIMITIVES: usize = 64;
+pub(crate) const NGG_MESHLET_WORDS_PER_GROUP: usize = 514;
+const NGG_MESHLET_STORAGE_VERTICES: usize = 256;
+const NGG_MESHLET_STORAGE_PRIMITIVES: usize = 256;
+const METAL_MESH_MAX_OUTPUTS: u32 = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedNggMeshlets {
@@ -39,19 +43,192 @@ pub(crate) struct PreparedNggMeshlets {
     pub(crate) primitive_count: usize,
 }
 
+impl NggSubgroupLimits {
+    pub(crate) fn new(
+        es_vertices_per_subgroup: u32,
+        gs_primitives_per_subgroup: u32,
+        gs_instance_primitives_per_subgroup: u32,
+        gs_max_vertices_out: u32,
+        max_output_vertices_per_subgroup: u32,
+        primitive_amplification_factor: u32,
+        output_primitive_type: Option<NggOutputPrimitiveType>,
+        programmed_instance_count: Option<u32>,
+    ) -> Result<Self, String> {
+        let derived_instance_count = gs_instance_primitives_per_subgroup
+            .checked_div(gs_primitives_per_subgroup)
+            .filter(|&count| {
+                count != 0
+                    && gs_primitives_per_subgroup.checked_mul(count)
+                        == Some(gs_instance_primitives_per_subgroup)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "GS_INST_PRIMS_IN_SUBGRP({gs_instance_primitives_per_subgroup}) is not an integer multiple of GS_PRIMS_PER_SUBGRP({gs_primitives_per_subgroup})"
+                )
+            })?;
+        let gs_instance_count = programmed_instance_count.unwrap_or(derived_instance_count);
+        if gs_instance_count != derived_instance_count {
+            return Err(format!(
+                "VGT_GS_INSTANCE_CNT={gs_instance_count} disagrees with subgroup primitive ratio {derived_instance_count}"
+            ));
+        }
+        let max_output_primitives_per_subgroup = gs_instance_primitives_per_subgroup
+            .checked_mul(primitive_amplification_factor)
+            .ok_or("NGG primitive output limit overflow")?;
+        let max_input_vertices = if es_vertices_per_subgroup < 256 {
+            es_vertices_per_subgroup
+        } else {
+            gs_instance_primitives_per_subgroup
+                .checked_mul(3)
+                .ok_or("NGG input vertex workgroup size overflow")?
+        };
+        let threadgroup_threads = max_input_vertices
+            .max(gs_instance_primitives_per_subgroup)
+            .max(max_output_vertices_per_subgroup)
+            .max(max_output_primitives_per_subgroup);
+        let limits = Self {
+            es_vertices_per_subgroup,
+            gs_primitives_per_subgroup,
+            gs_instance_primitives_per_subgroup,
+            gs_instance_count,
+            gs_max_vertices_out,
+            max_output_vertices_per_subgroup,
+            primitive_amplification_factor,
+            max_output_primitives_per_subgroup,
+            output_primitive_type,
+            threadgroup_threads,
+        };
+        if limits.es_vertices_per_subgroup == 0
+            || limits.gs_primitives_per_subgroup == 0
+            || limits.gs_instance_primitives_per_subgroup == 0
+            || limits.gs_instance_count == 0
+            || limits.gs_max_vertices_out == 0
+            || limits.max_output_vertices_per_subgroup == 0
+            || limits.primitive_amplification_factor == 0
+        {
+            return Err(format!("NGG subgroup limits must be non-zero: {limits:?}"));
+        }
+        if limits.es_vertices_per_subgroup > 256
+            || limits.gs_primitives_per_subgroup > 256
+            || limits.gs_instance_primitives_per_subgroup > 256
+        {
+            return Err(format!(
+                "NGG input subgroup {limits:?} exceeds Metal's 256-thread mesh limit"
+            ));
+        }
+        if limits.max_output_vertices_per_subgroup > METAL_MESH_MAX_OUTPUTS
+            || limits.max_output_primitives_per_subgroup > METAL_MESH_MAX_OUTPUTS
+            || limits.threadgroup_threads > METAL_MESH_MAX_OUTPUTS
+        {
+            return Err(format!(
+                "NGG subgroup vertices/primitives/threads {}/{}/{} exceed Metal's limit of {METAL_MESH_MAX_OUTPUTS}",
+                limits.max_output_vertices_per_subgroup,
+                limits.max_output_primitives_per_subgroup,
+                limits.threadgroup_threads
+            ));
+        }
+        let architectural_max = limits
+            .gs_instance_primitives_per_subgroup
+            .checked_mul(limits.gs_max_vertices_out)
+            .ok_or("NGG subgroup output limit overflow")?;
+        if limits.max_output_vertices_per_subgroup > architectural_max {
+            return Err(format!(
+                "GE_MAX_OUTPUT_PER_SUBGROUP={} exceeds GS_INST_PRIMS_IN_SUBGRP({}) * VGT_GS_MAX_VERT_OUT({})",
+                limits.max_output_vertices_per_subgroup,
+                limits.gs_instance_primitives_per_subgroup,
+                limits.gs_max_vertices_out
+            ));
+        }
+        Ok(limits)
+    }
+}
+
+pub(crate) fn decode_ngg_subgroup_limits(
+    context_registers: &[remu_gpu::GpuRegister],
+) -> Result<Option<NggSubgroupLimits>, String> {
+    let onchip = register_value(context_registers, VGT_GS_ONCHIP_CNTL);
+    let max_vert_out = register_value(context_registers, VGT_GS_MAX_VERT_OUT);
+    let max_output = register_value(context_registers, GE_MAX_OUTPUT_PER_SUBGROUP);
+    let subgroup_control = register_value(context_registers, GE_NGG_SUBGRP_CNTL);
+    let output_primitive = register_value(context_registers, VGT_GS_OUT_PRIM_TYPE);
+    let instance_control = register_value(context_registers, VGT_GS_INSTANCE_CNT);
+    // AGC's ordinary graphics defaults include zero GE_MAX_OUTPUT and VGT_GS_MAX_VERT_OUT state.
+    // Only the on-chip/subgroup controls identify a programmed NGG subgroup.
+    if onchip.is_none() && subgroup_control.is_none() {
+        return Ok(None);
+    }
+    let onchip = onchip.ok_or("NGG state is missing VGT_GS_ONCHIP_CNTL")?;
+    let max_vert_out = max_vert_out.ok_or("NGG state is missing VGT_GS_MAX_VERT_OUT")?;
+    let max_output = max_output.ok_or("NGG state is missing GE_MAX_OUTPUT_PER_SUBGROUP")?;
+    let subgroup_control =
+        subgroup_control.ok_or("NGG state is missing GE_NGG_SUBGRP_CNTL")?;
+    if subgroup_control >> 9 != 0 {
+        return Err(format!(
+            "non-zero GE_NGG_SUBGRP_CNTL.THDS_PER_SUBGRP is not represented: {subgroup_control:#010x}"
+        ));
+    }
+    let output_primitive_type = output_primitive
+        .map(|raw| {
+            if raw & !0x3f != 0 {
+                return Err(format!(
+                    "multi-stream VGT_GS_OUT_PRIM_TYPE is not represented: {raw:#010x}"
+                ));
+            }
+            match raw & 0x3f {
+                0 => Ok(NggOutputPrimitiveType::PointList),
+                1 => Ok(NggOutputPrimitiveType::LineStrip),
+                2 => Ok(NggOutputPrimitiveType::TriangleStrip),
+                3 => Ok(NggOutputPrimitiveType::RectangleList),
+                kind => Err(format!("unknown VGT_GS_OUT_PRIM_TYPE {kind:#x}")),
+            }
+        })
+        .transpose()?;
+    let programmed_instance_count = instance_control
+        .map(|raw| {
+            let count = (raw >> 2) & 0x7f;
+            if count != 0 {
+                Ok(count)
+            } else if raw & 1 == 0 {
+                Ok(1)
+            } else {
+                Err(format!(
+                    "enabled VGT_GS_INSTANCE_CNT has a zero invocation count: {raw:#010x}"
+                ))
+            }
+        })
+        .transpose()?;
+    NggSubgroupLimits::new(
+        onchip & 0x7ff,
+        (onchip >> 11) & 0x7ff,
+        (onchip >> 22) & 0x3ff,
+        max_vert_out & 0x7ff,
+        max_output & 0x3ff,
+        subgroup_control & 0x1ff,
+        output_primitive_type,
+        programmed_instance_count,
+    )
+    .map(Some)
+}
+
 /// Builds the GFX10 NGG workgroups consumed by a merged export/geometry shader.
 ///
-/// The native ABI supplies up to 64 unique vertex IDs and 64 packed triangle records to each
-/// wave. Treating every three source indices as three new vertices restricts a wave to only 21
-/// triangles, repeats vertex work, and can expand a large Unreal draw into thousands of Metal
-/// mesh threadgroups. Preserve index reuse by greedily packing consecutive triangles until
-/// either architectural limit is reached.
-pub(crate) fn prepare_ngg_meshlets(indices: &[u32]) -> PreparedNggMeshlets {
+/// The guest registers independently limit unique ES vertices and GS primitives in each subgroup.
+/// Preserve index reuse by greedily packing consecutive triangles until either declared input
+/// limit is reached. The backing record has the architectural 256-entry maximum so changing guest
+/// limits never changes the Metal-side offsets.
+pub(crate) fn prepare_ngg_meshlets(
+    indices: &[u32],
+    limits: NggSubgroupLimits,
+) -> PreparedNggMeshlets {
     let primitive_count = indices.len() / 3;
+    let max_vertices = usize::try_from(limits.es_vertices_per_subgroup)
+        .expect("validated NGG vertex count fits usize");
+    let max_primitives = usize::try_from(limits.gs_primitives_per_subgroup)
+        .expect("validated NGG primitive count fits usize");
     let mut words = Vec::new();
-    let mut vertices = Vec::<u32>::with_capacity(NGG_MESHLET_MAX_VERTICES);
-    let mut vertex_slots = HashMap::<u32, u32>::with_capacity(NGG_MESHLET_MAX_VERTICES);
-    let mut primitives = Vec::<u32>::with_capacity(NGG_MESHLET_MAX_PRIMITIVES);
+    let mut vertices = Vec::<u32>::with_capacity(max_vertices);
+    let mut vertex_slots = HashMap::<u32, u32>::with_capacity(max_vertices);
+    let mut primitives = Vec::<u32>::with_capacity(max_primitives);
     let mut first_primitive = 0_usize;
 
     let flush = |words: &mut Vec<u32>,
@@ -65,13 +242,17 @@ pub(crate) fn prepare_ngg_meshlets(indices: &[u32]) -> PreparedNggMeshlets {
         let vertex_count = u32::try_from(vertices.len()).expect("NGG vertex count fits u32");
         let primitive_count =
             u32::try_from(primitives.len()).expect("NGG primitive count fits u32");
-        words.push(vertex_count | (primitive_count << 8));
+        // The merged-shader ABI stores each count in eight bits; 256 is encoded as zero.
+        words.push((vertex_count & 0xff) | ((primitive_count & 0xff) << 8));
         words.push(u32::try_from(first_primitive).expect("NGG primitive ID fits u32"));
         words.extend(vertices.iter().copied());
-        words.resize(words.len() + NGG_MESHLET_MAX_VERTICES - vertices.len(), 0);
+        words.resize(
+            words.len() + NGG_MESHLET_STORAGE_VERTICES - vertices.len(),
+            0,
+        );
         words.extend(primitives.iter().copied());
         words.resize(
-            words.len() + NGG_MESHLET_MAX_PRIMITIVES - primitives.len(),
+            words.len() + NGG_MESHLET_STORAGE_PRIMITIVES - primitives.len(),
             0x8000_0000,
         );
         vertices.clear();
@@ -88,8 +269,8 @@ pub(crate) fn prepare_ngg_meshlets(indices: &[u32]) -> PreparedNggMeshlets {
             })
             .count();
         if !primitives.is_empty()
-            && (primitives.len() == NGG_MESHLET_MAX_PRIMITIVES
-                || vertices.len() + additional_vertices > NGG_MESHLET_MAX_VERTICES)
+            && (primitives.len() == max_primitives
+                || vertices.len() + additional_vertices > max_vertices)
         {
             flush(
                 &mut words,
@@ -122,7 +303,11 @@ pub(crate) fn prepare_ngg_meshlets(indices: &[u32]) -> PreparedNggMeshlets {
     // Count all packed vertex records rather than only the final workgroup.
     let vertex_references = words
         .chunks_exact(NGG_MESHLET_WORDS_PER_GROUP)
-        .map(|group| usize::try_from(group[0] & 0xff).expect("vertex count fits usize"))
+        .map(|group| {
+            let encoded = group[0] & 0xff;
+            usize::try_from(if encoded == 0 { 256 } else { encoded })
+                .expect("vertex count fits usize")
+        })
         .sum();
     let group_count = u64::try_from(words.len() / NGG_MESHLET_WORDS_PER_GROUP)
         .expect("NGG meshlet group count fits u64");
@@ -485,6 +670,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         vertex_output_control: register_value(&draw.context_registers, PA_CL_VS_OUT_CNTL)
             .unwrap_or_default(),
         pixel_input_controls: pixel_input_controls(&draw.context_registers),
+        ngg_subgroup_limits: decode_ngg_subgroup_limits(&draw.context_registers)?,
         pixel_depth_export: pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
         diagnostics: graphics_diagnostic_pipeline_state(
             draw,
