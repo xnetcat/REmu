@@ -101,6 +101,30 @@ fn native_metal_draw_arguments_match_the_gen5_indirect_layouts() {
 }
 
 #[test]
+fn busy_event_loop_retains_batches_but_idle_callbacks_flush() {
+    assert!(!super::super::submission::event_loop_batch_requires_flush(
+        true
+    ));
+    assert!(super::super::submission::event_loop_batch_requires_flush(
+        false
+    ));
+}
+
+#[test]
+fn retained_busy_batch_has_a_finite_submission_completion_bound() {
+    let capacity = super::super::GUEST_BATCH_COMPLETION_CAPACITY;
+    assert!(!super::super::submission::guest_batch_completion_capacity_reached(
+        capacity - 1
+    ));
+    assert!(
+        super::super::submission::guest_batch_completion_capacity_reached(capacity)
+    );
+    assert!(
+        super::super::submission::guest_batch_completion_capacity_reached(capacity + 1)
+    );
+}
+
+#[test]
 fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
