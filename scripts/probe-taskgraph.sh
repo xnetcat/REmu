@@ -120,6 +120,8 @@ set +e
             REMU_TASKGRAPH_TRACE_HITS="$hit_limit" \
             arch -x86_64 /usr/bin/lldb --no-lldbinit -b \
             -o 'process handle SIGALRM -n false -p true -s false' \
+            -o 'process handle SIGSEGV -n false -p true -s false' \
+            -o 'process handle SIGBUS -n false -p true -s false' \
             -o "command script import '$trace_script'" \
             -o 'remu-taskgraph-trace-start' \
             -o "process launch -o '$run_dir/guest.stdout' -e '$run_dir/guest.stderr'" \

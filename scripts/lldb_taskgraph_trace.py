@@ -31,6 +31,12 @@ DEFAULT_CYCLE_LIMIT = 16
 DEFAULT_HIT_LIMIT = 4096
 MAXIMUM_CYCLE_LIMIT = 64
 MAXIMUM_HIT_LIMIT = 100_000
+# REmu executes PS5 code directly in low canonical host mappings.  The main
+# image starts at 0x8_0000_0000, while guest modules, heaps, and direct-memory
+# aliases observed by the runtime remain below one tebibyte.  Native macOS
+# libraries and Rust allocations are in the high 0x7f/0x7ff ranges instead.
+MINIMUM_GUEST_EXECUTION_ADDRESS = 0x8_0000_0000
+MAXIMUM_GUEST_EXECUTION_ADDRESS = 0x100_0000_0000
 
 PHASE_PUBLISH = "publish"
 PHASE_CONSUME = "consume"
@@ -147,6 +153,25 @@ def is_taskgraph_diagnostic_stop_address(address: int) -> bool:
     return (
         address in TASKGRAPH_BREAKPOINT_ADDRESSES
         or address in TASKGRAPH_TRACE_FALLTHROUGH_ADDRESSES
+    )
+
+
+def is_guest_bad_access_stop(address: int, description: Optional[str]) -> bool:
+    """Return whether LLDB intercepted a guest fault meant for REmu's handler.
+
+    REmu uses page protection faults for guest-memory dirty/write tracking.
+    When running under LLDB, debugserver sees those Mach exceptions before
+    REmu's installed signal handler.  Only pass through EXC_BAD_ACCESS stops
+    whose instruction pointer is in the direct guest execution window; a host
+    fault must remain stopped for diagnosis.
+    """
+
+    return (
+        MINIMUM_GUEST_EXECUTION_ADDRESS
+        <= address
+        < MAXIMUM_GUEST_EXECUTION_ADDRESS
+        and description is not None
+        and description.startswith("EXC_BAD_ACCESS")
     )
 
 
@@ -625,7 +650,7 @@ def start_taskgraph_trace(debugger, _command, result, _internal_dict):
 
 
 def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
-    """Continue only dyld notifications and this diagnostic's breakpoints."""
+    """Continue diagnostic traps and guest faults owned by REmu's handler."""
 
     target = debugger.GetSelectedTarget()
     process = target.GetProcess()
@@ -655,6 +680,13 @@ def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
                 if is_taskgraph_diagnostic_stop_address(address):
                     diagnostic_stop = True
                     stop_kind = f"taskgraph-trace-{address:#x}"
+                    break
+            if reason == lldb.eStopReasonException:
+                address = frame.GetPCAddress().GetLoadAddress(target)
+                description = thread.GetStopDescription(256)
+                if is_guest_bad_access_stop(address, description):
+                    diagnostic_stop = True
+                    stop_kind = f"guest-bad-access-{address:#x}"
                     break
         if not diagnostic_stop:
             break
