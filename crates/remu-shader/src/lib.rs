@@ -24,10 +24,10 @@ pub use ir::{
     BufferMemoryControl, ComputeSystemRegisters, ComputeSystemValue, DataShareControl, Dpp8Control,
     DppControl, ExportControl, GlobalMemoryBinding, GlobalMemoryControl, ImageBinding,
     ImageBindingSlotMap, ImageControl, Instruction, InstructionControl, InterpolationControl,
-    Opcode, Operand, OperandKind, PixelOutputBinding, PixelOutputKind, Program, RawOpcodeFamily,
-    ResourceKind, ResourceMapping, ScalarMemoryControl, SdwaControl, ShaderEncoding,
-    ShaderEvaluation, ShaderMetadata, ShaderState, VertexInputBinding, Vop3Control, Vop3pControl,
-    image_is_comparison,
+    Opcode, Operand, OperandKind, PixelOutputBinding, PixelOutputKind, Program, ProgramLinkError,
+    RawOpcodeFamily, ResourceKind, ResourceMapping, ScalarMemoryControl, SdwaControl,
+    ShaderEncoding, ShaderEvaluation, ShaderMetadata, ShaderState, VertexInputBinding, Vop3Control,
+    Vop3pControl, image_is_comparison, link_program_continuation,
 };
 pub use metadata::{GuestMemoryReader, MetadataError, read_shader_metadata};
 pub use state::{ShaderStateError, build_shader_state};

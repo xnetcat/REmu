@@ -3,7 +3,7 @@
 
 //! Scalar liveness analysis used to size the evaluation slice of a decoded program.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Instruction, InstructionControl, Opcode, OperandKind, ShaderEncoding};
 
@@ -34,6 +34,7 @@ type ScalarLiveSet = [u64; SCALAR_LIVE_WORDS];
 pub(crate) fn evaluation_scalar_liveness(
     instructions: &[Instruction],
     next_evaluation_instruction_indices: &[u32],
+    linked_transfer_targets: &BTreeMap<u32, u32>,
 ) -> Vec<Vec<u8>> {
     let instruction_count = instructions.len();
     let mut uses = vec![[0_u64; SCALAR_LIVE_WORDS]; instruction_count];
@@ -101,9 +102,17 @@ pub(crate) fn evaluation_scalar_liveness(
         }
 
         let name = instruction.opcode.known_name();
-        if instruction.opcode == Opcode::END_PROGRAM
-            || matches!(name, Some("SSetpcB64" | "SSwappcB64"))
-        {
+        if instruction.opcode == Opcode::END_PROGRAM || matches!(name, Some("SSwappcB64")) {
+            continue;
+        }
+        if matches!(name, Some("SSetpcB64")) {
+            if let Some(target) = linked_transfer_targets.get(&instruction.pc)
+                && let Ok(target_index) =
+                    instructions.binary_search_by_key(target, |candidate| candidate.pc)
+                && let Some(target_evaluation) = next_evaluation(target_index)
+            {
+                successors[index].push(target_evaluation);
+            }
             continue;
         }
         let is_branch = matches!(

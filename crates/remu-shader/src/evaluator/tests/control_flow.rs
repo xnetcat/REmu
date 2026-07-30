@@ -215,3 +215,139 @@ fn exits_an_unconditional_back_edge_after_discovering_the_vector_loop_once() {
     )
     .expect("unconditional vector loop back edge must remain bounded");
 }
+
+#[test]
+fn linked_setpc_preserves_scalar_state_and_continuation_absolute_pc() {
+    let front = Program::new(
+        0x1000,
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SMovB32",
+                vec![Operand::scalar(0)],
+                vec![Operand::scalar(20)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sop1,
+                "SSetpcB64",
+                vec![Operand::scalar(6)],
+                Vec::new(),
+                None,
+            ),
+        ],
+    );
+    let continuation = Program::new(
+        0x4000,
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SGetpcB64",
+                Vec::new(),
+                vec![Operand::scalar(30)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sop2,
+                "SAddU32",
+                vec![Operand::scalar(20), Operand::scalar(30)],
+                vec![Operand::scalar(40)],
+                None,
+            ),
+            end(8),
+        ],
+    );
+    let shader = ShaderState {
+        program: Arc::new(
+            crate::link_program_continuation(&front, &continuation)
+                .expect("exact linked continuation"),
+        ),
+        user_data: vec![7].into(),
+        compute_system_registers: None,
+        user_data_scalar_register_base: 0,
+    };
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("linked scalar control flow");
+
+    assert_eq!(evaluation.scalar_registers[20], 7);
+    assert_eq!(evaluation.scalar_registers[30], 0x4004);
+    assert_eq!(evaluation.scalar_registers[31], 0);
+    assert_eq!(evaluation.scalar_registers[40], 0x400b);
+}
+
+#[test]
+fn linked_program_resources_keep_distinct_front_and_continuation_pcs() {
+    let image = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0, 1],
+        vector_data: 4,
+        scalar_resource: 0,
+        scalar_sampler: 8,
+        dimension: 1,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+    };
+    let image_instruction = |pc| {
+        instruction(
+            pc,
+            ShaderEncoding::Mimg,
+            "ImageSampleLz",
+            Vec::new(),
+            Vec::new(),
+            Some(InstructionControl::Image(image.clone())),
+        )
+    };
+    let front = Program::new(
+        0x1000,
+        vec![
+            image_instruction(0),
+            instruction(
+                4,
+                ShaderEncoding::Sop1,
+                "SSetpcB64",
+                vec![Operand::scalar(6)],
+                Vec::new(),
+                None,
+            ),
+        ],
+    );
+    let continuation = Program::new(0x4000, vec![image_instruction(0), end(4)]);
+    let shader = ShaderState {
+        program: Arc::new(
+            crate::link_program_continuation(&front, &continuation)
+                .expect("exact linked continuation"),
+        ),
+        user_data: (1..=12).collect::<Vec<_>>().into(),
+        compute_system_registers: None,
+        user_data_scalar_register_base: 0,
+    };
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("both linked resource sites should evaluate");
+
+    assert_eq!(
+        evaluation
+            .image_bindings
+            .iter()
+            .map(|binding| binding.pc)
+            .collect::<Vec<_>>(),
+        vec![0, 0x3000]
+    );
+}

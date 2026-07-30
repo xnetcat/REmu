@@ -302,6 +302,7 @@ pub struct Instruction {
 pub struct Program {
     pub address: u64,
     pub instructions: Vec<Instruction>,
+    linked_transfer_targets: BTreeMap<u32, u32>,
     pixel_color_export_masks: u32,
     next_evaluation_instruction_indices: Vec<u32>,
     evaluation_live_scalar_register_indices: Vec<Vec<u8>>,
@@ -311,6 +312,26 @@ pub struct Program {
     runtime_scalar_registers: BTreeSet<u32>,
     runtime_scalar_register_indices: Vec<u8>,
     input_scalar_registers: BTreeSet<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ProgramLinkError {
+    #[error("front shader program is empty")]
+    EmptyFront,
+    #[error("continuation shader program is empty")]
+    EmptyContinuation,
+    #[error("front shader program has no S_SETPC_B64 transfer")]
+    MissingSetpc,
+    #[error("shader program is already linked")]
+    AlreadyLinked,
+    #[error(
+        "continuation at {continuation:#x} overlaps or precedes front program end {front_end:#x}"
+    )]
+    OverlappingPrograms { front_end: u64, continuation: u64 },
+    #[error("linked shader address arithmetic overflowed")]
+    AddressOverflow,
+    #[error("linked shader span exceeds the 32-bit architectural PC range")]
+    ProgramCounterOverflow,
 }
 
 impl Program {
@@ -490,11 +511,15 @@ impl Program {
             }
             next_evaluation_instruction_indices[index] = next;
         }
-        let evaluation_live_scalar_register_indices =
-            evaluation_scalar_liveness(&instructions, &next_evaluation_instruction_indices);
+        let evaluation_live_scalar_register_indices = evaluation_scalar_liveness(
+            &instructions,
+            &next_evaluation_instruction_indices,
+            &BTreeMap::new(),
+        );
         Self {
             address,
             instructions,
+            linked_transfer_targets: BTreeMap::new(),
             pixel_color_export_masks,
             next_evaluation_instruction_indices,
             evaluation_live_scalar_register_indices,
@@ -505,6 +530,16 @@ impl Program {
             runtime_scalar_register_indices,
             input_scalar_registers,
         }
+    }
+
+    /// Returns the exact relative PC supplied for one registered indirect continuation.
+    ///
+    /// Ordinary decoded `S_SETPC_B64` instructions have no target here and retain their terminal
+    /// dynamic-transfer behavior. Only a runtime which observed the architectural front/back
+    /// linkage may build a program containing these edges.
+    #[must_use]
+    pub fn linked_transfer_target(&self, pc: u32) -> Option<u32> {
+        self.linked_transfer_targets.get(&pc).copied()
     }
 
     #[must_use]
@@ -569,6 +604,100 @@ impl Program {
     pub const fn input_scalar_registers(&self) -> &BTreeSet<u32> {
         &self.input_scalar_registers
     }
+}
+
+/// Joins one exact registered `S_SETPC_B64` continuation into a single shader program.
+///
+/// The continuation's PCs are rebased by its real allocation-address delta rather than placed in
+/// an invented namespace. Consequently `program.address + instruction.pc` remains the original
+/// absolute guest address in both halves, preserving `S_GETPC_B64` and giving resource bindings
+/// from each allocation distinct instruction identities. Every front `S_SETPC_B64` edge targets
+/// the continuation entry; callers must only invoke this after proving the exact fused pair.
+///
+/// # Errors
+///
+/// Returns an error for empty, already-linked, overlapping, address-overflowing, or non-`SETPC`
+/// input programs.
+pub fn link_program_continuation(
+    front: &Program,
+    continuation: &Program,
+) -> Result<Program, ProgramLinkError> {
+    if front.instructions.is_empty() {
+        return Err(ProgramLinkError::EmptyFront);
+    }
+    if continuation.instructions.is_empty() {
+        return Err(ProgramLinkError::EmptyContinuation);
+    }
+    if !front.linked_transfer_targets.is_empty() || !continuation.linked_transfer_targets.is_empty()
+    {
+        return Err(ProgramLinkError::AlreadyLinked);
+    }
+    let setpc_pcs = front
+        .instructions
+        .iter()
+        .filter(|instruction| instruction.opcode.is("SSetpcB64"))
+        .map(|instruction| instruction.pc)
+        .collect::<Vec<_>>();
+    if setpc_pcs.is_empty() {
+        return Err(ProgramLinkError::MissingSetpc);
+    }
+
+    let front_last = front
+        .instructions
+        .last()
+        .ok_or(ProgramLinkError::EmptyFront)?;
+    let front_last_bytes = u64::try_from(
+        front_last
+            .words
+            .len()
+            .checked_mul(size_of::<u32>())
+            .ok_or(ProgramLinkError::AddressOverflow)?,
+    )
+    .map_err(|_| ProgramLinkError::AddressOverflow)?;
+    let front_end = front
+        .address
+        .checked_add(u64::from(front_last.pc))
+        .and_then(|address| address.checked_add(front_last_bytes))
+        .ok_or(ProgramLinkError::AddressOverflow)?;
+    if continuation.address < front_end {
+        return Err(ProgramLinkError::OverlappingPrograms {
+            front_end,
+            continuation: continuation.address,
+        });
+    }
+    let continuation_offset = continuation
+        .address
+        .checked_sub(front.address)
+        .ok_or(ProgramLinkError::AddressOverflow)
+        .and_then(|offset| {
+            u32::try_from(offset).map_err(|_| ProgramLinkError::ProgramCounterOverflow)
+        })?;
+    let continuation_entry = continuation_offset
+        .checked_add(continuation.instructions[0].pc)
+        .ok_or(ProgramLinkError::ProgramCounterOverflow)?;
+
+    let mut instructions =
+        Vec::with_capacity(front.instructions.len() + continuation.instructions.len());
+    instructions.extend(front.instructions.iter().cloned());
+    for instruction in &continuation.instructions {
+        let mut instruction = instruction.clone();
+        instruction.pc = continuation_offset
+            .checked_add(instruction.pc)
+            .ok_or(ProgramLinkError::ProgramCounterOverflow)?;
+        instructions.push(instruction);
+    }
+
+    let mut linked = Program::new(front.address, instructions);
+    linked.linked_transfer_targets = setpc_pcs
+        .into_iter()
+        .map(|pc| (pc, continuation_entry))
+        .collect();
+    linked.evaluation_live_scalar_register_indices = evaluation_scalar_liveness(
+        &linked.instructions,
+        &linked.next_evaluation_instruction_indices,
+        &linked.linked_transfer_targets,
+    );
+    Ok(linked)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
