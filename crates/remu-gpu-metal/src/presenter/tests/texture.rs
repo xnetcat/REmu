@@ -2279,11 +2279,11 @@ fn shared_backing_aliases_reuse_identical_metal_storage() {
     };
 
     let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).unwrap();
-    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
     let first = memory
         .map_shared(
             GuestMapPlacement::Anywhere,
-            GUEST_PAGE_SIZE,
+            2 * GUEST_PAGE_SIZE,
             GUEST_PAGE_SIZE,
             GuestProtection::READ_WRITE,
             &backing,
@@ -2293,7 +2293,7 @@ fn shared_backing_aliases_reuse_identical_metal_storage() {
     let second = memory
         .map_shared(
             GuestMapPlacement::Anywhere,
-            GUEST_PAGE_SIZE,
+            2 * GUEST_PAGE_SIZE,
             GUEST_PAGE_SIZE,
             GuestProtection::READ_WRITE,
             &backing,
@@ -2317,7 +2317,18 @@ fn shared_backing_aliases_reuse_identical_metal_storage() {
     assert!(guest_texture_descriptors_overlap(first, second));
     assert!(guest_texture_descriptors_share_storage(first, second));
     let overlap = GuestTextureOverlapQuery::new(first);
+    let alias = GuestTextureOverlapQuery::new(second);
+    let partial_alias = GuestTextureOverlapQuery::new(GuestTextureDescriptor {
+        address: second.address + 4,
+        ..second
+    });
     assert!(overlap.overlaps(second));
+    assert!(overlap.shares_storage_query(&alias));
+    assert!(overlap.overlaps_query(&partial_alias));
+    assert!(
+        !overlap.shares_storage_query(&partial_alias),
+        "partial overlap is not exact typed-storage equivalence",
+    );
     assert!(!overlap.overlaps(GuestTextureDescriptor {
         address: second.address + GUEST_PAGE_SIZE,
         ..second
@@ -2389,6 +2400,10 @@ fn cached_overlap_identity_survives_original_virtual_address_rebinding() {
     assert!(
         written_alias.overlaps_query(&cached),
         "the admission-time identity continues to name the cached physical storage",
+    );
+    assert!(
+        written_alias.shares_storage_query(&cached),
+        "typed storage equivalence uses the same retained physical identity",
     );
 }
 

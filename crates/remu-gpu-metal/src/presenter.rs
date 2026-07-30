@@ -810,6 +810,11 @@ struct ResidentGuestTexture {
     texture: Texture,
     component_reorder_view: Option<Texture>,
     descriptor: GuestTextureDescriptor,
+    /// Admission-time physical identity used by hot resident overlap/storage scans.
+    ///
+    /// The associated write watch retires the resident when the mapping is replaced, so this
+    /// identity remains authoritative for exactly the same lifetime as the Metal allocation.
+    overlap: GuestTextureOverlapQuery,
     texture_type: u32,
     layer_count: u32,
     mip_level_count: u32,

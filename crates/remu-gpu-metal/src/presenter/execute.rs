@@ -9,12 +9,12 @@ use super::{
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
-    GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
-    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_THREADS, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
-    PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    ResidentTextureActivityStamp, append_unique_global_writebacks,
-    append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
-    capture_target_sample_textures, collect_pending_global_writebacks,
+    GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor,
+    GuestTextureOverlapQuery, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESH_THREADS,
+    NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0,
+    PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, ResidentTextureActivityStamp,
+    append_unique_global_writebacks, append_unique_guest_write_ranges, canonical_texture_bindings,
+    capture_guest_frame, capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, color_operation_is_raster_noop, compute_pipeline_key,
     compute_program_can_split_wave64, consume_color_metadata_clear, consume_depth_metadata_clear,
     create_global_argument_buffer, decode_color_eliminate_fast_clear_target,
@@ -492,10 +492,11 @@ impl MetalPresenter {
                 target_resolve_textures.push(None);
             }
         }
-        let depth_had_resident_storage = depth.is_some_and(|depth| {
-            self.resident_guest_textures.values().any(|resident| {
-                guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
-            })
+        let depth_overlap = depth.map(|depth| GuestTextureOverlapQuery::new(depth.texture));
+        let depth_had_resident_storage = depth_overlap.as_ref().is_some_and(|overlap| {
+            self.resident_guest_textures
+                .values()
+                .any(|resident| resident.overlap.shares_storage_query(overlap))
         });
         let resolved_depth_texture = depth
             .map(|depth| {

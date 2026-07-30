@@ -4,21 +4,21 @@
 use super::super::completion::commit_and_settle;
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
-    GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
-    MultisampleTextureKey, ResidentGuestTexture, ResidentTextureActivityStamp,
-    ScanoutSnapshotTexture, WriteWatchRefresh, create_mipmapped_guest_texture,
-    decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    decode_sampled_texture_linear_from_raw, guest_texture_byte_count,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage,
-    initial_depth_clear_for_target, mode27_mip_chain_layout, promote_resident_mip_hierarchy,
-    record_mode27_work_detail, refresh_resident_texture_write_watch,
-    resident_texture_eviction_plan, resident_texture_for_sample,
-    retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
-    retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
-    snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
-    snapshot_watched_sampled_texture_raw, texture_element_layout, trace_residency_churn,
-    trace_resident_texture_removal, watch_guest_texture, watch_resident_texture,
-    watch_sampled_texture, write_resident_texture_contents_to_guest,
+    GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter, Mode27WorkOrigin,
+    MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture,
+    ResidentTextureActivityStamp, ScanoutSnapshotTexture, WriteWatchRefresh,
+    create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
+    decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
+    guest_texture_byte_count, guest_texture_descriptors_overlap, initial_depth_clear_for_target,
+    mode27_mip_chain_layout, promote_resident_mip_hierarchy, record_mode27_work_detail,
+    refresh_resident_texture_write_watch, resident_texture_eviction_plan,
+    resident_texture_for_sample, retire_multisample_textures_overlapping_writeback,
+    retire_overlapping_sampled_textures, retire_resident_textures_overlapping_writeback,
+    retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
+    snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw,
+    texture_element_layout, trace_residency_churn, trace_resident_texture_removal,
+    watch_guest_texture, watch_resident_texture, watch_sampled_texture,
+    write_resident_texture_contents_to_guest,
 };
 use metal::{
     Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
@@ -364,12 +364,11 @@ impl MetalPresenter {
         &mut self,
         descriptor: GuestTextureDescriptor,
     ) -> Result<bool, String> {
+        let overlap = GuestTextureOverlapQuery::new(descriptor);
         let candidates = self
             .resident_guest_textures
             .values()
-            .filter(|resident| {
-                guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
-            })
+            .filter(|resident| resident.overlap.shares_storage_query(&overlap))
             .map(|resident| resident.descriptor)
             .collect::<Vec<_>>();
         let mut has_live_storage = false;
@@ -426,6 +425,7 @@ impl MetalPresenter {
         if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
             trace_resident_texture_removal("ensure-exact-resident-replaced", &resident);
         }
+        let overlap = GuestTextureOverlapQuery::new(descriptor);
         let shared_resident = self
             .resident_guest_textures
             .values()
@@ -433,7 +433,7 @@ impl MetalPresenter {
                 resident.texture_type == 9
                     && resident.layer_count == 1
                     && resident.mip_level_count >= 1
-                    && guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
+                    && resident.overlap.shares_storage_query(&overlap)
             })
             .map(|resident| resident.descriptor);
         if let Some(shared_resident) = shared_resident {
@@ -458,7 +458,7 @@ impl MetalPresenter {
         let mut aliases = self
             .resident_guest_textures
             .values()
-            .filter(|resident| guest_texture_descriptors_overlap(resident.descriptor, descriptor))
+            .filter(|resident| resident.overlap.overlaps_query(&overlap))
             .map(|resident| (resident.content_version, resident.descriptor))
             .collect::<Vec<_>>();
         if !aliases.is_empty() {
@@ -681,6 +681,7 @@ impl MetalPresenter {
                 texture: texture.clone(),
                 component_reorder_view: None,
                 descriptor: target.texture,
+                overlap: GuestTextureOverlapQuery::new(target.texture),
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
                 mip_level_count: target.mip_level_count,
@@ -780,6 +781,7 @@ impl MetalPresenter {
                 texture: texture.clone(),
                 component_reorder_view: None,
                 descriptor: target.texture,
+                overlap: GuestTextureOverlapQuery::new(target.texture),
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
                 mip_level_count: 1,
@@ -888,6 +890,7 @@ impl MetalPresenter {
         blit.end_encoding();
         commit_and_settle(&command_buffer, "depth-target promotion")?;
 
+        let overlap = GuestTextureOverlapQuery::new(depth.texture);
         let resident_descriptor = self
             .resident_guest_textures
             .contains_key(&depth.texture)
@@ -895,9 +898,7 @@ impl MetalPresenter {
             .or_else(|| {
                 self.resident_guest_textures
                     .values()
-                    .find(|resident| {
-                        guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
-                    })
+                    .find(|resident| resident.overlap.shares_storage_query(&overlap))
                     .map(|resident| resident.descriptor)
             })
             .ok_or("promoted depth target lost its resident identity")?;
@@ -1021,6 +1022,7 @@ impl MetalPresenter {
                 texture: texture.clone(),
                 component_reorder_view: None,
                 descriptor: depth.texture,
+                overlap: GuestTextureOverlapQuery::new(depth.texture),
                 texture_type: DEPTH_ARRAY_TEXTURE_TYPE,
                 layer_count: depth.layer_count,
                 mip_level_count: 1,
@@ -1180,6 +1182,7 @@ impl MetalPresenter {
         activity_stamp: ResidentTextureActivityStamp,
     ) {
         self.resident_content_version = self.resident_content_version.saturating_add(1);
+        let overlap = GuestTextureOverlapQuery::new(descriptor);
         let resident_descriptor = self
             .resident_guest_textures
             .contains_key(&descriptor)
@@ -1187,9 +1190,7 @@ impl MetalPresenter {
             .or_else(|| {
                 self.resident_guest_textures
                     .values()
-                    .find(|resident| {
-                        guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
-                    })
+                    .find(|resident| resident.overlap.shares_storage_query(&overlap))
                     .map(|resident| resident.descriptor)
             });
         if let Some(resident_descriptor) = resident_descriptor {
@@ -1203,7 +1204,7 @@ impl MetalPresenter {
                 .filter_map(|(candidate, resident)| {
                     (*candidate != resident_descriptor
                         && !resident.gpu_written
-                        && guest_texture_descriptors_overlap(*candidate, descriptor))
+                        && resident.overlap.overlaps_query(&overlap))
                     .then_some(*candidate)
                 })
                 .collect::<Vec<_>>();
@@ -1234,11 +1235,10 @@ impl MetalPresenter {
             .contains_key(&descriptor)
             .then_some(descriptor)
             .or_else(|| {
+                let overlap = GuestTextureOverlapQuery::new(descriptor);
                 self.resident_guest_textures
                     .values()
-                    .find(|resident| {
-                        guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
-                    })
+                    .find(|resident| resident.overlap.shares_storage_query(&overlap))
                     .map(|resident| resident.descriptor)
             });
         if let Some(resident) = resident_descriptor.and_then(|resident_descriptor| {
@@ -1296,6 +1296,7 @@ pub(crate) fn ensure_resident_texture_in_map(
             texture: texture.clone(),
             component_reorder_view: None,
             descriptor,
+            overlap: GuestTextureOverlapQuery::new(descriptor),
             texture_type: 9,
             layer_count: 1,
             mip_level_count: 1,

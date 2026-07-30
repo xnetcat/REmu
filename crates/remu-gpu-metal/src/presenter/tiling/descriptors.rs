@@ -10,6 +10,7 @@ pub(crate) struct GuestTextureOverlapQuery {
     descriptor: GuestTextureDescriptor,
     byte_count: Option<u64>,
     backing: Option<GuestSharedMappingIdentity>,
+    mapping: Option<GuestSharedMappingIdentity>,
 }
 
 impl GuestTextureOverlapQuery {
@@ -18,10 +19,13 @@ impl GuestTextureOverlapQuery {
         let backing = byte_count.and_then(|byte_count| {
             remu_memory::guest_shared_backing_identity(descriptor.address, byte_count)
         });
+        let mapping = byte_count
+            .and_then(|byte_count| guest_shared_mapping_identity(descriptor.address, byte_count));
         Self {
             descriptor,
             byte_count,
             backing,
+            mapping,
         }
     }
 
@@ -63,6 +67,34 @@ impl GuestTextureOverlapQuery {
                 right_backing.backing_offset,
                 right_bytes,
             )
+    }
+
+    /// Reports exact typed-storage equivalence without resolving either descriptor again.
+    ///
+    /// Resident and sampled textures retain a query for the lifetime of their write watch. A
+    /// render-target write can consequently compare every cached interpretation against one
+    /// newly resolved target query without reacquiring the process-global shared-mapping lock for
+    /// every candidate.
+    pub(crate) fn shares_storage_query(&self, other: &Self) -> bool {
+        if self.descriptor == other.descriptor {
+            return true;
+        }
+        if !guest_texture_descriptors_have_same_layout(self.descriptor, other.descriptor) {
+            return false;
+        }
+        let (Some(left_bytes), Some(right_bytes)) = (self.byte_count, other.byte_count) else {
+            return false;
+        };
+        if left_bytes != right_bytes {
+            return false;
+        }
+        if self.descriptor.address == other.descriptor.address {
+            return true;
+        }
+        matches!(
+            (self.mapping, other.mapping),
+            (Some(left), Some(right)) if left == right
+        )
     }
 }
 
