@@ -45,16 +45,17 @@ use self::decode::{
     initial_depth_clear_for_target, initial_render_target_clear_color, metal_color_write_mask,
     metal_nonindexed_vertex_count, metal_primitive_type, prepare_indexed_primitive,
     prepare_ngg_meshlets, raw_video_out_texture_descriptor, read_draw_indices, register_value,
-    render_target_fast_clear_color, sampled_alias_descriptor,
+    render_target_cmask_address, render_target_fast_clear_color, sampled_alias_descriptor,
 };
 #[cfg(test)]
 use self::decode::{
     CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_BASE, CB_COLOR0_BASE_EXT,
-    CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, DB_DEPTH_CLEAR,
-    DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE, DB_Z_READ_BASE_HI,
-    DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, NGG_MESHLET_WORDS_PER_GROUP, SPI_PS_INPUT_CNTL_0,
-    VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
-    common_render_target_array_length, decode_fast_clear_color,
+    CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_CMASK, CB_COLOR0_INFO,
+    CB_COLOR0_VIEW, DB_DEPTH_CLEAR, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL,
+    DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI,
+    NGG_MESHLET_WORDS_PER_GROUP, SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE,
+    VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length,
+    decode_fast_clear_color,
     decode_render_targets_from_registers, decode_scanout_target, graphics_shader_resource_key,
     initial_depth_clear_value, metal_primitive_topology_class, pixel_input_controls,
     raw_video_out_layout_is_linear,
@@ -539,6 +540,34 @@ fn rearm_depth_metadata_clear(states: &mut HashMap<u64, bool>, address: u64) -> 
         return false;
     };
     *pending = true;
+    true
+}
+
+fn consume_color_metadata_clear(
+    states: &mut HashMap<u64, u32>,
+    address: Option<u64>,
+    slice: u32,
+) -> bool {
+    let Some(address) = address else {
+        return false;
+    };
+    let Some(slice_mask) = 1_u32.checked_shl(slice) else {
+        return false;
+    };
+    // shadPS4 registers a newly observed CMASK with all slices logically cleared. A metadata
+    // compute/DMA fill can rearm that state; beginning a color attachment or eliminating the
+    // fast clear consumes it once.
+    let clear_mask = states.entry(address).or_insert(u32::MAX);
+    let consumed = *clear_mask & slice_mask != 0;
+    *clear_mask &= !slice_mask;
+    consumed
+}
+
+fn rearm_color_metadata_clear(states: &mut HashMap<u64, u32>, address: u64) -> bool {
+    let Some(clear_mask) = states.get_mut(&address) else {
+        return false;
+    };
+    *clear_mask = u32::MAX;
     true
 }
 
@@ -1172,6 +1201,10 @@ struct MetalPresenter {
     /// consume guest HTILE directly, so the next attachment use materializes a pending state as
     /// a depth load clear.
     depth_metadata_clears: HashMap<u64, bool>,
+    /// Logical CMASK clear bits keyed by CB_COLOR_CMASK byte address. REmu stores color targets
+    /// uncompressed, so attachment begin expands a pending bit through a Metal load clear and a
+    /// later EliminateFastClear observes that the bit was already consumed.
+    color_metadata_clears: HashMap<u64, u32>,
     next_depth_metadata_clear_sequence: u64,
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     sampled_texture_write_watches: HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
@@ -1324,6 +1357,7 @@ impl MetalPresenter {
             scanout_snapshot_textures: HashMap::new(),
             multisample_textures: HashMap::new(),
             depth_metadata_clears: HashMap::new(),
+            color_metadata_clears: HashMap::new(),
             next_depth_metadata_clear_sequence: 0,
             sampled_texture_cache: HashMap::new(),
             sampled_texture_write_watches: HashMap::new(),

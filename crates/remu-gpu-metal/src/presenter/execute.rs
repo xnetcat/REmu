@@ -17,7 +17,7 @@ use super::{
     capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, color_operation_is_raster_noop,
     compile_metal_compute_library, compute_pipeline_key, compute_program_can_split_wave64,
-    consume_depth_metadata_clear, create_global_argument_buffer,
+    consume_color_metadata_clear, consume_depth_metadata_clear, create_global_argument_buffer,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
     decode_raster_state, decode_render_targets, decode_scissor, decode_viewport,
@@ -45,8 +45,9 @@ use super::{
     metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
     native_texture_capture_to_bgra, prepare_indexed_primitive, read_draw_indices,
     read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
-    rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_scanout_writer,
-    record_diagnostic_texture_writer, register_value, render_target_fast_clear_color,
+    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
+    record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
+    render_target_cmask_address, render_target_fast_clear_color,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     sampled_image_bindings, shader_scalar_metadata_for_registers,
     should_record_diagnostic_target_writer, snapshot_guest_texture_raw,
@@ -393,13 +394,19 @@ impl MetalPresenter {
             } else {
                 let has_resident_storage =
                     self.render_target_has_live_resident_storage(target.texture)?;
+                let metadata_clear_pending = consume_color_metadata_clear(
+                    &mut self.color_metadata_clears,
+                    render_target_cmask_address(target, &draw.context_registers)?,
+                    target.base_layer,
+                );
                 let initial_clear_color = initial_render_target_clear_color(
                     target,
                     &draw.context_registers,
                     has_resident_storage,
+                    metadata_clear_pending,
                 );
                 initial_target_clear_colors.push(initial_clear_color);
-                if !has_resident_storage && (target.dcc_enabled || target.fast_clear_enabled) {
+                if !has_resident_storage && (target.dcc_enabled || metadata_clear_pending) {
                     static DISCARDED_DCC_TARGETS: AtomicUsize = AtomicUsize::new(0);
                     let sequence = DISCARDED_DCC_TARGETS.fetch_add(1, Ordering::Relaxed) + 1;
                     if sequence <= 16 || sequence.is_power_of_two() {
@@ -2651,10 +2658,10 @@ impl MetalPresenter {
 
     /// Materializes the logical color represented by MRT0's fast-clear metadata.
     ///
-    /// shadPS4 consumes an EliminateFastClear trigger by clearing the image when CMASK still marks
-    /// the selected slice as cleared. REmu keeps render targets in uncompressed Metal storage and
-    /// does not expose CMASK as an image, so the trigger itself is the ordering point at which the
-    /// programmed clear value must replace any resident pixels from the preceding frame.
+    /// shadPS4 clears here only while CMASK still marks the selected slice as cleared. REmu keeps
+    /// render targets in uncompressed Metal storage, so ordinary attachment begin consumes that
+    /// state through a Metal load clear. An elimination after the attachment was drawn is then a
+    /// no-op instead of erasing the completed frame.
     fn execute_eliminate_fast_clear(
         &mut self,
         draw: &IndexedDraw,
@@ -2662,6 +2669,13 @@ impl MetalPresenter {
         let Some(target) = decode_color_eliminate_fast_clear_target(draw)? else {
             return Ok(None);
         };
+        if !consume_color_metadata_clear(
+            &mut self.color_metadata_clears,
+            render_target_cmask_address(&target, &draw.context_registers)?,
+            target.base_layer,
+        ) {
+            return Ok(None);
+        }
         let activity_stamp = ResidentTextureActivityStamp {
             work: draw.sequence,
             flip: self.next_flip_sequence,

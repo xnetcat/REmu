@@ -41,7 +41,8 @@ pub(crate) use self::targets::{
     common_render_target_array_length, decode_color_eliminate_fast_clear_target,
     decode_color_resolve_targets, decode_depth_target, decode_render_target_format,
     decode_render_target_state, decode_render_targets, initial_depth_clear_for_target,
-    initial_render_target_clear_color, render_target_fast_clear_color,
+    initial_render_target_clear_color, render_target_cmask_address,
+    render_target_fast_clear_color,
 };
 #[cfg(test)]
 pub(crate) use self::targets::{
@@ -79,6 +80,8 @@ pub(super) const CB_COLOR0_VIEW: u32 = 0x31b;
 pub(super) const CB_COLOR0_INFO: u32 = 0x31c;
 
 pub(super) const CB_COLOR0_ATTRIB: u32 = 0x31d;
+
+pub(super) const CB_COLOR0_CMASK: u32 = 0x31f;
 
 pub(super) const CB_COLOR0_FMASK: u32 = 0x321;
 
