@@ -1663,6 +1663,98 @@ fn blocked_wait_dependencies_are_ingested_before_periodic_retry_clears_block_sta
 }
 
 #[test]
+fn unpolled_wait_front_does_not_hide_a_third_queue_dependency() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let graphics_wait = GpuMemoryWait {
+        address: 0x4c00,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    let compute_wait = GpuMemoryWait {
+        address: 0x4d00,
+        ..graphics_wait
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(graphics_wait)],
+        })
+        .expect("queue graphics wait");
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: vec![GpuEvent::MemoryWait(compute_wait)],
+        })
+        .expect("queue compute wait");
+    for _ in
+        0..(remu_gpu::GPU_PENDING_EVENT_CAPACITY / remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE - 1)
+    {
+        sender
+            .send(GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events: vec![
+                    GpuEvent::PipelineBarrier(remu_gpu::GpuPipelineBarrier {
+                        wait_for: remu_gpu::GpuPipelineStage::ComputeShader,
+                    });
+                    remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
+                ],
+            })
+            .expect("queue graphics tail");
+    }
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 34,
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+                address: graphics_wait.address,
+                value: GpuMemoryReleaseValue::Immediate32(1),
+            })],
+        })
+        .expect("queue producer behind two wait fronts");
+
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, graphics_wait);
+            source
+        }
+        other => panic!("expected graphics wait, got {other:?}"),
+    };
+    ordered.block_event(
+        source,
+        GpuEvent::MemoryWait(graphics_wait),
+        QueueBlockReason::GuestMemoryWait(graphics_wait),
+    );
+    assert!(
+        !ordered.submissions.contains_key(&34),
+        "the producer starts behind the ordinary decoded-event cap"
+    );
+    assert!(
+        !ordered.blocked_queues.contains_key(&33),
+        "the second wait has not yet been polled"
+    );
+
+    ordered.retry_guest_memory_waits();
+
+    assert!(
+        ordered.submissions.contains_key(&34),
+        "an unpolled wait front must not suppress bounded dependency ingress"
+    );
+    assert!(
+        ordered.pending_event_count()
+            <= remu_gpu::GPU_PENDING_EVENT_CAPACITY
+                + remu_gpu::GPU_EVENT_QUEUE_CAPACITY
+                    * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
+                    * 2,
+        "dependency discovery must retain the finite pending-event bound"
+    );
+}
+
+#[test]
 fn blocked_wait_dependency_ingress_has_a_finite_pending_event_bound() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let wait = GpuMemoryWait {
