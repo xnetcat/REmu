@@ -8,11 +8,11 @@ use thiserror::Error;
 
 use crate::{
     AGC_CB_COLOR_REGISTER_STRIDE, AGC_CB_COLOR0_ATTRIB, AGC_CB_COLOR0_ATTRIB2,
-    AGC_CB_COLOR0_ATTRIB3, AGC_CB_COLOR0_BASE, AGC_CB_COLOR0_BASE_EXT, AGC_CB_COLOR0_INFO,
-    AGC_CB_COLOR0_VIEW, AGC_CB_TARGET_MASK, AGC_COLOR_TARGET_COUNT, AGC_DB_DEPTH_CONTROL,
-    AGC_DB_DEPTH_SIZE_XY, AGC_DB_RENDER_CONTROL, AGC_DB_Z_INFO, AGC_DB_Z_READ_BASE,
-    AGC_DB_Z_READ_BASE_HI, AGC_DB_Z_WRITE_BASE, AGC_DB_Z_WRITE_BASE_HI, AGC_IT_NOP,
-    AGC_IT_SET_CONTEXT_REG, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG,
+    AGC_CB_COLOR0_ATTRIB3, AGC_CB_COLOR0_BASE, AGC_CB_COLOR0_BASE_EXT, AGC_CB_COLOR0_CMASK,
+    AGC_CB_COLOR0_INFO, AGC_CB_COLOR0_VIEW, AGC_CB_TARGET_MASK, AGC_COLOR_TARGET_COUNT,
+    AGC_DB_DEPTH_CONTROL, AGC_DB_DEPTH_SIZE_XY, AGC_DB_RENDER_CONTROL, AGC_DB_Z_INFO,
+    AGC_DB_Z_READ_BASE, AGC_DB_Z_READ_BASE_HI, AGC_DB_Z_WRITE_BASE, AGC_DB_Z_WRITE_BASE_HI,
+    AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG,
     AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX,
     AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_CX_REGS_INDIRECT, AGC_R_SH_REGS_INDIRECT,
     AGC_R_UC_REGS_INDIRECT, AGC_SHADER_SPECIALS_OFFSET, AGC_SPI_PS_INPUT_CNTL_0,
@@ -21,6 +21,138 @@ use crate::{
     AgcShaderRegistry, ProcessGuestMemory, agc_read_mapped_u64, read_guest_u32, read_guest_u64,
     trace_agc_programs, trace_agc_registers, try_read_process_guest_u32,
 };
+
+const AGC_EXTENT_HINT_NOP: u32 = 0xc000_1000;
+
+fn agc_trailing_extent_hint(packet_address: u64, dword_offset: u32) -> Option<u32> {
+    let hint_packet = packet_address.checked_add(u64::from(dword_offset) * 4)?;
+    (try_read_process_guest_u32(hint_packet)? == AGC_EXTENT_HINT_NOP)
+        .then(|| try_read_process_guest_u32(hint_packet + 4))
+        .flatten()
+}
+
+fn agc_color_register_slot(first_register: u32, base_register: u32) -> Option<usize> {
+    let delta = first_register.checked_sub(base_register)?;
+    if !delta.is_multiple_of(AGC_CB_COLOR_REGISTER_STRIDE) {
+        return None;
+    }
+    let slot = delta / AGC_CB_COLOR_REGISTER_STRIDE;
+    (slot < AGC_COLOR_TARGET_COUNT).then(|| usize::try_from(slot).expect("eight slots fit usize"))
+}
+
+fn agc_trace_extent_hint(
+    graphics: &mut AgcGraphicsState,
+    kind: u8,
+    source: &str,
+    hint: u32,
+    register_extent: u32,
+) {
+    if !trace_agc_registers()
+        || !graphics
+            .traced_extent_hints
+            .insert((kind, hint, register_extent))
+    {
+        return;
+    }
+    let hint_width = hint & 0xffff;
+    let hint_height = hint >> 16;
+    let register_width = if kind < AGC_COLOR_TARGET_COUNT as u8 {
+        ((register_extent >> 14) & 0x3fff) + 1
+    } else {
+        (register_extent & 0x3fff) + 1
+    };
+    let register_height = if kind < AGC_COLOR_TARGET_COUNT as u8 {
+        (register_extent & 0x3fff) + 1
+    } else {
+        ((register_extent >> 16) & 0x3fff) + 1
+    };
+    let target = if kind < AGC_COLOR_TARGET_COUNT as u8 {
+        format!("color{}", kind)
+    } else {
+        "depth".to_owned()
+    };
+    eprintln!(
+        "[REMu][AGC][EXTENT] target={target} source={source} hint={hint_width}x{hint_height}/{hint:#010x} registers={register_width}x{register_height}/{register_extent:#010x} differs={}",
+        hint != 0 && (hint_width != register_width || hint_height != register_height),
+    );
+}
+
+fn agc_capture_context_extent_hint(
+    packet_address: u64,
+    length: u32,
+    first_register: u32,
+    graphics: &mut AgcGraphicsState,
+) {
+    if let Some(slot) = agc_color_register_slot(first_register, AGC_CB_COLOR0_BASE) {
+        // shadPS4 observes encoded SET_CONTEXT counts 0xb, 0xd, and 0xe for the three
+        // Prospero color-buffer setup variants. REmu's packet length includes the header and
+        // register-offset dword, so those become 13, 15, and 16 dwords. The NOP follows
+        // immediately after the packet.
+        let hint = matches!(length, 13 | 15 | 16)
+            .then(|| agc_trailing_extent_hint(packet_address, length))
+            .flatten()
+            .unwrap_or_default();
+        graphics.color_target_extent_hints[slot] = hint;
+        let register_extent = graphics
+            .context_registers
+            .get(&(AGC_CB_COLOR0_ATTRIB2 + u32::try_from(slot).expect("slot fits u32")))
+            .copied()
+            .unwrap_or_default();
+        agc_trace_extent_hint(
+            graphics,
+            u8::try_from(slot).expect("color slot fits u8"),
+            "base",
+            hint,
+            register_extent,
+        );
+        return;
+    }
+
+    if let Some(slot) = agc_color_register_slot(first_register, AGC_CB_COLOR0_CMASK) {
+        // The shorter CMASK setup refreshes the same hint without invalidating the prior one when
+        // it is not the four-value Prospero form.
+        if length == 6
+            && let Some(hint) = agc_trailing_extent_hint(packet_address, length)
+        {
+            graphics.color_target_extent_hints[slot] = hint;
+            let register_extent = graphics
+                .context_registers
+                .get(&(AGC_CB_COLOR0_ATTRIB2 + u32::try_from(slot).expect("slot fits u32")))
+                .copied()
+                .unwrap_or_default();
+            agc_trace_extent_hint(
+                graphics,
+                u8::try_from(slot).expect("color slot fits u8"),
+                "cmask",
+                hint,
+                register_extent,
+            );
+        }
+        return;
+    }
+
+    if first_register == AGC_DB_Z_INFO {
+        // The DB setup's encoded count is eight. Its extent NOP is at payload[20], i.e. dword 22
+        // from the SET_CONTEXT header, after the rest of Sony's fixed DB setup sequence.
+        let hint = (length == 10)
+            .then(|| agc_trailing_extent_hint(packet_address, 22))
+            .flatten()
+            .unwrap_or_default();
+        graphics.depth_target_extent_hint = hint;
+        let register_extent = graphics
+            .context_registers
+            .get(&AGC_DB_DEPTH_SIZE_XY)
+            .copied()
+            .unwrap_or_default();
+        agc_trace_extent_hint(
+            graphics,
+            u8::try_from(AGC_COLOR_TARGET_COUNT).expect("target count fits u8"),
+            "z-info",
+            hint,
+            register_extent,
+        );
+    }
+}
 
 pub(crate) fn agc_apply_submission_registers(
     packet_address: u64,
@@ -148,6 +280,9 @@ pub(crate) fn agc_apply_submission_registers(
                 "[REMu][AGC][REG] pixel user-data direct packet={packet_address:#x} first={first_register:#x} count={} values={pixel_user_data:x?}",
                 length - 2,
             );
+        }
+        if opcode == AGC_IT_SET_CONTEXT_REG {
+            agc_capture_context_extent_hint(packet_address, length, first_register, graphics);
         }
         return Ok(());
     }
