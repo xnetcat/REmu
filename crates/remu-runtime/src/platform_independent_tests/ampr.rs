@@ -352,6 +352,7 @@ fn ampr_ordering_classifier_covers_every_stateful_operation() {
         "f12ObAMEi9A",
         "mv0O8Zg0woU",
         "o67gODLFpls",
+        "sJXyWHjP-F8",
     ] {
         assert!(
             crate::is_serialized_ampr_import(nid),
@@ -481,6 +482,7 @@ fn ampr_reset_and_destroy_wait_for_the_same_buffer_submission_order() {
             assert_eq!(command.command_count, 0);
             assert!(command.pending_reads.is_empty());
             assert!(command.pending_completions.is_empty());
+            assert!(command.pending_address_writes.is_empty());
         }
     }
 }
@@ -543,5 +545,176 @@ fn ampr_completions_are_announced_by_submission_not_registration() {
         state.pending_events.len(),
         1,
         "reusing the command buffer lost its completion command"
+    );
+}
+
+#[test]
+fn ampr_address_completion_runs_after_reads_before_equeue_and_repeats_until_reset() {
+    let path = create_ampr_test_file(b"ready");
+    let file_id = 0x1020_3040;
+    let mut state = ProbeDispatchState::default();
+    let mut records = [0_u8; 0x120];
+    let command_buffer = 0x5100_u64;
+    let equeue = 0x5300;
+    state.ampr_files.insert(file_id, path.clone());
+    state.kernel_equeues.insert(equeue);
+    state.ampr_command_buffers.insert(
+        command_buffer,
+        AmprCommandBufferState {
+            buffer: records.as_mut_ptr().addr() as u64,
+            size: records.len() as u64,
+            ..AmprCommandBufferState::default()
+        },
+    );
+
+    let mut destination = [0_u8; 5];
+    let mut completion = 0_u64;
+    let completion_address = (&raw mut completion).addr() as u64;
+    assert_eq!(
+        crate::ampr_command_buffer_record_read(
+            [
+                command_buffer,
+                0,
+                0,
+                file_id.into(),
+                destination.as_mut_ptr().addr() as u64,
+                destination.len() as u64,
+            ],
+            [0; 6],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        crate::ampr_command_buffer_write_address_on_completion(
+            [command_buffer, completion_address, 0xa5, 0, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(completion, 0, "recording published completion early");
+    assert_eq!(
+        kernel_add_ampr_event([equeue, 7, 0xbeef, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(
+        ampr_command_buffer_write_kernel_event_queue(
+            [command_buffer, equeue, 7, 0xfeed, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+
+    let dispatch = RwLock::new(state);
+    let order = Mutex::new(());
+    assert_eq!(
+        crate::ampr_submit_command_buffer_two_phase_with(
+            &order,
+            &dispatch,
+            [command_buffer, 0, 0, 0, 0, 0],
+            |file, id, address, size, offset, capacity| {
+                assert_eq!(completion, 0, "completion ran before its deferred read");
+                assert!(
+                    dispatch.read().unwrap().pending_events.is_empty(),
+                    "equeue completion ran before the deferred read"
+                );
+                crate::ampr_read_file_to_guest(file, id, address, size, offset, capacity)
+            },
+        ),
+        0
+    );
+    assert_eq!(&destination, b"ready");
+    assert_eq!(completion, 0xa5);
+    assert_eq!(dispatch.read().unwrap().pending_events.len(), 1);
+
+    completion = 0;
+    dispatch.write().unwrap().pending_events.clear();
+    assert_eq!(
+        crate::ampr_submit_command_buffer_two_phase_with(
+            &order,
+            &dispatch,
+            [command_buffer, 0, 0, 0, 0, 0],
+            crate::ampr_read_file_to_guest,
+        ),
+        0
+    );
+    assert_eq!(completion, 0xa5, "program reuse lost its completion write");
+
+    assert_eq!(
+        crate::ampr_command_buffer_reset(
+            [command_buffer, 0, 0, 0, 0, 0],
+            &mut dispatch.write().unwrap(),
+        ),
+        0
+    );
+    completion = 0;
+    assert_eq!(
+        ampr_submit_command_buffer(
+            [command_buffer, 0, 0, 0, 0, 0],
+            &mut dispatch.write().unwrap(),
+        ),
+        0
+    );
+    assert_eq!(completion, 0, "reset retained a stale completion write");
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn ampr_address_completion_rejects_invalid_destinations() {
+    let mut state = ProbeDispatchState::default();
+    let mut completion = 0_u64;
+    let completion_address = (&raw mut completion).addr() as u64;
+    assert_eq!(
+        crate::ampr_command_buffer_write_address_on_completion(
+            [0, completion_address, 1, 0, 0, 0],
+            &mut state,
+        ),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        crate::ampr_command_buffer_write_address_on_completion(
+            [0x5200, completion_address, 1, 0, 0, 0],
+            &mut state,
+        ),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+
+    let mut records = [0_u8; 0x100];
+    state.ampr_command_buffers.insert(
+        0x5200,
+        AmprCommandBufferState {
+            buffer: records.as_mut_ptr().addr() as u64,
+            size: records.len() as u64,
+            ..AmprCommandBufferState::default()
+        },
+    );
+    assert_eq!(
+        crate::ampr_command_buffer_write_address_on_completion([0x5200, 0, 1, 0, 0, 0], &mut state,),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        crate::ampr_command_buffer_write_address_on_completion([0x5200, 1, 1, 0, 0, 0], &mut state,),
+        0,
+        "a reusable destination is revalidated when the program submits"
+    );
+    let equeue = 0x5400;
+    state.kernel_equeues.insert(equeue);
+    assert_eq!(
+        kernel_add_ampr_event([equeue, 9, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(
+        ampr_command_buffer_write_kernel_event_queue([0x5200, equeue, 9, 0x1234, 0, 0], &mut state,),
+        0
+    );
+    assert_eq!(
+        ampr_submit_command_buffer([0x5200, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_MEMORY_FAULT)
+    );
+    assert_eq!(state.next_apr_submission_id, 0);
+    assert!(state.apr_submissions.is_empty());
+    assert!(
+        state.pending_events.is_empty(),
+        "a rejected completion write still announced its equeue event"
     );
 }

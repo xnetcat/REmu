@@ -492,6 +492,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "tZDDEo2tE5k" => "sceAmprCommandBufferGetSize",
         "GnxKOHEawhk" => "sceAmprCommandBufferGetCurrentOffset",
         "H896Pt-yB4I" => "sceAmprCommandBufferWriteKernelEventQueue_04_00",
+        "sJXyWHjP-F8" => "sceAmprCommandBufferWriteAddressOnCompletion",
+        "C+IEj+BsAFM" => "sceAmprMeasureCommandSizeWriteAddressOnCompletion",
         "sSAUCCU1dv4" => "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00",
         "vWU-odnS+fU" => "sceAmprMeasureCommandSizeReadFile",
         "GuchCTefuZw" => "sceAmprCommandBufferDestructor",

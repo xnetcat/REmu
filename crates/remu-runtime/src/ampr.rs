@@ -19,9 +19,10 @@
 use crate::{
     AMPR_COMMAND_RECORD_SIZE, ProbeDispatchState, SCE_KERNEL_ERROR_BUSY,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED,
-    ampr_command_buffer_write_kernel_event_queue, ampr_measure_command_size, guest_memset, low_u32,
-    process_guest_range_is_readable, read_guest_bytes, read_guest_u32, read_guest_u64,
-    sce_kernel_error, write_guest_bytes, write_guest_u32,
+    ampr_command_buffer_write_address_on_completion, ampr_command_buffer_write_kernel_event_queue,
+    ampr_measure_command_size, guest_memset, low_u32, process_guest_range_is_readable,
+    read_guest_bytes, read_guest_u32, read_guest_u64, sce_kernel_error, write_guest_bytes,
+    write_guest_u32,
 };
 
 /// Record tag for the command that invalidates a buffer's gather/scatter chain.
@@ -102,6 +103,7 @@ fn dispatch_builder(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchSta
         // The command that signals an event queue on completion is exported under both its
         // current and its original name, and the runtime already builds it.
         "o67gODLFpls" => ampr_command_buffer_write_kernel_event_queue(arguments, state),
+        "sJXyWHjP-F8" => ampr_command_buffer_write_address_on_completion(arguments, state),
         "RPCAhx-aabE" => buffer_base_address(arguments[0], state),
         "gzndltBEzWc" => num_commands(arguments[0], state),
         _ => return None,
@@ -121,7 +123,9 @@ fn dispatch_command_size(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         "pbnNnahE8vk" => MARKER_HEADER_BYTES,
         // The gather and scatter reads have no builder yet, but their records are the same fixed
         // stride as every other file command, so their footprint is already settled.
-        "rddQYXM0CjM" | "qesF88X4DRg" | "7nXGDGMXSqo" | "DXmgc5op8Yw" => AMPR_COMMAND_RECORD_SIZE,
+        "rddQYXM0CjM" | "qesF88X4DRg" | "7nXGDGMXSqo" | "DXmgc5op8Yw" | "C+IEj+BsAFM" => {
+            AMPR_COMMAND_RECORD_SIZE
+        }
         "Zi3dBUjgyXI" => ampr_measure_command_size(),
         _ => return None,
     })
@@ -922,6 +926,7 @@ mod tests {
         assert_eq!(fixture.call("7nXGDGMXSqo", [0; 6]), 0x30);
         assert_eq!(fixture.call("DXmgc5op8Yw", [0; 6]), 0x30);
         assert_eq!(fixture.call("Zi3dBUjgyXI", [0; 6]), 0x30);
+        assert_eq!(fixture.call("C+IEj+BsAFM", [0; 6]), 0x30);
     }
 
     #[test]
@@ -1038,6 +1043,26 @@ mod tests {
         );
 
         assert_eq!(fixture.word(0), 2);
+        assert_eq!(fixture.write_offset(), 0x30);
+        assert_eq!(fixture.command_count(), 1);
+    }
+
+    #[test]
+    fn the_address_completion_is_recorded_without_publishing_it() {
+        let mut fixture = Fixture::new(0x100);
+        let object = fixture.object();
+        let mut completion = 0_u64;
+
+        assert_eq!(
+            fixture.call(
+                "sJXyWHjP-F8",
+                args(&[object, (&raw mut completion).addr() as u64, 1]),
+            ),
+            0
+        );
+
+        assert_eq!(completion, 0);
+        assert_eq!(fixture.word(0), 3);
         assert_eq!(fixture.write_offset(), 0x30);
         assert_eq!(fixture.command_count(), 1);
     }
