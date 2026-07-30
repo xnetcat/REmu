@@ -179,6 +179,7 @@ pub(crate) use av_player::{
     av_player_set_looping, av_player_set_trick_speed, av_player_start, av_player_stop,
     av_player_stream_count, av_player_validate_handle, invoke_av_player_event_callbacks,
     invoke_av_player_texture_deallocations, prepare_av_player_video_buffers,
+    take_av_player_calling_thread_callbacks,
 };
 #[cfg(test)]
 pub(crate) use dialog::{
@@ -481,6 +482,13 @@ struct AvPlayerEventCallback {
     function: u64,
     object: u64,
     event: u64,
+    delivery: AvPlayerEventDelivery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AvPlayerEventDelivery {
+    Controller,
+    CallingThread,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2586,15 +2594,17 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         }
         return ProbeImportReturn::integer(0);
     }
-    // AVPlayer state notifications originate on the native library's controller thread. Deliver
-    // only callbacks queued by an earlier import so AddSource/Start/Pause always return before
-    // their notification can re-enter Unity's backend. Calling a freshly queued Ready callback
-    // inside AddSourceEx lets Unity complete preparation and then overwrite that state when the
-    // still-active AddSourceEx caller resumes.
+    // Ready originates asynchronously on the native library's controller thread. Deliver only
+    // controller callbacks queued by an earlier import so AddSource returns before Ready can
+    // re-enter the guest. Playback-state callbacks are different: the native implementation
+    // emits Play/Pause/Stop synchronously from their initiating game-thread calls. Keeping those
+    // in this process-wide deferred queue lets an unrelated renderer or audio worker steal the
+    // callback and mutate its thread-local media state.
     let av_player_callbacks = std::mem::take(&mut state.av_player.pending_callbacks);
     let dispatch_started = trace_lock_stall.then(Instant::now);
     begin_deferred_gpu_publication();
     let result = dispatch_probe_import(nid, call_args, stack_args, &mut state);
+    let av_player_calling_thread_callbacks = take_av_player_calling_thread_callbacks(&mut state);
     let av_player_texture_deallocations =
         std::mem::take(&mut state.av_player.pending_texture_deallocations);
     let gpu_publication = take_deferred_gpu_publication();
@@ -2620,6 +2630,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         );
     }
     invoke_av_player_event_callbacks(av_player_callbacks);
+    invoke_av_player_event_callbacks(av_player_calling_thread_callbacks);
     invoke_av_player_texture_deallocations(av_player_texture_deallocations);
     // Paced after the dispatch lock is released: the submitting thread waits for its own vblank,
     // exactly as it would on the console, without stalling other guest threads.
