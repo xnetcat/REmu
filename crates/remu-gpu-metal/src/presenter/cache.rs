@@ -15,7 +15,10 @@ use metal::{
     Buffer, DepthStencilDescriptor, DepthStencilState, Device, Function, MTLCompareFunction,
     MTLResourceOptions, SamplerState,
 };
-use remu_memory::{GuestSharedBackingRange, guest_shared_backing_range, read_guest_shared_backing};
+use remu_memory::{
+    GuestSharedBackingRange, GuestSharedMappingIdentity, guest_shared_backing_identity,
+    guest_shared_backing_range, read_guest_shared_backing,
+};
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -23,8 +26,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 enum QueuedGlobalReadSource {
     None,
-    Buffer { buffer: Buffer, offset: u64 },
-    GuestMemory,
+    Buffer {
+        buffer: Buffer,
+        offset: u64,
+        guest_memory: bool,
+        physical_identity: Option<remu_memory::GuestSharedMappingIdentity>,
+    },
     Synchronize,
 }
 
@@ -139,11 +146,15 @@ impl MetalPresenter {
         if trace_all || sequence <= 16 || sequence.is_power_of_two() {
             let source_detail = match &source {
                 QueuedGlobalReadSource::None => "guest".to_owned(),
-                QueuedGlobalReadSource::Buffer { buffer, offset } => format!(
-                    "gpu-writeback(buffer={:p},offset={offset:#x})",
-                    buffer.as_ptr()
+                QueuedGlobalReadSource::Buffer {
+                    buffer,
+                    offset,
+                    guest_memory,
+                    physical_identity,
+                } => format!(
+                    "gpu-buffer(buffer={:p},offset={offset:#x},guest_memory={guest_memory},physical={physical_identity:?})",
+                    buffer.as_ptr(),
                 ),
-                QueuedGlobalReadSource::GuestMemory => "ordered-guest".to_owned(),
                 QueuedGlobalReadSource::Synchronize => "synchronize".to_owned(),
             };
             eprintln!(
@@ -204,8 +215,13 @@ impl MetalPresenter {
             });
         let source = match source {
             QueuedGlobalReadSource::None => "guest",
-            QueuedGlobalReadSource::Buffer { .. } => "gpu-writeback",
-            QueuedGlobalReadSource::GuestMemory => "ordered-guest",
+            QueuedGlobalReadSource::Buffer {
+                guest_memory: true, ..
+            } => "gpu-guest-buffer",
+            QueuedGlobalReadSource::Buffer {
+                guest_memory: false,
+                ..
+            } => "gpu-writeback",
             QueuedGlobalReadSource::Synchronize => "synchronize",
         };
         let dwords = read_indirect_guest_dwords(address, byte_count);
@@ -365,33 +381,19 @@ impl MetalPresenter {
         source: QueuedGlobalReadSource,
     ) -> Result<UploadedGlobalBuffer, String> {
         match source {
-            QueuedGlobalReadSource::Buffer { buffer, offset } => {
+            QueuedGlobalReadSource::Buffer {
+                buffer,
+                offset,
+                guest_memory,
+                physical_identity,
+            } => {
                 trace_global_coherence(binding, "forwarded-buffer");
                 Ok(UploadedGlobalBuffer {
                     buffer,
                     offset,
-                    guest_memory: false,
+                    guest_memory,
+                    physical_identity,
                 })
-            }
-            QueuedGlobalReadSource::GuestMemory => {
-                trace_global_coherence(binding, "forwarded-guest-memory");
-                if let Some(uploaded) = self.upload_identity_global_buffer(device, binding)? {
-                    return Ok(uploaded);
-                }
-                // A queued producer may outlive the exact virtual mapping used when its work was
-                // recorded. Metal's bytes-no-copy API does not reject a partially unmapped range
-                // synchronously on every macOS version; the command buffer can instead remain
-                // scheduled forever after IOGPUResource creation fails. Drain the producer and
-                // take a validated backing copy when a complete identity view is unavailable.
-                trace_global_coherence(binding, "forwarded-copy-fallback");
-                let queue = self
-                    .command_queue
-                    .as_ref()
-                    .ok_or("Metal command queue is unavailable")?
-                    .clone();
-                self.wait_for_guest_command_batches()?;
-                self.ensure_open_guest_batch(&queue);
-                self.upload_fresh_global_buffer(device, binding)
             }
             QueuedGlobalReadSource::Synchronize => {
                 unreachable!("synchronizing global sources are handled before upload")
@@ -433,6 +435,7 @@ impl MetalPresenter {
                     buffer: cached.buffer.clone(),
                     offset: cached.offset,
                     guest_memory: false,
+                    physical_identity: None,
                 });
             }
             let (buffer, offset) = self
@@ -452,6 +455,7 @@ impl MetalPresenter {
                 buffer,
                 offset,
                 guest_memory: false,
+                physical_identity: None,
             });
         }
         if let Some(cached) = self.global_buffer_cache.get(&key)
@@ -461,6 +465,7 @@ impl MetalPresenter {
                 buffer: cached.buffer.clone(),
                 offset: cached.offset,
                 guest_memory: false,
+                physical_identity: None,
             });
         }
         // A stable guest address whose packet-time bytes keep changing is a transient constant
@@ -477,6 +482,7 @@ impl MetalPresenter {
                 buffer,
                 offset,
                 guest_memory: false,
+                physical_identity: None,
             });
         }
         if self.global_buffer_cache.len() >= GLOBAL_BUFFER_CACHE_CAPACITY
@@ -494,6 +500,7 @@ impl MetalPresenter {
                 buffer,
                 offset,
                 guest_memory: false,
+                physical_identity: None,
             });
         }
         let buffer = metal_buffer_with_bytes(device, &binding.data)?;
@@ -517,6 +524,7 @@ impl MetalPresenter {
             buffer,
             offset,
             guest_memory: false,
+            physical_identity: None,
         })
     }
 
@@ -569,10 +577,18 @@ impl MetalPresenter {
                 .saturating_add(view_byte_count_u64);
             buffer
         };
+        let physical_identity = GuestSharedMappingIdentity {
+            backing_id: view_identity.backing_id,
+            backing_offset: view_identity
+                .backing_offset
+                .checked_add(backing_range.resource_offset())
+                .ok_or("guest global physical identity overflows")?,
+        };
         Ok(Some(UploadedGlobalBuffer {
             buffer,
             offset: backing_range.resource_offset(),
             guest_memory: true,
+            physical_identity: Some(physical_identity),
         }))
     }
 
@@ -590,6 +606,7 @@ impl MetalPresenter {
             buffer,
             offset,
             guest_memory: false,
+            physical_identity: None,
         })
     }
 
@@ -695,34 +712,157 @@ fn queued_global_read_source_in_batch(
     }) {
         return QueuedGlobalReadSource::Synchronize;
     }
-    let mut overlapping_writebacks = batch.global_writebacks.iter().filter(|writeback| {
-        u64::try_from(writeback.byte_count).is_ok_and(|writeback_byte_count| {
-            guest_physical_ranges_overlap(
-                writeback.guest_address,
-                writeback_byte_count,
-                address,
-                byte_count,
-            )
-        })
-    });
-    let Some(first) = overlapping_writebacks.next() else {
-        return QueuedGlobalReadSource::GuestMemory;
-    };
-    let Some(offset) = contained_global_writeback_offset(first, address, byte_count) else {
-        return QueuedGlobalReadSource::Synchronize;
-    };
-    if overlapping_writebacks.any(|writeback| {
-        contained_global_writeback_offset(writeback, address, byte_count).is_none_or(
-            |candidate_offset| {
-                writeback.buffer.as_ptr() != first.buffer.as_ptr() || candidate_offset != offset
-            },
-        )
-    }) {
-        return QueuedGlobalReadSource::Synchronize;
+    let mut candidate: Option<(Buffer, u64, bool, Option<GuestSharedMappingIdentity>)> = None;
+    for writeback in &batch.global_writebacks {
+        match contained_global_writeback_offset(writeback, address, byte_count) {
+            QueuedWriteReadMatch::None => {}
+            QueuedWriteReadMatch::Synchronize => {
+                return QueuedGlobalReadSource::Synchronize;
+            }
+            QueuedWriteReadMatch::Buffer {
+                offset,
+                physical_identity,
+            } => {
+                if !merge_global_read_candidate(
+                    &mut candidate,
+                    &writeback.buffer,
+                    offset,
+                    false,
+                    physical_identity,
+                    byte_count,
+                ) {
+                    return QueuedGlobalReadSource::Synchronize;
+                }
+            }
+        }
     }
-    QueuedGlobalReadSource::Buffer {
-        buffer: first.buffer.clone(),
+    for range in &batch.guest_write_ranges {
+        match contained_guest_write_offset(range, address, byte_count) {
+            QueuedWriteReadMatch::None => {}
+            QueuedWriteReadMatch::Synchronize => {
+                return QueuedGlobalReadSource::Synchronize;
+            }
+            QueuedWriteReadMatch::Buffer {
+                offset,
+                physical_identity,
+            } => {
+                if !merge_global_read_candidate(
+                    &mut candidate,
+                    &range.buffer,
+                    offset,
+                    true,
+                    physical_identity,
+                    byte_count,
+                ) {
+                    return QueuedGlobalReadSource::Synchronize;
+                }
+            }
+        }
+    }
+    match candidate {
+        Some((buffer, offset, guest_memory, physical_identity)) => QueuedGlobalReadSource::Buffer {
+            buffer,
+            offset,
+            guest_memory,
+            physical_identity,
+        },
+        None => QueuedGlobalReadSource::None,
+    }
+}
+
+enum QueuedWriteReadMatch {
+    None,
+    Buffer {
+        offset: u64,
+        physical_identity: Option<GuestSharedMappingIdentity>,
+    },
+    Synchronize,
+}
+
+fn contained_guest_write_offset(
+    range: &super::PendingGuestWriteRange,
+    address: u64,
+    byte_count: u64,
+) -> QueuedWriteReadMatch {
+    let virtual_overlap =
+        super::guest_ranges_overlap(range.address, range.byte_count, address, byte_count);
+    let Some(read_identity) = guest_shared_backing_identity(address, byte_count) else {
+        return if virtual_overlap {
+            QueuedWriteReadMatch::Synchronize
+        } else {
+            QueuedWriteReadMatch::None
+        };
+    };
+    if read_identity.backing_id != range.physical_identity.backing_id {
+        return if virtual_overlap {
+            QueuedWriteReadMatch::Synchronize
+        } else {
+            QueuedWriteReadMatch::None
+        };
+    }
+    let producer_start = range.physical_identity.backing_offset;
+    let Some(producer_end) = producer_start.checked_add(range.byte_count) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    let read_start = read_identity.backing_offset;
+    let Some(read_end) = read_start.checked_add(byte_count) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    if producer_start >= read_end || read_start >= producer_end {
+        return if virtual_overlap {
+            QueuedWriteReadMatch::Synchronize
+        } else {
+            QueuedWriteReadMatch::None
+        };
+    }
+    if read_start < producer_start || read_end > producer_end {
+        return QueuedWriteReadMatch::Synchronize;
+    }
+    let Some(offset) = range.offset.checked_add(read_start - producer_start) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    let Some(buffer_end) = offset.checked_add(byte_count) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    if buffer_end > range.buffer.length() {
+        return QueuedWriteReadMatch::Synchronize;
+    }
+    QueuedWriteReadMatch::Buffer {
         offset,
+        physical_identity: Some(read_identity),
+    }
+}
+
+fn merge_global_read_candidate(
+    candidate: &mut Option<(Buffer, u64, bool, Option<GuestSharedMappingIdentity>)>,
+    buffer: &Buffer,
+    offset: u64,
+    guest_memory: bool,
+    physical_identity: Option<GuestSharedMappingIdentity>,
+    byte_count: u64,
+) -> bool {
+    let Some(end) = offset.checked_add(byte_count) else {
+        return false;
+    };
+    if end > buffer.length() {
+        return false;
+    }
+    match candidate {
+        Some((
+            existing_buffer,
+            existing_offset,
+            existing_guest_memory,
+            existing_physical_identity,
+        )) => {
+            existing_buffer.as_ptr() == buffer.as_ptr()
+                && *existing_offset == offset
+                && *existing_guest_memory == guest_memory
+                && *existing_physical_identity == physical_identity
+        }
+        None => {
+            *candidate = Some((buffer.clone(), offset, guest_memory, physical_identity));
+            true
+        }
     }
 }
 
@@ -730,16 +870,84 @@ fn contained_global_writeback_offset(
     writeback: &PendingGlobalWriteback,
     address: u64,
     byte_count: u64,
-) -> Option<u64> {
-    let writeback_byte_count = u64::try_from(writeback.byte_count).ok()?;
-    let writeback_end = writeback.guest_address.checked_add(writeback_byte_count)?;
-    let read_end = address.checked_add(byte_count)?;
-    if address < writeback.guest_address || read_end > writeback_end {
-        return None;
+) -> QueuedWriteReadMatch {
+    let Ok(writeback_byte_count) = u64::try_from(writeback.byte_count) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    let virtual_overlap = super::guest_ranges_overlap(
+        writeback.guest_address,
+        writeback_byte_count,
+        address,
+        byte_count,
+    );
+    if let Some(producer_identity) = writeback.mapping_identity {
+        let Some(read_identity) = guest_shared_backing_identity(address, byte_count) else {
+            return if virtual_overlap {
+                QueuedWriteReadMatch::Synchronize
+            } else {
+                QueuedWriteReadMatch::None
+            };
+        };
+        if read_identity.backing_id != producer_identity.backing_id {
+            return if virtual_overlap {
+                QueuedWriteReadMatch::Synchronize
+            } else {
+                QueuedWriteReadMatch::None
+            };
+        }
+        let producer_start = producer_identity.backing_offset;
+        let Some(producer_end) = producer_start.checked_add(writeback_byte_count) else {
+            return QueuedWriteReadMatch::Synchronize;
+        };
+        let read_start = read_identity.backing_offset;
+        let Some(read_end) = read_start.checked_add(byte_count) else {
+            return QueuedWriteReadMatch::Synchronize;
+        };
+        if producer_start >= read_end || read_start >= producer_end {
+            return if virtual_overlap {
+                QueuedWriteReadMatch::Synchronize
+            } else {
+                QueuedWriteReadMatch::None
+            };
+        }
+        if read_start < producer_start || read_end > producer_end {
+            return QueuedWriteReadMatch::Synchronize;
+        }
+        let Some(offset) = writeback.offset.checked_add(read_start - producer_start) else {
+            return QueuedWriteReadMatch::Synchronize;
+        };
+        return QueuedWriteReadMatch::Buffer {
+            offset,
+            physical_identity: Some(read_identity),
+        };
     }
-    writeback
+    if !guest_physical_ranges_overlap(
+        writeback.guest_address,
+        writeback_byte_count,
+        address,
+        byte_count,
+    ) {
+        return QueuedWriteReadMatch::None;
+    }
+    let Some(writeback_end) = writeback.guest_address.checked_add(writeback_byte_count) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    let Some(read_end) = address.checked_add(byte_count) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    if address < writeback.guest_address || read_end > writeback_end {
+        return QueuedWriteReadMatch::Synchronize;
+    }
+    let Some(offset) = writeback
         .offset
         .checked_add(address - writeback.guest_address)
+    else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    QueuedWriteReadMatch::Buffer {
+        offset,
+        physical_identity: None,
+    }
 }
 
 fn trace_global_coherence(binding: &GlobalMemoryBinding, source: &str) {

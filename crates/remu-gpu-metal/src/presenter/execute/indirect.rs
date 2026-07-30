@@ -85,6 +85,7 @@ impl MetalPresenter {
             buffer: destination,
             offset: destination_offset,
             guest_memory: false,
+            physical_identity: None,
         })
     }
 }

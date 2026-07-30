@@ -1496,6 +1496,7 @@ mod tests {
             buffer,
             offset: 9,
             guest_memory: false,
+            physical_identity: None,
         };
 
         assert_eq!(
@@ -1525,6 +1526,7 @@ mod tests {
             buffer: device.new_buffer(12, MTLResourceOptions::StorageModeShared),
             offset: 8,
             guest_memory: true,
+            physical_identity: None,
         };
         let snapshot = diagnostic_uploaded_global_binding_head(&binding, &uploaded);
 
