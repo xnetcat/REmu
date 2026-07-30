@@ -206,9 +206,10 @@ impl MetalPresenter {
         if self.statistics.last_logged.elapsed() >= Duration::from_secs(5) {
             eprintln!("[REMu][PERF] {title}");
             eprintln!(
-                "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
+                "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s color-op={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
                 f64::from(self.statistics.render_pass_ends_for_compute) / seconds,
                 f64::from(self.statistics.render_pass_ends_for_target_change) / seconds,
+                f64::from(self.statistics.render_pass_ends_for_color_operation) / seconds,
                 f64::from(self.statistics.render_pass_ends_for_batch_flush) / seconds,
                 f64::from(self.statistics.batch_flushes_from_event_loop) / seconds,
                 f64::from(self.statistics.batch_flushes_for_guest_memory_write) / seconds,
@@ -217,6 +218,37 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_for_work_capacity) / seconds,
                 f64::from(self.statistics.batch_flushes_for_command_processor_barrier) / seconds,
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
+            );
+            let transitions = &self.statistics.render_pass_key_transitions;
+            eprintln!(
+                "[REMu][PERF-RP-KEY] target count={:.0}/s addr={:.0}/s width={:.0}/s height={:.0}/s pitch={:.0}/s tile={:.0}/s format={:.0}/s bpp={:.0}/s samples={:.0}/s scanout={:.0}/s type={:.0}/s layers={:.0}/s base-layer={:.0}/s mip={:.0}/s mip-count={:.0}/s | depth presence={:.0}/s addr={:.0}/s width={:.0}/s height={:.0}/s pitch={:.0}/s tile={:.0}/s format={:.0}/s bpp={:.0}/s samples={:.0}/s layers={:.0}/s clear={:.0}/s clear-seq={:.0}/s",
+                f64::from(transitions.target_count) / seconds,
+                f64::from(transitions.target_address) / seconds,
+                f64::from(transitions.target_width) / seconds,
+                f64::from(transitions.target_height) / seconds,
+                f64::from(transitions.target_pitch) / seconds,
+                f64::from(transitions.target_tile_mode) / seconds,
+                f64::from(transitions.target_pixel_format) / seconds,
+                f64::from(transitions.target_bytes_per_pixel) / seconds,
+                f64::from(transitions.target_sample_count) / seconds,
+                f64::from(transitions.target_direct_scanout) / seconds,
+                f64::from(transitions.target_texture_type) / seconds,
+                f64::from(transitions.target_layer_count) / seconds,
+                f64::from(transitions.target_base_layer) / seconds,
+                f64::from(transitions.target_mip_level) / seconds,
+                f64::from(transitions.target_mip_level_count) / seconds,
+                f64::from(transitions.depth_presence) / seconds,
+                f64::from(transitions.depth_address) / seconds,
+                f64::from(transitions.depth_width) / seconds,
+                f64::from(transitions.depth_height) / seconds,
+                f64::from(transitions.depth_pitch) / seconds,
+                f64::from(transitions.depth_tile_mode) / seconds,
+                f64::from(transitions.depth_pixel_format) / seconds,
+                f64::from(transitions.depth_bytes_per_pixel) / seconds,
+                f64::from(transitions.depth_sample_count) / seconds,
+                f64::from(transitions.depth_layer_count) / seconds,
+                f64::from(transitions.depth_clear_value) / seconds,
+                f64::from(transitions.depth_clear_sequence) / seconds,
             );
             let compile_enqueued = PIPELINE_COMPILE_ENQUEUED.swap(0, Ordering::Relaxed);
             let compile_queue_full = PIPELINE_COMPILE_QUEUE_FULL.swap(0, Ordering::Relaxed);
@@ -660,7 +692,9 @@ impl MetalPresenter {
         self.statistics.encoded_render_passes = 0;
         self.statistics.render_pass_ends_for_compute = 0;
         self.statistics.render_pass_ends_for_target_change = 0;
+        self.statistics.render_pass_ends_for_color_operation = 0;
         self.statistics.render_pass_ends_for_batch_flush = 0;
+        self.statistics.render_pass_key_transitions = Default::default();
         self.statistics.batch_flushes_from_event_loop = 0;
         self.statistics.batch_flushes_for_guest_memory_write = 0;
         self.statistics.batch_flushes_for_blocked_wait = 0;

@@ -1014,7 +1014,9 @@ struct PresenterStatistics {
     encoded_render_passes: u32,
     render_pass_ends_for_compute: u32,
     render_pass_ends_for_target_change: u32,
+    render_pass_ends_for_color_operation: u32,
     render_pass_ends_for_batch_flush: u32,
+    render_pass_key_transitions: GuestRenderPassKeyTransitionStatistics,
     batch_flushes_from_event_loop: u32,
     batch_flushes_for_guest_memory_write: u32,
     batch_flushes_for_blocked_wait: u32,
@@ -1136,6 +1138,254 @@ struct GuestMemoryWaitTracker {
 struct GuestRenderPassKey {
     targets: Vec<(GuestTextureDescriptor, u32, bool, u32, u32, u32, u32, u32)>,
     depth: Option<(GuestTextureDescriptor, u32, u32, Option<u32>, Option<u64>)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+enum GuestRenderPassKeyField {
+    TargetCount,
+    TargetAddress,
+    TargetWidth,
+    TargetHeight,
+    TargetPitch,
+    TargetTileMode,
+    TargetPixelFormat,
+    TargetBytesPerPixel,
+    TargetSampleCount,
+    TargetDirectScanout,
+    TargetTextureType,
+    TargetLayerCount,
+    TargetBaseLayer,
+    TargetMipLevel,
+    TargetMipLevelCount,
+    DepthPresence,
+    DepthAddress,
+    DepthWidth,
+    DepthHeight,
+    DepthPitch,
+    DepthTileMode,
+    DepthPixelFormat,
+    DepthBytesPerPixel,
+    DepthSampleCount,
+    DepthLayerCount,
+    DepthClearValue,
+    DepthClearSequence,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GuestRenderPassKeyTransition(u32);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GuestRenderPassKeyTransitionStatistics {
+    target_count: u32,
+    target_address: u32,
+    target_width: u32,
+    target_height: u32,
+    target_pitch: u32,
+    target_tile_mode: u32,
+    target_pixel_format: u32,
+    target_bytes_per_pixel: u32,
+    target_sample_count: u32,
+    target_direct_scanout: u32,
+    target_texture_type: u32,
+    target_layer_count: u32,
+    target_base_layer: u32,
+    target_mip_level: u32,
+    target_mip_level_count: u32,
+    depth_presence: u32,
+    depth_address: u32,
+    depth_width: u32,
+    depth_height: u32,
+    depth_pitch: u32,
+    depth_tile_mode: u32,
+    depth_pixel_format: u32,
+    depth_bytes_per_pixel: u32,
+    depth_sample_count: u32,
+    depth_layer_count: u32,
+    depth_clear_value: u32,
+    depth_clear_sequence: u32,
+}
+
+impl GuestRenderPassKey {
+    fn transition_to(&self, next: &Self) -> GuestRenderPassKeyTransition {
+        let mut transition = GuestRenderPassKeyTransition::default();
+        transition.mark(
+            GuestRenderPassKeyField::TargetCount,
+            self.targets.len() != next.targets.len(),
+        );
+        transition.mark(
+            GuestRenderPassKeyField::DepthPresence,
+            self.depth.is_some() != next.depth.is_some(),
+        );
+        for (current, next) in self.targets.iter().zip(&next.targets) {
+            let current_descriptor = &current.0;
+            let next_descriptor = &next.0;
+            if current_descriptor != next_descriptor {
+                transition.mark(
+                    GuestRenderPassKeyField::TargetAddress,
+                    current_descriptor.address != next_descriptor.address,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::TargetWidth,
+                    current_descriptor.width != next_descriptor.width,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::TargetHeight,
+                    current_descriptor.height != next_descriptor.height,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::TargetPitch,
+                    current_descriptor.pitch != next_descriptor.pitch,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::TargetTileMode,
+                    current_descriptor.tile_mode != next_descriptor.tile_mode,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::TargetPixelFormat,
+                    current_descriptor.pixel_format != next_descriptor.pixel_format,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::TargetBytesPerPixel,
+                    current_descriptor.bytes_per_pixel != next_descriptor.bytes_per_pixel,
+                );
+            }
+            transition.mark(
+                GuestRenderPassKeyField::TargetSampleCount,
+                current.1 != next.1,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::TargetDirectScanout,
+                current.2 != next.2,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::TargetTextureType,
+                current.3 != next.3,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::TargetLayerCount,
+                current.4 != next.4,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::TargetBaseLayer,
+                current.5 != next.5,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::TargetMipLevel,
+                current.6 != next.6,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::TargetMipLevelCount,
+                current.7 != next.7,
+            );
+        }
+        if let (Some(current), Some(next)) = (&self.depth, &next.depth) {
+            let current_descriptor = &current.0;
+            let next_descriptor = &next.0;
+            if current_descriptor != next_descriptor {
+                transition.mark(
+                    GuestRenderPassKeyField::DepthAddress,
+                    current_descriptor.address != next_descriptor.address,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::DepthWidth,
+                    current_descriptor.width != next_descriptor.width,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::DepthHeight,
+                    current_descriptor.height != next_descriptor.height,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::DepthPitch,
+                    current_descriptor.pitch != next_descriptor.pitch,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::DepthTileMode,
+                    current_descriptor.tile_mode != next_descriptor.tile_mode,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::DepthPixelFormat,
+                    current_descriptor.pixel_format != next_descriptor.pixel_format,
+                );
+                transition.mark(
+                    GuestRenderPassKeyField::DepthBytesPerPixel,
+                    current_descriptor.bytes_per_pixel != next_descriptor.bytes_per_pixel,
+                );
+            }
+            transition.mark(
+                GuestRenderPassKeyField::DepthSampleCount,
+                current.1 != next.1,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::DepthLayerCount,
+                current.2 != next.2,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::DepthClearValue,
+                current.3 != next.3,
+            );
+            transition.mark(
+                GuestRenderPassKeyField::DepthClearSequence,
+                current.4 != next.4,
+            );
+        }
+        transition
+    }
+}
+
+impl GuestRenderPassKeyTransition {
+    fn mark(&mut self, field: GuestRenderPassKeyField, changed: bool) {
+        if changed {
+            self.0 |= 1_u32 << u32::from(field as u8);
+        }
+    }
+
+    fn contains(self, field: GuestRenderPassKeyField) -> bool {
+        self.0 & (1_u32 << u32::from(field as u8)) != 0
+    }
+}
+
+impl GuestRenderPassKeyTransitionStatistics {
+    fn record(&mut self, transition: GuestRenderPassKeyTransition) {
+        macro_rules! record_fields {
+            ($($field:ident => $cause:ident),+ $(,)?) => {
+                $(
+                    self.$field = self.$field.saturating_add(u32::from(
+                        transition.contains(GuestRenderPassKeyField::$cause),
+                    ));
+                )+
+            };
+        }
+        record_fields!(
+            target_count => TargetCount,
+            target_address => TargetAddress,
+            target_width => TargetWidth,
+            target_height => TargetHeight,
+            target_pitch => TargetPitch,
+            target_tile_mode => TargetTileMode,
+            target_pixel_format => TargetPixelFormat,
+            target_bytes_per_pixel => TargetBytesPerPixel,
+            target_sample_count => TargetSampleCount,
+            target_direct_scanout => TargetDirectScanout,
+            target_texture_type => TargetTextureType,
+            target_layer_count => TargetLayerCount,
+            target_base_layer => TargetBaseLayer,
+            target_mip_level => TargetMipLevel,
+            target_mip_level_count => TargetMipLevelCount,
+            depth_presence => DepthPresence,
+            depth_address => DepthAddress,
+            depth_width => DepthWidth,
+            depth_height => DepthHeight,
+            depth_pitch => DepthPitch,
+            depth_tile_mode => DepthTileMode,
+            depth_pixel_format => DepthPixelFormat,
+            depth_bytes_per_pixel => DepthBytesPerPixel,
+            depth_sample_count => DepthSampleCount,
+            depth_layer_count => DepthLayerCount,
+            depth_clear_value => DepthClearValue,
+            depth_clear_sequence => DepthClearSequence,
+        );
+    }
 }
 
 struct OpenGuestRenderPass {
