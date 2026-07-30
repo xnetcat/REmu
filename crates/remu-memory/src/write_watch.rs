@@ -295,6 +295,22 @@ impl CpuWriteWatch {
         }
     }
 
+    /// Retires watches while a new VA is added for bytes in the same physical backing.
+    ///
+    /// Stores through the new alias can occur before a resource owner has rebuilt its complete
+    /// alias watch. Marking the old watch dirty forces full content validation after renewal,
+    /// preventing an older GPU-owned image from overwriting CPU initialization through that VA.
+    pub fn begin_alias_change_overlapping(
+        address: u64,
+        byte_count: u64,
+    ) -> CpuWriteWatchReprotection {
+        let ranges = retire_overlapping(address, byte_count, WATCH_REPROTECTING);
+        for range in &ranges {
+            range.dirty.store(true, Ordering::Release);
+        }
+        CpuWriteWatchReprotection { ranges }
+    }
+
     /// Returns the exact requested guest range rather than its page-aligned protection span.
     #[must_use]
     pub fn range(&self) -> (u64, u64) {

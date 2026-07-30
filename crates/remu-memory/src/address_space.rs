@@ -37,7 +37,7 @@ mod shared;
 pub use shared::{
     GuestSharedBackingRange, GuestSharedBackingSegment, GuestSharedMappingIdentity,
     guest_shared_backing_alias_segments, guest_shared_backing_identity, guest_shared_backing_range,
-    guest_shared_backing_ranges_overlap, guest_shared_backing_segments,
+    guest_shared_backing_ranges_overlap, guest_shared_backing_segments, guest_shared_mapping_epoch,
     guest_shared_mapping_identity, read_guest_shared_backing, write_guest_shared_backing,
     write_guest_shared_backing_if_identity,
 };
@@ -379,6 +379,7 @@ impl GuestAddressSpace {
                 committed_bytes += sub_size;
                 continue;
             }
+            let _mapping_mutation = shared::begin_shared_mapping_mutation();
             let reprotection = CpuWriteWatch::begin_reprotect_overlapping(sub_start, sub_size);
             // SAFETY: Validation proves this subrange is claimed inside our host reservation.
             let result = unsafe {

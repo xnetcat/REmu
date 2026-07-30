@@ -8,7 +8,10 @@ use metal::{
 };
 use remu_memory::CpuWriteWatchRetirement;
 use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
+use std::collections::HashMap;
 
+use super::super::refresh_resident_texture_write_watch;
+use super::super::texture::ensure_resident_texture_in_map;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter,
     ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
@@ -510,6 +513,229 @@ fn texture_write_watch_observes_every_live_physical_alias_and_remap() {
             .with_contiguous_mapping(primary.get(), 4 * GUEST_PAGE_SIZE, || ())
             .is_err(),
         "a retired multi-alias watch cannot authorize a later VA dereference"
+    );
+}
+
+#[test]
+fn texture_write_watch_renews_after_a_late_physical_alias_and_validates_early_writes() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let base = memory.base();
+    let primary = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("primary alias");
+    let descriptor = GuestTextureDescriptor {
+        address: primary.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let original = watch_guest_texture(descriptor).expect("initial single-alias watch");
+    snapshot_watched_guest_texture_raw(descriptor, &original).expect("initialize content baseline");
+
+    let alias_address = base
+        .checked_add(8 * GUEST_PAGE_SIZE)
+        .expect("late alias address");
+    let alias = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(alias_address),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("late physical alias");
+    assert_eq!(
+        original.retirement(),
+        Some(CpuWriteWatchRetirement::Reprotected),
+        "adding a coherent VA must renew rather than discard GPU physical storage"
+    );
+
+    memory
+        .write(alias, &[0x5a; 32])
+        .expect("CPU initializes the new alias before the presenter refreshes");
+    let mut renewed = watch_guest_texture(descriptor).expect("renewed complete alias watch");
+    assert_eq!(renewed.ranges.len(), 2);
+    renewed
+        .inherit_content_state_from(&original)
+        .expect("preserve the old content baseline");
+    assert!(
+        renewed
+            .content_has_changed()
+            .expect("validate the complete alias-change range"),
+        "a late-alias CPU write must defeat stale GPU ownership"
+    );
+
+    snapshot_watched_guest_texture_raw(descriptor, &renewed)
+        .expect("establish the renewed content baseline");
+    memory
+        .write(alias, &[0x6b; 32])
+        .expect("write through the renewed alias");
+    assert!(
+        renewed.is_dirty(),
+        "the rebuilt watch must cover the late alias directly"
+    );
+}
+
+#[test]
+fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let base = memory.base();
+    let primary = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("primary alias");
+    let descriptor = GuestTextureDescriptor {
+        address: primary.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let mut residents = HashMap::new();
+    ensure_resident_texture_in_map(&device, descriptor, &mut residents, true)
+        .expect("resident with initialized content baseline");
+    {
+        let resident = residents.get_mut(&descriptor).expect("resident exists");
+        resident.gpu_written = true;
+        resident.note_gpu_write();
+    }
+
+    let alias_address = base
+        .checked_add(8 * GUEST_PAGE_SIZE)
+        .expect("late alias address");
+    let alias = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(alias_address),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("late physical alias");
+    memory
+        .write(alias, &[0x5a; 32])
+        .expect("CPU writes through the late alias");
+
+    let resident = residents.get_mut(&descriptor).expect("resident exists");
+    let refresh =
+        refresh_resident_texture_write_watch(resident).expect("renew complete physical watch");
+    assert_eq!(refresh, WriteWatchRefresh::Renewed { was_dirty: true });
+    assert!(resident.write_watch.content_validation_pending());
+
+    // A following draw establishes a new GPU generation boundary before eviction. The inherited
+    // dirty range must remain authoritative even though the new watch itself is clean.
+    resident.note_gpu_write();
+    let eviction_refresh =
+        refresh_resident_texture_write_watch(resident).expect("refresh at eviction");
+    assert_eq!(eviction_refresh, WriteWatchRefresh::Active);
+    assert!(
+        resident
+            .cpu_write_obsoletes_gpu_writeback(eviction_refresh)
+            .expect("validate pending CPU contents"),
+        "a later GPU boundary must not hide the CPU write and publish stale Metal bytes"
+    );
+}
+
+#[test]
+fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let base = memory.base();
+    let primary = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("primary alias");
+    let descriptor = GuestTextureDescriptor {
+        address: primary.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let mut residents = HashMap::new();
+    ensure_resident_texture_in_map(&device, descriptor, &mut residents, false)
+        .expect("discarded render target with a CPU baseline");
+    {
+        let resident = residents.get_mut(&descriptor).expect("resident exists");
+        resident.gpu_written = true;
+        resident.note_gpu_write();
+    }
+
+    let alias_address = base
+        .checked_add(8 * GUEST_PAGE_SIZE)
+        .expect("late alias address");
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(alias_address),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("late physical alias");
+
+    let resident = residents.get_mut(&descriptor).expect("resident exists");
+    let refresh =
+        refresh_resident_texture_write_watch(resident).expect("renew complete physical watch");
+    assert_eq!(refresh, WriteWatchRefresh::Renewed { was_dirty: true });
+    resident.note_gpu_write();
+    assert!(
+        !resident
+            .cpu_write_obsoletes_gpu_writeback(refresh)
+            .expect("validate unchanged guest bytes"),
+        "adding an alias without a CPU store must retain GPU-authored contents"
     );
 }
 

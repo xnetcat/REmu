@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::io;
 use std::ptr::NonNull;
 
-use super::shared::unregister_shared_mapping_range;
+use super::shared::{begin_shared_mapping_mutation, unregister_shared_mapping_range};
 use super::{
     AddressSpaceError, GUEST_PAGE_SIZE, RequestedAddress, align_up, host_pointer, host_size,
 };
@@ -166,6 +166,7 @@ impl HostReservation {
 
 impl Drop for HostReservation {
     fn drop(&mut self) {
+        let _mapping_mutation = begin_shared_mapping_mutation();
         CpuWriteWatch::retire_overlapping(self.address(), self.size as u64);
         unregister_shared_mapping_range(self.address(), self.size as u64);
         match self.kind {

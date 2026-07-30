@@ -5,7 +5,10 @@
 
 use remu_core::GuestAddress;
 
-use super::shared::{register_shared_mapping_range, unregister_shared_mapping_range};
+use super::shared::{
+    begin_shared_mapping_mutation, existing_shared_backing_alias_segments,
+    register_shared_mapping_range, unregister_shared_mapping_range,
+};
 use super::{
     AddressSpaceError, CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement,
     GuestPhysicalBacking, GuestProtection, Vma, VmaKind, align_up, checked_end, host_error,
@@ -220,6 +223,7 @@ impl GuestAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         debug_assert!(start >= self.base().get());
         debug_assert!(start.saturating_add(size) <= self.end);
+        let _mapping_mutation = begin_shared_mapping_mutation();
         CpuWriteWatch::retire_overlapping(start, size);
         let pointer = host_pointer(start)?;
         // SAFETY: Placement validation proves this fixed range lies entirely inside our host
@@ -256,6 +260,13 @@ impl GuestAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         debug_assert!(start >= self.base().get());
         debug_assert!(start.saturating_add(size) <= self.end);
+        let _mapping_mutation = begin_shared_mapping_mutation();
+        let _alias_changes = existing_shared_backing_alias_segments(backing, backing_offset, size)
+            .into_iter()
+            .map(|segment| {
+                CpuWriteWatch::begin_alias_change_overlapping(segment.address, segment.byte_count)
+            })
+            .collect::<Vec<_>>();
         CpuWriteWatch::retire_overlapping(start, size);
         let pointer = host_pointer(start)?;
         let offset = libc::off_t::try_from(backing_offset).map_err(|_| {

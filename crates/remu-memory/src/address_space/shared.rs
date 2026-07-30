@@ -3,7 +3,8 @@
 //! Process-global registry mapping live shared guest ranges back to their physical backing.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use super::{GuestPhysicalBacking, GuestSharedBackingView, align_up, host_page_size, host_size};
 
@@ -70,6 +71,76 @@ static SHARED_MAPPINGS: OnceLock<Mutex<BTreeMap<u64, SharedMappingRecord>>> = On
 
 fn shared_mappings() -> &'static Mutex<BTreeMap<u64, SharedMappingRecord>> {
     SHARED_MAPPINGS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+static SHARED_MAPPING_MUTATION: OnceLock<Mutex<()>> = OnceLock::new();
+
+static SHARED_MAPPING_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(super) struct GuestSharedMappingMutation {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for GuestSharedMappingMutation {
+    fn drop(&mut self) {
+        let previous = SHARED_MAPPING_EPOCH.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(
+            previous & 1,
+            1,
+            "shared-mapping mutation epoch must be odd while changing"
+        );
+    }
+}
+
+/// Serializes a guest mapping transition and makes incomplete alias snapshots detectable.
+pub(super) fn begin_shared_mapping_mutation() -> GuestSharedMappingMutation {
+    let guard = SHARED_MAPPING_MUTATION
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = SHARED_MAPPING_EPOCH.fetch_add(1, Ordering::AcqRel);
+    debug_assert_eq!(
+        previous & 1,
+        0,
+        "shared-mapping mutation epoch must be even before changing"
+    );
+    GuestSharedMappingMutation { _guard: guard }
+}
+
+/// Returns an even value while the shared-mapping alias set is stable and an odd value otherwise.
+#[must_use]
+pub fn guest_shared_mapping_epoch() -> u64 {
+    SHARED_MAPPING_EPOCH.load(Ordering::Acquire)
+}
+
+/// Returns every current VA intersecting a supplied physical-backing interval.
+pub(super) fn existing_shared_backing_alias_segments(
+    backing: &GuestPhysicalBacking,
+    backing_offset: u64,
+    byte_count: u64,
+) -> Vec<GuestSharedBackingSegment> {
+    let Some(backing_end) = backing_offset.checked_add(byte_count) else {
+        return Vec::new();
+    };
+    let mut aliases = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, record)| record.backing.id() == backing.id())
+        .filter_map(|(&mapping_start, record)| {
+            let mapping_length = record.end.checked_sub(mapping_start)?;
+            let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
+            let intersection_start = record.backing_offset.max(backing_offset);
+            let intersection_end = mapping_backing_end.min(backing_end);
+            (intersection_start < intersection_end).then(|| GuestSharedBackingSegment {
+                address: mapping_start + (intersection_start - record.backing_offset),
+                byte_count: intersection_end - intersection_start,
+            })
+        })
+        .collect::<Vec<_>>();
+    aliases.sort_unstable_by_key(|segment| (segment.address, segment.byte_count));
+    aliases.dedup();
+    aliases
 }
 
 fn resolve_shared_backing_range(

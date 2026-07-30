@@ -20,7 +20,8 @@ use metal::MTLTextureUsage;
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
     CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_backing_alias_segments,
-    guest_shared_mapping_identity, read_guest_shared_backing, write_guest_shared_backing,
+    guest_shared_mapping_epoch, guest_shared_mapping_identity, read_guest_shared_backing,
+    write_guest_shared_backing,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -321,6 +322,27 @@ impl MetalPresenter {
 
 impl GuestTextureWriteWatch {
     pub(crate) fn new(address: u64, byte_count: u64) -> Result<Self, String> {
+        loop {
+            let epoch = guest_shared_mapping_epoch();
+            if epoch & 1 != 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            match Self::new_at_stable_epoch(address, byte_count) {
+                Ok(watch) if guest_shared_mapping_epoch() == epoch => return Ok(watch),
+                Ok(watch) => {
+                    // A mapping transition raced alias discovery or watch installation. Dropping
+                    // these partial watches restores their pages before retrying against the
+                    // complete alias set.
+                    drop(watch);
+                }
+                Err(error) if guest_shared_mapping_epoch() == epoch => return Err(error),
+                Err(_) => {}
+            }
+        }
+    }
+
+    fn new_at_stable_epoch(address: u64, byte_count: u64) -> Result<Self, String> {
         let segments = guest_shared_backing_alias_segments(address, byte_count).ok_or_else(|| {
             format!(
                 "guest texture range {address:#x}+{byte_count:#x} has no complete live shared backing"
@@ -694,6 +716,15 @@ impl GuestTextureWriteWatch {
             TEXTURE_DIRTY_VALIDATION_UNCHANGED.fetch_add(1, Ordering::Relaxed);
         }
         Ok(changed)
+    }
+
+    pub(crate) fn content_validation_pending(&self) -> bool {
+        !self
+            .content_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_dirty_ranges
+            .is_empty()
     }
 
     pub(crate) fn record_content_snapshot(&self, address: u64, bytes: &[u8]) {

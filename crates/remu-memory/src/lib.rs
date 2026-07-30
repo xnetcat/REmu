@@ -24,8 +24,8 @@ pub use address_space::{
     GuestSharedBackingView, GuestSharedMapOptions, GuestSharedMappingIdentity, GuestVmaInfo,
     GuestVmaState, RequestedAddress, guest_shared_backing_alias_segments,
     guest_shared_backing_identity, guest_shared_backing_range, guest_shared_backing_ranges_overlap,
-    guest_shared_backing_segments, guest_shared_mapping_identity, read_guest_shared_backing,
-    write_guest_shared_backing, write_guest_shared_backing_if_identity,
+    guest_shared_backing_segments, guest_shared_mapping_epoch, guest_shared_mapping_identity,
+    read_guest_shared_backing, write_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 
 pub const PS5_MAIN_IMAGE_BASE: GuestAddress = GuestAddress::new(0x0000_0008_0000_0000);

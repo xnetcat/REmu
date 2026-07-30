@@ -997,6 +997,7 @@ impl ResidentGuestTexture {
         refresh: WriteWatchRefresh,
     ) -> Result<bool, String> {
         let possibly_changed = matches!(refresh, WriteWatchRefresh::Renewed { was_dirty: true })
+            || self.write_watch.content_validation_pending()
             || self.write_watch.is_dirty()
             || self.write_watch.generations() != self.gpu_write_watch_generations;
         if !possibly_changed {
