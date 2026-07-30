@@ -148,7 +148,28 @@ in the first floating-point register), `sceSystemGestureOpen`,
 hardware this host does not have; each reports the state that is actually true here — no touch
 occurs, no network link exists — rather than a placeholder, and that is recorded on each call.
 
-The title still submits no draws. Differencing against SharpEmu, which reaches menus and gameplay
+Two further defects were then fixed by following the assertion, both real:
+
+- `scePthreadMutexInit` refused any address that already carried a record, returning
+  `EINVAL`. Guest mutexes routinely live in stack frames, so a later frame legitimately places a
+  new mutex where a finished one lived, and the address alone cannot tell reuse from double
+  initialization. Refusing left SCREAM holding a mutex it believed was ready. Initialization now
+  replaces the previous record and releases its guest object.
+- The ACM signal-processing surface is routed: `sceAcmBatchStartBuffers`/`StartBuffer`,
+  `BatchWait`, `BatchJobNotification`, and the reverb, FFT and panner job builders, which advance
+  the caller's batch cursor by their own footprint so the guest can build a batch and read the
+  cursor back. As with Ajm, no processing runs.
+
+The title still submits no draws, and SCREAM still asserts at
+`wws_scream/scream/src/ps4/snd_osfuncs.cpp:397`; under the debugger that is an `int $0x41` assert
+trap sitting immediately before a stack-canary check, reached ten frames into guest code. Every
+import it makes is served and only two fail in a whole run, both benign, so it is asserting on a
+value rather than on a refusal.
+
+The next lead is recorded rather than guessed at: shortly before the trap the title calls
+`sceAudioOut2PortGetState` with handle `0xffffffffffffffff`, which REmu reports as a non-existent
+port. No `PortCreate` fails in that run, so where the title acquires that handle — and what the
+console returns for it — is the thing to establish next. Differencing against SharpEmu, which reaches menus and gameplay
 on this title, located the divergence. SharpEmu was built from its `main` at `5f1bd5a` and run on
 the same dump with `--trace-imports`.
 

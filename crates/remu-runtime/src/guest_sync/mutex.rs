@@ -117,11 +117,18 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
     let mut shard = guest_mutex_shards()[guest_mutex_shard(address)]
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if shard.contains_key(&address) {
-        if guest_object != 0 {
-            guest_free(guest_object);
-        }
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    // An address that already carries a record is storage being reused, not a double
+    // initialization. Guest mutexes routinely live in stack frames, so a later frame legitimately
+    // places a new mutex where a finished one lived, and the address alone cannot tell the two
+    // apart. Refusing left an audio engine holding a mutex it believed was ready and asserting the
+    // first time it locked one. The previous record is therefore replaced and its guest object
+    // released. A guest that genuinely re-initializes a live mutex loses that mutex's state, but
+    // that is already undefined for it, and the console accepts the call.
+    if let Some(previous) = shard.remove(&address)
+        && previous.guest_object != 0
+        && previous.guest_object != guest_object
+    {
+        guest_free(previous.guest_object);
     }
     shard.insert(
         address,

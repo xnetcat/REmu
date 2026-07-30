@@ -3774,6 +3774,74 @@ fn acm_context_create(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u6
     0
 }
 
+/// Bytes the ACM batch-error object occupies.
+const ACM_BATCH_ERROR_SIZE: u64 = 32;
+/// Identifiers handed out by [`acm_batch_start_buffers`].
+static ACM_NEXT_BATCH: AtomicU32 = AtomicU32::new(0);
+
+/// `sceAcmBatchStartBuffers(context, count, infoArray, error, batchOut)`.
+///
+/// Accepts a signal-processing batch and hands back an identifier to wait on. As with the audio
+/// job manager, nothing is processed: this host has no audio coprocessor, so the reverb, panner
+/// and transform jobs the batch describes are retired without touching their buffers, which leaves
+/// the silence already there rather than claiming processed samples.
+fn acm_batch_start_buffers(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let context = low_u32(arguments[0]);
+    let count = low_u32(arguments[1]);
+    let info_array = arguments[2];
+    let error = arguments[3];
+    let output = arguments[4];
+    if !state.acm_contexts.contains(&context)
+        || output == 0
+        || (count != 0 && info_array == 0)
+        || guest_output_pointer(output, std::mem::size_of::<u32>()).is_none()
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    if error != 0 {
+        if guest_output_pointer(error, ACM_BATCH_ERROR_SIZE as usize).is_none() {
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        }
+        guest_memset(error, 0, ACM_BATCH_ERROR_SIZE);
+    }
+    let batch = ACM_NEXT_BATCH
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1);
+    write_guest_u32(output, batch);
+    0
+}
+
+/// `sceAcmBatchWait(context, ...)`. A batch this host accepted is already retired.
+fn acm_batch_wait(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if state.acm_contexts.contains(&low_u32(arguments[0])) {
+        0
+    } else {
+        sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    }
+}
+
+/// Advances a signal-processing batch cursor by the bytes one job of that kind occupies.
+///
+/// The guest builds its batch by calling one of these per job and reading the cursor back, so the
+/// advance has to be real even though no job runs. The cursor is clamped to the arena size, which
+/// is how the guest learns it has run out of room.
+fn acm_advance_batch_info(info: u64, bytes: u64) -> u64 {
+    if info == 0 {
+        return 0;
+    }
+    if guest_output_pointer(info, 24).is_none() {
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    }
+    let buffer = read_guest_u64(info);
+    let offset = read_guest_u64(info + 8);
+    let size = read_guest_u64(info + 16);
+    if buffer != 0 && size != 0 {
+        write_guest_u64(info + 8, size.min(offset.saturating_add(bytes)));
+    }
+    0
+}
+
 /// `sceAcmContextDestroy(context)`.
 fn acm_context_destroy(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let context = low_u32(arguments[0]);
@@ -4102,6 +4170,12 @@ fn dispatch_probe_import(
         // ACM context handles. The batch/DSP entry points stay unserved.
         "ZIXln2K3XMk" => acm_context_create(arguments, state),
         "jBgBjAj02R8" => acm_context_destroy(arguments, state),
+        "8fe55ktlNVo" | "tW9W+CAG4FE" => acm_batch_start_buffers(arguments, state),
+        "RLN3gRlXJLE" => acm_batch_wait(arguments, state),
+        // Each signal-processing job advances the caller's batch cursor by its own footprint.
+        "r7z5YQFZo+U" => acm_advance_batch_info(arguments[0], 32),
+        "u70oWo92SYQ" | "9nLbWmRDpa8" => acm_advance_batch_info(arguments[0], 1024),
+        "KovqaFbmtsM" | "DR-ZCmvVR9Q" | "LA4RCNKnFjg" => acm_advance_batch_info(arguments[0], 256),
         "Q3dyFuwGn64" => ajm_module_register(arguments, state),
         "3cAg7xN995U" => ajm_batch_job_get_statistics(arguments),
         "5tOfnaClcqM" => ajm_batch_start(arguments, state),
