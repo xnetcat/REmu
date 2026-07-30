@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    MetalPresenter, PendingGlobalWriteback, PendingGuestMemoryWrite, WriteWatchRefresh,
-    guest_batch_writes_overlap, guest_ranges_overlap, guest_texture_byte_count,
+    GuestMemoryWriteOperation, MetalPresenter, PendingGlobalWriteback, PendingGuestMemoryWrite,
+    WriteWatchRefresh, guest_batch_writes_overlap, guest_ranges_overlap, guest_texture_byte_count,
     merge_guest_batch_result, read_guest_memory_wait_value, rearm_depth_metadata_clear,
     record_diagnostic_memory_copy, refresh_resident_texture_write_watch,
     retire_multisample_textures_overlapping_writeback,
@@ -13,6 +13,10 @@ use super::{
 };
 use remu_gpu::{
     GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
+};
+use remu_memory::{
+    CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_mapping_identity,
+    write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -38,7 +42,7 @@ impl MetalPresenter {
             return Err("release destination is null".to_owned());
         }
         validate_guest_memory_release(release)?;
-        self.queue_pending_guest_memory_write(PendingGuestMemoryWrite::Release(release))
+        self.queue_pending_guest_memory_write(GuestMemoryWriteOperation::Release(release))
     }
 
     pub(crate) fn execute_guest_memory_copy(&mut self, copy: GpuMemoryCopy) -> Result<(), String> {
@@ -70,7 +74,7 @@ impl MetalPresenter {
                     copy.destination_address, copy.byte_count
                 ));
             }
-            self.queue_pending_guest_memory_write(PendingGuestMemoryWrite::Fill {
+            self.queue_pending_guest_memory_write(GuestMemoryWriteOperation::Fill {
                 address: copy.destination_address,
                 value: copy.source_address as u32,
                 dword_count: copy.byte_count / 4,
@@ -259,13 +263,14 @@ impl MetalPresenter {
             ));
         }
         validate_guest_memory_write(write)?;
-        self.queue_pending_guest_memory_write(PendingGuestMemoryWrite::Write(write.clone()))
+        self.queue_pending_guest_memory_write(GuestMemoryWriteOperation::Write(write.clone()))
     }
 
     pub(crate) fn queue_pending_guest_memory_write(
         &mut self,
-        write: PendingGuestMemoryWrite,
+        write: GuestMemoryWriteOperation,
     ) -> Result<(), String> {
+        let write = pin_guest_memory_write(write)?;
         // RELEASE_MEM/WRITE_DATA label updates are ordered after the Metal work already encoded
         // in this batch, but do not themselves require a new Metal submission. Publish them when
         // the owning command buffer retires. A later wait can inspect the deferred value, while
@@ -307,8 +312,8 @@ impl MetalPresenter {
         pending: &[PendingGuestMemoryWrite],
     ) {
         for write in pending {
-            match write {
-                PendingGuestMemoryWrite::Release(release) => match release.value {
+            match &write.operation {
+                GuestMemoryWriteOperation::Release(release) => match release.value {
                     GpuMemoryReleaseValue::Immediate32(value) => {
                         self.record_guest_memory_producer(release.address, false, u64::from(value));
                     }
@@ -346,7 +351,7 @@ impl MetalPresenter {
                         );
                     }
                 },
-                PendingGuestMemoryWrite::Write(write) => {
+                GuestMemoryWriteOperation::Write(write) => {
                     for (index, value) in write.values.iter().copied().enumerate() {
                         let offset = if write.increment_address {
                             u64::try_from(index).unwrap_or(u64::MAX).saturating_mul(4)
@@ -371,7 +376,7 @@ impl MetalPresenter {
                         }
                     }
                 }
-                PendingGuestMemoryWrite::Fill { address, value, .. } => {
+                GuestMemoryWriteOperation::Fill { address, value, .. } => {
                     self.record_guest_memory_producer(*address, false, u64::from(*value));
                     if address.is_multiple_of(8) {
                         self.record_guest_memory_producer(
@@ -410,7 +415,7 @@ impl MetalPresenter {
     }
 }
 
-impl PendingGuestMemoryWrite {
+impl GuestMemoryWriteOperation {
     pub(crate) fn range(&self) -> (u64, u64) {
         match self {
             Self::Release(release) => (
@@ -486,6 +491,20 @@ impl PendingGuestMemoryWrite {
     }
 }
 
+impl PendingGuestMemoryWrite {
+    pub(crate) fn range(&self) -> (u64, u64) {
+        self.operation.range()
+    }
+
+    pub(crate) fn value_at(&self, address: u64, is_64_bit: bool) -> Option<u64> {
+        self.operation.value_at(address, is_64_bit)
+    }
+
+    pub(crate) fn overlaps(&self, address: u64, byte_count: u64) -> bool {
+        self.operation.overlaps(address, byte_count)
+    }
+}
+
 pub(crate) fn validate_guest_memory_release(release: GpuMemoryRelease) -> Result<(), String> {
     let alignment = match release.value {
         GpuMemoryReleaseValue::Immediate32(_) => 4,
@@ -524,86 +543,236 @@ pub(crate) fn validate_guest_memory_write(write: &GpuMemoryWrite) -> Result<(), 
     Ok(())
 }
 
+fn validate_guest_memory_operation(write: &GuestMemoryWriteOperation) -> Result<(), String> {
+    match write {
+        GuestMemoryWriteOperation::Release(release) => validate_guest_memory_release(*release),
+        GuestMemoryWriteOperation::Write(write) => validate_guest_memory_write(write),
+        GuestMemoryWriteOperation::Fill {
+            address,
+            dword_count,
+            ..
+        } => {
+            let byte_count = dword_count
+                .checked_mul(4)
+                .ok_or("DMA fill byte count overflowed")?;
+            if !address.is_multiple_of(4) || *address == 0 || byte_count == 0 {
+                return Err(format!(
+                    "DMA fill destination {address:#x} dwords={dword_count:#x} is invalid"
+                ));
+            }
+            address
+                .checked_add(byte_count)
+                .ok_or("DMA fill destination range overflowed")?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn pin_guest_memory_write(
+    operation: GuestMemoryWriteOperation,
+) -> Result<PendingGuestMemoryWrite, String> {
+    validate_guest_memory_operation(&operation)?;
+    let (address, byte_count) = operation.range();
+    let mapping_identity = guest_shared_mapping_identity(address, byte_count);
+    let write_watch = if mapping_identity.is_some() {
+        None
+    } else {
+        // SAFETY: command decoding admitted this exact writable guest range. The watch is kept
+        // with the deferred command-processor effect and pins its mapping during publication.
+        Some(unsafe { CpuWriteWatch::new(address, byte_count) }.map_err(|error| {
+            format!(
+                "could not pin deferred guest memory destination address={address:#x} bytes={byte_count}: {error}"
+            )
+        })?)
+    };
+    Ok(PendingGuestMemoryWrite {
+        operation,
+        mapping_identity,
+        write_watch,
+    })
+}
+
+fn gpu_timestamp() -> u64 {
+    static GPU_CLOCK_START: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(
+        GPU_CLOCK_START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+    .max(1)
+}
+
+fn apply_guest_memory_operation_direct(
+    operation: &GuestMemoryWriteOperation,
+) -> Result<(), String> {
+    match operation {
+        GuestMemoryWriteOperation::Release(release) => {
+            // SAFETY: the caller pins the original mapping against replacement for the duration
+            // of this operation. Validation proves the destination alignment.
+            unsafe {
+                match release.value {
+                    GpuMemoryReleaseValue::Immediate32(value) => {
+                        std::ptr::write_volatile(release.address as *mut u32, value);
+                    }
+                    GpuMemoryReleaseValue::Immediate64(value) => {
+                        std::ptr::write_volatile(release.address as *mut u64, value);
+                    }
+                    GpuMemoryReleaseValue::Timestamp => {
+                        std::ptr::write_volatile(release.address as *mut u64, gpu_timestamp());
+                    }
+                }
+            }
+        }
+        GuestMemoryWriteOperation::Write(write) => {
+            // SAFETY: the caller pins the original mapping against replacement for the duration
+            // of this operation. Validation proves every destination is aligned and bounded.
+            unsafe {
+                for (index, value) in write.values.iter().copied().enumerate() {
+                    let offset = if write.increment_address {
+                        u64::try_from(index)
+                            .map_err(|_| "WRITE_DATA index does not fit u64")?
+                            .checked_mul(4)
+                            .ok_or("WRITE_DATA destination offset overflowed")?
+                    } else {
+                        0
+                    };
+                    let address = write
+                        .address
+                        .checked_add(offset)
+                        .ok_or("WRITE_DATA destination range overflowed")?;
+                    std::ptr::write_volatile(address as *mut u32, value);
+                }
+            }
+        }
+        GuestMemoryWriteOperation::Fill {
+            address,
+            value,
+            dword_count,
+        } => {
+            // SAFETY: the caller pins the complete original mapping against replacement.
+            unsafe {
+                for index in 0..*dword_count {
+                    let offset = index
+                        .checked_mul(4)
+                        .ok_or("DMA fill destination offset overflowed")?;
+                    std::ptr::write_volatile((*address + offset) as *mut u32, *value);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_shared_identity_bytes(
+    address: u64,
+    identity: GuestSharedMappingIdentity,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let destination = address
+        .checked_add(offset)
+        .ok_or("deferred guest memory destination overflowed")?;
+    let expected = GuestSharedMappingIdentity {
+        backing_id: identity.backing_id,
+        backing_offset: identity
+            .backing_offset
+            .checked_add(offset)
+            .ok_or("deferred guest memory backing offset overflowed")?,
+    };
+    if write_guest_shared_backing_if_identity(destination, expected, bytes) {
+        Ok(())
+    } else {
+        Err(format!(
+            "deferred guest memory mapping changed before completion address={destination:#x} bytes={}",
+            bytes.len()
+        ))
+    }
+}
+
+fn apply_guest_memory_operation_shared(
+    operation: &GuestMemoryWriteOperation,
+    identity: GuestSharedMappingIdentity,
+) -> Result<(), String> {
+    let (address, _) = operation.range();
+    match operation {
+        GuestMemoryWriteOperation::Release(release) => {
+            let bytes = match release.value {
+                GpuMemoryReleaseValue::Immediate32(value) => value.to_le_bytes().to_vec(),
+                GpuMemoryReleaseValue::Immediate64(value) => value.to_le_bytes().to_vec(),
+                GpuMemoryReleaseValue::Timestamp => gpu_timestamp().to_le_bytes().to_vec(),
+            };
+            write_shared_identity_bytes(address, identity, 0, &bytes)
+        }
+        GuestMemoryWriteOperation::Write(write) if write.increment_address => {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(write.values.len().saturating_mul(4))
+                .map_err(|error| format!("could not stage WRITE_DATA values: {error}"))?;
+            for value in &write.values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            write_shared_identity_bytes(address, identity, 0, &bytes)
+        }
+        GuestMemoryWriteOperation::Write(write) => {
+            for value in &write.values {
+                write_shared_identity_bytes(address, identity, 0, &value.to_le_bytes())?;
+            }
+            Ok(())
+        }
+        GuestMemoryWriteOperation::Fill {
+            value, dword_count, ..
+        } => {
+            const CHUNK_DWORDS: u64 = 16 * 1024;
+            let pattern = value.to_le_bytes();
+            let mut chunk = vec![0_u8; usize::try_from(CHUNK_DWORDS * 4).unwrap_or(64 * 1024)];
+            for bytes in chunk.chunks_exact_mut(4) {
+                bytes.copy_from_slice(&pattern);
+            }
+            let mut written_dwords = 0;
+            while written_dwords < *dword_count {
+                let current_dwords = (*dword_count - written_dwords).min(CHUNK_DWORDS);
+                let current_bytes = usize::try_from(current_dwords * 4)
+                    .map_err(|_| "DMA fill chunk does not fit usize")?;
+                write_shared_identity_bytes(
+                    address,
+                    identity,
+                    written_dwords
+                        .checked_mul(4)
+                        .ok_or("DMA fill destination offset overflowed")?,
+                    &chunk[..current_bytes],
+                )?;
+                written_dwords += current_dwords;
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn apply_pending_guest_memory_writes(
     pending: &[PendingGuestMemoryWrite],
 ) -> Result<(), String> {
-    static GPU_CLOCK_START: OnceLock<Instant> = OnceLock::new();
-    for write in pending {
-        match write {
-            PendingGuestMemoryWrite::Release(release) => {
-                validate_guest_memory_release(*release)?;
-                // SAFETY: packet decoding admits only aligned, live process-local guest
-                // destinations. The owning Metal batch has completed, and volatile writes publish
-                // the ordered label update before submission completion becomes visible.
-                unsafe {
-                    match release.value {
-                        GpuMemoryReleaseValue::Immediate32(value) => {
-                            std::ptr::write_volatile(release.address as *mut u32, value);
-                        }
-                        GpuMemoryReleaseValue::Immediate64(value) => {
-                            std::ptr::write_volatile(release.address as *mut u64, value);
-                        }
-                        GpuMemoryReleaseValue::Timestamp => {
-                            let timestamp = u64::try_from(
-                                GPU_CLOCK_START
-                                    .get_or_init(Instant::now)
-                                    .elapsed()
-                                    .as_nanos(),
-                            )
-                            .unwrap_or(u64::MAX)
-                            .max(1);
-                            std::ptr::write_volatile(release.address as *mut u64, timestamp);
-                        }
-                    }
-                }
-            }
-            PendingGuestMemoryWrite::Write(write) => {
-                validate_guest_memory_write(write)?;
-                // SAFETY: validation above proves aligned, non-overflowing destinations in the
-                // guest mapping supplied by the runtime.
-                unsafe {
-                    for (index, value) in write.values.iter().copied().enumerate() {
-                        let offset = if write.increment_address {
-                            u64::try_from(index)
-                                .map_err(|_| "WRITE_DATA index does not fit u64")?
-                                .checked_mul(4)
-                                .ok_or("WRITE_DATA destination offset overflowed")?
-                        } else {
-                            0
-                        };
-                        let address = write
-                            .address
-                            .checked_add(offset)
-                            .ok_or("WRITE_DATA destination range overflowed")?;
-                        std::ptr::write_volatile(address as *mut u32, value);
-                    }
-                }
-            }
-            PendingGuestMemoryWrite::Fill {
-                address,
-                value,
-                dword_count,
-            } => {
-                let byte_count = dword_count
-                    .checked_mul(4)
-                    .ok_or("DMA fill byte count overflowed")?;
-                if !address.is_multiple_of(4) || address.checked_add(byte_count).is_none() {
-                    return Err(format!(
-                        "DMA fill destination {address:#x} dwords={dword_count:#x} is invalid"
-                    ));
-                }
-                // SAFETY: packet decoding admitted an aligned, non-overflowing guest range. The
-                // owning Metal batch has retired, so publishing the repeated dwords here preserves
-                // DMA ordering for following waits and CPU readers.
-                unsafe {
-                    for index in 0..*dword_count {
-                        let offset = index
-                            .checked_mul(4)
-                            .ok_or("DMA fill destination offset overflowed")?;
-                        std::ptr::write_volatile((*address + offset) as *mut u32, *value);
-                    }
-                }
-            }
+    for pending_write in pending {
+        validate_guest_memory_operation(&pending_write.operation)?;
+        if let Some(identity) = pending_write.mapping_identity {
+            apply_guest_memory_operation_shared(&pending_write.operation, identity)?;
+        } else if let Some(write_watch) = pending_write.write_watch.as_ref() {
+            write_watch
+                .with_live_mapping(|| {
+                    apply_guest_memory_operation_direct(&pending_write.operation)
+                })
+                .map_err(|error| {
+                    let (address, byte_count) = pending_write.range();
+                    format!(
+                        "deferred guest memory mapping changed before completion address={address:#x} bytes={byte_count}: {error}"
+                    )
+                })??;
+        } else {
+            let (address, byte_count) = pending_write.range();
+            return Err(format!(
+                "deferred guest memory write has no mapping lifetime guard address={address:#x} bytes={byte_count}"
+            ));
         }
     }
     Ok(())

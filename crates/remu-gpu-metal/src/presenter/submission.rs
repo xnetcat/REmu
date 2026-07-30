@@ -6,11 +6,11 @@ use super::{
     GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GlobalUploadChunk, GraphicsPipelineKey,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
     GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
-    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OrderedEventPoll, OrderedEventSource,
-    OrderedGpuEventReceiver, PIPELINE_DRAW_GATES, PendingFlip, PendingGlobalWriteback,
-    PendingGuestMemoryWrite, PendingGuestWriteRange, PresenterFlow, QueueBlockReason,
-    ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh,
-    graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
+    GuestMemoryWriteOperation, MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OrderedEventPoll,
+    OrderedEventSource, OrderedGpuEventReceiver, PIPELINE_DRAW_GATES, PendingFlip,
+    PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange, PresenterFlow,
+    QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer,
+    WriteWatchRefresh, graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
     guest_texture_byte_count, pixel_scalars, rearm_depth_metadata_clear,
     record_diagnostic_memory_copy, refresh_resident_texture_write_watch, register_value,
     retire_multisample_textures_overlapping_writeback,
@@ -36,7 +36,7 @@ pub(crate) use self::batch::{
     merge_guest_batch_result,
 };
 #[cfg(test)]
-pub(crate) use self::memory::apply_pending_guest_memory_writes;
+pub(crate) use self::memory::{apply_pending_guest_memory_writes, pin_guest_memory_write};
 pub(crate) use self::waits::read_guest_memory_wait_value;
 
 impl MetalPresenter {
