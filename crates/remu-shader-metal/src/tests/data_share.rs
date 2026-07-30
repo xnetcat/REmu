@@ -260,6 +260,134 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
 }
 
 #[test]
+fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocation() {
+    const CAPTURED_GS_RSRC2: u32 = 0x00fb_0018;
+    const CAPTURED_LDS_BYTES: u32 = ((CAPTURED_GS_RSRC2 >> 19) & 0xff) * 128 * 4;
+    assert_eq!(CAPTURED_LDS_BYTES, 15_872);
+    assert!(CAPTURED_LDS_BYTES <= 16 * 1024);
+
+    let export = |pc, target, sources| Instruction {
+        pc,
+        encoding: ShaderEncoding::Exp,
+        opcode: Opcode::Known("Exp"),
+        words: vec![0, 0],
+        sources,
+        destinations: Vec::new(),
+        control: Some(InstructionControl::Export(ExportControl {
+            target,
+            enable_mask: if target == 20 { 1 } else { 15 },
+            compressed: false,
+            done: true,
+            valid_mask: false,
+        })),
+    };
+    let front = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Ds,
+                opcode: Opcode::Known("DsWriteB32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(0), Operand::vector(1)],
+                destinations: Vec::new(),
+                control: Some(InstructionControl::DataShare(DataShareControl {
+                    offset0: 0,
+                    offset1: 0,
+                    gds: false,
+                })),
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SSetpcB64"),
+                words: vec![0xbe80_2006],
+                sources: vec![Operand::scalar(6)],
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let continuation = Program::new(
+        0x4000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: vec![0xbf90_0009],
+                sources: vec![Operand {
+                    kind: remu_shader::OperandKind::EncodedConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            export(
+                4,
+                20,
+                vec![
+                    Operand::vector(2),
+                    Operand::vector(2),
+                    Operand::vector(2),
+                    Operand::vector(2),
+                ],
+            ),
+            export(
+                12,
+                12,
+                vec![
+                    Operand::vector(3),
+                    Operand::vector(4),
+                    Operand::vector(5),
+                    Operand::vector(6),
+                ],
+            ),
+            export(
+                20,
+                32,
+                vec![
+                    Operand::vector(7),
+                    Operand::vector(8),
+                    Operand::vector(9),
+                    Operand::vector(10),
+                ],
+            ),
+            Instruction {
+                pc: 28,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let linked = remu_shader::link_program_continuation(&front, &continuation)
+        .expect("exact fused front/back pair");
+
+    let shader = compile_msl(
+        &linked,
+        &empty_evaluation(),
+        &MetalCompileOptions::mesh(1, 16 * 1024),
+    )
+    .expect("linked NGG program should lower as one mesh function");
+
+    assert_eq!(shader.stage, MetalShaderStage::Mesh);
+    assert!(shader.register_footprint.direct_control_flow);
+    assert!(
+        shader
+            .source
+            .contains("threadgroup atomic_uint remu_lds_storage[4096]")
+    );
+    assert!(shader.source.contains("remu_mesh.set_index("));
+    assert!(shader.source.contains("remu_out.position = float4("));
+    assert!(shader.source.contains("remu_out.param0 = float4("));
+    assert!(!shader.source.contains("active = false;"));
+}
+
+#[test]
 fn lowers_graphics_addtid_spills_to_lane_private_records() {
     let program = Program::new(
         0x1000,
