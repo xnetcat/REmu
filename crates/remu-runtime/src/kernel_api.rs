@@ -280,8 +280,8 @@ fn kernel_delete_user_event(arguments: [u64; 6], state: &mut ProbeDispatchState)
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     // An event queued before the interest was withdrawn must not still arrive after it.
-    state.pending_events.retain(|event| {
-        event.equeue != equeue || event.filter != KERNEL_EVENT_FILTER_USER || event.ident != ident
+    crate::discard_kernel_events(state, |event| {
+        event.equeue == equeue && event.filter == KERNEL_EVENT_FILTER_USER && event.ident == ident
     });
     0
 }

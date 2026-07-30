@@ -346,10 +346,10 @@ fn delete_eq_event(equeue: u64, requested: u64, state: &mut ProbeDispatchState) 
             .remove(&(equeue, KERNEL_EVENT_FILTER_GRAPHICS, ident));
         // An interrupt already queued for a listener the guest just cancelled must not surface on
         // the next wait, where it would resolve user data the guest considers released.
-        state.pending_events.retain(|event| {
-            event.equeue != equeue
-                || event.filter != KERNEL_EVENT_FILTER_GRAPHICS
-                || event.ident != ident
+        crate::discard_kernel_events(state, |event| {
+            event.equeue == equeue
+                && event.filter == KERNEL_EVENT_FILTER_GRAPHICS
+                && event.ident == ident
         });
     }
     0
@@ -896,6 +896,11 @@ mod tests {
         );
         queue_agc_event_write(&mut state, 7);
         assert_eq!(state.pending_events.len(), 1);
+        state
+            .pending_events
+            .front_mut()
+            .expect("queued event")
+            .agc_graphics_completions = 2;
 
         // The event type is a four-byte value in a register whose upper half the caller never
         // sets, so a stale upper half must not hide the registration.
@@ -909,6 +914,12 @@ mod tests {
         );
         assert!(state.kernel_event_registrations.is_empty());
         assert!(state.pending_events.is_empty());
+        assert_eq!(
+            state
+                .agc_completion_telemetry
+                .cancelled_graphics_notifications,
+            2
+        );
     }
 
     #[test]

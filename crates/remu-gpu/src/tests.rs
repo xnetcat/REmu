@@ -9,13 +9,14 @@ use super::{
     GpuMemoryWait, GpuRegister, HostPadState, audio_output_frames, audio_progress_age_millis,
     audio_underrun_frames, clear_event_sink, compute_program_address,
     decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
-    decode_compute_system_registers, emit_event, gpu_completed_submission_sequence,
-    gpu_event_channel, gpu_events_in_flight, gpu_progress_age_millis, gpu_work_items_pending,
-    host_pad_state, install_event_sink, install_gpu_completion_notifier,
-    progress_telemetry_enabled, record_gpu_event_consumed, record_gpu_flip_completed,
-    record_gpu_submission_completed, record_gpu_wait_producer, record_gpu_work_item_processed,
-    report_audio_frames, set_host_pad_state, set_progress_telemetry_enabled,
-    take_gpu_completed_flips, take_gpu_completed_submission_ids, take_gpu_wait_latch,
+    decode_compute_system_registers, emit_event, gpu_completed_submission_ids_snapshot,
+    gpu_completed_submission_sequence, gpu_event_channel, gpu_events_in_flight,
+    gpu_progress_age_millis, gpu_work_items_pending, host_pad_state, install_event_sink,
+    install_gpu_completion_notifier, progress_telemetry_enabled, record_gpu_event_consumed,
+    record_gpu_flip_completed, record_gpu_submission_completed, record_gpu_wait_producer,
+    record_gpu_work_item_processed, report_audio_frames, set_host_pad_state,
+    set_progress_telemetry_enabled, take_gpu_completed_flips, take_gpu_completed_submission_ids,
+    take_gpu_wait_latch,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,7 +118,9 @@ fn runtime_telemetry_tracks_gpu_queue_and_audio_callback_progress() {
     record_gpu_submission_completed(2);
     record_gpu_submission_completed(1);
     assert_eq!(gpu_completed_submission_sequence(), 2);
+    assert_eq!(gpu_completed_submission_ids_snapshot(), [1, 2]);
     assert_eq!(take_gpu_completed_submission_ids(), [1, 2]);
+    assert!(gpu_completed_submission_ids_snapshot().is_empty());
     assert_eq!(
         GPU_COMPLETION_NOTIFICATIONS.load(Ordering::Relaxed),
         notifications_before + 2

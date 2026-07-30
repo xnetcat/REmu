@@ -292,6 +292,19 @@ fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
         "graphics completion must not wake an unrelated compute queue"
     );
     assert!(state.pending_agc_completions.is_empty());
+    assert_eq!(state.agc_completion_telemetry.refreshed_graphics, 2);
+    assert_eq!(
+        state.agc_completion_telemetry.queued_graphics_notifications,
+        2
+    );
+    assert_eq!(
+        state
+            .agc_completion_telemetry
+            .delivered_graphics_notifications,
+        2,
+        "coalescing must preserve both logical completions in the diagnostic ledger"
+    );
+    assert_eq!(state.agc_completion_telemetry.unmatched_backend_ids, 0);
 }
 
 #[test]
@@ -342,6 +355,38 @@ fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
             .all(|event| event.filter != crate::KERNEL_EVENT_FILTER_GRAPHICS),
         "compute completion must not also wake the owner's graphics event"
     );
+    assert_eq!(state.agc_completion_telemetry.refreshed_compute, 1);
+    assert_eq!(state.agc_completion_telemetry.queued_user_interrupts, 1);
+    assert_eq!(state.agc_completion_telemetry.delivered_user_interrupts, 0);
+
+    let mut delivered = [0_u8; 0x20];
+    assert_eq!(
+        crate::kernel_poll_equeue(
+            [1, delivered.as_mut_ptr().addr() as u64, 1, 0, 0, 0],
+            &mut state,
+        ),
+        Ok(1)
+    );
+    assert_eq!(state.agc_completion_telemetry.delivered_user_interrupts, 1);
+}
+
+#[test]
+fn completion_ledger_identifies_a_backend_id_without_a_runtime_owner() {
+    let _serial = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
+    let mut state = ProbeDispatchState::default();
+    remu_gpu::record_gpu_submission_completed(sequence);
+
+    crate::refresh_completed_agc_submissions(&mut state);
+
+    assert_eq!(state.agc_completion_telemetry.unmatched_backend_ids, 1);
+    assert_eq!(
+        state.agc_completion_telemetry.last_unmatched_backend_id,
+        Some(sequence)
+    );
+    assert!(state.pending_events.is_empty());
 }
 
 #[test]
