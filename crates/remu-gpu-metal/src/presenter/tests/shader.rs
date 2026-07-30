@@ -13,7 +13,7 @@ use std::sync::Arc;
 use super::{
     MetalPresenter, canonical_sampler_bindings, canonical_texture_bindings, compute_launch,
     graphics_shader_resource_key, image_component_class, missing_vertex_parameter_exports,
-    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    ngg_mesh_export_stage, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
     rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
     shader_scalar_metadata, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, wave64_split_blockers,
@@ -89,6 +89,10 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
     let program = decode_program(0x1000, &words).expect("observed AGC rectangle stage decodes");
 
     assert!(procedural_rectangle_export_stage(&program));
+    assert!(
+        ngg_mesh_export_stage(&program),
+        "allocation plus primitive and position exports form an NGG contract even without LDS"
+    );
 }
 
 #[test]
