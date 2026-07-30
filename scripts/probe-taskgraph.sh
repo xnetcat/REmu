@@ -104,11 +104,36 @@ else
 fi
 
 auto_cross=${REMU_AUTO_CROSS:-}
+prepare_only=${REMU_TASKGRAPH_TRACE_PREPARE_ONLY:-0}
+case "$prepare_only" in
+    0 | 1) ;;
+    *)
+        echo "error: REMU_TASKGRAPH_TRACE_PREPARE_ONLY must be 0 or 1" >&2
+        exit 64
+        ;;
+esac
+disable_cpu_write_watch=${REMU_DISABLE_CPU_WRITE_WATCH:-0}
+if [ "$prepare_only" = 1 ]; then
+    # macOS debugserver intercepts deliberate CPU write-watch faults before
+    # REmu's handler.  PREPARE-only traces are long-lived, so use the existing
+    # debugger mode that never arms those page protections.  Guest VMA
+    # protections remain intact, and the LLDB script leaves every remaining
+    # EXC_BAD_ACCESS stopped as a real fault.
+    disable_cpu_write_watch=1
+fi
+case "$disable_cpu_write_watch" in
+    0 | 1) ;;
+    *)
+        echo "error: REMU_DISABLE_CPU_WRITE_WATCH must be 0 or 1" >&2
+        exit 64
+        ;;
+esac
 revision=$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)
 started_at=$(date +%s)
 
 echo "[REMu] launching bounded TaskGraph LLDB trace; artifacts: $run_dir"
 echo "[REMu] timeout=${timeout_seconds}s cycles=$cycle_limit hit-limit=$hit_limit"
+echo "[REMu] prepare-only=$prepare_only cpu-write-watch-disabled=$disable_cpu_write_watch"
 set +e
 (
     cd "$launch_working_directory"
@@ -119,6 +144,8 @@ set +e
             REMU_AUTO_CROSS="$auto_cross" \
             REMU_TASKGRAPH_TRACE_CYCLES="$cycle_limit" \
             REMU_TASKGRAPH_TRACE_HITS="$hit_limit" \
+            REMU_TASKGRAPH_TRACE_PREPARE_ONLY="$prepare_only" \
+            REMU_DISABLE_CPU_WRITE_WATCH="$disable_cpu_write_watch" \
             arch -x86_64 /usr/bin/lldb --no-lldbinit -b \
             -o 'process handle SIGALRM -n false -p true -s false' \
             -o 'process handle SIGSEGV -n false -p true -s false' \
@@ -166,6 +193,8 @@ finished_at=$(date +%s)
     echo "timeout_seconds=$timeout_seconds"
     echo "cycle_limit=$cycle_limit"
     echo "hit_limit=$hit_limit"
+    echo "prepare_only=$prepare_only"
+    echo "cpu_write_watch_disabled=$disable_cpu_write_watch"
     echo "elapsed_seconds=$((finished_at - started_at))"
     echo "exit_status=$status"
     echo "outcome=$outcome"

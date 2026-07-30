@@ -174,18 +174,25 @@ def is_taskgraph_diagnostic_stop_address(address: int) -> bool:
     )
 
 
-def is_guest_bad_access_stop(address: int, description: Optional[str]) -> bool:
+def is_guest_bad_access_stop(
+    address: int,
+    description: Optional[str],
+    write_watch_enabled: bool = True,
+) -> bool:
     """Return whether LLDB intercepted a guest fault meant for REmu's handler.
 
     REmu uses page protection faults for guest-memory dirty/write tracking.
     When running under LLDB, debugserver sees those Mach exceptions before
     REmu's installed signal handler.  Only pass through EXC_BAD_ACCESS stops
     whose instruction pointer is in the direct guest execution window; a host
-    fault must remain stopped for diagnosis.
+    fault must remain stopped for diagnosis.  When the probe disables precise
+    CPU write watching, no deliberate protection fault can exist, so every bad
+    access remains stopped.
     """
 
     return (
-        MINIMUM_GUEST_EXECUTION_ADDRESS
+        write_watch_enabled
+        and MINIMUM_GUEST_EXECUTION_ADDRESS
         <= address
         < MAXIMUM_GUEST_EXECUTION_ADDRESS
         and description is not None
@@ -854,6 +861,7 @@ def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
 
     target = debugger.GetSelectedTarget()
     process = target.GetProcess()
+    write_watch_enabled = os.environ.get("REMU_DISABLE_CPU_WRITE_WATCH") != "1"
     resumed = 0
     while process.GetState() == lldb.eStateStopped:
         diagnostic_stop = False
@@ -884,7 +892,11 @@ def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
             if reason == lldb.eStopReasonException:
                 address = frame.GetPCAddress().GetLoadAddress(target)
                 description = thread.GetStopDescription(256)
-                if is_guest_bad_access_stop(address, description):
+                if is_guest_bad_access_stop(
+                    address,
+                    description,
+                    write_watch_enabled,
+                ):
                     diagnostic_stop = True
                     stop_kind = f"guest-bad-access-{address:#x}"
                     break

@@ -433,6 +433,17 @@ class TaskGraphTraceTests(unittest.TestCase):
         )
         self.assertFalse(TRACE.is_guest_bad_access_stop(0x804F9CF72, None))
 
+    def test_guest_bad_access_filter_stops_all_faults_without_write_watch(
+        self,
+    ) -> None:
+        self.assertFalse(
+            TRACE.is_guest_bad_access_stop(
+                0x801239079,
+                "EXC_BAD_ACCESS (code=2, address=0x8010bd0000)",
+                write_watch_enabled=False,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
