@@ -64,6 +64,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 mod compute;
+mod indirect;
 
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
@@ -644,14 +645,6 @@ impl MetalPresenter {
                     draw.sequence,
                 ));
             }
-            if !draw.indexed && matches!(draw.primitive_type, 7 | 0x11) {
-                return Err(format!(
-                    "draw {} uses GPU indirect arguments {address:#x} with rectangle topology; \
-                     refusing the stale packet-time count because Metal rectangle expansion \
-                     requires a GPU argument conversion",
-                    draw.sequence,
-                ));
-            }
             if draw.indexed {
                 if !matches!(draw.index_size, 0 | 1) {
                     return Err(format!(
@@ -677,11 +670,18 @@ impl MetalPresenter {
                 4 * std::mem::size_of::<u32>()
             };
             let arguments = self.upload_ordered_indirect_arguments(&device, address, byte_count)?;
+            let source_offset = arguments.offset;
+            let rectangle_conversion = !draw.indexed && matches!(draw.primitive_type, 7 | 0x11);
+            let arguments = if rectangle_conversion {
+                self.convert_rectangle_indirect_arguments(&device, &arguments)?
+            } else {
+                arguments
+            };
             static LOGGED_INDIRECT_DRAWS: AtomicUsize = AtomicUsize::new(0);
             let sequence = LOGGED_INDIRECT_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
             if sequence <= 16 || sequence.is_power_of_two() {
                 eprintln!(
-                    "[REMu][METAL][INDIRECT-DRAW] sequence={sequence} draw={} indexed={} arguments={address:#x}+{byte_count:#x} observed=[count={},instances={},first={},base_vertex={}] source_offset={:#x}",
+                    "[REMu][METAL][INDIRECT-DRAW] sequence={sequence} draw={} indexed={} arguments={address:#x}+{byte_count:#x} observed=[count={},instances={},first={},base_vertex={}] source_offset={source_offset:#x} native_offset={:#x} rectangle_conversion={rectangle_conversion}",
                     draw.sequence,
                     draw.indexed,
                     draw.index_count,
