@@ -38,6 +38,7 @@ impl MetalPresenter {
         self.open_guest_batch = Some(GuestCommandBatch {
             command_buffer,
             work: Vec::new(),
+            committed_at: None,
             global_upload_chunks: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
@@ -174,6 +175,7 @@ impl MetalPresenter {
         // them here keeps completed writebacks immutable while reducing per-draw Metal allocation
         // to at most one buffer per unchanged guest address range per batch.
         self.transient_global_buffer_cache.clear();
+        batch.committed_at = Some(Instant::now());
         batch.command_buffer.commit();
         self.statistics.submitted_guest_batches =
             self.statistics.submitted_guest_batches.saturating_add(1);

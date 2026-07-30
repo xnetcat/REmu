@@ -1197,6 +1197,7 @@ enum GuestBatchWork {
 struct GuestCommandBatch {
     command_buffer: CommandBuffer,
     work: Vec<GuestBatchWork>,
+    committed_at: Option<Instant>,
     global_upload_chunks: Vec<GlobalUploadChunk>,
     global_writebacks: Vec<PendingGlobalWriteback>,
     guest_write_ranges: Vec<PendingGuestWriteRange>,

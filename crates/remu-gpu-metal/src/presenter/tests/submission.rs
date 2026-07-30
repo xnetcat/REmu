@@ -139,6 +139,7 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
     presenter.open_guest_batch = Some(GuestCommandBatch {
         command_buffer,
         work: Vec::new(),
+        committed_at: None,
         global_upload_chunks: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
@@ -290,6 +291,7 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
     presenter.open_guest_batch = Some(GuestCommandBatch {
         command_buffer,
         work: Vec::new(),
+        committed_at: None,
         global_upload_chunks: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
@@ -347,6 +349,7 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
     presenter.open_guest_batch = Some(GuestCommandBatch {
         command_buffer,
         work: Vec::new(),
+        committed_at: None,
         global_upload_chunks: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
@@ -467,6 +470,7 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
     presenter.open_guest_batch = Some(GuestCommandBatch {
         command_buffer: queue.new_command_buffer().to_owned(),
         work: Vec::new(),
+        committed_at: None,
         global_upload_chunks: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
@@ -635,6 +639,7 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
             .push_back(GuestCommandBatch {
                 command_buffer,
                 work: Vec::new(),
+                committed_at: None,
                 global_upload_chunks: Vec::new(),
                 global_writebacks: Vec::new(),
                 guest_write_ranges: Vec::new(),
@@ -682,6 +687,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
         .push_back(GuestCommandBatch {
             command_buffer,
             work: Vec::new(),
+            committed_at: None,
             global_upload_chunks: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
@@ -726,6 +732,7 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
     let mut batch = GuestCommandBatch {
         command_buffer: queue.new_command_buffer().to_owned(),
         work: Vec::new(),
+        committed_at: None,
         global_upload_chunks: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),

@@ -31,6 +31,7 @@ const SETTLE_YIELD_PERIOD: Duration = Duration::from_millis(2);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_micros(250);
 
 const METAL_COMMAND_ERROR_TRACE_ENVIRONMENT_VARIABLE: &str = "REMU_TRACE_METAL_COMMAND_ERRORS";
+const METAL_COMMAND_STALL_TRACE_ENVIRONMENT_VARIABLE: &str = "REMU_TRACE_METAL_STALLS";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MetalCommandErrorDetail {
@@ -132,6 +133,71 @@ fn trace_metal_command_errors() -> bool {
             !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
         })
     })
+}
+
+pub(crate) fn trace_metal_command_stalls() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os(METAL_COMMAND_STALL_TRACE_ENVIRONMENT_VARIABLE).is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    })
+}
+
+/// Summarizes native scheduling state without waiting for or mutating the command buffer.
+///
+/// A buffer that remains `Scheduled` can either be waiting behind older queue work or executing a
+/// dispatch that never terminates. Metal's native GPU/kernel timestamps distinguish those cases:
+/// a nonzero start with a zero end proves the driver began executing the buffer. The raw values are
+/// intentionally retained because Metal reports them in its host-time domain.
+pub(crate) fn command_buffer_native_state_summary(command_buffer: &CommandBufferRef) -> String {
+    let (retained_references, error_options, kernel_start, kernel_end, gpu_start, gpu_end): (
+        bool,
+        usize,
+        f64,
+        f64,
+        f64,
+        f64,
+    ) = unsafe {
+        (
+            msg_send![command_buffer, retainedReferences],
+            msg_send![command_buffer, errorOptions],
+            msg_send![command_buffer, kernelStartTime],
+            msg_send![command_buffer, kernelEndTime],
+            msg_send![command_buffer, GPUStartTime],
+            msg_send![command_buffer, GPUEndTime],
+        )
+    };
+    let error_present = unsafe {
+        let error: *mut Object = msg_send![command_buffer, error];
+        !error.is_null()
+    };
+    format_native_state_summary(
+        retained_references,
+        error_options,
+        kernel_start,
+        kernel_end,
+        gpu_start,
+        gpu_end,
+        error_present,
+    )
+}
+
+fn format_native_state_summary(
+    retained_references: bool,
+    error_options: usize,
+    kernel_start: f64,
+    kernel_end: f64,
+    gpu_start: f64,
+    gpu_end: f64,
+    error_present: bool,
+) -> String {
+    format!(
+        "retained={retained_references} error_options={error_options:#x} \
+         kernel={kernel_start:.6}/{kernel_end:.6} gpu={gpu_start:.6}/{gpu_end:.6} \
+         native_error={error_present}"
+    )
 }
 
 fn format_command_buffer_failure(
@@ -255,9 +321,10 @@ unsafe fn objc_string(string: *mut Object) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MetalCommandErrorDetail, format_command_buffer_failure, metal_command_error_code_name,
+        MetalCommandErrorDetail, command_buffer_native_state_summary,
+        format_command_buffer_failure, format_native_state_summary, metal_command_error_code_name,
     };
-    use metal::MTLCommandBufferStatus;
+    use metal::{Device, MTLCommandBufferStatus};
 
     #[test]
     fn native_command_error_formatter_classifies_and_escapes_detail() {
@@ -304,5 +371,31 @@ mod tests {
             ),
             "presentation command buffer ended in Error"
         );
+    }
+
+    #[test]
+    fn native_state_formatter_keeps_start_and_end_evidence_distinct() {
+        let summary = format_native_state_summary(true, 1, 41.25, 0.0, 41.5, 0.0, false);
+
+        assert!(summary.contains("retained=true"));
+        assert!(summary.contains("error_options=0x1"));
+        assert!(summary.contains("kernel=41.250000/0.000000"));
+        assert!(summary.contains("gpu=41.500000/0.000000"));
+        assert!(summary.contains("native_error=false"));
+    }
+
+    #[test]
+    fn native_state_capture_accepts_a_completed_metal_command_buffer() {
+        let device = Device::system_default().expect("Metal device");
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let summary = command_buffer_native_state_summary(command_buffer);
+
+        assert!(summary.contains("retained=true"));
+        assert!(summary.contains("native_error=false"));
+        assert!(summary.contains("gpu="));
     }
 }

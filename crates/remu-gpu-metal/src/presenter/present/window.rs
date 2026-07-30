@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::completion::{command_buffer_native_state_summary, trace_metal_command_stalls};
 use super::{
     EVENT_POLL_INTERVAL, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS,
@@ -20,7 +21,7 @@ use super::{
     take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
 use core_graphics_types::geometry::CGSize;
-use metal::{MTLPixelFormat, MetalLayer};
+use metal::{MTLCommandBufferStatus, MTLPixelFormat, MetalLayer};
 use objc::runtime::{NO, Object, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use remu_gpu::{
@@ -297,6 +298,24 @@ impl MetalPresenter {
                     .collect::<Vec<_>>()
                     .join("; ");
                 eprintln!("[REMu][PERF-BATCHES] {batches}");
+                if trace_metal_command_stalls() {
+                    for (index, batch) in self.committed_guest_batches.iter().enumerate() {
+                        let Some(age) = batch.committed_at.map(|committed| committed.elapsed())
+                        else {
+                            continue;
+                        };
+                        let status = batch.command_buffer.status();
+                        if !command_buffer_is_stall_candidate(status, age) {
+                            continue;
+                        }
+                        eprintln!(
+                            "[REMu][METAL][STALL] batch={index} status={status:?} age_ms={} {} work=[{}]",
+                            age.as_millis(),
+                            command_buffer_native_state_summary(&batch.command_buffer),
+                            describe_guest_batch(&batch.work),
+                        );
+                    }
+                }
             }
             if !self.dropped_draw_executions.is_empty()
                 || !self.dropped_compute_executions.is_empty()
@@ -778,6 +797,14 @@ impl MetalPresenter {
             r2: if down(KeyCode::KeyF) { 255 } else { 0 },
         });
     }
+}
+
+fn command_buffer_is_stall_candidate(status: MTLCommandBufferStatus, age: Duration) -> bool {
+    age >= Duration::from_secs(1)
+        && !matches!(
+            status,
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        )
 }
 
 pub(crate) fn headless_metal_value_is_enabled(value: Option<&OsStr>) -> bool {
