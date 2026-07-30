@@ -293,6 +293,123 @@ fn complete_memory_program() -> (Program, ShaderEvaluation) {
     (Program::new(0x1000, instructions), evaluation)
 }
 
+fn format_x_load_program(
+    site_count: u32,
+    instruction_format: Option<u32>,
+) -> (Program, ShaderEvaluation) {
+    let instruction_pcs = (0..site_count).map(|site| site * 8).collect::<Vec<_>>();
+    let mut instructions = instruction_pcs
+        .iter()
+        .copied()
+        .map(|pc| Instruction {
+            pc,
+            encoding: if instruction_format.is_some() {
+                ShaderEncoding::Mtbuf
+            } else {
+                ShaderEncoding::Mubuf
+            },
+            opcode: Opcode::Known(if instruction_format.is_some() {
+                "TBufferLoadFormatX"
+            } else {
+                "BufferLoadFormatX"
+            }),
+            words: vec![0, 0],
+            sources: vec![
+                Operand::vector(0),
+                Operand::scalar(0),
+                Operand::source(128, None),
+            ],
+            destinations: vec![Operand::vector(0)],
+            control: Some(InstructionControl::BufferMemory(
+                remu_shader::BufferMemoryControl {
+                    dword_count: 1,
+                    vector_address: 0,
+                    vector_data: 0,
+                    scalar_resource: 0,
+                    instruction_format,
+                    offset_bytes: 0,
+                    index_enabled: true,
+                    offset_enabled: false,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                    tfe: false,
+                },
+            )),
+        })
+        .collect::<Vec<_>>();
+    instructions.push(Instruction {
+        pc: site_count * 8,
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::END_PROGRAM,
+        words: vec![0xbf81_0000],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    });
+
+    let mut evaluation = empty_evaluation();
+    evaluation.initial_scalar_registers[0] = 0x1000;
+    evaluation.initial_scalar_registers[1] = 16 << 16;
+    evaluation.initial_scalar_registers[2] = 4096;
+    evaluation.initial_scalar_registers[3] =
+        4 | (5 << 3) | (6 << 6) | (7 << 9) | (0x16 << 12) | (3 << 28);
+    evaluation.scalar_registers = evaluation.initial_scalar_registers.clone();
+    evaluation
+        .global_memory_bindings
+        .push(remu_shader::GlobalMemoryBinding {
+            scalar_address: 0,
+            base_address: 0x1000,
+            instruction_pcs: instruction_pcs.into(),
+            byte_count: 4096,
+            data: vec![0; 4096],
+            writable: false,
+            write_back_to_guest: false,
+        });
+    (Program::new(0x800d_700000, instructions), evaluation)
+}
+
+#[test]
+fn captured_fixed_format_x_loads_decode_only_observable_components() {
+    // Silent Hill's captured 579,896-byte pixel shader contains 72 static
+    // TBUFFER_LOAD_FORMAT_X sites with an instruction-selected format. AMD's MTBUF semantics
+    // define identity DST_SEL X000 for FORMAT_X, so only canonical X is observable.
+    let (program, evaluation) = format_x_load_program(72, Some(0x16));
+    let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+        .expect("captured typed format load shape should lower");
+
+    assert_eq!(
+        shader.source.matches("remu_format_layout(").count(),
+        73,
+        "the prelude plus one observable X layout per captured static site"
+    );
+    assert!(
+        shader.source.len() < 170_000,
+        "fixed FORMAT_X sites must not restore four-component expansion: {} bytes",
+        shader.source.len()
+    );
+    assert!(
+        !shader.source.contains("= remu_s_3;"),
+        "instruction-selected loads do not read descriptor format/select fields"
+    );
+}
+
+#[test]
+fn descriptor_selected_format_x_load_keeps_all_canonical_components() {
+    let (program, evaluation) = format_x_load_program(1, None);
+    let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+        .expect("descriptor-selected format load should lower");
+
+    assert_eq!(
+        shader.source.matches("remu_format_layout(").count(),
+        5,
+        "the descriptor can route any of four canonical components to X"
+    );
+    assert!(shader.source.contains(">> 0u) & 7u"));
+    assert!(shader.source.contains("== 7u ?"));
+}
+
 #[test]
 fn lowers_complete_decoded_global_mubuf_and_mtbuf_memory_surface() {
     let (program, evaluation) = complete_memory_program();
