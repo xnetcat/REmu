@@ -28,6 +28,42 @@ enum QueuedGlobalReadSource {
 }
 
 impl MetalPresenter {
+    /// Resolves the three dwords consumed by a native indirect compute dispatch.
+    ///
+    /// Indirect arguments are commonly produced by an earlier GPU pass. Reading them from guest
+    /// memory while parsing the PM4 stream observes stale CPU backing; keep the read on Metal
+    /// instead, forwarding the exact pending writeback buffer when one owns this range. The
+    /// ordinary global-coherence fallback drains only ambiguous writers before taking a fresh
+    /// copy, matching shader global reads.
+    pub(super) fn upload_indirect_dispatch_arguments(
+        &mut self,
+        device: &Device,
+        address: u64,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        const INDIRECT_ARGUMENT_BYTE_COUNT: usize = 3 * std::mem::size_of::<u32>();
+        let binding = GlobalMemoryBinding {
+            scalar_address: 0,
+            base_address: address,
+            instruction_pcs: Default::default(),
+            byte_count: INDIRECT_ARGUMENT_BYTE_COUNT,
+            data: Vec::new(),
+            writable: false,
+            write_back_to_guest: false,
+        };
+        let source = self.queued_global_read_source(&binding)?;
+        if matches!(source, QueuedGlobalReadSource::Synchronize) {
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
+            self.wait_for_guest_command_batches()?;
+            self.ensure_open_guest_batch(&queue);
+            return self.upload_fresh_global_buffer(device, &binding);
+        }
+        self.upload_global_buffer_from_source(device, &binding, source)
+    }
+
     pub(super) fn cached_sampler_argument_buffer(
         &mut self,
         device: &Device,
