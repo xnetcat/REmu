@@ -353,6 +353,46 @@ impl MetalPresenter {
         )
     }
 
+    /// Returns whether `descriptor` already has live Metal storage.
+    ///
+    /// This must refresh the write watch before render-target load/discard policy is chosen.
+    /// A guest VM remap retires the old watch while leaving its resident texture in the cache
+    /// until the next texture operation. Treating that stale entry as resident would suppress a
+    /// DCC/CMASK first-use discard, after which the replacement allocation's compressed bytes
+    /// would be uploaded as ordinary color pixels.
+    pub(crate) fn render_target_has_live_resident_storage(
+        &mut self,
+        descriptor: GuestTextureDescriptor,
+    ) -> Result<bool, String> {
+        let candidates = self
+            .resident_guest_textures
+            .values()
+            .filter(|resident| {
+                guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
+            })
+            .map(|resident| resident.descriptor)
+            .collect::<Vec<_>>();
+        let mut has_live_storage = false;
+        for candidate in candidates {
+            let refresh = refresh_resident_texture_write_watch(
+                self.resident_guest_textures
+                    .get_mut(&candidate)
+                    .expect("collected render-target resident exists"),
+            )?;
+            if refresh == WriteWatchRefresh::Replaced {
+                if let Some(resident) = self.resident_guest_textures.remove(&candidate) {
+                    trace_resident_texture_removal(
+                        "render-target-residency-check-mapping-replaced",
+                        &resident,
+                    );
+                }
+            } else {
+                has_live_storage = true;
+            }
+        }
+        Ok(has_live_storage)
+    }
+
     pub(crate) fn ensure_resident_texture(
         &mut self,
         device: &Device,
