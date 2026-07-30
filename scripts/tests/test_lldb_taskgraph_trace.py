@@ -196,6 +196,13 @@ class TaskGraphTraceTests(unittest.TestCase):
             TRACE.is_loader_notification_symbol("libsystem`pthread_wqthread")
         )
 
+    def test_taskgraph_breakpoint_filter_rejects_unrelated_guest_code(self) -> None:
+        for phase_breakpoints in TRACE.BREAKPOINTS.values():
+            for address in phase_breakpoints.values():
+                self.assertTrue(TRACE.is_taskgraph_breakpoint_address(address))
+        self.assertFalse(TRACE.is_taskgraph_breakpoint_address(0x801BE1AF9))
+        self.assertFalse(TRACE.is_taskgraph_breakpoint_address(0x200D91D61))
+
 
 if __name__ == "__main__":
     unittest.main()

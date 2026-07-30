@@ -65,6 +65,11 @@ BREAKPOINTS = {
     },
     PHASE_DONE: {},
 }
+TASKGRAPH_BREAKPOINT_ADDRESSES = frozenset(
+    address
+    for phase_breakpoints in BREAKPOINTS.values()
+    for address in phase_breakpoints.values()
+)
 
 # These are instruction-boundary facts from the materialized PPSA10112 SELF,
 # decoded by REmu's non-executing ``disassemble`` command:
@@ -109,6 +114,12 @@ def is_loader_notification_symbol(symbol: Optional[str]) -> bool:
     """Return whether LLDB stopped in dyld's private image notification trap."""
 
     return symbol is not None and "lldb_image_notifier" in symbol
+
+
+def is_taskgraph_breakpoint_address(address: int) -> bool:
+    """Return whether an address belongs to this diagnostic's guest trace."""
+
+    return address in TASKGRAPH_BREAKPOINT_ADDRESSES
 
 
 def _register(registers: Mapping[str, int], name: str) -> int:
@@ -245,7 +256,8 @@ class TaskGraphTraceState:
             return TraceResult(
                 True,
                 f"cycle={self.cycles_started} publish task={self.task:#x} "
-                f"queue={self.queue:#x} lane={_register(registers, 'rdx') & 0xffffffff} "
+                f"queue={self.queue:#x} "
+                f"priority={_register(registers, 'rdx') & 0xffffffff} "
                 f"entry_rsp={self.publisher_entry_rsp:#x}",
             )
 
@@ -545,43 +557,58 @@ def start_taskgraph_trace(debugger, _command, result, _internal_dict):
     )
 
 
-def resume_loader_notifications(debugger, _command, result, _internal_dict):
-    """Continue only LLDB's spurious dyld image-notification trace stops."""
+def resume_diagnostic_stops(debugger, _command, result, _internal_dict):
+    """Continue only dyld notifications and this diagnostic's breakpoints."""
 
-    process = debugger.GetSelectedTarget().GetProcess()
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
     resumed = 0
     while process.GetState() == lldb.eStateStopped:
-        loader_notification = False
+        diagnostic_stop = False
+        stop_kind = ""
         for thread in process:
-            if thread.GetStopReason() != lldb.eStopReasonTrace:
-                continue
             frame = thread.GetFrameAtIndex(0)
-            symbol = frame.GetFunctionName()
-            if symbol is None and frame.GetSymbol().IsValid():
-                symbol = frame.GetSymbol().GetName()
-            if is_loader_notification_symbol(symbol):
-                loader_notification = True
-                break
-        if not loader_notification:
+            reason = thread.GetStopReason()
+            if reason == lldb.eStopReasonTrace:
+                symbol = frame.GetFunctionName()
+                if symbol is None and frame.GetSymbol().IsValid():
+                    symbol = frame.GetSymbol().GetName()
+                if is_loader_notification_symbol(symbol):
+                    diagnostic_stop = True
+                    stop_kind = "dyld-loader"
+                    break
+            if reason == lldb.eStopReasonBreakpoint:
+                address = frame.GetPCAddress().GetLoadAddress(target)
+                if is_taskgraph_breakpoint_address(address):
+                    diagnostic_stop = True
+                    stop_kind = f"taskgraph-{address:#x}"
+                    break
+        if not diagnostic_stop:
             break
         resumed += 1
         print(
-            "[REMu][LLDB][TASKGRAPH] resuming dyld loader notification "
-            f"count={resumed}",
+            "[REMu][LLDB][TASKGRAPH] resuming diagnostic stop "
+            f"count={resumed} kind={stop_kind}",
             flush=True,
         )
         error = process.Continue()
         if error.Fail():
             result.SetError(
-                "could not resume dyld loader notification: "
+                "could not resume diagnostic stop: "
                 f"{error.GetCString()}"
             )
             return
     if resumed:
         result.AppendMessage(
             "[REMu][LLDB][TASKGRAPH] resumed "
-            f"{resumed} dyld loader notification(s)"
+            f"{resumed} diagnostic stop(s)"
         )
+
+
+def resume_loader_notifications(debugger, command, result, internal_dict):
+    """Backward-compatible alias for the diagnostic resume command."""
+
+    resume_diagnostic_stops(debugger, command, result, internal_dict)
 
 
 def __lldb_init_module(debugger, _internal_dict):
@@ -594,6 +621,6 @@ def __lldb_init_module(debugger, _internal_dict):
     )
     debugger.HandleCommand(
         "command script add "
-        "-f lldb_taskgraph_trace.resume_loader_notifications "
-        "remu-taskgraph-resume-loader-notifications"
+        "-f lldb_taskgraph_trace.resume_diagnostic_stops "
+        "remu-taskgraph-resume-diagnostic-stops"
     )
