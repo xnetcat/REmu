@@ -685,6 +685,56 @@ fn av_player_change_stream_accepts_active_streams_and_rejects_unknown_ones() {
 }
 
 #[test]
+fn av_player_sync_none_hands_video_timing_to_the_caller() {
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+    sender.try_send(vec![0x80; 16 * 16 * 3 / 2]).unwrap();
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.source = Some("video-only.mp4".to_owned());
+        player.width = 16;
+        player.height = 16;
+        player.frames_per_second = 30.0;
+        player.active_session = true;
+        player.playing_since = Some(Instant::now());
+        player.next_video_frame = 1;
+        player.video_decoder = Some(crate::AvPlayerDecoder {
+            child: None,
+            frames: std::sync::Mutex::new(receiver),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker: None,
+        });
+    }
+    let mut frame_info = [0_u8; 112];
+    let output = frame_info.as_mut_ptr().addr() as u64;
+    assert_eq!(
+        crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, &mut state),
+        0,
+        "Default sync must withhold frame 1 before the 33 ms timestamp"
+    );
+    assert_eq!(
+        crate::av_player_set_av_sync_mode([handle, 1, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(state.av_player.players[&handle].av_sync_mode, 1);
+    assert_eq!(
+        crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, &mut state),
+        1,
+        "None sync must release an available frame without timestamp gating"
+    );
+    assert_eq!(
+        crate::av_player_set_av_sync_mode([handle, 2, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(crate::AV_PLAYER_ERROR_INVALID_PARAMS)
+    );
+    assert_eq!(
+        state.av_player.players[&handle].av_sync_mode, 1,
+        "an invalid mode must not replace the last accepted mode"
+    );
+    drop(sender);
+}
+
+#[test]
 fn av_player_trick_speed_scales_the_media_clock_and_rejects_reverse_rates() {
     let mut state = ProbeDispatchState::default();
     let handle = av_player_test_player(&mut state);

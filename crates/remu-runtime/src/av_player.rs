@@ -368,6 +368,7 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             looping: false,
             decoder_seek: Duration::ZERO,
             trick_speed_percent: 100,
+            av_sync_mode: 0,
             video_decoder: None,
             raw_video_frame: Vec::new(),
             padded_video_frame: Vec::new(),
@@ -1285,6 +1286,21 @@ pub(crate) fn av_player_set_looping(arguments: [u64; 6], state: &mut ProbeDispat
     0
 }
 
+pub(crate) fn av_player_set_av_sync_mode(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let Some(player) = state.av_player.players.get_mut(&arguments[0]) else {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    };
+    let mode = arguments[1];
+    if mode > 1 {
+        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+    }
+    player.av_sync_mode = u32::try_from(mode).unwrap_or_default();
+    0
+}
+
 /// sceAvPlayerChangeStream switches the active representation of a stream. Every source this
 /// backend serves has exactly one representation per stream (one video, at most one audio), so
 /// selecting any existing stream is already satisfied; anything else is a genuinely
@@ -1375,11 +1391,13 @@ pub(crate) fn av_player_get_video_data(
         av_player_trace_zero_return(arguments[0], "video", "no-decoder");
         return 0;
     }
-    if !av_player_video_frame_is_due(
-        player.next_video_frame,
-        player.frames_per_second,
-        player.media_clock_elapsed(),
-    ) {
+    if player.av_sync_mode == 0
+        && !av_player_video_frame_is_due(
+            player.next_video_frame,
+            player.frames_per_second,
+            player.media_clock_elapsed(),
+        )
+    {
         av_player_trace_zero_return(arguments[0], "video", "clock-not-reached");
         return 0;
     }
