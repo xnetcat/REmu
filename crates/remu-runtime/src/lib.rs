@@ -5792,8 +5792,12 @@ fn flush_deferred_gpu_publication(publication: DeferredGpuPublication) -> bool {
     let started = traced.then(Instant::now);
     if let Some(summary) = &summary {
         eprintln!(
-            "[REMu][GPU][PUBLICATION] begin ticket={ticket} outer={} work={} queues={:?}",
-            summary.outer_events, summary.work_items, summary.queue_work_items,
+            "[REMu][GPU][PUBLICATION] begin ticket={ticket} outer={} work={} queues={:?} thread={:?} guest={:#x}",
+            summary.outer_events,
+            summary.work_items,
+            summary.queue_work_items,
+            std::thread::current().name().unwrap_or("unnamed"),
+            current_guest_thread_handle(),
         );
     }
     let order = GPU_PUBLICATION_ORDER.get_or_init(|| (Mutex::new(0), Condvar::new()));
@@ -5806,6 +5810,12 @@ fn flush_deferred_gpu_publication(publication: DeferredGpuPublication) -> bool {
             .1
             .wait(next)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    if traced {
+        // Paired with `begin` and `end`, this identifies the blocking stage without changing the
+        // ordered publisher: begin-without-turn is an order wait, while turn-without-end is
+        // backend publication.
+        eprintln!("[REMu][GPU][PUBLICATION] turn ticket={ticket}");
     }
     // The ticket value prevents a later publisher from proceeding while this thread blocks in
     // the bounded channel; the mutex itself need not remain locked.
@@ -5823,9 +5833,7 @@ fn flush_deferred_gpu_publication(publication: DeferredGpuPublication) -> bool {
     debug_assert_eq!(*next, ticket);
     *next = next.saturating_add(1);
     order.1.notify_all();
-    if let (Some(started), Some(summary)) = (started, summary)
-        && started.elapsed() >= Duration::from_millis(2)
-    {
+    if let (Some(started), Some(summary)) = (started, summary) {
         eprintln!(
             "[REMu][GPU][PUBLICATION] end ticket={ticket} elapsed_ms={:.3} outer={} work={} queues={:?} success={all_sent}",
             started.elapsed().as_secs_f64() * 1_000.0,
