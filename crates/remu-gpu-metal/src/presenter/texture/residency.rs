@@ -23,11 +23,107 @@ use metal::{
     Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
     MTLTextureType, MTLTextureUsage, RenderPassDescriptor, Texture, TextureDescriptor,
 };
-use std::collections::HashMap;
+use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+/// Read-only attribution for persistent Metal render/storage targets.
+///
+/// GPU-owned residents may contain the only current copy of partially rendered pixels and cannot
+/// be dropped merely to satisfy a host-memory budget. Mapping retirement and repeated physical
+/// backing identities are the semantics-bearing signals needed to distinguish stale residents
+/// from live render-graph allocations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ResidentTextureOwnershipStats {
+    pub(crate) gpu_owned_count: usize,
+    pub(crate) gpu_owned_bytes: u64,
+    pub(crate) cpu_owned_count: usize,
+    pub(crate) cpu_owned_bytes: u64,
+    pub(crate) active_mapping_count: usize,
+    pub(crate) active_mapping_bytes: u64,
+    pub(crate) reprotected_mapping_count: usize,
+    pub(crate) reprotected_mapping_bytes: u64,
+    pub(crate) reprotecting_mapping_count: usize,
+    pub(crate) reprotecting_mapping_bytes: u64,
+    pub(crate) replaced_mapping_count: usize,
+    pub(crate) replaced_mapping_bytes: u64,
+    pub(crate) unique_backing_bases: usize,
+    pub(crate) duplicate_backing_bases: usize,
+    pub(crate) unique_backing_spans: usize,
+    pub(crate) duplicate_backing_spans: usize,
+    pub(crate) unresolved_backing_count: usize,
+    pub(crate) unresolved_backing_bytes: u64,
+}
+
+pub(crate) fn resident_texture_ownership_stats(
+    residents: &HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+) -> ResidentTextureOwnershipStats {
+    let mut stats = ResidentTextureOwnershipStats::default();
+    let mut backing_bases = HashSet::new();
+    let mut backing_spans = HashSet::new();
+    for resident in residents.values() {
+        let allocated_bytes = u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
+        if resident.gpu_written {
+            stats.gpu_owned_count += 1;
+            stats.gpu_owned_bytes = stats.gpu_owned_bytes.saturating_add(allocated_bytes);
+        } else {
+            stats.cpu_owned_count += 1;
+            stats.cpu_owned_bytes = stats.cpu_owned_bytes.saturating_add(allocated_bytes);
+        }
+
+        let mapping_is_live = match resident.write_watch.retirement() {
+            None => {
+                stats.active_mapping_count += 1;
+                stats.active_mapping_bytes =
+                    stats.active_mapping_bytes.saturating_add(allocated_bytes);
+                true
+            }
+            Some(CpuWriteWatchRetirement::Reprotected) => {
+                stats.reprotected_mapping_count += 1;
+                stats.reprotected_mapping_bytes = stats
+                    .reprotected_mapping_bytes
+                    .saturating_add(allocated_bytes);
+                true
+            }
+            Some(CpuWriteWatchRetirement::Reprotecting) => {
+                stats.reprotecting_mapping_count += 1;
+                stats.reprotecting_mapping_bytes = stats
+                    .reprotecting_mapping_bytes
+                    .saturating_add(allocated_bytes);
+                true
+            }
+            Some(CpuWriteWatchRetirement::Replaced) => {
+                stats.replaced_mapping_count += 1;
+                stats.replaced_mapping_bytes =
+                    stats.replaced_mapping_bytes.saturating_add(allocated_bytes);
+                false
+            }
+        };
+        if !mapping_is_live {
+            continue;
+        }
+        let (address, byte_count) = resident.write_watch.range();
+        let Some(identity) = guest_shared_backing_identity(address, byte_count) else {
+            stats.unresolved_backing_count += 1;
+            stats.unresolved_backing_bytes = stats
+                .unresolved_backing_bytes
+                .saturating_add(allocated_bytes);
+            continue;
+        };
+        if !backing_bases.insert((identity.backing_id, identity.backing_offset)) {
+            stats.duplicate_backing_bases += 1;
+        }
+        if !backing_spans.insert((identity.backing_id, identity.backing_offset, byte_count)) {
+            stats.duplicate_backing_spans += 1;
+        }
+    }
+    stats.unique_backing_bases = backing_bases.len();
+    stats.unique_backing_spans = backing_spans.len();
+    stats
+}
 
 impl MetalPresenter {
     pub(crate) fn ensure_mipmapped_storage_texture(

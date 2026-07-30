@@ -167,7 +167,8 @@ use self::texture::{
 };
 use self::texture::{
     decode_guest_texture_linear_from_raw, refresh_resident_texture_write_watch,
-    resident_color_view_sample_is_eligible, retire_multisample_textures_overlapping_writeback,
+    resident_color_view_sample_is_eligible, resident_texture_ownership_stats,
+    retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
     snapshot_watched_guest_range, storage_image_requires_mip_hierarchy,

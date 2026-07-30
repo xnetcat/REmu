@@ -14,7 +14,8 @@ use super::{
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     describe_guest_batch, presentation_drawable_size, process_resident_bytes,
-    take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
+    resident_texture_ownership_stats, take_mode27_work_details, take_texture_dirty_work_details,
+    take_texture_snapshot_work_details,
 };
 use core_graphics_types::geometry::CGSize;
 use metal::{MTLPixelFormat, MetalLayer};
@@ -340,6 +341,7 @@ impl MetalPresenter {
                         // the owning resident texture.
                         total.saturating_add(texture_allocated_bytes(&resident.texture))
                     });
+            let target_ownership = resident_texture_ownership_stats(&self.resident_guest_textures);
             let depth_array_bytes = self
                 .depth_array_textures
                 .values()
@@ -398,6 +400,59 @@ impl MetalPresenter {
                 fallback_bytes as f64 / (1024.0 * 1024.0),
                 accounted_texture_bytes as f64 / (1024.0 * 1024.0),
                 unaccounted_metal_bytes as f64 / (1024.0 * 1024.0),
+            );
+            let mut largest_targets = self
+                .resident_guest_textures
+                .values()
+                .map(|resident| {
+                    (
+                        texture_allocated_bytes(&resident.texture),
+                        resident.descriptor,
+                        resident.gpu_written,
+                        resident.content_version,
+                        resident.write_watch.retirement(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            largest_targets.sort_unstable_by_key(|(bytes, ..)| std::cmp::Reverse(*bytes));
+            let largest_targets = largest_targets
+                .into_iter()
+                .take(8)
+                .map(|(bytes, descriptor, gpu_written, version, retirement)| {
+                    format!(
+                        "{:#x}/{}x{}/p{}/{:?}/tile{}={:.1}MiB/gpu{gpu_written}/v{version}/{retirement:?}",
+                        descriptor.address,
+                        descriptor.width,
+                        descriptor.height,
+                        descriptor.pitch,
+                        descriptor.pixel_format,
+                        descriptor.tile_mode,
+                        bytes as f64 / (1024.0 * 1024.0),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            eprintln!(
+                "[REMu][PERF-METAL-TARGETS] owner=gpu:{}/{:.1}MiB,cpu:{}/{:.1}MiB mapping=active:{}/{:.1}MiB,reprotected:{}/{:.1}MiB,reprotecting:{}/{:.1}MiB,replaced:{}/{:.1}MiB backing=bases:{}/+{}versions,spans:{}/+{}duplicates,unresolved:{}/{:.1}MiB top=[{}]",
+                target_ownership.gpu_owned_count,
+                target_ownership.gpu_owned_bytes as f64 / (1024.0 * 1024.0),
+                target_ownership.cpu_owned_count,
+                target_ownership.cpu_owned_bytes as f64 / (1024.0 * 1024.0),
+                target_ownership.active_mapping_count,
+                target_ownership.active_mapping_bytes as f64 / (1024.0 * 1024.0),
+                target_ownership.reprotected_mapping_count,
+                target_ownership.reprotected_mapping_bytes as f64 / (1024.0 * 1024.0),
+                target_ownership.reprotecting_mapping_count,
+                target_ownership.reprotecting_mapping_bytes as f64 / (1024.0 * 1024.0),
+                target_ownership.replaced_mapping_count,
+                target_ownership.replaced_mapping_bytes as f64 / (1024.0 * 1024.0),
+                target_ownership.unique_backing_bases,
+                target_ownership.duplicate_backing_bases,
+                target_ownership.unique_backing_spans,
+                target_ownership.duplicate_backing_spans,
+                target_ownership.unresolved_backing_count,
+                target_ownership.unresolved_backing_bytes as f64 / (1024.0 * 1024.0),
+                largest_targets,
             );
             eprintln!(
                 "[REMu][PERF-GLOBAL-CACHE] captured={}/{:.1}MiB identity={}/{:.1}MiB",
