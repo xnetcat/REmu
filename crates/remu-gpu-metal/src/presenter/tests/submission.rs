@@ -7,22 +7,25 @@ use metal::{
     RenderPassDescriptor, TextureDescriptor,
 };
 use remu_gpu::{
-    GpuEvent, GpuMemoryAcquire, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
+    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent,
+    GpuMemoryAcquire, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
+    GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
 };
 use remu_memory::{
     CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
     GuestProtection,
 };
 use remu_shader::{GlobalMemoryBinding, Program};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    GLOBAL_UPLOAD_ALIGNMENT, GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason,
-    GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus,
-    GuestMemoryWaitTracker, GuestMemoryWriteOperation, GuestRenderPassKey, MetalPresenter,
-    OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
-    PendingGlobalWriteback, PendingGuestMemoryWrite, QueueBlockReason,
+    ComputePipelineKey, GLOBAL_UPLOAD_ALIGNMENT, GraphicsPipelineKey, GraphicsShaderResourceKey,
+    GuestBatchFlushReason, GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery,
+    GuestMemoryWaitStatus, GuestMemoryWaitTracker, GuestMemoryWriteOperation, GuestRenderPassKey,
+    MetalPresenter, OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource,
+    OrderedGpuEventReceiver, PendingGlobalWriteback, PendingGuestMemoryWrite,
+    PipelineCompileCandidate, ProgramIdentity, QueueBlockReason,
     apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
     write_back_pending_globals,
 };
@@ -1054,11 +1057,14 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
         ordered.try_recv(|_| false),
         OrderedEventPoll::Blocked
     ));
-    let prefetched = ordered.prefetch_draws(16, 16);
+    let prefetched = ordered.prefetch_pipeline_work(16, 16);
     assert_eq!(
         prefetched
             .iter()
-            .map(|draw| draw.sequence)
+            .filter_map(|candidate| match candidate {
+                PipelineCompileCandidate::Graphics(draw) => Some(draw.sequence),
+                PipelineCompileCandidate::Compute(_) => None,
+            })
             .collect::<Vec<_>>(),
         [17, 23]
     );
@@ -1125,6 +1131,107 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
             ..
         }
     ));
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Empty
+    ));
+}
+
+#[test]
+fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let dispatch = ComputeDispatch {
+        sequence: 41,
+        source: ComputeDispatchSource::Direct,
+        launch: ComputeLaunch {
+            grid: ComputeGrid::Threadgroups([1, 1, 1]),
+            group_count: [1, 1, 1],
+            base_group: [0, 0, 0],
+            threads_per_group: [8, 8, 1],
+            wave_lane_count: 64,
+            lds_size_bytes: 0,
+            initiator: 1,
+        },
+        shader_address: 0x5000,
+        shader_prefix: [0; 4],
+        shader: None,
+        shader_evaluation: None,
+        shader_registers: Vec::new(),
+    };
+    let program = Arc::new(Program::new(dispatch.shader_address, Vec::new()));
+    let key = ComputePipelineKey {
+        program_identity: ProgramIdentity(program),
+        lds_size_bytes: 0,
+        wave_lane_count: 64,
+        allocated_vector_register_count: 4,
+        compute_system_registers: None,
+        initial_scalar_count: 0,
+        global_bindings: Vec::new(),
+        image_bindings: Vec::new(),
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![
+                GpuEvent::ComputeDispatch(Box::new(dispatch.clone())),
+                GpuEvent::SubmissionBoundary(42),
+            ],
+        })
+        .expect("queue compute submission");
+
+    let prefetched = ordered.prefetch_pipeline_work(16, 16);
+    assert_eq!(
+        prefetched
+            .iter()
+            .filter_map(|candidate| match candidate {
+                PipelineCompileCandidate::Graphics(_) => None,
+                PipelineCompileCandidate::Compute(dispatch) => Some(dispatch.sequence),
+            })
+            .collect::<Vec<_>>(),
+        [41]
+    );
+
+    let (source, event) = match ordered.try_recv(|_| false) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::ComputeDispatch(actual),
+        } => {
+            assert_eq!(actual.as_ref(), &dispatch);
+            (source, GpuEvent::ComputeDispatch(actual))
+        }
+        other => panic!("expected cold compute dispatch, got {other:?}"),
+    };
+    ordered.block_event(
+        source,
+        event,
+        QueueBlockReason::ComputePipeline(key.clone()),
+    );
+    assert!(matches!(
+        ordered.try_recv(|_| false),
+        OrderedEventPoll::Blocked
+    ));
+
+    match ordered.try_recv(
+        |reason| matches!(reason, QueueBlockReason::ComputePipeline(actual) if actual == &key),
+    ) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::ComputeDispatch(actual),
+        } => {
+            assert_eq!(actual.as_ref(), &dispatch);
+            ordered.finish_event(source);
+        }
+        other => panic!("expected the unblocked compute dispatch exactly once, got {other:?}"),
+    }
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::SubmissionBoundary(42),
+        } => source,
+        other => panic!("expected compute boundary, got {other:?}"),
+    };
+    ordered.finish_event(source);
     assert!(matches!(
         ordered.try_recv(|_| true),
         OrderedEventPoll::Empty

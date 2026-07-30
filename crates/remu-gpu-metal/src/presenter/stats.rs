@@ -82,6 +82,7 @@ pub(super) static PIPELINE_COMPILE_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub(super) static PIPELINE_COMPILE_FAILED: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static PIPELINE_DRAW_GATES: AtomicU64 = AtomicU64::new(0);
+pub(super) static PIPELINE_COMPUTE_GATES: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn record_texture_work(
     count: &AtomicU64,
