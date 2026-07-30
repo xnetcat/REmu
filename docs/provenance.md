@@ -109,6 +109,18 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   kernel surface. A title may override its own budget through `mem_param->flexible_memory_size` in
   its process parameters (shadPS4 `src/core/linker.cpp`); that override is not read yet, and the
   titles exercised here leave the pointer null. No upstream source was copied.
+- The fiber ABI (`libSceFiber`) had its object layout, error family (`0x8059000x`), state machine,
+  and switch semantics cross-checked against shadPS4 snapshot
+  `4c72de0732ce7443a1631bf190e2606294f58f65` (`src/core/libraries/fiber/fiber.cpp`,
+  `fiber_context.cpp`, `fiber.h`, and `fiber_error.h`), with SharpEmu snapshot `ada67a19`
+  (`SharpEmu.Libs/Fiber/FiberExports.cs`) as corroborating research for the exported set. The
+  register-save layout here is REmu's own and deliberately differs: both floating-point control
+  words sit at naturally aligned offsets rather than the packed offsets the console library uses,
+  since the structure never reaches the guest. The switch primitives follow the naked-assembly
+  boundary this crate already used for guest thread exit
+  (`invoke_guest_entry_with_exit_boundary` / `escape_guest_entry`) rather than being copied. The
+  per-thread current-fiber record is a Rust thread local instead of a slot in a synthesized TCB.
+  No upstream source was copied.
 - AMD64 DTV slot layout and `__tls_get_addr` (`vNe1w4diLCs`) were cross-checked against FreeBSD src
   snapshot `afa048d159f64e1c609475314e19fb030ffd595f` (`sys/x86/include/tls.h` and
   `libexec/rtld-elf/rtld.c`), shadPS4 snapshot

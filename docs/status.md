@@ -85,13 +85,30 @@ the engine consumes directly:
   fatal error rather than as contention.
 
 With those served, the title reaches its own subsystem initialization, opens the presenter, and
-runs to the diagnostic timer without faulting. It is not playable and no compatibility is claimed:
-it submits no draws, because its job system is built on the fiber ABI and `_sceFiberInitializeImpl`,
-`sceFiberOptParamInitialize`, `sceFiberRun`, `sceFiberGetInfo`, and `sceFiberRename` are all
-unserved. `sceFiberRun` returning not-implemented means the job that drives startup never runs, and
-the title then blocks in `sceKernelWaitEventFlag` for the rest of the run. The fiber entry points
-are the next concrete gap for this title; `sceKernelSetPrtAperture` and `sceNetCtlInit` are also
-unserved but are not what stalls it.
+runs to the diagnostic timer without faulting. Its job system then stalled because it is built on
+the fiber ABI, which was unserved; `sceFiberRun` returning not-implemented meant the job driving
+startup never ran and the title blocked in `sceKernelWaitEventFlag` for the rest of the run.
+
+The fiber entry points are now implemented (`fiber.rs`), and a live run exercises the whole
+lifecycle without error: `sceFiberOptParamInitialize`, `_sceFiberInitializeImpl`, `sceFiberGetInfo`,
+`sceFiberRename`, `sceFiberRun`, `sceFiberReturnToThread`, and later `sceFiberSwitch`. The job
+system now runs and reaches asynchronous asset loading, resolving and reading
+`/app0/playgo-chunkdefs.xml` through the AMPR command-buffer path.
+
+The title is still not playable and no compatibility is claimed: it submits no draws. It now stops
+at `sceAmprCommandBufferWriteAddressOnCompletion`, the completion-notification write of the
+asynchronous file path, which is unserved — so the command buffer is submitted but the completion
+word the guest waits on is never written. That write is the next concrete gap for this title, and
+it sits in the asynchronous-file command-buffer family the import-coverage section already names as
+the bulk of the remaining work. `sceKernelSetPrtAperture` and `sceNetCtlInit` are also unserved but
+are not what stalls it.
+
+The fiber implementation is x86-64 only, because it saves and restores x86-64 register state. On
+any other host the NIDs fall through to the unimplemented path rather than to a stub, so its tests
+run under `--target x86_64-apple-darwin`. Two limits are deliberate: the attach-and-run/switch
+variants and the context-size-check pair stay unserved until a title needs them, and a fiber
+switched across host threads is refused with `SCE_FIBER_ERROR_PERMISSION` rather than silently
+corrupting state, since a fiber belongs to the thread that ran it.
 
 ### A run intermittently renders nothing
 

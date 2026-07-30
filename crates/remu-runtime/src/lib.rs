@@ -24,6 +24,10 @@ mod av_player;
 mod dialog;
 mod guest_files;
 mod guest_libc;
+// The fiber ABI switches x86-64 register state, so it exists only on that architecture. On any
+// other host the NIDs fall through to the unimplemented path rather than to a stub that lies.
+#[cfg(target_arch = "x86_64")]
+mod fiber;
 mod guest_sync;
 mod kernel_api;
 #[cfg(target_os = "macos")]
@@ -3667,6 +3671,12 @@ fn dispatch_stateless_import(
 ) -> Option<u64> {
     if let Some(result) = agc_command_abi::dispatch_agc_command_abi(nid, arguments, stack_arguments)
     {
+        return Some(result);
+    }
+    // Fibers run guest code that calls further imports, so they are served here rather than on the
+    // locked path: holding the process dispatch lock across a fiber entry would deadlock it.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(result) = fiber::dispatch(nid, arguments, stack_arguments) {
         return Some(result);
     }
     Some(match nid {
