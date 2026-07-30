@@ -866,6 +866,36 @@ fn pixel_pipe_release_trace_follows_the_exact_deferred_write_to_publication() {
 }
 
 #[test]
+fn pixel_pipe_query_completion_trace_follows_release_to_publication() {
+    let (_label_space, release_address) = mapped_test_label();
+    let payload_address = release_address - 0x100;
+    remu_gpu::record_pixel_pipe_stat_dump_trace(2001, payload_address, false);
+    remu_gpu::record_pixel_pipe_stat_dump_trace(2002, payload_address + 8, true);
+    let release = GpuMemoryRelease {
+        address: release_address,
+        value: GpuMemoryReleaseValue::Immediate64(1),
+    };
+    let trace = remu_gpu::record_pixel_pipe_query_completion_release_trace(release)
+        .expect("the matching query-completion release is traced");
+    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(release))
+        .expect("pin traced query-completion release destination");
+
+    apply_pending_guest_memory_writes(&[pending]).expect("publish query completion");
+
+    assert_eq!(
+        unsafe { std::ptr::read_volatile(release_address as *const u64) },
+        1
+    );
+    assert_eq!(
+        remu_gpu::take_pixel_pipe_query_completion_release_trace(release),
+        None,
+        "publication consumes the exact query-completion provenance once"
+    );
+    assert_eq!(trace.payload_address, payload_address);
+    assert_eq!(trace.completion_address, release_address);
+}
+
+#[test]
 fn deferred_shared_guest_write_rejects_reused_mapping() {
     let mut address_space =
         GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");

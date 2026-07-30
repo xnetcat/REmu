@@ -26,7 +26,9 @@ pub use event::{
 
 mod diagnostics;
 pub use diagnostics::{
-    PixelPipeStatReleaseTrace, record_pixel_pipe_stat_release_trace,
+    PixelPipeQueryCompletionTrace, PixelPipeStatReleaseTrace,
+    record_pixel_pipe_query_completion_release_trace, record_pixel_pipe_stat_dump_trace,
+    record_pixel_pipe_stat_release_trace, take_pixel_pipe_query_completion_release_trace,
     take_pixel_pipe_stat_release_trace,
 };
 
