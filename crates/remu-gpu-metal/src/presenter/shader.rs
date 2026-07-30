@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{Device, MeshRenderPipelineDescriptor, RenderPipelineDescriptor};
-use remu_gpu::{ComputeDispatch, IndexedDraw};
+use remu_gpu::{ComputeDispatch, GpuEvent, IndexedDraw};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{TryRecvError, TrySendError};
@@ -18,7 +19,8 @@ use super::{
     dump_msl_compute_filter_matches,
     dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
     evaluation_samples_large_linear_video, image_component_class, metal_color_write_mask,
-    register_value, video_target_binding_summary,
+    register_value, speculative_pipeline_compile_in_flight_capacity,
+    video_target_binding_summary,
 };
 mod archive;
 mod compile;
@@ -43,7 +45,50 @@ pub(crate) use self::program::{
 
 impl MetalPresenter {
     pub(super) fn prefetch_pipeline_compilations(&mut self) {
-        let candidates = self.receiver.prefetch_pipeline_work(512, 128);
+        let speculative_available = speculative_pipeline_compile_in_flight_capacity()
+            .saturating_sub(
+                self.compiling_shader_pairs
+                    .len()
+                    .saturating_add(self.compiling_compute_pipelines.len()),
+            );
+        if speculative_available == 0 {
+            return;
+        }
+        let compiled_shader_pairs = &self.compiled_shader_pairs;
+        let compiling_shader_pairs = &self.compiling_shader_pairs;
+        let failed_shader_pairs = &self.failed_shader_pairs;
+        let compiled_compute_pipelines = &self.compiled_compute_pipelines;
+        let compiling_compute_pipelines = &self.compiling_compute_pipelines;
+        let failed_compute_pipelines = &self.failed_compute_pipelines;
+        let mut seen_graphics = HashSet::new();
+        let mut seen_compute = HashSet::new();
+        let candidates =
+            self.receiver
+                .prefetch_pipeline_work(512, speculative_available, |event| match event {
+                    GpuEvent::IndexedDraw(draw) => {
+                        super::graphics_pipeline_key(draw).is_ok_and(|key| {
+                            !compiled_shader_pairs.contains_key(&key)
+                                && !compiling_shader_pairs.contains(&key)
+                                && !failed_shader_pairs.contains(&key)
+                                && seen_graphics.insert(key)
+                        })
+                    }
+                    GpuEvent::ComputeDispatch(dispatch) => {
+                        let (Some(snapshot), Some(evaluation)) = (
+                            dispatch.shader.as_ref(),
+                            dispatch.shader_evaluation.as_ref(),
+                        ) else {
+                            return false;
+                        };
+                        let key =
+                            compute_pipeline_key(dispatch, evaluation, &snapshot.program);
+                        !compiled_compute_pipelines.contains_key(&key)
+                            && !compiling_compute_pipelines.contains(&key)
+                            && !failed_compute_pipelines.contains(&key)
+                            && seen_compute.insert(key)
+                    }
+                    _ => false,
+                });
         for candidate in candidates {
             match candidate {
                 PipelineCompileCandidate::Graphics(draw) => {
