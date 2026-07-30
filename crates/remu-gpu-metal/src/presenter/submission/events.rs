@@ -27,6 +27,7 @@ impl OrderedGpuEventReceiver {
             submissions: HashMap::new(),
             queue_order: Vec::new(),
             next_queue_index: 0,
+            next_prefetch_source_index: 0,
             active_queue: None,
             blocked_queues: HashMap::new(),
             host_events: VecDeque::new(),
@@ -312,34 +313,73 @@ impl OrderedGpuEventReceiver {
         &mut self,
         receive_limit: usize,
         work_limit: usize,
+        mut include: impl FnMut(&GpuEvent) -> bool,
     ) -> Vec<PipelineCompileCandidate> {
         self.ingest(receive_limit);
-        let host_work = self.host_events.iter().filter_map(|host| match &host.event {
-            GpuEvent::IndexedDraw(draw) => {
-                Some(PipelineCompileCandidate::Graphics(draw.as_ref().clone()))
-            }
-            GpuEvent::ComputeDispatch(dispatch) => Some(PipelineCompileCandidate::Compute(
-                dispatch.as_ref().clone(),
-            )),
-            _ => None,
-        });
-        let queue_work = self.queue_order.iter().flat_map(|queue_id| {
+        if work_limit == 0 {
+            return Vec::new();
+        }
+
+        // Treat host events and each guest queue as independent lookahead sources. A per-source
+        // quota prevents one queue with hundreds of future draws from hiding another queue's
+        // first pipeline, while the rotating start keeps fairness when there are more sources
+        // than the bounded output can cover in one tick.
+        let mut sources = Vec::with_capacity(self.queue_order.len().saturating_add(1));
+        if self
+            .host_events
+            .iter()
+            .any(|host| event_has_pipeline_work(&host.event))
+        {
+            sources.push(None);
+        }
+        sources.extend(self.queue_order.iter().copied().filter_map(|queue_id| {
             self.submissions
-                .get(queue_id)
-                .into_iter()
-                .flatten()
-                .flat_map(|submission| submission.events.iter())
-                .filter_map(|event| match event {
-                    GpuEvent::IndexedDraw(draw) => {
-                        Some(PipelineCompileCandidate::Graphics(draw.as_ref().clone()))
-                    }
-                    GpuEvent::ComputeDispatch(dispatch) => Some(PipelineCompileCandidate::Compute(
-                        dispatch.as_ref().clone(),
-                    )),
-                    _ => None,
+                .get(&queue_id)
+                .is_some_and(|submissions| {
+                    submissions
+                        .iter()
+                        .flat_map(|submission| submission.events.iter())
+                        .any(event_has_pipeline_work)
                 })
-        });
-        host_work.chain(queue_work).take(work_limit).collect()
+                .then_some(Some(queue_id))
+        }));
+        if sources.is_empty() {
+            return Vec::new();
+        }
+
+        let start = self.next_prefetch_source_index % sources.len();
+        let per_source_limit = work_limit.div_ceil(sources.len()).max(1);
+        let mut candidates = Vec::with_capacity(work_limit.min(16));
+        let mut visited_sources = 0;
+        for offset in 0..sources.len() {
+            if candidates.len() >= work_limit {
+                break;
+            }
+            visited_sources = offset + 1;
+            let source = sources[(start + offset) % sources.len()];
+            let events: Box<dyn Iterator<Item = &GpuEvent> + '_> = match source {
+                None => Box::new(self.host_events.iter().map(|host| &host.event)),
+                Some(queue_id) => Box::new(
+                    self.submissions
+                        .get(&queue_id)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|submission| submission.events.iter()),
+                ),
+            };
+            candidates.extend(
+                events
+                    // Cache and within-pass duplicate filtering happens before cloning a large
+                    // immutable draw or dispatch snapshot.
+                    .filter(|event| include(event))
+                    .filter_map(pipeline_compile_candidate)
+                    .take(per_source_limit)
+                    .take(work_limit - candidates.len()),
+            );
+        }
+        self.next_prefetch_source_index =
+            (start + visited_sources.max(1)) % sources.len();
+        candidates
     }
 
     pub(crate) fn pending_event_count(&self) -> usize {
@@ -600,6 +640,25 @@ impl OrderedGpuEventReceiver {
         } else {
             producers.join(",")
         }
+    }
+}
+
+fn event_has_pipeline_work(event: &GpuEvent) -> bool {
+    matches!(
+        event,
+        GpuEvent::IndexedDraw(_) | GpuEvent::ComputeDispatch(_)
+    )
+}
+
+fn pipeline_compile_candidate(event: &GpuEvent) -> Option<PipelineCompileCandidate> {
+    match event {
+        GpuEvent::IndexedDraw(draw) => {
+            Some(PipelineCompileCandidate::Graphics(draw.as_ref().clone()))
+        }
+        GpuEvent::ComputeDispatch(dispatch) => Some(PipelineCompileCandidate::Compute(
+            dispatch.as_ref().clone(),
+        )),
+        _ => None,
     }
 }
 

@@ -314,6 +314,15 @@ fn shader_compiler_worker_count() -> usize {
     })
 }
 
+/// Leave one compiler worker available for an actual ordered queue-front miss.
+///
+/// Speculative requests never need to occupy the bounded channel: at most `workers - 1` can be
+/// active, so a required front can be received immediately by the reserved worker. A single-worker
+/// configuration disables speculative compilation rather than placing it ahead of required work.
+fn speculative_pipeline_compile_in_flight_capacity() -> usize {
+    shader_compiler_worker_count().saturating_sub(1)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PresenterFlow {
     Continue,
@@ -724,6 +733,63 @@ enum ShaderCompileRequest {
     },
 }
 
+const SHADER_COMPILE_PANIC_DESCRIPTION_CAPACITY: usize = 512;
+
+impl ShaderCompileRequest {
+    fn terminal_failure(&self, error: String) -> ShaderCompileResult {
+        match self {
+            Self::Graphics { key, .. } => ShaderCompileResult::Graphics {
+                key: key.clone(),
+                compiled: Err(error),
+            },
+            Self::Compute { key, dispatch } => ShaderCompileResult::Compute {
+                key: key.clone(),
+                shader_address: dispatch.shader_address,
+                threads_per_group: dispatch.launch.threads_per_group,
+                compiled: Err(error),
+            },
+        }
+    }
+}
+
+fn shader_compile_panic_description(payload: &(dyn std::any::Any + Send)) -> String {
+    let mut description = if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    };
+    if description.len() <= SHADER_COMPILE_PANIC_DESCRIPTION_CAPACITY {
+        return description;
+    }
+    const SUFFIX: &str = "...";
+    let mut end = SHADER_COMPILE_PANIC_DESCRIPTION_CAPACITY - SUFFIX.len();
+    while !description.is_char_boundary(end) {
+        end -= 1;
+    }
+    description.truncate(end);
+    description.push_str(SUFFIX);
+    description
+}
+
+fn compile_shader_request_catching_panics(
+    request: &ShaderCompileRequest,
+    compile: impl FnOnce() -> ShaderCompileResult,
+) -> ShaderCompileResult {
+    // Keep the catch outside the Objective-C pool. A compiler panic unwinds through
+    // `autoreleasepool`, draining request-local objects before it becomes a terminal queue result.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        objc::rc::autoreleasepool(compile)
+    })) {
+        Ok(result) => result,
+        Err(payload) => request.terminal_failure(format!(
+            "compiler worker panicked: {}",
+            shader_compile_panic_description(payload.as_ref())
+        )),
+    }
+}
+
 #[derive(Debug, Default)]
 struct RenderPipelineArchiveState {
     additions: usize,
@@ -792,6 +858,7 @@ struct OrderedGpuEventReceiver {
     submissions: HashMap<u64, VecDeque<ScheduledGpuSubmission>>,
     queue_order: Vec<u64>,
     next_queue_index: usize,
+    next_prefetch_source_index: usize,
     active_queue: Option<u64>,
     blocked_queues: HashMap<u64, QueueBlockReason>,
     host_events: VecDeque<ScheduledHostEvent>,
@@ -1623,30 +1690,35 @@ impl MetalPresenter {
                         let Ok(request) = request else {
                             break;
                         };
-                        let result = objc::rc::autoreleasepool(|| match request {
-                            ShaderCompileRequest::Graphics { key, draw } => {
-                                let compiled = Self::compile_draw_shader_pair(
-                                    &compiler_device,
-                                    &draw,
-                                    &key,
-                                    &function_cache,
-                                    render_pipeline_archive.as_ref(),
-                                );
-                                ShaderCompileResult::Graphics { key, compiled }
-                            }
-                            ShaderCompileRequest::Compute { key, dispatch } => {
-                                let shader_address = dispatch.shader_address;
-                                let threads_per_group = dispatch.launch.threads_per_group;
-                                let compiled = Self::compile_compute_pipeline(
-                                    &compiler_device,
-                                    &dispatch,
-                                    &key,
-                                );
-                                ShaderCompileResult::Compute {
-                                    key,
-                                    shader_address,
-                                    threads_per_group,
-                                    compiled,
+                        let result = compile_shader_request_catching_panics(&request, || {
+                            match &request {
+                                ShaderCompileRequest::Graphics { key, draw } => {
+                                    let compiled = Self::compile_draw_shader_pair(
+                                        &compiler_device,
+                                        draw,
+                                        key,
+                                        &function_cache,
+                                        render_pipeline_archive.as_ref(),
+                                    );
+                                    ShaderCompileResult::Graphics {
+                                        key: key.clone(),
+                                        compiled,
+                                    }
+                                }
+                                ShaderCompileRequest::Compute { key, dispatch } => {
+                                    let shader_address = dispatch.shader_address;
+                                    let threads_per_group = dispatch.launch.threads_per_group;
+                                    let compiled = Self::compile_compute_pipeline(
+                                        &compiler_device,
+                                        dispatch,
+                                        key,
+                                    );
+                                    ShaderCompileResult::Compute {
+                                        key: key.clone(),
+                                        shader_address,
+                                        threads_per_group,
+                                        compiled,
+                                    }
                                 }
                             }
                         });
