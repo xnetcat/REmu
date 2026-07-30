@@ -171,6 +171,26 @@ impl Compiler<'_> {
         instruction: &Instruction,
         export: &ExportControl,
     ) -> Result<(), String> {
+        // RDNA2 EXP target 8 is MRTZ. Component zero is fragment depth when
+        // DB_SHADER_CONTROL.Z_EXPORT_ENABLE is set. Silent Hill's captured gameplay shaders use
+        // the canonical uncompressed EN=1 form; dropping it made alpha-tested/depth-replacing
+        // materials populate color while retaining unrelated rasterizer depth.
+        if export.target == 8 {
+            if !self.options.pixel_depth_export || export.enable_mask & 1 == 0 {
+                return Ok(());
+            }
+            if export.compressed {
+                return Err(
+                    "compressed MRTZ depth export requires SPI_SHADER_Z_FORMAT lowering".to_owned(),
+                );
+            }
+            let register = vector_operand(instruction.sources[0])?;
+            self.line(
+                3,
+                &format!("if (exec) remu_out.depth = as_type<float>(v[{register}]);"),
+            );
+            return Ok(());
+        }
         let Some(output) = self
             .options
             .pixel_outputs
