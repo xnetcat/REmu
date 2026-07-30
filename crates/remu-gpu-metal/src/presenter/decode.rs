@@ -17,9 +17,9 @@ use super::{
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
-    is_storage_image_opcode, program_embeds_global_base, tiled_block_dimensions,
-    trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
-    video_target_binding_summary,
+    is_storage_image_opcode, ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw,
+    program_embeds_global_base, tiled_block_dimensions, trace_image_descriptors,
+    trace_target_sampling, unsigned_float_to_f32, video_target_binding_summary,
 };
 use metal::{MTLScissorRect, MTLViewport};
 use remu_gpu::{GpuRegister, IndexedDraw};
@@ -36,7 +36,8 @@ pub(crate) use self::pipeline::{
     ColorOperationMode, color_operation_is_raster_noop, decode_color_operation_mode,
     decode_metal_blend_attachment, decode_raster_state, graphics_pipeline_key,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
-    prepare_indexed_primitive, prepare_ngg_meshlets,
+    ngg_mesh_base_vertex, prepare_indexed_primitive, prepare_ngg_meshlets,
+    prepare_nonindexed_ngg_indices,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{

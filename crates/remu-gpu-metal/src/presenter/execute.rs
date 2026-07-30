@@ -42,16 +42,16 @@ use super::{
     image_resource_descriptor_is_null, initial_depth_clear_for_target,
     initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
     metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, prepare_indexed_primitive, read_draw_indices,
-    read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
-    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
-    record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
-    render_target_cmask_address, render_target_fast_clear_color,
-    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    sampled_image_bindings, shader_scalar_metadata_for_registers,
-    should_record_diagnostic_target_writer, snapshot_guest_texture_raw,
-    storage_image_requires_mip_hierarchy, trace_image_descriptors, trace_msaa_writes,
-    trace_scanout_writes, trace_target_sampling, upload_image_textures,
+    native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_primitive,
+    prepare_nonindexed_ngg_indices, read_draw_indices, read_texture_array_linear,
+    read_texture_linear, read_texture_volume_linear, rearm_color_metadata_clear,
+    rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_scanout_writer,
+    record_diagnostic_texture_writer, register_value, render_target_cmask_address,
+    render_target_fast_clear_color, resident_color_view_sample_is_eligible,
+    resident_depth_sample_is_eligible, sampled_image_bindings,
+    shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
+    snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy, trace_image_descriptors,
+    trace_msaa_writes, trace_scanout_writes, trace_target_sampling, upload_image_textures,
     validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
 };
 use metal::{
@@ -64,10 +64,29 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 mod compute;
 mod indirect;
+
+// metal-rs 0.33 predates the Mesh named constant, but its bitflags retain unknown Apple SDK bits.
+const MTL_RENDER_STAGE_MESH_BITS: u64 = 1 << 4;
+
+pub(super) fn export_resource_render_stage(uses_mesh_stage: bool) -> MTLRenderStages {
+    if uses_mesh_stage {
+        MTLRenderStages::from_bits_retain(MTL_RENDER_STAGE_MESH_BITS)
+    } else {
+        MTLRenderStages::Vertex
+    }
+}
+
+pub(super) const fn ngg_mesh_dispatch_required(
+    scissor: GuestScissor,
+    instance_count: u32,
+    has_meshlets: bool,
+) -> bool {
+    !matches!(scissor, GuestScissor::Empty) && instance_count != 0 && has_meshlets
+}
 
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
@@ -816,14 +835,22 @@ impl MetalPresenter {
         } else {
             None
         };
-        let ngg_meshlets = if uses_mesh_stage {
-            let (indices, _) = indexed_draw
-                .as_ref()
-                .ok_or("NGG mesh draw requires captured indices")?;
+        let ngg_indices = if uses_mesh_stage {
+            if let Some((indices, _)) = indexed_draw.as_ref() {
+                Some(Arc::clone(indices))
+            } else if !draw.indexed && draw.primitive_type == 6 {
+                Some(prepare_nonindexed_ngg_indices(draw)?)
+            } else {
+                return Err("NGG mesh draw has an unsupported source topology".to_owned());
+            }
+        } else {
+            None
+        };
+        let ngg_meshlets = if let Some(indices) = ngg_indices.as_ref() {
             let limits = key
                 .ngg_subgroup_limits
                 .ok_or("NGG mesh draw is missing subgroup sizing registers")?;
-            Some(self.cached_ngg_meshlets(&device, indices.as_ref(), limits)?)
+            self.cached_ngg_meshlets(&device, indices.as_ref(), limits)?
         } else {
             None
         };
@@ -1284,7 +1311,11 @@ impl MetalPresenter {
                     } else {
                         MTLResourceUsage::Read
                     };
-                    encoder.use_resource_at(&buffer.buffer, usage, MTLRenderStages::Vertex);
+                    encoder.use_resource_at(
+                        &buffer.buffer,
+                        usage,
+                        export_resource_render_stage(uses_mesh_stage),
+                    );
                 }
             } else {
                 for (index, buffer) in export_buffer_indices.iter().zip(&export_buffers) {
@@ -1383,47 +1414,52 @@ impl MetalPresenter {
             }
 
             if uses_mesh_stage {
-                let (indices, _) = indexed_draw
+                let indices = ngg_indices
                     .as_ref()
-                    .ok_or("NGG mesh draw requires captured indices")?;
-                let meshlets = ngg_meshlets
-                    .as_ref()
-                    .expect("NGG meshlets were prepared before opening the render pass");
-                let mesh_draw = [0_u32, 0_u32, draw.base_vertex as u32];
-                encoder.set_mesh_buffer(NGG_MESHLET_BUFFER_INDEX, Some(&meshlets.buffer), 0);
-                encoder.set_mesh_bytes(
-                    NGG_MESH_DRAW_BUFFER_INDEX,
-                    u64::try_from(std::mem::size_of_val(&mesh_draw))
-                        .expect("mesh draw metadata size fits u64"),
-                    mesh_draw.as_ptr().cast::<c_void>(),
-                );
-                static LOGGED_MESH_DRAWS: AtomicUsize = AtomicUsize::new(0);
-                let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
-                if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
-                    eprintln!(
-                        "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} primitives={} packed_vertices={} instances={} groups={}x{}",
-                        draw.sequence,
-                        indices.len(),
-                        meshlets.primitive_count,
-                        meshlets.vertex_references,
-                        draw.instance_count,
-                        meshlets.group_count,
-                        draw.instance_count,
+                    .expect("NGG indices were prepared before opening the render pass");
+                if ngg_mesh_dispatch_required(scissor, draw.instance_count, ngg_meshlets.is_some())
+                    && let Some(meshlets) = ngg_meshlets.as_ref()
+                {
+                    let mesh_draw = [
+                        0_u32,
+                        0_u32,
+                        u32::from_ne_bytes(ngg_mesh_base_vertex(draw).to_ne_bytes()),
+                    ];
+                    encoder.set_mesh_buffer(NGG_MESHLET_BUFFER_INDEX, Some(&meshlets.buffer), 0);
+                    encoder.set_mesh_bytes(
+                        NGG_MESH_DRAW_BUFFER_INDEX,
+                        u64::try_from(std::mem::size_of_val(&mesh_draw))
+                            .expect("mesh draw metadata size fits u64"),
+                        mesh_draw.as_ptr().cast::<c_void>(),
+                    );
+                    static LOGGED_MESH_DRAWS: AtomicUsize = AtomicUsize::new(0);
+                    let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][METAL][NGG-MESH] sequence={mesh_sequence} draw={} indices={} primitives={} packed_vertices={} instances={} groups={}x{}",
+                            draw.sequence,
+                            indices.len(),
+                            meshlets.primitive_count,
+                            meshlets.vertex_references,
+                            draw.instance_count,
+                            meshlets.group_count,
+                            draw.instance_count,
+                        );
+                    }
+                    encoder.draw_mesh_threadgroups(
+                        MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
+                        MTLSize::new(1, 1, 1),
+                        MTLSize::new(
+                            u64::from(
+                                key.ngg_subgroup_limits
+                                    .expect("NGG subgroup limits were validated before encoding")
+                                    .threadgroup_threads,
+                            ),
+                            1,
+                            1,
+                        ),
                     );
                 }
-                encoder.draw_mesh_threadgroups(
-                    MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
-                    MTLSize::new(1, 1, 1),
-                    MTLSize::new(
-                        u64::from(
-                            key.ngg_subgroup_limits
-                                .expect("NGG subgroup limits were validated before encoding")
-                                .threadgroup_threads,
-                        ),
-                        1,
-                        1,
-                    ),
-                );
             } else if diagnostic_force_triangle {
                 encoder.draw_primitives_instanced(MTLPrimitiveType::Triangle, 0, 3, 1);
             } else if matches!(scissor, GuestScissor::Empty) {

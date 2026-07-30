@@ -15,9 +15,9 @@ use super::{
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
     ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
-    DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestTextureDescriptor,
-    MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType, NggSubgroupLimits,
-    PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
+    DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestScissor,
+    GuestTextureDescriptor, MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType,
+    NggSubgroupLimits, PA_SU_SC_MODE_CNTL, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
     append_depth_target_registers, color_operation_is_raster_noop,
     common_render_target_array_length, consume_color_metadata_clear, consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
@@ -28,7 +28,8 @@ use super::{
     guest_texture_byte_count, guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
-    metal_primitive_type, pixel_input_controls, prepare_indexed_primitive, prepare_ngg_meshlets,
+    metal_primitive_type, ngg_mesh_base_vertex, ngg_mesh_dispatch_required, pixel_input_controls,
+    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
     read_draw_indices, read_texture_array_linear, read_texture_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, render_target_cmask_address, render_target_fast_clear_color,
 };
@@ -1505,6 +1506,88 @@ fn packs_ngg_meshlets_with_shared_vertex_indices() {
     assert_eq!(&prepared.words[2..6], &[10, 11, 12, 13]);
     assert_eq!(prepared.words[258], 1 << 10 | 2 << 20);
     assert_eq!(prepared.words[259], 2 | 1 << 10 | 3 << 20);
+}
+
+#[test]
+fn preserves_nonindexed_first_vertex_and_alternates_triangle_strip_winding() {
+    let mut draw = indexed_draw(0, 0, 5);
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    draw.index_offset = 7;
+    draw.base_vertex = 91;
+    let indices = prepare_nonindexed_ngg_indices(&draw).expect("strip expands");
+    assert_eq!(indices.as_ref(), &[7, 8, 9, 9, 8, 10, 9, 10, 11]);
+    assert_eq!(
+        ngg_mesh_base_vertex(&draw),
+        0,
+        "stale indexed base state must not shift non-indexed auto-generated vertex IDs"
+    );
+    let limits = NggSubgroupLimits::new(
+        24,
+        4,
+        4,
+        24,
+        96,
+        24,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect("captured Silent Hill NGG limits");
+    let prepared = prepare_ngg_meshlets(indices.as_ref(), limits);
+    assert_eq!(prepared.group_count, 1);
+    assert_eq!(prepared.vertex_references, 5);
+    assert_eq!(prepared.primitive_count, 3);
+}
+
+#[test]
+fn preserves_indexed_mesh_base_vertex() {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.base_vertex = -7;
+    assert_eq!(ngg_mesh_base_vertex(&draw), -7);
+}
+
+#[test]
+fn empty_nonindexed_triangle_strip_has_no_meshlets() {
+    let mut draw = indexed_draw(0, 0, 2);
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    let indices = prepare_nonindexed_ngg_indices(&draw).expect("short strip is empty");
+    assert!(indices.is_empty());
+    let limits = NggSubgroupLimits::new(
+        24,
+        4,
+        4,
+        24,
+        96,
+        24,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect("captured Silent Hill NGG limits");
+    assert_eq!(
+        prepare_ngg_meshlets(indices.as_ref(), limits).group_count,
+        0
+    );
+}
+
+#[test]
+fn mesh_dispatch_respects_guest_no_work_conditions() {
+    assert!(ngg_mesh_dispatch_required(GuestScissor::Full, 1, true));
+    assert!(!ngg_mesh_dispatch_required(GuestScissor::Empty, 1, true));
+    assert!(!ngg_mesh_dispatch_required(GuestScissor::Full, 0, true));
+    assert!(!ngg_mesh_dispatch_required(GuestScissor::Full, 1, false));
+}
+
+#[test]
+fn rejects_nonindexed_triangle_strip_vertex_id_overflow_before_allocating() {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    draw.index_offset = u32::MAX;
+    assert_eq!(
+        prepare_nonindexed_ngg_indices(&draw),
+        Err("triangle-strip vertex ID overflow".to_owned())
+    );
 }
 
 #[test]

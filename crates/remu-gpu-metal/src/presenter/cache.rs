@@ -534,14 +534,14 @@ impl MetalPresenter {
         device: &Device,
         indices: &[u32],
         limits: NggSubgroupLimits,
-    ) -> Result<CachedNggMeshlets, String> {
+    ) -> Result<Option<CachedNggMeshlets>, String> {
         let cache_key = (limits, indices.to_vec());
         if let Some(cached) = self.ngg_meshlet_cache.get(&cache_key) {
-            return Ok(cached.clone());
+            return Ok(Some(cached.clone()));
         }
         let prepared = prepare_ngg_meshlets(indices, limits);
         if prepared.group_count == 0 {
-            return Err("NGG triangle draw contains no complete primitive".to_owned());
+            return Ok(None);
         }
         let byte_count = prepared
             .words
@@ -562,7 +562,7 @@ impl MetalPresenter {
             self.ngg_meshlet_cache.clear();
         }
         self.ngg_meshlet_cache.insert(cache_key, cached.clone());
-        Ok(cached)
+        Ok(Some(cached))
     }
 }
 
