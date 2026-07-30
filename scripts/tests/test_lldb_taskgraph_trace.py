@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "lldb_taskgraph_trace.py"
+PROBE_SCRIPT = Path(__file__).resolve().parents[1] / "probe-taskgraph.sh"
 SPEC = importlib.util.spec_from_file_location("lldb_taskgraph_trace", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 TRACE = importlib.util.module_from_spec(SPEC)
@@ -52,6 +55,14 @@ class TaskGraphTraceTests(unittest.TestCase):
             },
         )
         self.assertEqual(len(TRACE.BREAKPOINTS[TRACE.PHASE_CONSUME]), 4)
+        self.assertLessEqual(
+            len(TRACE.QUEUE_HANDOFF_BREAKPOINTS),
+            TRACE.MAXIMUM_HARDWARE_BREAKPOINTS,
+        )
+        self.assertLessEqual(
+            len(TRACE.QUEUE_HANDOFF_POST_PUBLISH_BREAKPOINTS),
+            TRACE.MAXIMUM_HARDWARE_BREAKPOINTS,
+        )
 
     def test_prepare_captures_a_fence_blocked_before_conditional_dispatch(
         self,
@@ -229,6 +240,284 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertEqual(state.task, 0)
         self.assertEqual(state.active_breakpoints(), fixed)
 
+    def test_queue_handoff_correlates_enqueue_register_and_event_wait(
+        self,
+    ) -> None:
+        state = TRACE.TaskGraphTraceState(
+            cycle_limit=2,
+            hit_limit=32,
+            target_follow=True,
+            queue_handoff=True,
+        )
+        queue = 0x3000
+        queue_object = queue - 0x38
+        wrapper = 0x4000
+        underlying = 0x5000
+        singleton = 0x6000
+        self.memory.update(
+            {
+                0x1008: 1,
+                TRACE.TASKGRAPH_SINGLETON_POINTER: singleton,
+                singleton + 0x18 + 0x8: queue_object,
+                queue + 0x1A8: (0x15 << TRACE.TASK_QUEUE_WAITER_BITS) | 1,
+                queue + 0x118: 0xA1,
+                queue + 0x160: 0xB1,
+                queue + 0x1F8: wrapper,
+                TRACE.TASKGRAPH_NODE_SLAB_POINTERS: 0xD000,
+                0xD000 + 0xA1 * TRACE.TASK_QUEUE_NODE_STRIDE + 8: 0x1110,
+                0xD000 + 0xB1 * TRACE.TASK_QUEUE_NODE_STRIDE + 8: 0x2220,
+                wrapper + 0x10: underlying,
+                underlying + 0x10: 0,
+                0x8000: 0x9000,
+                0x8008: TRACE.DEFAULT_TARGET_FENCE_CALLER,
+                0x9008: TRACE.DEFAULT_TARGET_FENCE_PARENT,
+            }
+        )
+
+        ignored = state.observe(
+            TRACE.PREPARE,
+            {"rbx": 0x1000, "rbp": 0x7000},
+            7,
+            self.read_u64,
+        )
+        self.assertFalse(ignored.accepted)
+        self.assertEqual(
+            state.active_breakpoints(),
+            TRACE.QUEUE_HANDOFF_DISCOVERY_BREAKPOINTS,
+        )
+
+        self.memory[0x1018] = 0x2100
+        target = state.observe(
+            TRACE.PREPARE,
+            {
+                "rbx": 0x1000,
+                "rbp": 0x8000,
+                "r12": 1,
+                "rax": 1,
+            },
+            7,
+            self.read_u64,
+        )
+        self.assertTrue(target.accepted)
+        self.assertIn("target=1 capture", target.message or "")
+        self.assertIn("taskgraph=0x6000", target.message or "")
+        self.assertIn("event_condition=0x5028", target.message or "")
+        self.assertEqual(state.queue_object, queue_object)
+        self.assertEqual(
+            state.active_breakpoints(),
+            TRACE.QUEUE_HANDOFF_BREAKPOINTS,
+        )
+        self.assertNotIn(TRACE.PREPARE, state.active_breakpoints())
+        self.assertIn(TRACE.PUBLISH, state.active_breakpoints())
+
+        self.memory[queue + 0x1A8] = 0x16 << TRACE.TASK_QUEUE_WAITER_BITS
+        self.memory[queue + 0x118] = 0xA2
+        self.memory[queue + 0x160] = 0xB2
+        self.memory[
+            0xD000 + 0xA2 * TRACE.TASK_QUEUE_NODE_STRIDE + 8
+        ] = 0x1000
+        self.memory[
+            0xD000 + 0xB2 * TRACE.TASK_QUEUE_NODE_STRIDE + 8
+        ] = 0x3330
+        publish = state.observe(
+            TRACE.PUBLISH,
+            {
+                "rsi": 0x1000,
+                "rdi": queue,
+                "rdx": 1,
+                "rsp": 0x7000,
+            },
+            7,
+            self.read_u64,
+        )
+        self.assertTrue(publish.accepted)
+        self.assertIn("target-publish-entry", publish.message or "")
+        self.assertFalse(
+            state.observe(
+                TRACE.PUBLISH_RETURN,
+                {
+                    "r14": queue_object,
+                    "rbx": 0,
+                    "rax": 0,
+                    "rsp": 0x7008,
+                },
+                8,
+                self.read_u64,
+            ).accepted
+        )
+        enqueue = state.observe(
+            TRACE.PUBLISH_RETURN,
+            {
+                "r14": queue_object,
+                "rbx": 0,
+                "rax": 0,
+                "rsp": 0x7008,
+            },
+            7,
+            self.read_u64,
+        )
+        self.assertTrue(enqueue.accepted)
+        self.assertIn("target=True", enqueue.message or "")
+        self.assertIn("wake_waiter=0", enqueue.message or "")
+        self.assertIn("lane1_head=162", enqueue.message or "")
+        self.assertIn("lane1_tail=178", enqueue.message or "")
+        self.assertIn("/task=0x1000/target=True", enqueue.message or "")
+        self.assertIn("/task=0x3330/target=False", enqueue.message or "")
+        self.assertIn("chain=linked", enqueue.message or "")
+        self.assertIn("target_handle=0xa2", enqueue.message or "")
+        self.assertIn("target_slot=", enqueue.message or "")
+        self.assertEqual(
+            state.active_breakpoints(),
+            TRACE.QUEUE_HANDOFF_POST_PUBLISH_BREAKPOINTS,
+        )
+
+        self.memory[0xA000 - 0x48] = 1
+        self.memory[queue + 0x1A8] |= 1
+        self.memory[queue + 0x118] = 0xB2
+        self.memory[
+            0xD000 + 0xA2 * TRACE.TASK_QUEUE_NODE_STRIDE + 8
+        ] = 0
+        self.memory[0xD000 + 0xB2 * TRACE.TASK_QUEUE_NODE_STRIDE] = 0
+        self.memory[
+            0xD000 + 0xB2 * TRACE.TASK_QUEUE_NODE_STRIDE + 0x10
+        ] = 0x4440
+        registered = state.observe(
+            TRACE.QUEUE_REGISTER,
+            {
+                "r13": queue,
+                "rflags": 1 << 6,
+                "rbp": 0xA000,
+                "rax": 0x58000000,
+                "rbx": 0x58000001,
+            },
+            8,
+            self.read_u64,
+        )
+        self.assertTrue(registered.accepted)
+        self.assertIn("registered=True", registered.message or "")
+        self.assertIn("waiter_bit=1", registered.message or "")
+        self.assertIn("chain=null", registered.message or "")
+        self.assertIn("known_target_mutated=True", registered.message or "")
+        self.assertIn("known_target_current=[unreadable,0x0,unreadable]", registered.message or "")
+
+        waiting = state.observe(
+            TRACE.EVENT_WAIT_ENTRY,
+            {"r12": underlying},
+            8,
+            self.read_u64,
+        )
+        self.assertTrue(waiting.accepted)
+        self.assertIn("mutex=0x5020", waiting.message or "")
+        self.assertIn("condition=0x5028", waiting.message or "")
+        self.assertIn("done reason=decisive-queue-wait", waiting.message or "")
+        self.assertTrue(state.done)
+        self.assertEqual(state.active_breakpoints(), {})
+
+    def test_queue_handoff_requires_target_follow(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires target follow"):
+            TRACE.TaskGraphTraceState(
+                cycle_limit=1,
+                hit_limit=8,
+                queue_handoff=True,
+            )
+
+    def test_task_queue_node_decoder_uses_page_and_slot_slab(self) -> None:
+        node_id = (2 << TRACE.TASK_QUEUE_NODE_PAGE_BITS) | 7
+        value = (0x15 << TRACE.TASK_QUEUE_WAITER_BITS) | node_id
+        page_base = 0xD000
+        task = 0x123400
+        memory = {
+            TRACE.TASKGRAPH_NODE_SLAB_POINTERS + 2 * 8: page_base,
+            page_base + 7 * TRACE.TASK_QUEUE_NODE_STRIDE + 8: task,
+        }
+
+        description = TRACE.describe_task_queue_node(
+            value,
+            memory.get,
+            task,
+        )
+
+        self.assertIn(f"{value}/id={node_id:#x}", description)
+        self.assertIn("/page=0x2/slot=0x7/base=0xd000", description)
+        self.assertIn("/task=0x123400/target=True", description)
+
+    def test_task_queue_chain_walks_raw_handles_to_target(self) -> None:
+        first_id = (2 << TRACE.TASK_QUEUE_NODE_PAGE_BITS) | 7
+        second_id = (2 << TRACE.TASK_QUEUE_NODE_PAGE_BITS) | 9
+        first_handle = (0x15 << TRACE.TASK_QUEUE_WAITER_BITS) | first_id
+        second_handle = (0x16 << TRACE.TASK_QUEUE_WAITER_BITS) | second_id
+        page_base = 0xD000
+        first_slot = page_base + 7 * TRACE.TASK_QUEUE_NODE_STRIDE
+        second_slot = page_base + 9 * TRACE.TASK_QUEUE_NODE_STRIDE
+        target = 0x123400
+        memory = {
+            TRACE.TASKGRAPH_NODE_SLAB_POINTERS + 2 * 8: page_base,
+            first_slot: second_handle,
+            first_slot + 8: 0xAAAA,
+            first_slot + 0x10: 0xBBBB,
+            second_slot: 0,
+            second_slot + 8: target,
+            second_slot + 0x10: 0xCCCC,
+            target: 0x1111,
+            target + 8: 0x2222,
+            target + 0x10: 0x3333,
+            target + 0x18: 0x4444,
+        }
+
+        snapshot = TRACE.inspect_task_queue_chain(
+            first_handle,
+            target,
+            memory.get,
+        )
+        description = TRACE.describe_task_queue_chain(snapshot)
+
+        self.assertEqual(snapshot.termination, "linked")
+        self.assertEqual(snapshot.handles, (first_handle, second_handle))
+        self.assertEqual(snapshot.target_handle, second_handle)
+        self.assertEqual(snapshot.target_slot, second_slot)
+        self.assertEqual(
+            snapshot.nodes[-1],
+            TRACE.TaskQueueNodeSnapshot(
+                second_handle,
+                second_slot,
+                (0, target, 0xCCCC),
+            ),
+        )
+        self.assertEqual(
+            snapshot.target_slot_words,
+            (0, target, 0xCCCC),
+        )
+        self.assertEqual(
+            snapshot.target_words,
+            (0x1111, 0x2222, 0x3333, 0x4444),
+        )
+        self.assertIn(
+            f"handles=[{first_handle:#x},{second_handle:#x}]",
+            description,
+        )
+        self.assertIn(
+            f"{second_handle:#x}@{second_slot:#x}:"
+            "[0x0,0x123400,0xcccc]",
+            description,
+        )
+        self.assertIn(
+            "target_slot_words=[0x0,0x123400,0xcccc]",
+            description,
+        )
+        self.assertIn(
+            "target_words=[0x1111,0x2222,0x3333,0x4444]",
+            description,
+        )
+
+        memory[second_slot + 8] = 0
+        vanished = TRACE.inspect_task_queue_chain(
+            first_handle,
+            target,
+            memory.get,
+        )
+        self.assertEqual(vanished.termination, "null")
+        self.assertEqual(vanished.target_slot, 0)
+
     def test_persistent_breakpoint_planner_adds_without_replacing(self) -> None:
         prepare = {TRACE.PREPARE: TRACE.PREPARE_ADDRESS}
         fixed = {
@@ -266,6 +555,219 @@ class TaskGraphTraceTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {name: value}, clear=True):
                     with self.assertRaises(ValueError):
                         TRACE.guest_address_setting(name, 0x801BE0507)
+
+    def test_direct_attach_requires_stopped_process_with_guest_mapping(
+        self,
+    ) -> None:
+        class FakeError:
+            def __init__(self) -> None:
+                self.failed = False
+
+            def Fail(self) -> bool:
+                return self.failed
+
+        class FakeProcess:
+            def __init__(
+                self,
+                *,
+                valid: bool = True,
+                state: int = 5,
+                mapped: bool = True,
+            ) -> None:
+                self.valid = valid
+                self.state = state
+                self.mapped = mapped
+
+            def IsValid(self) -> bool:
+                return self.valid
+
+            def GetState(self) -> int:
+                return self.state
+
+            def ReadMemory(
+                self, address: int, size: int, error: FakeError
+            ) -> bytes:
+                self.testcase.assertEqual(address, TRACE.PREPARE_ADDRESS)
+                self.testcase.assertEqual(size, 1)
+                error.failed = not self.mapped
+                return b"\x90" if self.mapped else b""
+
+        class FakeTarget:
+            def __init__(self, process: FakeProcess) -> None:
+                self.process = process
+                process.testcase = self_test
+
+            def GetProcess(self) -> FakeProcess:
+                return self.process
+
+        self_test = self
+        fake_lldb = SimpleNamespace(eStateStopped=5, SBError=FakeError)
+        with mock.patch.object(TRACE, "lldb", fake_lldb):
+            self.assertEqual(
+                TRACE._direct_attach_error(
+                    FakeTarget(FakeProcess(valid=False))
+                ),
+                "no valid process is attached",
+            )
+            self.assertIn(
+                "must be stopped",
+                TRACE._direct_attach_error(
+                    FakeTarget(FakeProcess(state=4))
+                )
+                or "",
+            )
+            self.assertIn(
+                "has not mapped",
+                TRACE._direct_attach_error(
+                    FakeTarget(FakeProcess(mapped=False))
+                )
+                or "",
+            )
+            self.assertIsNone(
+                TRACE._direct_attach_error(FakeTarget(FakeProcess()))
+            )
+
+    def test_direct_attach_arms_without_a_host_seed_breakpoint(self) -> None:
+        target = mock.Mock()
+        debugger = mock.Mock()
+        debugger.GetSelectedTarget.return_value = target
+        result = mock.Mock()
+        with mock.patch.dict(
+            os.environ,
+            {"REMU_TASKGRAPH_TRACE_ATTACH": "1"},
+            clear=True,
+        ), mock.patch.object(TRACE, "_arm_direct_attach") as arm:
+            TRACE.start_taskgraph_trace(debugger, "", result, {})
+
+        arm.assert_called_once_with(target, result)
+        target.BreakpointCreateByRegex.assert_not_called()
+
+    def test_attach_cleanup_detaches_without_terminating_target(self) -> None:
+        class FakeError:
+            def Fail(self) -> bool:
+                return False
+
+        process = mock.Mock()
+        process.IsValid.return_value = True
+        process.GetState.return_value = 5
+        process.Detach.return_value = FakeError()
+        target = mock.Mock()
+        target.GetProcess.return_value = process
+        debugger = mock.Mock()
+        debugger.GetSelectedTarget.return_value = target
+        result = mock.Mock()
+        fake_lldb = SimpleNamespace(
+            eStateStopped=5,
+            eStateExited=10,
+            eStateDetached=9,
+        )
+
+        with mock.patch.object(TRACE, "lldb", fake_lldb):
+            TRACE.detach_taskgraph_trace(debugger, "", result, {})
+
+        process.Detach.assert_called_once_with(False)
+        result.SetError.assert_not_called()
+        result.AppendMessage.assert_called_once_with(
+            "[REMu][LLDB][TASKGRAPH] detached without terminating target"
+        )
+
+    def test_attach_duration_interrupts_before_external_watchdog(self) -> None:
+        class FakeTimer:
+            def __init__(self, duration: int, callback) -> None:
+                self.duration = duration
+                self.callback = callback
+                self.daemon = False
+                self.started = False
+                self.cancelled = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        process = mock.Mock()
+        process.IsValid.return_value = True
+        process.GetState.return_value = 6
+        target = mock.Mock()
+        target.GetProcess.return_value = process
+        trace = object.__new__(TRACE.LldbTaskGraphTrace)
+        trace.target = target
+        trace.attach_timer = None
+        trace.attach_timeout_requested = False
+        fake_lldb = SimpleNamespace(
+            eStateRunning=6,
+            eStateExited=10,
+            eStateDetached=9,
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"REMU_TASKGRAPH_TRACE_ATTACH_DURATION_SECONDS": "45"},
+            clear=True,
+        ), mock.patch.object(TRACE.threading, "Timer", FakeTimer), \
+            mock.patch.object(TRACE, "lldb", fake_lldb):
+            trace.start_attach_timeout()
+            timer = trace.attach_timer
+            self.assertIsInstance(timer, FakeTimer)
+            assert isinstance(timer, FakeTimer)
+            self.assertEqual(timer.duration, 45)
+            self.assertTrue(timer.daemon)
+            self.assertTrue(timer.started)
+            with mock.patch("builtins.print"):
+                timer.callback()
+
+        self.assertTrue(trace.attach_timeout_requested)
+        process.SendAsyncInterrupt.assert_called_once_with()
+        trace.cancel_attach_timeout()
+        self.assertTrue(timer.cancelled)
+
+    def test_attach_cli_rejects_non_numeric_pid_before_any_launch(self) -> None:
+        completed = subprocess.run(
+            [
+                "/bin/sh",
+                str(PROBE_SCRIPT),
+                "--attach",
+                "not-a-pid",
+                "/not/used/eboot.bin",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 64)
+        self.assertIn("attach PID must be an integer", completed.stderr)
+
+    def test_attach_contract_checks_target_write_watch_environment(
+        self,
+    ) -> None:
+        source = PROBE_SCRIPT.read_text()
+
+        self.assertIn(
+            '/bin/ps eww -p "$pid" -o command=',
+            source,
+        )
+        self.assertIn(
+            "requires target environment "
+            "REMU_DISABLE_CPU_WRITE_WATCH=1",
+            source,
+        )
+        self.assertIn(
+            'echo "target_cpu_write_watch_disabled='
+            '$target_cpu_write_watch_disabled"',
+            source,
+        )
+        self.assertIn(
+            'echo "debugger_cpu_write_watch_disabled='
+            '$disable_cpu_write_watch"',
+            source,
+        )
+        self.assertIn(
+            'REMU_TASKGRAPH_TRACE_ATTACH_DURATION_SECONDS='
+            '"$attach_trace_seconds"',
+            source,
+        )
 
     def test_wake_path_correlates_only_the_exact_task_and_thread(self) -> None:
         dispatch = self.observe(TRACE.DISPATCH, {"rsi": 0x1000, "rdx": 3, "rcx": 2})
