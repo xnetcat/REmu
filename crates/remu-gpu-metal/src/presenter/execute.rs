@@ -635,6 +635,93 @@ impl MetalPresenter {
                 compiled.pixel.source.contains("while (active)"),
             )
         };
+        let indirect_arguments = if let Some(address) = draw.indirect_arguments_address {
+            if uses_mesh_stage {
+                return Err(format!(
+                    "draw {} uses GPU indirect arguments {address:#x} with an NGG mesh stage; \
+                     refusing the stale packet-time count because mesh argument conversion is \
+                     not implemented",
+                    draw.sequence,
+                ));
+            }
+            if !draw.indexed && matches!(draw.primitive_type, 7 | 0x11) {
+                return Err(format!(
+                    "draw {} uses GPU indirect arguments {address:#x} with rectangle topology; \
+                     refusing the stale packet-time count because Metal rectangle expansion \
+                     requires a GPU argument conversion",
+                    draw.sequence,
+                ));
+            }
+            if draw.indexed {
+                if !matches!(draw.index_size, 0 | 1) {
+                    return Err(format!(
+                        "draw {} uses GPU indirect arguments {address:#x} with unsupported \
+                         {}-encoded index elements",
+                        draw.sequence, draw.index_size,
+                    ));
+                }
+                if register_value(&draw.context_registers, 0x2a5)
+                    .is_some_and(|value| value & 1 != 0)
+                {
+                    return Err(format!(
+                        "draw {} uses GPU indirect arguments {address:#x} with primitive restart; \
+                         refusing the stale packet-time count because restart expansion requires \
+                         a GPU index conversion",
+                        draw.sequence,
+                    ));
+                }
+            }
+            let byte_count = if draw.indexed {
+                5 * std::mem::size_of::<u32>()
+            } else {
+                4 * std::mem::size_of::<u32>()
+            };
+            let arguments = self.upload_ordered_indirect_arguments(&device, address, byte_count)?;
+            static LOGGED_INDIRECT_DRAWS: AtomicUsize = AtomicUsize::new(0);
+            let sequence = LOGGED_INDIRECT_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+            if sequence <= 16 || sequence.is_power_of_two() {
+                eprintln!(
+                    "[REMu][METAL][INDIRECT-DRAW] sequence={sequence} draw={} indexed={} arguments={address:#x}+{byte_count:#x} observed=[count={},instances={},first={},base_vertex={}] source_offset={:#x}",
+                    draw.sequence,
+                    draw.indexed,
+                    draw.index_count,
+                    draw.instance_count,
+                    draw.index_offset,
+                    draw.base_vertex,
+                    arguments.offset,
+                );
+            }
+            Some(arguments)
+        } else {
+            None
+        };
+        let indirect_index_buffer = if draw.indexed && indirect_arguments.is_some() {
+            let (element_size, index_type) = match draw.index_size {
+                0 => (std::mem::size_of::<u16>(), MTLIndexType::UInt16),
+                1 => (std::mem::size_of::<u32>(), MTLIndexType::UInt32),
+                _ => unreachable!("unsupported indirect index size was rejected above"),
+            };
+            let byte_count = usize::try_from(draw.index_buffer_count)
+                .map_err(|_| "indirect index count does not fit usize")?
+                .checked_mul(element_size)
+                .ok_or("indirect index buffer byte count overflow")?;
+            if draw.index_buffer_address < 0x10_000 || byte_count == 0 {
+                return Err(format!(
+                    "draw {} has invalid indirect index buffer {:#x}/{}",
+                    draw.sequence, draw.index_buffer_address, draw.index_buffer_count,
+                ));
+            }
+            Some((
+                self.upload_ordered_indirect_arguments(
+                    &device,
+                    draw.index_buffer_address,
+                    byte_count,
+                )?,
+                index_type,
+            ))
+        } else {
+            None
+        };
         let (export_sampler_buffer, export_samplers) = self.cached_sampler_argument_buffer(
             &device,
             &vertex_function,
@@ -660,7 +747,7 @@ impl MetalPresenter {
             &pixel_buffers,
         )?;
         let mut primitive = metal_primitive_type(draw.primitive_type)?;
-        let indexed_draw = if draw.indexed {
+        let indexed_draw = if draw.indexed && indirect_arguments.is_none() {
             let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
             let prepared = prepare_indexed_primitive(draw, indices)?;
             primitive = prepared.1;
@@ -1035,6 +1122,8 @@ impl MetalPresenter {
                 .expect("guest command batch was opened above");
             batch.work.push(GuestBatchWork::Draw {
                 sequence: draw.sequence,
+                indexed: draw.indexed,
+                indirect_arguments_address: draw.indirect_arguments_address,
                 export: key.export_shader_address,
                 pixel: key.pixel_shader_address,
                 index_count: draw.index_count,
@@ -1263,6 +1352,23 @@ impl MetalPresenter {
             } else if matches!(scissor, GuestScissor::Empty) {
                 // Metal rejects an empty scissor, so a guest empty-scissor draw encodes no
                 // primitive while preserving command-stream ordering.
+            } else if let Some(arguments) = indirect_arguments.as_ref() {
+                if let Some((index_buffer, index_type)) = indirect_index_buffer.as_ref() {
+                    encoder.draw_indexed_primitives_indirect(
+                        primitive,
+                        *index_type,
+                        &index_buffer.buffer,
+                        index_buffer.offset,
+                        &arguments.buffer,
+                        arguments.offset,
+                    );
+                } else {
+                    encoder.draw_primitives_indirect(
+                        primitive,
+                        &arguments.buffer,
+                        arguments.offset,
+                    );
+                }
             } else if let Some((_, index_buffer)) = indexed_draw.as_ref() {
                 encoder.draw_indexed_primitives_instanced_base_instance(
                     primitive,
@@ -2460,6 +2566,8 @@ impl MetalPresenter {
         encoder.end_encoding();
         batch.work.push(GuestBatchWork::Draw {
             sequence: draw.sequence,
+            indexed: draw.indexed,
+            indirect_arguments_address: draw.indirect_arguments_address,
             export: draw.export_shader_address,
             pixel: draw.pixel_shader_address,
             index_count: draw.index_count,
@@ -2551,6 +2659,8 @@ impl MetalPresenter {
         encoder.end_encoding();
         batch.work.push(GuestBatchWork::Draw {
             sequence: draw.sequence,
+            indexed: draw.indexed,
+            indirect_arguments_address: draw.indirect_arguments_address,
             export: draw.export_shader_address,
             pixel: draw.pixel_shader_address,
             index_count: draw.index_count,

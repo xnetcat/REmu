@@ -890,6 +890,8 @@ struct PresenterStatistics {
 enum GuestBatchWork {
     Draw {
         sequence: u64,
+        indexed: bool,
+        indirect_arguments_address: Option<u64>,
         export: u64,
         pixel: u64,
         index_count: u32,

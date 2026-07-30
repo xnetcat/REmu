@@ -330,8 +330,12 @@ fn agc_trace_draw_summary(draw: &remu_gpu::IndexedDraw) {
                 .find(|register| register.offset == offset)
                 .map(|register| register.value)
         });
+        let source = draw.indirect_arguments_address.map_or_else(
+            || "direct".to_owned(),
+            |address| format!("indirect@{address:#x}"),
+        );
         eprintln!(
-            "[REMu][AGC] draw={} indexed={} count={} instances={} offset={} base_vertex={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x} scanout={:#x} target_mask={:#x} viewport={viewport:x?} es_user_base={export_user_data_base:#x} es_user={export_user_data:x?} ps_user={pixel_user_data:x?}",
+            "[REMu][AGC] draw={} indexed={} source={source} count={} instances={} offset={} base_vertex={} index_buffer={:#x}/{} resource={:#x} index_size={} primitive={:#x} es={:#x} ps={:#x} target={:#x} scanout={:#x} target_mask={:#x} viewport={viewport:x?} es_user_base={export_user_data_base:#x} es_user={export_user_data:x?} ps_user={pixel_user_data:x?}",
             draw.sequence,
             draw.indexed,
             draw.index_count,
@@ -366,7 +370,34 @@ pub(crate) fn agc_emit_draw(
     draw_flags: u32,
     future_scanout_target: Option<AgcVideoOutTarget>,
 ) {
-    if element_count == 0 {
+    agc_emit_draw_with_indirect_arguments(
+        packet_address,
+        graphics,
+        shaders,
+        video_out,
+        indexed,
+        element_offset,
+        element_count,
+        draw_flags,
+        future_scanout_target,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agc_emit_draw_with_indirect_arguments(
+    packet_address: u64,
+    graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
+    video_out: &VideoOutState,
+    indexed: bool,
+    element_offset: u32,
+    element_count: u32,
+    draw_flags: u32,
+    future_scanout_target: Option<AgcVideoOutTarget>,
+    indirect_arguments_address: Option<u64>,
+) {
+    if element_count == 0 && indirect_arguments_address.is_none() {
         return;
     }
     graphics.draw_index_offset = element_offset;
@@ -421,7 +452,12 @@ pub(crate) fn agc_emit_draw(
     let mut draw = remu_gpu::IndexedDraw {
         sequence: graphics.emitted_draws,
         indexed,
-        instance_count: graphics.instance_count.max(1),
+        indirect_arguments_address,
+        instance_count: if indirect_arguments_address.is_some() {
+            graphics.instance_count
+        } else {
+            graphics.instance_count.max(1)
+        },
         index_buffer_address: graphics.index_buffer_address,
         index_resource_address: graphics.index_resource_address,
         index_buffer_count: graphics.index_buffer_count,
@@ -450,9 +486,17 @@ pub(crate) fn agc_emit_draw(
         shader_registers: agc_register_snapshot(&graphics.shader_registers),
         user_config_registers: agc_register_snapshot(&graphics.user_config_registers),
     };
-    draw.index_snapshot = snapshot_draw_indices(&draw);
+    if indirect_arguments_address.is_none() {
+        draw.index_snapshot = snapshot_draw_indices(&draw);
+    }
     let export_user_data_base = export_user_data_register(&draw);
-    let required_vertex_record_count = draw_required_vertex_record_count(&draw);
+    // An indirect count observed while parsing can precede the GPU producer that owns the
+    // argument buffer. Do not size vertex snapshots from that stale hint; the Metal backend
+    // consumes the live argument dwords at the ordered execution point.
+    let required_vertex_record_count = indirect_arguments_address
+        .is_none()
+        .then(|| draw_required_vertex_record_count(&draw))
+        .flatten();
     let export_request = draw.export_shader.as_ref().map(|snapshot| {
         shader_evaluation_worker_request(
             &graphics.shader_registers,

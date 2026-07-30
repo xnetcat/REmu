@@ -26,6 +26,54 @@ use super::{
 };
 
 #[test]
+fn native_metal_draw_arguments_match_the_gen5_indirect_layouts() {
+    use metal::{MTLDrawIndexedPrimitivesIndirectArguments, MTLDrawPrimitivesIndirectArguments};
+
+    assert_eq!(std::mem::size_of::<MTLDrawPrimitivesIndirectArguments>(), 16);
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawPrimitivesIndirectArguments, vertexCount),
+        0
+    );
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawPrimitivesIndirectArguments, instanceCount),
+        4
+    );
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawPrimitivesIndirectArguments, vertexStart),
+        8
+    );
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawPrimitivesIndirectArguments, baseInstance),
+        12
+    );
+
+    assert_eq!(
+        std::mem::size_of::<MTLDrawIndexedPrimitivesIndirectArguments>(),
+        20
+    );
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawIndexedPrimitivesIndirectArguments, indexCount),
+        0
+    );
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawIndexedPrimitivesIndirectArguments, instanceCount),
+        4
+    );
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawIndexedPrimitivesIndirectArguments, indexStart),
+        8
+    );
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawIndexedPrimitivesIndirectArguments, baseVertex),
+        12
+    );
+    assert_eq!(
+        std::mem::offset_of!(MTLDrawIndexedPrimitivesIndirectArguments, baseInstance),
+        16
+    );
+}
+
+#[test]
 fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
@@ -223,6 +271,16 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
     assert!(std::ptr::eq(indirect.buffer.as_ref(), producer.as_ref()));
     assert_eq!(indirect.offset, 48);
     assert!(!indirect.guest_memory);
+
+    let indexed_draw = presenter
+        .upload_ordered_indirect_arguments(&device, 0x12_0010, 5 * std::mem::size_of::<u32>())
+        .expect("indexed draw arguments forward the queued GPU producer");
+    assert!(std::ptr::eq(
+        indexed_draw.buffer.as_ref(),
+        producer.as_ref()
+    ));
+    assert_eq!(indexed_draw.offset, 48);
+    assert!(!indexed_draw.guest_memory);
 }
 
 #[test]

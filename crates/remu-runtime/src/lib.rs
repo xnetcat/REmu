@@ -101,8 +101,8 @@ pub(crate) use agc_api::{
     SHADER_HEADER_TYPE_OFFSET, SPI_SHADER_PGM_LO_ES,
 };
 pub(crate) use agc_draw::{
-    agc_apply_set_base, agc_decode_compute_dispatch, agc_emit_draw, agc_emit_indexed_draw,
-    agc_image_binding_address,
+    agc_apply_set_base, agc_decode_compute_dispatch, agc_emit_draw,
+    agc_emit_draw_with_indirect_arguments, agc_emit_indexed_draw, agc_image_binding_address,
 };
 #[cfg(test)]
 pub(crate) use agc_draw::{agc_prepare_draw_color_targets, agc_resolve_targetless_scanout};

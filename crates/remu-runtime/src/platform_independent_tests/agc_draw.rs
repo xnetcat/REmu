@@ -252,7 +252,7 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
 
 #[test]
 fn executes_nonindexed_indirect_draw_from_the_graphics_set_base() {
-    let arguments = AlignedIndirectArguments([6, 3, 4, 7, 0, 0, 0, 0]);
+    let mut arguments = AlignedIndirectArguments([6, 3, 4, 7, 0, 0, 0, 0]);
     let arguments_address = arguments.0.as_ptr().addr() as u64;
     let set_base = [
         agc_pm4(4, AGC_IT_SET_BASE, 0),
@@ -296,8 +296,49 @@ fn executes_nonindexed_indirect_draw_from_the_graphics_set_base() {
     assert_eq!(draw.index_offset, 4);
     assert_eq!(draw.base_vertex, 0);
     assert_eq!(draw.draw_flags, 2);
-    assert_eq!(graphics.shader_registers.get(&0x08c), Some(&4));
-    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&7));
+    assert_eq!(draw.indirect_arguments_address, Some(arguments_address));
+    assert_eq!(
+        draw.shader_registers
+            .iter()
+            .find(|register| register.offset == 0x08c)
+            .map(|register| register.value),
+        Some(0)
+    );
+    assert_eq!(
+        draw.shader_registers
+            .iter()
+            .find(|register| register.offset == 0x08d)
+            .map(|register| register.value),
+        Some(0)
+    );
+    assert_eq!(graphics.shader_registers.get(&0x08c), None);
+    assert_eq!(graphics.shader_registers.get(&0x08d), None);
+
+    arguments.0[..4].fill(0);
+    let (result, events) = crate::capture_agc_gpu_events(|| {
+        crate::agc_handle_submission_packet(
+            crate::AgcSubmissionPacket {
+                address: packet.as_ptr().addr() as u64,
+                length: 5,
+                opcode: AGC_IT_DRAW_INDIRECT,
+                register: 0,
+                predicated: false,
+            },
+            &mut graphics,
+            &mut shaders,
+            &VideoOutState::default(),
+            &mut flips,
+            &mut event_writes,
+            None,
+        )
+    });
+    result.expect("zero-snapshot nonindexed indirect draw");
+    let [remu_gpu::GpuEvent::IndexedDraw(draw)] = events.as_slice() else {
+        panic!("zero-snapshot indirect draw must reach the ordered backend");
+    };
+    assert_eq!(draw.indirect_arguments_address, Some(arguments_address));
+    assert_eq!(draw.index_count, 0);
+    assert_eq!(draw.instance_count, 0);
 }
 
 #[test]
@@ -369,11 +410,19 @@ fn executes_indexed_indirect_draw_with_all_five_argument_fields() {
     assert_eq!(draw.base_vertex, -3);
     assert_eq!(draw.draw_flags, 2);
     assert_eq!(
-        graphics.shader_registers.get(&0x08c),
-        Some(&((-3_i32) as u32))
+        draw.indirect_arguments_address,
+        Some(arguments_address + 0x28)
     );
-    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&1));
-    assert_eq!(graphics.shader_registers.get(&0x08e), Some(&9));
+    assert_eq!(
+        draw.shader_registers
+            .iter()
+            .find(|register| register.offset == 0x08c)
+            .map(|register| register.value),
+        Some(0)
+    );
+    assert_eq!(graphics.shader_registers.get(&0x08c), None);
+    assert_eq!(graphics.shader_registers.get(&0x08d), None);
+    assert_eq!(graphics.shader_registers.get(&0x08e), None);
 }
 
 #[test]

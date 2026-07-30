@@ -12,10 +12,10 @@ use crate::{
     AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64,
     AGC_R_WRITE_DATA, AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget,
     ProcessGuestMemory, VideoOutState, agc_apply_set_base, agc_apply_submission_registers,
-    agc_decode_compute_dispatch, agc_emit_draw, agc_emit_indexed_draw, agc_image_binding_address,
-    agc_submit_ordered_video_out_flip, emit_agc_gpu_event, read_guest_u32, read_guest_u64,
-    trace_agc_programs, trace_agc_registers, trace_agc_shaders, trace_guest_sync,
-    trace_logarithmic_sequence,
+    agc_decode_compute_dispatch, agc_emit_draw, agc_emit_draw_with_indirect_arguments,
+    agc_emit_indexed_draw, agc_image_binding_address, agc_submit_ordered_video_out_flip,
+    emit_agc_gpu_event, read_guest_u32, read_guest_u64, trace_agc_programs, trace_agc_registers,
+    trace_agc_shaders, trace_guest_sync, trace_logarithmic_sequence,
 };
 mod decode;
 mod driver;
@@ -92,12 +92,6 @@ fn agc_read_indirect_draw_arguments(
     })
 }
 
-fn agc_set_indirect_shader_register(graphics: &mut AgcGraphicsState, register: u32, value: u32) {
-    if register != INDIRECT_DRAW_REGISTER_UNMAPPED {
-        graphics.shader_registers.insert(register, value);
-    }
-}
-
 fn agc_emit_indirect_draw(
     packet_address: u64,
     graphics: &mut AgcGraphicsState,
@@ -109,33 +103,58 @@ fn agc_emit_indirect_draw(
     first_element_register: Option<u32>,
     first_instance_register: u32,
     draw_flags: u32,
+    arguments_address: u64,
     future_scanout_target: Option<AgcVideoOutTarget>,
 ) {
-    // The command processor suppresses zero-sized indirect draws. agc_emit_draw intentionally
-    // normalizes direct NUM_INSTANCES packets to one, so filter the indirect zero here.
-    if arguments.element_count == 0 || arguments.instance_count == 0 {
-        return;
+    static INDIRECT_DRAW_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let sequence = INDIRECT_DRAW_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if trace_agc_programs()
+        || sequence <= 8
+        || sequence.is_power_of_two()
+        || arguments.element_count > 1_048_576
+        || arguments.instance_count > 65_536
+    {
+        let first_element_register = first_element_register.map_or_else(
+            || "unmapped".to_owned(),
+            |register| format!("{register:#x}"),
+        );
+        eprintln!(
+            "[REMu][AGC][INDIRECT-DRAW] sequence={sequence} packet={packet_address:#x} indexed={indexed} arguments={arguments_address:#x} observed=[count={},instances={},first={},base_vertex={},base_instance={}] registers=[base={base_vertex_register:#x},first={first_element_register},instance={first_instance_register:#x}] flags={draw_flags:#x}",
+            arguments.element_count,
+            arguments.instance_count,
+            arguments.element_offset,
+            arguments.base_vertex,
+            arguments.first_instance,
+        );
     }
-    agc_set_indirect_shader_register(
-        graphics,
-        base_vertex_register,
-        if indexed {
-            arguments.base_vertex as u32
-        } else {
-            arguments.element_offset
-        },
-    );
-    if let Some(register) = first_element_register {
-        agc_set_indirect_shader_register(graphics, register, arguments.element_offset);
+    // The packet-time CPU observation can precede a GPU producer of these dwords. Preserve the
+    // event even when it presently looks empty and let the backend consume the argument buffer at
+    // its ordered execution point.
+    //
+    // Native indirect drawing applies first vertex/base vertex and first instance to the shader
+    // built-ins. Keep the corresponding translated scalar inputs neutral instead of baking this
+    // potentially stale CPU observation into the shader metadata as well. These are per-draw
+    // command-processor patches, so restore the persistent register file afterwards.
+    let mut neutralized_registers = Vec::with_capacity(3);
+    for register in std::iter::once(base_vertex_register)
+        .chain(first_element_register)
+        .chain(std::iter::once(first_instance_register))
+    {
+        if register != INDIRECT_DRAW_REGISTER_UNMAPPED
+            && !neutralized_registers
+                .iter()
+                .any(|&(saved, _)| saved == register)
+        {
+            neutralized_registers.push((register, graphics.shader_registers.insert(register, 0)));
+        }
     }
-    agc_set_indirect_shader_register(graphics, first_instance_register, arguments.first_instance);
 
     let previous_instance_count =
         std::mem::replace(&mut graphics.instance_count, arguments.instance_count);
     let previous_base_vertex = graphics
         .context_registers
         .insert(0x102, arguments.base_vertex as u32);
-    agc_emit_draw(
+    agc_emit_draw_with_indirect_arguments(
         packet_address,
         graphics,
         shaders,
@@ -145,12 +164,20 @@ fn agc_emit_indirect_draw(
         arguments.element_count,
         draw_flags,
         future_scanout_target,
+        Some(arguments_address),
     );
     graphics.instance_count = previous_instance_count;
     if let Some(value) = previous_base_vertex {
         graphics.context_registers.insert(0x102, value);
     } else {
         graphics.context_registers.remove(&0x102);
+    }
+    for (register, value) in neutralized_registers {
+        if let Some(value) = value {
+            graphics.shader_registers.insert(register, value);
+        } else {
+            graphics.shader_registers.remove(&register);
+        }
     }
 }
 
@@ -206,6 +233,7 @@ fn agc_handle_indirect_draw(
         first_element_register,
         first_instance_register,
         draw_flags,
+        address,
         future_scanout_target,
     );
     Ok(())
