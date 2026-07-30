@@ -110,6 +110,123 @@ fn resolves_acyclic_unconditional_branches_without_lowering_dead_instructions() 
     assert!(!shader.source.contains("switch (pc)"));
 }
 
+fn setpc(pc: u32) -> Instruction {
+    Instruction {
+        pc,
+        encoding: ShaderEncoding::Sop1,
+        opcode: Opcode::Known("SSetpcB64"),
+        words: vec![0xbe80_2006],
+        sources: vec![Operand::scalar(6)],
+        destinations: Vec::new(),
+        control: None,
+    }
+}
+
+#[test]
+fn setpc_terminates_direct_lowering_without_emitting_a_dynamic_pc_operation() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(2)],
+                control: None,
+            },
+            setpc(4),
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SSwappcB64"),
+                words: vec![0xbe80_2106],
+                sources: vec![Operand::scalar(6)],
+                destinations: vec![Operand::scalar(0)],
+                control: None,
+            },
+        ],
+    );
+
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("terminal setpc must lower without reaching trailing allocation contents");
+
+    assert!(shader.register_footprint.direct_control_flow);
+    assert!(!shader.source.contains("while (active)"));
+    assert!(!shader.source.contains("switch (pc)"));
+}
+
+#[test]
+fn setpc_deactivates_each_forward_control_flow_path() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SCbranchScc1"),
+                words: vec![1],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            setpc(4),
+            setpc(8),
+        ],
+    );
+
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("terminal setpc must lower in forward conditional blocks");
+
+    assert!(!shader.register_footprint.direct_control_flow);
+    assert_eq!(shader.source.matches("active = false;").count(), 2);
+}
+
+#[test]
+fn swappc_remains_a_nonterminal_unsupported_dynamic_call() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SSwappcB64"),
+                words: vec![0xbe80_2106],
+                sources: vec![Operand::scalar(6)],
+                destinations: vec![Operand::scalar(0)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+
+    let error = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect_err("swappc is a dynamic call whose continuation cannot be discarded");
+
+    assert!(error.to_string().contains("SSwappcB64"));
+}
+
 #[test]
 fn forward_conditional_control_flow_avoids_the_loop_dispatcher_and_register_arrays() {
     let program = Program::new(

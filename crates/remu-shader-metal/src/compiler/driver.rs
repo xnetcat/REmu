@@ -330,7 +330,7 @@ impl<'a> Compiler<'a> {
             .ok_or_else(|| "raw opcode has no lowering semantics".to_owned())?;
 
         match name {
-            "SEndpgm" => {
+            "SEndpgm" | "SSetpcB64" => {
                 if dispatched {
                     self.line(3, "active = false;");
                 }

@@ -127,7 +127,7 @@ pub(crate) fn analyze_control_flow(
         }
         path.push(index);
         match instruction.opcode.known_name() {
-            Some("SEndpgm") => break,
+            Some("SEndpgm" | "SSetpcB64") => break,
             Some("SBranch") => {
                 let target = branch_target(instruction).expect("all branch targets were validated");
                 index = instruction_by_pc[&target];
@@ -153,6 +153,10 @@ pub(crate) fn is_scalar_branch(opcode: Opcode) -> bool {
         .is_some_and(|name| name == "SBranch" || name.starts_with("SCbranch"))
 }
 
+pub(crate) fn is_terminal_transfer(opcode: Opcode) -> bool {
+    matches!(opcode.known_name(), Some("SEndpgm" | "SSetpcB64"))
+}
+
 pub(crate) fn dispatcher_basic_blocks(program: &Program) -> Vec<std::ops::Range<usize>> {
     let mut instruction_by_pc = BTreeMap::new();
     for (index, instruction) in program.instructions.iter().enumerate() {
@@ -161,8 +165,8 @@ pub(crate) fn dispatcher_basic_blocks(program: &Program) -> Vec<std::ops::Range<
 
     let mut leaders = BTreeSet::from([0_usize]);
     for (index, instruction) in program.instructions.iter().enumerate() {
-        let terminator = is_scalar_branch(instruction.opcode)
-            || instruction.opcode.known_name() == Some("SEndpgm");
+        let terminator =
+            is_scalar_branch(instruction.opcode) || is_terminal_transfer(instruction.opcode);
         if terminator && index + 1 < program.instructions.len() {
             leaders.insert(index + 1);
         }
