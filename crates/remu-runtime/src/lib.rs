@@ -117,7 +117,8 @@ pub(crate) use agc_flip::{
 pub(crate) use agc_registers::{
     AgcColorTargetState, AgcComputeDispatchError, AgcSubmissionError,
     agc_apply_submission_registers, agc_color_target_state, agc_has_active_depth_state,
-    agc_program_address, agc_register_snapshot, agc_shader_prefix_snapshot, agc_shader_snapshot,
+    agc_program_address, agc_register_snapshot, agc_shader_code_fingerprint,
+    agc_shader_prefix_snapshot, agc_shader_snapshot,
 };
 pub(crate) use agc_submission::{
     AgcSubmissionContext, agc_driver_submit_acb, agc_driver_submit_dcb,
@@ -984,6 +985,7 @@ struct AgcGraphicsState {
 struct AgcShaderRegistry {
     headers: BTreeMap<u64, u64>,
     code_sizes: BTreeMap<u64, u32>,
+    registration_code_fingerprints: BTreeMap<u64, u64>,
     snapshots: BTreeMap<u64, remu_gpu::ShaderSnapshot>,
     decode_failures: BTreeSet<u64>,
 }
