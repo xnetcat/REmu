@@ -1688,6 +1688,8 @@ struct ImportCallFrame {
     guest_return_address: u64,
     dispatch_index: u64,
     xmm_arguments: [u128; 8],
+    guest_rbx: u64,
+    _reserved: u64,
 }
 
 #[derive(Debug)]
@@ -1975,7 +1977,7 @@ fn retire_current_guest_import_trace() {
     });
 }
 
-const IMPORT_CALL_FRAME_SIZE: usize = 0xd0;
+const IMPORT_CALL_FRAME_SIZE: usize = 0xe0;
 const _: () = {
     assert!(std::mem::size_of::<ImportCallFrame>() == IMPORT_CALL_FRAME_SIZE);
     assert!(std::mem::align_of::<ImportCallFrame>() == 16);
@@ -1984,6 +1986,7 @@ const _: () = {
     assert!(std::mem::offset_of!(ImportCallFrame, guest_return_address) == 0x40);
     assert!(std::mem::offset_of!(ImportCallFrame, dispatch_index) == 0x48);
     assert!(std::mem::offset_of!(ImportCallFrame, xmm_arguments) == 0x50);
+    assert!(std::mem::offset_of!(ImportCallFrame, guest_rbx) == 0xd0);
 };
 
 #[repr(C, align(16))]
@@ -2058,7 +2061,7 @@ fn deliver_pending_guest_exception_at_import(frame: &ImportCallFrame) {
 #[unsafe(naked)]
 unsafe extern "C" fn import_dispatch_trampoline() {
     core::arch::naked_asm!(
-        "sub rsp, 0xd0",
+        "sub rsp, 0xe0",
         "mov [rsp + 0x00], rdi",
         "mov [rsp + 0x08], rsi",
         "mov [rsp + 0x10], rdx",
@@ -2066,11 +2069,11 @@ unsafe extern "C" fn import_dispatch_trampoline() {
         "mov [rsp + 0x20], r8",
         "mov [rsp + 0x28], r9",
         "mov [rsp + 0x30], rax",
-        "lea r10, [rsp + 0xd8]",
+        "lea r10, [rsp + 0xe8]",
         "mov [rsp + 0x38], r10",
-        "mov r10, [rsp + 0xd8]",
+        "mov r10, [rsp + 0xe8]",
         "mov [rsp + 0x40], r10",
-        "mov r10, [rsp + 0xd0]",
+        "mov r10, [rsp + 0xe0]",
         "mov [rsp + 0x48], r10",
         "movdqu [rsp + 0x50], xmm0",
         "movdqu [rsp + 0x60], xmm1",
@@ -2080,9 +2083,11 @@ unsafe extern "C" fn import_dispatch_trampoline() {
         "movdqu [rsp + 0xa0], xmm5",
         "movdqu [rsp + 0xb0], xmm6",
         "movdqu [rsp + 0xc0], xmm7",
+        "mov [rsp + 0xd0], rbx",
+        "mov qword ptr [rsp + 0xd8], 0",
         "mov rdi, rsp",
         "call {dispatch}",
-        "add rsp, 0xd0",
+        "add rsp, 0xe0",
         "add rsp, 8",
         "ret",
         dispatch = sym import_dispatch_entry,
@@ -2100,6 +2105,8 @@ static TEST_CAPTURED_IMPORT_FRAME: Mutex<Option<ImportCallFrame>> = Mutex::new(N
 unsafe extern "C" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
     core::arch::naked_asm!(
         "mov r11, rdi",
+        "push rbx",
+        "mov rbx, 0x7172737475767778",
         "mov rdi, 0x11",
         "mov rsi, 0x22",
         "mov rdx, 0x33",
@@ -2123,9 +2130,8 @@ unsafe extern "C" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
         "movq xmm6, r10",
         "mov r10, 0x808",
         "movq xmm7, r10",
-        "sub rsp, 8",
         "call r11",
-        "add rsp, 8",
+        "pop rbx",
         "ret",
     );
 }
@@ -2452,6 +2458,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     }
     if nid == "T72hz6ffq08" {
         static RENDER_THREAD_YIELD_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        const BLOCKING_RENDER_QUERY_YIELD_RETURN: u64 = 0x8011_42b17;
         let thread_name = current_guest_thread_name();
         if trace_guest_sync() && thread_name.contains("RenderThread") {
             let sequence = RENDER_THREAD_YIELD_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2464,27 +2471,33 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
                     )
                     .unwrap_or(0)
                 });
-                // This sampled RenderThread call site saves its RHI query object in RBX at
-                // stack[4]. The object owns a counter payload at +0x28 and a completion-label
-                // pointer at +0x30. All reads remain fallible because another yield call site can
-                // have a different frame shape.
-                let query_object = stack[4];
-                let query_payload = (query_object != 0)
-                    .then(|| query_object.checked_add(0x28))
-                    .flatten()
-                    .and_then(try_read_process_guest_u64);
-                let query_completion = (query_object != 0)
-                    .then(|| query_object.checked_add(0x30))
-                    .flatten()
-                    .and_then(try_read_process_guest_u64);
-                let query_completion_value = query_completion
-                    .filter(|address| *address != 0)
-                    .and_then(try_read_process_guest_u64);
-                eprintln!(
-                    "[REMu][PTHREAD][YIELD] sequence={sequence} thread={thread_name:?}/{:#x} return={guest_return_address:#x} rsp={:#x} stack={stack:#x?} query_object={query_object:#x} query_payload={query_payload:#x?} query_completion={query_completion:#x?} query_completion_value={query_completion_value:#x?}",
-                    current_guest_thread_handle(),
-                    frame.guest_rsp,
-                );
+                if guest_return_address == BLOCKING_RENDER_QUERY_YIELD_RETURN {
+                    // The materialized query-result routine keeps its live query object in RBX.
+                    // stack[4] is the caller's RBX saved by that routine's prologue, not the
+                    // current object. The object owns a counter payload at +0x28 and a separate
+                    // completion-label pointer at +0x30.
+                    let query_object = frame.guest_rbx;
+                    let query_payload = query_object
+                        .checked_add(0x28)
+                        .and_then(try_read_process_guest_u64);
+                    let query_completion = query_object
+                        .checked_add(0x30)
+                        .and_then(try_read_process_guest_u64);
+                    let query_completion_value = query_completion
+                        .filter(|address| *address != 0)
+                        .and_then(try_read_process_guest_u64);
+                    eprintln!(
+                        "[REMu][PTHREAD][YIELD] sequence={sequence} thread={thread_name:?}/{:#x} return={guest_return_address:#x} rsp={:#x} stack={stack:#x?} query_object={query_object:#x} query_payload={query_payload:#x?} query_completion={query_completion:#x?} query_completion_value={query_completion_value:#x?}",
+                        current_guest_thread_handle(),
+                        frame.guest_rsp,
+                    );
+                } else {
+                    eprintln!(
+                        "[REMu][PTHREAD][YIELD] sequence={sequence} thread={thread_name:?}/{:#x} return={guest_return_address:#x} rsp={:#x} stack={stack:#x?}",
+                        current_guest_thread_handle(),
+                        frame.guest_rsp,
+                    );
+                }
             }
         }
         std::thread::yield_now();
