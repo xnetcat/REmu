@@ -15,6 +15,7 @@ use super::{
     diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
     diagnostic_video_chain_selected_draw, effective_linear_pitch,
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
     is_storage_image_opcode, program_embeds_global_base, tiled_block_dimensions,
     trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,

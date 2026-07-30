@@ -9,7 +9,40 @@ use remu_shader::{
     InstructionControl, OperandKind, Program, ShaderEvaluation, image_is_comparison,
 };
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Canonical empty pixel program used by depth/stencil-only draws.
+///
+/// GFX10 permits a graphics pipeline with no pixel program when no color attachment is written.
+/// Keeping one process-wide IR allocation gives those fragmentless pipelines a stable cache
+/// identity without pretending that guest address zero names shader code.
+pub(crate) fn fragmentless_pixel_program() -> &'static Arc<Program> {
+    static PROGRAM: OnceLock<Arc<Program>> = OnceLock::new();
+    PROGRAM.get_or_init(|| {
+        Arc::new(
+            remu_shader::decode_program(0, &[0xbf81_0000])
+                .expect("the canonical S_ENDPGM instruction must decode"),
+        )
+    })
+}
+
+/// Canonical resource state paired with [`fragmentless_pixel_program`].
+///
+/// The generated Metal `fragment void` entry point still carries the backend's scalar-buffer
+/// parameter. Supply one inert dword so normal encoder binding remains valid while the stage has
+/// no guest resources or side effects.
+pub(crate) fn fragmentless_pixel_evaluation() -> &'static ShaderEvaluation {
+    static EVALUATION: OnceLock<ShaderEvaluation> = OnceLock::new();
+    EVALUATION.get_or_init(|| ShaderEvaluation {
+        initial_scalar_registers: std::iter::once(0).collect(),
+        scalar_registers: std::iter::once(0).collect(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    })
+}
 
 pub(crate) fn graphics_allocated_vector_register_count(
     shader_registers: &[GpuRegister],
