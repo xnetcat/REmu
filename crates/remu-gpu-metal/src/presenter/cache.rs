@@ -6,15 +6,15 @@ use super::{
     GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, NggSubgroupLimits,
     PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey,
     UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
-    guest_batch_writes_overlap, guest_global_buffer_view, guest_physical_ranges_overlap,
-    metal_buffer_with_bytes, prepare_ngg_meshlets,
+    describe_guest_batch, guest_batch_writes_overlap, guest_global_buffer_view,
+    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
     Buffer, DepthStencilDescriptor, DepthStencilState, Device, Function, MTLCompareFunction,
     MTLResourceOptions, SamplerState,
 };
-use remu_memory::guest_shared_mapping_identity;
+use remu_memory::{guest_shared_mapping_identity, read_guest_shared_backing};
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -25,6 +25,59 @@ enum QueuedGlobalReadSource {
     Buffer { buffer: Buffer, offset: u64 },
     GuestMemory,
     Synchronize,
+}
+
+fn read_indirect_guest_dwords(address: u64, byte_count: usize) -> Option<Vec<u32>> {
+    let mut bytes = vec![0_u8; byte_count];
+    if !read_guest_shared_backing(address, &mut bytes) {
+        return None;
+    }
+    Some(decode_indirect_dwords(&bytes))
+}
+
+fn decode_indirect_dwords(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(std::mem::size_of::<u32>())
+        .map(|word| u32::from_le_bytes(word.try_into().expect("dword chunk has four bytes")))
+        .collect()
+}
+
+fn indirect_producer_overlap_summary(
+    producer: &GuestCommandBatch,
+    address: u64,
+    byte_count: u64,
+) -> String {
+    let mut overlaps = Vec::new();
+    overlaps.extend(
+        producer
+            .guest_write_ranges
+            .iter()
+            .filter(|range| {
+                guest_physical_ranges_overlap(range.address, range.byte_count, address, byte_count)
+            })
+            .map(|range| format!("guest-write@{:#x}/{:#x}", range.address, range.byte_count)),
+    );
+    overlaps.extend(producer.global_writebacks.iter().filter_map(|writeback| {
+        let writeback_byte_count = u64::try_from(writeback.byte_count).ok()?;
+        guest_physical_ranges_overlap(
+            writeback.guest_address,
+            writeback_byte_count,
+            address,
+            byte_count,
+        )
+        .then(|| {
+            format!(
+                "global-writeback@{:#x}/{:#x}+buffer-offset-{:#x}",
+                writeback.guest_address, writeback_byte_count, writeback.offset,
+            )
+        })
+    }));
+    overlaps.extend(producer.memory_writes.iter().filter_map(|write| {
+        let (write_address, write_byte_count) = write.range();
+        guest_physical_ranges_overlap(write_address, write_byte_count, address, byte_count)
+            .then(|| format!("memory-write@{write_address:#x}/{write_byte_count:#x}"))
+    }));
+    overlaps.join(",")
 }
 
 impl MetalPresenter {
@@ -54,6 +107,7 @@ impl MetalPresenter {
             write_back_to_guest: false,
         };
         let source = self.queued_global_read_source(&binding)?;
+        self.trace_indirect_producer_selection(address, byte_count, &source);
         static INDIRECT_UPLOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
         static TRACE_ALL_INDIRECT_UPLOADS: OnceLock<bool> = OnceLock::new();
         let sequence = INDIRECT_UPLOAD_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -92,6 +146,63 @@ impl MetalPresenter {
         address: u64,
     ) -> Result<UploadedGlobalBuffer, String> {
         self.upload_ordered_indirect_arguments(device, address, 3 * std::mem::size_of::<u32>())
+    }
+
+    /// Identifies the queued producer selected for a native indirect argument read.
+    ///
+    /// The ordinary indirect-buffer trace deliberately reports only the source category. This
+    /// opt-in diagnostic reports the producer's complete ordered Metal batch and the CPU-visible
+    /// dwords at selection time, without synchronizing or otherwise perturbing the queue.
+    fn trace_indirect_producer_selection(
+        &self,
+        address: u64,
+        byte_count: usize,
+        source: &QueuedGlobalReadSource,
+    ) {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("REMU_TRACE_INDIRECT_PRODUCERS").is_some_and(|value| value != "0")
+        }) {
+            return;
+        }
+        let byte_count_u64 = u64::try_from(byte_count).unwrap_or(u64::MAX);
+        let selected = self
+            .open_guest_batch
+            .as_ref()
+            .filter(|batch| guest_batch_writes_overlap(batch, address, byte_count_u64))
+            .map(|batch| ("open", 0, batch))
+            .or_else(|| {
+                self.committed_guest_batches
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .find(|(_, batch)| guest_batch_writes_overlap(batch, address, byte_count_u64))
+                    .map(|(reverse_index, batch)| ("committed", reverse_index, batch))
+            });
+        let source = match source {
+            QueuedGlobalReadSource::None => "guest",
+            QueuedGlobalReadSource::Buffer { .. } => "gpu-writeback",
+            QueuedGlobalReadSource::GuestMemory => "ordered-guest",
+            QueuedGlobalReadSource::Synchronize => "synchronize",
+        };
+        let dwords = read_indirect_guest_dwords(address, byte_count);
+        match selected {
+            Some((location, reverse_index, producer)) => {
+                let overlap = indirect_producer_overlap_summary(producer, address, byte_count_u64);
+                eprintln!(
+                    "[REMu][METAL][INDIRECT-PRODUCER][SELECT] address={address:#x} bytes={byte_count} \
+                     source={source} producer_location={location} producer_reverse_index={reverse_index} \
+                     producer_status={:?} overlap=[{overlap}] \
+                     cpu_visible_dwords={dwords:?} producer=[{}]",
+                    producer.command_buffer.status(),
+                    describe_guest_batch(&producer.work),
+                );
+            }
+            None => eprintln!(
+                "[REMu][METAL][INDIRECT-PRODUCER][SELECT] address={address:#x} bytes={byte_count} \
+                 source={source} producer=none cpu_visible_dwords={dwords:?}"
+            ),
+        }
     }
 
     pub(super) fn cached_sampler_argument_buffer(
@@ -658,3 +769,16 @@ pub(super) const GUEST_GLOBAL_BUFFER_MAX_ZERO_COPY_BYTES: u64 = 256 * 1024 * 102
 pub(super) const INDEX_BUFFER_CACHE_CAPACITY: usize = 256;
 
 pub(super) const NGG_MESHLET_CACHE_CAPACITY: usize = 64;
+
+#[cfg(test)]
+mod tests {
+    use super::decode_indirect_dwords;
+
+    #[test]
+    fn indirect_dword_diagnostics_decode_complete_little_endian_words() {
+        assert_eq!(
+            decode_indirect_dwords(&[0x01, 0x02, 0x03, 0x04, 0x78, 0x56, 0x34, 0x12, 0xaa, 0xbb,]),
+            [0x0403_0201, 0x1234_5678]
+        );
+    }
+}
