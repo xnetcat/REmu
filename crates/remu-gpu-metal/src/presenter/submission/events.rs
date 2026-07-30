@@ -426,6 +426,27 @@ impl OrderedGpuEventReceiver {
             .join("; ")
     }
 
+    pub(crate) fn blocked_wait_dependency_diagnostics(&self) -> String {
+        self.queue_order
+            .iter()
+            .filter_map(|queue_id| {
+                let QueueBlockReason::GuestMemoryWait(wait) = self.blocked_queues.get(queue_id)?
+                else {
+                    return None;
+                };
+                Some(format!(
+                    "q{queue_id}:wait@{:#x}/ref:{:#x}/mask:{:#x}/cmp:{}/producers:[{}]",
+                    wait.address,
+                    wait.reference,
+                    wait.mask,
+                    wait.compare_function,
+                    self.describe_queued_wait_producers(*wait),
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// Describes already-ingested packets which can write the label watched by `wait`.
     ///
     /// This is diagnostic only: queue-local ordering must still be preserved. It distinguishes a

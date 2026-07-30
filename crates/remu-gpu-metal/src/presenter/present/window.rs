@@ -221,6 +221,10 @@ impl MetalPresenter {
             if !queue_diagnostics.is_empty() {
                 eprintln!("[REMu][PERF-QUEUES] {queue_diagnostics}");
             }
+            let wait_dependencies = self.receiver.blocked_wait_dependency_diagnostics();
+            if !wait_dependencies.is_empty() {
+                eprintln!("[REMu][PERF-QUEUE-WAITS] {wait_dependencies}");
+            }
             if !self.committed_guest_batches.is_empty() {
                 let batches = self
                     .committed_guest_batches
