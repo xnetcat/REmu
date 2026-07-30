@@ -3,7 +3,7 @@
 
 use metal::CompileOptions;
 use remu_gpu::{
-    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuRegister,
+    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuRegister,
     ShaderSnapshot, gpu_event_channel,
 };
 use remu_shader::{
@@ -15,16 +15,28 @@ use std::sync::Arc;
 
 use super::{
     CompiledComputePipeline, ComputePipelineKey, MetalPresenter, ProgramIdentity,
-    ShaderCompileRequest, ShaderCompileResult, canonical_sampler_bindings,
-    canonical_texture_bindings, compute_launch, graphics_shader_resource_key,
+    OrderedEventPoll, OrderedGpuEventReceiver, QueueBlockReason, ShaderCompileRequest,
+    ShaderCompileResult, canonical_sampler_bindings, canonical_texture_bindings,
+    compile_shader_request_catching_panics, compute_launch, graphics_shader_resource_key,
     image_component_class, missing_vertex_parameter_exports, ngg_mesh_export_stage,
     procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
     rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
-    shader_scalar_metadata, shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
+    shader_scalar_metadata, shader_scalar_metadata_for_registers,
+    speculative_pipeline_compile_in_flight_capacity, validate_compute_launch_for_metal,
     wave64_split_blockers,
 };
 
 fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
+    let program = Arc::new(Program::new(0x5000, Vec::new()));
+    let evaluation = Arc::new(ShaderEvaluation {
+        initial_scalar_registers: Default::default(),
+        scalar_registers: Default::default(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    });
     let dispatch = ComputeDispatch {
         sequence: 41,
         source: ComputeDispatchSource::Direct,
@@ -39,11 +51,15 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
         },
         shader_address: 0x5000,
         shader_prefix: [0; 4],
-        shader: None,
-        shader_evaluation: None,
+        shader: Some(ShaderSnapshot {
+            header_address: 0x5000,
+            program: Arc::clone(&program),
+            supplemental_programs: Arc::from([]),
+            metadata: None,
+        }),
+        shader_evaluation: Some(evaluation),
         shader_registers: Vec::new(),
     };
-    let program = Arc::new(Program::new(dispatch.shader_address, Vec::new()));
     let key = ComputePipelineKey {
         program_identity: ProgramIdentity(program),
         lds_size_bytes: 0,
@@ -90,6 +106,57 @@ fn duplicate_compute_pipeline_compile_requests_are_coalesced() {
 }
 
 #[test]
+fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
+    let (gpu_sender, gpu_receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
+    let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(1);
+    presenter.shader_compile_sender = request_sender;
+    let speculative_limit = speculative_pipeline_compile_in_flight_capacity();
+    for index in 0..speculative_limit {
+        let address = 0x6000 + u64::try_from(index).expect("test index fits u64");
+        presenter
+            .compiling_compute_pipelines
+            .insert(ComputePipelineKey {
+                program_identity: ProgramIdentity(Arc::new(Program::new(address, Vec::new()))),
+                lds_size_bytes: 0,
+                wave_lane_count: 64,
+                allocated_vector_register_count: 4,
+                compute_system_registers: None,
+                initial_scalar_count: 0,
+                global_bindings: Vec::new(),
+                image_bindings: Vec::new(),
+            });
+    }
+    let (dispatch, key) = pending_compute_pipeline();
+    gpu_sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::ComputeDispatch(Box::new(dispatch.clone()))],
+        })
+        .expect("queue speculative lookahead");
+
+    presenter.prefetch_pipeline_compilations();
+    assert!(
+        matches!(
+            request_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "lookahead stops before consuming capacity reserved for a required front"
+    );
+
+    presenter.compile_compute_shader(&dispatch, &key);
+    match request_receiver
+        .try_recv()
+        .expect("required queue-front compile is queued")
+    {
+        ShaderCompileRequest::Compute {
+            key: actual_key, ..
+        } => assert_eq!(actual_key, key),
+        ShaderCompileRequest::Graphics { .. } => panic!("expected required compute compile"),
+    }
+}
+
+#[test]
 fn failed_compute_pipeline_compile_is_terminal_and_observable() {
     let (_gpu_sender, gpu_receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
@@ -110,6 +177,98 @@ fn failed_compute_pipeline_compile_is_terminal_and_observable() {
 
     assert!(!presenter.compiling_compute_pipelines.contains(&key));
     assert!(presenter.failed_compute_pipelines.contains(&key));
+}
+
+#[test]
+fn compiler_panic_publishes_failure_and_releases_the_matching_queue_gate() {
+    let (dispatch, key) = pending_compute_pipeline();
+    let request = ShaderCompileRequest::Compute {
+        key: key.clone(),
+        dispatch: dispatch.clone(),
+    };
+    let panic_result = compile_shader_request_catching_panics(&request, || {
+        panic!("{}", "compile panic ".repeat(80));
+    });
+    let error = match &panic_result {
+        ShaderCompileResult::Compute {
+            key: actual_key,
+            compiled: Err(error),
+            ..
+        } => {
+            assert_eq!(actual_key, &key);
+            error
+        }
+        _ => panic!("compiler panic must preserve the compute request key"),
+    };
+    assert!(error.starts_with("compiler worker panicked: compile panic"));
+    assert!(
+        error.len() <= "compiler worker panicked: ".len() + 512,
+        "panic descriptions remain bounded"
+    );
+
+    let (_gpu_sender, gpu_receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
+    let (result_sender, result_receiver) = std::sync::mpsc::channel();
+    presenter.shader_compile_receiver = result_receiver;
+    presenter.compiling_compute_pipelines.insert(key.clone());
+    result_sender
+        .send(panic_result)
+        .expect("publish terminal panic result");
+    presenter.receive_shader_compilations();
+    assert!(!presenter.compiling_compute_pipelines.contains(&key));
+    assert!(presenter.failed_compute_pipelines.contains(&key));
+
+    let (sender, receiver) = gpu_event_channel();
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![
+                GpuEvent::ComputeDispatch(Box::new(dispatch.clone())),
+                GpuEvent::SubmissionBoundary(42),
+            ],
+        })
+        .expect("queue compute submission");
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let (source, event) = match ordered.try_recv(|_| false) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::ComputeDispatch(actual),
+        } => (source, GpuEvent::ComputeDispatch(actual)),
+        other => panic!("expected compute dispatch, got {other:?}"),
+    };
+    ordered.block_event(
+        source,
+        event,
+        QueueBlockReason::ComputePipeline(key.clone()),
+    );
+    assert!(matches!(
+        ordered.try_recv(|_| false),
+        OrderedEventPoll::Blocked
+    ));
+    match ordered.try_recv(|reason| {
+        matches!(
+            reason,
+            QueueBlockReason::ComputePipeline(actual)
+                if presenter.failed_compute_pipelines.contains(actual)
+        )
+    }) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::ComputeDispatch(actual),
+        } => {
+            assert_eq!(actual.as_ref(), &dispatch);
+            ordered.finish_event(source);
+        }
+        other => panic!("terminal compile panic did not release its matching gate: {other:?}"),
+    }
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::SubmissionBoundary(42),
+        } => source,
+        other => panic!("same-queue boundary overtook failed dispatch: {other:?}"),
+    };
+    ordered.finish_event(source);
 }
 
 #[test]
