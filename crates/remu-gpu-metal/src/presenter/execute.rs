@@ -391,9 +391,8 @@ impl MetalPresenter {
                 );
                 texture
             } else {
-                let has_resident_storage = self.resident_guest_textures.values().any(|resident| {
-                    guest_texture_descriptors_share_storage(resident.descriptor, target.texture)
-                });
+                let has_resident_storage =
+                    self.render_target_has_live_resident_storage(target.texture)?;
                 let initial_clear_color = initial_render_target_clear_color(
                     target,
                     &draw.context_registers,

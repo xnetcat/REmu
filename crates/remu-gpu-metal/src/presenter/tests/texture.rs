@@ -2393,6 +2393,72 @@ fn cached_overlap_identity_survives_original_virtual_address_rebinding() {
 }
 
 #[test]
+fn render_target_residency_check_rejects_replaced_guest_mapping() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let replacement_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .unwrap();
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("original render-target resident");
+    assert!(
+        presenter
+            .render_target_has_live_resident_storage(descriptor)
+            .unwrap()
+    );
+
+    memory.unmap(address, GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(address),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .unwrap();
+
+    assert!(
+        !presenter
+            .render_target_has_live_resident_storage(descriptor)
+            .unwrap(),
+        "a replacement guest allocation must not suppress compressed-target first-use discard",
+    );
+    assert!(
+        !presenter.resident_guest_textures.contains_key(&descriptor),
+        "the stale Metal image belongs to the retired guest backing",
+    );
+}
+
+#[test]
 fn persistent_target_removes_per_draw_full_surface_transfers() {
     let frame_bytes = 3_840_u64 * 2_160 * 4;
     let draws = 100_u64;
