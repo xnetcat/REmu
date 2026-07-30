@@ -274,6 +274,10 @@ struct NggSubgroupLimits {
     gs_primitives_per_subgroup: u32,
     gs_instance_primitives_per_subgroup: u32,
     gs_instance_count: u32,
+    /// Per-input-primitive API geometry-shader output limit.
+    ///
+    /// Zero means that no API GS limit is active. NGG passthrough primitive shaders still have a
+    /// non-zero subgroup output capacity in `max_output_vertices_per_subgroup`.
     gs_max_vertices_out: u32,
     max_output_vertices_per_subgroup: u32,
     primitive_amplification_factor: u32,
