@@ -247,6 +247,17 @@ impl MetalPresenter {
         self.ensure_open_guest_batch(&queue);
         self.prepare_depth_array_textures(&device, &[evaluation])?;
         let buffers = self.upload_global_buffers(&device, evaluation)?;
+        // DISPATCH_INDIRECT arguments are read by the GPU at this point in queue order. The
+        // runtime's packet-time dimensions are useful diagnostics, but can be stale when an
+        // earlier shader generated the argument dwords. Forward the pending Metal writeback
+        // buffer and let Metal consume the live values instead.
+        let indirect_arguments = match (dispatch.source, dispatch.launch.grid) {
+            (
+                remu_gpu::ComputeDispatchSource::Indirect { dimensions_address },
+                ComputeGrid::Threadgroups(_),
+            ) => Some(self.upload_indirect_dispatch_arguments(&device, dimensions_address)?),
+            _ => None,
+        };
         let global_argument_buffer = create_global_argument_buffer(
             &device,
             &function,
@@ -300,7 +311,11 @@ impl MetalPresenter {
                     .saturating_add(1);
             }
             batch.work.push(GuestBatchWork::Compute {
+                sequence: dispatch.sequence,
                 shader: dispatch.shader_address,
+                source: dispatch.source,
+                grid: dispatch.launch.grid,
+                threads_per_group: dispatch.launch.threads_per_group,
             });
             append_unique_global_writebacks(&mut batch.global_writebacks, pending_writebacks);
             append_unique_guest_write_ranges(
@@ -357,8 +372,15 @@ impl MetalPresenter {
                 u64::from(dispatch.launch.threads_per_group[1]),
                 u64::from(dispatch.launch.threads_per_group[2]),
             );
-            match dispatch.launch.grid {
-                ComputeGrid::Threadgroups(groups) => encoder.dispatch_thread_groups(
+            match (dispatch.launch.grid, indirect_arguments.as_ref()) {
+                (ComputeGrid::Threadgroups(_), Some(arguments)) => {
+                    encoder.dispatch_thread_groups_indirect(
+                        &arguments.buffer,
+                        arguments.offset,
+                        local,
+                    );
+                }
+                (ComputeGrid::Threadgroups(groups), None) => encoder.dispatch_thread_groups(
                     MTLSize::new(
                         u64::from(groups[0]),
                         u64::from(groups[1]),
@@ -366,7 +388,7 @@ impl MetalPresenter {
                     ),
                     local,
                 ),
-                ComputeGrid::Threads(threads) => encoder
+                (ComputeGrid::Threads(threads), _) => encoder
                     .dispatch_threads(MTLSize::new(threads[0], threads[1], threads[2]), local),
             }
             encoder.end_encoding();

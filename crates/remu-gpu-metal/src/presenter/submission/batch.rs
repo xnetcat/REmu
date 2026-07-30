@@ -269,8 +269,25 @@ fn settle_guest_batch_by(batch: &GuestCommandBatch, deadline: Instant) -> GuestB
 pub(crate) fn describe_guest_batch(work: &[GuestBatchWork]) -> String {
     work.iter()
         .map(|item| match item {
-            GuestBatchWork::Draw { export, pixel } => format!("draw({export:#x},{pixel:#x})"),
-            GuestBatchWork::Compute { shader } => format!("compute({shader:#x})"),
+            GuestBatchWork::Draw {
+                sequence,
+                export,
+                pixel,
+                index_count,
+                instance_count,
+                target,
+            } => format!(
+                "draw(seq={sequence},es={export:#x},ps={pixel:#x},indices={index_count},instances={instance_count},target={target:#x})"
+            ),
+            GuestBatchWork::Compute {
+                sequence,
+                shader,
+                source,
+                grid,
+                threads_per_group,
+            } => format!(
+                "compute(seq={sequence},cs={shader:#x},source={source:?},grid={grid:?},local={threads_per_group:?})"
+            ),
         })
         .collect::<Vec<_>>()
         .join(",")

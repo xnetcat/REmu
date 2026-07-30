@@ -1026,8 +1026,12 @@ impl MetalPresenter {
                 .as_mut()
                 .expect("guest command batch was opened above");
             batch.work.push(GuestBatchWork::Draw {
+                sequence: draw.sequence,
                 export: key.export_shader_address,
                 pixel: key.pixel_shader_address,
+                index_count: draw.index_count,
+                instance_count: draw.instance_count,
+                target: draw.color_target_address,
             });
             append_unique_global_writebacks(&mut batch.global_writebacks, pending_writebacks);
             append_unique_guest_write_ranges(
@@ -2434,8 +2438,12 @@ impl MetalPresenter {
         );
         encoder.end_encoding();
         batch.work.push(GuestBatchWork::Draw {
+            sequence: draw.sequence,
             export: draw.export_shader_address,
             pixel: draw.pixel_shader_address,
+            index_count: draw.index_count,
+            instance_count: draw.instance_count,
+            target: draw.color_target_address,
         });
         self.mark_resident_texture_written(destination.texture);
         self.note_pending_flip_target_write(destination.texture);
@@ -2516,8 +2524,12 @@ impl MetalPresenter {
         encoder.set_label("REMu translated color fast-clear elimination");
         encoder.end_encoding();
         batch.work.push(GuestBatchWork::Draw {
+            sequence: draw.sequence,
             export: draw.export_shader_address,
             pixel: draw.pixel_shader_address,
+            index_count: draw.index_count,
+            instance_count: draw.instance_count,
+            target: draw.color_target_address,
         });
         if target.sample_count > 1 {
             self.mark_multisample_texture_initialized(target.texture, target.sample_count);

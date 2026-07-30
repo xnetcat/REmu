@@ -216,6 +216,13 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
     assert!(std::ptr::eq(uploaded.buffer.as_ref(), producer.as_ref()));
     assert_eq!(uploaded.offset, 48);
     assert!(!uploaded.guest_memory);
+
+    let indirect = presenter
+        .upload_indirect_dispatch_arguments(&device, 0x12_0010)
+        .expect("indirect arguments forward the queued GPU producer");
+    assert!(std::ptr::eq(indirect.buffer.as_ref(), producer.as_ref()));
+    assert_eq!(indirect.offset, 48);
+    assert!(!indirect.guest_memory);
 }
 
 #[test]

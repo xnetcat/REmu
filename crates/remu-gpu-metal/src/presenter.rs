@@ -887,8 +887,21 @@ struct PresenterStatistics {
 
 #[derive(Debug)]
 enum GuestBatchWork {
-    Draw { export: u64, pixel: u64 },
-    Compute { shader: u64 },
+    Draw {
+        sequence: u64,
+        export: u64,
+        pixel: u64,
+        index_count: u32,
+        instance_count: u32,
+        target: u64,
+    },
+    Compute {
+        sequence: u64,
+        shader: u64,
+        source: remu_gpu::ComputeDispatchSource,
+        grid: remu_gpu::ComputeGrid,
+        threads_per_group: [u32; 3],
+    },
 }
 
 struct GuestCommandBatch {
