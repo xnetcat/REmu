@@ -490,14 +490,19 @@ impl Compiler<'_> {
                         self.options.render_target_array_length - 1
                     );
                 }
-                // GFX10 merged NGG shaders read subgroup lane IDs as
-                // `(s3[27:24] << 5) + v_mbcnt_lo`. Bits [15:0] still carry the meshlet
-                // vertex/primitive counts; pack the wave32 index into [27:24] so amplified
-                // subgroups larger than one wave (e.g. 96 threads) keep unique LDS/export IDs.
-                // Always overwrite s3 for mesh — even shaders that only read the count bits
-                // need a well-defined register, and packing is harmless when unused.
+                // Always seed s[3] for mesh: GFX10 merged NGG shaders read
+                // - lane ID as `(s3[27:24] << 5) + v_mbcnt_lo`
+                // - wave count as `s3[31:28]`, then `(1 << count) - 1` as the reduce mask
+                //   that loads per-wave totals from LDS (Void Terrarium soft/main particles).
+                // Bits [15:0] still carry the meshlet vertex/primitive counts. Clear [31:24]
+                // before packing so stale meshlet high bits cannot override the wave fields.
                 source.push_str(
-                    "    s[3] = remu_mesh_counts | (((remu_thread_index >> 5u) & 0xfu) << 24u);\n",
+                    "    {\n\
+                     \x20       uint remu_mesh_wave_count = ((remu_group_size.x * remu_group_size.y * remu_group_size.z) + 31u) >> 5u;\n\
+                     \x20       s[3] = (remu_mesh_counts & 0x00ffffffu)\n\
+                     \x20           | (((remu_thread_index >> 5u) & 0xfu) << 24u)\n\
+                     \x20           | ((remu_mesh_wave_count & 0xfu) << 28u);\n\
+                     \x20   }\n",
                 );
                 if contains_register_reference(&self.body, 'v', 0) {
                     source.push_str("    v[0] = remu_mesh_primitive;\n");

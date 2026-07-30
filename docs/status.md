@@ -25,10 +25,14 @@ expanded into the meshlet triangle ABI, and wave32 `SAndSaveexecB32` lowers for 
 Void Terrarium’s content quads and amplified point draws compile and encode. The post/composite
 pixel path that needed `ImageGetResinfo` now lowers to Metal (`get_width`/`get_height`/
 `get_num_mip_levels`, with optional `unorm` float bitcasts), so that previously failing
-`es:0x70e5db0400`/`ps:0x70e5da8700` pair compiles. NGG mesh lowering now uses wave32 lane IDs and packs `s3[27:24]` so amplified
-point-list particle subgroups (e.g. 96 threads) no longer collide LDS/export
-indices into a center-screen haze. Depth residency (`depth_native`) and remaining
-post/lighting correctness are still open.
+`es:0x70e5db0400`/`ps:0x70e5da8700` pair compiles. NGG mesh lowering now uses wave32 lane IDs and packs `s3[27:24]` (wave index) plus `s3[31:28]` (wave count) so amplified
+point-list particle subgroups (e.g. 96 threads) keep unique LDS/export IDs and a working
+per-wave export reduce; unexported mesh verts default to `w=0`. Wave32 `V_CMP` lane masks
+no longer zero the adjacent SGPR, which was wiping those packed `s3` fields before the
+export reduce. Host present now keeps `RGB10A2` VideoOut on a `BGRA8Unorm` drawable (no
+second sRGB encode); float scanouts still use `BGRA8Unorm_sRGB`. Guest common-dialog /
+toast UI is a present-path PS5-like overlay (no AppKit panels); soft cursor/glow and
+depth residency (`depth_native`) remain open.
 
 ## Import coverage
 

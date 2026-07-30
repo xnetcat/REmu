@@ -501,7 +501,7 @@ fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
         .presentation
         .as_ref()
         .expect("test presenter has presentation resources");
-    encoder.set_render_pipeline_state(&presentation.pipeline);
+    encoder.set_render_pipeline_state(&presentation.srgb_pipeline);
     encoder.set_viewport(presentation_viewport(640, 360, 320, 180));
     encoder.set_fragment_texture(0, Some(output_texture));
     encoder.set_fragment_sampler_state(0, Some(&presentation.sampler));

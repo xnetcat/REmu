@@ -1,16 +1,17 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Common dialog and save-data dialog HLE backed by a real host UI surface.
+//! Common dialog and save-data dialog HLE backed by the present-path system UI overlay.
 //!
-//! Opening a dialog publishes [`remu_gpu::GpuEvent::ShowHostDialog`] to the Metal presenter, which
-//! shows a native AppKit alert. Status stays `RUNNING` until the presenter records a result through
-//! [`remu_gpu::complete_host_dialog`]. Headless runs and unit tests without a presenter auto-complete
-//! with cancel so titles that poll never hang.
+//! Opening a dialog publishes [`remu_gpu::GpuEvent::ShowHostDialog`] to the presenter, which
+//! composites a PS5-like panel over the guest scanout. Status stays `RUNNING` until the presenter
+//! records a result through [`remu_gpu::complete_host_dialog`]. Headless runs and
+//! `REMU_AUTO_DISMISS_DIALOGS` auto-complete with cancel so titles that poll never hang.
 
 use crate::{
     CommonDialogOwner, InitializationState, ProbeDispatchState, guest_output_pointer,
-    publish_gpu_event, read_guest_cstring, sce_kernel_error, write_guest_u32,
+    publish_gpu_event, read_guest_cstring, read_guest_u32, read_guest_u64, sce_kernel_error,
+    write_guest_u32,
 };
 use remu_gpu::{
     HostDialogButtons, HostDialogKind, HostDialogRequest, HostDialogResultCode, HostToastRequest,
@@ -66,6 +67,22 @@ pub(crate) fn message_dialog_terminate(state: &mut ProbeDispatchState) -> u64 {
     0
 }
 
+/// Orbis `OrbisCommonDialogBaseParam` is 48 bytes; `OrbisMsgDialogParam` then has `size`, `mode`,
+/// padding, and `userMsgParam*` at +0x40. `OrbisMsgDialogUserMessageParam::msg` is at +0x8.
+const MSG_DIALOG_PARAM_MODE_OFFSET: u64 = 0x38;
+const MSG_DIALOG_PARAM_USER_MSG_OFFSET: u64 = 0x40;
+const MSG_DIALOG_PARAM_PROG_BAR_OFFSET: u64 = 0x48;
+const MSG_DIALOG_USER_BUTTON_TYPE_OFFSET: u64 = 0x0;
+const MSG_DIALOG_USER_MSG_PTR_OFFSET: u64 = 0x8;
+const MSG_DIALOG_MODE_USER_MSG: u32 = 1;
+const MSG_DIALOG_MODE_PROGRESS_BAR: u32 = 2;
+const MSG_DIALOG_MODE_SYSTEM_MSG: u32 = 3;
+const MSG_DIALOG_BUTTON_OK: u32 = 0;
+const MSG_DIALOG_BUTTON_YESNO: u32 = 1;
+const MSG_DIALOG_BUTTON_OK_CANCEL: u32 = 3;
+const MSG_DIALOG_BUTTON_YESNO_FOCUS_NO: u32 = 7;
+const MSG_DIALOG_BUTTON_OK_CANCEL_FOCUS_CANCEL: u32 = 8;
+
 /// Opens a system message dialog on the host presenter and leaves it `RUNNING` until dismissed.
 pub(crate) fn message_dialog_open(parameters: u64, state: &mut ProbeDispatchState) -> u64 {
     if state.services.message_dialog_status == COMMON_DIALOG_STATUS_NONE {
@@ -74,9 +91,7 @@ pub(crate) fn message_dialog_open(parameters: u64, state: &mut ProbeDispatchStat
     if parameters == 0 {
         return sce_kernel_error(COMMON_DIALOG_ERROR_ARG_NULL);
     }
-    let message = read_guest_cstring(parameters.saturating_add(0x10))
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| "Message".to_owned());
+    let (kind, title, message, buttons) = decode_message_dialog_request(parameters);
     let sequence = begin_host_dialog();
     state.services.message_dialog_sequence = sequence;
     state.services.message_dialog_result_code = MESSAGE_DIALOG_RESULT_USER_CANCELED;
@@ -84,15 +99,80 @@ pub(crate) fn message_dialog_open(parameters: u64, state: &mut ProbeDispatchStat
     state.services.message_dialog_status = COMMON_DIALOG_STATUS_RUNNING;
     publish_or_auto_dismiss(
         HostDialogRequest {
-            kind: HostDialogKind::Message,
-            title: "Message".to_owned(),
+            kind,
+            title,
             message,
-            buttons: HostDialogButtons::OkCancel,
+            buttons,
             sequence,
         },
         sequence,
     );
     0
+}
+
+fn decode_message_dialog_request(
+    parameters: u64,
+) -> (HostDialogKind, String, String, HostDialogButtons) {
+    let mode = read_guest_u32(parameters.saturating_add(MSG_DIALOG_PARAM_MODE_OFFSET));
+    let user = read_guest_u64(parameters.saturating_add(MSG_DIALOG_PARAM_USER_MSG_OFFSET));
+    let prog = read_guest_u64(parameters.saturating_add(MSG_DIALOG_PARAM_PROG_BAR_OFFSET));
+    match mode {
+        MSG_DIALOG_MODE_PROGRESS_BAR => {
+            let message = read_user_message_text(prog)
+                .or_else(|| read_user_message_text(user))
+                .unwrap_or_else(|| "Please wait...".to_owned());
+            (
+                HostDialogKind::Progress,
+                "Please Wait".to_owned(),
+                message,
+                HostDialogButtons::Ok,
+            )
+        }
+        MSG_DIALOG_MODE_SYSTEM_MSG => (
+            HostDialogKind::System,
+            "System".to_owned(),
+            "A system message is displayed.".to_owned(),
+            HostDialogButtons::Ok,
+        ),
+        MSG_DIALOG_MODE_USER_MSG | _ => {
+            let button_type = if user != 0 {
+                read_guest_u32(user.saturating_add(MSG_DIALOG_USER_BUTTON_TYPE_OFFSET))
+            } else {
+                MSG_DIALOG_BUTTON_OK_CANCEL
+            };
+            let message = read_user_message_text(user).unwrap_or_else(|| {
+                eprintln!(
+                    "[REMu][UI] MsgDialog userMsgParam decode failed mode={mode} user={user:#x} prog={prog:#x}"
+                );
+                "Message".to_owned()
+            });
+            (
+                HostDialogKind::Message,
+                "Message".to_owned(),
+                message,
+                buttons_from_msg_dialog(button_type),
+            )
+        }
+    }
+}
+
+fn read_user_message_text(user_msg_param: u64) -> Option<String> {
+    if user_msg_param == 0 {
+        return None;
+    }
+    let msg_ptr = read_guest_u64(user_msg_param.saturating_add(MSG_DIALOG_USER_MSG_PTR_OFFSET));
+    read_guest_cstring(msg_ptr).filter(|text| !text.is_empty())
+}
+
+fn buttons_from_msg_dialog(button_type: u32) -> HostDialogButtons {
+    match button_type {
+        MSG_DIALOG_BUTTON_OK => HostDialogButtons::Ok,
+        MSG_DIALOG_BUTTON_YESNO | MSG_DIALOG_BUTTON_YESNO_FOCUS_NO => HostDialogButtons::YesNo,
+        MSG_DIALOG_BUTTON_OK_CANCEL | MSG_DIALOG_BUTTON_OK_CANCEL_FOCUS_CANCEL => {
+            HostDialogButtons::OkCancel
+        }
+        _ => HostDialogButtons::OkCancel,
+    }
 }
 
 pub(crate) fn message_dialog_update_status(state: &mut ProbeDispatchState) -> u64 {
@@ -231,6 +311,57 @@ pub(crate) fn publish_host_toast(kind: HostDialogKind, title: &str, message: &st
         message: message.to_owned(),
         duration_ms: 4_000,
     }));
+}
+
+/// Opens a host error dialog (used when titles hit stubbed error-dialog entry points).
+#[allow(dead_code)] // wired when error-dialog NIDs are hooked up
+pub(crate) fn open_error_dialog(message: &str) -> u64 {
+    let sequence = begin_host_dialog();
+    publish_or_auto_dismiss(
+        HostDialogRequest {
+            kind: HostDialogKind::Error,
+            title: "Error".to_owned(),
+            message: message.to_owned(),
+            buttons: HostDialogButtons::Ok,
+            sequence,
+        },
+        sequence,
+    );
+    0
+}
+
+/// Opens a host progress / please-wait dialog.
+#[allow(dead_code)] // wired when progress-dialog NIDs are hooked up
+pub(crate) fn open_progress_dialog(message: &str) -> u64 {
+    let sequence = begin_host_dialog();
+    publish_or_auto_dismiss(
+        HostDialogRequest {
+            kind: HostDialogKind::Progress,
+            title: "Please Wait".to_owned(),
+            message: message.to_owned(),
+            buttons: HostDialogButtons::Ok,
+            sequence,
+        },
+        sequence,
+    );
+    0
+}
+
+/// Opens a host IME / on-screen keyboard stand-in.
+pub(crate) fn ime_keyboard_open() -> u64 {
+    let sequence = begin_host_dialog();
+    publish_or_auto_dismiss(
+        HostDialogRequest {
+            kind: HostDialogKind::Ime,
+            title: "Keyboard".to_owned(),
+            message: "On-screen keyboard is unavailable. Use the host keyboard, then press OK."
+                .to_owned(),
+            buttons: HostDialogButtons::Ok,
+            sequence,
+        },
+        sequence,
+    );
+    0
 }
 
 fn publish_or_auto_dismiss(request: HostDialogRequest, sequence: u64) {

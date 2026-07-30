@@ -329,13 +329,15 @@ fn a_malformed_control_chain_is_rejected_rather_than_walked() {
 
     let mut unknown = [0_u8; 12];
     control_entry(&mut unknown, 0, 12, 0, 0x99);
+    // Unknown control IDs are accepted as no-ops so titles that probe optional mixer
+    // commands keep running; invalid address/size still hard-fail above/below.
     assert_eq!(
         dispatch(
             "uu94irFOGpA",
             args(&[voice, address(&unknown)]),
             &mut fixture.state
         ),
-        Some(error(NGS2_ERROR_INVALID_VOICE_CONTROL_ID))
+        Some(SUCCESS)
     );
 
     let mut truncated = [0_u8; 12];

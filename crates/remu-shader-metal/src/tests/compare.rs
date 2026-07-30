@@ -121,7 +121,10 @@ fn vector_compares_preserve_float_integer_and_mask_semantics() {
             .source
             .contains("remu_s_12 = (uint)(uint64_t)simd_ballot(t")
     );
-    assert!(shader.source.contains("remu_s_13 = 0u;"));
+    assert!(
+        !shader.source.contains("remu_s_13 = 0u;"),
+        "wave32 V_CMP must not zero the adjacent SGPR (NGG mesh packs wave fields in s3)"
+    );
 }
 
 #[test]
@@ -173,4 +176,51 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
     );
     assert!(shader.source.contains("(uint)(uint64_t)simd_ballot("));
     assert!(!shader.source.contains("const uint remu_lane = 0u"));
+}
+
+#[test]
+fn wave32_mesh_vcmp_into_s2_preserves_packed_s3_wave_fields() {
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vopc,
+            opcode: Opcode::Known("VCmpGtU32"),
+            words: vec![0],
+            sources: vec![Operand::vector(1), Operand::vector(2)],
+            destinations: Vec::new(),
+            control: Some(InstructionControl::Sdwa(SdwaControl {
+                destination_select: 6,
+                destination_unused: 0,
+                source0_select: 6,
+                source1_select: 6,
+                source0_sign_extend: false,
+                source1_sign_extend: false,
+                absolute_mask: 0,
+                negate_mask: 0,
+                output_modifier: 0,
+                clamp: false,
+                scalar_destination: Some(2),
+            })),
+        }],
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96),
+    )
+    .expect("mesh wave32 compare should lower");
+    assert!(
+        shader
+            .source
+            .contains("remu_s_2 = (uint)(uint64_t)simd_ballot(")
+    );
+    assert!(
+        !shader.source.contains("remu_s_3 = 0u;"),
+        "wave32 mesh V_CMP into s[2] must leave s[3] wave index/count intact"
+    );
+    assert!(
+        shader.source.contains("((remu_mesh_wave_count & 0xfu) << 28u)"),
+        "mesh prologue must still pack s3[31:28] wave count"
+    );
 }

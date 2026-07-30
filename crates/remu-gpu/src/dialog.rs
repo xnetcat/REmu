@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
-/// Modal dialog kinds the presenter knows how to show.
+/// System UI surfaces the presenter can composite over the guest scanout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum HostDialogKind {
@@ -17,6 +17,10 @@ pub enum HostDialogKind {
     SaveData = 2,
     Trophy = 3,
     Notification = 4,
+    Error = 5,
+    Progress = 6,
+    Ime = 7,
+    System = 8,
 }
 
 impl HostDialogKind {
@@ -27,6 +31,10 @@ impl HostDialogKind {
             2 => Some(Self::SaveData),
             3 => Some(Self::Trophy),
             4 => Some(Self::Notification),
+            5 => Some(Self::Error),
+            6 => Some(Self::Progress),
+            7 => Some(Self::Ime),
+            8 => Some(Self::System),
             _ => None,
         }
     }

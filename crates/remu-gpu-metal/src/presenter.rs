@@ -374,9 +374,18 @@ enum PresentationResolution {
 }
 
 struct PresentationResources {
-    pipeline: RenderPipelineState,
+    /// Drawable + pipeline for linear float scanout (Unity RGBA16F): Metal writes sRGB.
+    srgb_pipeline: RenderPipelineState,
+    /// Drawable + pipeline for display-referred Unorm scanout (VT RGB10A2): passthrough.
+    unorm_pipeline: RenderPipelineState,
+    /// Alpha-blended system UI overlay for sRGB drawables.
+    overlay_srgb_pipeline: RenderPipelineState,
+    /// Alpha-blended system UI overlay for Unorm drawables.
+    overlay_unorm_pipeline: RenderPipelineState,
+    overlay_texture: Texture,
     _vertex_function: Function,
     _fragment_function: Function,
+    _overlay_fragment_function: Function,
     sampler: SamplerState,
 }
 

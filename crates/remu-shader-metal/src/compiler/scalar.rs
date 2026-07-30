@@ -24,12 +24,16 @@ impl Compiler<'_> {
             VCC_LO => {
                 self.line(3, &format!("vcc = {condition};"));
                 self.line(3, &format!("s[{VCC_LO}] = {low};"));
+                // VCC is an architectural pair; keep HI coherent even on wave32.
                 self.line(3, &format!("s[{VCC_HI}] = {high};"));
             }
             EXEC_LO => self.store_exec_mask(condition),
             register if register < SCALAR_REGISTER_COUNT => {
                 self.line(3, &format!("s[{register}] = {low};"));
-                if register + 1 < SCALAR_REGISTER_COUNT {
+                // Wave32 lane masks occupy a single SGPR. Writing the high half as 0
+                // would clobber the adjacent SGPR — on NGG mesh that is often s[3],
+                // which carries packed wave index/count used by the export reduce.
+                if self.split_wave64() && register + 1 < SCALAR_REGISTER_COUNT {
                     self.line(3, &format!("s[{}] = {high};", register + 1));
                 }
             }

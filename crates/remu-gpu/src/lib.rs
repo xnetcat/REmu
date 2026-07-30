@@ -64,6 +64,11 @@ pub use dialog::{
     complete_host_dialog, host_dialog_is_pending, host_dialog_result, reset_host_dialog_state,
 };
 
+mod system_ui;
+pub use system_ui::{
+    SYSTEM_UI_HEIGHT, SYSTEM_UI_WIDTH, SystemUiFramebuffer, rasterize_system_ui,
+};
+
 mod pad;
 pub use pad::{
     HostPadState, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,

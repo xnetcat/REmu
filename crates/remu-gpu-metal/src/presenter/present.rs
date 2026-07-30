@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{
-    CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLStoreAction,
-    MTLViewport, RenderPassDescriptor, RenderPipelineDescriptor, SamplerDescriptor,
+    CompileOptions, Device, MTLBlendFactor, MTLBlendOperation, MTLClearColor, MTLLoadAction,
+    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLSamplerAddressMode,
+    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSize, MTLStorageMode, MTLStoreAction,
+    MTLTextureUsage, MTLViewport, RenderPassDescriptor, RenderPipelineDescriptor,
+    SamplerDescriptor, TextureDescriptor,
 };
+use remu_gpu::{SYSTEM_UI_HEIGHT, SYSTEM_UI_WIDTH};
 use std::time::Instant;
 
 use super::{
@@ -121,6 +124,7 @@ impl MetalPresenter {
                     | MTLPixelFormat::BGRA8Unorm
                     | MTLPixelFormat::BGRA8Unorm_sRGB
                     | MTLPixelFormat::RGBA16Float
+                    | MTLPixelFormat::RGB10A2Unorm
             )
             && let (Some(device), Some(queue)) = (
                 self.device.as_ref().cloned(),
@@ -137,9 +141,20 @@ impl MetalPresenter {
         // A host splash is presentable before VideoOut registration. After HideSplash, a missing
         // guest texture intentionally clears the old system-owned image to black until the first
         // guest scanout is ready.
-        let (Some(layer), Some(queue)) = (self.layer.as_ref(), self.command_queue.as_ref()) else {
+        let encode_srgb = frame_texture
+            .as_ref()
+            .is_none_or(|texture| presentation_applies_srgb_encode(texture.pixel_format()));
+        let drawable_format = if encode_srgb {
+            MTLPixelFormat::BGRA8Unorm_sRGB
+        } else {
+            MTLPixelFormat::BGRA8Unorm
+        };
+        let (Some(layer), Some(queue)) = (self.layer.as_mut(), self.command_queue.as_ref()) else {
             return;
         };
+        if layer.pixel_format() != drawable_format {
+            layer.set_pixel_format(drawable_format);
+        }
         let Some(drawable) = layer.next_drawable() else {
             if trace_scanout_writes() {
                 eprintln!(
@@ -178,7 +193,12 @@ impl MetalPresenter {
                 .expect("windowed presenter has presentation resources");
             let (source_width, source_height) = source_dimensions
                 .expect("every presentation texture has validated source dimensions");
-            encoder.set_render_pipeline_state(&presentation.pipeline);
+            let pipeline = if encode_srgb {
+                &presentation.srgb_pipeline
+            } else {
+                &presentation.unorm_pipeline
+            };
+            encoder.set_render_pipeline_state(pipeline);
             encoder.set_viewport(presentation_viewport(
                 source_width,
                 source_height,
@@ -186,6 +206,32 @@ impl MetalPresenter {
                 destination_height,
             ));
             encoder.set_fragment_texture(0, Some(texture));
+            encoder.set_fragment_sampler_state(0, Some(&presentation.sampler));
+            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        if crate::presenter::host_ui::system_ui_overlay_visible() {
+            let presentation = self
+                .presentation
+                .as_mut()
+                .expect("windowed presenter has presentation resources");
+            if let Some(overlay) = crate::presenter::host_ui::take_system_ui_overlay_upload() {
+                upload_system_ui_overlay(&presentation.overlay_texture, &overlay.rgba);
+            }
+            let overlay_pipeline = if encode_srgb {
+                &presentation.overlay_srgb_pipeline
+            } else {
+                &presentation.overlay_unorm_pipeline
+            };
+            encoder.set_render_pipeline_state(overlay_pipeline);
+            encoder.set_viewport(MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: f64::from(destination_width),
+                height: f64::from(destination_height),
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            encoder.set_fragment_texture(0, Some(&presentation.overlay_texture));
             encoder.set_fragment_sampler_state(0, Some(&presentation.sampler));
             encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
         }
@@ -261,6 +307,14 @@ fragment float4 remu_presentation_fragment(
     // black, so host presentation must always be opaque.
     return float4(source.sample(source_sampler, input.texture_coordinate).rgb, 1.0);
 }
+
+fragment float4 remu_system_ui_fragment(
+    REmuPresentationVertex input [[stage_in]],
+    texture2d<float> source [[texture(0)]],
+    sampler source_sampler [[sampler(0)]]) {
+    // Same UV space as guest present; overlay pixels are uploaded top-left like VideoOut.
+    return source.sample(source_sampler, input.texture_coordinate);
+}
 ";
 
 impl PresentationResolution {
@@ -273,6 +327,91 @@ impl PresentationResolution {
             .map_err(|_| "REMU_PRESENTATION_SIZE is not valid UTF-8".to_owned())?;
         parse_presentation_resolution(&value)
     }
+}
+
+/// Most guest scanouts are treated as linear and need an sRGB drawable (Unity RGBA16F and the
+/// common RGBA8 path). Packed `RGB10A2` VideoOut — Void Terrarium's flip format — is already
+/// display-referred; writing it into `BGRA8Unorm_sRGB` applies a second linear→sRGB encode and
+/// lifts near-blacks into the washed title look.
+pub(super) fn presentation_applies_srgb_encode(source_format: MTLPixelFormat) -> bool {
+    !matches!(source_format, MTLPixelFormat::RGB10A2Unorm)
+}
+
+fn create_presentation_pipeline(
+    device: &Device,
+    vertex_function: &metal::Function,
+    fragment_function: &metal::Function,
+    pixel_format: MTLPixelFormat,
+    label: &str,
+) -> Result<metal::RenderPipelineState, String> {
+    let descriptor = RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_function));
+    descriptor.set_fragment_function(Some(fragment_function));
+    descriptor
+        .color_attachments()
+        .object_at(0)
+        .ok_or("Metal has no presentation color attachment")?
+        .set_pixel_format(pixel_format);
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| format!("Metal presentation pipeline ({label}): {error}"))
+}
+
+fn create_overlay_pipeline(
+    device: &Device,
+    vertex_function: &metal::Function,
+    fragment_function: &metal::Function,
+    pixel_format: MTLPixelFormat,
+    label: &str,
+) -> Result<metal::RenderPipelineState, String> {
+    let descriptor = RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_function));
+    descriptor.set_fragment_function(Some(fragment_function));
+    let attachment = descriptor
+        .color_attachments()
+        .object_at(0)
+        .ok_or("Metal has no overlay color attachment")?;
+    attachment.set_pixel_format(pixel_format);
+    attachment.set_blending_enabled(true);
+    attachment.set_source_rgb_blend_factor(MTLBlendFactor::SourceAlpha);
+    attachment.set_destination_rgb_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
+    attachment.set_rgb_blend_operation(MTLBlendOperation::Add);
+    attachment.set_source_alpha_blend_factor(MTLBlendFactor::One);
+    attachment.set_destination_alpha_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
+    attachment.set_alpha_blend_operation(MTLBlendOperation::Add);
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| format!("Metal overlay pipeline ({label}): {error}"))
+}
+
+fn create_system_ui_overlay_texture(device: &Device) -> metal::Texture {
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(metal::MTLTextureType::D2);
+    descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+    descriptor.set_width(u64::from(SYSTEM_UI_WIDTH));
+    descriptor.set_height(u64::from(SYSTEM_UI_HEIGHT));
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    device.new_texture(&descriptor)
+}
+
+fn upload_system_ui_overlay(texture: &metal::Texture, rgba: &[u8]) {
+    let region = MTLRegion {
+        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+        size: MTLSize {
+            width: u64::from(SYSTEM_UI_WIDTH),
+            height: u64::from(SYSTEM_UI_HEIGHT),
+            depth: 1,
+        },
+    };
+    texture.replace_region(
+        region,
+        0,
+        rgba.as_ptr().cast(),
+        u64::from(SYSTEM_UI_WIDTH) * 4,
+    );
 }
 
 pub(super) fn create_presentation_resources(
@@ -293,18 +432,37 @@ pub(super) fn create_presentation_resources(
     let fragment_function = library
         .get_function("remu_presentation_fragment", None)
         .map_err(|error| format!("Metal presentation fragment function: {error}"))?;
-    let descriptor = RenderPipelineDescriptor::new();
-    descriptor.set_label("REMu scaled display presentation");
-    descriptor.set_vertex_function(Some(&vertex_function));
-    descriptor.set_fragment_function(Some(&fragment_function));
-    descriptor
-        .color_attachments()
-        .object_at(0)
-        .ok_or("Metal has no presentation color attachment")?
-        .set_pixel_format(MTLPixelFormat::BGRA8Unorm_sRGB);
-    let pipeline = device
-        .new_render_pipeline_state(&descriptor)
-        .map_err(|error| format!("Metal presentation pipeline: {error}"))?;
+    let overlay_fragment_function = library
+        .get_function("remu_system_ui_fragment", None)
+        .map_err(|error| format!("Metal system UI fragment function: {error}"))?;
+    let srgb_pipeline = create_presentation_pipeline(
+        device,
+        &vertex_function,
+        &fragment_function,
+        MTLPixelFormat::BGRA8Unorm_sRGB,
+        "REMu scaled display presentation (sRGB)",
+    )?;
+    let unorm_pipeline = create_presentation_pipeline(
+        device,
+        &vertex_function,
+        &fragment_function,
+        MTLPixelFormat::BGRA8Unorm,
+        "REMu scaled display presentation (Unorm)",
+    )?;
+    let overlay_srgb_pipeline = create_overlay_pipeline(
+        device,
+        &vertex_function,
+        &overlay_fragment_function,
+        MTLPixelFormat::BGRA8Unorm_sRGB,
+        "REMu system UI overlay (sRGB)",
+    )?;
+    let overlay_unorm_pipeline = create_overlay_pipeline(
+        device,
+        &vertex_function,
+        &overlay_fragment_function,
+        MTLPixelFormat::BGRA8Unorm,
+        "REMu system UI overlay (Unorm)",
+    )?;
     let sampler_descriptor = SamplerDescriptor::new();
     sampler_descriptor.set_address_mode_s(MTLSamplerAddressMode::ClampToEdge);
     sampler_descriptor.set_address_mode_t(MTLSamplerAddressMode::ClampToEdge);
@@ -312,10 +470,16 @@ pub(super) fn create_presentation_resources(
     sampler_descriptor.set_mag_filter(MTLSamplerMinMagFilter::Linear);
     sampler_descriptor.set_mip_filter(MTLSamplerMipFilter::NotMipmapped);
     let sampler = device.new_sampler(&sampler_descriptor);
+    let overlay_texture = create_system_ui_overlay_texture(device);
     Ok(PresentationResources {
-        pipeline,
+        srgb_pipeline,
+        unorm_pipeline,
+        overlay_srgb_pipeline,
+        overlay_unorm_pipeline,
+        overlay_texture,
         _vertex_function: vertex_function,
         _fragment_function: fragment_function,
+        _overlay_fragment_function: overlay_fragment_function,
         sampler,
     })
 }
