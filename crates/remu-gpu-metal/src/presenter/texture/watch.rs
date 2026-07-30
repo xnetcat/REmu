@@ -537,6 +537,70 @@ impl GuestTextureWriteWatch {
         })
     }
 
+    fn alias_address_for_canonical_range(&self, address: u64, byte_count: u64) -> Option<u64> {
+        self.ranges.iter().find_map(|range| {
+            let offset = address.checked_sub(range.canonical_address)?;
+            let (alias_address, alias_byte_count) = range.watch.range();
+            (offset.checked_add(byte_count)? <= alias_byte_count)
+                .then(|| alias_address.checked_add(offset))
+                .flatten()
+        })
+    }
+
+    /// Copies a canonical physical range through whichever live CPU aliases cover it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold [`Self::with_live_backing`] for the duration of this operation.
+    unsafe fn copy_from_live_aliases(
+        &self,
+        address: u64,
+        destination: &mut [u8],
+    ) -> Result<(), String> {
+        let byte_count = u64::try_from(destination.len())
+            .map_err(|_| "canonical texture copy length does not fit u64")?;
+        let end = address
+            .checked_add(byte_count)
+            .ok_or("canonical texture copy range overflows")?;
+        let mut cursor = address;
+        while cursor < end {
+            let (range, canonical_end) = self
+                .ranges
+                .iter()
+                .filter_map(|range| {
+                    let (_, alias_byte_count) = range.watch.range();
+                    let range_end = range.canonical_address.checked_add(alias_byte_count)?;
+                    (range.canonical_address <= cursor && cursor < range_end)
+                        .then_some((range, range_end))
+                })
+                .max_by_key(|(_, range_end)| *range_end)
+                .ok_or_else(|| {
+                    format!("canonical texture range {cursor:#x}..{end:#x} has no live CPU alias")
+                })?;
+            let copy_end = canonical_end.min(end);
+            let copy_bytes = usize::try_from(copy_end - cursor)
+                .map_err(|_| "canonical texture copy segment is too large")?;
+            let destination_offset = usize::try_from(cursor - address)
+                .map_err(|_| "canonical texture copy offset is too large")?;
+            let (alias_address, _) = range.watch.range();
+            let source_address = alias_address
+                .checked_add(cursor - range.canonical_address)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or("canonical texture alias address does not fit usize")?;
+            // SAFETY: the caller pins every write-watch mapping against replacement, and the
+            // selected alias range covers this exact source segment.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source_address as *const u8,
+                    destination.as_mut_ptr().add(destination_offset),
+                    copy_bytes,
+                );
+            }
+            cursor = copy_end;
+        }
+        Ok(())
+    }
+
     pub(crate) fn overlaps_alias_range(&self, address: u64, byte_count: u64) -> bool {
         Self::ranges_overlap_alias(&self.ranges, address, byte_count, |range| {
             range.watch.range()
@@ -596,10 +660,10 @@ impl GuestTextureWriteWatch {
         }
 
         let started = Instant::now();
-        let chunks = snapshot_dirty_content_chunks(self, dirty_ranges)?;
-        let validated_bytes = chunks.iter().fold(0_u64, |total, chunk| {
-            total.saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX))
-        });
+        let chunks = snapshot_dirty_content_fingerprints(self, dirty_ranges)?;
+        let validated_bytes = chunks
+            .iter()
+            .fold(0_u64, |total, chunk| total.saturating_add(chunk.byte_count));
         let mut state = self
             .content_state
             .lock()
@@ -615,7 +679,7 @@ impl GuestTextureWriteWatch {
                     .get(chunk.index)
                     .copied()
                     .unwrap_or_default()
-                    != content_fingerprint(&chunk.bytes)
+                    != chunk.fingerprint
         });
         state.pending_dirty_ranges.clear();
         drop(state);
@@ -696,9 +760,11 @@ impl GuestTextureWriteWatch {
     }
 }
 
-struct DirtyContentChunk {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirtyContentFingerprint {
     index: usize,
-    bytes: Vec<u8>,
+    byte_count: u64,
+    fingerprint: u64,
 }
 
 fn normalize_content_ranges(
@@ -766,35 +832,117 @@ fn dirty_content_chunk_indices(
     indices
 }
 
-fn snapshot_dirty_content_chunks(
+fn contiguous_dirty_chunk_runs(indices: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &index in indices {
+        if let Some((start, count)) = runs.last_mut()
+            && start
+                .checked_add(*count)
+                .is_some_and(|run_end| run_end == index)
+        {
+            *count += 1;
+        } else {
+            runs.push((index, 1));
+        }
+    }
+    runs
+}
+
+fn fingerprint_dirty_chunk_run(
+    write_watch: &GuestTextureWriteWatch,
+    start_index: usize,
+    chunk_count: usize,
+) -> Result<Vec<DirtyContentFingerprint>, String> {
+    let (address, _) = content_chunk_range(write_watch, start_index)
+        .ok_or("dirty texture fingerprint run starts out of range")?;
+    let last_index = start_index
+        .checked_add(chunk_count)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or("dirty texture fingerprint run is empty or overflows")?;
+    let (last_address, last_byte_count) = content_chunk_range(write_watch, last_index)
+        .ok_or("dirty texture fingerprint run ends out of range")?;
+    let byte_count = last_address
+        .checked_add(last_byte_count)
+        .and_then(|end| end.checked_sub(address))
+        .ok_or("dirty texture fingerprint run byte count overflows")?;
+    let length =
+        usize::try_from(byte_count).map_err(|_| "dirty texture fingerprint run is too large")?;
+
+    let fingerprint = |bytes: &[u8]| {
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for index in start_index..start_index + chunk_count {
+            let (chunk_address, chunk_byte_count) = content_chunk_range(write_watch, index)
+                .ok_or("dirty texture fingerprint chunk is out of range")?;
+            let offset = usize::try_from(chunk_address - address)
+                .map_err(|_| "dirty texture fingerprint chunk offset is too large")?;
+            let chunk_length = usize::try_from(chunk_byte_count)
+                .map_err(|_| "dirty texture fingerprint chunk is too large")?;
+            let chunk = bytes
+                .get(offset..offset.saturating_add(chunk_length))
+                .ok_or("dirty texture fingerprint chunk exceeds its stable run")?;
+            chunks.push(DirtyContentFingerprint {
+                index,
+                byte_count: chunk_byte_count,
+                fingerprint: content_fingerprint(chunk),
+            });
+        }
+        Ok(chunks)
+    };
+
+    if let Some(alias_address) = write_watch.alias_address_for_canonical_range(address, byte_count)
+    {
+        let source_address = usize::try_from(alias_address)
+            .map_err(|_| "dirty texture fingerprint address does not fit usize")?;
+        // SAFETY: the caller holds `with_live_backing`, and this exact canonical range has one
+        // covering live alias. A racing CPU store faults after rearm and is rejected by the
+        // generation/dirty check before these fingerprints can become authoritative.
+        let bytes = unsafe { std::slice::from_raw_parts(source_address as *const u8, length) };
+        fingerprint(bytes)
+    } else if chunk_count > 1 {
+        // A canonical run can cross a seam between unrelated CPU virtual aliases. Split only at
+        // that seam; each half normally becomes a zero-copy direct hash, while preserving physical
+        // chunk order in the returned fingerprints.
+        let left_count = chunk_count / 2;
+        let mut chunks = fingerprint_dirty_chunk_run(write_watch, start_index, left_count)?;
+        chunks.extend(fingerprint_dirty_chunk_run(
+            write_watch,
+            start_index + left_count,
+            chunk_count - left_count,
+        )?);
+        Ok(chunks)
+    } else {
+        // A single fingerprint chunk can straddle an alias seam when the texture base is not
+        // chunk-aligned. Assemble only that 4 KiB neighborhood through the pinned aliases.
+        let mut bytes = vec![0; length];
+        // SAFETY: snapshot_dirty_content_fingerprints holds with_live_backing around this call.
+        unsafe {
+            write_watch.copy_from_live_aliases(address, &mut bytes)?;
+        }
+        fingerprint(&bytes)
+    }
+}
+
+fn snapshot_dirty_content_fingerprints(
     write_watch: &GuestTextureWriteWatch,
     mut dirty_ranges: Vec<(u64, u64)>,
-) -> Result<Vec<DirtyContentChunk>, String> {
+) -> Result<Vec<DirtyContentFingerprint>, String> {
     loop {
         dirty_ranges.extend(write_watch.dirty_page_ranges());
         dirty_ranges = normalize_content_ranges(write_watch, dirty_ranges);
         let chunk_indices = dirty_content_chunk_indices(write_watch, &dirty_ranges);
+        let chunk_runs = contiguous_dirty_chunk_runs(&chunk_indices);
         let _ = write_watch.consume_dirty();
         write_watch.rearm()?;
         let generations = write_watch.generations();
         let chunks = write_watch
             .with_live_backing(|| {
-                chunk_indices
-                    .iter()
-                    .map(|&index| {
-                        let (address, byte_count) = content_chunk_range(write_watch, index)
-                            .ok_or("dirty texture fingerprint chunk is out of range")?;
-                        let length = usize::try_from(byte_count)
-                            .map_err(|_| "dirty texture fingerprint chunk is too large")?;
-                        let mut bytes = vec![0; length];
-                        if !read_guest_shared_backing(address, &mut bytes) {
-                            return Err(format!(
-                                "dirty texture fingerprint range {address:#x}+{byte_count:#x} lost shared backing"
-                            ));
-                        }
-                        Ok(DirtyContentChunk { index, bytes })
-                    })
-                    .collect::<Result<Vec<_>, String>>()
+                chunk_runs.iter().try_fold(
+                    Vec::with_capacity(chunk_indices.len()),
+                    |mut chunks, run| {
+                        chunks.extend(fingerprint_dirty_chunk_run(write_watch, run.0, run.1)?);
+                        Ok::<_, String>(chunks)
+                    },
+                )
             })
             .and_then(|result| result)?;
         if write_watch.generations() == generations && !write_watch.is_dirty() {
@@ -1192,5 +1340,19 @@ pub(crate) fn write_watched_guest_range(
         Err(format!(
             "guest range {address:#x}+{byte_count:#x} lost shared backing during writeback"
         ))
+    }
+}
+
+#[cfg(test)]
+mod content_validation_tests {
+    use super::contiguous_dirty_chunk_runs;
+
+    #[test]
+    fn coalesces_only_adjacent_dirty_fingerprint_chunks() {
+        assert_eq!(contiguous_dirty_chunk_runs(&[]), Vec::new());
+        assert_eq!(
+            contiguous_dirty_chunk_runs(&[1, 2, 3, 7, 9, 10]),
+            vec![(1, 3), (7, 1), (9, 2)]
+        );
     }
 }
