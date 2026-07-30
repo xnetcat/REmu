@@ -586,6 +586,36 @@ pub(crate) fn agc_shader_snapshot(
     if let Some(snapshot) = shaders.snapshots.get(&address) {
         return Some(snapshot.clone());
     }
+    let fused_continuation = match shaders.fused_continuations.get(&address) {
+        None => None,
+        Some(continuations) if continuations.len() == 1 => continuations.first().copied(),
+        Some(continuations) => {
+            shaders.decode_failures.insert(address);
+            eprintln!(
+                "[REMu][AGC][SHADER] refusing ambiguous fused entry={address:#x} continuations={continuations:x?}"
+            );
+            return None;
+        }
+    };
+    if let Some(continuation) = fused_continuation
+        && (shaders.headers.get(&address).copied() != Some(continuation.front_header_address)
+            || shaders
+                .headers
+                .get(&continuation.back_program_address)
+                .copied()
+                != Some(continuation.back_header_address)
+            || shaders
+                .code_sizes
+                .get(&continuation.back_program_address)
+                .copied()
+                != Some(continuation.back_code_size))
+    {
+        shaders.decode_failures.insert(address);
+        eprintln!(
+            "[REMu][AGC][SHADER] refusing stale fused entry={address:#x} continuation={continuation:x?}"
+        );
+        return None;
+    }
     let memory = ProcessGuestMemory;
     let programs = match shaders.code_sizes.get(&address).copied() {
         Some(code_size) => usize::try_from(code_size)
@@ -618,9 +648,51 @@ pub(crate) fn agc_shader_snapshot(
             return None;
         }
     };
+    if let Some(continuation) = fused_continuation {
+        let back_program = usize::try_from(continuation.back_code_size)
+            .map_err(|_| remu_shader::DecodeError::InvalidCodeSize { bytes: usize::MAX })
+            .and_then(|code_size| {
+                remu_shader::read_program_bounded(
+                    &memory,
+                    continuation.back_program_address,
+                    code_size,
+                )
+            });
+        match back_program {
+            // Keep the front allocation's own segments first and append only the exact
+            // continuation entry point selected by this fuse operation. Trailing entry points in
+            // the back allocation are not targets of the front program's S_SETPC edge.
+            Ok(back_program) => programs.push(back_program),
+            Err(error) => {
+                shaders.decode_failures.insert(address);
+                eprintln!(
+                    "[REMu][AGC][SHADER] fused continuation decode failed entry={address:#x} continuation={:#x}: {error}",
+                    continuation.back_program_address,
+                );
+                trace_shader_decode_failure(
+                    &memory,
+                    continuation.back_program_address,
+                    continuation.back_header_address,
+                    Some(continuation.back_code_size),
+                    shaders
+                        .registration_code_fingerprints
+                        .get(&continuation.back_program_address)
+                        .copied(),
+                    &error,
+                );
+                return None;
+            }
+        }
+    }
     let program = Arc::new(programs.remove(0));
     let supplemental_programs: Arc<[remu_shader::Program]> = programs.into();
-    let header_address = shaders.headers.get(&address).copied().unwrap_or_default();
+    // AGC's fused object is the back descriptor with only its program registers repointed at the
+    // front entry point. User-data metadata and output semantics therefore belong to the back
+    // header even though `program` begins at the front code address.
+    let header_address = fused_continuation.map_or_else(
+        || shaders.headers.get(&address).copied().unwrap_or_default(),
+        |continuation| continuation.back_header_address,
+    );
     let metadata = (header_address != 0)
         .then(|| remu_shader::read_shader_metadata(&memory, header_address))
         .transpose()
@@ -708,7 +780,7 @@ pub(crate) fn agc_shader_snapshot(
             })
             .collect::<Vec<_>>();
         eprintln!(
-            "[REMu][AGC][SHADER] decoded code={address:#x} header={header_address:#x} user_data_range={user_data_range:x?} metadata={metadata:x?} supplemental={supplemental:x?} prefix={prefix:x?}"
+            "[REMu][AGC][SHADER] decoded code={address:#x} header={header_address:#x} fused_continuation={fused_continuation:x?} user_data_range={user_data_range:x?} metadata={metadata:x?} supplemental={supplemental:x?} prefix={prefix:x?}"
         );
     }
     let snapshot = remu_gpu::ShaderSnapshot {

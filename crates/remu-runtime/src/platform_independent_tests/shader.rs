@@ -79,6 +79,37 @@ fn create_shader_registers_the_authoritative_agc_code_extent() {
         2,
     );
     let mut state = ProbeDispatchState::default();
+    let other_front = code_address.wrapping_add(0x1000);
+    state
+        .agc_shader_registry
+        .fused_continuations
+        .entry(code_address)
+        .or_default()
+        .insert(crate::AgcFusedShaderContinuation {
+            front_header_address: header_address,
+            back_header_address: 0x1111,
+            back_program_address: 0x2222,
+            back_code_size: 4,
+        });
+    state
+        .agc_shader_registry
+        .fused_continuations
+        .entry(other_front)
+        .or_default()
+        .insert(crate::AgcFusedShaderContinuation {
+            front_header_address: 0x3333,
+            back_header_address: header_address,
+            back_program_address: code_address,
+            back_code_size: 4,
+        });
+    state
+        .agc_shader_registry
+        .decode_failures
+        .insert(code_address);
+    state
+        .agc_shader_registry
+        .decode_failures
+        .insert(other_front);
 
     assert_eq!(
         crate::agc_create_shader(
@@ -101,6 +132,19 @@ fn create_shader_registers_the_authoritative_agc_code_extent() {
     );
     assert_eq!(shader_registers[1], low_u32(code_address >> 8));
     assert_eq!(shader_registers[3], low_u32(code_address >> 40));
+    assert!(state.agc_shader_registry.fused_continuations.is_empty());
+    assert!(
+        !state
+            .agc_shader_registry
+            .decode_failures
+            .contains(&code_address)
+    );
+    assert!(
+        !state
+            .agc_shader_registry
+            .decode_failures
+            .contains(&other_front)
+    );
 }
 
 #[test]
@@ -174,6 +218,7 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
     let front_address = front.as_mut_ptr().addr() as u64;
     let back_address = back.as_mut_ptr().addr() as u64;
     let code = 0x00ab_cdef_1234_5600_u64;
+    let back_code = 0x0012_3456_789a_bc00_u64;
     let user_data = 0x1234_5678_9abc_def0_u64;
     write_guest_u8(
         front_address + SHADER_HEADER_TYPE_OFFSET,
@@ -185,21 +230,27 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
     );
     write_guest_u8(back_address + SHADER_HEADER_NUM_SH_REGISTERS_OFFSET, 2);
     write_guest_u64(front_address + SHADER_HEADER_CODE_OFFSET, code);
+    write_guest_u64(back_address + SHADER_HEADER_CODE_OFFSET, back_code);
+    write_guest_u32(back_address + crate::AGC_SHADER_SIZE_OFFSET, 0x340);
     write_guest_u64(back_address + 8, user_data);
     write_guest_u64(
         back_address + SHADER_HEADER_SH_REGISTERS_OFFSET,
         back_registers.as_mut_ptr().addr() as u64,
     );
 
+    let mut state = crate::ProbeDispatchState::default();
     assert_eq!(
-        agc_fuse_shader_halves([
-            fused.as_mut_ptr().addr() as u64,
-            front_address,
-            back_address,
-            scratch.as_mut_ptr().addr() as u64,
-            0,
-            0,
-        ]),
+        agc_fuse_shader_halves(
+            [
+                fused.as_mut_ptr().addr() as u64,
+                front_address,
+                back_address,
+                scratch.as_mut_ptr().addr() as u64,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
         0
     );
     let fused_address = fused.as_ptr().addr() as u64;
@@ -210,4 +261,103 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
     );
     assert_eq!(scratch[1], low_u32(code >> 8));
     assert_eq!(scratch[3], 0xa5a5_5a00 | (low_u32(code >> 40) & 0xff));
+    assert_eq!(
+        state.agc_shader_registry.fused_continuations.get(&code),
+        Some(&std::collections::BTreeSet::from([
+            crate::AgcFusedShaderContinuation {
+                front_header_address: front_address,
+                back_header_address: back_address,
+                back_program_address: back_code,
+                back_code_size: 0x340,
+            },
+        ]))
+    );
+
+    // The ES program register alone cannot distinguish two different continuations for one front
+    // allocation. Preserve both fuse-time identities and refuse to guess at snapshot time.
+    let mut other_back = back;
+    let other_back_address = other_back.as_mut_ptr().addr() as u64;
+    let other_back_code = back_code + 0x1000;
+    write_guest_u64(
+        other_back_address + SHADER_HEADER_CODE_OFFSET,
+        other_back_code,
+    );
+    assert_eq!(
+        agc_fuse_shader_halves(
+            [
+                fused.as_mut_ptr().addr() as u64,
+                front_address,
+                other_back_address,
+                scratch.as_mut_ptr().addr() as u64,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        state
+            .agc_shader_registry
+            .fused_continuations
+            .get(&code)
+            .map(std::collections::BTreeSet::len),
+        Some(2)
+    );
+    assert!(crate::agc_shader_snapshot(&mut state.agc_shader_registry, code).is_none());
+    assert!(state.agc_shader_registry.decode_failures.contains(&code));
+}
+
+#[test]
+fn fused_shader_snapshot_uses_back_descriptor_and_retains_continuation_program() {
+    let front_program = [0xbe80_2006_u32]; // s_setpc_b64 s[6:7]
+    let back_program = [0xbf81_0000_u32]; // s_endpgm
+    let mut front_header = [0_u8; SHADER_HEADER_SIZE as usize];
+    let mut back_header = [0_u8; SHADER_HEADER_SIZE as usize];
+    let mut back_user_data = [0_u8; 0x36];
+    let front_program_address = front_program.as_ptr().addr() as u64;
+    let back_program_address = back_program.as_ptr().addr() as u64;
+    let front_header_address = front_header.as_mut_ptr().addr() as u64;
+    let back_header_address = back_header.as_mut_ptr().addr() as u64;
+    write_guest_u64(
+        back_header_address + 0x08,
+        back_user_data.as_mut_ptr().addr() as u64,
+    );
+
+    let mut shaders = crate::AgcShaderRegistry::default();
+    shaders
+        .headers
+        .insert(front_program_address, front_header_address);
+    shaders
+        .headers
+        .insert(back_program_address, back_header_address);
+    shaders.code_sizes.insert(
+        front_program_address,
+        u32::try_from(std::mem::size_of_val(&front_program)).unwrap(),
+    );
+    shaders.code_sizes.insert(
+        back_program_address,
+        u32::try_from(std::mem::size_of_val(&back_program)).unwrap(),
+    );
+    shaders
+        .fused_continuations
+        .entry(front_program_address)
+        .or_default()
+        .insert(crate::AgcFusedShaderContinuation {
+            front_header_address,
+            back_header_address,
+            back_program_address,
+            back_code_size: u32::try_from(std::mem::size_of_val(&back_program)).unwrap(),
+        });
+
+    let snapshot = crate::agc_shader_snapshot(&mut shaders, front_program_address)
+        .expect("both exact fused programs decode");
+    assert_eq!(snapshot.program.address, front_program_address);
+    assert_eq!(snapshot.header_address, back_header_address);
+    assert!(snapshot.metadata.is_some());
+    assert_eq!(snapshot.supplemental_programs.len(), 1);
+    assert_eq!(
+        snapshot.supplemental_programs[0].address,
+        back_program_address
+    );
 }

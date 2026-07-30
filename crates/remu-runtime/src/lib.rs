@@ -996,8 +996,24 @@ struct AgcShaderRegistry {
     headers: BTreeMap<u64, u64>,
     code_sizes: BTreeMap<u64, u32>,
     registration_code_fingerprints: BTreeMap<u64, u64>,
+    /// Separately allocated continuations selected by merged Gen5 shader tail calls.
+    ///
+    /// AGC programs the front half as the hardware entry point, but the fused stage descriptor is
+    /// copied from the back half. Keying this relationship by the actually bound front address
+    /// keeps code ownership and descriptor semantics together when a draw is snapshotted. The set
+    /// deliberately retains ambiguity: if one entry point is fused with distinct back halves, a
+    /// draw cannot safely select one from the ES program address alone.
+    fused_continuations: BTreeMap<u64, BTreeSet<AgcFusedShaderContinuation>>,
     snapshots: BTreeMap<u64, remu_gpu::ShaderSnapshot>,
     decode_failures: BTreeSet<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AgcFusedShaderContinuation {
+    front_header_address: u64,
+    back_header_address: u64,
+    back_program_address: u64,
+    back_code_size: u32,
 }
 
 impl AgcGraphicsState {
@@ -3695,7 +3711,6 @@ fn dispatch_stateless_import(
         "aJf+j5yntiU" => agc_dcb_event_write(arguments),
         "LtTouSCZjHM" => agc_cb_nop(arguments),
         "dolOmWH+huQ" => agc_get_fused_shader_size(arguments),
-        "fd5Bp5tGTgo" => agc_fuse_shader_halves(arguments),
         "WmAc2MEj6Io" => agc_dcb_dma_data(arguments, stack_arguments),
         "wr23dPKyWc0" => agc_cb_release_mem(arguments, stack_arguments),
         "VmW0Tdpy420" => agc_dcb_wait_reg_mem(arguments, stack_arguments),
@@ -4145,6 +4160,7 @@ fn dispatch_probe_import(
         }
         "D9sr1xGUriE" => agc_create_primitive_state(arguments),
         "HV4j+E0MBHE" => agc_create_interpolant_mapping(arguments),
+        "fd5Bp5tGTgo" => agc_fuse_shader_halves(arguments, state),
         "n2fD4A+pb+g" => agc_cb_set_sh_register_range_direct(arguments),
         "V++UgBtQhn0" => agc_get_data_packet_payload_address(arguments),
         "aJf+j5yntiU" => agc_dcb_event_write(arguments),
