@@ -13,8 +13,8 @@ use super::{
     OrderedEventSource, PendingFlip, PresentationResolution, VIDEO_OUT_DISPLAY_TILE_MODE,
     VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, decode_scanout_target,
     headless_metal_value_is_enabled, parse_presentation_resolution, presentation_drawable_size,
-    presentation_viewport, process_resident_bytes, raw_video_out_layout_is_linear,
-    raw_video_out_texture_descriptor, read_texture_linear,
+    presentation_viewport, process_memory_statistics, process_resident_bytes,
+    raw_video_out_layout_is_linear, raw_video_out_texture_descriptor, read_texture_linear,
 };
 
 #[test]
@@ -103,6 +103,12 @@ fn raw_video_out_upload_maps_both_abi_layouts() {
 #[test]
 fn reads_live_process_resident_memory_for_window_telemetry() {
     assert!(process_resident_bytes().is_some_and(|bytes| bytes > 0));
+    let statistics = process_memory_statistics().expect("live process memory statistics");
+    assert!(statistics.physical_footprint_bytes > 0);
+    assert!(
+        statistics.peak_physical_footprint_bytes >= statistics.physical_footprint_bytes,
+        "lifetime peak cannot be lower than the current physical footprint"
+    );
 }
 
 #[test]
