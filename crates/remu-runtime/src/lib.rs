@@ -51,7 +51,7 @@ use std::ffi::CString;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -121,16 +121,16 @@ pub(crate) use agc_registers::{
     agc_program_address, agc_register_snapshot, agc_shader_code_fingerprint,
     agc_shader_prefix_snapshot, agc_shader_snapshot,
 };
+#[cfg(test)]
+pub(crate) use agc_submission::{
+    AgcEventWrite, AgcSubmissionPacket, agc_handle_submission_packet, agc_parse_submission,
+    decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire, decode_agc_memory_wait,
+};
 pub(crate) use agc_submission::{
     AgcSubmissionContext, agc_driver_submit_acb, agc_driver_submit_dcb,
     agc_driver_submit_multi_acbs, agc_driver_submit_multi_dcbs, agc_memory_shadow_overlaps,
     agc_parse_graphics_submission, agc_read_mapped_u64, apply_agc_memory_shadow,
     begin_agc_memory_shadow,
-};
-#[cfg(test)]
-pub(crate) use agc_submission::{
-    AgcEventWrite, AgcSubmissionPacket, agc_handle_submission_packet, agc_parse_submission,
-    decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire, decode_agc_memory_wait,
 };
 #[cfg(test)]
 pub(crate) use agc_submission::{agc_future_scanout_targets, decode_agc_pipeline_barrier};
@@ -1667,7 +1667,7 @@ struct GuestImportTraceRecord {
     thread: u64,
     name: String,
     active: AtomicBool,
-    in_import: AtomicBool,
+    phase: AtomicU8,
     dispatch_index: AtomicU64,
     guest_return_address: AtomicU64,
     guest_rsp: AtomicU64,
@@ -1682,6 +1682,91 @@ struct GuestImportTraceGuard {
     dispatch_index: u64,
     guest_return_address: u64,
     guest_rsp: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum GuestImportTracePhase {
+    Guest = 0,
+    Dispatch = 1,
+    AgcDcbParse = 2,
+    AgcAcbParse = 3,
+    GpuPublication = 4,
+    ImportCallbacks = 5,
+    FlipPacing = 6,
+}
+
+impl GuestImportTracePhase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Dispatch,
+            2 => Self::AgcDcbParse,
+            3 => Self::AgcAcbParse,
+            4 => Self::GpuPublication,
+            5 => Self::ImportCallbacks,
+            6 => Self::FlipPacing,
+            _ => Self::Guest,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Guest => "in-guest",
+            Self::Dispatch => "in-import-dispatch",
+            Self::AgcDcbParse => "agc-dcb-parse",
+            Self::AgcAcbParse => "agc-acb-parse",
+            Self::GpuPublication => "gpu-publication",
+            Self::ImportCallbacks => "import-callbacks",
+            Self::FlipPacing => "flip-pacing",
+        }
+    }
+}
+
+pub(crate) struct GuestImportTracePhaseGuard {
+    record: *const GuestImportTraceRecord,
+    previous: GuestImportTracePhase,
+}
+
+impl GuestImportTracePhaseGuard {
+    pub(crate) fn enter(phase: GuestImportTracePhase) -> Self {
+        let record = GUEST_IMPORT_TRACE_RECORD.with(Cell::get);
+        if record.is_null() {
+            return Self {
+                record,
+                previous: GuestImportTracePhase::Guest,
+            };
+        }
+        // SAFETY: the process-lifetime registry owns every trace record referenced by TLS.
+        let trace = unsafe { &*record };
+        let previous =
+            GuestImportTracePhase::from_u8(trace.phase.swap(phase as u8, Ordering::Relaxed));
+        trace
+            .transition_nanos
+            .store(guest_import_trace_nanos(), Ordering::Relaxed);
+        trace.transition_sequence.store(
+            GUEST_IMPORT_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Release,
+        );
+        Self { record, previous }
+    }
+}
+
+impl Drop for GuestImportTracePhaseGuard {
+    fn drop(&mut self) {
+        if self.record.is_null() {
+            return;
+        }
+        // SAFETY: the process-lifetime registry owns every trace record referenced by this guard.
+        let trace = unsafe { &*self.record };
+        trace.phase.store(self.previous as u8, Ordering::Relaxed);
+        trace
+            .transition_nanos
+            .store(guest_import_trace_nanos(), Ordering::Relaxed);
+        trace.transition_sequence.store(
+            GUEST_IMPORT_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Release,
+        );
+    }
 }
 
 fn trace_guest_threads() -> bool {
@@ -1744,16 +1829,15 @@ fn start_guest_import_trace_reporter() {
                             .ok()
                             .and_then(|index| telemetry.nids.get(index))
                             .map_or("?", String::as_str);
+                        let phase = GuestImportTracePhase::from_u8(
+                            record.phase.load(Ordering::Acquire),
+                        );
                         eprintln!(
                             "[REMu][THREAD][STALE] thread={:#x} name={:?} age_ms={} phase={} nid={} import={} return={:#x} rsp={:#x} calls={} transition={transition_sequence}",
                             record.thread,
                             record.name,
                             age_nanos / 1_000_000,
-                            if record.in_import.load(Ordering::Acquire) {
-                                "in-import"
-                            } else {
-                                "in-guest"
-                            },
+                            phase.name(),
                             nid,
                             nid_display_name(nid).unwrap_or("unknown"),
                             record.guest_return_address.load(Ordering::Acquire),
@@ -1782,7 +1866,7 @@ impl GuestImportTraceGuard {
                 thread: current_guest_thread_handle(),
                 name: current_guest_thread_name(),
                 active: AtomicBool::new(true),
-                in_import: AtomicBool::new(false),
+                phase: AtomicU8::new(GuestImportTracePhase::Guest as u8),
                 dispatch_index: AtomicU64::new(0),
                 guest_return_address: AtomicU64::new(0),
                 guest_rsp: AtomicU64::new(0),
@@ -1810,7 +1894,9 @@ impl GuestImportTraceGuard {
             .store(frame.guest_return_address, Ordering::Relaxed);
         record.guest_rsp.store(frame.guest_rsp, Ordering::Relaxed);
         record.calls.fetch_add(1, Ordering::Relaxed);
-        record.in_import.store(true, Ordering::Relaxed);
+        record
+            .phase
+            .store(GuestImportTracePhase::Dispatch as u8, Ordering::Relaxed);
         record
             .transition_nanos
             .store(guest_import_trace_nanos(), Ordering::Relaxed);
@@ -1838,7 +1924,9 @@ impl Drop for GuestImportTraceGuard {
             .guest_return_address
             .store(self.guest_return_address, Ordering::Relaxed);
         record.guest_rsp.store(self.guest_rsp, Ordering::Relaxed);
-        record.in_import.store(false, Ordering::Relaxed);
+        record
+            .phase
+            .store(GuestImportTracePhase::Guest as u8, Ordering::Relaxed);
         record
             .transition_nanos
             .store(guest_import_trace_nanos(), Ordering::Relaxed);
@@ -2657,20 +2745,30 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         }
     }
     drop(state);
-    if !flush_deferred_gpu_publication(gpu_publication) {
+    let publication_succeeded = {
+        let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::GpuPublication);
+        flush_deferred_gpu_publication(gpu_publication)
+    };
+    if !publication_succeeded {
         eprintln!(
             "[REMu][GPU] presenter became unavailable while publishing events from {}",
             nid_display_name(nid).unwrap_or(nid)
         );
     }
-    invoke_av_player_event_callbacks(av_player_callbacks);
-    invoke_av_player_event_callbacks(av_player_calling_thread_callbacks);
-    invoke_av_player_texture_deallocations(av_player_texture_deallocations);
+    {
+        let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::ImportCallbacks);
+        invoke_av_player_event_callbacks(av_player_callbacks);
+        invoke_av_player_event_callbacks(av_player_calling_thread_callbacks);
+        invoke_av_player_texture_deallocations(av_player_texture_deallocations);
+    }
     // Paced after the dispatch lock is released: the submitting thread waits for its own vblank,
     // exactly as it would on the console, without stalling other guest threads.
     let queued_flips = QUEUED_FLIPS.with(|queued| queued.replace(0));
-    for _ in 0..queued_flips {
-        pace_video_out_flip();
+    {
+        let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::FlipPacing);
+        for _ in 0..queued_flips {
+            pace_video_out_flip();
+        }
     }
     ProbeImportReturn::integer(result)
 }
@@ -5604,8 +5702,42 @@ struct DeferredGpuPublication {
     events: Vec<remu_gpu::GpuEvent>,
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct DeferredGpuPublicationSummary {
+    outer_events: usize,
+    work_items: usize,
+    queue_work_items: BTreeMap<u64, usize>,
+}
+
+impl DeferredGpuPublication {
+    fn summary(&self) -> DeferredGpuPublicationSummary {
+        let mut summary = DeferredGpuPublicationSummary {
+            outer_events: self.events.len(),
+            ..DeferredGpuPublicationSummary::default()
+        };
+        for event in &self.events {
+            match event {
+                remu_gpu::GpuEvent::QueueSubmission { queue_id, events } => {
+                    summary.work_items = summary.work_items.saturating_add(events.len());
+                    let queue = summary.queue_work_items.entry(*queue_id).or_default();
+                    *queue = queue.saturating_add(events.len());
+                }
+                _ => summary.work_items = summary.work_items.saturating_add(1),
+            }
+        }
+        summary
+    }
+}
+
 static GPU_PUBLICATION_TICKET: AtomicU64 = AtomicU64::new(0);
 static GPU_PUBLICATION_ORDER: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+
+fn trace_gpu_publication() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_GPU_PUBLICATION").is_some_and(|value| value == "1")
+    })
+}
 
 fn begin_deferred_gpu_publication() {
     DEFERRED_GPU_PUBLICATION.with_borrow_mut(|publication| {
@@ -5655,6 +5787,15 @@ fn flush_deferred_gpu_publication(publication: DeferredGpuPublication) -> bool {
         debug_assert!(publication.events.is_empty());
         return true;
     };
+    let traced = trace_gpu_publication();
+    let summary = traced.then(|| publication.summary());
+    let started = traced.then(Instant::now);
+    if let Some(summary) = &summary {
+        eprintln!(
+            "[REMu][GPU][PUBLICATION] begin ticket={ticket} outer={} work={} queues={:?}",
+            summary.outer_events, summary.work_items, summary.queue_work_items,
+        );
+    }
     let order = GPU_PUBLICATION_ORDER.get_or_init(|| (Mutex::new(0), Condvar::new()));
     let mut next = order
         .0
@@ -5682,6 +5823,17 @@ fn flush_deferred_gpu_publication(publication: DeferredGpuPublication) -> bool {
     debug_assert_eq!(*next, ticket);
     *next = next.saturating_add(1);
     order.1.notify_all();
+    if let (Some(started), Some(summary)) = (started, summary)
+        && started.elapsed() >= Duration::from_millis(2)
+    {
+        eprintln!(
+            "[REMu][GPU][PUBLICATION] end ticket={ticket} elapsed_ms={:.3} outer={} work={} queues={:?} success={all_sent}",
+            started.elapsed().as_secs_f64() * 1_000.0,
+            summary.outer_events,
+            summary.work_items,
+            summary.queue_work_items,
+        );
+    }
     all_sent
 }
 

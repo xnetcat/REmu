@@ -55,11 +55,22 @@ pub(crate) fn agc_parse_submission(
     dword_count: u32,
     context: &mut AgcSubmissionContext<'_>,
 ) -> Result<(), AgcSubmissionError> {
-    let (offset, packet_counts) =
-        agc_parse_command_stream(command_address, dword_count, context, 0)?;
+    let next_submission = context.submission_count.saturating_add(1);
+    // Packet counts are diagnostic only. Building a BTreeMap for every ordinary command buffer,
+    // and another discarded map for every nested IB, added allocator traffic directly to the
+    // guest's submission path. Collect the same top-level summary only when it will be printed.
+    let collect_packet_counts =
+        trace_agc_programs() || trace_logarithmic_sequence(next_submission, 8);
+    let (offset, packet_counts) = agc_parse_command_stream(
+        command_address,
+        dword_count,
+        context,
+        0,
+        collect_packet_counts,
+    )?;
 
-    *context.submission_count = context.submission_count.saturating_add(1);
-    if trace_agc_programs() || trace_logarithmic_sequence(*context.submission_count, 8) {
+    *context.submission_count = next_submission;
+    if collect_packet_counts {
         let packet_summary = packet_counts
             .iter()
             .map(|(&(opcode, register), &count)| {
@@ -95,7 +106,7 @@ pub(crate) fn agc_parse_graphics_submission(
             eprintln!(
                 "[REMu][AGC] applying graphics continuation packet={packet_address:#x} target={target_address:#x}/{target_dword_count} before={command_address:#x}"
             );
-            agc_parse_command_stream(target_address, target_dword_count, context, 1)?;
+            agc_parse_command_stream(target_address, target_dword_count, context, 1, false)?;
             agc_command_abi::consume_recorded_graphics_range(target_address, target_dword_count);
         }
     }
@@ -106,7 +117,7 @@ pub(crate) fn agc_parse_graphics_submission(
             eprintln!(
                 "[REMu][AGC] applying recorded graphics prefix address={prefix_address:#x} dwords={prefix_dword_count} before={command_address:#x}"
             );
-            agc_parse_command_stream(prefix_address, prefix_dword_count, context, 1)?;
+            agc_parse_command_stream(prefix_address, prefix_dword_count, context, 1, false)?;
         }
     }
     agc_parse_submission(command_address, dword_count, context)
@@ -117,6 +128,7 @@ pub(super) fn agc_parse_command_stream(
     dword_count: u32,
     context: &mut AgcSubmissionContext<'_>,
     nesting: u32,
+    collect_packet_counts: bool,
 ) -> Result<(u32, BTreeMap<(u32, u32), u32>), AgcSubmissionError> {
     const MAX_INDIRECT_BUFFER_NESTING: u32 = 32;
     if nesting > MAX_INDIRECT_BUFFER_NESTING {
@@ -154,7 +166,9 @@ pub(super) fn agc_parse_command_stream(
         }
         let opcode = (header >> 8) & 0xff;
         let register = (header >> 2) & 0x3f;
-        *packet_counts.entry((opcode, register)).or_default() += 1;
+        if collect_packet_counts {
+            *packet_counts.entry((opcode, register)).or_default() += 1;
+        }
         packets.push(AgcSubmissionPacket {
             address: packet_address,
             length,
@@ -230,6 +244,7 @@ pub(super) fn agc_parse_command_stream(
                         branch_dword_count,
                         context,
                         nesting + 1,
+                        false,
                     )?;
                     // This target has now executed as part of the native branch. Its constructor
                     // records exist only so a target separated from its submitted tail can be
@@ -270,7 +285,13 @@ pub(super) fn agc_parse_command_stream(
                     packet.address,
                 );
             }
-            agc_parse_command_stream(indirect_address, indirect_dword_count, context, nesting + 1)?;
+            agc_parse_command_stream(
+                indirect_address,
+                indirect_dword_count,
+                context,
+                nesting + 1,
+                false,
+            )?;
             continue;
         }
         agc_handle_submission_packet(

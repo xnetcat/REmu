@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use crate::{
-    AgcSubmissionError, ProbeDispatchState, agc_command_abi, capture_agc_gpu_events, low_u32,
-    queue_agc_event_write, queue_video_out_flip, read_guest_u32, read_guest_u64,
-    request_agc_compute_submission_completion, request_agc_submission_completion,
-    trace_agc_programs, trace_logarithmic_sequence,
+    AgcSubmissionError, GuestImportTracePhase, GuestImportTracePhaseGuard, ProbeDispatchState,
+    agc_command_abi, capture_agc_gpu_events, low_u32, queue_agc_event_write, queue_video_out_flip,
+    read_guest_u32, read_guest_u64, request_agc_compute_submission_completion,
+    request_agc_submission_completion, trace_agc_programs, trace_logarithmic_sequence,
 };
 
 use super::{AgcSubmissionContext, agc_parse_graphics_submission, agc_parse_submission};
@@ -34,20 +34,23 @@ pub(crate) fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispat
     }
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
-    let (result, gpu_events) = capture_agc_gpu_events(|| {
-        agc_parse_graphics_submission(
-            command_address,
-            dword_count,
-            &mut AgcSubmissionContext {
-                graphics: &mut state.agc_graphics,
-                shaders: &mut state.agc_shader_registry,
-                video_out: &state.video_out,
-                submission_count: &mut state.agc_submission_count,
-                flips: &mut flips,
-                event_writes: &mut event_writes,
-            },
-        )
-    });
+    let (result, gpu_events) = {
+        let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::AgcDcbParse);
+        capture_agc_gpu_events(|| {
+            agc_parse_graphics_submission(
+                command_address,
+                dword_count,
+                &mut AgcSubmissionContext {
+                    graphics: &mut state.agc_graphics,
+                    shaders: &mut state.agc_shader_registry,
+                    video_out: &state.video_out,
+                    submission_count: &mut state.agc_submission_count,
+                    flips: &mut flips,
+                    event_writes: &mut event_writes,
+                },
+            )
+        })
+    };
     match result {
         Ok(()) => {
             agc_command_abi::track_graphics_submission(command_address, dword_count);
@@ -86,20 +89,23 @@ pub(crate) fn agc_driver_submit_multi_dcbs(
         if command_address != 0 && dword_count != 0 && dword_count <= 1_000_000 {
             let mut flips = Vec::new();
             let mut event_writes = Vec::new();
-            let (result, gpu_events) = capture_agc_gpu_events(|| {
-                agc_parse_graphics_submission(
-                    command_address,
-                    dword_count,
-                    &mut AgcSubmissionContext {
-                        graphics: &mut state.agc_graphics,
-                        shaders: &mut state.agc_shader_registry,
-                        video_out: &state.video_out,
-                        submission_count: &mut state.agc_submission_count,
-                        flips: &mut flips,
-                        event_writes: &mut event_writes,
-                    },
-                )
-            });
+            let (result, gpu_events) = {
+                let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::AgcDcbParse);
+                capture_agc_gpu_events(|| {
+                    agc_parse_graphics_submission(
+                        command_address,
+                        dword_count,
+                        &mut AgcSubmissionContext {
+                            graphics: &mut state.agc_graphics,
+                            shaders: &mut state.agc_shader_registry,
+                            video_out: &state.video_out,
+                            submission_count: &mut state.agc_submission_count,
+                            flips: &mut flips,
+                            event_writes: &mut event_writes,
+                        },
+                    )
+                })
+            };
             match result {
                 Ok(()) => {
                     agc_command_abi::track_graphics_submission(command_address, dword_count);
@@ -199,16 +205,19 @@ pub(crate) fn agc_driver_submit_acb(arguments: [u64; 6], state: &mut ProbeDispat
     }
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
-    let (result, gpu_events) = capture_agc_gpu_events(|| {
-        agc_submit_compute_commands(
-            owner,
-            command_address,
-            dword_count,
-            state,
-            &mut flips,
-            &mut event_writes,
-        )
-    });
+    let (result, gpu_events) = {
+        let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::AgcAcbParse);
+        capture_agc_gpu_events(|| {
+            agc_submit_compute_commands(
+                owner,
+                command_address,
+                dword_count,
+                state,
+                &mut flips,
+                &mut event_writes,
+            )
+        })
+    };
     match result {
         Ok(()) => {
             // The native driver asks the compute backend to trigger an interrupt when the
@@ -256,16 +265,19 @@ pub(crate) fn agc_driver_submit_multi_acbs(
         }
         let mut flips = Vec::new();
         let mut event_writes = Vec::new();
-        let (result, gpu_events) = capture_agc_gpu_events(|| {
-            agc_submit_compute_commands(
-                owner,
-                command_address,
-                dword_count,
-                state,
-                &mut flips,
-                &mut event_writes,
-            )
-        });
+        let (result, gpu_events) = {
+            let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::AgcAcbParse);
+            capture_agc_gpu_events(|| {
+                agc_submit_compute_commands(
+                    owner,
+                    command_address,
+                    dword_count,
+                    state,
+                    &mut flips,
+                    &mut event_writes,
+                )
+            })
+        };
         match result {
             Ok(()) => {
                 if !request_agc_compute_submission_completion(state, u64::from(owner), gpu_events) {

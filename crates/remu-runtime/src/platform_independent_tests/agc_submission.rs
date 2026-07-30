@@ -35,6 +35,33 @@ fn gpu_publication_waits_until_the_dispatch_state_can_be_released() {
 }
 
 #[test]
+fn gpu_publication_summary_separates_queue_work_from_outer_events() {
+    let publication = crate::DeferredGpuPublication {
+        ticket: Some(7),
+        events: vec![
+            remu_gpu::GpuEvent::QueueSubmission {
+                queue_id: 0,
+                events: vec![
+                    remu_gpu::GpuEvent::SubmissionBoundary(1),
+                    remu_gpu::GpuEvent::SubmissionBoundary(2),
+                ],
+            },
+            remu_gpu::GpuEvent::QueueSubmission {
+                queue_id: 33,
+                events: vec![remu_gpu::GpuEvent::SubmissionBoundary(3)],
+            },
+            remu_gpu::GpuEvent::Shutdown,
+        ],
+    };
+
+    let summary = publication.summary();
+    assert_eq!(summary.outer_events, 3);
+    assert_eq!(summary.work_items, 4);
+    assert_eq!(summary.queue_work_items.get(&0), Some(&2));
+    assert_eq!(summary.queue_work_items.get(&33), Some(&1));
+}
+
+#[test]
 fn gpu_publication_backpressure_releases_dispatch_state_and_preserves_ticket_order() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()
