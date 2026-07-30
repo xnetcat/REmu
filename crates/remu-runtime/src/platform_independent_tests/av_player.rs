@@ -474,7 +474,7 @@ fn av_player_stall_snapshot_distinguishes_decoder_and_guest_progress() {
             frames: std::sync::Mutex::new(frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
-            progress,
+            progress: Some(progress),
         });
     }
 
@@ -868,7 +868,9 @@ fn av_player_actual_eof_exposes_duration_and_queues_one_controller_stop() {
             frames: std::sync::Mutex::new(frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
-            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
+            progress: Some(std::sync::Arc::new(
+                crate::AvPlayerDecoderProgress::default(),
+            )),
         });
     }
     let mut frame_info = [0_u8; 112];
@@ -933,14 +935,18 @@ fn av_player_multiplexed_source_waits_for_video_and_audio_to_drain() {
             frames: std::sync::Mutex::new(video_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
-            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
+            progress: Some(std::sync::Arc::new(
+                crate::AvPlayerDecoderProgress::default(),
+            )),
         });
         player.audio_decoder = Some(crate::AvPlayerDecoder {
             child: None,
             frames: std::sync::Mutex::new(audio_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
-            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
+            progress: Some(std::sync::Arc::new(
+                crate::AvPlayerDecoderProgress::default(),
+            )),
         });
     }
 
@@ -1005,14 +1011,18 @@ fn av_player_loop_restarts_only_after_every_enabled_stream_drains() {
             frames: std::sync::Mutex::new(video_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
-            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
+            progress: Some(std::sync::Arc::new(
+                crate::AvPlayerDecoderProgress::default(),
+            )),
         });
         player.audio_decoder = Some(crate::AvPlayerDecoder {
             child: None,
             frames: std::sync::Mutex::new(audio_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
-            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
+            progress: Some(std::sync::Arc::new(
+                crate::AvPlayerDecoderProgress::default(),
+            )),
         });
     }
 
@@ -1137,7 +1147,9 @@ fn av_player_sync_none_hands_video_timing_to_the_caller() {
             frames: std::sync::Mutex::new(receiver),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
-            progress: std::sync::Arc::new(crate::AvPlayerDecoderProgress::default()),
+            progress: Some(std::sync::Arc::new(
+                crate::AvPlayerDecoderProgress::default(),
+            )),
         });
     }
     let mut frame_info = [0_u8; 112];

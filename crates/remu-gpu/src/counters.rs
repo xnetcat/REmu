@@ -3,7 +3,7 @@
 //! Process-global GPU queue depth, submission completion and audio callback counters.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -29,6 +29,8 @@ pub(crate) static AUDIO_UNDERRUN_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 static PROGRESS_EPOCH: OnceLock<Instant> = OnceLock::new();
 
+static PROGRESS_TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
+
 static GPU_LAST_PROGRESS_MILLIS: AtomicU64 = AtomicU64::new(0);
 
 static AUDIO_LAST_PROGRESS_MILLIS: AtomicU64 = AtomicU64::new(0);
@@ -45,12 +47,41 @@ fn progress_timestamp_millis() -> u64 {
 }
 
 fn progress_age_millis(timestamp: &AtomicU64) -> Option<u64> {
+    if !progress_telemetry_enabled() {
+        return None;
+    }
     let timestamp = timestamp.load(Ordering::Acquire);
     (timestamp != 0).then(|| progress_timestamp_millis().saturating_sub(timestamp))
 }
 
 fn record_gpu_progress() {
+    if !progress_telemetry_enabled() {
+        return;
+    }
     GPU_LAST_PROGRESS_MILLIS.store(progress_timestamp_millis(), Ordering::Release);
+}
+
+/// Enables or disables bounded-run progress timestamps.
+///
+/// Queue depths, completion state and cumulative audio counters are always maintained. Only the
+/// diagnostic progress clocks are gated, keeping `Instant` sampling out of normal presenter and
+/// audio callback paths. Changing modes starts a fresh observation window.
+pub fn set_progress_telemetry_enabled(enabled: bool) {
+    if enabled {
+        GPU_LAST_PROGRESS_MILLIS.store(0, Ordering::Release);
+        AUDIO_LAST_PROGRESS_MILLIS.store(0, Ordering::Release);
+        PROGRESS_TELEMETRY_ENABLED.store(true, Ordering::Release);
+    } else {
+        PROGRESS_TELEMETRY_ENABLED.store(false, Ordering::Release);
+        GPU_LAST_PROGRESS_MILLIS.store(0, Ordering::Release);
+        AUDIO_LAST_PROGRESS_MILLIS.store(0, Ordering::Release);
+    }
+}
+
+/// Returns whether bounded-run progress timestamps are enabled.
+#[must_use]
+pub fn progress_telemetry_enabled() -> bool {
+    PROGRESS_TELEMETRY_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Returns the number of guest GPU events queued or blocked on the bounded presenter channel.
@@ -107,7 +138,7 @@ pub(crate) fn cancel_pending_gpu_flips(count: usize) {
 pub fn report_audio_frames(output_frames: u64, underrun_frames: u64) {
     AUDIO_OUTPUT_FRAMES.fetch_add(output_frames, Ordering::Relaxed);
     AUDIO_UNDERRUN_FRAMES.fetch_add(underrun_frames, Ordering::Relaxed);
-    if output_frames != 0 {
+    if output_frames != 0 && progress_telemetry_enabled() {
         AUDIO_LAST_PROGRESS_MILLIS.store(progress_timestamp_millis(), Ordering::Release);
     }
 }
@@ -127,7 +158,8 @@ pub fn audio_underrun_frames() -> u64 {
 
 /// Returns the age of the most recent host audio callback that requested output frames.
 ///
-/// `None` means no audio stream has reached the host callback yet.
+/// `None` means progress telemetry is disabled or no audio stream has reached the host callback
+/// during the current observation window.
 #[must_use]
 pub fn audio_progress_age_millis() -> Option<u64> {
     progress_age_millis(&AUDIO_LAST_PROGRESS_MILLIS)
@@ -138,6 +170,8 @@ pub fn audio_progress_age_millis() -> Option<u64> {
 ///
 /// This is diagnostic progress, not a completion fence. It lets bounded runs distinguish an idle
 /// guest from a backend which still has outstanding work but has stopped retiring it.
+/// `None` means progress telemetry is disabled or no GPU progress has been observed in the current
+/// window.
 #[must_use]
 pub fn gpu_progress_age_millis() -> Option<u64> {
     progress_age_millis(&GPU_LAST_PROGRESS_MILLIS)
