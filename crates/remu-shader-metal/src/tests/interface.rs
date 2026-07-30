@@ -16,30 +16,24 @@ fn compile_pixel_export_mask(
     compressed: bool,
     enable_mask: u32,
 ) -> MetalShader {
-    let instruction = Instruction {
-        pc: 0,
-        encoding: ShaderEncoding::Exp,
-        opcode: Opcode::Known("Exp"),
-        words: vec![0, 0],
-        sources: if compressed {
-            vec![
-                Operand::vector(0),
-                Operand::vector(1),
-                Operand::vector(0),
-                Operand::vector(1),
-            ]
-        } else {
-            (0..4).map(Operand::vector).collect()
-        },
-        destinations: Vec::new(),
-        control: Some(InstructionControl::Export(ExportControl {
+    // Decode a real GCN EXP instead of constructing compiler IR by hand. This locks the raw
+    // VGPR payload and COMPR/EN bit semantics to the generated Metal source.
+    let export_word =
+        0xf800_0000 | enable_mask | (u32::from(compressed) << 10) | (1 << 11) | (1 << 12);
+    let program = decode_program(0x1000, &[export_word, 0x0302_0100, 0xbf81_0000])
+        .expect("pixel export should decode");
+    let export = program.instructions.first().expect("decoded EXP");
+    assert_eq!(export.opcode, Opcode::EXPORT);
+    assert_eq!(
+        export.control,
+        Some(InstructionControl::Export(ExportControl {
             target: 0,
             enable_mask,
             compressed,
             done: true,
             valid_mask: true,
-        })),
-    };
+        }))
+    );
     let options = MetalCompileOptions::pixel(
         vec![PixelOutputBinding {
             guest_slot: 0,
@@ -49,12 +43,7 @@ fn compile_pixel_export_mask(
         0,
         0,
     );
-    compile_msl(
-        &Program::new(0x1000, vec![instruction]),
-        &empty_evaluation(),
-        &options,
-    )
-    .expect("pixel export should lower")
+    compile_msl(&program, &empty_evaluation(), &options).expect("pixel export should lower")
 }
 
 #[test]
@@ -99,14 +88,30 @@ fn preserves_integer_mrt_export_bits_without_float_conversion() {
 
 #[test]
 fn unpacks_compressed_integer_mrt_exports_as_integer_halves() {
-    let unsigned = compile_pixel_export(PixelOutputKind::Uint, true);
+    // COMPR uses EN[0] for R/G and EN[2] for B/A, so 0b0101 is the canonical all-component mask.
+    let unsigned = compile_pixel_export_mask(PixelOutputKind::Uint, true, 0x05);
     assert!(unsigned.source.contains(
         "remu_out.mrt0 = uint4((uint)as_type<ushort2>(remu_v_0)[0], (uint)as_type<ushort2>(remu_v_0)[1], (uint)as_type<ushort2>(remu_v_1)[0], (uint)as_type<ushort2>(remu_v_1)[1]);"
     ));
+    assert!(!unsigned.source.contains("as_type<float>(remu_v_"));
 
-    let signed = compile_pixel_export(PixelOutputKind::Sint, true);
+    let signed = compile_pixel_export_mask(PixelOutputKind::Sint, true, 0x05);
     assert!(signed.source.contains(
         "remu_out.mrt0 = int4((int)as_type<short2>(remu_v_0)[0], (int)as_type<short2>(remu_v_0)[1], (int)as_type<short2>(remu_v_1)[0], (int)as_type<short2>(remu_v_1)[1]);"
+    ));
+    assert!(!signed.source.contains("as_type<float>(remu_v_"));
+}
+
+#[test]
+fn compressed_integer_mrt_pair_enables_preserve_the_other_pair() {
+    let rg = compile_pixel_export_mask(PixelOutputKind::Uint, true, 0x01);
+    assert!(rg.source.contains(
+        "remu_out.mrt0 = uint4((uint)as_type<ushort2>(remu_v_0)[0], (uint)as_type<ushort2>(remu_v_0)[1], remu_out.mrt0[2], remu_out.mrt0[3]);"
+    ));
+
+    let ba = compile_pixel_export_mask(PixelOutputKind::Sint, true, 0x04);
+    assert!(ba.source.contains(
+        "remu_out.mrt0 = int4(remu_out.mrt0[0], remu_out.mrt0[1], (int)as_type<short2>(remu_v_1)[0], (int)as_type<short2>(remu_v_1)[1]);"
     ));
 }
 
