@@ -428,7 +428,7 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                 Ok(handle) => handle,
                 Err(error) => return error,
             };
-            let handle = state.allocate_handle();
+            let handle = state.allocate_port_handle(parameter.port_type);
             state.ports.insert(
                 handle,
                 AudioOut2PortRuntimeState {
@@ -445,7 +445,7 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
             write_guest_u64(arguments[2], handle);
             if create <= 8 || create.is_power_of_two() {
                 eprintln!(
-                    "[REMu][AUDIO2] port create={create} handle={handle} context={} parameter_address={:#x} parameter={parameter:?} channels={channel_count} backend={backend_handle:?} rate={frequency}",
+                    "[REMu][AUDIO2] port create={create} handle={handle:#x} context={} parameter_address={:#x} parameter={parameter:?} channels={channel_count} backend={backend_handle:?} rate={frequency}",
                     arguments[0], arguments[1],
                 );
             }
