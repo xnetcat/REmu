@@ -2217,6 +2217,9 @@ fn trace_dispatch_stalls() -> bool {
     })
 }
 
+/// How many times each dispatch site has reported a failure, so the log stays bounded.
+static IMPORT_FAILURE_COUNTS: OnceLock<Mutex<BTreeMap<u64, u64>>> = OnceLock::new();
+
 /// Reports an import that returned a console error code or a negative status.
 fn report_failed_import(frame: *const ImportCallFrame) -> ProbeImportReturn {
     // SAFETY: the caller supplies one aligned, fully initialized frame that stays live for the
@@ -2228,6 +2231,22 @@ fn report_failed_import(frame: *const ImportCallFrame) -> ProbeImportReturn {
     // errors instead carry their own facility in a plain 32-bit value, so match that facility
     // directly rather than widening the sign test and catching ordinary counters.
     let failed = value >> 32 == 0xffff_ffff || value >> 16 == 0x8a6c;
+    // Reporting is unconditional: a failed import is the single most useful line in a bring-up
+    // log, and gating it behind an environment variable meant the runs that needed it were the
+    // ones without it. Volume is bounded per call site instead — the first failure of each is
+    // always shown, then powers of two — so a hot call that legitimately fails, a trylock or a
+    // file probe, cannot bury the rest. `REMU_TRACE_IMPORT_ERRORS=1` removes the bound.
+    let failed = failed && {
+        let seen = IMPORT_FAILURE_COUNTS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(index)
+            .and_modify(|count| *count += 1_u64)
+            .or_insert(1_u64)
+            .to_owned();
+        trace_import_errors() || seen.is_power_of_two()
+    };
     if failed {
         // SAFETY: the telemetry Arc is retained by this thread's cache for the whole call.
         let telemetry = unsafe { &*cached_import_telemetry() };
@@ -2274,7 +2293,7 @@ extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImpor
         .flatten();
     let limit = import_call_trace_limit();
     if limit == 0 {
-        if trace_import_errors() && !frame.is_null() {
+        if !frame.is_null() {
             return report_failed_import(frame);
         }
         return import_dispatch(frame);
@@ -3549,6 +3568,84 @@ const _: () = {
     assert!(std::mem::offset_of!(SceAjmBatchInfo, last_good_job_return_address) == 0x20);
 };
 
+/// Bytes the batch-error object a caller may supply occupies.
+///
+/// It carries an error code, the address of the offending job, a command offset, and that job's
+/// return address. Clearing fewer bytes than this leaves the trailing fields holding whatever the
+/// caller's stack held, and an engine that reads them back asserts on the garbage.
+const AJM_BATCH_ERROR_SIZE: u64 = 24;
+
+/// Identifiers handed out by [`ajm_batch_start`].
+static AJM_NEXT_BATCH: AtomicU32 = AtomicU32::new(0);
+
+/// `sceAjmBatchStart(context, info, priority, error, batchOut)`.
+///
+/// Accepts the batch the guest built and hands back an identifier it can wait on.
+///
+/// No decode runs. This host has no audio-job coprocessor and no general Ajm decoder, so a batch
+/// is accepted and retired without producing samples; the job result fields the guest reads back
+/// keep the zero-length output the arena was initialized with, which reports "nothing was
+/// decoded" rather than claiming samples that do not exist. A title consuming this gets silence
+/// on Ajm-decoded audio, and that is a real limitation, not a hidden one — but its control flow
+/// proceeds, where refusing the call strands the audio thread and with it everything downstream.
+fn ajm_batch_start(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let context = low_u32(arguments[0]);
+    let info = arguments[1];
+    let error = arguments[3];
+    let output = arguments[4];
+    if !state.ajm_contexts.contains_key(&context) {
+        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
+    }
+    if info == 0
+        || output == 0
+        || guest_output_pointer(output, std::mem::size_of::<u32>()).is_none()
+        || guest_output_pointer(info, std::mem::size_of::<SceAjmBatchInfo>()).is_none()
+    {
+        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+    }
+    if error != 0 {
+        if guest_output_pointer(error, AJM_BATCH_ERROR_SIZE as usize).is_none() {
+            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+        }
+        // No job failed, because no job ran.
+        guest_memset(error, 0, AJM_BATCH_ERROR_SIZE);
+    }
+    let batch = AJM_NEXT_BATCH
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1);
+    write_guest_u32(output, batch);
+    0
+}
+
+/// `sceAjmBatchWait(context, batch, timeout, error)`.
+///
+/// A batch this host accepted is already retired, so the wait completes immediately.
+fn ajm_batch_wait(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let context = low_u32(arguments[0]);
+    let error = arguments[3];
+    if !state.ajm_contexts.contains_key(&context) {
+        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
+    }
+    if error != 0 {
+        if guest_output_pointer(error, AJM_BATCH_ERROR_SIZE as usize).is_none() {
+            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+        }
+        guest_memset(error, 0, AJM_BATCH_ERROR_SIZE);
+    }
+    0
+}
+
+/// `sceAjmBatchCancel(context, batch)`.
+///
+/// Cancelling a retired batch is a no-op that the guest is entitled to call.
+fn ajm_batch_cancel(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if !state.ajm_contexts.contains_key(&low_u32(arguments[0])) {
+        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
+    }
+    0
+}
+
 /// Bytes one `sceAjmBatchJobGetStatistics` job occupies in a batch arena.
 const AJM_JOB_GET_STATISTICS_SIZE: u64 = 88;
 /// Bytes the statistics result object occupies.
@@ -3585,6 +3682,9 @@ fn ajm_batch_job_get_statistics(arguments: [u64; 6]) -> u64 {
     guest_memset(job, 0, AJM_JOB_GET_STATISTICS_SIZE);
     batch_info.offset = end;
     batch_info.last_good_job = job;
+    // The arena cursor's return-address field belongs to the job just appended, not to whatever
+    // occupied the slot before it.
+    batch_info.last_good_job_return_address = 0;
     // SAFETY: the same validated cursor object.
     unsafe {
         std::ptr::write_unaligned(info as *mut SceAjmBatchInfo, batch_info);
@@ -4004,6 +4104,9 @@ fn dispatch_probe_import(
         "jBgBjAj02R8" => acm_context_destroy(arguments, state),
         "Q3dyFuwGn64" => ajm_module_register(arguments, state),
         "3cAg7xN995U" => ajm_batch_job_get_statistics(arguments),
+        "5tOfnaClcqM" => ajm_batch_start(arguments, state),
+        "-qLsfDAywIY" => ajm_batch_wait(arguments, state),
+        "NVDXiUesSbA" => ajm_batch_cancel(arguments, state),
         "Wi7DtlLV+KI" => ajm_module_unregister(arguments, state),
         "AxoDrINp4J8" => ajm_instance_create(arguments, state),
         "RbLbuKv8zho" => ajm_instance_destroy(arguments, state),

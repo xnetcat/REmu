@@ -178,8 +178,31 @@ is served — the append into the caller's batch arena is real, while the counte
 zero, because no decode work runs on a coprocessor here and invented figures would be worse than
 none.
 
-The title still submits no draws. It now stops at `sceAjmBatchStart`, which is unserved: it has
-built a batch and is trying to run it.
+The Ajm batch lifecycle (`sceAjmBatchStart`, `Wait`, `Cancel`) and `sceAjmBatchJobGetStatistics`
+are now routed, and a run reports zero unimplemented NIDs. This did not help, and the way it
+failed is the useful part.
+
+No decode runs behind those calls: this host has no audio-job coprocessor and no general Ajm
+decoder, so a batch is accepted and retired without producing samples. The title's audio engine is
+Sony's SCREAM, and SCREAM checks its pipeline. It now asserts in
+`wws_scream/scream/src/ps4/snd_osfuncs.cpp:397` immediately after starting a batch, and the process
+dies there instead of idling.
+
+That is this file's own warning about fabricated success arriving in practice. Accepting a batch
+and reporting completion is a claim that audio was decoded, and an engine that verifies its own
+pipeline catches the claim. Serving the batch ABI as a lifetime shell is therefore not the route:
+Ajm needs a real decoder — the title's audio is ATRAC9 and AAC — or the batch entry points should
+go back to being loudly unimplemented so the failure stays a stall rather than an abort. That
+decision is open, and the shell should not be treated as progress until it is made.
+
+Import failures are now reported unconditionally rather than behind `REMU_TRACE_IMPORT_ERRORS=1`.
+A failed import is the most useful line in a bring-up log, and gating it meant the runs that needed
+it were the ones without it. Volume is bounded per call site — first failure, then powers of two —
+so a call that legitimately fails often cannot bury the rest; the environment variable now removes
+the bound instead of enabling the report. A whole run of this title reports four failures, none of
+which is its blocker.
+
+The title still submits no draws.
 
 Note for whoever picks this up: `scripts/audit-import-coverage.py` under-reports. It walks modules
 from `lib.rs` and does not recognise every dispatch shape, so it lists NIDs as unserved that
