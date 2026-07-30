@@ -35,6 +35,108 @@ fn gpu_publication_waits_until_the_dispatch_state_can_be_released() {
 }
 
 #[test]
+fn gpu_publication_backpressure_releases_dispatch_state_and_preserves_ticket_order() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_event_sink(sender.clone());
+    for _ in 0..remu_gpu::GPU_EVENT_QUEUE_CAPACITY {
+        sender
+            .try_send(remu_gpu::GpuEvent::Shutdown)
+            .expect("filler event fits the bounded backend channel");
+    }
+
+    crate::begin_deferred_gpu_publication();
+    assert!(crate::publish_gpu_event(
+        remu_gpu::GpuEvent::SubmissionBoundary(0xa11)
+    ));
+    let first = crate::take_deferred_gpu_publication();
+    crate::begin_deferred_gpu_publication();
+    assert!(crate::publish_gpu_event(
+        remu_gpu::GpuEvent::SubmissionBoundary(0xb22)
+    ));
+    let second = crate::take_deferred_gpu_publication();
+
+    let (first_started, first_started_rx) = std::sync::mpsc::channel();
+    let (first_done, first_done_rx) = std::sync::mpsc::channel();
+    let first_thread = std::thread::spawn(move || {
+        first_started.send(()).expect("test receiver remains alive");
+        first_done
+            .send(crate::flush_deferred_gpu_publication(first))
+            .expect("test receiver remains alive");
+    });
+    first_started_rx
+        .recv()
+        .expect("first publisher reaches the flush");
+    assert_eq!(
+        first_done_rx.recv_timeout(Duration::from_millis(20)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "a full backend channel must retain bounded producer backpressure"
+    );
+
+    let dispatch =
+        crate::PROBE_DISPATCH.get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    assert!(
+        dispatch.try_write().is_ok(),
+        "a publisher blocked on backend capacity must not retain the process-wide dispatch state"
+    );
+
+    let (second_done, second_done_rx) = std::sync::mpsc::channel();
+    let second_thread = std::thread::spawn(move || {
+        second_done
+            .send(crate::flush_deferred_gpu_publication(second))
+            .expect("test receiver remains alive");
+    });
+    assert_eq!(
+        second_done_rx.recv_timeout(Duration::from_millis(20)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "a later ticket must not overtake the blocked publisher"
+    );
+
+    assert_eq!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown));
+    assert_eq!(
+        first_done_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(true),
+        "receiver progress must release the first publisher"
+    );
+    assert_eq!(
+        second_done_rx.recv_timeout(Duration::from_millis(20)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "the second publisher remains backpressured until another slot opens"
+    );
+    for _ in 1..remu_gpu::GPU_EVENT_QUEUE_CAPACITY {
+        assert_eq!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown));
+    }
+    assert_eq!(
+        receiver.recv(),
+        Ok(remu_gpu::GpuEvent::SubmissionBoundary(0xa11)),
+        "the first publication must retain its ticket order"
+    );
+    remu_gpu::record_gpu_event_consumed();
+    remu_gpu::record_gpu_work_item_processed();
+    assert_eq!(
+        second_done_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(true),
+        "receiver progress must release the second publisher"
+    );
+    assert_eq!(
+        receiver.recv(),
+        Ok(remu_gpu::GpuEvent::SubmissionBoundary(0xb22)),
+        "the later publication must follow the earlier ticket"
+    );
+    remu_gpu::record_gpu_event_consumed();
+    remu_gpu::record_gpu_work_item_processed();
+
+    first_thread.join().expect("first publisher exits cleanly");
+    second_thread
+        .join()
+        .expect("second publisher exits cleanly");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
 fn agc_completion_tracking_requires_a_published_queue_submission() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()
