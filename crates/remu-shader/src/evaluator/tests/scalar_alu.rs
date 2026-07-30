@@ -93,6 +93,77 @@ fn s_bcnt1_i32_b64_counts_the_source_pair_and_updates_scc() {
 }
 
 #[test]
+fn s_bfm_b64_uses_32_bit_controls_and_preserves_scc() {
+    let operation = instruction(
+        0,
+        ShaderEncoding::Sop2,
+        "SBfmB64",
+        vec![Operand::scalar(0), Operand::scalar(2)],
+        vec![Operand::scalar(10)],
+        None,
+    );
+
+    for (width, offset, expected) in [
+        (0_u32, 12_u32, 0_u64),
+        (32, 16, 0x0000_ffff_ffff_0000),
+        (0x43, 0x7c, 0x7000_0000_0000_0000),
+        (63, 63, 0x8000_0000_0000_0000),
+    ] {
+        for original_scc in [false, true] {
+            let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+            let mut exec_mask = u64::MAX;
+            let mut scalar_condition = original_scc;
+            registers[0] = width;
+            registers[2] = offset;
+
+            execute_scalar_alu(
+                &operation,
+                0x1000,
+                &mut registers,
+                &mut exec_mask,
+                &mut scalar_condition,
+            )
+            .expect("S_BFM_B64 evaluates");
+
+            let result = u64::from(registers[10]) | (u64::from(registers[11]) << 32);
+            assert_eq!(
+                result, expected,
+                "width=0x{width:08X}, offset=0x{offset:08X}"
+            );
+            assert_eq!(
+                scalar_condition, original_scc,
+                "S_BFM_B64 must not modify SCC"
+            );
+        }
+    }
+}
+
+#[test]
+fn s_pack_ll_b32_b16_packs_low_halves_and_preserves_scc() {
+    let operation = instruction(
+        0,
+        ShaderEncoding::Sop2,
+        "SPackLlB32B16",
+        vec![Operand::scalar(0), Operand::scalar(1)],
+        vec![Operand::scalar(2)],
+        None,
+    );
+
+    for original_scc in [false, true] {
+        let mut scalar_condition = original_scc;
+        assert_eq!(
+            execute_scalar_binary(&operation, 0x1234_abcd, 0x5678_ef01, &mut scalar_condition)
+                .expect("S_PACK_LL_B32_B16 evaluates"),
+            0xef01_abcd
+        );
+        assert_eq!(
+            scalar_condition, original_scc,
+            "S_PACK_LL_B32_B16 must not modify SCC"
+        );
+    }
+}
+
+#[test]
 fn s_bitcmp1_b32_uses_the_low_five_index_bits() {
     let instruction = instruction(
         0,

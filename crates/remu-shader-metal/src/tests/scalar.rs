@@ -184,3 +184,56 @@ fn lowers_scalar_bitfield_mask_operation() {
     assert!(shader.source.contains("& 31u)) - 1u) << ("));
     assert!(shader.source.contains("remu_s_20"));
 }
+
+#[test]
+fn lowers_s_bfm_b64_from_two_u32_controls_without_modifying_scc() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x224,
+            encoding: ShaderEncoding::Sop2,
+            opcode: Opcode::Known("SBfmB64"),
+            words: vec![0x9294_0c0a],
+            sources: vec![Operand::scalar(10), Operand::scalar(12)],
+            destinations: vec![Operand::scalar(20)],
+            control: None,
+        },
+        MetalShaderStage::Pixel,
+    );
+
+    assert!(shader.source.contains("1ul << (remu_s_10 & 63u)"));
+    assert!(shader.source.contains("<< (remu_s_12 & 63u)"));
+    assert!(shader.source.contains("remu_s_20 = (uint)"));
+    assert!(shader.source.contains("remu_s_21 = (uint)"));
+    assert!(!shader.source.contains("remu_s_11"));
+    assert!(!shader.source.contains("remu_s_13"));
+    assert_eq!(
+        shader.source.matches("scc = ").count(),
+        1,
+        "S_BFM_B64 must preserve the initialized SCC value"
+    );
+}
+
+#[test]
+fn lowers_s_pack_ll_b32_b16_from_both_low_halves_without_modifying_scc() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x228,
+            encoding: ShaderEncoding::Sop2,
+            opcode: Opcode::Known("SPackLlB32B16"),
+            words: vec![0x9914_0c0a],
+            sources: vec![Operand::scalar(10), Operand::scalar(12)],
+            destinations: vec![Operand::scalar(20)],
+            control: None,
+        },
+        MetalShaderStage::Pixel,
+    );
+
+    assert!(shader.source.contains("(remu_s_10 & 0xFFFFu)"));
+    assert!(shader.source.contains("((remu_s_12 & 0xFFFFu) << 16)"));
+    assert!(shader.source.contains("remu_s_20 = "));
+    assert_eq!(
+        shader.source.matches("scc = ").count(),
+        1,
+        "S_PACK_LL_B32_B16 must preserve the initialized SCC value"
+    );
+}
