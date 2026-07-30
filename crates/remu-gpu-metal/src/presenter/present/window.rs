@@ -5,8 +5,9 @@ use super::{
     EVENT_POLL_INTERVAL, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS,
     MetalPresenter, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED,
-    PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_DRAW_GATES, PresenterFlow, RESIDENT_DEPTH_SAMPLE_HITS,
-    RESIDENT_FLIP_AGE_LABELS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WORK_AGE_LABELS,
+    PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PresenterFlow,
+    RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_FLIP_AGE_LABELS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
+    RESIDENT_WORK_AGE_LABELS,
     SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
@@ -223,12 +224,16 @@ impl MetalPresenter {
             let compile_completed = PIPELINE_COMPILE_COMPLETED.swap(0, Ordering::Relaxed);
             let compile_failed = PIPELINE_COMPILE_FAILED.swap(0, Ordering::Relaxed);
             let draw_gates = PIPELINE_DRAW_GATES.swap(0, Ordering::Relaxed);
+            let compute_gates = PIPELINE_COMPUTE_GATES.swap(0, Ordering::Relaxed);
             let (pipeline_blocks, memory_blocks) = self.receiver.block_reason_counts();
             eprintln!(
-                "[REMu][PERF-PIPELINE] ready={} active={} failed={} interval=enqueued:{compile_enqueued}/full:{compile_queue_full}/done:{compile_completed}/failed:{compile_failed}/gates:{draw_gates} blocked=pipeline:{pipeline_blocks}/memory:{memory_blocks}",
+                "[REMu][PERF-PIPELINE] ready={}/{} active={}/{} failed={}/{} interval=enqueued:{compile_enqueued}/full:{compile_queue_full}/done:{compile_completed}/failed:{compile_failed}/gates:{draw_gates}/{compute_gates} blocked=pipeline:{pipeline_blocks}/memory:{memory_blocks}",
                 self.compiled_shader_pairs.len(),
+                self.compiled_compute_pipelines.len(),
                 self.compiling_shader_pairs.len(),
+                self.compiling_compute_pipelines.len(),
                 self.failed_shader_pairs.len(),
+                self.failed_compute_pipelines.len(),
             );
             let queue_diagnostics = self.receiver.queue_diagnostics();
             if !queue_diagnostics.is_empty() {

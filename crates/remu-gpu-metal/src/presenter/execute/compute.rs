@@ -2,15 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CompiledComputePipeline, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork,
-    MetalPresenter, ResidentTextureActivityStamp, append_unique_global_writebacks,
+    GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
+    ResidentTextureActivityStamp, append_unique_global_writebacks,
     append_unique_guest_write_ranges, collect_pending_global_writebacks,
-    collect_pending_guest_write_ranges, compile_metal_compute_library, compute_pipeline_key,
-    compute_program_can_split_wave64, create_global_argument_buffer, decode_image_descriptor,
-    diagnostic_texture_writer_enabled, dump_compute_shader_msl, dump_msl_compute_filter_matches,
-    guest_texture_descriptors_overlap, image_resource_descriptor_is_null, is_storage_image_opcode,
-    is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear,
+    collect_pending_guest_write_ranges, compute_pipeline_key, compute_program_can_split_wave64,
+    create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
+    dump_msl_compute_filter_matches, guest_texture_descriptors_overlap,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    read_texture_linear, rearm_color_metadata_clear, rearm_depth_metadata_clear,
     record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     sampled_image_bindings, shader_scalar_metadata_for_registers,
@@ -22,7 +21,6 @@ use remu_gpu::{ComputeDispatch, ComputeGrid};
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 fn storage_image_requires_exact_preacquire(
     opcode: remu_shader::Opcode,
@@ -67,80 +65,10 @@ impl MetalPresenter {
         if self.failed_compute_pipelines.contains(&pipeline_key) {
             return Err("compute pipeline previously failed to compile".to_owned());
         }
-        if !self.compiled_compute_pipelines.contains_key(&pipeline_key) {
-            let compiled = (|| {
-                let mut options = remu_shader_metal::MetalCompileOptions::compute_wave(
-                    dispatch.launch.lds_size_bytes,
-                    dispatch.launch.wave_lane_count,
-                );
-                options.allocated_vector_register_count =
-                    pipeline_key.allocated_vector_register_count;
-                let lowering_started = Instant::now();
-                let lowered =
-                    remu_shader_metal::compile_msl(&snapshot.program, evaluation, &options)
-                        .map_err(|error| format!("compute lowering: {error}"))?;
-                let lowering_duration = lowering_started.elapsed();
-                if lowered.stage != remu_shader_metal::MetalShaderStage::Compute {
-                    return Err("compute lowering returned a non-compute Metal stage".to_owned());
-                }
-                let function_started = Instant::now();
-                let library = compile_metal_compute_library(&device, &lowered.source)?;
-                let function = library
-                    .get_function(&lowered.entry_point, None)
-                    .map_err(|error| format!("Metal compute function: {error}"))?;
-                let function_duration = function_started.elapsed();
-                let pipeline_started = Instant::now();
-                let pipeline = device
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(|error| format!("Metal compute pipeline: {error}"))?;
-                let pipeline_duration = pipeline_started.elapsed();
-                Ok::<_, String>(CompiledComputePipeline {
-                    pipeline,
-                    function,
-                    shader: lowered,
-                    lowering_duration,
-                    function_duration,
-                    pipeline_duration,
-                })
-            })();
-            let compiled = match compiled {
-                Ok(compiled) => compiled,
-                Err(error) => {
-                    self.failed_compute_pipelines.insert(pipeline_key.clone());
-                    return Err(error);
-                }
-            };
-            eprintln!(
-                "[REMu][METAL] compiled Gen5 compute cs={:#x} MSL={} bytes time={:.1}/{:.1}/{:.1}ms lower/function/pipeline local={:?} LDS={} bytes",
-                dispatch.shader_address,
-                compiled.shader.source.len(),
-                compiled.lowering_duration.as_secs_f64() * 1_000.0,
-                compiled.function_duration.as_secs_f64() * 1_000.0,
-                compiled.pipeline_duration.as_secs_f64() * 1_000.0,
-                dispatch.launch.threads_per_group,
-                compiled.shader.bindings.threadgroup_memory_bytes,
-            );
-            if let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR")
-                && dump_msl_compute_filter_matches(dispatch.shader_address)
-                && let Err(error) = dump_compute_shader_msl(
-                    Path::new(&directory),
-                    dispatch.shader_address,
-                    &snapshot.program.instructions,
-                    &compiled.shader.source,
-                )
-            {
-                eprintln!(
-                    "[REMu][METAL] could not dump compute shader cs={:#x}: {error}",
-                    dispatch.shader_address
-                );
-            }
-            self.compiled_compute_pipelines
-                .insert(pipeline_key.clone(), compiled);
-        }
         let compiled = self
             .compiled_compute_pipelines
             .get(&pipeline_key)
-            .expect("compute pipeline was cached above");
+            .ok_or("compute pipeline is not ready")?;
         let pipeline = compiled.pipeline.clone();
         let function = compiled.function.clone();
         let bindings = compiled.shader.bindings.clone();

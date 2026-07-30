@@ -15,7 +15,9 @@ use metal::{
     MTLPrimitiveTopologyClass, MTLScissorRect, MTLTriangleFillMode, MTLWinding, MetalLayer,
     RenderCommandEncoder, RenderPipelineState, SamplerState, Texture,
 };
-use remu_gpu::{GpuEvent, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite, IndexedDraw};
+use remu_gpu::{
+    ComputeDispatch, GpuEvent, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite, IndexedDraw,
+};
 use remu_memory::{CpuWriteWatch, GuestSharedMappingIdentity};
 mod cache;
 mod completion;
@@ -120,8 +122,8 @@ use self::sampler::{
 };
 use self::shader::{
     SHADER_COMPILE_QUEUE_CAPACITY, compile_metal_compute_library, compile_metal_library_with_tools,
-    compute_pipeline_key, compute_program_can_split_wave64, dump_compute_shader_msl,
-    dump_shader_pair_msl, graphics_allocated_vector_register_count,
+    compute_pipeline_key, compute_program_can_split_wave64, dump_shader_pair_msl,
+    graphics_allocated_vector_register_count,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
     pixel_scalars, program_embeds_global_base, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, wave64_split_blockers,
@@ -136,7 +138,8 @@ use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
     MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
-    PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
+    PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
     SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
@@ -678,14 +681,28 @@ struct ComputePipelineKey {
     image_bindings: Vec<(u32, bool, bool, u32, u32, u32, Option<u32>)>,
 }
 
-struct ShaderCompileResult {
-    key: GraphicsPipelineKey,
-    compiled: Result<CompiledShaderPair, String>,
+enum ShaderCompileResult {
+    Graphics {
+        key: GraphicsPipelineKey,
+        compiled: Result<CompiledShaderPair, String>,
+    },
+    Compute {
+        key: ComputePipelineKey,
+        shader_address: u64,
+        threads_per_group: [u32; 3],
+        compiled: Result<CompiledComputePipeline, String>,
+    },
 }
 
-struct ShaderCompileRequest {
-    key: GraphicsPipelineKey,
-    draw: IndexedDraw,
+enum ShaderCompileRequest {
+    Graphics {
+        key: GraphicsPipelineKey,
+        draw: IndexedDraw,
+    },
+    Compute {
+        key: ComputePipelineKey,
+        dispatch: ComputeDispatch,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -737,6 +754,12 @@ struct ScheduledHostEvent {
 enum QueueBlockReason {
     GuestMemoryWait(GpuMemoryWait),
     GraphicsPipeline(GraphicsPipelineKey),
+    ComputePipeline(ComputePipelineKey),
+}
+
+enum PipelineCompileCandidate {
+    Graphics(IndexedDraw),
+    Compute(ComputeDispatch),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1190,6 +1213,7 @@ struct MetalPresenter {
     /// instead of being silently dropped after one log line.
     dropped_draw_executions: HashMap<(u64, u64), u64>,
     compiled_compute_pipelines: HashMap<ComputePipelineKey, CompiledComputePipeline>,
+    compiling_compute_pipelines: HashSet<ComputePipelineKey>,
     rectangle_indirect_pipeline: Option<ComputePipelineState>,
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
@@ -1296,22 +1320,37 @@ impl MetalPresenter {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .recv();
-                        let Ok(ShaderCompileRequest { key, draw }) = request else {
+                        let Ok(request) = request else {
                             break;
                         };
-                        let compiled = objc::rc::autoreleasepool(|| {
-                            Self::compile_draw_shader_pair(
-                                &compiler_device,
-                                &draw,
-                                &key,
-                                &function_cache,
-                                render_pipeline_archive.as_ref(),
-                            )
+                        let result = objc::rc::autoreleasepool(|| match request {
+                            ShaderCompileRequest::Graphics { key, draw } => {
+                                let compiled = Self::compile_draw_shader_pair(
+                                    &compiler_device,
+                                    &draw,
+                                    &key,
+                                    &function_cache,
+                                    render_pipeline_archive.as_ref(),
+                                );
+                                ShaderCompileResult::Graphics { key, compiled }
+                            }
+                            ShaderCompileRequest::Compute { key, dispatch } => {
+                                let shader_address = dispatch.shader_address;
+                                let threads_per_group = dispatch.launch.threads_per_group;
+                                let compiled = Self::compile_compute_pipeline(
+                                    &compiler_device,
+                                    &dispatch,
+                                    &key,
+                                );
+                                ShaderCompileResult::Compute {
+                                    key,
+                                    shader_address,
+                                    threads_per_group,
+                                    compiled,
+                                }
+                            }
                         });
-                        if shader_compile_results
-                            .send(ShaderCompileResult { key, compiled })
-                            .is_err()
-                        {
+                        if shader_compile_results.send(result).is_err() {
                             break;
                         }
                     }
@@ -1351,6 +1390,7 @@ impl MetalPresenter {
             failed_draw_execution: HashSet::new(),
             dropped_draw_executions: HashMap::new(),
             compiled_compute_pipelines: HashMap::new(),
+            compiling_compute_pipelines: HashSet::new(),
             rectangle_indirect_pipeline: None,
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),

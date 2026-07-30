@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    GPU_EVENTS_PER_TICK, GraphicsPipelineKey, OrderedEventPoll, OrderedEventSource,
-    OrderedGpuEventReceiver, QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
+    GPU_EVENTS_PER_TICK, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
+    PipelineCompileCandidate, QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
 };
-use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, IndexedDraw};
+use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -126,16 +126,18 @@ impl OrderedGpuEventReceiver {
 
     pub(crate) fn try_recv(
         &mut self,
-        pipeline_resolved: impl Fn(&GraphicsPipelineKey) -> bool,
+        pipeline_resolved: impl Fn(&QueueBlockReason) -> bool,
     ) -> OrderedEventPoll {
         self.ingest(GPU_EVENTS_PER_TICK);
         self.blocked_queues.retain(|_, reason| match reason {
             QueueBlockReason::GuestMemoryWait(_) => true,
-            QueueBlockReason::GraphicsPipeline(key) => !pipeline_resolved(key),
+            reason @ (QueueBlockReason::GraphicsPipeline(_)
+            | QueueBlockReason::ComputePipeline(_)) => !pipeline_resolved(reason),
         });
         if self.host_block.as_ref().is_some_and(|reason| match reason {
             QueueBlockReason::GuestMemoryWait(_) => false,
-            QueueBlockReason::GraphicsPipeline(key) => pipeline_resolved(key),
+            reason @ (QueueBlockReason::GraphicsPipeline(_)
+            | QueueBlockReason::ComputePipeline(_)) => pipeline_resolved(reason),
         }) {
             self.host_block = None;
         }
@@ -306,31 +308,38 @@ impl OrderedGpuEventReceiver {
         }
     }
 
-    pub(crate) fn prefetch_draws(
+    pub(crate) fn prefetch_pipeline_work(
         &mut self,
         receive_limit: usize,
-        draw_limit: usize,
-    ) -> Vec<IndexedDraw> {
+        work_limit: usize,
+    ) -> Vec<PipelineCompileCandidate> {
         self.ingest(receive_limit);
-        let host_draws = self
-            .host_events
-            .iter()
-            .filter_map(|host| match &host.event {
-                GpuEvent::IndexedDraw(draw) => Some(draw.as_ref().clone()),
-                _ => None,
-            });
-        let queue_draws = self.queue_order.iter().flat_map(|queue_id| {
+        let host_work = self.host_events.iter().filter_map(|host| match &host.event {
+            GpuEvent::IndexedDraw(draw) => {
+                Some(PipelineCompileCandidate::Graphics(draw.as_ref().clone()))
+            }
+            GpuEvent::ComputeDispatch(dispatch) => Some(PipelineCompileCandidate::Compute(
+                dispatch.as_ref().clone(),
+            )),
+            _ => None,
+        });
+        let queue_work = self.queue_order.iter().flat_map(|queue_id| {
             self.submissions
                 .get(queue_id)
                 .into_iter()
                 .flatten()
                 .flat_map(|submission| submission.events.iter())
                 .filter_map(|event| match event {
-                    GpuEvent::IndexedDraw(draw) => Some(draw.as_ref().clone()),
+                    GpuEvent::IndexedDraw(draw) => {
+                        Some(PipelineCompileCandidate::Graphics(draw.as_ref().clone()))
+                    }
+                    GpuEvent::ComputeDispatch(dispatch) => Some(PipelineCompileCandidate::Compute(
+                        dispatch.as_ref().clone(),
+                    )),
                     _ => None,
                 })
         });
-        host_draws.chain(queue_draws).take(draw_limit).collect()
+        host_work.chain(queue_work).take(work_limit).collect()
     }
 
     pub(crate) fn pending_event_count(&self) -> usize {
@@ -369,7 +378,9 @@ impl OrderedGpuEventReceiver {
         let mut memory = 0;
         for reason in self.blocked_queues.values().chain(self.host_block.iter()) {
             match reason {
-                QueueBlockReason::GraphicsPipeline(_) => pipeline += 1,
+                QueueBlockReason::GraphicsPipeline(_) | QueueBlockReason::ComputePipeline(_) => {
+                    pipeline += 1;
+                }
                 QueueBlockReason::GuestMemoryWait(_) => memory += 1,
             }
         }
@@ -430,6 +441,9 @@ impl OrderedGpuEventReceiver {
                                 "pipeline:{:#x}/{:#x}",
                                 key.export_shader_address, key.pixel_shader_address
                             ),
+                            QueueBlockReason::ComputePipeline(key) => {
+                                format!("compute-pipeline:{:#x}", key.program_identity.0.address)
+                            }
                         });
                 Some(format!(
                     "q{queue_id}:pending:{pending}/submissions:{}/blocked:{blocked}/front:{front}",
