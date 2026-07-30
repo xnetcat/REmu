@@ -819,6 +819,8 @@ pub(crate) fn ampr_submit_command_buffer(
                 fflags: 1,
                 data: completion.user_data,
                 user_data,
+                agc_graphics_completions: 0,
+                agc_user_interrupts: 0,
             },
         );
     }

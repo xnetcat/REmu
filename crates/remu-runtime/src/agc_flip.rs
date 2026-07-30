@@ -236,6 +236,8 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
                     fflags: 0,
                     data: event_data,
                     user_data,
+                    agc_graphics_completions: 0,
+                    agc_user_interrupts: 0,
                 },
             );
             queued = true;
@@ -271,6 +273,8 @@ pub(crate) fn queue_agc_event_write(state: &mut ProbeDispatchState, event_type: 
                 fflags: 1,
                 data: u64::from(event_type),
                 user_data,
+                agc_graphics_completions: 0,
+                agc_user_interrupts: 0,
             },
         );
     }

@@ -42,11 +42,12 @@ pub use waits::{
 mod counters;
 pub use counters::{
     audio_output_frames, audio_progress_age_millis, audio_underrun_frames,
-    gpu_completed_submission_sequence, gpu_events_in_flight, gpu_flips_pending,
-    gpu_progress_age_millis, gpu_work_items_pending, install_gpu_completion_notifier,
-    progress_telemetry_enabled, record_gpu_event_consumed, record_gpu_flip_completed,
-    record_gpu_submission_completed, record_gpu_work_item_processed, report_audio_frames,
-    set_progress_telemetry_enabled, take_gpu_completed_flips, take_gpu_completed_submission_ids,
+    gpu_completed_submission_ids_snapshot, gpu_completed_submission_sequence, gpu_events_in_flight,
+    gpu_flips_pending, gpu_progress_age_millis, gpu_work_items_pending,
+    install_gpu_completion_notifier, progress_telemetry_enabled, record_gpu_event_consumed,
+    record_gpu_flip_completed, record_gpu_submission_completed, record_gpu_work_item_processed,
+    report_audio_frames, set_progress_telemetry_enabled, take_gpu_completed_flips,
+    take_gpu_completed_submission_ids,
 };
 
 mod resource;

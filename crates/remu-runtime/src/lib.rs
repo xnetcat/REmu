@@ -453,6 +453,7 @@ struct ProbeDispatchState {
     /// `sceAgcDriverAddEqEvent` (graphics is 0, ACB queues use their owner ID).
     pending_agc_completions: VecDeque<(u64, u64)>,
     pending_agc_user_interrupts: VecDeque<u64>,
+    agc_completion_telemetry: AgcCompletionTelemetry,
     save_root: PathBuf,
     save_data_initialized: bool,
     save_mounts: BTreeMap<String, SaveDataMount>,
@@ -1056,6 +1057,28 @@ struct KernelQueuedEvent {
     fflags: u32,
     data: u64,
     user_data: u64,
+    /// Logical AGC graphics completions represented by this possibly coalesced event.
+    agc_graphics_completions: u32,
+    /// Logical AGC compute user interrupts represented by this possibly coalesced event.
+    agc_user_interrupts: u32,
+}
+
+#[derive(Debug, Default)]
+struct AgcCompletionTelemetry {
+    refreshed_graphics: u64,
+    refreshed_compute: u64,
+    queued_graphics_notifications: u64,
+    queued_user_interrupts: u64,
+    delivered_graphics_notifications: u64,
+    delivered_user_interrupts: u64,
+    cancelled_graphics_notifications: u64,
+    cancelled_user_interrupts: u64,
+    missing_graphics_registration: u64,
+    missing_user_interrupt_registration: u64,
+    unmatched_backend_ids: u64,
+    last_refreshed_graphics: Option<u64>,
+    last_refreshed_compute: Option<u64>,
+    last_unmatched_backend_id: Option<u64>,
 }
 
 const KERNEL_EVENT_FILTER_GRAPHICS: i16 = -14;
@@ -1536,6 +1559,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.pending_video_out_flips.clear();
     state.pending_agc_completions.clear();
     state.pending_agc_user_interrupts.clear();
+    state.agc_completion_telemetry = AgcCompletionTelemetry::default();
     *KERNEL_FILES
         .get_or_init(|| Mutex::new(KernelFileState::default()))
         .lock()
@@ -4453,7 +4477,7 @@ fn kernel_delete_equeue(handle: u64, state: &mut ProbeDispatchState) -> u64 {
     state
         .kernel_event_registrations
         .retain(|&(equeue, _, _), _| equeue != handle);
-    state.pending_events.retain(|event| event.equeue != handle);
+    discard_kernel_events(state, |event| event.equeue == handle);
     notify_kernel_equeue_waiters();
     0
 }
@@ -4538,6 +4562,8 @@ fn kernel_trigger_user_event(arguments: [u64; 6], state: &mut ProbeDispatchState
             fflags: 1,
             data: arguments[2],
             user_data,
+            agc_graphics_completions: 0,
+            agc_user_interrupts: 0,
         },
     );
     notify_kernel_equeue_waiters();
@@ -4630,10 +4656,44 @@ fn queue_kernel_event(state: &mut ProbeDispatchState, mut event: KernelQueuedEve
             && pending.filter == event.filter
     }) {
         event.fflags = pending.fflags.saturating_add(1).max(event.fflags);
+        event.agc_graphics_completions = pending
+            .agc_graphics_completions
+            .saturating_add(event.agc_graphics_completions);
+        event.agc_user_interrupts = pending
+            .agc_user_interrupts
+            .saturating_add(event.agc_user_interrupts);
         *pending = event;
     } else {
         state.pending_events.push_back(event);
     }
+}
+
+fn discard_kernel_events(
+    state: &mut ProbeDispatchState,
+    mut should_discard: impl FnMut(&KernelQueuedEvent) -> bool,
+) {
+    let mut cancelled_graphics = 0_u64;
+    let mut cancelled_user = 0_u64;
+    state.pending_events.retain(|event| {
+        if should_discard(event) {
+            cancelled_graphics =
+                cancelled_graphics.saturating_add(u64::from(event.agc_graphics_completions));
+            cancelled_user = cancelled_user.saturating_add(u64::from(event.agc_user_interrupts));
+            false
+        } else {
+            true
+        }
+    });
+    state
+        .agc_completion_telemetry
+        .cancelled_graphics_notifications = state
+        .agc_completion_telemetry
+        .cancelled_graphics_notifications
+        .saturating_add(cancelled_graphics);
+    state.agc_completion_telemetry.cancelled_user_interrupts = state
+        .agc_completion_telemetry
+        .cancelled_user_interrupts
+        .saturating_add(cancelled_user);
 }
 
 fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
@@ -4646,9 +4706,11 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
     }
     let newest_completed = completed.iter().next_back().copied().unwrap_or_default();
     let mut completed_queues = Vec::new();
+    let mut claimed = BTreeSet::new();
     state.pending_agc_completions.retain(|&(sequence, ident)| {
         if completed.contains(&sequence) {
             completed_queues.push((sequence, ident));
+            claimed.insert(sequence);
             false
         } else {
             true
@@ -4658,11 +4720,19 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
     state.pending_agc_user_interrupts.retain(|sequence| {
         if completed.contains(sequence) {
             completed_compute.push(*sequence);
+            claimed.insert(*sequence);
             false
         } else {
             true
         }
     });
+    for &sequence in completed.difference(&claimed) {
+        state.agc_completion_telemetry.unmatched_backend_ids = state
+            .agc_completion_telemetry
+            .unmatched_backend_ids
+            .saturating_add(1);
+        state.agc_completion_telemetry.last_unmatched_backend_id = Some(sequence);
+    }
     let mut queued = false;
     for (sequence, completed_ident) in completed_queues {
         // `sceAgcDriverAddEqEvent` registers one hardware queue by ID. Queue zero is graphics and
@@ -4677,6 +4747,17 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                     .then_some((equeue, ident, filter, user_data))
             })
             .collect::<Vec<_>>();
+        state.agc_completion_telemetry.refreshed_graphics = state
+            .agc_completion_telemetry
+            .refreshed_graphics
+            .saturating_add(1);
+        state.agc_completion_telemetry.last_refreshed_graphics = Some(sequence);
+        if registrations.is_empty() {
+            state.agc_completion_telemetry.missing_graphics_registration = state
+                .agc_completion_telemetry
+                .missing_graphics_registration
+                .saturating_add(1);
+        }
         for (equeue, ident, filter, user_data) in registrations {
             queue_kernel_event(
                 state,
@@ -4688,8 +4769,14 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                     fflags: 1,
                     data: ident,
                     user_data,
+                    agc_graphics_completions: 1,
+                    agc_user_interrupts: 0,
                 },
             );
+            state.agc_completion_telemetry.queued_graphics_notifications = state
+                .agc_completion_telemetry
+                .queued_graphics_notifications
+                .saturating_add(1);
             queued = true;
         }
         if trace_logarithmic_sequence(sequence, 8) {
@@ -4716,6 +4803,19 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                     .then_some((equeue, ident, filter, user_data))
             })
             .collect::<Vec<_>>();
+        state.agc_completion_telemetry.refreshed_compute = state
+            .agc_completion_telemetry
+            .refreshed_compute
+            .saturating_add(1);
+        state.agc_completion_telemetry.last_refreshed_compute = Some(sequence);
+        if registrations.is_empty() {
+            state
+                .agc_completion_telemetry
+                .missing_user_interrupt_registration = state
+                .agc_completion_telemetry
+                .missing_user_interrupt_registration
+                .saturating_add(1);
+        }
         for (equeue, ident, filter, user_data) in registrations {
             queue_kernel_event(
                 state,
@@ -4727,8 +4827,14 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                     fflags: 1,
                     data: timestamp,
                     user_data,
+                    agc_graphics_completions: 0,
+                    agc_user_interrupts: 1,
                 },
             );
+            state.agc_completion_telemetry.queued_user_interrupts = state
+                .agc_completion_telemetry
+                .queued_user_interrupts
+                .saturating_add(1);
             queued = true;
         }
         if trace_logarithmic_sequence(sequence, 8) {
@@ -4784,6 +4890,16 @@ fn kernel_poll_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> Re
         write_guest_u32(output + 0x0c, event.fflags);
         write_guest_u64(output + 0x10, event.data);
         write_guest_u64(output + 0x18, event.user_data);
+        state
+            .agc_completion_telemetry
+            .delivered_graphics_notifications = state
+            .agc_completion_telemetry
+            .delivered_graphics_notifications
+            .saturating_add(u64::from(event.agc_graphics_completions));
+        state.agc_completion_telemetry.delivered_user_interrupts = state
+            .agc_completion_telemetry
+            .delivered_user_interrupts
+            .saturating_add(u64::from(event.agc_user_interrupts));
         if event.filter == KERNEL_EVENT_FILTER_GRAPHICS {
             static GRAPHICS_DELIVERY_COUNT: AtomicUsize = AtomicUsize::new(0);
             let sequence = GRAPHICS_DELIVERY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -7313,6 +7429,80 @@ fn report_diagnostic_stall_attribution() {
     } else {
         eprintln!(
             "[REMu][STALL-ATTRIBUTION] main_timed_wait=none gpu={gpu_state} events={gpu_events} work={gpu_work} flips={gpu_flips} completed_submission={gpu_completed} progress_age_ms={gpu_age:?} audio={audio_state} frames={audio_frames} underrun_frames={audio_underruns} progress_age_ms={audio_age:?}"
+        );
+    }
+    let backend_unclaimed = remu_gpu::gpu_completed_submission_ids_snapshot();
+    let backend_unclaimed_range = backend_unclaimed
+        .first()
+        .copied()
+        .zip(backend_unclaimed.last().copied());
+    if let Some(state) = PROBE_DISPATCH
+        .get()
+        .and_then(|dispatch| dispatch.try_read().ok())
+    {
+        let pending_graphics_range = state
+            .pending_agc_completions
+            .front()
+            .map(|&(sequence, _)| sequence)
+            .zip(
+                state
+                    .pending_agc_completions
+                    .back()
+                    .map(|&(sequence, _)| sequence),
+            );
+        let pending_compute_range = state
+            .pending_agc_user_interrupts
+            .front()
+            .copied()
+            .zip(state.pending_agc_user_interrupts.back().copied());
+        let pending_graphics_notifications = state
+            .pending_events
+            .iter()
+            .map(|event| u64::from(event.agc_graphics_completions))
+            .sum::<u64>();
+        let pending_user_interrupts = state
+            .pending_events
+            .iter()
+            .map(|event| u64::from(event.agc_user_interrupts))
+            .sum::<u64>();
+        let graphics_registrations = state
+            .kernel_event_registrations
+            .keys()
+            .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
+            .count();
+        let user_interrupt_registrations = state
+            .kernel_event_registrations
+            .keys()
+            .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
+            .count();
+        let telemetry = &state.agc_completion_telemetry;
+        eprintln!(
+            "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?}",
+            state.agc_submission_count,
+            backend_unclaimed.len(),
+            state.pending_agc_completions.len(),
+            state.pending_agc_user_interrupts.len(),
+            telemetry.refreshed_graphics,
+            telemetry.last_refreshed_graphics,
+            telemetry.refreshed_compute,
+            telemetry.last_refreshed_compute,
+            telemetry.queued_graphics_notifications,
+            telemetry.delivered_graphics_notifications,
+            telemetry.cancelled_graphics_notifications,
+            pending_graphics_notifications,
+            telemetry.queued_user_interrupts,
+            telemetry.delivered_user_interrupts,
+            telemetry.cancelled_user_interrupts,
+            pending_user_interrupts,
+            telemetry.missing_graphics_registration,
+            telemetry.missing_user_interrupt_registration,
+            telemetry.unmatched_backend_ids,
+            telemetry.last_unmatched_backend_id,
+        );
+    } else {
+        eprintln!(
+            "[REMu][STALL-AGC] runtime=unavailable-or-dispatch-busy backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?}",
+            backend_unclaimed.len(),
         );
     }
     guest_sync::report_condition_stall_attribution();

@@ -229,6 +229,22 @@ pub fn take_gpu_completed_submission_ids() -> Vec<u64> {
     std::mem::take(&mut *completed).into_iter().collect()
 }
 
+/// Snapshots exact guest submission IDs which the backend has completed but the runtime has not
+/// yet consumed.
+///
+/// This is diagnostic state. Unlike [`take_gpu_completed_submission_ids`], it does not remove IDs
+/// from the completion queue or affect guest notification delivery.
+#[must_use]
+pub fn gpu_completed_submission_ids_snapshot() -> Vec<u64> {
+    GPU_COMPLETED_SUBMISSIONS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .copied()
+        .collect()
+}
+
 /// Publishes completion of one display-buffer presentation.
 pub fn record_gpu_flip_completed(completion: GpuFlipCompletion) {
     cancel_pending_gpu_flips(1);

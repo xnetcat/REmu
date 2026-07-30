@@ -25,6 +25,8 @@ fn a_user_event_registration_can_be_added_and_withdrawn_again() {
         fflags: 1,
         data: 0,
         user_data: 0,
+        agc_graphics_completions: 0,
+        agc_user_interrupts: 0,
     });
 
     assert_eq!(
