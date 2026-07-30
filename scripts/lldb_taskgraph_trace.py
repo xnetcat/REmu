@@ -11,7 +11,9 @@ completion.
 
 Load this file from LLDB, then run ``remu-taskgraph-trace-start`` before
 launching REmu.  ``scripts/probe-taskgraph.sh`` provides the complete bounded
-invocation.
+invocation.  Set ``REMU_TASKGRAPH_TRACE_PREPARE_ONLY=1`` to keep one persistent
+hardware breakpoint at the prerequisite-release site and avoid dynamic
+breakpoint rotation while logging every fence.
 """
 
 from __future__ import annotations
@@ -217,13 +219,19 @@ class TraceResult:
 class TaskGraphTraceState:
     """Pure state machine for one address-correlated fence task at a time."""
 
-    def __init__(self, cycle_limit: int, hit_limit: int) -> None:
+    def __init__(
+        self,
+        cycle_limit: int,
+        hit_limit: int,
+        prepare_only: bool = False,
+    ) -> None:
         if not 1 <= cycle_limit <= MAXIMUM_CYCLE_LIMIT:
             raise ValueError("cycle_limit is outside the bounded diagnostic range")
         if not 1 <= hit_limit <= MAXIMUM_HIT_LIMIT:
             raise ValueError("hit_limit is outside the bounded diagnostic range")
         self.cycle_limit = cycle_limit
         self.hit_limit = hit_limit
+        self.prepare_only = prepare_only
         self.phase = PHASE_PUBLISH
         self.hits = 0
         self.cycles_started = 0
@@ -246,6 +254,13 @@ class TaskGraphTraceState:
         return self.phase == PHASE_DONE
 
     def active_breakpoints(self) -> Mapping[str, int]:
+        if self.done:
+            return BREAKPOINTS[PHASE_DONE]
+        if self.prepare_only:
+            # Keep one hardware breakpoint installed for the whole run.  In
+            # particular, do not make debugserver remove/re-add translated
+            # guest breakpoints after each fence.
+            return {PREPARE: PREPARE_ADDRESS}
         if self.phase == PHASE_PUBLISH:
             if self.task == 0:
                 return {
@@ -326,6 +341,8 @@ class TaskGraphTraceState:
             return self._finish("hit-limit")
         if label not in self.active_breakpoints():
             return TraceResult(False)
+        if self.prepare_only:
+            return self._observe_prepare_only(registers, read_u64)
 
         candidate_task = (
             _register(registers, "rbx")
@@ -366,6 +383,85 @@ class TaskGraphTraceState:
             return TraceResult(True, message)
         return result
 
+    def _observe_prepare_only(
+        self,
+        registers: Mapping[str, int],
+        read_u64: ReadU64,
+    ) -> TraceResult:
+        """Record one fence without changing the persistent breakpoint set."""
+
+        task = _register(registers, "rbx")
+        if task == 0:
+            return TraceResult(False)
+        event = read_u64(task + 0x18) or 0
+        counter_before_release = _register(registers, "r12") & 0xFFFFFFFF
+        release_threshold = _register(registers, "rax") & 0xFFFFFFFF
+        task_word = read_u64(task + 0x8)
+        task_counter_after = (
+            (task_word >> 32) & 0xFFFFFFFF
+            if task_word is not None
+            else None
+        )
+        frame_pointer = _register(registers, "rbp")
+        caller_frame = read_u64(frame_pointer) or 0
+        caller = read_u64(frame_pointer + 0x8) or 0
+        caller_parent = read_u64(caller_frame + 0x8) or 0
+        prerequisite_list = _register(registers, "r15")
+        count_word = (
+            read_u64(prerequisite_list + 0x28)
+            if prerequisite_list != 0
+            else None
+        )
+        prerequisite_count = (
+            signed_u32(count_word)
+            if count_word is not None
+            else 0
+        )
+        storage = (
+            read_u64(prerequisite_list + 0x20)
+            if prerequisite_list != 0
+            else None
+        )
+        storage_base = (
+            storage
+            if storage not in (None, 0)
+            else prerequisite_list
+        )
+        prerequisite_events = []
+        if counter_before_release != release_threshold and storage_base != 0:
+            for index in range(min(max(prerequisite_count, 0), 16)):
+                prerequisite = read_u64(storage_base + index * 8) or 0
+                if prerequisite == 0:
+                    continue
+                words = [
+                    value
+                    for word_index in range(4)
+                    if (
+                        value := read_u64(
+                            prerequisite + word_index * 8
+                        )
+                    )
+                    is not None
+                ]
+                prerequisite_events.append(
+                    f"{prerequisite:#x}:{[hex(value) for value in words]}"
+                )
+        return TraceResult(
+            True,
+            f"sample={self.hits} prepare-only task={task:#x} "
+            f"event={event:#x} "
+            f"counter_before_release={counter_before_release:#x} "
+            f"release_threshold={release_threshold:#x} "
+            f"task_counter_after="
+            f"{task_counter_after if task_counter_after is not None else 'unreadable'} "
+            f"dispatchable={counter_before_release == release_threshold} "
+            f"caller={caller:#x} caller_parent={caller_parent:#x} "
+            f"prerequisite_list={prerequisite_list:#x} "
+            f"prerequisite_count={prerequisite_count} "
+            f"prerequisite_storage={storage_base:#x} "
+            f"prerequisite_events={prerequisite_events}",
+        )
+
     def _observe_publish(
         self,
         label: str,
@@ -381,12 +477,12 @@ class TaskGraphTraceState:
             task = _register(registers, "rbx")
             if task == 0:
                 return TraceResult(False)
+            counter_before_release = _register(registers, "r12") & 0xFFFFFFFF
+            release_threshold = _register(registers, "rax") & 0xFFFFFFFF
             self.task = task
             self.completion_event = read_u64(task + 0x18) or 0
-            self.counter_before_release = (
-                _register(registers, "r12") & 0xFFFFFFFF
-            )
-            self.release_threshold = _register(registers, "rax") & 0xFFFFFFFF
+            self.counter_before_release = counter_before_release
+            self.release_threshold = release_threshold
             self.cycles_started += 1
             return TraceResult(
                 True,
@@ -580,6 +676,7 @@ class LldbTaskGraphTrace:
                 DEFAULT_HIT_LIMIT,
                 MAXIMUM_HIT_LIMIT,
             ),
+            os.environ.get("REMU_TASKGRAPH_TRACE_PREPARE_ONLY") == "1",
         )
         self.enabled_breakpoints = []
 
@@ -717,7 +814,9 @@ def install_taskgraph_trace(frame, breakpoint_location, _internal_dict):
     breakpoint_location.GetBreakpoint().SetEnabled(False)
     print(
         "[REMu][LLDB][TASKGRAPH] guest mapping reached; "
-        f"cycle_limit={SESSION.state.cycle_limit} hit_limit={SESSION.state.hit_limit}",
+        f"cycle_limit={SESSION.state.cycle_limit} "
+        f"hit_limit={SESSION.state.hit_limit} "
+        f"prepare_only={SESSION.state.prepare_only}",
         flush=True,
     )
     SESSION.arm_phase()

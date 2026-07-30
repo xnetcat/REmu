@@ -77,6 +77,73 @@ class TaskGraphTraceTests(unittest.TestCase):
         self.assertTrue(dispatched.accepted)
         self.assertIn("conditional-dispatch", dispatched.message or "")
 
+    def test_prepare_only_keeps_one_breakpoint_and_records_every_fence(
+        self,
+    ) -> None:
+        state = TRACE.TaskGraphTraceState(
+            cycle_limit=2,
+            hit_limit=32,
+            prepare_only=True,
+        )
+
+        ready = state.observe(
+            TRACE.PREPARE,
+            {"rbx": 0x1000, "r12": 2, "rax": 2},
+            7,
+            self.read_u64,
+        )
+        self.assertTrue(ready.accepted)
+        self.assertEqual(state.task, 0)
+        self.assertEqual(state.cycles_started, 0)
+        self.assertIn("sample=1 prepare-only", ready.message or "")
+        self.assertIn("dispatchable=True", ready.message or "")
+        self.assertEqual(
+            state.active_breakpoints(),
+            {TRACE.PREPARE: TRACE.PREPARE_ADDRESS},
+        )
+
+        self.memory.update(
+            {
+                0x1008: 5 << 32,
+                0x5020: 0x6000,
+                0x5028: 2,
+                0x6000: 0x7000,
+                0x6008: 0,
+                0x7000: 0xA,
+                0x7008: 0xB,
+                0x7010: 0xC,
+                0x7018: 0xD,
+                0x8000: 0x9000,
+                0x8008: 0x801BE0507,
+                0x9008: 0x80101AF94,
+            }
+        )
+        blocked = state.observe(
+            TRACE.PREPARE,
+            {
+                "rbx": 0x1000,
+                "r12": 3,
+                "rax": 2,
+                "r15": 0x5000,
+                "rbp": 0x8000,
+            },
+            7,
+            self.read_u64,
+        )
+        self.assertTrue(blocked.accepted)
+        self.assertEqual(state.task, 0)
+        self.assertIn("sample=2 prepare-only", blocked.message or "")
+        self.assertIn("dispatchable=False", blocked.message or "")
+        self.assertIn("task_counter_after=5", blocked.message or "")
+        self.assertIn("caller=0x801be0507", blocked.message or "")
+        self.assertIn("caller_parent=0x80101af94", blocked.message or "")
+        self.assertIn("prerequisite_count=2", blocked.message or "")
+        self.assertIn("0x7000:['0xa', '0xb', '0xc', '0xd']", blocked.message or "")
+        self.assertEqual(
+            state.active_breakpoints(),
+            {TRACE.PREPARE: TRACE.PREPARE_ADDRESS},
+        )
+
     def test_wake_path_correlates_only_the_exact_task_and_thread(self) -> None:
         dispatch = self.observe(TRACE.DISPATCH, {"rsi": 0x1000, "rdx": 3, "rcx": 2})
         self.assertTrue(dispatch.accepted)
