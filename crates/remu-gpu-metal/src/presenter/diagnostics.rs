@@ -679,6 +679,47 @@ pub(super) fn diagnostic_disable_blending() -> bool {
         .get_or_init(|| std::env::var_os("REMU_DIAGNOSTIC_BLEND").is_some_and(|value| value == "1"))
 }
 
+/// Opt-in: skip encoding draws whose pixel shader address is listed in `REMU_SKIP_PS`
+/// (comma-separated hex, optional `0x` prefix).
+pub(super) fn diagnostic_skip_pixel_shader(pixel_shader_address: u64) -> bool {
+    static FILTER: OnceLock<Vec<u64>> = OnceLock::new();
+    let filters = FILTER.get_or_init(|| {
+        std::env::var("REMU_SKIP_PS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|part| {
+                        let part = part.trim().strip_prefix("0x").unwrap_or(part.trim());
+                        u64::from_str_radix(part, 16).ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    !filters.is_empty() && filters.contains(&pixel_shader_address)
+}
+
+/// Opt-in: skip encoding draws whose export/ES shader address is listed in `REMU_SKIP_ES`.
+pub(super) fn diagnostic_skip_export_shader(export_shader_address: u64) -> bool {
+    static FILTER: OnceLock<Vec<u64>> = OnceLock::new();
+    let filters = FILTER.get_or_init(|| {
+        std::env::var("REMU_SKIP_ES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|part| {
+                        let part = part.trim().strip_prefix("0x").unwrap_or(part.trim());
+                        u64::from_str_radix(part, 16).ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    !filters.is_empty() && filters.contains(&export_shader_address)
+}
+
 pub(super) fn diagnostic_use_draw_merged_wave_counts() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {

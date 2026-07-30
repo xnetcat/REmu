@@ -739,6 +739,9 @@ fn host_event_bypasses_blocked_guest_queues(event: &GpuEvent) -> bool {
         GpuEvent::DisplayRegistered { .. }
             | GpuEvent::ShowHostSplash(_)
             | GpuEvent::HideHostSplash
+            | GpuEvent::ShowHostDialog(_)
+            | GpuEvent::HideHostDialog { .. }
+            | GpuEvent::ShowHostToast(_)
             | GpuEvent::Flip { .. }
             | GpuEvent::Shutdown
     )

@@ -29,7 +29,8 @@ use super::{
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
     metal_primitive_type, ngg_mesh_base_vertex, ngg_mesh_dispatch_required, pixel_input_controls,
-    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
+    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_indexed_ngg_indices,
+    prepare_nonindexed_ngg_indices,
     read_draw_indices, read_texture_array_linear, read_texture_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, render_target_cmask_address, render_target_fast_clear_color,
 };
@@ -409,9 +410,10 @@ fn native_depth_surface_matches_shader_r32_view_without_writeback() {
     assert!(guest_texture_descriptors_share_depth_sample_storage(
         rendered, sampled, 0x204
     ));
-    assert!(!guest_texture_descriptors_share_depth_sample_storage(
-        rendered, sampled, 0xfac
-    ));
+    assert!(
+        guest_texture_descriptors_share_depth_sample_storage(rendered, sampled, 0xfac),
+        "R32 depth views with XYZW identity still only need .x from the native Z plane"
+    );
 }
 
 #[test]
@@ -1607,6 +1609,61 @@ fn preserves_nonindexed_first_vertex_and_alternates_triangle_strip_winding() {
     assert_eq!(prepared.group_count, 1);
     assert_eq!(prepared.vertex_references, 5);
     assert_eq!(prepared.primitive_count, 3);
+}
+
+#[test]
+fn expands_indexed_triangle_strips_for_ngg_meshlets() {
+    let mut draw = indexed_draw(0, 0, 4);
+    draw.indexed = true;
+    draw.primitive_type = 6;
+    let expanded = prepare_indexed_ngg_indices(
+        &draw,
+        [10, 11, 12, 13].into(),
+        MTLPrimitiveType::TriangleStrip,
+    )
+    .expect("indexed strip expands");
+    assert_eq!(
+        expanded.as_ref(),
+        &[10, 11, 12, 12, 11, 13],
+        "a four-vertex indexed strip becomes two triangles with GFX10 winding"
+    );
+    let already_list = prepare_indexed_ngg_indices(
+        &draw,
+        [10, 11, 12, 12, 11, 13].into(),
+        MTLPrimitiveType::Triangle,
+    )
+    .expect("restart-expanded strips pass through");
+    assert_eq!(already_list.as_ref(), &[10, 11, 12, 12, 11, 13]);
+}
+
+#[test]
+fn expands_indexed_point_lists_for_ngg_meshlets() {
+    let mut draw = indexed_draw(0, 0, 2);
+    draw.indexed = true;
+    draw.primitive_type = 1;
+    let expanded =
+        prepare_indexed_ngg_indices(&draw, [7, 9].into(), MTLPrimitiveType::Point).expect("points");
+    assert_eq!(
+        expanded.as_ref(),
+        &[7, 7, 7, 9, 9, 9],
+        "each point becomes one meshlet input primitive with duplicated local slots"
+    );
+    let prepared = prepare_ngg_meshlets(
+        expanded.as_ref(),
+        NggSubgroupLimits::new(
+            24,
+            4,
+            4,
+            24,
+            96,
+            24,
+            Some(NggOutputPrimitiveType::TriangleStrip),
+            Some(1),
+        )
+        .expect("limits"),
+    );
+    assert_eq!(prepared.primitive_count, 2);
+    assert_eq!(prepared.vertex_references, 2);
 }
 
 #[test]

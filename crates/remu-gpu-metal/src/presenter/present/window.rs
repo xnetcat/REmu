@@ -943,6 +943,7 @@ impl ApplicationHandler for MetalPresenter {
         }
         self.retire_completed_presentations();
         self.update_window_title();
+        crate::presenter::host_ui::poll_host_ui();
         if self.redraw_pending
             && let Some(window) = self.window.as_ref()
         {

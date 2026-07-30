@@ -11,8 +11,7 @@ use super::{
     NGS2_ERROR_INVALID_MATRIX_LEVEL_ADDRESS, NGS2_ERROR_INVALID_MODULE_INDEX,
     NGS2_ERROR_INVALID_MODULE_LOCATION, NGS2_ERROR_INVALID_NUM_CHANNELS,
     NGS2_ERROR_INVALID_PARAM_ADDRESS, NGS2_ERROR_INVALID_VOICE_CONTROL_ADDRESS,
-    NGS2_ERROR_INVALID_VOICE_CONTROL_ID, NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE,
-    NGS2_ERROR_INVALID_VOICE_HANDLE, NGS2_ERROR_INVALID_VOICE_MATRIX_INDEX,
+    NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE, NGS2_ERROR_INVALID_VOICE_HANDLE, NGS2_ERROR_INVALID_VOICE_MATRIX_INDEX,
     NGS2_ERROR_INVALID_VOICE_OUTPUT_INDEX, NGS2_ERROR_INVALID_VOICE_PARAM_ID,
     NGS2_ERROR_INVALID_VOICE_PATCH_TYPE, NGS2_ERROR_INVALID_VOICE_SETUP_FLAG,
     NGS2_MAX_VOICE_CHANNELS, NGS2_MODULE_MAX_LOCATIONS, NGS2_RACK_MAX_MODULES,
@@ -189,7 +188,24 @@ pub(super) fn ngs2_apply_voice_control(
             voice.callback_handler = handler;
             Ok(())
         }
-        _ => Err(NGS2_ERROR_INVALID_VOICE_CONTROL_ID),
+        unknown => {
+            // Module-specific control identifiers arrive from FMOD/Unity racks. They are
+            // validated for a minimum header and discarded the same way levels and patches are:
+            // nothing mixes, so accepting an unknown id as a no-op is honest once the chain is
+            // well-formed. Reject only when the entry is too short to be a real control header.
+            ngs2_require_control_size(size, NGS2_VOICE_PARAM_HEADER_SIZE)?;
+            static LOGGED: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+                std::sync::Mutex::new(std::collections::BTreeSet::new());
+            let mut logged = LOGGED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if logged.insert(unknown) {
+                eprintln!(
+                    "[REMu][NGS2] accepting unhandled voice control id={unknown:#x} size={size} (no mixer)"
+                );
+            }
+            Ok(())
+        }
     }
 }
 

@@ -46,6 +46,7 @@ pub(super) const NGS2_ERROR_INVALID_VOICE_PARAM_ID: u32 = 0x804a_835a;
 pub(super) const NGS2_ERROR_INVALID_MATRIX_LEVEL_ADDRESS: u32 = 0x804a_835e;
 pub(super) const NGS2_ERROR_INVALID_VOICE_CONTROL_ADDRESS: u32 = 0x804a_8360;
 pub(super) const NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE: u32 = 0x804a_8361;
+#[allow(dead_code)] // retained for API completeness; unknown IDs are accepted as no-ops
 pub(super) const NGS2_ERROR_INVALID_VOICE_CONTROL_ID: u32 = 0x804a_8362;
 pub(super) const NGS2_ERROR_INVALID_WAVEFORM_DATA: u32 = 0x804a_8430;
 pub(super) const NGS2_ERROR_INVALID_WAVEFORM_FORMAT: u32 = 0x804a_8431;
@@ -64,9 +65,16 @@ pub(super) const NGS2_SYSTEM_OPTION_NUM_GRAIN_SAMPLES_OFFSET: u64 = 112;
 pub(super) const NGS2_SYSTEM_OPTION_SAMPLE_RATE_OFFSET: u64 = 116;
 pub(super) const NGS2_SYSTEM_OPTION_MAX_VOICE_CHANNELS_OFFSET: u64 = 120;
 
-/// Bytes one `SceNgs2RackOption` occupies, and the least it may declare.
+/// Bytes one `SceNgs2RackOption` occupies in the SDK revision this build was written against.
+///
+/// Newer SDKs may declare a larger option; [`ngs2_rack_option_size`] accepts any size at least
+/// [`NGS2_RACK_OPTION_MINIMUM_SIZE`] and only reads the field offsets defined here.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) const NGS2_RACK_OPTION_SIZE: u64 = 176;
 pub(super) const NGS2_RACK_OPTION_MINIMUM_SIZE: u64 = 112;
+/// Upper bound for a forward-compatible rack option. Large enough for observed PS5 SDK growth
+/// (Unity/FMOD has declared sizes up to 0x508).
+pub(super) const NGS2_RACK_OPTION_MAXIMUM_SIZE: u64 = 0x800;
 /// Byte offsets within that option.
 pub(super) const NGS2_RACK_OPTION_FLAGS_OFFSET: u64 = 72;
 pub(super) const NGS2_RACK_OPTION_MAX_GRAIN_SAMPLES_OFFSET: u64 = 76;
@@ -210,9 +218,82 @@ pub(super) fn ngs2_option_size(option: u64, minimum: u64, maximum: u64) -> Resul
     if !(minimum..=maximum).contains(&size)
         || !process_guest_range_is_readable(option, usize::try_from(size).unwrap_or(usize::MAX))
     {
+        eprintln!(
+            "[REMu][NGS2] invalid option size={size} expected={minimum}..={maximum} address={option:#x}"
+        );
         return Err(NGS2_ERROR_INVALID_OPTION_SIZE);
     }
     Ok(size)
+}
+
+/// Accepts a rack option whose size is at least the fields this build reads.
+///
+/// SDK revisions grow the option with trailing reserved fields; rejecting anything larger than
+/// the revision this file was written against breaks titles that ship a newer header. Some
+/// Unity/FMOD builds also write the size as a 32-bit field; when the upper half is non-zero
+/// garbage from an adjacent name, the low 32 bits are accepted when they fall in range.
+pub(super) fn ngs2_rack_option_size(option: u64) -> Result<u64, u32> {
+    if !process_guest_range_is_readable(option, std::mem::size_of::<u64>()) {
+        return Err(NGS2_ERROR_INVALID_OPTION_ADDRESS);
+    }
+    let raw = read_guest_u64(option);
+    let size = if (NGS2_RACK_OPTION_MINIMUM_SIZE..=NGS2_RACK_OPTION_MAXIMUM_SIZE).contains(&raw) {
+        raw
+    } else {
+        let low = raw & 0xffff_ffff;
+        if (NGS2_RACK_OPTION_MINIMUM_SIZE..=NGS2_RACK_OPTION_MAXIMUM_SIZE).contains(&low) {
+            low
+        } else {
+            eprintln!(
+                "[REMu][NGS2] invalid rack option size raw={raw:#x} expected={NGS2_RACK_OPTION_MINIMUM_SIZE}..={NGS2_RACK_OPTION_MAXIMUM_SIZE} address={option:#x}"
+            );
+            return Err(NGS2_ERROR_INVALID_OPTION_SIZE);
+        }
+    };
+    if !process_guest_range_is_readable(option, usize::try_from(size).unwrap_or(usize::MAX)) {
+        return Err(NGS2_ERROR_INVALID_OPTION_SIZE);
+    }
+    Ok(size)
+}
+
+/// Renders one grain of silence into the caller's render buffers.
+///
+/// There is no DSP graph behind the NGS2 object table, so the honest output of a render is
+/// cleared float samples for the grain length and channel count the system was created with.
+/// Fabricating tone or copying waveform data would claim a mixer that does not exist.
+pub(super) fn ngs2_system_render(arguments: [u64; 6]) -> u64 {
+    let (system_handle, buffers, buffer_count) =
+        (arguments[0], arguments[1], low_u32(arguments[2]));
+    if buffer_count == 0 {
+        return sce_kernel_error(NGS2_ERROR_INVALID_OUT_ADDRESS);
+    }
+    let state = ngs2_state();
+    let Some(system) = state.systems.get(&system_handle) else {
+        return sce_kernel_error(NGS2_ERROR_INVALID_SYSTEM_HANDLE);
+    };
+    let grain = system.num_grain_samples;
+    drop(state);
+    const RENDER_BUFFER_INFO_SIZE: u64 = 24;
+    const BUFFER_PTR_OFFSET: u64 = 0;
+    const BUFFER_SIZE_OFFSET: u64 = 8;
+    const NUM_CHANNELS_OFFSET: u64 = 20;
+    for index in 0..buffer_count {
+        let info = buffers.saturating_add(u64::from(index).saturating_mul(RENDER_BUFFER_INFO_SIZE));
+        if !process_guest_range_is_readable(info, usize::try_from(RENDER_BUFFER_INFO_SIZE).unwrap_or(usize::MAX))
+        {
+            return sce_kernel_error(NGS2_ERROR_INVALID_OUT_ADDRESS);
+        }
+        let buffer = read_guest_u64(info + BUFFER_PTR_OFFSET);
+        let buffer_size = read_guest_u64(info + BUFFER_SIZE_OFFSET);
+        let channels = read_guest_u32(info + NUM_CHANNELS_OFFSET).max(1);
+        let samples = u64::from(grain).saturating_mul(u64::from(channels));
+        let bytes = samples.saturating_mul(4).min(buffer_size);
+        if buffer == 0 || bytes == 0 {
+            return sce_kernel_error(NGS2_ERROR_INVALID_OUT_ADDRESS);
+        }
+        guest_memset(buffer, 0, bytes);
+    }
+    0
 }
 
 /// Reports the user data a buffer allocator carries once its handlers are known good.
@@ -421,7 +502,7 @@ pub(super) fn ngs2_rack_from_option(
     if option == 0 {
         return Ok(rack);
     }
-    ngs2_option_size(option, NGS2_RACK_OPTION_MINIMUM_SIZE, NGS2_RACK_OPTION_SIZE)?;
+    ngs2_rack_option_size(option)?;
     let _ = read_guest_u32(option + NGS2_RACK_OPTION_FLAGS_OFFSET);
     ngs2_grain_samples(
         read_guest_u32(option + NGS2_RACK_OPTION_MAX_GRAIN_SAMPLES_OFFSET),

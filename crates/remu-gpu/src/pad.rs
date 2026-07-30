@@ -77,6 +77,12 @@ pub fn set_host_pad_state(state: HostPadState) {
     HOST_PAD_BUTTONS.store(state.buttons, Ordering::Release);
 }
 
+/// Current held buttons without consuming rising edges reserved for guest pad reads.
+#[must_use]
+pub fn host_pad_buttons_held() -> u32 {
+    HOST_PAD_BUTTONS.load(Ordering::Acquire)
+}
+
 #[must_use]
 pub fn host_pad_state() -> HostPadState {
     // The AppKit event loop can publish key-down and key-up between two guest pad polls,

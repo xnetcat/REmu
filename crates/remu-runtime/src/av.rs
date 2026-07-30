@@ -7,9 +7,8 @@
 //! `libSceVideoOut` entry points.
 //!
 //! The `NGS2` entry points own the object graph -- systems, racks, voices and the state a title
-//! polls for -- but no mixing engine stands behind them, so a voice never consumes waveform data
-//! and `sceNgs2SystemRender` stays unimplemented rather than producing silence that looks like a
-//! working render path.
+//! polls for. There is no DSP mixer behind them, so `sceNgs2SystemRender` clears the caller's
+//! render buffers for one grain of silence rather than inventing mixed audio.
 //!
 //! [`dispatch`] is consulted by the runtime's import dispatcher only after the main table
 //! misses, and returns `None` for any NID it does not own so the caller can keep looking.
@@ -49,18 +48,18 @@ use self::ngs2::{
     NGS2_ERROR_INVALID_MATRIX_LEVEL_ADDRESS, NGS2_ERROR_INVALID_MODULE_INDEX,
     NGS2_ERROR_INVALID_MODULE_LOCATION, NGS2_ERROR_INVALID_NUM_CHANNELS,
     NGS2_ERROR_INVALID_OUT_ADDRESS, NGS2_ERROR_INVALID_PARAM_ADDRESS,
-    NGS2_ERROR_INVALID_VOICE_CONTROL_ADDRESS, NGS2_ERROR_INVALID_VOICE_CONTROL_ID,
-    NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE, NGS2_ERROR_INVALID_VOICE_HANDLE,
-    NGS2_ERROR_INVALID_VOICE_MATRIX_INDEX, NGS2_ERROR_INVALID_VOICE_OUTPUT_INDEX,
-    NGS2_ERROR_INVALID_VOICE_PARAM_ID, NGS2_ERROR_INVALID_VOICE_PATCH_TYPE,
-    NGS2_ERROR_INVALID_VOICE_SETUP_FLAG, NGS2_ERROR_INVALID_WAVEFORM_ADDRESS,
+    NGS2_ERROR_INVALID_VOICE_CONTROL_ADDRESS, NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE,
+    NGS2_ERROR_INVALID_VOICE_HANDLE, NGS2_ERROR_INVALID_VOICE_MATRIX_INDEX,
+    NGS2_ERROR_INVALID_VOICE_OUTPUT_INDEX, NGS2_ERROR_INVALID_VOICE_PARAM_ID,
+    NGS2_ERROR_INVALID_VOICE_PATCH_TYPE, NGS2_ERROR_INVALID_VOICE_SETUP_FLAG,
+    NGS2_ERROR_INVALID_WAVEFORM_ADDRESS,
     NGS2_ERROR_INVALID_WAVEFORM_DATA, NGS2_ERROR_INVALID_WAVEFORM_FORMAT,
     NGS2_ERROR_INVALID_WAVEFORM_TYPE, NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT, NGS2_MAX_SAMPLE_RATE,
     NGS2_MAX_VOICE_CHANNELS, NGS2_MODULE_MAX_LOCATIONS, NGS2_RACK_MAX_MODULES,
     NGS2_VOICE_STATE_FLAG_IN_USE, Ngs2State, Ngs2Voice, ngs2_apply_voice_event,
     ngs2_rack_create_with_allocator, ngs2_rack_destroy, ngs2_rack_get_voice_handle, ngs2_state,
-    ngs2_system_create_with_allocator, ngs2_system_destroy, ngs2_system_reset_option,
-    ngs2_voice_get_state, ngs2_voice_get_state_flags,
+    ngs2_system_create_with_allocator, ngs2_system_destroy, ngs2_system_render,
+    ngs2_system_reset_option, ngs2_voice_get_state, ngs2_voice_get_state_flags,
 };
 #[cfg(test)]
 use self::ngs2_voice::{
@@ -132,6 +131,7 @@ fn dispatch_ngs2(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         "AQkj7C0f3PY" => ngs2_system_reset_option(arguments[0]),
         "mPYgU4oYpuY" => ngs2_system_create_with_allocator(arguments),
         "u-WrYDaJA3k" => ngs2_system_destroy(arguments),
+        "i0VnXM-C9fc" => ngs2_system_render(arguments),
         "U546k6orxQo" => ngs2_rack_create_with_allocator(arguments),
         "lCqD7oycmIM" => ngs2_rack_destroy(arguments),
         "MwmHz8pAdAo" => ngs2_rack_get_voice_handle(arguments),

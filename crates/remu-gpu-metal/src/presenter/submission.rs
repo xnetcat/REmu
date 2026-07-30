@@ -11,8 +11,9 @@ use super::{
     PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
     PipelineCompileCandidate, PresenterFlow, QueueBlockReason, ScheduledGpuSubmission,
     ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh, compute_pipeline_key,
-    graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
-    guest_texture_byte_count, pixel_scalars, rearm_color_metadata_clear,
+    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader, graphics_pipeline_key,
+    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count, pixel_scalars,
+    rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_memory_copy,
     refresh_resident_texture_write_watch, register_value,
     retire_multisample_textures_overlapping_writeback,
@@ -146,6 +147,17 @@ impl MetalPresenter {
                         eprintln!("[REMu][METAL] hiding installed-title system splash");
                     }
                     self.redraw_pending = true;
+                }
+                GpuEvent::ShowHostDialog(request) => {
+                    crate::presenter::host_ui::present_host_dialog(&request);
+                    self.redraw_pending = true;
+                }
+                GpuEvent::HideHostDialog { sequence } => {
+                    crate::presenter::host_ui::hide_host_dialog(sequence);
+                    self.redraw_pending = true;
+                }
+                GpuEvent::ShowHostToast(request) => {
+                    crate::presenter::host_ui::present_host_toast(&request);
                 }
                 GpuEvent::Flip {
                     address,
@@ -365,6 +377,20 @@ impl MetalPresenter {
                             );
                             return PresenterFlow::Continue;
                         }
+                    }
+                    if diagnostic_skip_pixel_shader(draw.pixel_shader_address)
+                        || diagnostic_skip_export_shader(draw.export_shader_address)
+                    {
+                        static LOGGED_SKIPPED_PS: AtomicUsize = AtomicUsize::new(0);
+                        if LOGGED_SKIPPED_PS.fetch_add(1, Ordering::Relaxed) < 8 {
+                            eprintln!(
+                                "[REMu][METAL] skipping draw={} es={:#x} ps={:#x} (REMU_SKIP_PS/ES)",
+                                draw.sequence,
+                                draw.export_shader_address,
+                                draw.pixel_shader_address,
+                            );
+                        }
+                        continue;
                     }
                     let result = match key.as_ref() {
                         Ok(key) => self.execute_compiled_draw(&draw, key),

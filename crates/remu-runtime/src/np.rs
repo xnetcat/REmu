@@ -672,6 +672,24 @@ impl TrophyState {
         Ok(())
     }
 
+    pub fn require_registered(&self, context: i32, handle: i32) -> Result<(), u32> {
+        let handle_state = self
+            .handles
+            .get(&handle)
+            .ok_or(TROPHY2_ERROR_INVALID_HANDLE)?;
+        if handle_state.aborted {
+            return Err(TROPHY2_ERROR_ABORT);
+        }
+        let context = self
+            .contexts
+            .get(&context)
+            .ok_or(TROPHY2_ERROR_INVALID_CONTEXT)?;
+        if !context.registered {
+            return Err(TROPHY2_ERROR_INVALID_CONTEXT);
+        }
+        Ok(())
+    }
+
     pub fn register_unlock_callback(&mut self, function: u64, argument: u64) -> Result<(), u32> {
         if function == 0 {
             return Err(TROPHY2_ERROR_INVALID_ARGUMENT);

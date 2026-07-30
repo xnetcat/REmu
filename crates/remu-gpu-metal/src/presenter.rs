@@ -25,6 +25,7 @@ mod decode;
 mod diagnostics;
 mod execute;
 mod format;
+mod host_ui;
 mod present;
 mod readback;
 mod sampler;
@@ -74,6 +75,7 @@ use self::diagnostics::{
     diagnostic_capture_vertex_position, diagnostic_context_register_snapshot,
     diagnostic_disable_blending, diagnostic_disable_culling, diagnostic_disable_depth,
     diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
+    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader,
     diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,

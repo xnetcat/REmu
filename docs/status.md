@@ -12,6 +12,24 @@ Unity/IL2CPP title (which commits nearly all of its memory by reserving virtual 
 write-watched textures; its environment backdrop, lighting, and menu UI now render with the
 correct orientation. Lighting and post-processing are improved but not yet visually correct.
 
+A third Unity title (Void Terrarium) previously aborted in ~2s with a host stack overflow on
+`GraSubmitThread` during the first AGC submit. Guest pthread stacks of 16 KiB are now floored to
+a 2 MiB host stack without changing guest-visible attributes. The title now sustains AGC
+submissions and VideoOut flips for a full diagnostic timeout. Save-data and message dialogs are
+presented as non-blocking AppKit `NSPanel` overlays that stay `RUNNING` until the user clicks a
+button or presses Cross/Enter (accept) or Circle/Escape (cancel); trophy unlocks and notifications
+publish floating toast panels that auto-dismiss. Remaining visual gap: many draws are still dropped
+after pipeline compile failure, so captured frame dumps are still zero even while flips proceed.
+Indexed NGG triangle strips (`primitive=0x6`) and point lists (`primitive=0x1`) are now
+expanded into the meshlet triangle ABI, and wave32 `SAndSaveexecB32` lowers for mesh shaders.
+Void Terrarium’s content quads and amplified point draws compile and encode. The post/composite
+pixel path that needed `ImageGetResinfo` now lowers to Metal (`get_width`/`get_height`/
+`get_num_mip_levels`, with optional `unorm` float bitcasts), so that previously failing
+`es:0x70e5db0400`/`ps:0x70e5da8700` pair compiles. NGG mesh lowering now uses wave32 lane IDs and packs `s3[27:24]` so amplified
+point-list particle subgroups (e.g. 96 threads) no longer collide LDS/export
+indices into a center-screen haze. Depth residency (`depth_native`) and remaining
+post/lighting correctness are still open.
+
 ## Import coverage
 
 A PS5 import identifies its function only by an 11-character NID, so measuring coverage means
