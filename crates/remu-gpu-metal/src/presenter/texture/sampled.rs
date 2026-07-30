@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, MetalTextureSwizzleChannels,
-    RESIDENT_DEPTH_SAMPLE_HITS, ResidentGuestTexture, SAMPLED_ALIAS_WRITEBACK_BYTES,
-    SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey,
-    WriteWatchRefresh, comparison_depth32_upload, compressed_texture_block_extent,
+    DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter,
+    MetalTextureSwizzleChannels, RESIDENT_DEPTH_SAMPLE_HITS, ResidentGuestTexture,
+    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey, WriteWatchRefresh,
+    comparison_depth32_upload, compressed_texture_block_extent,
     decode_guest_texture_linear_from_raw_at_z, guest_frame_fingerprint, guest_texture_byte_count,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
@@ -58,6 +59,7 @@ impl MetalPresenter {
                         binding.pc
                     )
                 })?;
+                let sampled_overlap = GuestTextureOverlapQuery::new(sampled.guest);
                 // A Gen5 MSAA allocation can expose its shader-readable resolved image through
                 // an overlapping SRD whose base follows the allocation's mask metadata. Keep the
                 // Metal resolve GPU-current so `upload_image_textures` can bind it directly. A
@@ -80,10 +82,7 @@ impl MetalPresenter {
                                 .overlaps_alias_range(sampled.guest.address, sampled_bytes);
                             let aliases_sample = overlaps_resident
                                 && resident.descriptor != sampled.guest
-                                && !guest_texture_descriptors_share_storage(
-                                    resident.descriptor,
-                                    sampled.guest,
-                                )
+                                && !resident.overlap.shares_storage_query(&sampled_overlap)
                                 && !resident_color_view_sample_is_eligible(
                                     resident, sampled, comparison,
                                 )

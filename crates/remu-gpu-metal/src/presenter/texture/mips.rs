@@ -3,9 +3,9 @@
 
 use super::super::GuestMipChainLayout;
 use super::{
-    DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
-    MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, ResidentGuestTexture, WriteWatchRefresh,
-    compressed_texture_block_extent, copy_mode27_mip_level_to_linear,
+    DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MIP_UPLOAD_BYTES,
+    MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, ResidentGuestTexture,
+    WriteWatchRefresh, compressed_texture_block_extent, copy_mode27_mip_level_to_linear,
     decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
     record_mode27_work_detail, record_texture_work, refresh_resident_texture_write_watch,
     resident_texture_for_sample, snapshot_watched_guest_range, trace_resident_texture_removal,
@@ -139,6 +139,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             texture,
             component_reorder_view: None,
             descriptor: descriptor.guest,
+            overlap: GuestTextureOverlapQuery::new(descriptor.guest),
             texture_type: descriptor.texture_type,
             layer_count: descriptor.layer_count,
             mip_level_count: underlying_mip_count,
@@ -316,6 +317,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
         texture,
         component_reorder_view: None,
         descriptor: descriptor.guest,
+        overlap: GuestTextureOverlapQuery::new(descriptor.guest),
         texture_type: descriptor.texture_type,
         layer_count: descriptor.layer_count,
         mip_level_count: underlying_mip_count,
