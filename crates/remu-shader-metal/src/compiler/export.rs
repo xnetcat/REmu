@@ -183,7 +183,16 @@ impl Compiler<'_> {
         let field = format!("remu_out.mrt{}", output.guest_slot);
         let mut values = Vec::with_capacity(4);
         for component in 0..4 {
-            if export.enable_mask & (1 << component) == 0 {
+            // AMD compressed color exports use EN[0] for the packed R/G pair and EN[2] for the
+            // packed B/A pair. EN[1] and EN[3] are not independent component enables. Treating
+            // the mask like an uncompressed export silently dropped G and A from the canonical
+            // 0b0101 compressed mask.
+            let enable_component = if export.compressed {
+                export.enable_mask & (1 << (component & !1)) != 0
+            } else {
+                export.enable_mask & (1 << component) != 0
+            };
+            if !enable_component {
                 values.push(format!("{field}[{component}]"));
                 continue;
             }
