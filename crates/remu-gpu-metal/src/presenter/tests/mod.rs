@@ -78,6 +78,7 @@ mod completion;
 mod decode;
 mod present;
 mod readback;
+mod render_pass;
 mod shader;
 mod submission;
 mod texture;

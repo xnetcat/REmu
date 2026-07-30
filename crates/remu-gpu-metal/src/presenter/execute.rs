@@ -113,6 +113,10 @@ impl MetalPresenter {
                     .statistics
                     .render_pass_ends_for_target_change
                     .saturating_add(1);
+                self.statistics.render_pass_ends_for_color_operation = self
+                    .statistics
+                    .render_pass_ends_for_color_operation
+                    .saturating_add(1);
             }
             let operation_targets = match color_operation {
                 ColorOperationMode::Resolve => {
@@ -1182,11 +1186,18 @@ impl MetalPresenter {
                 pending_guest_write_ranges,
             );
             if needs_new_render_pass {
+                let key_transition = batch
+                    .render_pass
+                    .as_ref()
+                    .map(|open| open.key.transition_to(&render_pass_key));
                 if batch.end_render_pass() {
                     self.statistics.render_pass_ends_for_target_change = self
                         .statistics
                         .render_pass_ends_for_target_change
                         .saturating_add(1);
+                    self.statistics
+                        .render_pass_key_transitions
+                        .record(key_transition.expect("an ended render pass had a key"));
                 }
                 let encoder = batch
                     .command_buffer
