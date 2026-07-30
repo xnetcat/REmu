@@ -536,9 +536,6 @@ struct AvPlayerInstance {
     video_buffer_stride: usize,
     next_video_buffer: usize,
     next_video_frame: u64,
-    /// Timestamp of the last video frame released to the guest. Host time is only a readiness
-    /// clock: under slow emulation it may outrun the media the guest has actually received.
-    last_video_timestamp_milliseconds: Option<u64>,
     /// Host media-clock segment established only after the guest has consumed its first decoded
     /// frame. This prevents a long initial shader compile from seeking a short splash straight to
     /// EOF, while still allowing later frames to catch up when emulation runs below movie FPS.
@@ -548,9 +545,6 @@ struct AvPlayerInstance {
     audio_buffer_base: u64,
     next_audio_buffer: usize,
     next_audio_frame: u64,
-    /// Timestamp of the last audio frame released to the guest. Audio is the public presentation
-    /// clock whenever the selected source has an audio stream.
-    last_audio_timestamp_milliseconds: Option<u64>,
 }
 
 impl AvPlayerInstance {
@@ -569,10 +563,8 @@ impl AvPlayerInstance {
         self.elapsed = Duration::ZERO;
         self.end_of_stream = false;
         self.next_video_frame = 0;
-        self.last_video_timestamp_milliseconds = None;
         self.video_catch_up_origin = None;
         self.next_audio_frame = 0;
-        self.last_audio_timestamp_milliseconds = None;
         self.next_video_buffer = 0;
         self.next_audio_buffer = 0;
         self.decoder_seek = Duration::ZERO;
@@ -583,20 +575,9 @@ impl AvPlayerInstance {
             .map_or(self.elapsed, |started| self.elapsed + started.elapsed())
     }
 
-    /// Host time used only to decide whether another decoded frame is ready to be released.
-    /// Public playback position comes from `presented_media_elapsed` below.
-    fn readiness_clock_elapsed(&self) -> Duration {
+    fn media_clock_elapsed(&self) -> Duration {
         self.playback_elapsed()
             .mul_f64(f64::from(self.trick_speed_percent) / 100.0)
-    }
-
-    fn presented_media_elapsed(&self) -> Duration {
-        let delivered_timestamp = if self.has_audio {
-            self.last_audio_timestamp_milliseconds
-        } else {
-            self.last_video_timestamp_milliseconds
-        };
-        delivered_timestamp.map_or(self.decoder_seek, Duration::from_millis)
     }
 }
 
