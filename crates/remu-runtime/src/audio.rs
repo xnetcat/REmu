@@ -175,12 +175,16 @@ impl AudioMixer {
         Some(overflow)
     }
 
-    fn write_interleaved(&mut self, output: &mut [f32], channels: usize) {
+    fn write_interleaved(&mut self, output: &mut [f32], channels: usize) -> (u64, u64) {
         if channels == 0 {
             output.fill(0.0);
-            return;
+            return (0, 0);
         }
         let requested_frames = output.len() / channels;
+        // Capture this before moving an exhausted queue back into prebuffering. Otherwise the
+        // most common underrun shape -- a callback arriving at an exactly empty queue -- makes
+        // `has_audio_port` false below and the callback disappears from the telemetry entirely.
+        let had_started_port = self.queues.values().any(|queue| queue.started);
         let mut starved_port = false;
         for queue in self.queues.values_mut() {
             if queue.started && queue.frames.len() < requested_frames {
@@ -196,7 +200,8 @@ impl AudioMixer {
         let has_audio_port = self
             .queues
             .values()
-            .any(|queue| queue.started || !queue.frames.is_empty());
+            .any(|queue| queue.started || !queue.frames.is_empty())
+            || had_started_port;
         let mut output_frames = 0_u64;
         let mut underrun_frames = 0_u64;
         for frame in output.chunks_mut(channels) {
@@ -224,6 +229,9 @@ impl AudioMixer {
         }
         if has_audio_port {
             remu_gpu::report_audio_frames(output_frames, underrun_frames);
+            (output_frames, underrun_frames)
+        } else {
+            (0, 0)
         }
     }
 }
@@ -902,6 +910,33 @@ mod tests {
             queued,
             "an underrun must rebuffer instead of emitting a partial callback"
         );
+    }
+
+    #[test]
+    fn mixer_reports_an_underrun_when_a_started_queue_is_exactly_empty() {
+        let mut mixer = AudioMixer::default();
+        mixer.add_port(1, AUDIO_PREBUFFER_FRAMES);
+        assert!(mixer.push(
+            1,
+            std::iter::repeat_n([0.25, -0.25], AUDIO_PREBUFFER_FRAMES)
+        ));
+
+        let mut prebuffer = vec![1.0_f32; AUDIO_PREBUFFER_FRAMES * 2];
+        assert_eq!(
+            mixer.write_interleaved(&mut prebuffer, 2),
+            (AUDIO_PREBUFFER_FRAMES as u64, 0)
+        );
+        assert!(mixer.queues[&1].frames.is_empty());
+        assert!(mixer.queues[&1].started);
+
+        let mut starved = vec![1.0_f32; 256 * 2];
+        assert_eq!(
+            mixer.write_interleaved(&mut starved, 2),
+            (256, 256),
+            "the callback that observes an empty live stream must remain visible as an underrun"
+        );
+        assert_eq!(starved, vec![0.0; 256 * 2]);
+        assert!(!mixer.queues[&1].started);
     }
 
     #[test]
