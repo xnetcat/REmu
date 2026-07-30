@@ -13,7 +13,10 @@ Load this file from LLDB, then run ``remu-taskgraph-trace-start`` before
 launching REmu.  ``scripts/probe-taskgraph.sh`` provides the complete bounded
 invocation.  Set ``REMU_TASKGRAPH_TRACE_PREPARE_ONLY=1`` to keep one persistent
 hardware breakpoint at the prerequisite-release site and avoid dynamic
-breakpoint rotation while logging every fence.
+breakpoint rotation while logging every fence.  Set
+``REMU_TASKGRAPH_TRACE_TARGET_FOLLOW=1`` to log only the configured BeginFence
+caller chain and add persistent publish, execute, and complete breakpoints once
+that task is captured.
 """
 
 from __future__ import annotations
@@ -40,6 +43,8 @@ MAXIMUM_HIT_LIMIT = 100_000
 # libraries and Rust allocations are in the high 0x7f/0x7ff ranges instead.
 MINIMUM_GUEST_EXECUTION_ADDRESS = 0x8_0000_0000
 MAXIMUM_GUEST_EXECUTION_ADDRESS = 0x100_0000_0000
+DEFAULT_TARGET_FENCE_CALLER = 0x801BE0507
+DEFAULT_TARGET_FENCE_PARENT = 0x80101AF94
 TASK_QUEUE_WAITER_BITS = 26
 TASK_QUEUE_WAITER_MASK = (1 << TASK_QUEUE_WAITER_BITS) - 1
 
@@ -146,6 +151,25 @@ def _positive_limit(name: str, default: int, maximum: int) -> int:
     return parsed if 1 <= parsed <= maximum else default
 
 
+def guest_address_setting(name: str, default: int) -> int:
+    """Read one validated direct-guest code address from the environment."""
+
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        address = int(raw, 0)
+    except ValueError as error:
+        raise ValueError(f"{name} is not an integer address") from error
+    if not (
+        MINIMUM_GUEST_EXECUTION_ADDRESS
+        <= address
+        < MAXIMUM_GUEST_EXECUTION_ADDRESS
+    ):
+        raise ValueError(f"{name} is outside the direct guest execution window")
+    return address
+
+
 def signed_u32(value: int) -> int:
     """Interpret eax as the signed 32-bit queue-publish result."""
 
@@ -215,6 +239,19 @@ def _register(registers: Mapping[str, int], name: str) -> int:
     return registers.get(name, 0) & ((1 << 64) - 1)
 
 
+def persistent_breakpoint_additions(
+    installed_labels: Mapping[str, object],
+    requested: Mapping[str, int],
+) -> dict[str, int]:
+    """Return only fixed breakpoints not already installed."""
+
+    return {
+        label: address
+        for label, address in requested.items()
+        if label not in installed_labels
+    }
+
+
 @dataclass(frozen=True)
 class TraceResult:
     """One state-machine observation returned to the LLDB adapter."""
@@ -231,6 +268,9 @@ class TaskGraphTraceState:
         cycle_limit: int,
         hit_limit: int,
         prepare_only: bool = False,
+        target_follow: bool = False,
+        target_caller: int = DEFAULT_TARGET_FENCE_CALLER,
+        target_parent: int = DEFAULT_TARGET_FENCE_PARENT,
     ) -> None:
         if not 1 <= cycle_limit <= MAXIMUM_CYCLE_LIMIT:
             raise ValueError("cycle_limit is outside the bounded diagnostic range")
@@ -238,7 +278,14 @@ class TaskGraphTraceState:
             raise ValueError("hit_limit is outside the bounded diagnostic range")
         self.cycle_limit = cycle_limit
         self.hit_limit = hit_limit
-        self.prepare_only = prepare_only
+        self.prepare_only = prepare_only or target_follow
+        self.target_follow = target_follow
+        self.target_caller = target_caller
+        self.target_parent = target_parent
+        self.target_stages_installed = False
+        self.target_capture_count = 0
+        self.target_published = False
+        self.target_executed = False
         self.phase = PHASE_PUBLISH
         self.hits = 0
         self.cycles_started = 0
@@ -263,6 +310,17 @@ class TaskGraphTraceState:
     def active_breakpoints(self) -> Mapping[str, int]:
         if self.done:
             return BREAKPOINTS[PHASE_DONE]
+        if self.target_follow:
+            breakpoints = {PREPARE: PREPARE_ADDRESS}
+            if self.target_stages_installed:
+                breakpoints.update(
+                    {
+                        PUBLISH: BREAKPOINTS[PHASE_PUBLISH][PUBLISH],
+                        EXECUTE: BREAKPOINTS[PHASE_CONSUME][EXECUTE],
+                        COMPLETE: BREAKPOINTS[PHASE_COMPLETE][COMPLETE],
+                    }
+                )
+            return breakpoints
         if self.prepare_only:
             # Keep one hardware breakpoint installed for the whole run.  In
             # particular, do not make debugserver remove/re-add translated
@@ -348,6 +406,13 @@ class TaskGraphTraceState:
             return self._finish("hit-limit")
         if label not in self.active_breakpoints():
             return TraceResult(False)
+        if self.target_follow:
+            return self._observe_target_follow(
+                label,
+                registers,
+                thread_id,
+                read_u64,
+            )
         if self.prepare_only:
             return self._observe_prepare_only(registers, read_u64)
 
@@ -389,6 +454,103 @@ class TaskGraphTraceState:
                 message += f" next=({result.message})"
             return TraceResult(True, message)
         return result
+
+    def _observe_target_follow(
+        self,
+        label: str,
+        registers: Mapping[str, int],
+        thread_id: int,
+        read_u64: ReadU64,
+    ) -> TraceResult:
+        """Follow only a fence selected by its BeginFence return chain."""
+
+        if label == PREPARE:
+            if self.task != 0:
+                return TraceResult(False)
+            frame_pointer = _register(registers, "rbp")
+            caller_frame = read_u64(frame_pointer) or 0
+            caller = read_u64(frame_pointer + 0x8) or 0
+            parent = read_u64(caller_frame + 0x8) or 0
+            if caller != self.target_caller or parent != self.target_parent:
+                return TraceResult(False)
+            task = _register(registers, "rbx")
+            if task == 0:
+                return TraceResult(False)
+            self.task = task
+            self.completion_event = read_u64(task + 0x18) or 0
+            self.counter_before_release = _register(registers, "r12") & 0xFFFFFFFF
+            self.release_threshold = _register(registers, "rax") & 0xFFFFFFFF
+            task_word = read_u64(task + 0x8)
+            task_counter_after = (
+                (task_word >> 32) & 0xFFFFFFFF
+                if task_word is not None
+                else None
+            )
+            self.target_stages_installed = True
+            self.target_capture_count += 1
+            self.target_published = False
+            self.target_executed = False
+            return TraceResult(
+                True,
+                f"target={self.target_capture_count} capture task={task:#x} "
+                f"event={self.completion_event:#x} "
+                f"counter_before_release={self.counter_before_release:#x} "
+                f"release_threshold={self.release_threshold:#x} "
+                f"task_counter_after="
+                f"{task_counter_after if task_counter_after is not None else 'unreadable'} "
+                f"dispatchable="
+                f"{self.counter_before_release == self.release_threshold} "
+                f"caller={caller:#x} caller_parent={parent:#x}",
+            )
+
+        if self.task == 0:
+            return TraceResult(False)
+        if label == PUBLISH:
+            if _register(registers, "rsi") != self.task:
+                return TraceResult(False)
+            self.target_published = True
+            self.queue = _register(registers, "rdi")
+            return TraceResult(
+                True,
+                f"target={self.target_capture_count} publish "
+                f"task={self.task:#x} event={self.completion_event:#x} "
+                f"queue={self.queue:#x} "
+                f"priority={_register(registers, 'rdx') & 0xffffffff} "
+                f"thread={thread_id:#x} "
+                f"wait_state={describe_queue_wait_state(read_u64(self.queue + 0x1A8))}",
+            )
+        if label == EXECUTE:
+            if _register(registers, "rdi") != self.task:
+                return TraceResult(False)
+            self.target_executed = True
+            return TraceResult(
+                True,
+                f"target={self.target_capture_count} execute "
+                f"task={self.task:#x} event={self.completion_event:#x} "
+                f"thread={thread_id:#x}",
+            )
+        if label != COMPLETE or _register(registers, "r14") != self.task:
+            return TraceResult(False)
+        event_words = [
+            value
+            for index in range(12)
+            if (
+                value := read_u64(self.completion_event + index * 8)
+            )
+            is not None
+        ]
+        task = self.task
+        event = self.completion_event
+        capture = self.target_capture_count
+        published = self.target_published
+        executed = self.target_executed
+        self._reset_cycle()
+        return TraceResult(
+            True,
+            f"target={capture} complete task={task:#x} event={event:#x} "
+            f"published={published} executed={executed} "
+            f"event_words={[hex(value) for value in event_words]}",
+        )
 
     def _observe_prepare_only(
         self,
@@ -672,6 +834,9 @@ class LldbTaskGraphTrace:
 
     def __init__(self, target) -> None:
         self.target = target
+        target_follow = (
+            os.environ.get("REMU_TASKGRAPH_TRACE_TARGET_FOLLOW") == "1"
+        )
         self.state = TaskGraphTraceState(
             _positive_limit(
                 "REMU_TASKGRAPH_TRACE_CYCLES",
@@ -684,8 +849,17 @@ class LldbTaskGraphTrace:
                 MAXIMUM_HIT_LIMIT,
             ),
             os.environ.get("REMU_TASKGRAPH_TRACE_PREPARE_ONLY") == "1",
+            target_follow,
+            guest_address_setting(
+                "REMU_TASKGRAPH_TRACE_TARGET_CALLER",
+                DEFAULT_TARGET_FENCE_CALLER,
+            ),
+            guest_address_setting(
+                "REMU_TASKGRAPH_TRACE_TARGET_PARENT",
+                DEFAULT_TARGET_FENCE_PARENT,
+            ),
         )
-        self.enabled_breakpoints = []
+        self.enabled_breakpoints = {}
 
     def _command(self, command: str):
         result = lldb.SBCommandReturnObject()
@@ -693,59 +867,82 @@ class LldbTaskGraphTrace:
         return result
 
     def _disable_active(self) -> None:
-        for breakpoint in self.enabled_breakpoints:
+        for breakpoint in self.enabled_breakpoints.values():
             breakpoint.SetEnabled(False)
-        self.enabled_breakpoints = []
+        self.enabled_breakpoints = {}
+
+    def _install_breakpoint(self, label: str, address: int):
+        result = self._command(
+            f"breakpoint set --hardware --address {address:#x}"
+        )
+        if not result.Succeeded():
+            print(
+                "[REMu][LLDB][TASKGRAPH] hardware breakpoint install failed "
+                f"label={label} address={address:#x}: "
+                f"{result.GetError().strip()}",
+                flush=True,
+            )
+            return None
+        breakpoint = self.target.GetBreakpointAtIndex(
+            self.target.GetNumBreakpoints() - 1
+        )
+        callback = self._command(
+            "breakpoint command add --script-type python "
+            "--python-function lldb_taskgraph_trace.trace_breakpoint "
+            f"{breakpoint.GetID()}"
+        )
+        if not callback.Succeeded():
+            breakpoint.SetEnabled(False)
+            print(
+                "[REMu][LLDB][TASKGRAPH] callback install failed "
+                f"label={label} address={address:#x}: "
+                f"{callback.GetError().strip()}",
+                flush=True,
+            )
+            return None
+        return breakpoint
 
     def arm_phase(self) -> bool:
         requested = self.state.active_breakpoints()
         if len(requested) > MAXIMUM_HARDWARE_BREAKPOINTS:
-            self._disable_active()
+            if not self.state.target_follow:
+                self._disable_active()
             print(
                 "[REMu][LLDB][TASKGRAPH] refusing phase with more than four breakpoints",
                 flush=True,
             )
             return False
+        if self.state.target_follow:
+            added = []
+            additions = persistent_breakpoint_additions(
+                self.enabled_breakpoints,
+                requested,
+            )
+            for label, address in additions.items():
+                breakpoint = self._install_breakpoint(label, address)
+                if breakpoint is None:
+                    self.state.phase = PHASE_DONE
+                    return False
+                self.enabled_breakpoints[label] = breakpoint
+                added.append(label)
+            print(
+                "[REMu][LLDB][TASKGRAPH] persistent breakpoints="
+                f"{','.join(self.enabled_breakpoints) or 'none'} "
+                f"added={','.join(added) or 'none'}",
+                flush=True,
+            )
+            return True
         self._disable_active()
-        installed = []
+        installed = {}
         for label, address in requested.items():
-            result = self._command(
-                f"breakpoint set --hardware --address {address:#x}"
-            )
-            if not result.Succeeded():
-                for breakpoint in installed:
-                    breakpoint.SetEnabled(False)
-                print(
-                    "[REMu][LLDB][TASKGRAPH] hardware breakpoint install failed "
-                    f"label={label} address={address:#x}: "
-                    f"{result.GetError().strip()}",
-                    flush=True,
-                )
-                self.state.phase = PHASE_DONE
-                self.enabled_breakpoints = []
-                return False
-            breakpoint = self.target.GetBreakpointAtIndex(
-                self.target.GetNumBreakpoints() - 1
-            )
-            callback = self._command(
-                "breakpoint command add --script-type python "
-                "--python-function lldb_taskgraph_trace.trace_breakpoint "
-                f"{breakpoint.GetID()}"
-            )
-            if not callback.Succeeded():
-                breakpoint.SetEnabled(False)
-                for installed_breakpoint in installed:
+            breakpoint = self._install_breakpoint(label, address)
+            if breakpoint is None:
+                for installed_breakpoint in installed.values():
                     installed_breakpoint.SetEnabled(False)
-                print(
-                    "[REMu][LLDB][TASKGRAPH] callback install failed "
-                    f"label={label} address={address:#x}: "
-                    f"{callback.GetError().strip()}",
-                    flush=True,
-                )
                 self.state.phase = PHASE_DONE
-                self.enabled_breakpoints = []
+                self.enabled_breakpoints = {}
                 return False
-            installed.append(breakpoint)
+            installed[label] = breakpoint
         self.enabled_breakpoints = installed
         labels = ",".join(requested)
         print(
@@ -823,7 +1020,10 @@ def install_taskgraph_trace(frame, breakpoint_location, _internal_dict):
         "[REMu][LLDB][TASKGRAPH] guest mapping reached; "
         f"cycle_limit={SESSION.state.cycle_limit} "
         f"hit_limit={SESSION.state.hit_limit} "
-        f"prepare_only={SESSION.state.prepare_only}",
+        f"prepare_only={SESSION.state.prepare_only} "
+        f"target_follow={SESSION.state.target_follow} "
+        f"target_caller={SESSION.state.target_caller:#x} "
+        f"target_parent={SESSION.state.target_parent:#x}",
         flush=True,
     )
     SESSION.arm_phase()
@@ -831,7 +1031,7 @@ def install_taskgraph_trace(frame, breakpoint_location, _internal_dict):
 
 
 def trace_breakpoint(frame, breakpoint_location, _internal_dict):
-    """Shared callback for every dynamically armed guest hardware breakpoint."""
+    """Shared callback for every guest hardware breakpoint."""
 
     if SESSION is None:
         return False
@@ -841,6 +1041,19 @@ def trace_breakpoint(frame, breakpoint_location, _internal_dict):
 def start_taskgraph_trace(debugger, _command, result, _internal_dict):
     """Install one host-code seed breakpoint; guest breakpoints are armed later."""
 
+    if os.environ.get("REMU_TASKGRAPH_TRACE_TARGET_FOLLOW") == "1":
+        try:
+            guest_address_setting(
+                "REMU_TASKGRAPH_TRACE_TARGET_CALLER",
+                DEFAULT_TARGET_FENCE_CALLER,
+            )
+            guest_address_setting(
+                "REMU_TASKGRAPH_TRACE_TARGET_PARENT",
+                DEFAULT_TARGET_FENCE_PARENT,
+            )
+        except ValueError as error:
+            result.SetError(str(error))
+            return
     target = debugger.GetSelectedTarget()
     seed = target.BreakpointCreateByRegex("remu_runtime::import_dispatch_entry")
     if not seed.IsValid() or seed.GetNumLocations() == 0:

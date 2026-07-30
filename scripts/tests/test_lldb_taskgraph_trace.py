@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "lldb_taskgraph_trace.py"
@@ -143,6 +145,127 @@ class TaskGraphTraceTests(unittest.TestCase):
             state.active_breakpoints(),
             {TRACE.PREPARE: TRACE.PREPARE_ADDRESS},
         )
+
+    def test_target_follow_filters_caller_and_keeps_fixed_stage_breakpoints(
+        self,
+    ) -> None:
+        state = TRACE.TaskGraphTraceState(
+            cycle_limit=2,
+            hit_limit=32,
+            target_follow=True,
+        )
+        self.memory.update(
+            {
+                0x8000: 0x9000,
+                0x8008: TRACE.DEFAULT_TARGET_FENCE_CALLER,
+                0x9008: TRACE.DEFAULT_TARGET_FENCE_PARENT,
+            }
+        )
+
+        ignored = state.observe(
+            TRACE.PREPARE,
+            {"rbx": 0x1000, "rbp": 0x7000},
+            7,
+            self.read_u64,
+        )
+        self.assertFalse(ignored.accepted)
+        self.assertEqual(state.task, 0)
+        self.assertEqual(
+            state.active_breakpoints(),
+            {TRACE.PREPARE: TRACE.PREPARE_ADDRESS},
+        )
+
+        captured = state.observe(
+            TRACE.PREPARE,
+            {
+                "rbx": 0x1000,
+                "rbp": 0x8000,
+                "r12": 1,
+                "rax": 1,
+            },
+            7,
+            self.read_u64,
+        )
+        self.assertTrue(captured.accepted)
+        self.assertIn("target=1 capture", captured.message or "")
+        fixed = {
+            TRACE.PREPARE: TRACE.PREPARE_ADDRESS,
+            TRACE.PUBLISH: TRACE.BREAKPOINTS[TRACE.PHASE_PUBLISH][TRACE.PUBLISH],
+            TRACE.EXECUTE: TRACE.BREAKPOINTS[TRACE.PHASE_CONSUME][TRACE.EXECUTE],
+            TRACE.COMPLETE: TRACE.BREAKPOINTS[TRACE.PHASE_COMPLETE][TRACE.COMPLETE],
+        }
+        self.assertEqual(state.active_breakpoints(), fixed)
+
+        self.assertFalse(
+            state.observe(
+                TRACE.PUBLISH,
+                {"rsi": 0x9990},
+                8,
+                self.read_u64,
+            ).accepted
+        )
+        published = state.observe(
+            TRACE.PUBLISH,
+            {"rsi": 0x1000, "rdi": 0x3000, "rdx": 1},
+            8,
+            self.read_u64,
+        )
+        self.assertTrue(published.accepted)
+        executed = state.observe(
+            TRACE.EXECUTE,
+            {"rdi": 0x1000},
+            9,
+            self.read_u64,
+        )
+        self.assertTrue(executed.accepted)
+        completed = state.observe(
+            TRACE.COMPLETE,
+            {"r14": 0x1000},
+            9,
+            self.read_u64,
+        )
+        self.assertTrue(completed.accepted)
+        self.assertIn("published=True executed=True", completed.message or "")
+        self.assertEqual(state.task, 0)
+        self.assertEqual(state.active_breakpoints(), fixed)
+
+    def test_persistent_breakpoint_planner_adds_without_replacing(self) -> None:
+        prepare = {TRACE.PREPARE: TRACE.PREPARE_ADDRESS}
+        fixed = {
+            **prepare,
+            TRACE.PUBLISH: TRACE.BREAKPOINTS[TRACE.PHASE_PUBLISH][TRACE.PUBLISH],
+            TRACE.EXECUTE: TRACE.BREAKPOINTS[TRACE.PHASE_CONSUME][TRACE.EXECUTE],
+            TRACE.COMPLETE: TRACE.BREAKPOINTS[TRACE.PHASE_COMPLETE][TRACE.COMPLETE],
+        }
+        self.assertEqual(
+            TRACE.persistent_breakpoint_additions({}, prepare),
+            prepare,
+        )
+        additions = TRACE.persistent_breakpoint_additions(prepare, fixed)
+        self.assertNotIn(TRACE.PREPARE, additions)
+        self.assertEqual(set(additions), {TRACE.PUBLISH, TRACE.EXECUTE, TRACE.COMPLETE})
+        self.assertEqual(
+            TRACE.persistent_breakpoint_additions(fixed, fixed),
+            {},
+        )
+
+    def test_target_addresses_are_validated(self) -> None:
+        name = "REMU_TASKGRAPH_TRACE_TARGET_CALLER"
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                TRACE.guest_address_setting(name, 0x801BE0507),
+                0x801BE0507,
+            )
+        with mock.patch.dict(os.environ, {name: "0x80101af94"}, clear=True):
+            self.assertEqual(
+                TRACE.guest_address_setting(name, 0x801BE0507),
+                0x80101AF94,
+            )
+        for value in ("not-an-address", "0x7ffffffff", "0x10000000000"):
+            with self.subTest(value=value):
+                with mock.patch.dict(os.environ, {name: value}, clear=True):
+                    with self.assertRaises(ValueError):
+                        TRACE.guest_address_setting(name, 0x801BE0507)
 
     def test_wake_path_correlates_only_the_exact_task_and_thread(self) -> None:
         dispatch = self.observe(TRACE.DISPATCH, {"rsi": 0x1000, "rdx": 3, "rcx": 2})
