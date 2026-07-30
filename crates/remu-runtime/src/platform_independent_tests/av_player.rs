@@ -26,6 +26,25 @@ fn av_player_decoder_backpressure_trace_schedule_is_bounded() {
 }
 
 #[test]
+fn av_player_content_summary_distinguishes_live_and_constant_frames() {
+    let constant = crate::av_player::av_player_byte_content_summary(&[16; 8]);
+    assert_eq!(constant.minimum, 16);
+    assert_eq!(constant.maximum, 16);
+    assert_eq!(constant.nonzero_bytes, 8);
+
+    let live = crate::av_player::av_player_byte_content_summary(&[0, 16, 64, 128, 255]);
+    assert_eq!(live.minimum, 0);
+    assert_eq!(live.maximum, 255);
+    assert_eq!(live.nonzero_bytes, 4);
+    assert_ne!(live.hash, constant.hash);
+
+    let empty = crate::av_player::av_player_byte_content_summary(&[]);
+    assert_eq!(empty.minimum, 0);
+    assert_eq!(empty.maximum, 0);
+    assert_eq!(empty.nonzero_bytes, 0);
+}
+
+#[test]
 fn av_player_resolves_relative_file_urls_inside_app0_case_insensitively() {
     let root = std::env::temp_dir().join(format!("remu-avplayer-path-{}", std::process::id()));
     std::fs::remove_dir_all(&root).ok();

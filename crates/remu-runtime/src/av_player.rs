@@ -32,6 +32,40 @@ enum AvPlayerFrameStatus {
     Finished,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AvPlayerByteContentSummary {
+    pub(crate) minimum: u8,
+    pub(crate) maximum: u8,
+    pub(crate) nonzero_bytes: usize,
+    pub(crate) hash: u64,
+}
+
+pub(crate) fn av_player_byte_content_summary(bytes: &[u8]) -> AvPlayerByteContentSummary {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut minimum = u8::MAX;
+    let mut maximum = u8::MIN;
+    let mut nonzero_bytes = 0_usize;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        minimum = minimum.min(*byte);
+        maximum = maximum.max(*byte);
+        nonzero_bytes += usize::from(*byte != 0);
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    if bytes.is_empty() {
+        minimum = 0;
+    }
+    AvPlayerByteContentSummary {
+        minimum,
+        maximum,
+        nonzero_bytes,
+        hash,
+    }
+}
+
 fn av_player_decoder_reaper() -> &'static mpsc::Sender<AvPlayerDecoder> {
     static REAPER: OnceLock<mpsc::Sender<AvPlayerDecoder>> = OnceLock::new();
     REAPER.get_or_init(|| {
@@ -1238,6 +1272,80 @@ fn av_player_trace_enabled() -> bool {
         .get_or_init(|| std::env::var_os("REMU_TRACE_AVPLAYER").is_some_and(|value| value == "1"))
 }
 
+fn av_player_content_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_AVPLAYER_CONTENT").is_some_and(|value| value == "1")
+    })
+}
+
+fn av_player_trace_video_content(handle: u64, frame: u64, player: &AvPlayerInstance) {
+    if !av_player_content_trace_enabled() || !crate::trace_logarithmic_sequence(frame, 4) {
+        return;
+    }
+    let Some(luma_bytes) = usize::try_from(player.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(player.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .filter(|luma_bytes| *luma_bytes <= player.raw_video_frame.len())
+    else {
+        eprintln!(
+            "[REMu][AVPLAYER][CONTENT] handle={handle:#x} video frame={frame} invalid_nv12_bytes={} dimensions={}x{}",
+            player.raw_video_frame.len(),
+            player.width,
+            player.height,
+        );
+        return;
+    };
+    let (luma_bytes, chroma_bytes) = player.raw_video_frame.split_at(luma_bytes);
+    let luma = av_player_byte_content_summary(luma_bytes);
+    let chroma = av_player_byte_content_summary(chroma_bytes);
+    eprintln!(
+        "[REMu][AVPLAYER][CONTENT] handle={handle:#x} video frame={frame} raw_bytes={} dimensions={}x{} y={}..{} nz={}/{} hash={:016x} uv={}..{} nz={}/{} hash={:016x}",
+        player.raw_video_frame.len(),
+        player.width,
+        player.height,
+        luma.minimum,
+        luma.maximum,
+        luma.nonzero_bytes,
+        luma_bytes.len(),
+        luma.hash,
+        chroma.minimum,
+        chroma.maximum,
+        chroma.nonzero_bytes,
+        chroma_bytes.len(),
+        chroma.hash,
+    );
+}
+
+fn av_player_trace_audio_content(handle: u64, frame: u64, bytes: &[u8]) {
+    if !av_player_content_trace_enabled() || !crate::trace_logarithmic_sequence(frame, 4) {
+        return;
+    }
+    let summary = av_player_byte_content_summary(bytes);
+    let mut live_samples = 0_usize;
+    let mut peak = 0_i32;
+    for sample in bytes
+        .chunks_exact(std::mem::size_of::<i16>())
+        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+    {
+        live_samples += usize::from(sample != 0);
+        peak = peak.max(i32::from(sample).abs());
+    }
+    eprintln!(
+        "[REMu][AVPLAYER][CONTENT] handle={handle:#x} audio frame={frame} raw_bytes={} live_samples={live_samples}/{} peak={peak} bytes={}..{} nz={} hash={:016x}",
+        bytes.len(),
+        bytes.len() / std::mem::size_of::<i16>(),
+        summary.minimum,
+        summary.maximum,
+        summary.nonzero_bytes,
+        summary.hash,
+    );
+}
+
 /// Counts every zero-return from the data exports by reason so a stalled guest player can be
 /// diagnosed from one run: which gate starves it, and how often.
 fn av_player_trace_zero_return(handle: u64, kind: &'static str, reason: &'static str) {
@@ -1683,6 +1791,7 @@ pub(crate) fn av_player_get_video_data(
     let timestamp = ((player.next_video_frame as f64) * 1_000.0 / player.frames_per_second.max(1.0))
         .round() as u64;
     player.next_video_frame = player.next_video_frame.saturating_add(1);
+    av_player_trace_video_content(arguments[0], player.next_video_frame, player);
     if av_player_write_video_frame(player, arguments[1], timestamp, extended) {
         if !player.has_audio && player.av_sync_mode == 0 {
             av_player_anchor_presentation(player, Duration::from_millis(timestamp), Instant::now());
@@ -1776,6 +1885,11 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
         * 1_000
         / u64::from(SAMPLE_RATE);
     player.next_audio_frame = player.next_audio_frame.saturating_add(1);
+    av_player_trace_audio_content(
+        arguments[0],
+        player.next_audio_frame,
+        &player.raw_audio_frame,
+    );
     guest_memset(arguments[1], 0, 40);
     write_guest_u64(arguments[1], address);
     write_guest_u64(arguments[1] + 16, timestamp);
