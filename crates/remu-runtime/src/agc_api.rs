@@ -241,8 +241,30 @@ pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchSt
                 .remove(&code);
         }
     }
-    state.agc_shader_registry.snapshots.remove(&code);
-    state.agc_shader_registry.decode_failures.remove(&code);
+    // Guest shader heaps reuse virtual addresses. A new registration invalidates both an entry
+    // point's cached decode and every exact fuse-time relationship in which that allocation
+    // participated; otherwise a later shader could inherit an unrelated continuation merely
+    // because its code landed at the same address.
+    let mut invalidated_entries = vec![code];
+    state
+        .agc_shader_registry
+        .fused_continuations
+        .retain(|front_code, continuations| {
+            if *front_code == code {
+                invalidated_entries.push(*front_code);
+                return false;
+            }
+            let previous_count = continuations.len();
+            continuations.retain(|continuation| continuation.back_program_address != code);
+            if continuations.len() != previous_count {
+                invalidated_entries.push(*front_code);
+            }
+            !continuations.is_empty()
+        });
+    for entry in invalidated_entries {
+        state.agc_shader_registry.snapshots.remove(&entry);
+        state.agc_shader_registry.decode_failures.remove(&entry);
+    }
     if destination != 0 {
         write_guest_u64(destination, header);
     }
@@ -723,7 +745,7 @@ fn find_shader_register(registers: u64, count: u64, offset: u32, occurrence: u32
 /// The fused stage is the back half with the front half's entry point: its register block is
 /// copied into caller-supplied scratch, the front half's checksum registers are carried over, and
 /// the program address registers are repointed at the front half's code.
-pub(crate) fn agc_fuse_shader_halves(arguments: [u64; 6]) -> u64 {
+pub(crate) fn agc_fuse_shader_halves(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let (fused, front, back, scratch) = (arguments[0], arguments[1], arguments[2], arguments[3]);
     let Some(stage) = fused_shader_stage(front, back) else {
         if trace_agc_programs() {
@@ -842,6 +864,29 @@ pub(crate) fn agc_fuse_shader_halves(arguments: [u64; 6]) -> u64 {
             read_guest_u64(fused + AGC_SHADER_USER_DATA_OFFSET),
             read_guest_u64(fused + AGC_SHADER_SPECIALS_OFFSET),
         );
+    }
+    let front_program_address = read_guest_u64(front + SHADER_HEADER_CODE_OFFSET);
+    let back_program_address = read_guest_u64(back + SHADER_HEADER_CODE_OFFSET);
+    if front_program_address != 0 && back_program_address != 0 {
+        state
+            .agc_shader_registry
+            .fused_continuations
+            .entry(front_program_address)
+            .or_default()
+            .insert(crate::AgcFusedShaderContinuation {
+                front_header_address: front,
+                back_header_address: back,
+                back_program_address,
+                back_code_size: read_guest_u32(back + AGC_SHADER_SIZE_OFFSET),
+            });
+        state
+            .agc_shader_registry
+            .snapshots
+            .remove(&front_program_address);
+        state
+            .agc_shader_registry
+            .decode_failures
+            .remove(&front_program_address);
     }
     0
 }
