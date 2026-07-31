@@ -568,7 +568,7 @@ fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
 
     assert!(
         presenter
-            .activate_translated_scanout(descriptor.address, descriptor.width, descriptor.height,)
+            .activate_translated_scanout(descriptor.address, descriptor.width, descriptor.height)
             .expect("activate direct scanout")
     );
     assert_eq!(presenter.frame_texture_size, (640, 360));

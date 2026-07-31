@@ -340,10 +340,11 @@ Visual confirmation past NEW GAME/character select without pad injection remains
 display is still black with healthy pipelines, the next suspect is post-process composite sampling
 (`INTERFACE-FILL` procedural draws, scanout vs resident color RT timing).
 
-Scanout presentation now waits on the ordered VideoOut snapshot blit (not a full guest-batch drain),
-re-snapshots at present when compositor output is still in flight or advances past a clear-only
-capture, and skips writing fully black PPM evidence frames until real pixels land. A 180s windowed
-verify captures 126 non-black frames at ~8.3–9.2 FPS with zero fully-black PPMs.
+Scanout presentation re-snapshots at present only when resident `content_version`
+advances past the last private copy (not on every in-flight batch overlap), skips writing
+fully black PPM evidence frames until real pixels land, and avoids blocking the AppKit tick
+on snapshot blit completion. A 180s windowed verify without pad injection captures 83 non-black
+frames at up to ~9.4 FPS with Draw ~320/s and Q W154–415, zero fully-black PPMs.
 
 ### The runtime test suite is order-dependent
 
