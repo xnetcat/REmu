@@ -252,9 +252,10 @@ pub(crate) use memory::{
     available_flexible_memory_size, direct_memory_query, kernel_batch_map, kernel_batch_map_2,
     kernel_checked_release_direct_memory, kernel_mprotect, kernel_mtypeprotect, kernel_munmap,
     kernel_release_direct_memory, kernel_reserve_virtual_range, kernel_set_virtual_range_name,
-    kernel_virtual_query, map_direct_memory, map_direct_memory_2, map_flexible_memory_core,
-    map_named_flexible_memory,
+    kernel_virtual_query, map_direct_memory, map_direct_memory_2, map_named_flexible_memory,
 };
+#[cfg(target_os = "macos")]
+pub(crate) use memory::map_flexible_memory_core;
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 pub(crate) use memory::{host_protection_from_guest, process_mapping_contains};
 pub use nid_table::{known_nid_name, nid_display_name};
@@ -375,6 +376,12 @@ unsafe extern "C" {
         output_address: u64,
         output_size: *mut u64,
     ) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "ucrt")]
+unsafe extern "C" {
+    fn _localtime64_s(tm_dest: *mut libc::tm, source_time: *const i64) -> i32;
 }
 
 /// Returns the number of guest pthread workers that are still executing.
@@ -7826,10 +7833,10 @@ fn guest_local_timezone(unix_seconds: i64) -> (i64, i32) {
     }
     #[cfg(windows)]
     {
-        let host_time: libc::time_t = unix_seconds;
-        // SAFETY: `local` is writable; MSVC's `localtime_s` fills it for a valid time_t.
+        let host_time: i64 = unix_seconds;
+        // SAFETY: `local` is writable; UCRT's `_localtime64_s` fills it for a valid time_t.
         let mut local: libc::tm = unsafe { std::mem::zeroed() };
-        let status = unsafe { libc::localtime_s(&raw mut local, &raw const host_time) };
+        let status = unsafe { _localtime64_s(&raw mut local, &raw const host_time) };
         if status != 0 {
             return (0, 0);
         }
