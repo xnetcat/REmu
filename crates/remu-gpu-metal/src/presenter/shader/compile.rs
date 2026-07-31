@@ -47,13 +47,15 @@ pub(crate) fn compile_metal_library_with_tools(
 ) -> Result<Library, String> {
     static NEXT_COMPILE_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
     static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
-    let compiler = std::env::var_os("REMU_METAL_COMPILER")
-        .map(PathBuf::from)
-        .ok_or("REMU_METAL_COMPILER is not configured")?;
+    let compiler = canonical_tool_path(
+        std::env::var_os("REMU_METAL_COMPILER")
+            .map(PathBuf::from)
+            .ok_or("REMU_METAL_COMPILER is not configured")?,
+    );
     if !compiler.is_file() {
         return Err(format!("{} is not a file", compiler.display()));
     }
-    let linker = compiler.with_file_name("metallib");
+    let linker = canonical_tool_path(compiler.with_file_name("metallib"));
     if !linker.is_file() {
         return Err(format!("{} is not a file", linker.display()));
     }
@@ -149,6 +151,18 @@ pub(crate) fn metal_cache_root() -> PathBuf {
                 .map(|home| home.join("Library/Caches/REMu/metal"))
         })
         .unwrap_or_else(|| std::env::temp_dir().join("remu-metal-cache"))
+}
+
+/// Offline Metal tool spawn failures are often transient under concurrent worker load.
+/// Treating them as terminal permanently poisons shader pairs that the title submits every frame.
+pub(crate) fn metal_compile_failure_is_transient(error: &str) -> bool {
+    error.contains("could not start ")
+        || error.contains("could not create ")
+        || error.contains("could not write ")
+}
+
+fn canonical_tool_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 pub(crate) fn run_metal_tool(command: &mut Command, operation: &str) -> Result<(), String> {

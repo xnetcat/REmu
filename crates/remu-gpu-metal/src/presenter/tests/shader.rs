@@ -175,7 +175,9 @@ fn failed_compute_pipeline_compile_is_terminal_and_observable() {
             key: key.clone(),
             shader_address: dispatch.shader_address,
             threads_per_group: dispatch.launch.threads_per_group,
-            compiled: Err::<CompiledComputePipeline, _>("test compiler failure".to_owned()),
+            compiled: Err::<CompiledComputePipeline, _>(
+                "compute compilation exited with exit status: 1".to_owned(),
+            ),
         })
         .expect("queue failed compile result");
 
@@ -183,6 +185,45 @@ fn failed_compute_pipeline_compile_is_terminal_and_observable() {
 
     assert!(!presenter.compiling_compute_pipelines.contains(&key));
     assert!(presenter.failed_compute_pipelines.contains(&key));
+}
+
+#[test]
+fn transient_compile_failure_is_retried_not_terminal() {
+    let (_gpu_sender, gpu_receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
+    let (result_sender, result_receiver) = std::sync::mpsc::channel();
+    presenter.shader_compile_receiver = result_receiver;
+    let (dispatch, key) = pending_compute_pipeline();
+    presenter.compiling_compute_pipelines.insert(key.clone());
+    result_sender
+        .send(ShaderCompileResult::Compute {
+            key: key.clone(),
+            shader_address: dispatch.shader_address,
+            threads_per_group: dispatch.launch.threads_per_group,
+            compiled: Err::<CompiledComputePipeline, _>(
+                "could not start compute compilation: No such file or directory (os error 2)"
+                    .to_owned(),
+            ),
+        })
+        .expect("queue transient compile result");
+
+    presenter.receive_shader_compilations();
+
+    assert!(!presenter.compiling_compute_pipelines.contains(&key));
+    assert!(!presenter.failed_compute_pipelines.contains(&key));
+}
+
+#[test]
+fn metal_compile_failure_is_transient_for_tool_spawn_errors() {
+    assert!(super::super::shader::metal_compile_failure_is_transient(
+        "could not start vertex compilation: No such file or directory (os error 2)"
+    ));
+    assert!(super::super::shader::metal_compile_failure_is_transient(
+        "could not create /tmp/remu-metal-123: No such file or directory (os error 2)"
+    ));
+    assert!(!super::super::shader::metal_compile_failure_is_transient(
+        "vertex compilation exited with exit status: 1: error: use of undeclared identifier"
+    ));
 }
 
 #[test]

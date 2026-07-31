@@ -23,6 +23,7 @@ use super::{
 };
 mod archive;
 mod compile;
+pub(crate) use self::compile::metal_compile_failure_is_transient;
 mod program;
 pub(crate) use self::compile::{
     compile_metal_compute_library, compile_metal_library_with_tools, compile_metal_shader_library,
@@ -232,12 +233,19 @@ impl MetalPresenter {
                             self.compiled_shader_pairs.insert(key, compiled);
                         }
                         Err(error) => {
-                            PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
-                            self.failed_shader_pairs.insert(key.clone());
-                            eprintln!(
-                                "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
-                                key.export_shader_address, key.pixel_shader_address
-                            );
+                            if metal_compile_failure_is_transient(&error) {
+                                eprintln!(
+                                    "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} compile deferred (transient): {error}",
+                                    key.export_shader_address, key.pixel_shader_address
+                                );
+                            } else {
+                                PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
+                                self.failed_shader_pairs.insert(key.clone());
+                                eprintln!(
+                                    "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: {error}",
+                                    key.export_shader_address, key.pixel_shader_address
+                                );
+                            }
                         }
                     }
                 }
@@ -263,11 +271,17 @@ impl MetalPresenter {
                             self.compiled_compute_pipelines.insert(key, compiled);
                         }
                         Err(error) => {
-                            PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
-                            self.failed_compute_pipelines.insert(key);
-                            eprintln!(
-                                "[REMu][METAL] Gen5 compute cs={shader_address:#x} failed: {error}"
-                            );
+                            if metal_compile_failure_is_transient(&error) {
+                                eprintln!(
+                                    "[REMu][METAL] Gen5 compute cs={shader_address:#x} compile deferred (transient): {error}"
+                                );
+                            } else {
+                                PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
+                                self.failed_compute_pipelines.insert(key);
+                                eprintln!(
+                                    "[REMu][METAL] Gen5 compute cs={shader_address:#x} failed: {error}"
+                                );
+                            }
                         }
                     }
                 }
