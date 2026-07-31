@@ -266,6 +266,21 @@ impl MetalPresenter {
             {
                 continue;
             }
+            // Permission-only acquire renewals can mark the sampled watch dirty even when a
+            // GPU-authored resident still owns the pixels (Octopath 0x80f27e0000 snapshots).
+            let resident_descriptor = self
+                .resident_guest_textures
+                .keys()
+                .copied()
+                .find(|descriptor| guest_texture_descriptors_overlap(*descriptor, key.descriptor));
+            if let Some(resident_descriptor) = resident_descriptor
+                && let Some(resident) = self.resident_guest_textures.get_mut(&resident_descriptor)
+                && resident.gpu_written
+                && !resident.write_watch.content_has_changed()?
+            {
+                resident.note_gpu_write();
+                continue;
+            }
             // ACQUIRE_MEM makes CPU-authored bytes authoritative, but it does not require eagerly
             // materializing a new Metal texture. Evict the stale cache entry and let the ordinary
             // upload path rebuild it from a stable watched snapshot only if a later shader
