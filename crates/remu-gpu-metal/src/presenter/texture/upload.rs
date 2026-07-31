@@ -14,7 +14,7 @@ use super::{
     ensure_mipmapped_resident_texture_in_map, ensure_resident_texture_in_map,
     fallback_image_descriptor, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_storage, is_storage_image_opcode, is_writable_image_opcode,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage, is_storage_image_opcode, is_writable_image_opcode,
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
     refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
@@ -322,6 +322,9 @@ pub(crate) fn upload_image_textures(
                                     && resident.mip_level_count >= underlying_mip_count
                                     && ((!comparison
                                         && (guest_texture_descriptors_share_storage(
+                                            resident.descriptor,
+                                            descriptor.guest,
+                                        ) || guest_texture_descriptors_share_gpu_sample_storage(
                                             resident.descriptor,
                                             descriptor.guest,
                                         ) || resident_color_view_sample_is_eligible(

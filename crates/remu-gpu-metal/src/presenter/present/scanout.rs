@@ -425,11 +425,17 @@ impl MetalPresenter {
             .pending_flip
             .filter(|flip| flip.address == address)
             .map_or(self.next_flip_sequence, |flip| flip.sequence);
+        let snapshotted_content_version = self
+            .resident_guest_textures
+            .get(&descriptor)
+            .map(|resident| resident.content_version)
+            .unwrap_or(0);
         self.active_translated_scanout = Some(ActiveTranslatedScanout {
             address,
             width,
             height,
             sequence,
+            snapshotted_content_version,
         });
         if trace_scanout_writes() {
             let selected_state = self
@@ -466,6 +472,38 @@ impl MetalPresenter {
             );
         }
         Ok(true)
+    }
+
+    pub(crate) fn refresh_translated_scanout_before_present(&mut self) {
+        let Some(display) = self.display else {
+            return;
+        };
+        let Some(active) = self.active_translated_scanout else {
+            return;
+        };
+        if !self.pending_flip_target_written_since_boundary
+            && self.pending_scanout_write_address.is_none()
+        {
+            return;
+        }
+        let Some((descriptor, _, _)) =
+            self.translated_scanout_source(active.address, active.width, active.height)
+        else {
+            return;
+        };
+        let current_version = self
+            .resident_guest_textures
+            .get(&descriptor)
+            .map(|resident| resident.content_version)
+            .unwrap_or(0);
+        if current_version <= active.snapshotted_content_version {
+            return;
+        }
+        if let Err(error) =
+            self.activate_translated_scanout(active.address, display.width, display.height)
+        {
+            eprintln!("[REMu][METAL] translated scanout refresh failed: {error}");
+        }
     }
 
     pub(crate) fn upload_pending_frame(&mut self) {

@@ -57,6 +57,7 @@ impl MetalPresenter {
             return;
         }
         self.upload_pending_frame();
+        self.refresh_translated_scanout_before_present();
         let translated_snapshot = self
             .active_translated_scanout
             .filter(|scanout| scanout.sequence == self.uploaded_flip_sequence)

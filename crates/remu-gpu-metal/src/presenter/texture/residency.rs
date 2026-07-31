@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::commit_and_settle;
+use super::super::GuestBatchFlushReason;
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
-    GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
-    MultisampleTextureKey, ResidentGuestTexture, ResidentTextureActivityStamp,
-    ScanoutSnapshotTexture, WriteWatchRefresh, create_mipmapped_guest_texture,
-    decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    decode_sampled_texture_linear_from_raw, guest_texture_byte_count,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage,
+    GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture,
+    ResidentTextureActivityStamp, ScanoutSnapshotTexture, WriteWatchRefresh,
+    create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
+    decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
+    guest_texture_byte_count, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     initial_depth_clear_for_target, mode27_mip_chain_layout, promote_resident_mip_hierarchy,
     record_mode27_work_detail, refresh_resident_texture_write_watch,
     resident_texture_eviction_plan, resident_texture_for_sample,
@@ -415,6 +416,28 @@ impl MetalPresenter {
                 }
             }
         }
+        if let Some(gpu_sample_resident) = self
+            .resident_guest_textures
+            .values()
+            .filter(|resident| {
+                resident.gpu_written
+                    && resident.texture_type == 9
+                    && resident.layer_count == 1
+                    && resident.mip_level_count >= 1
+                    && guest_texture_descriptors_share_gpu_sample_storage(
+                        resident.descriptor,
+                        descriptor,
+                    )
+            })
+            .max_by_key(|resident| resident.content_version)
+            .map(|resident| resident.descriptor)
+        {
+            let resident = self
+                .resident_guest_textures
+                .get(&gpu_sample_resident)
+                .expect("selected GPU sample resident exists");
+            return Ok(resident.texture.clone());
+        }
         let mut aliases = self
             .resident_guest_textures
             .values()
@@ -441,7 +464,7 @@ impl MetalPresenter {
                     .is_some_and(|resident| resident.gpu_written)
             });
             let queue = if has_gpu_written_alias {
-                self.wait_for_guest_command_batches()?;
+                self.flush_guest_command_batch(false, GuestBatchFlushReason::CpuSynchronization)?;
                 self.multisample_textures.retain(|key, _| {
                     !guest_texture_descriptors_overlap(key.descriptor, descriptor)
                 });

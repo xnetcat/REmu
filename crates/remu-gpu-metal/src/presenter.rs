@@ -428,6 +428,8 @@ struct ActiveTranslatedScanout {
     width: u32,
     height: u32,
     sequence: u64,
+    /// Resident `content_version` copied into the private scanout snapshot texture.
+    snapshotted_content_version: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

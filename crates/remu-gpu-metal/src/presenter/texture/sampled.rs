@@ -18,6 +18,7 @@ use super::{
     trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
     write_resident_texture_contents_to_guest,
 };
+use super::super::GuestBatchFlushReason;
 use metal::foreign_types::ForeignType;
 use metal::{
     Device, MTLPixelFormat, MTLRegion, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange,
@@ -173,7 +174,11 @@ impl MetalPresenter {
             total.saturating_add(guest_texture_byte_count(descriptor).unwrap_or_default())
         });
         let alias_count = aliases.len();
-        self.wait_for_guest_command_batches()?;
+        // End the open render pass and commit the current batch, but do not drain every in-flight
+        // guest batch on the CPU. The following texture readbacks are encoded on the same Metal
+        // queue and `PendingTextureReadback::finish` waits only for that blit, which implicitly
+        // orders after the producer work already queued ahead of it.
+        self.flush_guest_command_batch(false, GuestBatchFlushReason::CpuSynchronization)?;
         let device = self
             .device
             .as_ref()
