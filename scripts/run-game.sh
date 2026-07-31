@@ -287,6 +287,16 @@ case "$status" in
         outcome=external-watchdog-timeout
         runner_status=$status
         ;;
+    137)
+        # SIGKILL from an external actor (concurrent launch cleanup, OOM killer, manual kill -9).
+        outcome=host-sigkill
+        runner_status=$status
+        ;;
+    143)
+        # SIGTERM from orchestration (wrapper cleanup, concurrent run termination, shell trap).
+        outcome=host-sigterm
+        runner_status=$status
+        ;;
     *)
         outcome=guest-failure
         runner_status=$status

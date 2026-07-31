@@ -344,12 +344,14 @@ Scanout presentation re-snapshots at present only when resident `content_version
 advances past the last private copy (not on every in-flight batch overlap), skips writing
 fully black PPM evidence frames until real pixels land, and avoids blocking the AppKit tick
 on snapshot blit completion. Consecutive compute dispatches within one guest batch now share
-a single Metal compute encoder instead of opening and closing one per dispatch. A 180s windowed
-verify without pad injection captures 83 non-black frames at up to ~9.4 FPS with Draw ~320/s
-and Q W154–415, zero fully-black PPMs; verify14's 143s `guest-failure` was exit 143 (SIGTERM)
-with no guest fault in the log — orchestration killed the process mid shader-compile, not an
-engine assert. Steady-state Draw ~374/s (verify11) remains ~15% above the content_version fix;
-RP-end key ~196/s (mostly target-address churn) is the next throughput lever.
+a single Metal compute encoder instead of opening and closing one per dispatch; active pass
+encoders are closed before scanout blit (fixes host SIGSEGV at present). A 300s isolated
+windowed verify16 at `dfc1f40` completes on the in-process watchdog (`outcome=timeout`,
+302s elapsed, 127 captured PPMs, 0 fully-black frames, no host SIGSEGV). Steady-state Draw
+~320–360/s and RP-end key ~189–199/s remain ~4–15% below verify11 (~374/s); verify14/15
+ended at 143s/154s from orchestration SIGTERM/SIGKILL, not guest faults — `run-game.sh`
+now labels exit 137/143 as `host-sigkill`/`host-sigterm`. RP-end target-address churn is
+still the next throughput lever.
 
 ### The runtime test suite is order-dependent
 
