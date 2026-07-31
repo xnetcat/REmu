@@ -104,20 +104,29 @@ fn resolves_guest_paths_that_differ_only_by_case() {
 fn discovers_runtime_modules_in_media_and_app0_prx_layouts() {
     let root = std::env::temp_dir().join(format!("remu-runtime-modules-{}", std::process::id()));
     std::fs::remove_dir_all(&root).ok();
-    let media_plugins = root.join("decrypted/Media/Plugins/Runtime");
+    let decrypted_plugins = root.join("decrypted/Media/Plugins/Runtime");
+    let media_plugins = root.join("Media/Plugins");
     let app_prx = root.join("prx");
+    std::fs::create_dir_all(&decrypted_plugins).unwrap();
     std::fs::create_dir_all(&media_plugins).unwrap();
     std::fs::create_dir_all(&app_prx).unwrap();
-    std::fs::write(media_plugins.join("media_plugin.sprx"), b"module").unwrap();
+    std::fs::write(decrypted_plugins.join("overlay_plugin.sprx"), b"module").unwrap();
+    std::fs::write(media_plugins.join("unity_plugin.prx"), b"module").unwrap();
     std::fs::write(app_prx.join("akroomverb.prx"), b"module").unwrap();
     std::fs::write(app_prx.join("akroomverb.prx.esbak"), b"backup").unwrap();
 
     let modules = discover_runtime_module_paths(&root).unwrap();
-    assert_eq!(modules.len(), 2);
+    assert_eq!(modules.len(), 3);
     assert!(
         modules
             .iter()
-            .any(|path| path.ends_with("media_plugin.sprx"))
+            .any(|path| path.ends_with("overlay_plugin.sprx"))
+    );
+    assert!(
+        modules
+            .iter()
+            .any(|path| path.ends_with("unity_plugin.prx")),
+        "flattened dumps expose plugins directly under Media/Plugins"
     );
     assert!(modules.iter().any(|path| path.ends_with("akroomverb.prx")));
 
