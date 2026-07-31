@@ -246,9 +246,7 @@ impl MetalPresenter {
                     .open_guest_batch
                     .as_mut()
                     .ok_or("layered depth-sample assembly requires an open guest batch")?;
-                // An uncounted render-pass end: the pass cannot span a blit encoder, and the
-                // per-cause statistics do not yet model sample-assembly endings.
-                batch.end_render_pass();
+                batch.close_active_pass_encoders();
                 let blit = batch.command_buffer.new_blit_command_encoder();
                 blit.set_label("REMu layered depth-sample assembly");
                 for index in stale {

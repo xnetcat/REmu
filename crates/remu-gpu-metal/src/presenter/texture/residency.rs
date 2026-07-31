@@ -286,7 +286,7 @@ impl MetalPresenter {
                     .open_guest_batch
                     .as_mut()
                     .expect("guest batch was opened for mip promotion");
-                batch.end_render_pass();
+                batch.close_active_pass_encoders();
                 batch.command_buffer.clone()
             };
             let refresh = refresh_resident_texture_write_watch(
@@ -340,7 +340,8 @@ impl MetalPresenter {
                 .open_guest_batch
                 .as_mut()
                 .expect("guest batch was opened for mip promotion");
-            batch.end_render_pass();
+            batch.end_compute_pass();
+            batch.close_active_pass_encoders();
             Some(batch.command_buffer.clone())
         } else {
             None
@@ -597,7 +598,7 @@ impl MetalPresenter {
                     .open_guest_batch
                     .as_mut()
                     .expect("guest batch was opened for mip promotion");
-                batch.end_render_pass();
+                batch.close_active_pass_encoders();
                 batch.command_buffer.clone()
             };
             retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);

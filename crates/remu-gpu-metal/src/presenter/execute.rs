@@ -136,7 +136,10 @@ impl MetalPresenter {
             if self
                 .open_guest_batch
                 .as_mut()
-                .is_some_and(super::GuestCommandBatch::end_render_pass)
+                .is_some_and(|batch| {
+                    batch.end_compute_pass();
+                    batch.end_render_pass()
+                })
             {
                 self.statistics.render_pass_ends_for_target_change = self
                     .statistics
@@ -1260,6 +1263,7 @@ impl MetalPresenter {
                     .render_pass
                     .as_ref()
                     .map(|open| open.key.transition_to(&render_pass_key));
+                batch.end_compute_pass();
                 if batch.end_render_pass() {
                     self.statistics.render_pass_ends_for_target_change = self
                         .statistics
@@ -2772,6 +2776,7 @@ impl MetalPresenter {
             .open_guest_batch
             .as_mut()
             .expect("color resolve opened a guest command batch");
+        batch.close_active_pass_encoders();
         let encoder = batch.command_buffer.new_blit_command_encoder();
         encoder.set_label("REMu translated MRT0-to-MRT1 color resolve");
         encoder.copy_from_texture(
@@ -2891,6 +2896,7 @@ impl MetalPresenter {
             .open_guest_batch
             .as_mut()
             .expect("fast-clear elimination opened a guest command batch");
+        batch.close_active_pass_encoders();
         let encoder = batch.command_buffer.new_render_command_encoder(pass);
         encoder.set_label("REMu translated color fast-clear elimination");
         encoder.end_encoding();

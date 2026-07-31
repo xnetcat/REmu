@@ -59,12 +59,13 @@ impl MetalPresenter {
             .as_ref()
             .expect("rectangle indirect pipeline was initialized")
             .clone();
-        let (destination, destination_offset, ended_render_pass) = {
+            let (destination, destination_offset, ended_render_pass) = {
             let batch = self
                 .open_guest_batch
                 .as_mut()
                 .ok_or("rectangle indirect conversion has no open guest batch")?;
             let (destination, destination_offset) = batch.upload_global_bytes(device, &[0; 16])?;
+            batch.end_compute_pass();
             let ended_render_pass = batch.end_render_pass();
             let encoder = batch.command_buffer.new_compute_command_encoder();
             encoder.set_label("REMu rectangle indirect argument conversion");

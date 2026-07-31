@@ -357,6 +357,7 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
             },
             encoder,
         }),
+        compute_encoder: None,
         completion_sequences: vec![40],
     });
     sender
@@ -509,6 +510,7 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
             },
             encoder,
         }),
+        compute_encoder: None,
         completion_sequences: Vec::new(),
     });
 
@@ -561,6 +563,7 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
         render_pass: None,
+        compute_encoder: None,
         completion_sequences: vec![40],
     });
     sender
@@ -1408,6 +1411,7 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
         render_pass: None,
+        compute_encoder: None,
         completion_sequences: Vec::new(),
     });
 
@@ -1577,6 +1581,7 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
                 guest_write_ranges: Vec::new(),
                 memory_writes,
                 render_pass: None,
+        compute_encoder: None,
                 completion_sequences: Vec::new(),
             });
     }
@@ -1631,6 +1636,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
                 .expect("pin completion label mapping"),
             ],
             render_pass: None,
+        compute_encoder: None,
             completion_sequences: Vec::new(),
         });
 
@@ -1670,6 +1676,7 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
         render_pass: None,
+        compute_encoder: None,
         completion_sequences: Vec::new(),
     };
     let (first_buffer, first_offset) = batch
@@ -1821,6 +1828,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),
             render_pass: None,
+        compute_encoder: None,
             completion_sequences: Vec::new(),
         });
 
@@ -1844,6 +1852,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                 .expect("pin later completion label"),
             ],
             render_pass: None,
+        compute_encoder: None,
             completion_sequences: Vec::new(),
         });
 

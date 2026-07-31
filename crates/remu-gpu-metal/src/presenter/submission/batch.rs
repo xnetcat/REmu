@@ -12,7 +12,7 @@ use super::{
     guest_physical_ranges_overlap, guest_ranges_overlap,
 };
 use metal::foreign_types::ForeignType;
-use metal::{Buffer, CommandBuffer, Device, MTLCommandBufferStatus, MTLResourceOptions};
+use metal::{Buffer, CommandBuffer, ComputeCommandEncoder, Device, MTLCommandBufferStatus, MTLResourceOptions};
 use objc::{msg_send, sel, sel_impl};
 use remu_memory::{
     CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_backing_identity,
@@ -55,6 +55,7 @@ impl MetalPresenter {
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),
             render_pass: None,
+            compute_encoder: None,
             completion_sequences: Vec::new(),
         });
     }
@@ -202,6 +203,7 @@ impl MetalPresenter {
                     .saturating_add(1);
             }
         }
+        batch.end_compute_pass();
         if batch.end_render_pass() {
             self.statistics.render_pass_ends_for_batch_flush = self
                 .statistics
@@ -517,6 +519,33 @@ impl GuestCommandBatch {
         } else {
             false
         }
+    }
+
+    pub(crate) fn close_active_pass_encoders(&mut self) {
+        self.end_compute_pass();
+        self.end_render_pass();
+    }
+
+    pub(crate) fn end_compute_pass(&mut self) -> bool {
+        if let Some(encoder) = self.compute_encoder.take() {
+            encoder.end_encoding();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn ensure_compute_encoder(&mut self) -> &ComputeCommandEncoder {
+        if self.compute_encoder.is_none() {
+            self.compute_encoder = Some(
+                self.command_buffer
+                    .new_compute_command_encoder()
+                    .to_owned(),
+            );
+        }
+        self.compute_encoder
+            .as_ref()
+            .expect("compute encoder was just opened")
     }
 }
 

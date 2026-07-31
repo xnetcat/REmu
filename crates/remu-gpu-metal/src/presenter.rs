@@ -10,10 +10,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use metal::{
-    BinaryArchive, Buffer, CommandBuffer, ComputePipelineState, DepthStencilState, Device,
-    Function, MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLCullMode, MTLPixelFormat,
-    MTLPrimitiveTopologyClass, MTLScissorRect, MTLTriangleFillMode, MTLWinding, MetalLayer,
-    RenderCommandEncoder, RenderPipelineState, SamplerState, Texture,
+    BinaryArchive, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState,
+    DepthStencilState, Device, Function, MTLBlendFactor, MTLBlendOperation, MTLCompareFunction,
+    MTLCullMode, MTLPixelFormat, MTLPrimitiveTopologyClass, MTLScissorRect, MTLTriangleFillMode,
+    MTLWinding, MetalLayer, RenderCommandEncoder, RenderPipelineState, SamplerState, Texture,
 };
 use remu_gpu::{
     ComputeDispatch, GpuEvent, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite, IndexedDraw,
@@ -1229,6 +1229,7 @@ struct GuestCommandBatch {
     guest_write_ranges: Vec<PendingGuestWriteRange>,
     memory_writes: Vec<PendingGuestMemoryWrite>,
     render_pass: Option<OpenGuestRenderPass>,
+    compute_encoder: Option<ComputeCommandEncoder>,
     /// Guest submissions whose final ordered work is contained in this Metal batch.
     ///
     /// Queue scheduling can complete a newer global sequence before an older blocked queue, so

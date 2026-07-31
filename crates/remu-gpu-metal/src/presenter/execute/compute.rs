@@ -264,7 +264,7 @@ impl MetalPresenter {
                 &mut batch.guest_write_ranges,
                 pending_guest_write_ranges,
             );
-            let encoder = batch.command_buffer.new_compute_command_encoder();
+            let encoder = batch.ensure_compute_encoder();
             encoder.set_label(&format!("REMu Gen5 compute {:#x}", dispatch.shader_address));
             encoder.set_compute_pipeline_state(&pipeline);
             if let (Some(index), Some(argument_buffer)) = (
@@ -333,7 +333,6 @@ impl MetalPresenter {
                 (ComputeGrid::Threads(threads), _) => encoder
                     .dispatch_threads(MTLSize::new(threads[0], threads[1], threads[2]), local),
             }
-            encoder.end_encoding();
         }
         // GNM also clears HTILE through small compute fills. Follow shadPS4's conservative
         // metadata heuristic: a writable binding at a registered metadata base rearms the clear
