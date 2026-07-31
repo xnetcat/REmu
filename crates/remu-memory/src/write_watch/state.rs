@@ -106,6 +106,18 @@ pub(super) fn retire_overlapping(
     for range in &retired {
         restore_unowned_pages(range, &state);
     }
+    // `mprotect(PROT_WRITE)` can return while a protection fault for the same page is already
+    // committed on another CPU, so the delayed signal arrives after these ranges have left the
+    // snapshot. `CpuWriteWatch::drop` retains the mapping interval for exactly that reason;
+    // permission-only retirements need the same treatment, because the mapping stays live and the
+    // guest is still allowed to write to it. Replacements deliberately do not: their pages are
+    // about to be remapped, and recovering a fault there would grant silent write access to
+    // memory the mapping change took away.
+    if retirement == WATCH_REPROTECTING {
+        for range in &retired {
+            remember_writable_range(&mut state, range);
+        }
+    }
     publish_snapshot(&state);
     retired
 }

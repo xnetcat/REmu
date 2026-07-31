@@ -4,11 +4,42 @@
 //! Export lowering: EXP targets for the vertex, mesh and pixel stages, and the
 //! parameter interpolation instructions the pixel stage reads them back with.
 
-use remu_shader::{ExportControl, Instruction, InstructionControl, PixelOutputKind};
+use remu_shader::{
+    ExportControl, Instruction, InstructionControl, OperandKind, PixelOutputKind, Program,
+};
 
 use crate::compiler::interface::vertex_clip_distance_mask;
 use crate::compiler::vector::{destination_vector, vector_operand};
 use crate::{Compiler, MetalShaderStage};
+
+/// Locate the VGPR that carries the NGG compacted vertex id used to gate POS export
+/// (typically `V_CMPX_* sN, vM` immediately before the first `EXP POS`).
+pub(crate) fn mesh_export_vertex_vgpr(program: &Program) -> Option<u32> {
+    let exp_pos = program.instructions.iter().position(|instruction| {
+        matches!(
+            instruction.control.as_ref(),
+            Some(InstructionControl::Export(export)) if export.target == 12
+        )
+    })?;
+    for instruction in program.instructions[..exp_pos].iter().rev().take(32) {
+        if !instruction.opcode.starts_with("VCmpx") {
+            continue;
+        }
+        let mut vgpr = None;
+        let mut has_sgpr = false;
+        for source in &instruction.sources {
+            match source.kind {
+                OperandKind::VectorRegister => vgpr = Some(source.value),
+                OperandKind::ScalarRegister => has_sgpr = true,
+                _ => {}
+            }
+        }
+        if has_sgpr {
+            return vgpr;
+        }
+    }
+    None
+}
 
 impl Compiler<'_> {
     pub(crate) fn emit_export(&mut self, instruction: &Instruction) -> Result<(), String> {
@@ -100,7 +131,27 @@ impl Compiler<'_> {
                 values[0], values[1], values[2], values[3]
             ),
         );
+        self.stage_mesh_vertex_export();
         Ok(())
+    }
+
+    /// Publish the current `remu_out` under the guest compacted vertex id so Metal
+    /// `set_vertex(i, …)` receives the payload that EXP wrote for vertex `i`, not the
+    /// payload left in the arbitrary thread that happens to own `remu_thread_index == i`.
+    fn stage_mesh_vertex_export(&mut self) {
+        let Some(vgpr) = self.mesh_export_vertex_vgpr else {
+            return;
+        };
+        if self.options.stage != MetalShaderStage::Mesh {
+            return;
+        }
+        self.line(
+            3,
+            &format!(
+                "if (exec && v[{vgpr}] < {}u) remu_mesh_staged_vertices[v[{vgpr}]] = remu_out;",
+                self.options.mesh_max_vertex_count
+            ),
+        );
     }
 
     fn emit_vertex_misc_export(
@@ -123,14 +174,20 @@ impl Compiler<'_> {
         let values = self.export_float_values(instruction, export)?;
         let maximum_layer = self.options.render_target_array_length - 1;
         let (destination, lane_guard) = match self.options.stage {
-            MetalShaderStage::Vertex => ("remu_out.render_target_array_index", String::new()),
-            MetalShaderStage::Mesh => (
-                "remu_mesh_render_target_indices[remu_thread_index]",
-                format!(
-                    " && remu_thread_index < {}u",
-                    self.options.mesh_max_vertex_count
-                ),
-            ),
+            MetalShaderStage::Vertex => ("remu_out.render_target_array_index".to_owned(), String::new()),
+            MetalShaderStage::Mesh => {
+                let max = self.options.mesh_max_vertex_count;
+                match self.mesh_export_vertex_vgpr {
+                    Some(vgpr) => (
+                        format!("remu_mesh_render_target_indices[v[{vgpr}]]"),
+                        format!(" && v[{vgpr}] < {max}u"),
+                    ),
+                    None => (
+                        "remu_mesh_render_target_indices[remu_thread_index]".to_owned(),
+                        format!(" && remu_thread_index < {max}u"),
+                    ),
+                }
+            }
             _ => return Ok(()),
         };
         self.line(
@@ -185,6 +242,7 @@ impl Compiler<'_> {
                 );
             }
         }
+        self.stage_mesh_vertex_export();
         Ok(())
     }
 

@@ -10,6 +10,11 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
+mod diagnostic;
+
+mod guest_space;
+pub(crate) use guest_space::{forget_guest_reservation, publish_guest_reservation};
+
 mod page;
 use page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size, host_page_size_infallible};
 

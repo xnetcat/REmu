@@ -88,6 +88,7 @@ impl GuestAddressSpace {
 
     fn from_reservation(reservation: HostReservation) -> Result<Self, AddressSpaceError> {
         let end = checked_end(reservation.address(), reservation.size as u64)?;
+        reservation.publish_bounds();
         Ok(Self {
             reservation,
             end,

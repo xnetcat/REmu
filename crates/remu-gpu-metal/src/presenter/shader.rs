@@ -33,7 +33,8 @@ pub(crate) use self::program::{
     fragmentless_pixel_program, graphics_allocated_vector_register_count,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
     missing_vertex_parameter_exports, ngg_export_uses_general_lds,
-    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw,
     pixel_interpolation_attribute_mask, pixel_scalars, procedural_rectangle_stage_for_draw,
     program_embeds_global_base, program_uses_lds, rectangle_coordinate_parameter_mask,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
@@ -504,13 +505,31 @@ impl MetalPresenter {
             // Triangle-strip GS output cannot produce more primitives than emitted vertices.
             // Reserve the guest-programmed subgroup output capacity for both Metal arrays. The
             // host thread count is derived separately from all input and output limits.
-            remu_shader_metal::MetalCompileOptions::mesh(
+            let mut mesh_options = remu_shader_metal::MetalCompileOptions::mesh(
                 pixel_msl.interpolated_attribute_count,
                 NGG_MESH_LDS_BYTES,
                 limits.max_output_vertices_per_subgroup,
                 limits.max_output_primitives_per_subgroup,
                 limits.threadgroup_threads,
-            )
+            );
+            if ngg_export_uses_wave64_exec(&export.program) {
+                // Wave64 NGG exports (Poppy Playtime UI/LUT quads) gate their exports on
+                // 64-bit EXEC masks and compute meshlet thread indices as
+                // `s3[27:24] * 64 + v_mbcnt`. Splitting the guest wave across two SIMD32
+                // halves keeps those indices equal to the Metal thread index; compiling
+                // them as wave32 skipped every thread past the first 32 and left their
+                // vertices unexported (letter-count white boxes instead of glyphs).
+                let blockers = wave64_split_blockers(&export.program);
+                if blockers.is_empty() {
+                    mesh_options.wave_lane_count = 64;
+                } else {
+                    eprintln!(
+                        "[REMu][METAL] wave64 NGG mesh export {:#x} cannot split across SIMD32 halves: {blockers:?}",
+                        export.program.address,
+                    );
+                }
+            }
+            mesh_options
         } else {
             remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count)
         };

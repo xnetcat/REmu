@@ -291,12 +291,14 @@ impl MetalCompileOptions {
         }
     }
 
-    /// Builds options for one wave32 GFX10 NGG mesh workgroup.
+    /// Builds options for one GFX10 NGG mesh workgroup, defaulting to wave32 lane IDs.
     ///
     /// The presenter supplies the register-derived subgroup width. Guest registers independently
     /// determine how many input lanes are populated and how many vertex/primitive output records
-    /// Metal exposes. Merged NGG export shaders on Prospero use wave32 lane IDs
-    /// (`v_mbcnt_lo` plus a wave index in `s3[27:24]`), matching `S_AND_SAVEEXEC_B32`.
+    /// Metal exposes. Merged NGG export shaders on Prospero recover their subgroup thread index
+    /// as `s3[27:24] * wave_size + v_mbcnt`, so the presenter raises `wave_lane_count` to 64 for
+    /// exports that manipulate the 64-bit EXEC pair (`S_*_SAVEEXEC_B64` rather than
+    /// `S_AND_SAVEEXEC_B32`) and are safe to split across two SIMD32 halves.
     #[must_use]
     pub const fn mesh(
         required_vertex_output_count: u32,

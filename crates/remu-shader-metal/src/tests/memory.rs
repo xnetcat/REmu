@@ -366,6 +366,90 @@ fn range_checks_raw_dword_vectors_per_component() {
 }
 
 #[test]
+fn structured_buffer_oob_honors_expanded_metal_binding_span() {
+    // Poppy Playtime UI reloads V# from SMEM with guest NUM_RECORDS=4 while the presenter
+    // expands the Metal buffer to the instanced draw span. OOB_SELECT=0 must accept those
+    // extra records or every glyph instance past the guest count fetches zeroes (tofu).
+    let stride = 16_u32;
+    let guest_records = 4_u32;
+    let draw_records = 256_u32;
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Mubuf,
+                opcode: Opcode::Known("BufferLoadFormatXy"),
+                words: vec![0, 0],
+                sources: vec![
+                    Operand::vector(1),
+                    Operand::scalar(0),
+                    Operand::source(128, None),
+                ],
+                destinations: Vec::new(),
+                control: Some(InstructionControl::BufferMemory(
+                    remu_shader::BufferMemoryControl {
+                        dword_count: 2,
+                        vector_address: 1,
+                        vector_data: 16,
+                        scalar_resource: 0,
+                        instruction_format: None,
+                        offset_bytes: 0,
+                        index_enabled: true,
+                        offset_enabled: false,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                        tfe: false,
+                    },
+                )),
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let mut evaluation = empty_evaluation();
+    evaluation.initial_scalar_registers[0] = 0x1000;
+    evaluation.initial_scalar_registers[1] = stride << 16;
+    evaluation.initial_scalar_registers[2] = guest_records;
+    evaluation.initial_scalar_registers[3] = 0 << 28; // OOB_SELECT=0
+    evaluation.scalar_registers = evaluation.initial_scalar_registers.clone();
+    evaluation
+        .global_memory_bindings
+        .push(remu_shader::GlobalMemoryBinding {
+            scalar_address: 0,
+            base_address: 0x1000,
+            instruction_pcs: vec![0].into(),
+            byte_count: usize::try_from(stride * draw_records).unwrap(),
+            data: vec![0; usize::try_from(stride * draw_records).unwrap()],
+            writable: false,
+            write_back_to_guest: false,
+        });
+
+    let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+        .expect("expanded structured buffer load should lower");
+    assert!(
+        shader
+            .source
+            .contains("max(")
+            && shader.source.contains("/ "),
+        "structured OOB must lift NUM_RECORDS from the expanded Metal binding length"
+    );
+    assert!(
+        shader.source.contains("<= 1u &&"),
+        "record lift must stay limited to OOB_SELECT 0/1"
+    );
+}
+
+#[test]
 fn formatted_elements_use_record_stride_without_total_size_alignment() {
     let expression =
         format_buffer_element_oob_expression("descriptor_oob", "record_address", "12u", "28u");

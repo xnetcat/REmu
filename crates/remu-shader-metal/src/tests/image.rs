@@ -643,3 +643,65 @@ fn image_get_resinfo_unorm_writes_float_bitcasts() {
     assert!(shader.source.contains("tex0.get_width("));
     assert!(shader.source.contains("tex0.get_height("));
 }
+
+#[test]
+fn rematerializes_dim3_sample_against_type2d_srd_like_ue_slate() {
+    // Unreal Slate font atlases: MIMG DIM=3D (control.dimension == 2) against TYPE=2D SRD.
+    // Kyty rematerializes image.dimension from the descriptor; without that, Metal binds
+    // texture3d and samples with float3 → solid tofu glyphs.
+    let control = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0, 1, 2],
+        vector_data: 4,
+        scalar_resource: 0,
+        scalar_sampler: 8,
+        dimension: 2,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSample"),
+        words: vec![0, 0],
+        sources: vec![Operand::vector(0), Operand::vector(1), Operand::scalar(0)],
+        destinations: (4..8).map(Operand::vector).collect(),
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let mut evaluation = empty_evaluation();
+    let mut resource_descriptor = vec![0; 8];
+    resource_descriptor[3] = 0xfac | (9 << 28);
+    evaluation.image_bindings.push(ImageBinding {
+        pc: 0,
+        opcode: Opcode::Known("ImageSample"),
+        control,
+        resource_descriptor: resource_descriptor.into(),
+        sampler_descriptor: vec![0; 4].into(),
+        mip_level: None,
+    });
+    let shader = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("DIM=3D sample against TYPE=2D should rematerialize");
+    assert!(
+        shader.source.contains("texture2d<float> tex0"),
+        "expected texture2d from SRD TYPE, got:\n{}",
+        shader.source
+    );
+    assert!(
+        !shader.source.contains("texture3d"),
+        "must not bind texture3d for TYPE=2D Slate atlas"
+    );
+    assert!(
+        shader.source.contains(".xy") && shader.source.contains("tex0.sample("),
+        "expected .xy sample coords for rematerialized 2D texture:\n{}",
+        shader.source
+    );
+}

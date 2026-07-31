@@ -15,7 +15,8 @@ use super::{
     SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_DIRTY_VALIDATION_BYTES,
     TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
     TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
-    TEXTURE_SNAPSHOT_NANOSECONDS, UploadedImageTexture, WriteWatchRefresh,
+    TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT, UploadedImageTexture,
+    WriteWatchRefresh,
     canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled_at_z,
     copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z, decode_image_descriptor,
     decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, fallback_image_descriptor,
@@ -61,7 +62,7 @@ pub(crate) use self::mips::{
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::residency::{
-    create_guest_texture, ensure_resident_texture_in_map, resident_texture_ownership_stats,
+    ensure_resident_texture_in_map, resident_texture_ownership_stats,
 };
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,

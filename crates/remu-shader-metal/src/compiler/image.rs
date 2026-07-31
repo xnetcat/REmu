@@ -20,6 +20,23 @@ pub(crate) struct ImageKind {
     pub(crate) texture_type: u32,
 }
 
+/// Metal texture dimensionality after Kyty-style SRD rematerialization.
+///
+/// MIMG `DIM` encodes the guest address layout, while the image SRD `TYPE` field selects the
+/// actual resource. Unreal Slate font atlases commonly issue DIM=3D samples (`dimension == 2`)
+/// against TYPE=2D descriptors; binding those as `texture3d` yields solid tofu glyphs. Prefer
+/// the live descriptor type when it is a known Prospero 2D/3D/array encoding.
+pub(crate) fn metal_image_dimension(kind: ImageKind) -> u32 {
+    // Prospero SQ_IMG TYPE (dwords[3]>>28), matching Kyty DescriptorDimension:
+    // 1D/2D/2D_MSAA → Dim2D; 3D → Dim3D; cube/arrays → Dim2DArray.
+    match kind.texture_type {
+        8 | 9 | 14 => 1,
+        10 => 2,
+        11 | 12 | 13 | 15 => 3,
+        _ => kind.dimension,
+    }
+}
+
 const fn image_address_register(image: &ImageControl, component: usize) -> usize {
     if image.a16 { component / 2 } else { component }
 }
@@ -140,9 +157,10 @@ impl Compiler<'_> {
         let width = self.temp("uint", &format!("tex{binding_index}.get_width({mip})"));
         let height = self.temp("uint", &format!("tex{binding_index}.get_height({mip})"));
         // AMD Z is depth for 3D, otherwise array/cube layer count (or 1 for plain 2D).
-        let depth = if kind.texture_type == 10 || kind.dimension == 2 {
+        let metal_dim = metal_image_dimension(kind);
+        let depth = if metal_dim == 2 {
             self.temp("uint", &format!("tex{binding_index}.get_depth({mip})"))
-        } else if kind.dimension == 3 || image.is_array {
+        } else if metal_dim == 3 || image.is_array {
             self.temp("uint", &format!("tex{binding_index}.get_array_size()"))
         } else {
             self.temp("uint", "1u")
@@ -403,8 +421,10 @@ impl Compiler<'_> {
         binding_index: usize,
         sampler_slot: u32,
     ) -> Result<String, String> {
+        let kind = self.image_kinds[binding_index];
+        let metal_dim = metal_image_dimension(kind);
         let is_gather = name.starts_with("ImageGather4");
-        if is_gather && image.dimension != 1 {
+        if is_gather && metal_dim != 1 {
             return Err(format!(
                 "gather image dimension {} requires a 2D Metal texture",
                 image.dimension
@@ -556,12 +576,22 @@ impl Compiler<'_> {
             };
             let mip = self.temp("uint", &format!("(uint)max((int)({offset_lod}), 0)"));
             coordinates = if image.dimension == 2 {
-                self.temp(
-                    "float3",
-                    &format!(
-                        "{coordinates} + float3((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}), (float){offset_z} / (float)tex{binding_index}.get_depth({mip}))"
-                    ),
-                )
+                if metal_dim == 2 {
+                    self.temp(
+                        "float3",
+                        &format!(
+                            "{coordinates} + float3((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}), (float){offset_z} / (float)tex{binding_index}.get_depth({mip}))"
+                        ),
+                    )
+                } else {
+                    // SRD rematerialized to 2D: keep the guest Z lane, offset only XY.
+                    self.temp(
+                        "float3",
+                        &format!(
+                            "float3({coordinates}.x + (float){offset_x} / (float)tex{binding_index}.get_width({mip}), {coordinates}.y + (float){offset_y} / (float)tex{binding_index}.get_height({mip}), {coordinates}.z)"
+                        ),
+                    )
+                }
             } else {
                 self.temp(
                     "float2",
@@ -577,7 +607,14 @@ impl Compiler<'_> {
         // (x - 1, y - 1) with layer round(z). The cube resource is bound as a Metal 2D array,
         // so this addresses exactly the texel the guest computed; passing the raw atlas triple
         // to a direction-vector cube sampler reads arbitrary texels instead.
-        let coordinate_arguments = if image.dimension == 3 {
+        //
+        // When the SRD TYPE rematerializes a DIM=3D address layout onto a 2D texture (UE Slate
+        // font atlases), keep the guest float3 parse for VGPR layout but sample with .xy.
+        let mut sample_coordinates = coordinates.clone();
+        if metal_dim == 1 && matches!(image.dimension, 2 | 3) {
+            sample_coordinates = self.temp("float2", &format!("{coordinates}.xy"));
+        }
+        let coordinate_arguments = if image.dimension == 3 && metal_dim == 3 {
             let face_uv = self.temp(
                 "float2",
                 &format!("float2({coordinates}.x - 1.0f, {coordinates}.y - 1.0f)"),
@@ -590,20 +627,23 @@ impl Compiler<'_> {
             );
             format!("{face_uv}, {layer}")
         } else {
-            coordinates.clone()
+            sample_coordinates
         };
         let extra = if is_gather {
             String::new()
         } else if has_gradients {
-            if image.dimension == 3 {
+            if image.dimension == 3 && metal_dim == 3 {
                 // The guest supplies derivatives of the face-atlas coordinates, which are the
                 // 2D face coordinates up to the constant offset, so they pass through directly.
                 format!(", gradient2d({gradient_x}.xy, {gradient_y}.xy)")
+            } else if metal_dim == 2 {
+                let gradient = "gradient3d";
+                format!(", {gradient}({gradient_x}, {gradient_y})")
+            } else if matches!(image.dimension, 2 | 3) && metal_dim == 1 {
+                // Rematerialized 2D: discard the unused Z derivative lane.
+                format!(", gradient2d({gradient_x}.xy, {gradient_y}.xy)")
             } else {
-                let gradient = match image.dimension {
-                    2 => "gradient3d",
-                    _ => "gradient2d",
-                };
+                let gradient = "gradient2d";
                 format!(", {gradient}({gradient_x}, {gradient_y})")
             }
         } else if has_zero_lod || has_lod {
@@ -626,7 +666,7 @@ impl Compiler<'_> {
             self.temp(
                 &vector_kind,
                 &format!(
-                    "tex{binding_index}.gather_compare({sampler}, {coordinates}, {compare}, int2(0))"
+                    "tex{binding_index}.gather_compare({sampler}, {coordinate_arguments}, {compare}, int2(0))"
                 ),
             )
         } else if is_gather {
@@ -640,7 +680,7 @@ impl Compiler<'_> {
                 self.temp(
                     &vector_kind,
                     &format!(
-                        "tex{binding_index}.gather({sampler}, {coordinates}, int2(0), component::{component})"
+                        "tex{binding_index}.gather({sampler}, {coordinate_arguments}, int2(0), component::{component})"
                     ),
                 )
             });

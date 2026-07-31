@@ -20,7 +20,8 @@ use super::{
     compile_shader_request_catching_panics, compute_launch, export_resource_render_stage,
     fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
     image_component_class, missing_vertex_parameter_exports, ngg_export_uses_general_lds,
-    ngg_mesh_draw_supported, ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage,
+    ngg_export_uses_wave64_exec, ngg_mesh_draw_supported, ngg_fullscreen_cover_draw,
+    ngg_memoryless_cover_export_stage,
     ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
     procedural_rectangle_stage_for_draw, rectangle_coordinate_parameter_mask,
     rectangle_draw_has_incomplete_interface, sampler_lod_bias,
@@ -621,6 +622,49 @@ fn keeps_general_lds_ngg_triangle_lists_on_the_mesh_path() {
         ngg_mesh_stage_for_draw(&program, &draw)
             .expect_err("general-LDS NGG with an unsupported topology must not silently fall back")
             .contains("unsupported topology")
+    );
+}
+
+#[test]
+fn classifies_wave64_exec_manipulation_in_ngg_exports() {
+    let scalar_op = |name: &'static str, destination: u32| {
+        Program::new(
+            0x7000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known(name),
+                words: Vec::new(),
+                sources: Vec::new(),
+                destinations: vec![Operand::scalar(destination)],
+                control: None,
+            }],
+        )
+    };
+    // EXEC_LO is architectural SGPR 126; a 64-bit write there names the full EXEC pair.
+    assert!(
+        ngg_export_uses_wave64_exec(&scalar_op("SMovB64", 126)),
+        "S_MOV_B64 into EXEC is a wave64 mask restore"
+    );
+    assert!(
+        ngg_export_uses_wave64_exec(&scalar_op("SBfeU64", 126)),
+        "S_BFE_U64 into EXEC builds the wave64 vertex-count mask"
+    );
+    assert!(
+        ngg_export_uses_wave64_exec(&scalar_op("SAndSaveexecB64", 10)),
+        "64-bit SAVEEXEC manipulates EXEC regardless of the save register"
+    );
+    assert!(
+        !ngg_export_uses_wave64_exec(&scalar_op("SMovB64", 10)),
+        "64-bit moves into ordinary SGPR pairs do not imply wave64"
+    );
+    assert!(
+        !ngg_export_uses_wave64_exec(&scalar_op("SAndSaveexecB32", 10)),
+        "wave32 exports use the B32 SAVEEXEC forms"
+    );
+    assert!(
+        !ngg_export_uses_wave64_exec(&scalar_op("SMovB32", 126)),
+        "32-bit EXEC_LO writes stay on the wave32 lowering"
     );
 }
 

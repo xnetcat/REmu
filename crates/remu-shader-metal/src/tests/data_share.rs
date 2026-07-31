@@ -286,6 +286,143 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
 }
 
 #[test]
+fn packs_wave64_merged_wave_info_for_split_ngg_mesh_exports() {
+    // Wave64 NGG exports (Poppy Playtime UI/LUT quads) recover their meshlet thread index as
+    // `s3[27:24] * 64 + v_mbcnt`, so the merged wave info must count 64-lane guest waves
+    // rather than SIMD32 halves once the presenter selects the split-wave64 lowering.
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 128, 128, 128);
+    options.wave_lane_count = 64;
+    let shader =
+        compile_msl(&program, &empty_evaluation(), &options).expect("wave64 NGG mesh lowering");
+    assert_eq!(shader.stage, MetalShaderStage::Mesh);
+    assert!(
+        shader
+            .source
+            .contains("uint remu_wave_index = remu_thread_index >> 6u;")
+    );
+    assert!(
+        shader
+            .source
+            .contains("((remu_thread_index >> 6u) & 0xfu) << 24u"),
+        "wave64 NGG subgroups must pack a wave64 index into s3[27:24]"
+    );
+    assert!(
+        shader.source.contains("+ 63u) >> 6u"),
+        "wave64 NGG subgroups must count 64-lane guest waves for s3[31:28]"
+    );
+    assert!(
+        !shader
+            .source
+            .contains("((remu_thread_index >> 5u) & 0xfu) << 24u"),
+        "SIMD32 halves must not leak into the guest-visible merged wave info"
+    );
+}
+
+#[test]
+fn stages_ngg_mesh_vertex_exports_by_compacted_vertex_vgpr() {
+    // Poppy Slate UI: EXP is gated by `V_CMPX_GT_U32 s4, v18` where v18 is the compacted
+    // vertex id. Publishing remu_out via remu_thread_index swaps UV/position across slots.
+    let export = |pc, target, sources| Instruction {
+        pc,
+        encoding: ShaderEncoding::Exp,
+        opcode: Opcode::Known("Exp"),
+        words: vec![0, 0],
+        sources,
+        destinations: Vec::new(),
+        control: Some(InstructionControl::Export(ExportControl {
+            target,
+            enable_mask: 15,
+            compressed: false,
+            done: true,
+            valid_mask: false,
+        })),
+    };
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vopc,
+                opcode: Opcode::Known("VCmpxGtU32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(4), Operand::vector(18)],
+                destinations: Vec::new(),
+                control: None,
+            },
+            export(
+                4,
+                12,
+                vec![
+                    Operand::vector(0),
+                    Operand::vector(1),
+                    Operand::vector(2),
+                    Operand::vector(3),
+                ],
+            ),
+            export(
+                12,
+                32,
+                vec![
+                    Operand::vector(4),
+                    Operand::vector(5),
+                    Operand::vector(6),
+                    Operand::vector(7),
+                ],
+            ),
+            Instruction {
+                pc: 20,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let mut options = MetalCompileOptions::mesh(2, 16 * 1024, 64, 64, 64);
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("compacted NGG mesh vertex staging should lower");
+    assert!(
+        shader
+            .source
+            .contains("threadgroup RemuVsOut remu_mesh_staged_vertices[64]"),
+        "compacted exports need a threadgroup staging array"
+    );
+    assert!(
+        shader
+            .source
+            .contains("if (exec && remu_v_18 < 64u) remu_mesh_staged_vertices[remu_v_18] = remu_out;"),
+        "EXP must stage remu_out under the compacted vertex VGPR"
+    );
+    assert!(
+        shader.source.contains(
+            "if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_mesh_staged_vertices[remu_thread_index])"
+        ),
+        "epilogue must publish staged vertices by compacted index"
+    );
+    assert!(
+        !shader.source.contains(
+            "if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out)"
+        ),
+        "must not publish the exporting thread's private remu_out by thread index"
+    );
+}
+
+#[test]
 fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocation() {
     const CAPTURED_GS_RSRC2: u32 = 0x00fb_0018;
     const CAPTURED_LDS_BYTES: u32 = ((CAPTURED_GS_RSRC2 >> 19) & 0xff) * 128 * 4;

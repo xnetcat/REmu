@@ -9,6 +9,11 @@ use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::diagnostic::{
+    DiagnosticBuffer, FaultReason, FaultRegister, FaultReport, FaultSpace, format_fault_registers,
+    format_fault_report,
+};
+use super::guest_space::contains_guest_address;
 use super::page::{align_down, host_page_size_infallible};
 use super::snapshot::{ACTIVE_HANDLERS, WATCH_SNAPSHOT};
 
@@ -101,13 +106,35 @@ extern "C" fn write_fault_signal_handler(
     context: *mut c_void,
 ) {
     ACTIVE_HANDLERS.fetch_add(1, Ordering::SeqCst);
-    let fault_address = if information.is_null() {
-        0
+    let (fault_address, fault_code) = if information.is_null() {
+        (0, 0)
     } else {
         // SAFETY: SA_SIGINFO supplies a live siginfo_t for the duration of this callback.
-        unsafe { (*information).si_addr().addr() as u64 }
+        unsafe {
+            (
+                (*information).si_addr().addr() as u64,
+                (*information).si_code,
+            )
+        }
     };
-    let handled = try_handle_write_fault(fault_address);
+    let handled = try_handle_write_fault(fault_address, || {
+        // SAFETY: SA_SIGINFO supplies a live ucontext_t for the duration of this callback.
+        let (program_counter, registers) = unsafe { fault_machine_state(context) };
+        (
+            FaultReport {
+                signal,
+                code: fault_code,
+                address: fault_address,
+                program_counter,
+                space: if contains_guest_address(fault_address) {
+                    FaultSpace::Guest
+                } else {
+                    FaultSpace::Host
+                },
+            },
+            registers,
+        )
+    });
     ACTIVE_HANDLERS.fetch_sub(1, Ordering::SeqCst);
     if handled {
         return;
@@ -116,14 +143,16 @@ extern "C" fn write_fault_signal_handler(
     unsafe { chain_previous_action(signal, information, context) };
 }
 
-fn try_handle_write_fault(fault_address: u64) -> bool {
+type FaultState = (FaultReport, Option<[FaultRegister; REGISTER_COUNT]>);
+
+fn try_handle_write_fault(fault_address: u64, state: impl Fn() -> FaultState) -> bool {
     if fault_address == 0 {
-        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: null address\n");
+        write_fault_diagnostic(state(), FaultReason::NullAddress);
         return false;
     }
     let snapshot_pointer = WATCH_SNAPSHOT.load(Ordering::SeqCst);
     if snapshot_pointer.is_null() {
-        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: no watch snapshot\n");
+        write_fault_diagnostic(state(), FaultReason::NoSnapshot);
         return false;
     }
     // SAFETY: ACTIVE_HANDLERS pins the immutable snapshot until this handler leaves.
@@ -135,7 +164,7 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         // This handler receives every process SIGSEGV/SIGBUS while CPU write watching is active.
         // A fault outside the immutable watch snapshot is not a write-watch failure; forward it
         // unchanged so the system crash report retains the guest RIP and register state.
-        write_unrelated_fault_diagnostic(fault_address);
+        write_fault_diagnostic(state(), FaultReason::Unwatched);
         return false;
     }
     let has_armed_owner = has_page
@@ -146,11 +175,11 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         });
 
     let Ok(address) = usize::try_from(page_address) else {
-        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: address conversion failed\n");
+        write_fault_diagnostic(state(), FaultReason::AddressConversion);
         return false;
     };
     let Ok(length) = usize::try_from(page_size) else {
-        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: length conversion failed\n");
+        write_fault_diagnostic(state(), FaultReason::LengthConversion);
         return false;
     };
     // SAFETY: all page owners registered this live mapping. This is the exact protected host page.
@@ -162,7 +191,7 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         )
     } != 0
     {
-        write_signal_diagnostic(b"[REMu][WATCH] unhandled fault: mprotect failed\n");
+        write_fault_diagnostic(state(), FaultReason::ProtectFailed);
         return false;
     }
 
@@ -193,52 +222,167 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
     true
 }
 
-/// Reports a fault the watch snapshot does not own, including the address the kernel supplied.
+/// Reports a fault the watch layer declined, with everything needed to identify its real cause.
 ///
 /// Every process SIGSEGV/SIGBUS reaches this handler while CPU write watching is active, so this
-/// line is normally the last output before an unrelated crash refaults under the previous action.
-/// Without the address the report says only that the watch layer declined the fault, which is not
-/// enough to identify the real faulting resource from a run log.
-fn write_unrelated_fault_diagnostic(fault_address: u64) {
-    let mut message = [0_u8; UNRELATED_FAULT_MESSAGE_CAPACITY];
-    let length = format_unrelated_fault_message(fault_address, &mut message);
-    write_signal_diagnostic_bytes(&message[..length]);
-}
-
-const UNRELATED_FAULT_PREFIX: &[u8] = b"[REMu][WATCH] unrelated fault outside watched memory at 0x";
-
-const UNRELATED_FAULT_SUFFIX: &[u8] = b"; forwarding\n";
-
-pub(super) const UNRELATED_FAULT_MESSAGE_CAPACITY: usize =
-    UNRELATED_FAULT_PREFIX.len() + 16 + UNRELATED_FAULT_SUFFIX.len();
-
-/// Renders the diagnostic into caller-owned storage, returning the used length.
-///
-/// Signal context forbids allocation and `core::fmt`, so the hexadecimal conversion is written by
-/// hand against a fixed stack buffer.
-pub(super) fn format_unrelated_fault_message(
-    fault_address: u64,
-    message: &mut [u8; UNRELATED_FAULT_MESSAGE_CAPACITY],
-) -> usize {
-    let mut length = UNRELATED_FAULT_PREFIX.len();
-    message[..length].copy_from_slice(UNRELATED_FAULT_PREFIX);
-    let mut digits = [0_u8; 16];
-    for (index, digit) in digits.iter_mut().enumerate() {
-        let nibble = (fault_address >> (60 - index * 4)) & 0xf;
-        *digit = b"0123456789abcdef"[nibble as usize];
+/// line is normally the last output before the fault refaults under the previous action and
+/// terminates the process. A report that only says the watch layer declined the fault cannot
+/// distinguish a wild guest store from an emulator access to memory whose mapping went away.
+fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) {
+    let mut buffer = DiagnosticBuffer::new();
+    format_fault_report(report, reason, &mut buffer);
+    if let Some(registers) = registers.as_ref() {
+        format_fault_registers(registers, &mut buffer);
     }
-    let leading = digits
-        .iter()
-        .position(|&digit| digit != b'0')
-        .unwrap_or(digits.len() - 1);
-    message[length..length + digits.len() - leading].copy_from_slice(&digits[leading..]);
-    length += digits.len() - leading;
-    message[length..length + UNRELATED_FAULT_SUFFIX.len()].copy_from_slice(UNRELATED_FAULT_SUFFIX);
-    length + UNRELATED_FAULT_SUFFIX.len()
+    write_signal_diagnostic_bytes(buffer.as_slice());
 }
 
-fn write_signal_diagnostic(message: &'static [u8]) {
-    write_signal_diagnostic_bytes(message);
+/// Reads the interrupted instruction pointer and integer registers out of the machine context.
+///
+/// # Safety
+///
+/// `context` must be the `ucontext_t` pointer an `SA_SIGINFO` handler received, or null.
+unsafe fn fault_machine_state(
+    context: *mut c_void,
+) -> (u64, Option<[FaultRegister; REGISTER_COUNT]>) {
+    if context.is_null() {
+        return (0, None);
+    }
+    // SAFETY: the caller guarantees this is the live signal ucontext_t.
+    let machine_context = unsafe { (*context.cast::<UserContext>()).machine_context };
+    if machine_context.is_null() {
+        return (0, None);
+    }
+    // SAFETY: the kernel initializes the machine context for every SIGSEGV/SIGBUS delivery.
+    let machine_context = unsafe { &*machine_context };
+    (
+        machine_context.program_counter(),
+        Some(machine_context.registers()),
+    )
+}
+
+/// Darwin's `__darwin_ucontext`, truncated after the machine-context pointer this handler needs.
+#[repr(C)]
+struct UserContext {
+    _on_stack: libc::c_int,
+    _signal_mask: u32,
+    _stack: libc::stack_t,
+    _link: *mut UserContext,
+    _machine_context_size: usize,
+    machine_context: *const MachineContext,
+}
+
+/// Darwin's `_STRUCT_MCONTEXT64`, truncated after the integer thread state.
+///
+/// The trailing vector state is never read, so leaving it out of the declaration keeps the layout
+/// dependency limited to the exception and integer register blocks.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct MachineContext {
+    _trap_number: u16,
+    _cpu: u16,
+    _error: u32,
+    _fault_address: u64,
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rdi: u64,
+    rsi: u64,
+    rbp: u64,
+    rsp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    instruction_pointer: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+struct MachineContext {
+    _fault_address: u64,
+    _syndrome: u32,
+    _exception: u32,
+    general: [u64; 29],
+    frame_pointer: u64,
+    link_register: u64,
+    stack_pointer: u64,
+    instruction_pointer: u64,
+}
+
+/// Fixed register-file width, sized for the widest supported architecture.
+#[cfg(target_arch = "x86_64")]
+const REGISTER_COUNT: usize = 16;
+
+#[cfg(target_arch = "aarch64")]
+const REGISTER_COUNT: usize = 32;
+
+impl MachineContext {
+    const fn program_counter(&self) -> u64 {
+        self.instruction_pointer
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    const fn registers(&self) -> [FaultRegister; REGISTER_COUNT] {
+        const fn register(name: &'static [u8], value: u64) -> FaultRegister {
+            FaultRegister { name, value }
+        }
+        [
+            register(b"rax", self.rax),
+            register(b"rbx", self.rbx),
+            register(b"rcx", self.rcx),
+            register(b"rdx", self.rdx),
+            register(b"rdi", self.rdi),
+            register(b"rsi", self.rsi),
+            register(b"rbp", self.rbp),
+            register(b"rsp", self.rsp),
+            register(b"r8", self.r8),
+            register(b"r9", self.r9),
+            register(b"r10", self.r10),
+            register(b"r11", self.r11),
+            register(b"r12", self.r12),
+            register(b"r13", self.r13),
+            register(b"r14", self.r14),
+            register(b"r15", self.r15),
+        ]
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn registers(&self) -> [FaultRegister; REGISTER_COUNT] {
+        const NAMES: [&[u8]; 29] = [
+            b"x0", b"x1", b"x2", b"x3", b"x4", b"x5", b"x6", b"x7", b"x8", b"x9", b"x10", b"x11",
+            b"x12", b"x13", b"x14", b"x15", b"x16", b"x17", b"x18", b"x19", b"x20", b"x21", b"x22",
+            b"x23", b"x24", b"x25", b"x26", b"x27", b"x28",
+        ];
+        let mut registers = [FaultRegister {
+            name: b"",
+            value: 0,
+        }; REGISTER_COUNT];
+        for (index, name) in NAMES.iter().enumerate() {
+            registers[index] = FaultRegister {
+                name,
+                value: self.general[index],
+            };
+        }
+        registers[29] = FaultRegister {
+            name: b"fp",
+            value: self.frame_pointer,
+        };
+        registers[30] = FaultRegister {
+            name: b"lr",
+            value: self.link_register,
+        };
+        registers[31] = FaultRegister {
+            name: b"sp",
+            value: self.stack_pointer,
+        };
+        registers
+    }
 }
 
 fn write_signal_diagnostic_bytes(message: &[u8]) {

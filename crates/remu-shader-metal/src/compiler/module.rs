@@ -170,19 +170,21 @@ impl Compiler<'_> {
             // GCN cube resources are addressed with face-atlas coordinates produced by
             // V_CUBEID/SC/TC/MA, not with a direction vector, so they bind as 2D arrays and
             // sampling indexes the face layer directly (see emit_image_sample).
+            let metal_dim = crate::compiler::image::metal_image_dimension(*kind);
             let texture_kind = if kind.comparison {
-                match kind.dimension {
+                match metal_dim {
                     3 => "depth2d_array",
                     _ => "depth2d",
                 }
             } else if kind.storage {
-                if kind.texture_type == 10 {
+                if metal_dim == 2 {
                     "texture3d"
                 } else {
                     "texture2d"
                 }
             } else {
-                match kind.dimension {
+                // Sampled views follow the SRD TYPE (see metal_image_dimension), not MIMG DIM.
+                match metal_dim {
                     2 => "texture3d",
                     3 => "texture2d_array",
                     _ => "texture2d",
@@ -330,6 +332,24 @@ impl Compiler<'_> {
                 "    threadgroup atomic_uint remu_mesh_output_vertex_count;\n\
                  \x20   threadgroup atomic_uint remu_mesh_output_primitive_count;\n",
             );
+            if self.mesh_export_vertex_vgpr.is_some() {
+                let _ = writeln!(
+                    source,
+                    "    threadgroup RemuVsOut remu_mesh_staged_vertices[{}];",
+                    self.options.mesh_max_vertex_count
+                );
+                let _ = writeln!(
+                    source,
+                    "    if (remu_thread_index < {}u) {{",
+                    self.options.mesh_max_vertex_count
+                );
+                source.push_str(
+                    "        remu_mesh_staged_vertices[remu_thread_index] = {};\n\
+                     \x20       remu_mesh_staged_vertices[remu_thread_index].position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\
+                     \x20   }\n\
+                     \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+                );
+            }
         }
         if self.split_wave64() {
             source.push_str(
@@ -491,18 +511,28 @@ impl Compiler<'_> {
                     );
                 }
                 // Always seed s[3] for mesh: GFX10 merged NGG shaders read
-                // - lane ID as `(s3[27:24] << 5) + v_mbcnt_lo`
+                // - lane ID as `(s3[27:24] << log2(wave)) + v_mbcnt`
                 // - wave count as `s3[31:28]`, then `(1 << count) - 1` as the reduce mask
                 //   that loads per-wave totals from LDS (Void Terrarium soft/main particles).
                 // Bits [15:0] still carry the meshlet vertex/primitive counts. Clear [31:24]
                 // before packing so stale meshlet high bits cannot override the wave fields.
-                source.push_str(
-                    "    {\n\
-                     \x20       uint remu_mesh_wave_count = ((remu_group_size.x * remu_group_size.y * remu_group_size.z) + 31u) >> 5u;\n\
+                // The wave fields must use the guest's architectural wave size: wave64 NGG
+                // exports (Poppy Playtime UI/LUT quads) recover their meshlet thread index as
+                // `s3[27:24] * 64 + v_mbcnt`, so packing SIMD32 halves there sent every
+                // thread past the first 32 out of range and left their vertices unexported.
+                let (wave_round, wave_shift) = if self.split_wave64() {
+                    (63u32, 6u32)
+                } else {
+                    (31u32, 5u32)
+                };
+                let _ = write!(
+                    source,
+                    "    {{\n\
+                     \x20       uint remu_mesh_wave_count = ((remu_group_size.x * remu_group_size.y * remu_group_size.z) + {wave_round}u) >> {wave_shift}u;\n\
                      \x20       s[3] = (remu_mesh_counts & 0x00ffffffu)\n\
-                     \x20           | (((remu_thread_index >> 5u) & 0xfu) << 24u)\n\
+                     \x20           | (((remu_thread_index >> {wave_shift}u) & 0xfu) << 24u)\n\
                      \x20           | ((remu_mesh_wave_count & 0xfu) << 28u);\n\
-                     \x20   }\n",
+                     \x20   }}\n",
                 );
                 if contains_register_reference(&self.body, 'v', 0) {
                     source.push_str("    v[0] = remu_mesh_primitive;\n");
@@ -702,12 +732,24 @@ impl Compiler<'_> {
                 }
                 // Metal mesh has no set_vertex_count; only set_primitive_count exists.
                 // Vertex occupancy comes from set_vertex + index references.
-                source.push_str(
-                    "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
-                     \x20   if (remu_thread_index == 0u) {\n\
-                     \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
-                     \x20   }\n",
-                );
+                // When EXP is gated by a compacted vertex VGPR, publish staged payloads by that
+                // index — remu_out lives on the exporting thread, which is usually not the same
+                // as remu_thread_index == vertex_id (Poppy Slate NGG UI).
+                if self.mesh_export_vertex_vgpr.is_some() {
+                    source.push_str(
+                        "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_mesh_staged_vertices[remu_thread_index]);\n\
+                         \x20   if (remu_thread_index == 0u) {\n\
+                         \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
+                         \x20   }\n",
+                    );
+                } else {
+                    source.push_str(
+                        "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
+                         \x20   if (remu_thread_index == 0u) {\n\
+                         \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
+                         \x20   }\n",
+                    );
+                }
             }
         }
         source.push_str("}\n");

@@ -127,15 +127,9 @@ pub(crate) fn guest_texture_descriptors_share_color_view_storage(
     left: GuestTextureDescriptor,
     right: GuestTextureDescriptor,
 ) -> bool {
-    let is_view_compatible_color = |format| {
-        matches!(
-            format,
-            MTLPixelFormat::RGBA8Unorm
-                | MTLPixelFormat::RGBA8Unorm_sRGB
-                | MTLPixelFormat::BGRA8Unorm
-                | MTLPixelFormat::BGRA8Unorm_sRGB
-        )
-    };
+    let formats_are_view_compatible = pixel_format_view_class(left.pixel_format)
+        .zip(pixel_format_view_class(right.pixel_format))
+        .is_some_and(|(left, right)| left == right);
     let layout_compatible = guest_texture_descriptors_have_same_byte_layout(left, right)
         || (left.address == right.address
             && left.width == right.width
@@ -145,10 +139,84 @@ pub(crate) fn guest_texture_descriptors_share_color_view_storage(
             && left.pitch >= left.width
             && right.pitch >= right.width);
     left.pixel_format != right.pixel_format
-        && is_view_compatible_color(left.pixel_format)
-        && is_view_compatible_color(right.pixel_format)
+        && formats_are_view_compatible
         && layout_compatible
         && guest_texture_descriptors_share_byte_storage(left, right)
+}
+
+/// Metal's pixel-format view class for `format`, or `None` when it cannot back a format view.
+///
+/// `newTextureViewWithPixelFormat:` accepts a different format only within one class, where every
+/// member shares the channel count and channel width and differs solely in how the sampler
+/// interprets those bits. That is exactly the reinterpretation a Prospero SRD asks for when it
+/// describes a render target's bytes with another numeric format, so a view reproduces the CPU
+/// decode path's result without reading the target back through guest memory. Octopath renders its
+/// occlusion chain to `R8Uint` targets and samples them as `R8Unorm`; routing those six surfaces
+/// through the writeback path cost hundreds of megabytes and roughly a second of presenter time
+/// per interval.
+///
+/// Depth and stencil formats are deliberately absent: they are not view-compatible with colour
+/// formats, and `guest_texture_descriptors_share_depth_sample_storage` already models the native
+/// depth-plane aliases Metal does allow.
+fn pixel_format_view_class(format: MTLPixelFormat) -> Option<PixelFormatViewClass> {
+    use PixelFormatViewClass as Class;
+    Some(match format {
+        MTLPixelFormat::R8Unorm
+        | MTLPixelFormat::R8Unorm_sRGB
+        | MTLPixelFormat::R8Snorm
+        | MTLPixelFormat::R8Uint
+        | MTLPixelFormat::R8Sint => Class::OneChannel8,
+        MTLPixelFormat::R16Unorm
+        | MTLPixelFormat::R16Snorm
+        | MTLPixelFormat::R16Uint
+        | MTLPixelFormat::R16Sint
+        | MTLPixelFormat::R16Float => Class::OneChannel16,
+        MTLPixelFormat::R32Uint | MTLPixelFormat::R32Sint | MTLPixelFormat::R32Float => {
+            Class::OneChannel32
+        }
+        MTLPixelFormat::RG8Unorm
+        | MTLPixelFormat::RG8Unorm_sRGB
+        | MTLPixelFormat::RG8Snorm
+        | MTLPixelFormat::RG8Uint
+        | MTLPixelFormat::RG8Sint => Class::TwoChannel8,
+        MTLPixelFormat::RG16Unorm
+        | MTLPixelFormat::RG16Snorm
+        | MTLPixelFormat::RG16Uint
+        | MTLPixelFormat::RG16Sint
+        | MTLPixelFormat::RG16Float => Class::TwoChannel16,
+        MTLPixelFormat::RG32Uint | MTLPixelFormat::RG32Sint | MTLPixelFormat::RG32Float => {
+            Class::TwoChannel32
+        }
+        MTLPixelFormat::RGBA8Unorm
+        | MTLPixelFormat::RGBA8Unorm_sRGB
+        | MTLPixelFormat::RGBA8Snorm
+        | MTLPixelFormat::RGBA8Uint
+        | MTLPixelFormat::RGBA8Sint
+        | MTLPixelFormat::BGRA8Unorm
+        | MTLPixelFormat::BGRA8Unorm_sRGB => Class::FourChannel8,
+        MTLPixelFormat::RGBA16Unorm
+        | MTLPixelFormat::RGBA16Snorm
+        | MTLPixelFormat::RGBA16Uint
+        | MTLPixelFormat::RGBA16Sint
+        | MTLPixelFormat::RGBA16Float => Class::FourChannel16,
+        MTLPixelFormat::RGBA32Uint | MTLPixelFormat::RGBA32Sint | MTLPixelFormat::RGBA32Float => {
+            Class::FourChannel32
+        }
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PixelFormatViewClass {
+    OneChannel8,
+    OneChannel16,
+    OneChannel32,
+    TwoChannel8,
+    TwoChannel16,
+    TwoChannel32,
+    FourChannel8,
+    FourChannel16,
+    FourChannel32,
 }
 
 pub(crate) fn guest_texture_descriptors_share_depth_sample_storage(

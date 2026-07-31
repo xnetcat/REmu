@@ -529,27 +529,52 @@ fn repeated_watch_lifecycles_reclaim_registry_state() {
 }
 
 #[test]
-fn unrelated_fault_diagnostics_name_the_faulting_address() {
-    use super::signal::{UNRELATED_FAULT_MESSAGE_CAPACITY, format_unrelated_fault_message};
+fn a_guest_mapping_change_keeps_recovering_delayed_protection_faults() {
+    let mapping = TestMapping::new(1);
+    // SAFETY: the retained mapping outlives this watch.
+    let watch = unsafe { CpuWriteWatch::new(mapping.address(), watch_bytes()).unwrap() };
+    // A permission-only guest change retires the watch and restores write access. A store that
+    // already faulted on another CPU can still be delivered afterwards, so the interval must stay
+    // recoverable instead of becoming an unowned fault that terminates the process.
+    let reprotection = CpuWriteWatch::begin_reprotect_overlapping(mapping.address(), watch_bytes());
+    assert_eq!(
+        watch.retirement(),
+        Some(CpuWriteWatchRetirement::Reprotecting)
+    );
+    assert!(
+        writable_range_covers(mapping.address()),
+        "a reprotected mapping must remain recoverable by the fault handler"
+    );
+    drop(reprotection);
+    drop(watch);
 
-    let render = |address: u64| {
-        let mut message = [0_u8; UNRELATED_FAULT_MESSAGE_CAPACITY];
-        let length = format_unrelated_fault_message(address, &mut message);
-        String::from_utf8(message[..length].to_vec()).expect("diagnostic is ASCII")
-    };
+    // A replacement is different: the pages are about to be remapped, so silently granting write
+    // access would hide a guest access to memory the mapping change took away.
+    // SAFETY: the retained mapping outlives this watch.
+    let replaced = unsafe { CpuWriteWatch::new(mapping.address(), watch_bytes()).unwrap() };
+    CpuWriteWatch::retire_overlapping(mapping.address(), watch_bytes());
+    assert_eq!(
+        replaced.retirement(),
+        Some(CpuWriteWatchRetirement::Replaced)
+    );
+    assert!(
+        !writable_range_covers(mapping.address()),
+        "a replaced mapping must not be recoverable by the fault handler"
+    );
+    drop(replaced);
+}
 
-    assert_eq!(
-        render(0x8063_d500_0000),
-        "[REMu][WATCH] unrelated fault outside watched memory at 0x8063d5000000; forwarding\n"
-    );
-    assert_eq!(
-        render(u64::MAX),
-        "[REMu][WATCH] unrelated fault outside watched memory at 0xffffffffffffffff; forwarding\n"
-    );
-    // A zero address is reported before this path, but the renderer must never produce an
-    // empty digit run for it.
-    assert_eq!(
-        render(0),
-        "[REMu][WATCH] unrelated fault outside watched memory at 0x0; forwarding\n"
-    );
+fn writable_range_covers(address: u64) -> bool {
+    let state = super::state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+        .writable_ranges
+        .range(..=address)
+        .next_back()
+        .is_some_and(|(_, &end)| address < end)
+}
+
+fn watch_bytes() -> u64 {
+    u64::try_from(page_size()).expect("a host page size fits u64")
 }

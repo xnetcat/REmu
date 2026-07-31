@@ -3,20 +3,18 @@
 
 use super::{
     CachedSampledTexture, DecodedImageDescriptor, GuestTextureContentState, GuestTextureDescriptor,
-    GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter, Mode27WorkOrigin,
+    GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
     TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    WriteWatchRefresh, create_guest_texture, create_mipmapped_guest_texture,
-    decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    guest_texture_byte_count, guest_texture_descriptors_overlap, mode5_mip_chain_layout,
-    mode27_mip_chain_layout, record_mode27_work_detail, record_texture_dirty_work_detail,
-    record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
-    texture_alias_trace_match, trace_alias_correlated_acquire, trace_resident_texture_removal,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, guest_texture_byte_count,
+    guest_texture_descriptors_overlap, mode5_mip_chain_layout, mode27_mip_chain_layout,
+    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
+    retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
+    trace_resident_texture_removal,
 };
-use metal::MTLTextureUsage;
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
     CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_backing_alias_segments,
@@ -35,6 +33,17 @@ use std::time::Instant;
 /// than copying and decoding a complete multi-megabyte image.
 const CONTENT_FINGERPRINT_CHUNK_BYTES: u64 = 4 * 1024;
 
+/// Attempts allowed while trying to copy a guest resource nobody else is writing.
+///
+/// A store that lands during the copy invalidates it, and retrying keeps an ordinary
+/// false-positive protection fault from publishing torn pixels. A surface the guest rewrites every
+/// frame never converges, though, and each attempt re-copies the entire resource: an unbounded
+/// retry turned a single 64 MiB Unreal render target into seconds of presenter time, which starved
+/// submission while the GPU sat idle. Publishing the last copy is the same outcome the hardware
+/// gives an unsynchronized guest, and the range stays dirty so ordinary content validation
+/// re-examines it on the next use.
+const MAX_STABLE_SNAPSHOT_ATTEMPTS: u32 = 4;
+
 impl MetalPresenter {
     pub(crate) fn synchronize_cpu_written_guest_resources(
         &mut self,
@@ -43,11 +52,6 @@ impl MetalPresenter {
         if !acquire.invalidates_guest_resources() {
             return Ok(());
         }
-        let device = self
-            .device
-            .as_ref()
-            .ok_or("Metal device is unavailable")?
-            .clone();
         let mut invalidated_multisample_descriptors = Vec::new();
         let resident_descriptors = self
             .resident_guest_textures
@@ -161,6 +165,7 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .get_mut(&descriptor)
                 .expect("overlapping resident survived write-watch refresh");
+            let gpu_written = resident.gpu_written;
             let content_changed = resident.write_watch.content_has_changed()?;
             if !content_changed {
                 if resident.gpu_written {
@@ -182,82 +187,36 @@ impl MetalPresenter {
                 );
                 continue;
             }
-            // When the CPU is already authoritative for the complete resident, an acquire only
-            // invalidates its old Metal copy. Rebuilding it here eagerly decodes large Unreal
-            // render allocations even when several more acquires arrive before the image is used.
-            // Drop the stale resident and let the ordinary render/sample path materialize one
-            // stable snapshot on demand. GPU-authored residents cannot take this path because
-            // clean bytes may still exist only in Metal and must be merged by the writeback path.
-            if !resident.gpu_written {
-                invalidated_multisample_descriptors.push(descriptor);
-                trace_acquire(
-                    resident,
-                    refresh,
-                    "removed",
-                    Some(true),
-                    "removed-cpu-dirty",
-                );
-                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
-                    trace_resident_texture_removal("acquire-cpu-dirty", &resident);
-                }
-                RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            let started = Instant::now();
-            let texture = if resident.mip_level_count == 1 {
-                let raw =
-                    snapshot_watched_guest_texture_raw(resident.descriptor, &resident.write_watch)?;
-                let linear = decode_guest_texture_linear_from_raw(resident.descriptor, &raw)?;
-                create_guest_texture(
-                    &device,
-                    resident.descriptor,
-                    MTLTextureUsage::RenderTarget
-                        | MTLTextureUsage::ShaderRead
-                        | MTLTextureUsage::ShaderWrite,
-                    &linear,
-                )?
-            } else {
-                let layout =
-                    mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
-                let raw = snapshot_watched_guest_range(
-                    resident.descriptor.address,
-                    layout.byte_count,
-                    &resident.write_watch,
-                )?;
-                let (_, linear_levels) = decode_mode27_mip_chain_from_raw(
-                    resident.descriptor,
-                    resident.mip_level_count,
-                    &raw,
-                )?;
-                create_mipmapped_guest_texture(
-                    &device,
-                    resident.descriptor,
-                    resident.mip_level_count,
-                    &linear_levels,
-                )?
-            };
-            if resident.mip_level_count > 1 {
-                let layout =
-                    mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
-                record_mode27_work_detail(
-                    Mode27WorkOrigin::AcquireReload,
-                    resident.descriptor,
-                    resident.mip_level_count,
-                    layout.byte_count,
-                    started.elapsed(),
+            // An acquire only invalidates the old Metal copy; it does not require materializing a
+            // replacement here. Rebuilding eagerly decoded whole multi-megabyte Unreal render
+            // allocations even when several more acquires arrived before the image was used, and
+            // even when the next render pass discards those guest bytes anyway. Drop the stale
+            // resident and let the ordinary render/sample path materialize one stable snapshot on
+            // demand. A GPU-authored resident is safe to drop as well: the reload it replaces
+            // overwrote every pixel with guest bytes, so no Metal-only content survived it either.
+            invalidated_multisample_descriptors.push(descriptor);
+            trace_acquire(
+                resident,
+                refresh,
+                "removed",
+                Some(true),
+                if gpu_written {
+                    "removed-gpu-dirty"
+                } else {
+                    "removed-cpu-dirty"
+                },
+            );
+            if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                trace_resident_texture_removal(
+                    if gpu_written {
+                        "acquire-gpu-dirty"
+                    } else {
+                        "acquire-cpu-dirty"
+                    },
+                    &resident,
                 );
             }
-            texture.set_label(&format!(
-                "REMu guest image {:#x}",
-                resident.descriptor.address
-            ));
-            // Replace instead of mutating the old texture. Already encoded Metal work retains the
-            // old allocation, while following draws observe the CPU update without a GPU wait.
-            resident.texture = texture;
-            resident.component_reorder_view = None;
-            resident.gpu_written = false;
-            trace_acquire(resident, refresh, "cpu", Some(true), "gpu-to-cpu-reloaded");
-            invalidated_multisample_descriptors.push(resident.descriptor);
+            RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
         }
         self.multisample_textures.retain(|key, _| {
             !invalidated_multisample_descriptors
@@ -1338,9 +1297,11 @@ pub(crate) fn snapshot_watched_guest_range(
             }
         }
     };
+    let mut stable = true;
     let result = if !write_watch.precise_tracking() {
         snapshot()
     } else {
+        let mut attempts = 0_u32;
         loop {
             let _ = write_watch.consume_dirty();
             write_watch.rearm()?;
@@ -1349,10 +1310,18 @@ pub(crate) fn snapshot_watched_guest_range(
             if write_watch.generations() == generations && !write_watch.is_dirty() {
                 break Ok(raw);
             }
+            attempts += 1;
+            if attempts >= MAX_STABLE_SNAPSHOT_ATTEMPTS {
+                stable = false;
+                TEXTURE_SNAPSHOT_UNSTABLE_COUNT.fetch_add(1, Ordering::Relaxed);
+                break Ok(raw);
+            }
         }
     };
     if let Ok(raw) = &result {
-        write_watch.record_content_snapshot(address, raw);
+        if stable {
+            write_watch.record_content_snapshot(address, raw);
+        }
         let elapsed = started.elapsed();
         record_texture_work(
             &TEXTURE_SNAPSHOT_COUNT,

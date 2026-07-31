@@ -134,6 +134,22 @@ pub(crate) fn upload_image_textures(
             let comparison = image_is_comparison(binding.opcode);
             let decoded = decode_image_descriptor(&binding.resource_descriptor);
             let fallback = decoded.is_err();
+            if let Err(error) = &decoded {
+                // A fallback image samples as opaque black, so any draw that modulates by its
+                // alpha renders solid covers (Poppy menu glyphs). Name the failing descriptor
+                // once so the responsible guest SRD is attributable from the run log.
+                static LOGGED: OnceLock<Mutex<HashSet<Vec<u32>>>> = OnceLock::new();
+                let mut logged = LOGGED
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if logged.len() < 64 && logged.insert(binding.resource_descriptor.to_vec()) {
+                    eprintln!(
+                        "[REMu][METAL][IMAGE-FALLBACK] pc={:#x} opcode={} words={:08x?} error={error}",
+                        binding.pc, binding.opcode, binding.resource_descriptor,
+                    );
+                }
+            }
             let descriptor = decoded
                 .or_else(|_| fallback_image_descriptor(binding))
                 .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;

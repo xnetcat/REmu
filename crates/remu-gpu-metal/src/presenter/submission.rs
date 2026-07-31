@@ -270,7 +270,7 @@ impl MetalPresenter {
                                 GpuEvent::MemoryWait(wait),
                                 QueueBlockReason::GuestMemoryWait(wait),
                             );
-                            return PresenterFlow::Continue;
+                            continue;
                         }
                         Err(error) => {
                             eprintln!("[REMu][METAL] WAIT_REG_MEM synchronization failed: {error}");
@@ -286,7 +286,7 @@ impl MetalPresenter {
                                 GpuEvent::RegisteredMemoryWait { id, wait },
                                 QueueBlockReason::GuestMemoryWait(wait),
                             );
-                            return PresenterFlow::Continue;
+                            continue;
                         }
                         Err(error) => {
                             eprintln!(
@@ -319,7 +319,7 @@ impl MetalPresenter {
                                 GpuEvent::ComputeDispatch(dispatch),
                                 QueueBlockReason::ComputePipeline(key),
                             );
-                            return PresenterFlow::Continue;
+                            continue;
                         }
                     }
                     match self.execute_compute_dispatch(&dispatch) {
@@ -375,7 +375,7 @@ impl MetalPresenter {
                                 GpuEvent::IndexedDraw(draw),
                                 QueueBlockReason::GraphicsPipeline(key.clone()),
                             );
-                            return PresenterFlow::Continue;
+                            continue;
                         }
                     }
                     if diagnostic_skip_pixel_shader(draw.pixel_shader_address)

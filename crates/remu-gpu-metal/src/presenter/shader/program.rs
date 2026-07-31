@@ -451,6 +451,29 @@ pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
     allocation_message && primitive_export && position_export
 }
 
+/// Returns whether an export program manipulates the architectural 64-bit EXEC pair.
+///
+/// Prospero NGG exports ship in both wave sizes. Wave32 programs touch EXEC only through the
+/// `_B32` scalar forms, while wave64 programs build full 64-bit masks (`S_BFE_U64`/`S_MOV_B64`
+/// into EXEC, or the 64-bit SAVEEXEC forms) and recover their subgroup thread index as
+/// `s3[27:24] * 64 + v_mbcnt`. The mesh lowering must synthesize the merged wave info with the
+/// matching granularity, so this classification selects its architectural lane count.
+pub(crate) fn ngg_export_uses_wave64_exec(program: &Program) -> bool {
+    const EXEC_LO: u32 = 126;
+    program.instructions.iter().any(|instruction| {
+        let Some(name) = instruction.opcode.known_name() else {
+            return false;
+        };
+        if !(name.ends_with("B64") || name.ends_with("U64") || name.ends_with("I64")) {
+            return false;
+        }
+        name.contains("Saveexec")
+            || instruction.destinations.first().is_some_and(|destination| {
+                destination.kind == OperandKind::ScalarRegister && destination.value == EXEC_LO
+            })
+    })
+}
+
 /// True when an NGG export stages geometry records through general LDS (not ADDTID spills).
 ///
 /// GFX10 NGG recognition ([`ngg_mesh_export_stage`]) only needs alloc + prim/pos export. Mesh

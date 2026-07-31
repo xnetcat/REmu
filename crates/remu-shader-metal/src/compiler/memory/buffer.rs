@@ -134,8 +134,19 @@ impl Compiler<'_> {
         } else {
             format_u32(memory_payload_bytes(name, control.dword_count)?)
         };
-        let record_count = self.temp("uint", &resource2);
         let oob_select = self.temp("uint", &format!("({resource3} >> 28) & 3u"));
+        // Guest NUM_RECORDS often arrives through an SMEM-loaded V# (Poppy Slate/NGG UI), so
+        // rewriting only the presenter's scalar-metadata copy never reaches the Metal OOB check.
+        // When evaluation already expanded the bound Metal span past NUM_RECORDS*stride for
+        // instanced draws, honor that larger structured record count for OOB_SELECT 0/1.
+        // OOB_SELECT 3 keeps word2 as a raw byte extent and must not be reinterpreted.
+        let guest_record_count = self.temp("uint", &resource2);
+        let record_count = self.temp(
+            "uint",
+            &format!(
+                "({oob_select} <= 1u && {stride} != 0u) ? max({guest_record_count}, {binding_length} / {stride}) : {guest_record_count}"
+            ),
+        );
         let descriptor_null = self.temp(
             "bool",
             &format!("({resource0} | {resource1} | {resource2} | {resource3}) == 0u"),

@@ -46,6 +46,11 @@ pub(crate) struct Compiler<'a> {
     image_kinds: Vec<ImageKind>,
     image_slots: ImageBindingSlotMap,
     control_flow: ControlFlowLowering,
+    /// VGPR holding the NGG allocated/compacted vertex id that gates EXP (e.g. `v18` in
+    /// `V_CMPX_GT_U32 s4, v18` before POS). When set, mesh exports stage `remu_out` into
+    /// `remu_mesh_staged_vertices[vN]` so the epilogue can `set_vertex` by compacted index
+    /// instead of `remu_thread_index` (Poppy Slate UI tofu).
+    mesh_export_vertex_vgpr: Option<u32>,
 }
 
 impl Compiler<'_> {

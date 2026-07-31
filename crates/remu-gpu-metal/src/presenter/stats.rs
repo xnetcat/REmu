@@ -33,6 +33,9 @@ pub(super) static TEXTURE_SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static TEXTURE_SNAPSHOT_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
 
+/// Snapshots published while a guest thread was still writing the range.
+pub(super) static TEXTURE_SNAPSHOT_UNSTABLE_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub(super) static TEXTURE_DIRTY_VALIDATION_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static TEXTURE_DIRTY_VALIDATION_BYTES: AtomicU64 = AtomicU64::new(0);

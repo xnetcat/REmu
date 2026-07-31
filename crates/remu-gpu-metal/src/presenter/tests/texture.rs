@@ -994,6 +994,61 @@ fn texture_content_validation_avoids_clean_whole_resource_reloads() {
 }
 
 #[test]
+fn a_continuously_written_resource_still_completes_its_snapshot() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("contiguous texture mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let watch = watch_guest_texture(descriptor).expect("contiguous texture watch");
+
+    // Stores land through the guest mapping so they fault the armed watch exactly as the game's
+    // own writer thread does. A snapshot that only accepts a run with no concurrent store never
+    // converges against this writer, so reaching the assertions at all is the regression.
+    let finished = Arc::new(AtomicBool::new(false));
+    let writer_finished = Arc::clone(&finished);
+    let writer_address = usize::try_from(address.get()).expect("guest address fits usize");
+    let writer = std::thread::spawn(move || {
+        while !writer_finished.load(Ordering::Acquire) {
+            // SAFETY: the mapping outlives this thread because the test joins it before dropping
+            // the address space, and the write watch restores write access on the fault it takes.
+            unsafe { (writer_address as *mut u8).write_volatile(0x5a) };
+            std::hint::spin_loop();
+        }
+    });
+
+    let raw = snapshot_watched_guest_texture_raw(descriptor, &watch)
+        .expect("a concurrently written resource still yields a snapshot");
+    finished.store(true, Ordering::Release);
+    writer.join().expect("guest writer thread");
+
+    assert_eq!(raw.len(), 64 * 64 * 4);
+}
+
+#[test]
 fn live_content_baseline_skips_full_host_snapshot_copy() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -2446,6 +2501,54 @@ fn rgba_bgra_and_transfer_variants_can_share_typed_color_view_storage() {
         bgra_srgb,
         bgra_linear,
     ));
+}
+
+#[test]
+fn integer_and_normalized_views_of_one_channel_targets_share_typed_color_view_storage() {
+    // Octopath renders its occlusion chain to R8Uint targets and samples the same bytes through
+    // R8Unorm SRDs. Both formats are in Metal's one-channel 8-bit view class, so a format view
+    // reproduces the CPU decode without reading roughly 260 MiB per interval back through guest
+    // memory.
+    let rendered = GuestTextureDescriptor {
+        address: 0x80cd_de00_00,
+        width: 1_920,
+        height: 1_080,
+        pitch: 2_048,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::R8Uint,
+        bytes_per_pixel: 1,
+    };
+    let sampled = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::R8Unorm,
+        ..rendered
+    };
+    assert!(guest_texture_descriptors_share_color_view_storage(
+        rendered, sampled,
+    ));
+    assert!(guest_texture_descriptors_share_color_view_storage(
+        sampled, rendered,
+    ));
+    assert!(
+        !guest_texture_descriptors_share_color_view_storage(
+            rendered,
+            GuestTextureDescriptor {
+                pixel_format: MTLPixelFormat::R16Unorm,
+                bytes_per_pixel: 2,
+                ..rendered
+            },
+        ),
+        "channel widths that differ cannot back one Metal format view"
+    );
+    assert!(
+        !guest_texture_descriptors_share_color_view_storage(
+            rendered,
+            GuestTextureDescriptor {
+                pixel_format: MTLPixelFormat::Stencil8,
+                ..rendered
+            },
+        ),
+        "colour formats are not view-compatible with depth or stencil formats"
+    );
 }
 
 #[test]

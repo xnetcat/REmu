@@ -143,9 +143,9 @@ use self::shader::{
 #[cfg(test)]
 use self::shader::{
     lift_expanded_vertex_buffer_num_records, missing_vertex_parameter_exports,
-    ngg_mesh_draw_supported, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
-    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
-    truncated_memoryless_ngg_rectangle_cover,
+    ngg_export_uses_wave64_exec, ngg_mesh_draw_supported, procedural_rectangle_export_stage,
+    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
+    shader_scalar_metadata, truncated_memoryless_ngg_rectangle_cover,
 };
 #[cfg(test)]
 use self::stats::process_resident_bytes;
@@ -161,6 +161,7 @@ use self::stats::{
     TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT,
     process_memory_statistics, record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, take_mode27_work_details,
     take_texture_dirty_work_details, take_texture_snapshot_work_details,
@@ -232,7 +233,7 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// callback imposed an artificial ~2k draw/s ceiling even when both the guest producer and Metal
 /// encoder had capacity. This bound covers most of a frame while still returning to AppKit often
 /// enough to service input and window events.
-const GPU_EVENTS_PER_TICK: usize = 512;
+const GPU_EVENTS_PER_TICK: usize = 1024;
 // Unity can introduce dozens of distinct 200-400 KiB pixel programs at a scene boundary. Four
 // workers let the ordered GPU queue grow by several thousand events while Apple's compiler is
 // busy, which in turn withholds real guest flips and starves the guest audio producers. Each
@@ -440,7 +441,6 @@ struct GuestTextureDescriptor {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Mode27WorkOrigin {
     RenderTargetCreate,
-    AcquireReload,
     SampledCacheCreate,
     StorageCreate,
 }

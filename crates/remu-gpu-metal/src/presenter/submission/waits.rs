@@ -20,10 +20,14 @@ impl MetalPresenter {
             && let Some(value) = remu_gpu::take_gpu_wait_latch(ticket_id)
         {
             self.guest_memory_waits.complete(key);
-            eprintln!(
-                "[REMu][METAL] resumed WAIT_REG_MEM from submitted producer ticket address={:#x} value={value:#x}",
-                wait.address
-            );
+            static RESUMED_TICKET_WAITS: AtomicUsize = AtomicUsize::new(0);
+            let sequence = RESUMED_TICKET_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if sequence <= 16 || sequence.is_power_of_two() {
+                eprintln!(
+                    "[REMu][METAL] resumed WAIT_REG_MEM from submitted producer ticket address={:#x} value={value:#x}",
+                    wait.address
+                );
+            }
             return Ok(GuestMemoryWaitStatus::Satisfied);
         }
         if wait.address == 0 {
@@ -112,10 +116,14 @@ impl MetalPresenter {
         if ticket_id.is_none() {
             match self.guest_memory_waits.observe_unsatisfied(key) {
                 GuestMemoryWaitRecovery::ProducerLatched(value) => {
-                    eprintln!(
-                        "[REMu][METAL] resumed WAIT_REG_MEM from a real producer latch address={:#x} value={value:#x}",
-                        wait.address
-                    );
+                    static RESUMED_PRODUCER_WAITS: AtomicUsize = AtomicUsize::new(0);
+                    let sequence = RESUMED_PRODUCER_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sequence <= 16 || sequence.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][METAL] resumed WAIT_REG_MEM from a real producer latch address={:#x} value={value:#x}",
+                            wait.address
+                        );
+                    }
                     return Ok(GuestMemoryWaitStatus::Satisfied);
                 }
                 GuestMemoryWaitRecovery::None => {}
