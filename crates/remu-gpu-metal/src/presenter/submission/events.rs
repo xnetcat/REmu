@@ -2,12 +2,24 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    GPU_EVENTS_PER_TICK, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
-    PipelineCompileCandidate, QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
+    OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PipelineCompileCandidate,
+    QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
+};
+use super::super::{
+    GPU_EVENTS_PER_TICK, GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER,
+    GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD,
 };
 use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
+
+fn dependency_ingress_budget() -> usize {
+    if remu_gpu::gpu_work_items_pending() > GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD {
+        GPU_EVENTS_PER_TICK.saturating_mul(GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER)
+    } else {
+        GPU_EVENTS_PER_TICK
+    }
+}
 
 /// Extra decoded-event storage used only to discover an independent queue behind blocked tails.
 ///
@@ -175,7 +187,7 @@ impl OrderedGpuEventReceiver {
     /// indefinitely withhold a producer from another queue.
     fn ingest_guest_memory_wait_dependencies(&mut self) {
         if self.needs_dependency_ingress() {
-            self.ingest(GPU_EVENTS_PER_TICK);
+            self.ingest(dependency_ingress_budget());
         }
     }
 
@@ -183,7 +195,7 @@ impl OrderedGpuEventReceiver {
         &mut self,
         pipeline_resolved: impl Fn(&QueueBlockReason) -> bool,
     ) -> OrderedEventPoll {
-        self.ingest(GPU_EVENTS_PER_TICK);
+        self.ingest(dependency_ingress_budget());
         self.blocked_queues.retain(|_, reason| match reason {
             QueueBlockReason::GuestMemoryWait(_) => true,
             reason @ (QueueBlockReason::GraphicsPipeline(_)

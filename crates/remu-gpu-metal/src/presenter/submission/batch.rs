@@ -130,11 +130,37 @@ impl MetalPresenter {
         self.publish_terminal_guest_memory_writes(&batch.memory_writes, result)
     }
 
+    pub(super) fn gpu_events_per_tick_budget(&self) -> usize {
+        if remu_gpu::gpu_work_items_pending() > super::super::GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD
+        {
+            super::super::GPU_EVENTS_PER_TICK
+                .saturating_mul(super::super::GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER)
+        } else {
+            super::super::GPU_EVENTS_PER_TICK
+        }
+    }
+
+    pub(super) fn guest_submission_backpressure_full(&self) -> bool {
+        self.committed_guest_batches.len() >= super::super::MAX_COMMITTED_GUEST_BATCHES
+            && self
+                .open_guest_batch
+                .as_ref()
+                .is_none_or(|batch| batch.work.len() >= super::super::GUEST_BATCH_WORK_CAPACITY)
+    }
+
     pub(crate) fn flush_guest_command_batch(
         &mut self,
         wait: bool,
         reason: GuestBatchFlushReason,
     ) -> Result<(), String> {
+        if self.open_guest_batch.is_none() {
+            return Ok(());
+        }
+        if !wait
+            && self.committed_guest_batches.len() >= super::super::MAX_COMMITTED_GUEST_BATCHES
+        {
+            return Ok(());
+        }
         let Some(mut batch) = self.open_guest_batch.take() else {
             return Ok(());
         };

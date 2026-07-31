@@ -3,10 +3,10 @@
 
 use super::{
     ActiveGuestMemoryWait, DisplayConfiguration, GLOBAL_UPLOAD_ALIGNMENT,
-    GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GPU_EVENTS_PER_TICK, GlobalUploadChunk, GuestBatchFlushReason,
+    GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk, GuestBatchFlushReason,
     GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery,
     GuestMemoryWaitStatus, GuestMemoryWaitTracker, GuestMemoryWriteOperation,
-    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OrderedEventPoll, OrderedEventSource,
+    MetalPresenter, OrderedEventPoll, OrderedEventSource,
     OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PendingFlip,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
     PipelineCompileCandidate, PresenterFlow, QueueBlockReason, ScheduledGpuSubmission,
@@ -54,10 +54,10 @@ impl MetalPresenter {
         // cross-queue producer waiting in later channel chunks. Then retry suspended queue fronts
         // once; an unsatisfied wait is re-suspended without permitting later work to overtake it.
         self.receiver.retry_guest_memory_waits();
-        // Do not pull more guest commands while Metal already owns the bounded in-flight budget.
-        // The event loop remains responsive and retries after every retirement tick, while the
-        // channel's existing capacity propagates backpressure to the guest producer.
-        if self.committed_guest_batches.len() >= MAX_COMMITTED_GUEST_BATCHES {
+        // Do not commit more Metal batches while the in-flight budget is exhausted. Keep draining
+        // decoded guest work into the open batch so queue depth (Q W) does not grow just because
+        // the GPU is still executing earlier submissions.
+        if self.guest_submission_backpressure_full() {
             return PresenterFlow::Continue;
         }
         // Feed the existing compile workers from bounded ordered lookahead even while the current
@@ -69,7 +69,7 @@ impl MetalPresenter {
         self.prefetch_pipeline_compilations();
         // A bounded batch prevents a continuously producing guest from starving redraw and input
         // delivery. Queue-local shader and memory waits leave independent guest queues runnable.
-        for _ in 0..GPU_EVENTS_PER_TICK {
+        for _ in 0..self.gpu_events_per_tick_budget() {
             // A bounded drain can still spend several seconds preparing hundreds of large shaders.
             // Compiler workers publish into an independent result channel during that time.
             // Refresh before every readiness decision so a pipeline that completed during this
@@ -483,7 +483,7 @@ impl MetalPresenter {
             if self.redraw_pending {
                 return PresenterFlow::Continue;
             }
-            if self.committed_guest_batches.len() >= MAX_COMMITTED_GUEST_BATCHES {
+            if self.guest_submission_backpressure_full() {
                 return PresenterFlow::Continue;
             }
         }

@@ -235,6 +235,8 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// encoder had capacity. This bound covers most of a frame while still returning to AppKit often
 /// enough to service input and window events.
 const GPU_EVENTS_PER_TICK: usize = 1024;
+const GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD: usize = 256;
+const GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER: usize = 2;
 // Unity can introduce dozens of distinct 200-400 KiB pixel programs at a scene boundary. Four
 // workers let the ordered GPU queue grow by several thousand events while Apple's compiler is
 // busy, which in turn withholds real guest flips and starves the guest audio producers. Each
@@ -243,14 +245,14 @@ const GPU_EVENTS_PER_TICK: usize = 1024;
 /// Keep individual Metal submissions short enough for the shared Apple GPU to return regularly
 /// to WindowServer. Unreal transition scenes can otherwise put hundreds of full-resolution draws
 /// in one command buffer and monopolize the device for seconds.
-const GUEST_BATCH_WORK_CAPACITY: usize = 32;
+const GUEST_BATCH_WORK_CAPACITY: usize = 64;
 
 /// Maximum number of committed guest batches allowed ahead of the host GPU.
 ///
 /// Each batch retains its transient uploads, render targets, and writeback resources until Metal
 /// completes it. Bounding the queue prevents a stalled or simply overloaded game from growing
 /// unified-memory use indefinitely and making the whole system unresponsive.
-const MAX_COMMITTED_GUEST_BATCHES: usize = 3;
+const MAX_COMMITTED_GUEST_BATCHES: usize = 4;
 const SAMPLED_TEXTURE_CACHE_CAPACITY: usize = 2_048;
 const DEFAULT_SAMPLED_TEXTURE_CACHE_MIB: u64 = 1_536;
 /// Persistent GPU-authored render/storage images retain the architectural contents of guest
