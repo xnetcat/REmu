@@ -23,12 +23,14 @@ use super::{
 };
 mod archive;
 mod compile;
-pub(crate) use self::compile::metal_compile_failure_is_transient;
-mod program;
 pub(crate) use self::compile::{
     compile_metal_compute_library, compile_metal_library_with_tools, compile_metal_shader_library,
-    dump_compute_shader_msl, dump_shader_pair_ir, dump_shader_pair_msl, metal_cache_root,
+    dump_compute_shader_msl, dump_shader_pair_ir, dump_shader_pair_msl,
+    invalidate_metal_library_cache, metal_cache_root, metal_compile_failure_is_transient,
 };
+#[cfg(test)]
+pub(crate) use self::compile::{metallib_bytes_are_usable, MIN_VALID_METALLIB_BYTES};
+mod program;
 pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, effective_global_memory_binding,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,

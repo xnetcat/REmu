@@ -319,10 +319,26 @@ an open defect.
 
 ### Gameplay after NEW GAME remains black
 
-The loading screen completes, but the following in-game view remains black. UI elements can still
-appear and the renderer continues submitting work with no failed pipelines, so this remains a
-scene-content, synchronization, or post-processing defect rather than a completed compatibility
-milestone.
+The loading screen completes, but the following in-game view can remain black while UI overlays
+still draw. Two host-side causes were confirmed on the default `run-game.sh` path (bundled offline
+`REMU_METAL_COMPILER`):
+
+1. **Poisoned persistent metallib cache** — failed or raced offline links left ~92-byte header-only
+   `.metallib` files in `~/Library/Caches/REMu/metal/`. Cache hits loaded them successfully but
+   exposed no `remu_main`, permanently failing every graphics/compute pair (`failed=25+`,
+   `targets=2`, ~28k dropped draws). Fixed by rejecting sub-256-byte cache entries, refusing to
+   persist empty libraries, and falling back to in-process Metal compile when an offline library
+   lacks the entry point.
+2. **Transient offline spawn failures** — `ENOENT` from concurrent `metal` worker spawns were
+   recorded as terminal pipeline failures. Fixed by deferring transient tool errors instead of
+   inserting into `failed_shader_pairs`.
+
+After both fixes, a 120s foreground verify with the bundled offline compiler reaches
+`failed=0/0`, ~30 compiled Gen5 shader pairs, and ~44 color targets (~636 MiB resident) with no
+`PERF-DROPPED` lines. A separate in-process-only verify matches verify2-style pipeline health.
+Visual confirmation past NEW GAME/character select without pad injection remains open; if the
+display is still black with healthy pipelines, the next suspect is post-process composite sampling
+(`INTERFACE-FILL` procedural draws, scanout vs resident color RT timing).
 
 ### The runtime test suite is order-dependent
 

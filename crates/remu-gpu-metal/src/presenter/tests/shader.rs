@@ -214,6 +214,29 @@ fn transient_compile_failure_is_retried_not_terminal() {
 }
 
 #[test]
+fn metallib_bytes_are_usable_rejects_header_only_cache_entries() {
+    use std::io::Write;
+
+    let directory = std::env::temp_dir().join(format!(
+        "remu-metallib-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("create temp directory");
+    let truncated = directory.join("truncated.metallib");
+    let mut file = std::fs::File::create(&truncated).expect("create truncated metallib");
+    file.write_all(&[0; 92]).expect("write truncated metallib");
+    assert!(!super::super::shader::metallib_bytes_are_usable(&truncated));
+
+    let valid = directory.join("valid.metallib");
+    let mut file = std::fs::File::create(&valid).expect("create valid metallib");
+    file.write_all(&[0; super::super::shader::MIN_VALID_METALLIB_BYTES as usize])
+        .expect("write valid metallib");
+    assert!(super::super::shader::metallib_bytes_are_usable(&valid));
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
 fn metal_compile_failure_is_transient_for_tool_spawn_errors() {
     assert!(super::super::shader::metal_compile_failure_is_transient(
         "could not start vertex compilation: No such file or directory (os error 2)"

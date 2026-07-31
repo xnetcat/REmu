@@ -4,10 +4,11 @@
 use super::{
     MetalPresenter, PersistentRenderPipelineArchive, RenderPipelineArchiveState,
     ShaderFunctionCache, ShaderFunctionCacheEntry, ShaderFunctionStageCache,
-    compile_metal_shader_library, metal_cache_root,
+    compile_metal_shader_library, invalidate_metal_library_cache, metal_cache_root,
 };
 use metal::{
-    BinaryArchiveDescriptor, Device, Function, RenderPipelineDescriptor, RenderPipelineState, URL,
+    BinaryArchiveDescriptor, CompileOptions, Device, Function, RenderPipelineDescriptor,
+    RenderPipelineState, URL,
 };
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
@@ -402,6 +403,27 @@ impl ShaderFunctionCache {
                 .get_function(&shader.entry_point, None)
                 .map_err(|error| format!("Metal {stage} function: {error}"))
         })();
+        let compiled = match compiled {
+            Ok(function) => Ok(function),
+            Err(error)
+                if std::env::var_os("REMU_METAL_COMPILER").is_some()
+                    && error.contains("does not exist") =>
+            {
+                invalidate_metal_library_cache(&shader.source);
+                eprintln!(
+                    "[REMu][METAL] discarding poisoned offline {stage} cache; falling back to in-process compile"
+                );
+                let compile_options = CompileOptions::new();
+                compile_options.set_fast_math_enabled(false);
+                let library = device
+                    .new_library_with_source(&shader.source, &compile_options)
+                    .map_err(|error| format!("Metal {stage} compilation: {error}"))?;
+                library
+                    .get_function(&shader.entry_point, None)
+                    .map_err(|error| format!("Metal {stage} function: {error}"))
+            }
+            Err(error) => Err(error),
+        };
         let mut entries = cache
             .entries
             .lock()

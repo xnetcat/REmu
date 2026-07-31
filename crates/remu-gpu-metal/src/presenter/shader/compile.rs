@@ -10,15 +10,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) const METAL_LIBRARY_CACHE_FORMAT: &[u8] = b"remu-metal-library-v1\0";
 
-pub(crate) fn compile_metal_shader_library(
+/// Header-only metallibs from failed offline links are ~92 bytes and load successfully but expose
+/// no entry points. Reject them before cache hits poison every subsequent compile attempt.
+pub(crate) const MIN_VALID_METALLIB_BYTES: u64 = 256;
+
+pub(crate) fn metallib_bytes_are_usable(path: &Path) -> bool {
+    path.metadata()
+        .map(|metadata| metadata.len() >= MIN_VALID_METALLIB_BYTES)
+        .unwrap_or(false)
+}
+
+pub(crate) fn invalidate_metal_library_cache(source: &str) {
+    let cache_path = metal_library_cache_path(source);
+    if cache_path.is_file() {
+        let _ = std::fs::remove_file(cache_path);
+    }
+}
+
+fn compile_metal_library_in_process(
     device: &Device,
     stage: &str,
     source: &str,
 ) -> Result<Library, String> {
-    if std::env::var_os("REMU_METAL_COMPILER").is_some() {
-        return compile_metal_library_with_tools(device, stage, source);
-    }
-
     let compile_options = CompileOptions::new();
     compile_options.set_fast_math_enabled(false);
     device
@@ -26,18 +39,45 @@ pub(crate) fn compile_metal_shader_library(
         .map_err(|error| format!("Metal {stage} compilation: {error}"))
 }
 
+pub(crate) fn compile_metal_shader_library(
+    device: &Device,
+    stage: &str,
+    source: &str,
+) -> Result<Library, String> {
+    if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+        match compile_metal_library_with_tools(device, stage, source) {
+            Ok(library) => Ok(library),
+            Err(error) if metal_compile_failure_is_transient(&error) => Err(error),
+            Err(error) => {
+                eprintln!(
+                    "[REMu][METAL] offline {stage} compile failed ({error}); falling back to in-process"
+                );
+                compile_metal_library_in_process(device, stage, source)
+            }
+        }
+    } else {
+        compile_metal_library_in_process(device, stage, source)
+    }
+}
+
 pub(crate) fn compile_metal_compute_library(
     device: &Device,
     source: &str,
 ) -> Result<Library, String> {
     if std::env::var_os("REMU_METAL_COMPILER").is_some() {
-        return compile_metal_library_with_tools(device, "compute", source);
+        match compile_metal_library_with_tools(device, "compute", source) {
+            Ok(library) => Ok(library),
+            Err(error) if metal_compile_failure_is_transient(&error) => Err(error),
+            Err(error) => {
+                eprintln!(
+                    "[REMu][METAL] offline compute compile failed ({error}); falling back to in-process"
+                );
+                compile_metal_library_in_process(device, "compute", source)
+            }
+        }
+    } else {
+        compile_metal_library_in_process(device, "compute", source)
     }
-    let compile_options = CompileOptions::new();
-    compile_options.set_fast_math_enabled(false);
-    device
-        .new_library_with_source(source, &compile_options)
-        .map_err(|error| format!("Metal compute compilation: {error}"))
 }
 
 pub(crate) fn compile_metal_library_with_tools(
@@ -61,24 +101,33 @@ pub(crate) fn compile_metal_library_with_tools(
     }
     let cache_path = metal_library_cache_path(source);
     if cache_path.is_file() {
-        match device.new_library_with_file(&cache_path) {
-            Ok(library) => {
-                let hit = CACHE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
-                if hit <= 8 || hit.is_power_of_two() {
+        if !metallib_bytes_are_usable(&cache_path) {
+            let bytes = cache_path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            eprintln!(
+                "[REMu][METAL] discarding truncated cached {stage} library {} ({bytes} bytes)",
+                cache_path.display()
+            );
+            let _ = std::fs::remove_file(&cache_path);
+        } else {
+            match device.new_library_with_file(&cache_path) {
+                Ok(library) => {
+                    let hit = CACHE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if hit <= 8 || hit.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][METAL] persistent shader cache hit={hit} stage={stage} path={}",
+                            cache_path.display()
+                        );
+                    }
+                    return Ok(library);
+                }
+                Err(error) => {
+                    PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
-                        "[REMu][METAL] persistent shader cache hit={hit} stage={stage} path={}",
+                        "[REMu][METAL] discarding unreadable cached {stage} library {}: {error}",
                         cache_path.display()
                     );
+                    let _ = std::fs::remove_file(&cache_path);
                 }
-                return Ok(library);
-            }
-            Err(error) => {
-                PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
-                    "[REMu][METAL] discarding unreadable cached {stage} library {}: {error}",
-                    cache_path.display()
-                );
-                let _ = std::fs::remove_file(&cache_path);
             }
         }
     }
@@ -111,6 +160,12 @@ pub(crate) fn compile_metal_library_with_tools(
             .arg(&library_path),
         &format!("{stage} library link"),
     )?;
+    if !metallib_bytes_are_usable(&library_path) {
+        let bytes = library_path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        return Err(format!(
+            "{stage} library link produced an unusable metallib ({bytes} bytes)"
+        ));
+    }
     if let Some(parent) = cache_path.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
