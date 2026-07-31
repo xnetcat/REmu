@@ -482,6 +482,18 @@ pub(crate) fn map_flexible_memory_core(
 }
 
 #[cfg(not(target_os = "macos"))]
+pub(crate) fn map_flexible_memory_core(
+    _output: u64,
+    _length: u64,
+    _protection: i32,
+    _flags: u64,
+    _name: &str,
+    _state: &mut ProbeDispatchState,
+) -> u64 {
+    sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+}
+
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn map_named_flexible_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,

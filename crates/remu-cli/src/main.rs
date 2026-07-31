@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "macos")]
 use remu_gpu::GpuProbe;
+#[cfg(target_os = "macos")]
 use remu_gpu_metal::MetalProbe;
 
 mod analyze;
@@ -74,17 +76,7 @@ fn main() -> ExitCode {
             println!("process_translation={}", info.process_translation);
             ExitCode::SUCCESS
         }
-        Command::GpuInfo => match MetalProbe::probe_default() {
-            Ok(adapter) => {
-                println!("api={}", adapter.api);
-                println!("adapter={}", adapter.name);
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::FAILURE
-            }
-        },
+        Command::GpuInfo => gpu_info(),
         Command::Imports { path } => imports(&path),
         Command::Map { path } => map(&path),
         Command::Link { path } => link(&path),
@@ -104,6 +96,27 @@ fn main() -> ExitCode {
             timeout_seconds,
         } => run_game(&path, import_limit, timeout_seconds),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn gpu_info() -> ExitCode {
+    match MetalProbe::probe_default() {
+        Ok(adapter) => {
+            println!("api={}", adapter.api);
+            println!("adapter={}", adapter.name);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gpu_info() -> ExitCode {
+    eprintln!("error: gpu-info requires the macOS Metal backend");
+    ExitCode::FAILURE
 }
 
 fn parse_integer(value: &str) -> Result<u64, String> {

@@ -37,6 +37,11 @@ pub use address_space::{
     read_guest_shared_backing, write_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 
+/// Guest page size is 16 KiB on every host. The sparse address-space backend that uses it is
+/// macOS-only today; analysis and page-alignment helpers still need the constant everywhere.
+#[cfg(not(target_os = "macos"))]
+pub const GUEST_PAGE_SIZE: u64 = 16 * 1024;
+
 pub const PS5_MAIN_IMAGE_BASE: GuestAddress = GuestAddress::new(0x0000_0008_0000_0000);
 
 pub const GUEST_EXECUTE: u32 = 0x1;

@@ -163,15 +163,27 @@ pub(crate) fn dispatch_guest_numeric_parser(nid: &str, arguments: [u64; 6]) -> P
     let end_pointer = arguments[1] as *mut *mut libc::c_char;
     let result = match nid {
         // Dinkumware _Stoul uses the target's unsigned-long parser and the same three-argument
-        // signature as strtoul. Gen5 and the macOS x86-64 host both use a 64-bit unsigned long.
+        // signature as strtoul. Gen5 uses a 64-bit unsigned long; Windows LLP64 hosts use
+        // `strtoull` so the guest still observes a 64-bit parse width.
         "zlfEH8FmyUA" => {
             // SAFETY: The guest supplies a NUL-terminated string and optional writable end pointer.
             ProbeImportReturn::integer(unsafe {
-                libc::strtoul(
-                    arguments[0] as *const libc::c_char,
-                    end_pointer,
-                    low_i32(arguments[2]),
-                )
+                #[cfg(windows)]
+                {
+                    libc::strtoull(
+                        arguments[0] as *const libc::c_char,
+                        end_pointer,
+                        low_i32(arguments[2]),
+                    )
+                }
+                #[cfg(not(windows))]
+                {
+                    libc::strtoul(
+                        arguments[0] as *const libc::c_char,
+                        end_pointer,
+                        low_i32(arguments[2]),
+                    ) as u64
+                }
             })
         }
         // libc strtoull

@@ -13,11 +13,13 @@ path = "src/main.rs"
 clap.workspace = true
 iced-x86.workspace = true
 remu-gpu = { path = "../remu-gpu" }
-remu-gpu-metal = { path = "../remu-gpu-metal" }
 remu-loader = { path = "../remu-loader" }
 remu-memory = { path = "../remu-memory" }
 remu-platform = { path = "../remu-platform" }
 remu-runtime = { path = "../remu-runtime" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+remu-gpu-metal = { path = "../remu-gpu-metal" }
 
 [lints]
 workspace = true

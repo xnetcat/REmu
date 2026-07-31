@@ -4,7 +4,7 @@ use remu_core::GuestAddress;
 use remu_loader::LoadedExecutable;
 use remu_memory::{GuestImage, MappingError};
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 use crate::native_cxx_runtime;
 use crate::{LinkError, LinkedImage, runtime_address_at};
 
@@ -99,6 +99,14 @@ pub(crate) fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize,
             );
         }
     }
+    Ok(image.unwind_fdes.len())
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+pub(crate) fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize, LinkError> {
+    // Host libunwind registration is a macOS x86_64 Rosetta path. Analysis and non-macOS hosts
+    // still decode FDE inventories for diagnostics, but they do not register them with a native
+    // unwinder.
     Ok(image.unwind_fdes.len())
 }
 

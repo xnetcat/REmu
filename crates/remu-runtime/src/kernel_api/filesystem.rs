@@ -8,8 +8,12 @@ use crate::{
     process_guest_range_has_read_access, read_guest_cstring, read_guest_u64,
     resolve_probe_guest_path, sce_kernel_error, sce_kernel_io_error,
 };
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{FileExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 use super::{
     KERNEL_MODE_BITS, MICROSECONDS_PER_SECOND, TIMEVAL_MICROSECONDS_OFFSET, TIMEVAL_SIZE,
@@ -76,9 +80,18 @@ pub(super) fn kernel_chmod(arguments: [u64; 6], state: &ProbeDispatchState) -> u
     if !host_path.exists() {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
-    let mode = low_u32(arguments[1]) & KERNEL_MODE_BITS;
-    std::fs::set_permissions(&host_path, PermissionsExt::from_mode(mode))
-        .map_or_else(|error| sce_kernel_io_error(&error), |()| 0)
+    #[cfg(unix)]
+    {
+        let mode = low_u32(arguments[1]) & KERNEL_MODE_BITS;
+        return std::fs::set_permissions(&host_path, PermissionsExt::from_mode(mode))
+            .map_or_else(|error| sce_kernel_io_error(&error), |()| 0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (arguments[1], KERNEL_MODE_BITS);
+        // Windows NTFS permissions are not POSIX mode bits; accept the call as a no-op.
+        0
+    }
 }
 
 /// Sets the length of the file at a guest path, extending it with zeroes when it grows.
@@ -99,6 +112,7 @@ pub(super) fn kernel_truncate(arguments: [u64; 6], state: &ProbeDispatchState) -
     }
 }
 
+#[cfg(unix)]
 /// Reads one guest `timeval` into the host's own representation of the same instant.
 ///
 /// Both fields are 64 bits wide in the guest ABI while the host narrows the fractional one, so
@@ -116,6 +130,21 @@ pub(super) fn read_guest_timeval(address: u64) -> Option<libc::timeval> {
     })
 }
 
+#[cfg(not(unix))]
+fn read_guest_system_time(address: u64) -> Option<std::time::SystemTime> {
+    let seconds = i64::from_ne_bytes(read_guest_u64(address).to_ne_bytes());
+    let microseconds =
+        i64::from_ne_bytes(read_guest_u64(address + TIMEVAL_MICROSECONDS_OFFSET).to_ne_bytes());
+    if seconds < 0 || !(0..MICROSECONDS_PER_SECOND).contains(&microseconds) {
+        return None;
+    }
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(seconds.cast_unsigned())
+            + std::time::Duration::from_micros(microseconds.cast_unsigned()),
+    )
+}
+
 /// Sets the access and modification times of a guest path.
 ///
 /// A null time array asks for the current time on both.
@@ -124,34 +153,68 @@ pub(super) fn kernel_utimes(arguments: [u64; 6], state: &ProbeDispatchState) -> 
         Ok(host_path) => host_path,
         Err(error) => return error,
     };
-    let Ok(host_path) = std::ffi::CString::new(host_path.as_os_str().as_bytes()) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    };
-    let times = arguments[1];
-    let result = if times == 0 {
-        // SAFETY: the path is a live NUL-terminated host string and a null time array is the
-        // documented request for the current time.
-        unsafe { libc::utimes(host_path.as_ptr(), std::ptr::null()) }
-    } else {
-        let length = usize::try_from(TIMEVAL_SIZE * 2).expect("two timevals fit usize");
-        if !guest_range_is_readable(times, length) {
-            return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
-        }
-        let (Some(accessed), Some(modified)) = (
-            read_guest_timeval(times),
-            read_guest_timeval(times + TIMEVAL_SIZE),
-        ) else {
+    #[cfg(unix)]
+    {
+        let Ok(host_path) = std::ffi::CString::new(host_path.as_os_str().as_bytes()) else {
             return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
         };
-        let values = [accessed, modified];
-        // SAFETY: the path is a live NUL-terminated host string and `values` is a complete
-        // two-element host time array owned by this frame.
-        unsafe { libc::utimes(host_path.as_ptr(), values.as_ptr()) }
-    };
-    if result == 0 {
-        0
-    } else {
-        sce_kernel_io_error(&std::io::Error::last_os_error())
+        let times = arguments[1];
+        let result = if times == 0 {
+            // SAFETY: the path is a live NUL-terminated host string and a null time array is the
+            // documented request for the current time.
+            unsafe { libc::utimes(host_path.as_ptr(), std::ptr::null()) }
+        } else {
+            let length = usize::try_from(TIMEVAL_SIZE * 2).expect("two timevals fit usize");
+            if !guest_range_is_readable(times, length) {
+                return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+            }
+            let (Some(accessed), Some(modified)) = (
+                read_guest_timeval(times),
+                read_guest_timeval(times + TIMEVAL_SIZE),
+            ) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            let values = [accessed, modified];
+            // SAFETY: the path is a live NUL-terminated host string and `values` is a complete
+            // two-element host time array owned by this frame.
+            unsafe { libc::utimes(host_path.as_ptr(), values.as_ptr()) }
+        };
+        if result == 0 {
+            0
+        } else {
+            sce_kernel_io_error(&std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let times = arguments[1];
+        let (accessed, modified) = if times == 0 {
+            let now = std::time::SystemTime::now();
+            (now, now)
+        } else {
+            let length = usize::try_from(TIMEVAL_SIZE * 2).expect("two timevals fit usize");
+            if !guest_range_is_readable(times, length) {
+                return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+            }
+            let (Some(accessed), Some(modified)) = (
+                read_guest_system_time(times),
+                read_guest_system_time(times + TIMEVAL_SIZE),
+            ) else {
+                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            };
+            (accessed, modified)
+        };
+        let file_times = std::fs::FileTimes::new()
+            .set_accessed(accessed)
+            .set_modified(modified);
+        match std::fs::File::options()
+            .write(true)
+            .open(&host_path)
+            .and_then(|file| file.set_times(file_times))
+        {
+            Ok(()) => 0,
+            Err(error) => sce_kernel_io_error(&error),
+        }
     }
 }
 
@@ -181,6 +244,46 @@ pub(super) fn kernel_fsync(arguments: [u64; 6]) -> u64 {
         .map_or_else(|error| sce_kernel_io_error(&error), |()| 0)
 }
 
+fn positional_write(
+    file: &std::fs::File,
+    source: &[u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        file.write_at(source, offset)
+    }
+    #[cfg(windows)]
+    {
+        file.seek_write(source, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, source, offset);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
+fn positional_read(
+    file: &std::fs::File,
+    destination: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        file.read_at(destination, offset)
+    }
+    #[cfg(windows)]
+    {
+        file.seek_read(destination, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, destination, offset);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
 /// Transfers bytes at an explicit file offset without disturbing the descriptor's shared cursor.
 pub(super) fn kernel_positional_transfer(arguments: [u64; 6], write: bool) -> u64 {
     let fd = low_i32(arguments[0]);
@@ -206,7 +309,7 @@ pub(super) fn kernel_positional_transfer(arguments: [u64; 6], write: bool) -> u6
         // SAFETY: the positional write ABI supplies a readable guest range of exactly `length`
         // bytes, and the descriptor table lock serialises access to the file.
         let source = unsafe { std::slice::from_raw_parts(buffer as *const u8, length) };
-        file.write_at(source, offset.cast_unsigned())
+        positional_write(file, source, offset.cast_unsigned())
     } else {
         if !process_guest_range_has_read_access(buffer, length) {
             return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
@@ -216,14 +319,13 @@ pub(super) fn kernel_positional_transfer(arguments: [u64; 6], write: bool) -> u6
             return sce_kernel_error(SCE_KERNEL_ERROR_OUT_OF_MEMORY);
         }
         staging.resize(length, 0_u8);
-        file.read_at(&mut staging, offset.cast_unsigned())
-            .inspect(|&transferred| {
-                // SAFETY: the complete guest destination range was validated above. Copying with
-                // CPU stores lets CpuWriteWatch synchronously disarm and dirty protected pages.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(staging.as_ptr(), buffer as *mut u8, transferred);
-                }
-            })
+        positional_read(file, &mut staging, offset.cast_unsigned()).inspect(|&transferred| {
+            // SAFETY: the complete guest destination range was validated above. Copying with
+            // CPU stores lets CpuWriteWatch synchronously disarm and dirty protected pages.
+            unsafe {
+                std::ptr::copy_nonoverlapping(staging.as_ptr(), buffer as *mut u8, transferred);
+            }
+        })
     };
     match transferred {
         Ok(transferred) => u64::try_from(transferred).expect("transferred byte count fits u64"),

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{
@@ -17,6 +19,26 @@ use crate::{
 const AMPR_ORDER_LOCK_COUNT: usize = 64;
 const AMPR_STAGING_POOL_LIMIT: usize = 4;
 const AMPR_MAX_RETAINED_STAGING_BYTES: usize = 8 * 1024 * 1024;
+
+fn positional_file_read(
+    file: &std::fs::File,
+    destination: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        file.read_at(destination, offset)
+    }
+    #[cfg(windows)]
+    {
+        file.seek_read(destination, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, destination, offset);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
 
 pub(crate) fn ampr_command_order(command_buffer: u64) -> &'static Mutex<()> {
     let locks = AMPR_COMMAND_ORDER
@@ -665,7 +687,7 @@ pub(crate) fn ampr_read_file_to_guest(
         let Some(offset) = file_offset.checked_add(total as u64) else {
             return Err(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
         };
-        let read = match file.read_at(&mut staging[total..], offset) {
+        let read = match positional_file_read(file, &mut staging[total..], offset) {
             Ok(file) => file,
             Err(error) => {
                 eprintln!(

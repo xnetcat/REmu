@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::process::ExitCode;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 pub(crate) fn map(path: &Path) -> ExitCode {
@@ -137,6 +138,20 @@ pub(crate) fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> E
 }
 
 pub(crate) fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, import_limit, timeout_seconds);
+        eprintln!("error: run requires the macOS Metal presenter");
+        return ExitCode::FAILURE;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        run_game_metal(path, import_limit, timeout_seconds)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_game_metal(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
     let (linked, module_report) = match load_process_image(path) {
         Ok(process) => process,
         Err(error) => {

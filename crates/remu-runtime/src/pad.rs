@@ -256,21 +256,17 @@ pub(crate) fn pad_read_state(arguments: [u64; 6]) -> u64 {
     write_guest_u8(output + 0x09, host.r2);
     write_guest_u32(output + 0x18, 1.0_f32.to_bits());
     write_guest_u8(output + 0x4c, 1);
-    let mut timestamp = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: timestamp is a valid writable host timespec.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut timestamp) } == 0 {
-        let seconds = u64::try_from(timestamp.tv_sec).unwrap_or(0);
-        let nanoseconds = u64::try_from(timestamp.tv_nsec).unwrap_or(0);
-        write_guest_u64(
-            output + 0x50,
-            seconds
-                .saturating_mul(1_000_000)
-                .saturating_add(nanoseconds / 1_000),
-        );
-    }
+    let monotonic = std::time::Instant::now();
+    // Host Instant has no public epoch; approximate a rising microsecond counter from a process
+    // start so pad consumers that only need monotonicity keep working off-macOS.
+    static PAD_MONOTONIC_ORIGIN: std::sync::OnceLock<std::time::Instant> =
+        std::sync::OnceLock::new();
+    let origin = *PAD_MONOTONIC_ORIGIN.get_or_init(|| monotonic);
+    let elapsed = monotonic.saturating_duration_since(origin);
+    write_guest_u64(
+        output + 0x50,
+        u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+    );
     write_guest_u8(output + 0x68, 1);
     0
 }

@@ -38,11 +38,34 @@ fn trace(call: &str, fiber: u64, result: u64) {
             "[REMu][FIBER] {call} fiber={fiber:#x} result={result:#x} context={:?} slot={:?} host={:?} thread={:?}",
             fiber_context(),
             THREAD_FIBER_CONTEXT.with(std::ptr::from_ref),
-            // SAFETY: `pthread_self` is always valid on the calling thread.
-            unsafe { libc::pthread_self() },
+            host_thread_id(),
             current_guest_thread_name()
         );
     }
+}
+
+fn host_thread_id() -> u64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `pthread_self` is always valid on the calling thread.
+        unsafe { libc::pthread_self() as usize as u64 }
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: GetCurrentThreadId has no preconditions.
+        u64::from(unsafe { windows_get_current_thread_id() })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        0
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "GetCurrentThreadId"]
+    fn windows_get_current_thread_id() -> u32;
 }
 
 const SCE_FIBER_ERROR_NULL: u32 = 0x8059_0001;
@@ -584,8 +607,7 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]
             arguments[0],
             fiber_context(),
             THREAD_FIBER_CONTEXT.with(std::ptr::from_ref),
-            // SAFETY: `pthread_self` is always valid on the calling thread.
-            unsafe { libc::pthread_self() },
+            host_thread_id(),
             current_guest_thread_name()
         );
     }

@@ -490,14 +490,20 @@ pub(crate) fn guest_fseek(handle: u64, offset: u64, whence: u64) -> u64 {
     if handle == 0 {
         return u64::MAX;
     }
+    let offset = i64::from_ne_bytes(offset.to_ne_bytes());
+    let whence = low_i32(whence);
     // SAFETY: fopen returned the handle, and libc validates offset/whence.
-    signed_i32_return(unsafe {
+    #[cfg(windows)]
+    let status = unsafe { windows_fseeki64(handle as *mut libc::FILE, offset, whence) };
+    #[cfg(not(windows))]
+    let status = unsafe {
         libc::fseek(
             handle as *mut libc::FILE,
-            i64::from_ne_bytes(offset.to_ne_bytes()),
-            low_i32(whence),
+            offset as libc::c_long,
+            whence,
         )
-    })
+    };
+    signed_i32_return(status)
 }
 
 pub(crate) fn guest_ftell(handle: u64) -> u64 {
@@ -505,7 +511,24 @@ pub(crate) fn guest_ftell(handle: u64) -> u64 {
         return u64::MAX;
     }
     // SAFETY: fopen returned the live FILE handle.
-    unsafe { libc::ftell(handle as *mut libc::FILE).cast_unsigned() }
+    #[cfg(windows)]
+    let position = unsafe { windows_ftelli64(handle as *mut libc::FILE) };
+    #[cfg(not(windows))]
+    let position = unsafe { i64::from(libc::ftell(handle as *mut libc::FILE)) };
+    if position < 0 {
+        u64::MAX
+    } else {
+        position.cast_unsigned()
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "ucrt")]
+unsafe extern "C" {
+    #[link_name = "_fseeki64"]
+    fn windows_fseeki64(stream: *mut libc::FILE, offset: i64, origin: i32) -> i32;
+    #[link_name = "_ftelli64"]
+    fn windows_ftelli64(stream: *mut libc::FILE) -> i64;
 }
 
 pub(crate) fn guest_fclose(handle: u64) -> u64 {

@@ -7184,14 +7184,14 @@ fn guest_malloc(size: u64) -> u64 {
         return 0;
     };
     // SAFETY: The returned allocation is process-local and uses the same x86-64 pointer ABI.
-    unsafe { libc::malloc(size) as usize as u64 }
+    unsafe { host_malloc(size) as usize as u64 }
 }
 
 fn guest_free(address: u64) -> u64 {
     if address != 0 {
         // SAFETY: The guest passes an allocation previously returned by this libc HLE family.
         unsafe {
-            libc::free(address as *mut std::ffi::c_void);
+            host_free(address as *mut std::ffi::c_void);
         }
     }
     0
@@ -7202,7 +7202,7 @@ fn guest_calloc(count: u64, size: u64) -> u64 {
         return 0;
     };
     // SAFETY: libc validates the allocation-size multiplication and returns process-local memory.
-    unsafe { libc::calloc(count, size) as usize as u64 }
+    unsafe { host_calloc(count, size) as usize as u64 }
 }
 
 fn guest_realloc(address: u64, size: u64) -> u64 {
@@ -7210,7 +7210,7 @@ fn guest_realloc(address: u64, size: u64) -> u64 {
         return 0;
     };
     // SAFETY: `address` is null or belongs to the same libc allocation family.
-    unsafe { libc::realloc(address as *mut std::ffi::c_void, size) as usize as u64 }
+    unsafe { host_realloc(address as *mut std::ffi::c_void, size) as usize as u64 }
 }
 
 fn guest_aligned_alloc(alignment: u64, size: u64) -> u64 {
@@ -7223,30 +7223,101 @@ fn guest_aligned_alloc(alignment: u64, size: u64) -> u64 {
     // Guest memalign accepts sub-pointer alignments; the host allocator requires at least
     // sizeof(void*), which still satisfies the guest's weaker request.
     alignment = alignment.max(std::mem::size_of::<usize>());
-    let mut output = std::ptr::null_mut();
-    // SAFETY: `output` is writable and alignment/size are represented in the host ABI.
-    let result = unsafe { libc::posix_memalign(&raw mut output, alignment, size) };
-    if result == 0 {
-        output as usize as u64
-    } else {
-        0
-    }
+    unsafe { host_aligned_malloc(alignment, size) as usize as u64 }
 }
 
 fn guest_posix_memalign(output: u64, alignment: u64, size: u64) -> u64 {
     if output == 0 {
         return libc::EINVAL as u64;
     }
-    let (Ok(alignment), Ok(size)) = (usize::try_from(alignment), usize::try_from(size)) else {
+    let (Ok(mut alignment), Ok(size)) = (usize::try_from(alignment), usize::try_from(size)) else {
         return libc::ENOMEM as u64;
     };
-    let mut allocation = std::ptr::null_mut();
-    // SAFETY: `allocation` is writable and libc validates the requested alignment.
-    let result = unsafe { libc::posix_memalign(&raw mut allocation, alignment, size) };
-    if result == 0 {
-        write_guest_u64(output, allocation as usize as u64);
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return libc::EINVAL as u64;
     }
-    u64::try_from(result).unwrap_or(u64::MAX)
+    alignment = alignment.max(std::mem::size_of::<usize>());
+    let allocation = unsafe { host_aligned_malloc(alignment, size) };
+    if allocation.is_null() {
+        return libc::ENOMEM as u64;
+    }
+    write_guest_u64(output, allocation as usize as u64);
+    0
+}
+
+#[cfg(unix)]
+unsafe fn host_malloc(size: usize) -> *mut std::ffi::c_void {
+    // SAFETY: size is representable; libc owns the returned block.
+    unsafe { libc::malloc(size) }
+}
+
+#[cfg(unix)]
+unsafe fn host_free(pointer: *mut std::ffi::c_void) {
+    // SAFETY: pointer is null or from this host malloc family.
+    unsafe { libc::free(pointer) }
+}
+
+#[cfg(unix)]
+unsafe fn host_calloc(count: usize, size: usize) -> *mut std::ffi::c_void {
+    // SAFETY: libc validates the multiplication.
+    unsafe { libc::calloc(count, size) }
+}
+
+#[cfg(unix)]
+unsafe fn host_realloc(pointer: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void {
+    // SAFETY: pointer is null or from this host malloc family.
+    unsafe { libc::realloc(pointer, size) }
+}
+
+#[cfg(unix)]
+unsafe fn host_aligned_malloc(alignment: usize, size: usize) -> *mut std::ffi::c_void {
+    let mut pointer = std::ptr::null_mut();
+    // SAFETY: pointer is writable; alignment/size are host-representable.
+    let result = unsafe { libc::posix_memalign(&raw mut pointer, alignment, size.max(1)) };
+    if result == 0 { pointer } else { std::ptr::null_mut() }
+}
+
+#[cfg(windows)]
+const WINDOWS_HEAP_ALIGNMENT: usize = 16;
+
+#[cfg(windows)]
+unsafe fn host_malloc(size: usize) -> *mut std::ffi::c_void {
+    // SAFETY: MSVC aligned heap; paired with `aligned_free` in `host_free`.
+    unsafe { libc::aligned_malloc(size.max(1), WINDOWS_HEAP_ALIGNMENT) }
+}
+
+#[cfg(windows)]
+unsafe fn host_free(pointer: *mut std::ffi::c_void) {
+    // SAFETY: pointer is null or from `aligned_malloc` / `aligned_realloc`.
+    unsafe { libc::aligned_free(pointer) }
+}
+
+#[cfg(windows)]
+unsafe fn host_calloc(count: usize, size: usize) -> *mut std::ffi::c_void {
+    let Some(total) = count.checked_mul(size) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: paired with `aligned_free`.
+    let pointer = unsafe { libc::aligned_malloc(total.max(1), WINDOWS_HEAP_ALIGNMENT) };
+    if !pointer.is_null() {
+        // SAFETY: freshly allocated writable block of `total` bytes.
+        unsafe {
+            std::ptr::write_bytes(pointer.cast::<u8>(), 0, total);
+        }
+    }
+    pointer
+}
+
+#[cfg(windows)]
+unsafe fn host_realloc(pointer: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void {
+    // SAFETY: pointer is null or from the Windows aligned heap family.
+    unsafe { libc::aligned_realloc(pointer, size.max(1), WINDOWS_HEAP_ALIGNMENT) }
+}
+
+#[cfg(windows)]
+unsafe fn host_aligned_malloc(alignment: usize, size: usize) -> *mut std::ffi::c_void {
+    // SAFETY: MSVC aligned heap; alignment is a power of two.
+    unsafe { libc::aligned_malloc(size.max(1), alignment.max(WINDOWS_HEAP_ALIGNMENT)) }
 }
 
 fn guest_strlen(address: u64) -> u64 {
@@ -7289,9 +7360,38 @@ fn guest_strcasecmp(left: u64, right: u64) -> u64 {
         return u64::from(left != right);
     }
     // SAFETY: strcasecmp's guest ABI contract supplies two NUL-terminated strings.
-    let result =
-        unsafe { libc::strcasecmp(left as *const libc::c_char, right as *const libc::c_char) };
+    let result = unsafe { host_strcasecmp(left as *const libc::c_char, right as *const libc::c_char) };
     signed_i32_return(result)
+}
+
+#[cfg(unix)]
+unsafe fn host_strcasecmp(left: *const libc::c_char, right: *const libc::c_char) -> i32 {
+    // SAFETY: caller supplies two NUL-terminated C strings.
+    unsafe { libc::strcasecmp(left, right) }
+}
+
+#[cfg(windows)]
+unsafe fn host_strcasecmp(left: *const libc::c_char, right: *const libc::c_char) -> i32 {
+    // SAFETY: caller supplies two NUL-terminated C strings; MSVC exports `_stricmp`.
+    unsafe { libc::stricmp(left, right) }
+}
+
+#[cfg(not(any(unix, windows)))]
+unsafe fn host_strcasecmp(left: *const libc::c_char, right: *const libc::c_char) -> i32 {
+    // SAFETY: caller supplies two NUL-terminated C strings.
+    unsafe {
+        let mut left = left;
+        let mut right = right;
+        loop {
+            let left_ch = (*left as u8 as char).to_ascii_lowercase() as i32;
+            let right_ch = (*right as u8 as char).to_ascii_lowercase() as i32;
+            if left_ch != right_ch || left_ch == 0 {
+                return left_ch - right_ch;
+            }
+            left = left.add(1);
+            right = right.add(1);
+        }
+    }
 }
 
 fn guest_strstr(haystack: u64, needle: u64) -> u64 {
@@ -7654,11 +7754,8 @@ fn signed_i32_return(value: i32) -> u64 {
 
 fn guest_usleep(microseconds: u64) -> u64 {
     let bounded = microseconds.min(u64::from(u32::MAX));
-    let Ok(bounded) = u32::try_from(bounded) else {
-        return u64::MAX;
-    };
-    // SAFETY: usleep has no pointer arguments and the duration is bounded to its host ABI width.
-    signed_i32_return(unsafe { libc::usleep(bounded) })
+    std::thread::sleep(std::time::Duration::from_micros(bounded));
+    0
 }
 
 fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
@@ -7667,23 +7764,20 @@ fn guest_clock_gettime(clock_id: u64, output: u64) -> u64 {
     }
     // Console clock ids do not share Darwin's numeric constants. This POSIX compatibility export
     // returns wall-clock time, matching the console runtime's observable calendar-time contract.
-    let mut timestamp = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: timestamp is a valid writable host timespec.
-    let status = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut timestamp) };
-    if status == 0 {
-        write_guest_u64(output, u64::try_from(timestamp.tv_sec).unwrap_or(0));
-        write_guest_u64(output + 8, u64::try_from(timestamp.tv_nsec).unwrap_or(0));
-    }
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = elapsed.as_secs();
+    let nanoseconds = u64::from(elapsed.subsec_nanos());
+    write_guest_u64(output, seconds);
+    write_guest_u64(output + 8, nanoseconds);
     if trace_guest_time() {
         eprintln!(
-            "[REMu][TIME] clock_gettime id={} output={output:#x} status={status} sec={} nsec={}",
-            clock_id, timestamp.tv_sec, timestamp.tv_nsec
+            "[REMu][TIME] clock_gettime id={} output={output:#x} status=0 sec={} nsec={}",
+            clock_id, seconds, nanoseconds
         );
     }
-    signed_i32_return(status)
+    0
 }
 
 fn guest_kernel_gettimeofday(output: u64) -> u64 {
@@ -7714,19 +7808,39 @@ fn write_guest_timeval(output: u64) {
 /// calendar conversions describe the machine's configured civil time zone, so they must not be
 /// reduced to UTC-only stubs even though emulated monotonic clocks remain host-independent.
 fn guest_local_timezone(unix_seconds: i64) -> (i64, i32) {
-    let host_time: libc::time_t = unix_seconds;
-    // SAFETY: `local` is writable and `host_time` is a valid scalar time_t value.
-    let mut local: libc::tm = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::localtime_r(&raw const host_time, &raw mut local) };
-    if result.is_null() {
-        return (0, 0);
+    #[cfg(unix)]
+    {
+        let host_time: libc::time_t = unix_seconds;
+        // SAFETY: `local` is writable and `host_time` is a valid scalar time_t value.
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::localtime_r(&raw const host_time, &raw mut local) };
+        if result.is_null() {
+            return (0, 0);
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        let offset = local.tm_gmtoff;
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+        let offset = 0;
+        let daylight_seconds = if local.tm_isdst > 0 { 3_600 } else { 0 };
+        (offset, daylight_seconds)
     }
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    let offset = local.tm_gmtoff;
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
-    let offset = 0;
-    let daylight_seconds = if local.tm_isdst > 0 { 3_600 } else { 0 };
-    (offset, daylight_seconds)
+    #[cfg(windows)]
+    {
+        let host_time: libc::time_t = unix_seconds;
+        // SAFETY: `local` is writable; MSVC's `localtime_s` fills it for a valid time_t.
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        let status = unsafe { libc::localtime_s(&raw mut local, &raw const host_time) };
+        if status != 0 {
+            return (0, 0);
+        }
+        let daylight_seconds = if local.tm_isdst > 0 { 3_600 } else { 0 };
+        (0, daylight_seconds)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = unix_seconds;
+        (0, 0)
+    }
 }
 
 fn guest_kernel_convert_localtime_to_utc(arguments: [u64; 6]) -> u64 {
