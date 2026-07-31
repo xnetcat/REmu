@@ -567,6 +567,39 @@ pub fn write_guest_shared_backing_if_identity(
     backing.write_all_at(offset, source)
 }
 
+/// Copies bytes into a captured physical backing identity without requiring the original VA.
+///
+/// Prospero recycles direct-memory VAs while GPU work is still in flight. Metal writebacks that
+/// recorded the producer identity must still land on those physical pages so any remaining alias
+/// (and later remaps back onto that interval) observe the GPU results. The backing object is
+/// resolved through any live shared mapping that still names `identity.backing_id`.
+pub fn write_guest_shared_backing_at_identity(
+    identity: GuestSharedMappingIdentity,
+    source: &[u8],
+) -> bool {
+    let Ok(byte_count) = u64::try_from(source.len()) else {
+        return false;
+    };
+    let Some(end) = identity.backing_offset.checked_add(byte_count) else {
+        return false;
+    };
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(backing) = mappings
+        .values()
+        .find(|record| record.backing.id() == identity.backing_id)
+        .map(|record| record.backing.clone())
+    else {
+        return false;
+    };
+    if end > backing.size() {
+        return false;
+    }
+    drop(mappings);
+    backing.write_all_at(identity.backing_offset, source)
+}
+
 fn unregister_shared_mapping_range_locked(
     mappings: &mut BTreeMap<u64, SharedMappingRecord>,
     address: u64,

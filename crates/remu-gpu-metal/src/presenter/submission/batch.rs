@@ -16,7 +16,8 @@ use metal::{Buffer, CommandBuffer, Device, MTLCommandBufferStatus, MTLResourceOp
 use objc::{msg_send, sel, sel_impl};
 use remu_memory::{
     CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_backing_identity,
-    read_guest_shared_backing, write_guest_shared_backing_if_identity,
+    read_guest_shared_backing, write_guest_shared_backing_at_identity,
+    write_guest_shared_backing_if_identity,
 };
 use remu_shader::ShaderEvaluation;
 use std::io::ErrorKind;
@@ -777,29 +778,31 @@ pub(crate) fn write_back_pending_globals(
                 writeback.buffer.length()
             ));
         }
-        if let Some(expected) = writeback.mapping_identity {
-            let byte_count = u64::try_from(writeback.byte_count)
-                .map_err(|_| "writable global buffer byte count does not fit u64")?;
-            let current = guest_shared_backing_identity(writeback.guest_address, byte_count);
-            if current != Some(expected) {
-                trace_discarded_stale_global_writeback(
-                    writeback.guest_address,
-                    writeback.byte_count,
-                    "before completion",
-                    expected,
-                    current,
-                );
-                continue;
-            }
-        }
         let current_bytes = unsafe {
             std::slice::from_raw_parts(
                 writeback.buffer.contents().cast::<u8>().add(offset),
                 writeback.byte_count,
             )
         };
-        let outcome = if writeback.mapping_identity.is_some() {
-            write_changed_global_ranges(writeback, current_bytes)?
+        let outcome = if let Some(expected) = writeback.mapping_identity {
+            let byte_count = u64::try_from(writeback.byte_count)
+                .map_err(|_| "writable global buffer byte count does not fit u64")?;
+            let current = guest_shared_backing_identity(writeback.guest_address, byte_count);
+            if current != Some(expected) {
+                // Prospero recycles direct-memory VAs while GPU work is still draining. Publishing
+                // through the captured producer identity keeps GPU results on those physical pages
+                // (Poppy Slate glyph prep at 0x9010960000). Discarding left every later reader of
+                // that backing with the pre-dispatch snapshot and solid tofu glyphs.
+                trace_remapped_global_writeback_published_by_identity(
+                    writeback.guest_address,
+                    writeback.byte_count,
+                    expected,
+                    current,
+                );
+                write_changed_global_ranges_at_identity(writeback, current_bytes, expected)?
+            } else {
+                write_changed_global_ranges(writeback, current_bytes)?
+            }
         } else if let Some(write_watch) = writeback.write_watch.as_ref() {
             match write_watch
                 .with_live_mapping(|| write_changed_global_ranges_direct(writeback, current_bytes))
@@ -848,6 +851,42 @@ fn write_changed_global_ranges(
     writeback: &PendingGlobalWriteback,
     current_bytes: &[u8],
 ) -> Result<GlobalWritebackOutcome, String> {
+    let expected = writeback
+        .mapping_identity
+        .expect("shared writeback path has a mapping identity");
+    write_changed_global_ranges_with(
+        writeback,
+        current_bytes,
+        expected,
+        GlobalWritePublishMode::RequireLiveVa,
+    )
+}
+
+fn write_changed_global_ranges_at_identity(
+    writeback: &PendingGlobalWriteback,
+    current_bytes: &[u8],
+    expected: GuestSharedMappingIdentity,
+) -> Result<GlobalWritebackOutcome, String> {
+    write_changed_global_ranges_with(
+        writeback,
+        current_bytes,
+        expected,
+        GlobalWritePublishMode::ProducerIdentity,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum GlobalWritePublishMode {
+    RequireLiveVa,
+    ProducerIdentity,
+}
+
+fn write_changed_global_ranges_with(
+    writeback: &PendingGlobalWriteback,
+    current_bytes: &[u8],
+    expected: GuestSharedMappingIdentity,
+    mode: GlobalWritePublishMode,
+) -> Result<GlobalWritebackOutcome, String> {
     let mut cursor = 0;
     while cursor < current_bytes.len() {
         while cursor < current_bytes.len()
@@ -871,9 +910,6 @@ fn write_changed_global_ranges(
                     .map_err(|_| "writable global buffer changed offset does not fit u64")?,
             )
             .ok_or("writable global buffer changed address overflow")?;
-        let expected = writeback
-            .mapping_identity
-            .expect("shared writeback path has a mapping identity");
         let backing_offset = expected
             .backing_offset
             .checked_add(
@@ -881,27 +917,56 @@ fn write_changed_global_ranges(
                     .map_err(|_| "writable global buffer backing offset does not fit u64")?,
             )
             .ok_or("writable global buffer backing offset overflow")?;
-        let expected = GuestSharedMappingIdentity {
+        let range_identity = GuestSharedMappingIdentity {
             backing_id: expected.backing_id,
             backing_offset,
         };
-        if !write_guest_shared_backing_if_identity(address, expected, &current_bytes[start..cursor])
-        {
+        let published = match mode {
+            GlobalWritePublishMode::RequireLiveVa => {
+                write_guest_shared_backing_if_identity(
+                    address,
+                    range_identity,
+                    &current_bytes[start..cursor],
+                )
+            }
+            GlobalWritePublishMode::ProducerIdentity => {
+                write_guest_shared_backing_at_identity(range_identity, &current_bytes[start..cursor])
+            }
+        };
+        if !published {
             let byte_count = u64::try_from(cursor - start)
                 .map_err(|_| "writable global buffer changed byte count does not fit u64")?;
             let current = guest_shared_backing_identity(address, byte_count);
-            if current != Some(expected) {
+            if matches!(mode, GlobalWritePublishMode::RequireLiveVa) && current != Some(range_identity)
+            {
+                // VA moved mid-publish; fall back to the captured producer pages.
+                if write_guest_shared_backing_at_identity(
+                    range_identity,
+                    &current_bytes[start..cursor],
+                ) {
+                    continue;
+                }
                 trace_discarded_stale_global_writeback(
                     address,
                     cursor - start,
                     "during completion",
-                    expected,
+                    range_identity,
+                    current,
+                );
+                return Ok(GlobalWritebackOutcome::DiscardedStale);
+            }
+            if matches!(mode, GlobalWritePublishMode::ProducerIdentity) {
+                trace_discarded_stale_global_writeback(
+                    address,
+                    cursor - start,
+                    "producer identity unavailable",
+                    range_identity,
                     current,
                 );
                 return Ok(GlobalWritebackOutcome::DiscardedStale);
             }
             return Err(format!(
-                "writable global buffer backing write failed despite matching identity address={address:#x} bytes={}",
+                "writable global buffer backing write failed address={address:#x} bytes={} identity={range_identity:?}",
                 cursor - start
             ));
         }
@@ -920,6 +985,21 @@ fn trace_discarded_stale_global_writeback(
     if sequence <= 16 || sequence.is_power_of_two() {
         eprintln!(
             "[REMu][METAL] discarded stale writable global writeback sequence={sequence} mapping changed {stage} address={address:#x} bytes={byte_count} expected={expected:?} current={current:?}"
+        );
+    }
+}
+
+fn trace_remapped_global_writeback_published_by_identity(
+    address: u64,
+    byte_count: usize,
+    expected: GuestSharedMappingIdentity,
+    current: Option<GuestSharedMappingIdentity>,
+) {
+    static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+    let sequence = PUBLISHED.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL] published remapped writable global writeback sequence={sequence} by producer identity address={address:#x} bytes={byte_count} expected={expected:?} current={current:?}"
         );
     }
 }

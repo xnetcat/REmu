@@ -359,6 +359,60 @@ fn identity_guarded_backing_write_rejects_reused_guest_address() {
 }
 
 #[test]
+fn identity_targeted_backing_write_survives_same_heap_va_recycle() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let first = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let first_identity = guest_shared_backing_identity(first.get(), GUEST_PAGE_SIZE)
+        .expect("first mapping identity");
+    let observer = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+
+    memory.unmap(first, GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(first),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    let recycled_identity = guest_shared_backing_identity(first.get(), GUEST_PAGE_SIZE)
+        .expect("recycled mapping identity");
+    assert_ne!(first_identity, recycled_identity);
+
+    assert!(write_guest_shared_backing_at_identity(
+        first_identity,
+        b"glyph"
+    ));
+    let mut observed = [0_u8; 5];
+    memory.read(observer, &mut observed).unwrap();
+    assert_eq!(&observed, b"glyph");
+    let mut recycled = [0_u8; 5];
+    memory.read(first, &mut recycled).unwrap();
+    assert_eq!(recycled, [0; 5]);
+}
+
+#[test]
 fn replacing_shared_pages_removes_their_backing_identity() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();

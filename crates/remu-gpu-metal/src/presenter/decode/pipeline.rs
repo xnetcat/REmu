@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CB_BLEND0_CONTROL, DB_SHADER_CONTROL, DecodedRasterState, DecodedRenderTarget,
-    DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
+    CB_BLEND0_CONTROL, CB_TARGET_MASK, DB_SHADER_CONTROL, DecodedRasterState,
+    DecodedRenderTarget, DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, PA_CL_VS_OUT_CNTL,
     PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState, VGT_GS_INSTANCE_CNT,
@@ -69,6 +69,33 @@ pub(crate) fn ngg_fullscreen_cover_draw(program: &remu_shader::Program, draw: &I
     } else {
         false
     }
+}
+
+/// Returns whether a draw is a UE/Octopath memoryless cover placeholder with no attachments.
+///
+/// Boot and frame-boundary fences occasionally emit ps=0 draws whose `CB_TARGET_MASK` is zero and
+/// whose depth block is inactive. They carry no renderable state and exist only to preserve queue
+/// ordering until the next real pass.
+pub(crate) fn noop_placeholder_cover_draw(draw: &IndexedDraw) -> bool {
+    if draw.pixel_shader_address != 0 {
+        return false;
+    }
+    let target_mask =
+        register_value(&draw.context_registers, CB_TARGET_MASK).unwrap_or_default();
+    if target_mask != 0 {
+        return false;
+    }
+    if decode_depth_target(draw)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return false;
+    }
+    draw.export_shader.as_ref().is_some_and(|shader| {
+        procedural_rectangle_stage_for_draw(&shader.program, draw)
+            || ngg_memoryless_cover_export_stage(&shader.program)
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

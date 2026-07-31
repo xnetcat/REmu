@@ -990,6 +990,110 @@ fn writable_physical_alias_uses_exact_staging_and_preserves_adjacent_bytes() {
 }
 
 #[test]
+fn remapped_exact_writable_writeback_publishes_to_producer_physical_pages() {
+    // Poppy Slate glyph prep recycles a direct-memory VA onto a later heap offset while the
+    // producing compute writeback is still draining. Publishing through the captured producer
+    // identity keeps GPU results on the original physical pages instead of discarding them.
+    let mut address_space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let observer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let binding_address = producer_alias.get() + 64;
+    let binding_byte_count = 16_usize;
+    // SAFETY: producer alias remains mapped read/write for the staged upload.
+    unsafe {
+        std::ptr::write_bytes(binding_address as *mut u8, 0x11, binding_byte_count);
+    }
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: binding_address,
+        instruction_pcs: Default::default(),
+        byte_count: binding_byte_count,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("writable upload stages exact storage");
+    let producer_identity = uploaded
+        .physical_identity
+        .expect("staged writable upload captures producer identity");
+
+    address_space
+        .unmap(producer_alias, GUEST_PAGE_SIZE)
+        .unwrap();
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(producer_alias),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    assert_ne!(
+        guest_shared_backing_identity(binding_address, u64::try_from(binding_byte_count).unwrap()),
+        Some(producer_identity)
+    );
+
+    let evaluation = evaluation_with_global(binding);
+    let mut pending = Vec::new();
+    collect_pending_global_writebacks(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
+        .expect("exact staged writeback is captured");
+    // SAFETY: the exact shared buffer is binding_byte_count bytes long and retained by `uploaded`.
+    unsafe {
+        std::ptr::write_bytes(
+            uploaded.buffer.contents().cast::<u8>(),
+            0x5a,
+            binding_byte_count,
+        );
+    }
+    let applied = write_back_pending_globals(&pending).expect("remapped writeback publishes");
+    assert_eq!(applied.len(), 1);
+
+    let observer_binding = observer_alias.get() + 64;
+    // SAFETY: observer still maps the original producer physical page.
+    unsafe {
+        for offset in 0..binding_byte_count {
+            assert_eq!(
+                ((observer_binding + u64::try_from(offset).unwrap()) as *const u8).read(),
+                0x5a
+            );
+        }
+    }
+}
+
+#[test]
 fn queued_zero_copy_writer_stages_writable_alias_across_shifted_aliases_and_eviction() {
     let mut address_space = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).unwrap();
     let base = address_space.base();

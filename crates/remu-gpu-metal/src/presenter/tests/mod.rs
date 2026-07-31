@@ -60,7 +60,7 @@ use super::{
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view, ngg_mesh_base_vertex,
     ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_fullscreen_cover_draw,
     ngg_memoryless_cover_export_stage, ngg_mesh_dispatch_required, ngg_mesh_draw_supported,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, noop_placeholder_cover_draw,
     parse_diagnostic_hex_address, parse_presentation_resolution,
     pin_guest_memory_write, pixel_input_controls, prepare_indexed_ngg_indices,
     prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,

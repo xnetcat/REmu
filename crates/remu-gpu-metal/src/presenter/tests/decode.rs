@@ -7,7 +7,7 @@ use metal::{
     MTLTriangleFillMode, MTLWinding, RenderPipelineDescriptor,
 };
 use remu_gpu::{GpuRegister, ShaderSnapshot};
-use remu_shader::{PixelOutputKind, Program, ShaderEvaluation};
+use remu_shader::{PixelOutputKind, Program, ShaderEvaluation, decode_program};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,7 +31,8 @@ use super::{
     guest_texture_byte_count, guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_topology_class,
-    metal_primitive_type, ngg_mesh_base_vertex, ngg_mesh_dispatch_required, pixel_input_controls,
+    metal_primitive_type, noop_placeholder_cover_draw, ngg_mesh_base_vertex,
+    ngg_mesh_dispatch_required, pixel_input_controls,
     prepare_indexed_primitive, prepare_ngg_meshlets, prepare_indexed_ngg_indices,
     prepare_nonindexed_ngg_indices,
     read_draw_indices, read_texture_array_linear, read_texture_linear, rearm_color_metadata_clear,
@@ -82,6 +83,46 @@ fn accepts_fragmentless_depth_only_pipeline() {
     assert_eq!(key.pixel_resources.initial_scalar_count, 1);
     assert!(key.pixel_resources.global_bindings.is_empty());
     assert!(key.pixel_resources.image_bindings.is_empty());
+}
+
+#[test]
+fn recognizes_noop_placeholder_cover_without_attachments() {
+    let words = [
+        0xbfa0_0001,
+        0x93ea_ff03,
+        0x0008_0008,
+        0x876b_ff03,
+        0x0000_00ff,
+        0x8f6a_8c6a,
+        0x887c_6a6b,
+        0xbf90_0009,
+        0x906a_8803,
+        0x81ea_6a80,
+        0x90fe_6ac1,
+        0xf800_0941,
+        0x0000_0000,
+        0x81ea_0380,
+        0xbf8c_ff0f,
+        0xbf81_0000,
+    ];
+    let program = decode_program(0x8051_4b00_00, &words).expect("memoryless cover decodes");
+    let mut draw = super::indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    draw.export_shader_address = 0x8051_4b00_00;
+    draw.export_shader = Some(ShaderSnapshot {
+        header_address: 0,
+        program: Arc::new(program),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    });
+    draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    assert!(noop_placeholder_cover_draw(&draw));
+    assert!(
+        graphics_pipeline_key(&draw)
+            .expect_err("pipeline key stays invalid")
+            .contains("neither an enabled color target nor an active depth target")
+    );
 }
 
 #[test]

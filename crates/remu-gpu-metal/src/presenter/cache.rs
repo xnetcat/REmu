@@ -960,45 +960,42 @@ fn contained_global_writeback_offset(
         byte_count,
     );
     if let Some(producer_identity) = writeback.mapping_identity {
-        let Some(read_identity) = guest_shared_backing_identity(address, byte_count) else {
-            return if virtual_overlap {
-                QueuedWriteReadMatch::Synchronize
-            } else {
-                QueuedWriteReadMatch::None
-            };
-        };
-        if read_identity.backing_id != producer_identity.backing_id {
-            return if virtual_overlap {
-                QueuedWriteReadMatch::Synchronize
-            } else {
-                QueuedWriteReadMatch::None
-            };
+        if let Some(read_identity) = guest_shared_backing_identity(address, byte_count) {
+            if read_identity.backing_id == producer_identity.backing_id {
+                let producer_start = producer_identity.backing_offset;
+                if let (Some(producer_end), Some(read_end)) = (
+                    producer_start.checked_add(writeback_byte_count),
+                    read_identity.backing_offset.checked_add(byte_count),
+                ) {
+                    let read_start = read_identity.backing_offset;
+                    if producer_start < read_end && read_start < producer_end {
+                        if read_start >= producer_start && read_end <= producer_end {
+                            if let Some(offset) =
+                                writeback.offset.checked_add(read_start - producer_start)
+                            {
+                                return QueuedWriteReadMatch::Buffer {
+                                    offset,
+                                    physical_identity: Some(read_identity),
+                                };
+                            }
+                        }
+                        return QueuedWriteReadMatch::Synchronize;
+                    }
+                }
+            }
         }
-        let producer_start = producer_identity.backing_offset;
-        let Some(producer_end) = producer_start.checked_add(writeback_byte_count) else {
-            return QueuedWriteReadMatch::Synchronize;
-        };
-        let read_start = read_identity.backing_offset;
-        let Some(read_end) = read_start.checked_add(byte_count) else {
-            return QueuedWriteReadMatch::Synchronize;
-        };
-        if producer_start >= read_end || read_start >= producer_end {
-            return if virtual_overlap {
-                QueuedWriteReadMatch::Synchronize
-            } else {
-                QueuedWriteReadMatch::None
-            };
+        // VA recycled onto a different physical interval while this writeback is still queued.
+        // Forward the live Metal buffer by virtual offset instead of Synchronize→guest snapshot:
+        // draining then re-reading the remapped VA observes pre-dispatch bytes (Poppy tofu).
+        if virtual_overlap {
+            return contained_global_writeback_virtual_offset(
+                writeback,
+                address,
+                byte_count,
+                writeback_byte_count,
+            );
         }
-        if read_start < producer_start || read_end > producer_end {
-            return QueuedWriteReadMatch::Synchronize;
-        }
-        let Some(offset) = writeback.offset.checked_add(read_start - producer_start) else {
-            return QueuedWriteReadMatch::Synchronize;
-        };
-        return QueuedWriteReadMatch::Buffer {
-            offset,
-            physical_identity: Some(read_identity),
-        };
+        return QueuedWriteReadMatch::None;
     }
     if !guest_physical_ranges_overlap(
         writeback.guest_address,
@@ -1008,6 +1005,15 @@ fn contained_global_writeback_offset(
     ) {
         return QueuedWriteReadMatch::None;
     }
+    contained_global_writeback_virtual_offset(writeback, address, byte_count, writeback_byte_count)
+}
+
+fn contained_global_writeback_virtual_offset(
+    writeback: &PendingGlobalWriteback,
+    address: u64,
+    byte_count: u64,
+    writeback_byte_count: u64,
+) -> QueuedWriteReadMatch {
     let Some(writeback_end) = writeback.guest_address.checked_add(writeback_byte_count) else {
         return QueuedWriteReadMatch::Synchronize;
     };
@@ -1025,7 +1031,7 @@ fn contained_global_writeback_offset(
     };
     QueuedWriteReadMatch::Buffer {
         offset,
-        physical_identity: None,
+        physical_identity: writeback.mapping_identity,
     }
 }
 

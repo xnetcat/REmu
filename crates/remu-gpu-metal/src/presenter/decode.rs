@@ -38,8 +38,8 @@ pub(crate) use self::pipeline::{
     ColorOperationMode, color_operation_is_raster_noop, decode_color_operation_mode,
     decode_metal_blend_attachment, decode_raster_state, graphics_pipeline_key,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
-    ngg_mesh_base_vertex, prepare_indexed_ngg_indices, prepare_indexed_primitive,
-    prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
+    noop_placeholder_cover_draw, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
+    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{

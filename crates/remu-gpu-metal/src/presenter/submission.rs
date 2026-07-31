@@ -12,7 +12,8 @@ use super::{
     PipelineCompileCandidate, PresenterFlow, QueueBlockReason, ScheduledGpuSubmission,
     ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh, compute_pipeline_key,
     diagnostic_skip_export_shader, diagnostic_skip_pixel_shader, graphics_pipeline_key,
-    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count, pixel_scalars,
+    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
+    noop_placeholder_cover_draw, pixel_scalars,
     rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_memory_copy,
     refresh_resident_texture_write_watch, register_value,
@@ -348,6 +349,9 @@ impl MetalPresenter {
                 }
                 GpuEvent::IndexedDraw(draw) => {
                     trace_video_target_draw_consumer(&draw);
+                    if noop_placeholder_cover_draw(&draw) {
+                        continue;
+                    }
                     let key = graphics_pipeline_key(&draw);
                     if let Ok(key) = key.as_ref() {
                         self.compile_draw_shaders(&draw, key);
