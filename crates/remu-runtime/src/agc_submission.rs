@@ -422,7 +422,10 @@ pub(crate) fn agc_handle_submission_packet(
             DMA_SNAPSHOT_COUNT.fetch_add(1, Ordering::Relaxed);
             DMA_SNAPSHOT_BYTES.fetch_add(snapshot_bytes, Ordering::Relaxed);
         }
-        if trace_guest_sync()
+        let fence_label_dma = (0x7e00_0000_0000..0x8000_0000_0000)
+            .contains(&copy.destination_address);
+        if fence_label_dma
+            || trace_guest_sync()
             || trace_agc_programs()
             || sequence <= 32
             || sequence.is_power_of_two()

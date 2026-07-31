@@ -289,7 +289,12 @@ impl Compiler<'_> {
                 };
                 let value = self.temp("uint", &converted);
                 if lds {
-                    let lds_index = self.temp("uint", "((s[124] & 0xFFFFu) >> 2) + remu_lane");
+                    // Hardware MUBUF→LDS uses the architectural wave lane (0..63 for wave64).
+                    // Metal's remu_lane is only SIMD32-local; with split wave64 / multi-wave
+                    // mesh groups that collides LDS slots across halves and zeroes staged PARAMs.
+                    let lane = self.architectural_lane();
+                    let lds_index =
+                        self.temp("uint", &format!("((s[124] & 0xFFFFu) >> 2) + {lane}"));
                     self.line(
                         3,
                         &format!(
@@ -496,7 +501,8 @@ impl Compiler<'_> {
                     "formatted memory-to-LDS requires a non-D16 FORMAT_X compute load".to_owned(),
                 );
             }
-            let lds_index = self.temp("uint", "((s[124] & 0xFFFFu) >> 2) + remu_lane");
+            let lane = self.architectural_lane();
+            let lds_index = self.temp("uint", &format!("((s[124] & 0xFFFFu) >> 2) + {lane}"));
             self.line(
                 3,
                 &format!(

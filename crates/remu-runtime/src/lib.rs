@@ -51,6 +51,7 @@ mod shader_eval;
 mod tls;
 mod unwind;
 mod video_out;
+mod videodec2;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -199,12 +200,14 @@ pub(crate) use dialog::{
     COMMON_DIALOG_ERROR_NOT_SYSTEM_INITIALIZED, COMMON_DIALOG_STATUS_INITIALIZED,
 };
 pub(crate) use dialog::{
-    common_dialog_initialize, message_dialog_close, message_dialog_get_result,
-    message_dialog_get_status, message_dialog_initialize, message_dialog_open,
-    message_dialog_terminate, message_dialog_update_status, publish_host_toast,
-    save_data_dialog_close, save_data_dialog_get_result, save_data_dialog_get_status,
-    save_data_dialog_initialize, save_data_dialog_is_ready_to_display, save_data_dialog_open,
-    save_data_dialog_terminate, save_data_dialog_update_status,
+    common_dialog_initialize, error_dialog_close, error_dialog_get_result, error_dialog_get_status,
+    error_dialog_initialize, error_dialog_open, error_dialog_terminate, error_dialog_update_status,
+    message_dialog_close, message_dialog_get_result, message_dialog_get_status,
+    message_dialog_initialize, message_dialog_open, message_dialog_terminate,
+    message_dialog_update_status, publish_host_toast, save_data_dialog_close,
+    save_data_dialog_get_result, save_data_dialog_get_status, save_data_dialog_initialize,
+    save_data_dialog_is_ready_to_display, save_data_dialog_open, save_data_dialog_terminate,
+    save_data_dialog_update_status,
 };
 #[cfg(any(test, not(unix)))]
 pub(crate) use guest_files::kernel_stat_payload;
@@ -259,13 +262,14 @@ pub(crate) use np_api::{
     np_game_intent_get_property_string, np_game_intent_initialize, np_game_intent_receive,
     np_trophy_abort_handle, np_trophy_create_context, np_trophy_create_handle,
     np_trophy_destroy_context, np_trophy_destroy_handle, np_trophy_get_game_info,
-    np_trophy_register_context, np_trophy_register_unlock_callback,
-    np_trophy_unregister_unlock_callback,
+    np_trophy_get_trophy_info_array, np_trophy_register_context,
+    np_trophy_register_unlock_callback, np_trophy_unregister_unlock_callback,
     np_universal_data_abort_handle, np_universal_data_array_set_string,
     np_universal_data_create_context, np_universal_data_create_event,
-    np_universal_data_create_handle, np_universal_data_create_property_object,
-    np_universal_data_destroy_context, np_universal_data_destroy_event,
-    np_universal_data_destroy_handle, np_universal_data_initialize,
+    np_universal_data_create_handle, np_universal_data_create_property_array,
+    np_universal_data_create_property_object, np_universal_data_destroy_context,
+    np_universal_data_destroy_event, np_universal_data_destroy_handle,
+    np_universal_data_destroy_property_array, np_universal_data_initialize,
     np_universal_data_object_set_array, np_universal_data_object_set_i32,
     np_universal_data_object_set_string, np_universal_data_post_event,
     np_universal_data_register_context, np_universal_data_terminate,
@@ -480,6 +484,8 @@ struct ProbeDispatchState {
     save_transaction_resources: BTreeSet<u32>,
     prepared_save_resources: BTreeSet<u32>,
     save_transactions: BTreeMap<u32, SaveDataTransaction>,
+    /// Opaque Videodec2 compute queues returned by `sceVideodec2AllocateComputeQueue`.
+    videodec2_compute_queues: BTreeSet<u64>,
 }
 
 #[derive(Debug)]
@@ -933,10 +939,16 @@ struct RuntimeServiceState {
     np_session_signaling: Option<Vec<u8>>,
     next_np_web_api2_user_context: i32,
     np_web_api2_user_contexts: BTreeMap<i32, (i32, i32)>,
+    next_np_web_api2_push_event_handle: i32,
+    np_web_api2_push_event_handles: BTreeMap<i32, i32>,
     np_callback_polls: u64,
     np_title_id: Option<[u8; 16]>,
     share_feature_permitted: bool,
     share_content_parameter: Option<String>,
+    /// Lifecycle state of `libSceErrorDialog`, using the common-dialog status values.
+    error_dialog_status: u32,
+    error_dialog_sequence: u64,
+    error_dialog_result_code: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -950,6 +962,7 @@ enum InitializationState {
 enum CommonDialogOwner {
     Message,
     SaveData,
+    Error,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3690,6 +3703,15 @@ const SCE_AJM_ERROR_INVALID_CONTEXT: u32 = 0x8093_0002;
 const SCE_AJM_ERROR_INVALID_INSTANCE: u32 = 0x8093_0003;
 const SCE_AJM_ERROR_CODEC_ALREADY_REGISTERED: u32 = 0x8093_0009;
 const SCE_AJM_ERROR_CODEC_NOT_REGISTERED: u32 = 0x8093_000a;
+const SCE_AJM_ERROR_JOB_CREATION: u32 = 0x8093_0012;
+/// Sideband result written by control jobs (`result` + `internal_result`).
+const AJM_SIDEBAND_RESULT_SIZE: usize = 8;
+/// Bytes one control job (initialize / clear-context / gapless) occupies in a batch arena.
+const AJM_JOB_CONTROL_SIZE: u64 = 48;
+/// Smallest arena a caller may hand `sceAjmBatchInitialize`. One control job is 0x30 bytes;
+/// rejecting that size strands audio workers that build single-job batches.
+const AJM_BATCH_MIN_SIZE: u64 = AJM_JOB_CONTROL_SIZE;
+const AJM_BATCH_MAX_SIZE: u64 = 0x10_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3793,35 +3815,21 @@ const AJM_JOB_GET_STATISTICS_SIZE: u64 = 88;
 /// Bytes the statistics result object occupies.
 const AJM_STATISTICS_RESULT_SIZE: usize = 48;
 
-/// `sceAjmBatchJobGetStatistics(info, result)`.
-///
-/// Appends one statistics job to the caller's batch arena and clears the result object. The
-/// counters this host can honestly report are all zero: no decode work runs on a coprocessor here,
-/// so there is no elapsed time or job count to report, and reporting invented figures would be
-/// worse than reporting none. The append itself is real, because the guest reads the arena cursor
-/// back and builds the rest of its batch from it.
-fn ajm_batch_job_get_statistics(arguments: [u64; 6]) -> u64 {
-    let info = arguments[0];
-    let result = arguments[1];
+/// Appends `job_size` bytes to a batch arena cursor and returns the reserved job address.
+fn ajm_append_batch_job(info: u64, job_size: u64) -> Result<u64, u32> {
     if info == 0 || guest_output_pointer(info, std::mem::size_of::<SceAjmBatchInfo>()).is_none() {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+        return Err(SCE_AJM_ERROR_INVALID_PARAMETER);
     }
     // SAFETY: the complete cursor object was validated immediately above.
     let mut batch_info = unsafe { std::ptr::read_unaligned(info as *const SceAjmBatchInfo) };
-    let Some(end) = batch_info.offset.checked_add(AJM_JOB_GET_STATISTICS_SIZE) else {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+    let Some(end) = batch_info.offset.checked_add(job_size) else {
+        return Err(SCE_AJM_ERROR_JOB_CREATION);
     };
-    if end > batch_info.size {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+    if batch_info.buffer == 0 || end > batch_info.size {
+        return Err(SCE_AJM_ERROR_JOB_CREATION);
     }
     let job = batch_info.buffer.wrapping_add(batch_info.offset);
-    if result != 0 {
-        if guest_output_pointer(result, AJM_STATISTICS_RESULT_SIZE).is_none() {
-            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-        }
-        guest_memset(result, 0, AJM_STATISTICS_RESULT_SIZE as u64);
-    }
-    guest_memset(job, 0, AJM_JOB_GET_STATISTICS_SIZE);
+    guest_memset(job, 0, job_size);
     batch_info.offset = end;
     batch_info.last_good_job = job;
     // The arena cursor's return-address field belongs to the job just appended, not to whatever
@@ -3830,6 +3838,57 @@ fn ajm_batch_job_get_statistics(arguments: [u64; 6]) -> u64 {
     // SAFETY: the same validated cursor object.
     unsafe {
         std::ptr::write_unaligned(info as *mut SceAjmBatchInfo, batch_info);
+    }
+    Ok(job)
+}
+
+/// `sceAjmBatchJobGetStatistics(info, result)`.
+///
+/// Appends one statistics job to the caller's batch arena and clears the result object. The
+/// counters this host can honestly report are all zero: no decode work runs on a coprocessor here,
+/// so there is no elapsed time or job count to report, and reporting invented figures would be
+/// worse than reporting none. The append itself is real, because the guest reads the arena cursor
+/// back and builds the rest of its batch from it.
+fn ajm_batch_job_get_statistics(arguments: [u64; 6]) -> u64 {
+    let result = arguments[1];
+    if let Err(error) = ajm_append_batch_job(arguments[0], AJM_JOB_GET_STATISTICS_SIZE) {
+        return sce_kernel_error(error);
+    }
+    if result != 0 {
+        if guest_output_pointer(result, AJM_STATISTICS_RESULT_SIZE).is_none() {
+            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+        }
+        guest_memset(result, 0, AJM_STATISTICS_RESULT_SIZE as u64);
+    }
+    0
+}
+
+/// `sceAjmBatchJobInitialize(info, instance, codecParameters, parametersSize, result)`.
+///
+/// Appends one control job and clears the sideband result. This host has no Ajm codec coprocessor,
+/// so initialization records success for a live instance without consuming the parameter blob —
+/// the guest still advances its batch cursor and later Start/Wait calls retire the batch as silence.
+fn ajm_batch_job_initialize(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    let (info, instance, result) = (arguments[0], low_u32(arguments[1]), arguments[4]);
+    if let Err(error) = ajm_append_batch_job(info, AJM_JOB_CONTROL_SIZE) {
+        return sce_kernel_error(error);
+    }
+    let status = if state
+        .ajm_contexts
+        .values()
+        .any(|context| context.instances.contains(&instance))
+    {
+        0_i32
+    } else {
+        // Sideband decode-result "invalid parameter" (not the SCE_AJM_ERROR_* facility).
+        0x4_i32
+    };
+    if result != 0 {
+        if guest_output_pointer(result, AJM_SIDEBAND_RESULT_SIZE).is_none() {
+            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
+        }
+        guest_memset(result, 0, AJM_SIDEBAND_RESULT_SIZE as u64);
+        write_guest_u32(result, status as u32);
     }
     0
 }
@@ -3843,7 +3902,7 @@ fn ajm_batch_initialize(arguments: [u64; 6]) -> u64 {
     };
     if batch == 0
         || info == 0
-        || !(0x40..=0x10_000).contains(&size)
+        || !(AJM_BATCH_MIN_SIZE..=AJM_BATCH_MAX_SIZE).contains(&size)
         || !process_guest_range_has_read_access(batch, batch_size)
         || guest_output_pointer(info, std::mem::size_of::<SceAjmBatchInfo>()).is_none()
     {
@@ -4139,6 +4198,7 @@ fn dispatch_stateless_import(
         "Qs0wWulgl7U" => 0,
         "RaqxZIf6DvE" => 0,
         "rbknaUjpqWo" => write_output_u64(arguments[1], 0),
+        "XDncXQIJUSk" => np_get_online_id(arguments),
         "JT+t00a3TxA" => np_get_account_country(arguments[1]),
         "eQH7nWPcAgc" => write_output_i32(arguments[1], 1),
         "e-ZuhGEoeC4" => write_output_i32(arguments[1], 0),
@@ -4252,6 +4312,7 @@ fn dispatch_probe_import(
         "jBgBjAj02R8" => acm_context_destroy(arguments, state),
         "Q3dyFuwGn64" => ajm_module_register(arguments, state),
         "3cAg7xN995U" => ajm_batch_job_get_statistics(arguments),
+        "ezM2OhNxzck" => ajm_batch_job_initialize(arguments, state),
         "5tOfnaClcqM" => ajm_batch_start(arguments, state),
         "-qLsfDAywIY" => ajm_batch_wait(arguments, state),
         "NVDXiUesSbA" => ajm_batch_cancel(arguments, state),
@@ -4654,7 +4715,7 @@ fn dispatch_probe_import(
         }
         // libSceSaveData uses durable host-side transactions while preserving the guest ABI.
         "TywrFKCoLGY" => save_data_initialize(state),
-        "dyIhnXq-0SM" => save_data_dir_name_search(arguments, state),
+        "dyIhnXq-0SM" | "X4MYzukPc3g" => save_data_dir_name_search(arguments, state),
         "ZP4e7rlzOUk" => save_data_mount3(arguments, state),
         "gjRZNnw0JPE" => save_data_create_transaction_resource(arguments, state),
         "lJUQuaKqoKY" => save_data_delete_transaction_resource(arguments, state),
@@ -4695,11 +4756,19 @@ fn dispatch_probe_import(
         "CWVW78Qc3fI" => message_dialog_get_status(state),
         "6fIC3XKt2k0" => message_dialog_update_status(state),
         "Lr8ovHH9l6A" => message_dialog_get_result(arguments[0], state),
+        "I88KChlynSs" => error_dialog_initialize(state),
+        "9XAxK2PMwk8" => error_dialog_terminate(state),
+        "M2ZF-ClLhgY" => error_dialog_open(arguments[0], state),
+        "ekXHb1kDBl0" => error_dialog_close(state),
+        "t2FvHRXzgqk" => error_dialog_get_status(state),
+        "WWiGuh9XfgQ" => error_dialog_update_status(state),
+        "PfLB0BjAuQw" => error_dialog_get_result(arguments[0], state),
         "buYbeLOGWmA" => app_content_temporary_data_mount(arguments, state),
         "YJtKLttI9fM" => game_update_initialize(state),
         "jO8DM8oyego" => np_entitlement_access_initialize(arguments, state),
         "ysmw6J-P8Ak" => np_session_signaling_initialize(arguments, state),
         "sk54bi6FtYM" => np_web_api2_create_user_context(arguments, state),
+        "WV1GwM32NgY" => np_web_api2_push_event_create_handle(arguments, state),
         "3Zl8BePTh9Y" => np_check_callback(state),
         "Ec63y59l9tw" => np_set_np_title_id(arguments, state),
         "YBiIdcDPrxs" => share_feature_permit(state),
@@ -4740,6 +4809,8 @@ fn dispatch_probe_import(
         "tpFJ8LIKvPw" => np_universal_data_register_context(arguments, state),
         "p+GcLqwpL9M" => np_universal_data_create_event(arguments, state),
         "s6W4Zl4Slgk" => np_universal_data_create_property_object(arguments[0], state),
+        "Hm7qubT3b70" => np_universal_data_create_property_array(arguments[0], state),
+        "W-0xwY0ZMjw" => np_universal_data_destroy_property_array(arguments[0], state),
         "wG+84pnNIuo" => np_universal_data_destroy_event(arguments[0], state),
         "YE4dbtbz6OE" => np_universal_data_object_set_i32(arguments, state),
         "MfDb+4Nln64" => np_universal_data_object_set_string(arguments, state),
@@ -4756,6 +4827,7 @@ fn dispatch_probe_import(
         "fYapWA9xVmA" => np_trophy_abort_handle(arguments[0], state),
         "bIDov3wBu5Q" => np_trophy_register_context(arguments, state),
         "4IzqhhUQ3nk" => np_trophy_get_game_info(arguments, state),
+        "y3zHpdZO6ME" => np_trophy_get_trophy_info_array(arguments, stack_arguments, state),
         "sUXGfNMalIo" => np_trophy_register_unlock_callback(arguments, state),
         "wVqxM58sIKs" => np_trophy_unregister_unlock_callback(state),
         // Exact Gen5 register-default descriptors consumed by indirect AGC state packets.
@@ -4825,6 +4897,9 @@ fn dispatch_extended_import(
         return Some(result);
     }
     if let Some(result) = av::dispatch(nid, arguments, state) {
+        return Some(result);
+    }
+    if let Some(result) = videodec2::dispatch(nid, arguments, state) {
         return Some(result);
     }
     if let Some(result) = ces::dispatch(nid, arguments, state) {
@@ -5561,6 +5636,30 @@ fn np_web_api2_create_user_context(arguments: [u64; 6], state: &mut ProbeDispatc
     signed_i32_return(context)
 }
 
+/// `sceNpWebApi2PushEventCreateHandle(userCtxId) -> handle`.
+///
+/// Offline titles still allocate push-event handles so later register/unregister calls have a
+/// stable identifier. No push traffic is ever delivered. The handle is returned like
+/// `Initialize` / `CreateUserContext` (rax), not written through an out-parameter: observed
+/// call sites pass a non-pointer second register that must not be treated as a store target.
+fn np_web_api2_push_event_create_handle(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    const INVALID_USER_CONTEXT: u32 = 0x8055_3404;
+    let user_context = low_i32(arguments[0]);
+    if user_context <= 0 || user_context >= 0x8000 {
+        return sce_kernel_error(INVALID_USER_CONTEXT);
+    }
+    let handle = state.services.next_np_web_api2_push_event_handle.max(1);
+    state.services.next_np_web_api2_push_event_handle = handle.saturating_add(1);
+    state
+        .services
+        .np_web_api2_push_event_handles
+        .insert(handle, user_context);
+    signed_i32_return(handle)
+}
+
 fn np_check_callback(state: &mut ProbeDispatchState) -> u64 {
     state.services.np_callback_polls = state.services.np_callback_polls.saturating_add(1);
     0
@@ -5805,6 +5904,24 @@ fn np_get_account_country(output: u64) -> u64 {
     // state is reported separately as signed out, but callers still expect deterministic profile
     // metadata rather than uninitialized stack bytes.
     write_guest_bytes(output, b"US\0\0");
+    0
+}
+
+/// `sceNpGetOnlineId(userId, onlineIdOut)`.
+///
+/// There is no signed-in PSN account on this host. Callers still receive a fixed-width
+/// `SceNpOnlineId` (16 data bytes including the terminator) so offline profile paths do not read
+/// uninitialized memory.
+fn np_get_online_id(arguments: [u64; 6]) -> u64 {
+    const ONLINE_ID_SIZE: usize = 16;
+    const ONLINE_ID: &[u8; ONLINE_ID_SIZE] = b"REmuUser\0\0\0\0\0\0\0\0";
+    if low_i32(arguments[0]) != 0x1000_0000 {
+        return sce_kernel_error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    }
+    if arguments[1] == 0 {
+        return sce_kernel_error(SCE_NP_ERROR_INVALID_ARGUMENT);
+    }
+    write_guest_bytes(arguments[1], ONLINE_ID);
     0
 }
 

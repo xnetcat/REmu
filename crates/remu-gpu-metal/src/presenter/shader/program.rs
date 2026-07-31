@@ -603,13 +603,68 @@ pub(crate) fn procedural_rectangle_export_stage(program: &Program) -> bool {
         && coordinate_mads >= 2
 }
 
+/// Poppy/UE memoryless NGG rectangle covers: GS_ALLOC + prim EXP, no memory/PARAM traffic.
+///
+/// Real binaries are often a short live prefix (sometimes without a position EXP) followed by
+/// padded/undecoded tails. Rejecting on `Opcode::known_name() == None` missed every Poppy cover
+/// and left INTERFACE-FILL zeroes on scanout (mid-band noise).
+pub(crate) fn truncated_memoryless_ngg_rectangle_cover(program: &Program) -> bool {
+    let mut allocation_message = false;
+    let mut primitive_export = false;
+    for instruction in &program.instructions {
+        match instruction.control.as_ref() {
+            Some(InstructionControl::Export(export)) => match export.target {
+                20 if export.enable_mask != 0 => primitive_export = true,
+                // Position may appear in longer UE covers; PARAMs mean a real attribute path.
+                12 => {}
+                32..=63 if export.enable_mask != 0 => return false,
+                _ => {}
+            },
+            Some(
+                InstructionControl::Image(_)
+                | InstructionControl::GlobalMemory(_)
+                | InstructionControl::BufferMemory(_)
+                | InstructionControl::Interpolation(_)
+                | InstructionControl::DataShare(_),
+            ) => return false,
+            _ => {}
+        }
+        match instruction.opcode.known_name() {
+            Some("SSendmsg")
+                if instruction
+                    .sources
+                    .first()
+                    .is_some_and(|source| source.value == 9) =>
+            {
+                allocation_message = true;
+            }
+            Some(name)
+                if name.starts_with("Ds")
+                    || name.starts_with("Image")
+                    || name.starts_with("Buffer")
+                    || name.starts_with("SBuffer")
+                    || name.starts_with("Global")
+                    || name.starts_with("Flat")
+                    || name.starts_with("Scratch") =>
+            {
+                return false;
+            }
+            // Padding / undecoded tails after the live cover prefix.
+            None => {}
+            _ => {}
+        }
+    }
+    allocation_message && primitive_export
+}
+
 /// Returns whether this exact draw uses the synthesized procedural-rectangle vertex stage.
 pub(crate) fn procedural_rectangle_stage_for_draw(program: &Program, draw: &IndexedDraw) -> bool {
     !draw.indexed
         && draw.indirect_arguments_address.is_none()
         && draw.index_count == 3
         && matches!(draw.primitive_type, 7 | 0x11)
-        && procedural_rectangle_export_stage(program)
+        && (procedural_rectangle_export_stage(program)
+            || truncated_memoryless_ngg_rectangle_cover(program))
 }
 
 #[cfg(test)]

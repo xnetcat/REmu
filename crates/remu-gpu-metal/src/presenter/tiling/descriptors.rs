@@ -157,9 +157,21 @@ pub(crate) fn guest_texture_descriptors_share_depth_sample_storage(
     // supplying zero/one in the other channels. Metal samples the native depth texture as a
     // scalar float in .x; XYZW identity (0xFAC) is common for R32 views that only read .x/.r.
     let supported_select = matches!(destination_select, 0 | 0x004 | 0x204 | 0x924 | 0xfac);
+    // Poppy title samples Depth32Float residents through an R32Float SRD whose pitch field is
+    // the visible width (2848) while the depth target keeps RDNA2 padded pitch (2944). Same
+    // address + extent still identifies the native Z plane; forcing CPU writeback here costs
+    // ~75 MiB/frame and still feeds the sampler from a pitch-mismatched decode.
+    let layout_compatible = guest_texture_descriptors_have_same_byte_layout(rendered, sampled)
+        || (rendered.address == sampled.address
+            && rendered.width == sampled.width
+            && rendered.height == sampled.height
+            && rendered.tile_mode == sampled.tile_mode
+            && rendered.bytes_per_pixel == sampled.bytes_per_pixel
+            && rendered.pitch >= rendered.width
+            && sampled.pitch >= sampled.width);
     formats_are_depth_sample_views
         && supported_select
-        && guest_texture_descriptors_have_same_byte_layout(rendered, sampled)
+        && layout_compatible
         && guest_texture_descriptors_share_byte_storage(rendered, sampled)
 }
 

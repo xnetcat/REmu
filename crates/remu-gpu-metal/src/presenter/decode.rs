@@ -360,6 +360,22 @@ pub(super) fn read_draw_indices(draw: &IndexedDraw) -> Option<Arc<[u32]>> {
         2 => 1,
         _ => return None,
     };
+    let indices = read_draw_indices_with_element_size(draw, element_size)?;
+    // When VGT_INDEX_TYPE is stuck at the 16-bit CLEAR default but the buffer is 32-bit, small
+    // indices decode as `(lo, 0)` pairs — e.g. u32 `[0,1,2]` → u16 `[0,0,1,0,2,0]`. Re-read as
+    // 32-bit so NGG/UI quads keep real connectivity instead of degenerate fans.
+    if element_size == 2 && indices_look_like_u32_read_as_u16(indices.as_ref()) {
+        if let Some(recovered) = read_draw_indices_with_element_size(draw, 4) {
+            return Some(recovered);
+        }
+    }
+    Some(indices)
+}
+
+fn read_draw_indices_with_element_size(
+    draw: &IndexedDraw,
+    element_size: u64,
+) -> Option<Arc<[u32]>> {
     let first = u64::from(draw.index_offset).checked_mul(element_size)?;
     let base = draw.index_buffer_address.checked_add(first)?;
     Some(
@@ -380,4 +396,12 @@ pub(super) fn read_draw_indices(draw: &IndexedDraw) -> Option<Arc<[u32]>> {
             .collect::<Vec<_>>()
             .into(),
     )
+}
+
+/// True when a 16-bit decode of small 32-bit indices produced the characteristic `(value, 0)` pairs.
+fn indices_look_like_u32_read_as_u16(indices: &[u32]) -> bool {
+    indices.len() >= 4
+        && indices.len() % 2 == 0
+        && indices.chunks_exact(2).all(|pair| pair[1] == 0 && pair[0] < 0x1_0000)
+        && indices.iter().step_by(2).any(|value| *value != 0)
 }

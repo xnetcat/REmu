@@ -137,8 +137,28 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         // No signed-in network account exists to change state, so a registered state callback is
         // one that never fires. The queries that would report an account stay unserved.
         "qQJfO8HAiaY" => 0,
+        // VoiceQoS is peer-to-peer chat over the console network. This host has no link, so
+        // initialization only validates the caller-owned workspace; no QoS sessions are created.
+        "U8IfNl6-Css" => voice_qos_init(arguments),
         _ => return None,
     })
+}
+
+/// `sceVoiceQoSInit(memBlock, memSize, cpuAffinityMask)`.
+///
+/// Accepts a non-empty caller-owned workspace. Session create and connect stay unserved so titles
+/// that probe for chat disable the feature rather than waiting on peers that never appear.
+fn voice_qos_init(arguments: [u64; 6]) -> u64 {
+    const VOICE_QOS_ERROR_INVALID_ARGUMENT: u32 = 0x8041_0401;
+    let (mem_block, mem_size) = (arguments[0], arguments[1]);
+    if mem_block == 0 || mem_size == 0 {
+        return sce_kernel_error(VOICE_QOS_ERROR_INVALID_ARGUMENT);
+    }
+    let _cpu_affinity = arguments[2];
+    eprintln!(
+        "[REMu][VOICEQOS] initialized workspace={mem_block:#x} size={mem_size:#x} (offline)"
+    );
+    0
 }
 
 #[cfg(test)]

@@ -283,6 +283,139 @@ fn pending_adjacent_release_survives_ordinary_allocation_history_pressure() {
 }
 
 #[test]
+fn adjacent_release_is_recovered_across_nop_padding() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let buffer = fixture.address();
+    let command = call(
+        "wr23dPKyWc0",
+        args(&[buffer, 0x2f, 0x100, 1, 2, 0x70_0000_0000]),
+        args(&[2, 0x1122_3344_5566_7788, 0, 0, 2, 0x123]),
+    );
+    assert_eq!(command, fixture.start());
+    // UE often inserts NOP padding between the HLE release and the guest-authored DCB tail.
+    let nop = call("LtTouSCZjHM", args(&[buffer, 2]), [0; 6]);
+    assert_eq!(nop, command + 32);
+    let submit = nop + 8;
+    assert_eq!(
+        take_recorded_graphics_prefix(submit),
+        Some((command, 10)),
+        "HLE release separated from the submitted tail by NOP padding must still be recovered"
+    );
+    assert_eq!(
+        take_recorded_graphics_prefix(submit),
+        None,
+        "padded release recovery remains one-shot"
+    );
+}
+
+#[test]
+fn grow_preserves_unsubmitted_adjacent_release_outside_the_new_allocation() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let buffer = fixture.address();
+    let release = call(
+        "wr23dPKyWc0",
+        args(&[buffer, 0x2f, 0x100, 1, 2, 0x70_0000_0000]),
+        args(&[2, 0x1122_3344_5566_7788, 0, 0, 2, 0x123]),
+    );
+    assert_eq!(release, fixture.start());
+    // A later grow starts a new generation. The still-pending release must survive so the
+    // guest-authored tail submitted after the grow can recover its producer.
+    track_graphics_command_allocation(buffer, release + 64, 3, true);
+    assert_eq!(
+        take_recorded_graphics_prefix(release + 32),
+        Some((release, 8)),
+        "grow must not erase an unsubmitted HLE release that does not overlap the new allocation"
+    );
+}
+
+#[test]
+fn stale_grow_boundary_falls_back_to_adjacent_release() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let buffer = fixture.address();
+    let release = call(
+        "wr23dPKyWc0",
+        args(&[buffer, 0x2f, 0x100, 1, 2, 0x70_0000_0000]),
+        args(&[2, 0x1122_3344_5566_7788, 0, 0, 2, 0x123]),
+    );
+    assert_eq!(release, fixture.start());
+    // Plant a grow recovery that has already been covered by an intervening submission so the
+    // grow path cannot consume it. Adjacent release recovery must still attach the HLE producer.
+    track_graphics_command_allocation(buffer, release + 64, 3, true);
+    track_graphics_submission(release + 64, 3);
+    assert_eq!(
+        take_recorded_graphics_prefix(release + 32),
+        Some((release, 8)),
+        "an invalid grow split must fall back to the pending adjacent release"
+    );
+}
+
+#[test]
+fn recovered_adjacent_release_cannot_poison_later_submits() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let buffer = fixture.address();
+    let first = call(
+        "wr23dPKyWc0",
+        args(&[buffer, 0x2f, 0x100, 1, 2, 0x70_0000_0000]),
+        args(&[2, 0x1122_3344_5566_7788, 0, 0, 2, 0x123]),
+    );
+    assert_eq!(first, fixture.start());
+    assert_eq!(
+        take_recorded_graphics_prefix(first + 32),
+        Some((first, 8)),
+        "first adjacent release must recover"
+    );
+    track_graphics_submission(first, 8);
+
+    // Plant a stale mark at the already-submitted terminal RELEASE without resetting this
+    // descriptor's submission history (a separate allocation record is enough to reproduce the
+    // Poppy tip-poison). Candidate selection must skip it via submission overlap.
+    track_graphics_allocation(first, 8);
+    mark_graphics_release_allocation(first);
+    let second = call(
+        "wr23dPKyWc0",
+        args(&[buffer, 0x2f, 0x100, 1, 2, 0x70_0000_0001]),
+        args(&[2, 0x99aa_bbcc_ddee_ff00, 0, 0, 2, 0x456]),
+    );
+    assert_eq!(second, first + 32);
+    assert_eq!(
+        take_recorded_graphics_prefix(second + 32),
+        Some((second, 8)),
+        "a stale terminal release from a prior recovered prefix must not block a newer adjacent producer"
+    );
+}
+
+#[test]
+fn mark_release_accepts_a_containing_allocation_span() {
+    let _tracking = graphics_tracking_test_guard();
+    let mut fixture = CommandFixture::new(0);
+    let buffer = fixture.address();
+    let start = fixture.start();
+    // Track a larger span first, then write a release at its start and mark it. The mark helper
+    // must accept the containing allocation when no exact 8-dword record exists.
+    track_graphics_command_allocation(buffer, start, 16, false);
+    fixture.words[..8].copy_from_slice(&[
+        pm4(8, IT_NOP, R_RELEASE_MEM),
+        0x2f,
+        0x0002_0100,
+        0,
+        0x70,
+        0x1122_3344,
+        0x5566_7788,
+        0x123,
+    ]);
+    mark_graphics_release_allocation(start);
+    assert_eq!(
+        take_recorded_graphics_prefix(start + 32),
+        Some((start, 8)),
+        "a release written inside a larger tracked allocation remains recoverable"
+    );
+}
+
+#[test]
 fn consumed_continuation_target_cannot_be_replayed_as_a_prefix() {
     let _tracking = graphics_tracking_test_guard();
     let commands = Box::new([

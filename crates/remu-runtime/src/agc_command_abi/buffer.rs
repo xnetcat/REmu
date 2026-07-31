@@ -426,9 +426,96 @@ pub(crate) fn retire_pending_graphics_continuation(packet: u64) {
 /// The command constructors have still recorded the replacement buffer's prefix. Only a complete,
 /// readable PM4 stream ending exactly at the submitted address is accepted, so unrelated recent
 /// allocations cannot be replayed as graphics work.
+/// Recoverable HLE releases that can form a readable PM4 prefix ending at `command_address`.
+///
+/// Ordered earliest-start first (then newest generation) so a run of marked releases before the
+/// submitted tail is recovered together. Callers must skip candidates that cross an already
+/// submitted range — a stale terminal RELEASE from a prior recovered prefix can still scan as
+/// valid PM4 after ring reuse and would otherwise poison every later submit.
+fn adjacent_recoverable_release_candidates(
+    command_address: u64,
+    lower_bound: u64,
+) -> Vec<(u64, u64, u64)> {
+    let mut candidates: Vec<_> = RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|allocation| {
+            allocation.recoverable_release
+                && allocation.end <= command_address
+                && allocation.start >= lower_bound
+                && scan_valid_command_stream_end(allocation.start, command_address)
+                    == command_address
+                && !prefix_crosses_submitted_range(allocation.start, command_address)
+        })
+        .map(|allocation| {
+            (
+                allocation.descriptor,
+                allocation.generation,
+                allocation.start,
+            )
+        })
+        .collect();
+    candidates.sort_by_key(|&(_, generation, prefix_start)| {
+        (prefix_start, std::cmp::Reverse(generation))
+    });
+    candidates
+}
+
+/// Retires every recoverable release covered by a recovered prefix, regardless of generation.
+///
+/// Matching only the recovered generation leaves a later-generation mark at the terminal RELEASE
+/// of that prefix live. The next submit then selects that stale tip, fails submission-overlap,
+/// and never tries a newer adjacent producer — Poppy title q41 waits stay `none-ingested`.
+fn retire_recoverable_releases_in_prefix(prefix_start: u64, command_address: u64) {
+    RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|allocation| {
+            !(allocation.recoverable_release
+                && allocation.start >= prefix_start
+                && allocation.end <= command_address)
+        });
+}
+
+/// Drops marked releases whose bytes already executed in a recorded submission.
+///
+/// Without this, a later-generation re-mark at a prior prefix's terminal RELEASE keeps winning
+/// earliest-start selection and only fails later on overlap — forever blocking newer producers if
+/// the caller returns on the first failure.
+fn prune_submitted_recoverable_releases() {
+    let submitted = RECENT_GRAPHICS_SUBMISSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if submitted.is_empty() {
+        return;
+    }
+    RECENT_COMMAND_ALLOCATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|allocation| {
+            if !allocation.recoverable_release {
+                return true;
+            }
+            !submitted.iter().any(|range| {
+                allocation.start >= range.start && allocation.end <= range.end
+            })
+        });
+}
+
+fn prefix_crosses_submitted_range(prefix_start: u64, command_address: u64) -> bool {
+    RECENT_GRAPHICS_SUBMISSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|range| range.start < command_address && prefix_start < range.end)
+}
+
 pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64, u32)> {
     const MAX_PREFIX_DWORDS: u64 = 1_000_000;
     let lower_bound = command_address.saturating_sub(MAX_PREFIX_DWORDS * 4);
+    prune_submitted_recoverable_releases();
     let recoveries = GRAPHICS_COMMAND_BUFFER_GENERATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -451,84 +538,100 @@ pub(crate) fn take_recorded_graphics_prefix(command_address: u64) -> Option<(u64
         .max_by_key(|&(_, generation, _)| generation);
     drop(recoveries);
 
+    // Prefer a validated grow split, but never let a stale/invalid grow boundary permanently hide
+    // a still-pending HLE release that sits immediately before the submitted tail.
+    if let Some((descriptor, generation, prefix_start)) = grown_prefix {
+        let scan_ok =
+            scan_valid_command_stream_end(prefix_start, command_address) == command_address;
+        let overlap = prefix_crosses_submitted_range(prefix_start, command_address);
+        if scan_ok && !overlap {
+            let dword_count = u32::try_from((command_address - prefix_start) / 4).ok()?;
+            if dword_count != 0 {
+                let mut recoveries = GRAPHICS_COMMAND_BUFFER_GENERATIONS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(recovery) = recoveries.get_mut(&descriptor)
+                    && recovery.generation == generation
+                    && recovery.recovery_start == Some(prefix_start)
+                {
+                    recovery.recovery_start = None;
+                    drop(recoveries);
+                    eprintln!(
+                        "[REMu][AGC][PREFIX] recovered grow split={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={descriptor:#x} generation={generation}"
+                    );
+                    retire_recoverable_releases_in_prefix(prefix_start, command_address);
+                    let mut allocations = RECENT_COMMAND_ALLOCATIONS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    allocations.retain(|allocation| {
+                        allocation.descriptor != descriptor
+                            || allocation.generation != generation
+                            || !(allocation.start >= prefix_start
+                                && allocation.end <= command_address)
+                    });
+                    return Some((prefix_start, dword_count));
+                }
+                eprintln!(
+                    "[REMu][AGC][PREFIX] grow split rejected submit={command_address:#x} prefix={prefix_start:#x} reason=generation-mismatch; trying adjacent release"
+                );
+            }
+        } else {
+            eprintln!(
+                "[REMu][AGC][PREFIX] grow split rejected submit={command_address:#x} prefix={prefix_start:#x} reason={} ; trying adjacent release",
+                if !scan_ok {
+                    "no-valid-scan"
+                } else {
+                    "submission-overlap"
+                }
+            );
+        }
+    }
+
     // Gen5 also emits a release through an HLE constructor immediately before a guest-authored
-    // DCB tail without invoking the descriptor's grow callback. The concrete allocation record,
-    // exact adjacency, and packet kind are authoritative; do not scan backward across arbitrary
-    // valid-looking PM4 as the old fallback did.
-    let adjacent_release = if grown_prefix.is_none() {
-        RECENT_COMMAND_ALLOCATIONS
+    // DCB tail without invoking the descriptor's grow callback. Exact `end == submit` is too
+    // strict: UE often inserts NOP padding between the HLE release and the submitted tail.
+    let candidates = adjacent_recoverable_release_candidates(command_address, lower_bound);
+    if candidates.is_empty() {
+        let marked = RECENT_COMMAND_ALLOCATIONS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|allocation| {
                 allocation.recoverable_release
-                    && allocation.end == command_address
+                    && allocation.end <= command_address
                     && allocation.start >= lower_bound
             })
-            .max_by_key(|allocation| allocation.generation)
-            .map(|allocation| {
-                (
-                    allocation.descriptor,
-                    allocation.generation,
-                    allocation.start,
-                )
-            })
-    } else {
-        None
-    };
-    let (descriptor, generation, prefix_start, grew) = grown_prefix
-        .map(|(descriptor, generation, prefix_start)| (descriptor, generation, prefix_start, true))
-        .or_else(|| {
-            adjacent_release.map(|(descriptor, generation, prefix_start)| {
-                (descriptor, generation, prefix_start, false)
-            })
-        })?;
-
-    let submitted = RECENT_GRAPHICS_SUBMISSIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if submitted
-        .iter()
-        .any(|range| range.start < command_address && prefix_start < range.end)
-        || scan_valid_command_stream_end(prefix_start, command_address) != command_address
-    {
-        return None;
-    }
-    drop(submitted);
-
-    let dword_count = u32::try_from((command_address - prefix_start) / 4).ok()?;
-    if dword_count == 0 {
-        return None;
-    }
-
-    if grew {
-        let mut recoveries = GRAPHICS_COMMAND_BUFFER_GENERATIONS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let recovery = recoveries.get_mut(&descriptor)?;
-        if recovery.generation != generation || recovery.recovery_start != Some(prefix_start) {
-            return None;
+            .count();
+        if marked != 0 {
+            eprintln!(
+                "[REMu][AGC][PREFIX] adjacent release rejected submit={command_address:#x} marked={marked} reason=no-valid-unsubmitted-candidate"
+            );
         }
-        recovery.recovery_start = None;
-        drop(recoveries);
+        return None;
+    }
 
-        eprintln!(
-            "[REMu][AGC][PREFIX] recovered grow split={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={descriptor:#x} generation={generation}"
-        );
-    } else {
+    for (descriptor, generation, prefix_start) in candidates {
+        let dword_count = match u32::try_from((command_address - prefix_start) / 4) {
+            Ok(count) if count != 0 => count,
+            _ => continue,
+        };
+        // Re-check under the current submission set: a concurrent submit can land between
+        // candidate collection and recovery.
+        if prefix_crosses_submitted_range(prefix_start, command_address)
+            || scan_valid_command_stream_end(prefix_start, command_address) != command_address
+        {
+            eprintln!(
+                "[REMu][AGC][PREFIX] adjacent release skipped submit={command_address:#x} prefix={prefix_start:#x} reason=submission-overlap-or-scan"
+            );
+            continue;
+        }
         eprintln!(
             "[REMu][AGC][PREFIX] recovered adjacent release={prefix_start:#x}..{command_address:#x}/{dword_count} descriptor={descriptor:#x} generation={generation}"
         );
+        retire_recoverable_releases_in_prefix(prefix_start, command_address);
+        return Some((prefix_start, dword_count));
     }
-    let mut allocations = RECENT_COMMAND_ALLOCATIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    allocations.retain(|allocation| {
-        allocation.descriptor != descriptor
-            || allocation.generation != generation
-            || !(allocation.start >= prefix_start && allocation.end <= command_address)
-    });
-    Some((prefix_start, dword_count))
+    None
 }
 
 /// Retires command-constructor records covered by work that has already been parsed.
@@ -560,26 +663,76 @@ pub(crate) fn consume_recorded_graphics_range(command_address: u64, dword_count:
     }
 }
 
-/// Marks one exact constructor allocation as a synchronization prefix candidate.
+/// Marks a graphics-DCB HLE release as a recoverable adjacent-tail prefix.
+///
+/// Async command buffers allocate without graphics tracking; their RELEASE packets execute in the
+/// ACB submit path and must not be treated as DCB prefix candidates.
+pub(crate) fn mark_graphics_release_for_command_buffer(command_buffer: u64, command: u64) {
+    if is_async_command_buffer(command_buffer) {
+        return;
+    }
+    mark_graphics_release_allocation(command);
+}
+
+/// Marks one constructor allocation as a synchronization prefix candidate.
 ///
 /// The guest can submit a directly authored DCB tail beginning immediately after this release.
 /// Keeping the semantic marker on the allocation lets submission recovery include that release
 /// without treating unrelated PM4 bytes in the recycled command ring as executable.
-pub(super) fn mark_graphics_release_allocation(command: u64) {
+pub(crate) fn mark_graphics_release_allocation(command: u64) {
     const RELEASE_DWORDS: u64 = 8;
     let Some(command_end) = command.checked_add(RELEASE_DWORDS * 4) else {
         return;
     };
+    // The HLE constructor just wrote these words; still refuse to probe unmapped command memory.
+    if command == 0 || !command.is_multiple_of(4) {
+        eprintln!(
+            "[REMu][AGC][PREFIX] mark release missed command={command:#x} reason=bad-address"
+        );
+        return;
+    }
+    if !is_packet(command, super::IT_NOP, Some(super::R_RELEASE_MEM))
+        && !is_packet(command, super::IT_RELEASE_MEM, None)
+    {
+        eprintln!(
+            "[REMu][AGC][PREFIX] mark release missed command={command:#x} reason=not-release-packet"
+        );
+        return;
+    }
     let mut allocations = RECENT_COMMAND_ALLOCATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Prefer an exact 8-dword constructor record. When the release sits inside a larger tracked
+    // span, publish a dedicated 8-dword recoverable record so adjacent-tail recovery can require
+    // `end <= submit` without dragging unrelated PM4 into the prefix.
     if let Some(allocation) = allocations
         .iter_mut()
         .rev()
         .find(|allocation| allocation.start == command && allocation.end == command_end)
     {
         allocation.recoverable_release = true;
+        return;
     }
+    if let Some(template) = allocations
+        .iter()
+        .rev()
+        .find(|allocation| allocation.start <= command && allocation.end >= command_end)
+        .copied()
+    {
+        allocations.push(RecentGraphicsAllocation {
+            descriptor: template.descriptor,
+            generation: template.generation,
+            buffer_start: template.buffer_start,
+            buffer_end: template.buffer_end,
+            start: command,
+            end: command_end,
+            recoverable_release: true,
+        });
+        return;
+    }
+    eprintln!(
+        "[REMu][AGC][PREFIX] mark release missed command={command:#x}..{command_end:#x} reason=no-allocation"
+    );
 }
 
 /// Bounds ordinary constructor history without discarding pending queue synchronization.
@@ -676,7 +829,22 @@ pub(crate) fn track_graphics_command_allocation(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if started_new_generation {
-        allocations.retain(|allocation| allocation.descriptor != command_buffer);
+        // Ordinary constructor history for this descriptor is generation-scoped. An unsubmitted
+        // HLE release is queue synchronization, not reconstruction aid: keep it across grow so the
+        // adjacent-tail submit can still recover the producer. Only drop a marked release when the
+        // new allocation recycles its bytes (cursor wrap / in-place reuse), which makes the old
+        // packet contents invalid.
+        allocations.retain(|allocation| {
+            if allocation.descriptor != command_buffer {
+                return true;
+            }
+            if allocation.recoverable_release {
+                let overlaps_new = allocation.start < command_end && command < allocation.end;
+                !overlaps_new
+            } else {
+                false
+            }
+        });
     }
     // Prune before appending so a release constructor's fresh allocation remains present for
     // `mark_graphics_release_allocation`, which runs after its words have been written.

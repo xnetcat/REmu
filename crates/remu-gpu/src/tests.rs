@@ -691,6 +691,32 @@ fn decodes_direct_group_dimensions_wave_size_and_lds() {
 }
 
 #[test]
+fn decodes_compute_num_thread_registers_with_selector_high_bits() {
+    let registers = [
+        GpuRegister {
+            offset: 0x2000_0000 | COMPUTE_NUM_THREAD_X_REGISTER,
+            value: 64,
+        },
+        GpuRegister {
+            offset: 0x2000_0000 | COMPUTE_NUM_THREAD_Y_REGISTER,
+            value: 1,
+        },
+        GpuRegister {
+            offset: 0x2000_0000 | COMPUTE_NUM_THREAD_Z_REGISTER,
+            value: 1,
+        },
+        GpuRegister {
+            offset: COMPUTE_PGM_RSRC2_REGISTER,
+            value: 64 << 15,
+        },
+    ];
+    let launch = decode_compute_launch([16, 1, 1], 0x8005, &registers)
+        .expect("NUM_THREAD with UE selector high bits");
+    assert_eq!(launch.threads_per_group, [64, 1, 1]);
+    assert_eq!(launch.grid, ComputeGrid::Threadgroups([16, 1, 1]));
+}
+
+#[test]
 fn decodes_thread_dimensions_as_an_exact_unpadded_grid() {
     let registers = compute_registers([64, 1, 1], [0; 3]);
     let launch = decode_compute_launch([130, 3, 1], 0x8025, &registers)

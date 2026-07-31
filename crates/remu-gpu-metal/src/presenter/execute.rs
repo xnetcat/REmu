@@ -843,7 +843,11 @@ impl MetalPresenter {
             // topology and base vertex must not reshape that draw.
             primitive = MTLPrimitiveType::Triangle;
         }
-        let indexed_draw = if draw.indexed && indirect_arguments.is_none() {
+        // Cover draws must not consume guest index buffers: an indexed cover would take the
+        // draw_indexed path below and ignore the synthesized three-vertex triangle.
+        let indexed_draw = if uses_procedural_rectangle_stage {
+            None
+        } else if draw.indexed && indirect_arguments.is_none() {
             let indices = read_draw_indices(draw).ok_or("index buffer is unreadable")?;
             let prepared = prepare_indexed_primitive(draw, indices)?;
             primitive = prepared.1;

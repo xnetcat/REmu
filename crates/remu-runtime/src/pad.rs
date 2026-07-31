@@ -293,13 +293,15 @@ struct AutoCrossPulseState {
 }
 
 impl AutoCrossPulseState {
-    fn begin_pulse(&mut self, now: Instant, hold: Duration) -> u32 {
-        self.active_buttons = if self.next_button_is_square {
+    fn begin_pulse(&mut self, now: Instant, hold: Duration, allow_square: bool) -> u32 {
+        self.active_buttons = if allow_square && self.next_button_is_square {
             remu_gpu::PAD_BUTTON_SQUARE
         } else {
             remu_gpu::PAD_BUTTON_CROSS
         };
-        self.next_button_is_square = !self.next_button_is_square;
+        if allow_square {
+            self.next_button_is_square = !self.next_button_is_square;
+        }
         self.active_until = Some(now + hold);
         self.active_buttons
     }
@@ -329,8 +331,13 @@ impl AutoCrossPulseState {
             self.next_scheduled_pulse += 1;
             if self.next_scheduled_pulse == times.len() {
                 self.next_repeated_pulse = repeat.map(|period| now + period);
+                // First post-schedule pulse should be Square so Confirm and Restore Default
+                // keep alternating on separate edges.
+                self.next_button_is_square = true;
             }
-            return self.begin_pulse(now, hold);
+            // Explicit schedule pulses stay on Cross. Square is reserved for the post-schedule
+            // repeat phase so a Confirm path cannot be undone by Restore Default mid-menu.
+            return self.begin_pulse(now, hold, false);
         }
 
         if self.next_scheduled_pulse == times.len()
@@ -339,7 +346,7 @@ impl AutoCrossPulseState {
                 .is_some_and(|scheduled| now >= scheduled)
         {
             self.next_repeated_pulse = repeat.map(|period| now + period);
-            return self.begin_pulse(now, hold);
+            return self.begin_pulse(now, hold, true);
         }
         0
     }
@@ -485,6 +492,29 @@ mod tests {
                 None,
             ),
             0
+        );
+    }
+
+    #[test]
+    fn scheduled_pulses_stay_on_cross_so_confirm_is_not_undone() {
+        let start = Instant::now();
+        let hold = Duration::from_millis(50);
+        let times = [Duration::from_millis(10), Duration::from_millis(200)];
+        let mut state = AutoCrossPulseState::default();
+
+        assert_eq!(
+            state.buttons_at(start + Duration::from_millis(10), start, &times, hold, None),
+            remu_gpu::PAD_BUTTON_CROSS
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(200),
+                start,
+                &times,
+                hold,
+                None
+            ),
+            remu_gpu::PAD_BUTTON_CROSS
         );
     }
 }

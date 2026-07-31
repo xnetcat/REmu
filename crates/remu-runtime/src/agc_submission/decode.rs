@@ -8,6 +8,12 @@ use crate::{
     trace_guest_sync,
 };
 
+/// GPU label / fence addresses used by UE WAIT_REG_MEM handshakes (Poppy title menu).
+/// Always trace producers that touch this window — rate-limited SYNC logs previously hid them.
+fn is_gpu_sync_label_address(address: u64) -> bool {
+    (0x7e00_0000_0000..0x8000_0000_0000).contains(&address)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgcEventWrite {
     PipelineBarrier(remu_gpu::GpuPipelineBarrier),
@@ -101,7 +107,7 @@ pub(super) fn decode_agc_memory_write(
         .collect::<Vec<_>>();
     static WRITE_DATA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
     let sequence = WRITE_DATA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if sequence <= 32 || sequence.is_power_of_two() {
+    if is_gpu_sync_label_address(address) || sequence <= 32 || sequence.is_power_of_two() {
         eprintln!(
             "[REMu][AGC][SYNC] write sequence={sequence} packet={packet_address:#x} standard={standard_packet} destination={destination} address={address:#x} dwords={} increment={increment_address} values={values:?}",
             values.len()
@@ -204,7 +210,11 @@ pub(super) fn decode_agc_memory_release(
         _ => None,
     };
     let trace = TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if trace_guest_sync() || trace <= 96 || trace.is_power_of_two() {
+    if is_gpu_sync_label_address(address)
+        || trace_guest_sync()
+        || trace <= 96
+        || trace.is_power_of_two()
+    {
         eprintln!(
             "[REMu][AGC][SYNC] release packet={packet_address:#x} standard={standard_packet} control={control:#010x} selection={data_selection} address={address:#x} data={data:#x} emitted={}",
             value.is_some() && address != 0

@@ -91,7 +91,7 @@ pub enum MappingError {
     InvalidAlignment(u64),
     #[error("guest auxiliary allocation of 0x{size:x} bytes exceeds the reserved range")]
     AuxiliaryRangeExhausted { size: u64 },
-    #[error("fixed guest mappings are currently implemented only on macOS")]
+    #[error("fixed guest mappings are not supported on this host")]
     UnsupportedPlatform,
 }
 
@@ -422,8 +422,12 @@ impl GuestImage {
 
 #[derive(Clone, Copy, Debug)]
 enum AllocationKind {
+    #[cfg(unix)]
     Mmap,
+    #[cfg(target_os = "macos")]
     Mach,
+    #[cfg(windows)]
+    VirtualAlloc,
 }
 
 #[derive(Debug)]
@@ -515,7 +519,46 @@ impl RawAllocation {
         })
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    fn allocate_exact(address: u64, size: u64) -> Result<Self, MappingError> {
+        let size_usize = usize::try_from(size).map_err(|_| MappingError::SizeNotRepresentable)?;
+        let requested = usize::try_from(address).map_err(|_| MappingError::SizeNotRepresentable)?
+            as *mut c_void;
+        // SAFETY: Reserves and commits an exact free range; failure leaves no mapping owned.
+        let mapped = unsafe {
+            VirtualAlloc(
+                requested,
+                size_usize,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if mapped.is_null() {
+            return Err(MappingError::AllocationFailed {
+                address,
+                size,
+                source: io::Error::last_os_error(),
+            });
+        }
+        if mapped != requested {
+            // SAFETY: Owns the unexpected mapping returned above.
+            unsafe {
+                VirtualFree(mapped, 0, MEM_RELEASE);
+            }
+            return Err(MappingError::AllocationFailed {
+                address,
+                size,
+                source: io::Error::from_raw_os_error(ERROR_INVALID_ADDRESS),
+            });
+        }
+        Ok(Self {
+            address: NonNull::new(mapped).ok_or(MappingError::AddressOverflow)?,
+            size: size_usize,
+            kind: AllocationKind::VirtualAlloc,
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
     const fn allocate_exact(_address: u64, _size: u64) -> Result<Self, MappingError> {
         Err(MappingError::UnsupportedPlatform)
     }
@@ -528,6 +571,7 @@ impl RawAllocation {
 impl Drop for RawAllocation {
     fn drop(&mut self) {
         match self.kind {
+            #[cfg(unix)]
             AllocationKind::Mmap => {
                 // SAFETY: This allocation is live and owned exclusively by `self`.
                 unsafe {
@@ -541,12 +585,18 @@ impl Drop for RawAllocation {
                     mach_vm_deallocate(mach_task_self(), self.address_u64(), self.size as u64);
                 }
             }
-            #[cfg(not(target_os = "macos"))]
-            AllocationKind::Mach => {}
+            #[cfg(windows)]
+            AllocationKind::VirtualAlloc => {
+                // SAFETY: This VirtualAlloc mapping is live and owned exclusively by `self`.
+                unsafe {
+                    VirtualFree(self.address.as_ptr(), 0, MEM_RELEASE);
+                }
+            }
         }
     }
 }
 
+#[cfg(unix)]
 fn host_page_size() -> Result<u64, MappingError> {
     // SAFETY: `sysconf` has no pointer preconditions.
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -555,6 +605,25 @@ fn host_page_size() -> Result<u64, MappingError> {
         return Err(MappingError::InvalidHostPageSize);
     }
     Ok(page_size)
+}
+
+#[cfg(windows)]
+fn host_page_size() -> Result<u64, MappingError> {
+    let mut info = SystemInfo::zeroed();
+    // SAFETY: `info` is a valid SYSTEM_INFO buffer for GetSystemInfo.
+    unsafe {
+        GetSystemInfo(&raw mut info);
+    }
+    let page_size = u64::from(info.dw_page_size);
+    if page_size == 0 || !page_size.is_power_of_two() {
+        return Err(MappingError::InvalidHostPageSize);
+    }
+    Ok(page_size)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn host_page_size() -> Result<u64, MappingError> {
+    Err(MappingError::UnsupportedPlatform)
 }
 
 fn align_down(value: u64, alignment: u64) -> u64 {
@@ -568,6 +637,7 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, MappingError> {
         .ok_or(MappingError::AddressOverflow)
 }
 
+#[cfg(unix)]
 fn protect(address: u64, size: u64, flags: u32) -> Result<(), MappingError> {
     let mut protection = libc::PROT_NONE;
     if flags & GUEST_READ != 0 || flags & GUEST_EXECUTE != 0 {
@@ -595,6 +665,46 @@ fn protect(address: u64, size: u64, flags: u32) -> Result<(), MappingError> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn protect(address: u64, size: u64, flags: u32) -> Result<(), MappingError> {
+    let protection = windows_page_protection(flags);
+    let address_ptr =
+        usize::try_from(address).map_err(|_| MappingError::SizeNotRepresentable)? as *mut c_void;
+    let size_usize = usize::try_from(size).map_err(|_| MappingError::SizeNotRepresentable)?;
+    let mut old_protection = 0_u32;
+    // SAFETY: The caller passes page-aligned ranges belonging to the live guest allocation.
+    if unsafe { VirtualProtect(address_ptr, size_usize, protection, &raw mut old_protection) } == 0
+    {
+        return Err(MappingError::ProtectionFailed {
+            address,
+            end: address
+                .checked_add(size)
+                .ok_or(MappingError::AddressOverflow)?,
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+const fn windows_page_protection(flags: u32) -> u32 {
+    let readable = flags & GUEST_READ != 0 || flags & GUEST_EXECUTE != 0;
+    let writable = flags & GUEST_WRITE != 0;
+    let executable = flags & GUEST_EXECUTE != 0;
+    match (readable, writable, executable) {
+        (_, true, true) => PAGE_EXECUTE_READWRITE,
+        (_, false, true) => PAGE_EXECUTE_READ,
+        (_, true, false) => PAGE_READWRITE,
+        (true, false, false) => PAGE_READONLY,
+        (false, false, false) => PAGE_NOACCESS,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protect(_address: u64, _size: u64, _flags: u32) -> Result<(), MappingError> {
+    Err(MappingError::UnsupportedPlatform)
+}
+
 #[cfg(target_os = "macos")]
 const KERN_SUCCESS: i32 = 0;
 #[cfg(target_os = "macos")]
@@ -606,6 +716,79 @@ unsafe extern "C" {
     fn mach_task_self() -> u32;
     fn mach_vm_allocate(target: u32, address: *mut u64, size: u64, flags: i32) -> i32;
     fn mach_vm_deallocate(target: u32, address: u64, size: u64) -> i32;
+}
+
+#[cfg(windows)]
+const MEM_COMMIT: u32 = 0x1000;
+#[cfg(windows)]
+const MEM_RESERVE: u32 = 0x2000;
+#[cfg(windows)]
+const MEM_RELEASE: u32 = 0x8000;
+#[cfg(windows)]
+const PAGE_NOACCESS: u32 = 0x01;
+#[cfg(windows)]
+const PAGE_READONLY: u32 = 0x02;
+#[cfg(windows)]
+const PAGE_READWRITE: u32 = 0x04;
+#[cfg(windows)]
+const PAGE_EXECUTE_READ: u32 = 0x20;
+#[cfg(windows)]
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+#[cfg(windows)]
+const ERROR_INVALID_ADDRESS: i32 = 487;
+
+#[cfg(windows)]
+#[repr(C)]
+struct SystemInfo {
+    w_processor_architecture: u16,
+    w_reserved: u16,
+    dw_page_size: u32,
+    lp_minimum_application_address: *mut c_void,
+    lp_maximum_application_address: *mut c_void,
+    dw_active_processor_mask: usize,
+    dw_number_of_processors: u32,
+    dw_processor_type: u32,
+    dw_allocation_granularity: u32,
+    w_processor_level: u16,
+    w_processor_revision: u16,
+}
+
+#[cfg(windows)]
+impl SystemInfo {
+    const fn zeroed() -> Self {
+        Self {
+            w_processor_architecture: 0,
+            w_reserved: 0,
+            dw_page_size: 0,
+            lp_minimum_application_address: std::ptr::null_mut(),
+            lp_maximum_application_address: std::ptr::null_mut(),
+            dw_active_processor_mask: 0,
+            dw_number_of_processors: 0,
+            dw_processor_type: 0,
+            dw_allocation_granularity: 0,
+            w_processor_level: 0,
+            w_processor_revision: 0,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn VirtualAlloc(
+        lp_address: *mut c_void,
+        dw_size: usize,
+        fl_allocation_type: u32,
+        fl_protect: u32,
+    ) -> *mut c_void;
+    fn VirtualFree(lp_address: *mut c_void, dw_size: usize, dw_free_type: u32) -> i32;
+    fn VirtualProtect(
+        lp_address: *mut c_void,
+        dw_size: usize,
+        fl_new_protect: u32,
+        lpfl_old_protect: *mut u32,
+    ) -> i32;
+    fn GetSystemInfo(lp_system_info: *mut SystemInfo);
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]

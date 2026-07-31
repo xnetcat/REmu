@@ -104,7 +104,9 @@ fn dispatch_builder(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchSta
         // current and its original name, and the runtime already builds it.
         "o67gODLFpls" => ampr_command_buffer_write_kernel_event_queue(arguments, state),
         // The polled half of the same contract: a completion word written to guest memory.
-        "sJXyWHjP-F8" => ampr_command_buffer_write_address_on_completion(arguments, state),
+        "sJXyWHjP-F8" | "j0+3uJMxYJY" => {
+            ampr_command_buffer_write_address_on_completion(arguments, state)
+        }
         "RPCAhx-aabE" => buffer_base_address(arguments[0], state),
         "gzndltBEzWc" => num_commands(arguments[0], state),
         _ => return None,
@@ -124,9 +126,8 @@ fn dispatch_command_size(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         "pbnNnahE8vk" => MARKER_HEADER_BYTES,
         // The gather and scatter reads have no builder yet, and the completion-word command does,
         // but every record is the same fixed stride, so their footprints are already settled.
-        "rddQYXM0CjM" | "qesF88X4DRg" | "7nXGDGMXSqo" | "DXmgc5op8Yw" | "C+IEj+BsAFM" => {
-            AMPR_COMMAND_RECORD_SIZE
-        }
+        "rddQYXM0CjM" | "qesF88X4DRg" | "7nXGDGMXSqo" | "DXmgc5op8Yw" | "C+IEj+BsAFM"
+        | "4fgtGfXDrFc" => AMPR_COMMAND_RECORD_SIZE,
         "Zi3dBUjgyXI" => ampr_measure_command_size(),
         _ => return None,
     })

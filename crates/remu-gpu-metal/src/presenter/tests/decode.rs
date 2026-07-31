@@ -417,6 +417,26 @@ fn native_depth_surface_matches_shader_r32_view_without_writeback() {
         guest_texture_descriptors_share_depth_sample_storage(rendered, sampled, 0xfac),
         "R32 depth views with XYZW identity still only need .x from the native Z plane"
     );
+
+    // Poppy title: depth target pitch is RDNA2-padded while the R32 SRD reports visible width.
+    let rendered = GuestTextureDescriptor {
+        address: 0x9023_2c00_00,
+        width: 2_848,
+        height: 1_600,
+        pitch: 2_944,
+        tile_mode: 24,
+        pixel_format: MTLPixelFormat::Depth32Float,
+        bytes_per_pixel: 4,
+    };
+    let sampled = GuestTextureDescriptor {
+        pitch: 2_848,
+        pixel_format: MTLPixelFormat::R32Float,
+        ..rendered
+    };
+    assert!(
+        guest_texture_descriptors_share_depth_sample_storage(rendered, sampled, 0x204),
+        "padded depth pitch vs visible-width R32 SRD must still bind the native resident"
+    );
 }
 
 #[test]
@@ -756,6 +776,18 @@ fn decodes_agc_16_and_32_bit_index_types() {
     assert_eq!(
         read_draw_indices(&draw_32).as_deref(),
         Some([0, 1, 2, 0, 2, 3].as_slice())
+    );
+}
+
+#[test]
+fn recovers_32_bit_index_buffers_mislabeled_as_16_bit() {
+    // u32 [0,1,2,2,1,3] read as u16 is [0,0,1,0,2,0,2,0,1,0,3,0]. Poppy/UE often leave
+    // VGT_INDEX_TYPE at the 16-bit CLEAR default while the buffer is 32-bit.
+    let indices_32 = [0_u32, 1, 2, 2, 1, 3];
+    let draw = indexed_draw(indices_32.as_ptr().addr() as u64, 0, 6);
+    assert_eq!(
+        read_draw_indices(&draw).as_deref(),
+        Some([0, 1, 2, 2, 1, 3].as_slice())
     );
 }
 

@@ -1,7 +1,6 @@
 use crate::{
-    ProbeDispatchState, guest_memset, low_i32, np, read_guest_cstring, read_guest_u64,
+    ProbeDispatchState, guest_memset, low_i32, low_u32, np, read_guest_cstring, read_guest_u64,
     sce_kernel_error, write_guest_u8, write_guest_u32, write_guest_u64, write_output_i32,
-    write_output_u64,
 };
 
 fn np_error(result: Result<(), u32>) -> u64 {
@@ -131,6 +130,33 @@ pub(crate) fn np_universal_data_create_property_object(
     }
 }
 
+/// `sceNpUniversalDataSystemCreateEventPropertyArray(arrayOut)`.
+///
+/// Observed call sites pass extra unused register values after the out-pointer (same pattern as
+/// Initialize); only the first argument is the array handle slot.
+pub(crate) fn np_universal_data_create_property_array(
+    output: u64,
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    if output == 0 {
+        return sce_kernel_error(np::UDS_ERROR_INVALID_ARGUMENT);
+    }
+    match state.np_universal_data.create_property_array(0) {
+        Ok(array) => {
+            write_guest_u64(output, array);
+            0
+        }
+        Err(error) => sce_kernel_error(error),
+    }
+}
+
+pub(crate) fn np_universal_data_destroy_property_array(
+    array: u64,
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    np_error(state.np_universal_data.destroy_property_array(array))
+}
+
 pub(crate) fn np_universal_data_object_set_i32(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -162,21 +188,36 @@ pub(crate) fn np_universal_data_object_set_string(
     )
 }
 
+/// `sceNpUniversalDataSystemEventPropertyObjectSetArray(object, key, value, valueOut)`.
+///
+/// `value` may already be a live array from `CreateEventPropertyArray`. When both `value` and
+/// `valueOut` are null the call is a no-op success, matching the Gen5 cleanup path after a
+/// failed create.
 pub(crate) fn np_universal_data_object_set_array(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
 ) -> u64 {
-    if arguments[3] == 0 {
+    let (object, existing, output) = (arguments[0], arguments[2], arguments[3]);
+    if object == 0 {
         return sce_kernel_error(np::UDS_ERROR_INVALID_ARGUMENT);
+    }
+    if existing == 0 && output == 0 {
+        return 0;
     }
     let Some(key) = read_guest_cstring(arguments[1]) else {
         return sce_kernel_error(np::UDS_ERROR_INVALID_EVENT_PROPERTY_KEY);
     };
+    let existing = (existing != 0).then_some(existing);
     match state
         .np_universal_data
-        .object_set_array(arguments[0], key, arguments[2])
+        .object_set_array(object, key, existing)
     {
-        Ok(array) => write_output_u64(arguments[3], array),
+        Ok(array) => {
+            if output != 0 {
+                write_guest_u64(output, array);
+            }
+            0
+        }
         Err(error) => sce_kernel_error(error),
     }
 }
@@ -369,6 +410,35 @@ pub(crate) fn np_trophy_get_game_info(
         "Trophies",
         "Trophy metadata is unavailable offline.",
     );
+    0
+}
+
+/// `sceNpTrophy2GetTrophyInfoArray(context, handle, offset, limit, details, data, count)`.
+///
+/// Offline hosts have no trophy catalogue. A zero `limit` (or missing output buffers) reports
+/// `count=0` after validating the registered context/handle, which is what Octopath asks for
+/// during boot. Inventing placeholder trophies would misrepresent unlock state.
+pub(crate) fn np_trophy_get_trophy_info_array(
+    arguments: [u64; 6],
+    stack_arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let (context, handle, _offset, limit, details, data) = (
+        low_i32(arguments[0]),
+        low_i32(arguments[1]),
+        low_u32(arguments[2]),
+        low_u32(arguments[3]),
+        arguments[4],
+        arguments[5],
+    );
+    let count = stack_arguments[0];
+    if let Err(error) = state.np_trophy.require_registered(context, handle) {
+        return np_error(Err(error));
+    }
+    let _ = (details, data, limit);
+    if count != 0 {
+        write_guest_u32(count, 0);
+    }
     0
 }
 

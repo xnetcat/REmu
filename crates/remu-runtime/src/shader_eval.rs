@@ -167,30 +167,35 @@ pub(crate) fn export_user_data_register(draw: &remu_gpu::IndexedDraw) -> u32 {
 }
 
 pub(crate) fn draw_required_vertex_record_count(draw: &remu_gpu::IndexedDraw) -> Option<u32> {
-    if !draw.indexed {
+    let per_instance = if !draw.indexed {
         let count = if draw.primitive_type == 0x11 {
             4
         } else {
             draw.index_count
         };
         let first = i64::from(draw.index_offset) + i64::from(draw.base_vertex);
-        return u32::try_from(first).ok()?.checked_add(count);
-    }
-    let restart = draw_primitive_restart_index(draw);
-    draw.index_snapshot
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .copied()
-        .filter(|index| restart != Some(*index))
-        .try_fold(None, |maximum, index| {
-            let adjusted = i64::from(index) + i64::from(draw.base_vertex);
-            let adjusted = u32::try_from(adjusted).ok()?;
-            Some(Some(
-                maximum.map_or(adjusted, |current: u32| current.max(adjusted)),
-            ))
-        })?
-        .and_then(|maximum| maximum.checked_add(1))
+        u32::try_from(first).ok()?.checked_add(count)
+    } else {
+        let restart = draw_primitive_restart_index(draw);
+        draw.index_snapshot
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|index| restart != Some(*index))
+            .try_fold(None, |maximum, index| {
+                let adjusted = i64::from(index) + i64::from(draw.base_vertex);
+                let adjusted = u32::try_from(adjusted).ok()?;
+                Some(Some(
+                    maximum.map_or(adjusted, |current: u32| current.max(adjusted)),
+                ))
+            })?
+            .and_then(|maximum| maximum.checked_add(1))
+    }?;
+    // Instanced NGG UI packs per-instance attributes after the base vertex span. Clamping the
+    // binding to max(index)+1 truncates later instances to OOB zeroes (solid white glyph boxes).
+    let instances = draw.instance_count.max(1);
+    per_instance.checked_mul(instances)
 }
 
 pub(crate) fn draw_primitive_restart_index(draw: &remu_gpu::IndexedDraw) -> Option<u32> {
@@ -228,6 +233,22 @@ pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<
         2 => 1,
         _ => return None,
     };
+    let indices = snapshot_draw_indices_with_element_size(draw, element_size)?;
+    // When VGT_INDEX_TYPE is stuck at the 16-bit CLEAR default but the buffer is 32-bit, small
+    // indices decode as `(lo, 0)` pairs. Recover by re-reading as 32-bit before the snapshot is
+    // frozen onto the draw (Metal prefers `index_snapshot` over a live re-read).
+    if element_size == 2 && indices_look_like_u32_read_as_u16(indices.as_ref()) {
+        if let Some(recovered) = snapshot_draw_indices_with_element_size(draw, 4) {
+            return Some(recovered);
+        }
+    }
+    Some(indices)
+}
+
+fn snapshot_draw_indices_with_element_size(
+    draw: &remu_gpu::IndexedDraw,
+    element_size: usize,
+) -> Option<Arc<[u32]>> {
     let first = usize::try_from(draw.index_offset)
         .ok()?
         .checked_mul(element_size)?;
@@ -252,6 +273,13 @@ pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<
             .collect::<Vec<_>>()
             .into(),
     )
+}
+
+fn indices_look_like_u32_read_as_u16(indices: &[u32]) -> bool {
+    indices.len() >= 4
+        && indices.len() % 2 == 0
+        && indices.chunks_exact(2).all(|pair| pair[1] == 0 && pair[0] < 0x1_0000)
+        && indices.iter().step_by(2).any(|value| *value != 0)
 }
 
 pub(crate) fn snapshot_small_readonly_global_bindings(

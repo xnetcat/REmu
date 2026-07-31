@@ -175,6 +175,12 @@ synthetic tests. No game bytes or proprietary SDK material are included.
   and 104-byte extended stream-info fields were recovered from the authorized local Unity and
   Unreal executable call sites. REmu's ffmpeg pipe decoders, input-side `-ss` seek, and
   host-elapsed media clock are independent implementations. No SDK material was copied.
+- Videodec2 compute-queue struct layouts (`OrbisVideodec2ComputeMemoryInfo` /
+  `OrbisVideodec2ComputeConfigInfo`), error codes, and the allocate-returns-workspace-pointer
+  contract were cross-checked against shadPS4's GPL-2.0-or-later `videodec2.h` /
+  `videodec2.cpp` / `videodec_error.h`. REmu's offline path reports a fixed workspace size,
+  validates pipe/queue ids, and tracks allocated queue opaques without implementing decoder
+  create/decode.
 
 ## `remu-shader`
 

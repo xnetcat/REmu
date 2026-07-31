@@ -313,8 +313,98 @@ pub(crate) fn publish_host_toast(kind: HostDialogKind, title: &str, message: &st
     }));
 }
 
+/// Opens a host error dialog and records it as the active common-dialog owner.
+pub(crate) fn error_dialog_initialize(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.common_dialog != InitializationState::Initialized {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_SYSTEM_INITIALIZED);
+    }
+    if state.services.error_dialog_status != COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_DIALOG_ALREADY_INITIALIZED);
+    }
+    if state.services.common_dialog_owner.is_some() {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_BUSY);
+    }
+    state.services.error_dialog_status = COMMON_DIALOG_STATUS_INITIALIZED;
+    state.services.common_dialog_owner = Some(CommonDialogOwner::Error);
+    state.services.error_dialog_sequence = 0;
+    state.services.error_dialog_result_code = MESSAGE_DIALOG_RESULT_USER_CANCELED;
+    0
+}
+
+pub(crate) fn error_dialog_terminate(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.error_dialog_status == COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    dismiss_error_dialog(state);
+    state.services.error_dialog_status = COMMON_DIALOG_STATUS_NONE;
+    if state.services.common_dialog_owner == Some(CommonDialogOwner::Error) {
+        state.services.common_dialog_owner = None;
+    }
+    0
+}
+
+/// `sceErrorDialogOpen`. Titles pass a parameter block whose first fields are the common-dialog
+/// base and an SCE error code; the host dialog surfaces that code so the offline path still
+/// completes when `REMU_AUTO_DISMISS_DIALOGS` is set.
+pub(crate) fn error_dialog_open(parameters: u64, state: &mut ProbeDispatchState) -> u64 {
+    if state.services.error_dialog_status == COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    if parameters == 0 {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_ARG_NULL);
+    }
+    // After the 0x30-byte common-dialog base, the first dword is the SCE error code.
+    let error_code = read_guest_u32(parameters.saturating_add(0x30));
+    let message = format!("Error {error_code:#010x}");
+    let sequence = begin_host_dialog();
+    state.services.error_dialog_sequence = sequence;
+    state.services.error_dialog_result_code = MESSAGE_DIALOG_RESULT_USER_CANCELED;
+    state.services.error_dialog_status = COMMON_DIALOG_STATUS_RUNNING;
+    publish_or_auto_dismiss(
+        HostDialogRequest {
+            kind: HostDialogKind::Error,
+            title: "Error".to_owned(),
+            message,
+            buttons: HostDialogButtons::Ok,
+            sequence,
+        },
+        sequence,
+    );
+    0
+}
+
+pub(crate) fn error_dialog_update_status(state: &mut ProbeDispatchState) -> u64 {
+    poll_error_dialog(state);
+    u64::from(state.services.error_dialog_status)
+}
+
+pub(crate) fn error_dialog_get_status(state: &ProbeDispatchState) -> u64 {
+    u64::from(state.services.error_dialog_status)
+}
+
+pub(crate) fn error_dialog_close(state: &mut ProbeDispatchState) -> u64 {
+    if state.services.error_dialog_status == COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    dismiss_error_dialog(state);
+    state.services.error_dialog_status = COMMON_DIALOG_STATUS_FINISHED;
+    0
+}
+
+pub(crate) fn error_dialog_get_result(output: u64, state: &ProbeDispatchState) -> u64 {
+    if state.services.error_dialog_status == COMMON_DIALOG_STATUS_NONE {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
+    }
+    let Some(output) = guest_output_pointer(output, 8) else {
+        return sce_kernel_error(COMMON_DIALOG_ERROR_ARG_NULL);
+    };
+    write_guest_u32(output, state.services.error_dialog_result_code);
+    write_guest_u32(output + 4, 0);
+    0
+}
+
 /// Opens a host error dialog (used when titles hit stubbed error-dialog entry points).
-#[allow(dead_code)] // wired when error-dialog NIDs are hooked up
+#[allow(dead_code)] // retained for one-shot error toast paths outside the dialog lifecycle
 pub(crate) fn open_error_dialog(message: &str) -> u64 {
     let sequence = begin_host_dialog();
     publish_or_auto_dismiss(
@@ -409,6 +499,17 @@ fn poll_save_data_dialog(state: &mut ProbeDispatchState) {
     state.services.save_data_dialog_status = COMMON_DIALOG_STATUS_FINISHED.cast_signed();
 }
 
+fn poll_error_dialog(state: &mut ProbeDispatchState) {
+    if state.services.error_dialog_status != COMMON_DIALOG_STATUS_RUNNING {
+        return;
+    }
+    let Some(result) = host_dialog_result(state.services.error_dialog_sequence) else {
+        return;
+    };
+    apply_error_dialog_result(state, result.code);
+    state.services.error_dialog_status = COMMON_DIALOG_STATUS_FINISHED;
+}
+
 fn dismiss_message_dialog(state: &mut ProbeDispatchState, code: HostDialogResultCode) {
     let sequence = state.services.message_dialog_sequence;
     if sequence != 0 {
@@ -425,6 +526,15 @@ fn dismiss_save_data_dialog(state: &mut ProbeDispatchState, code: HostDialogResu
         cancel_host_dialog(sequence);
     }
     apply_save_data_dialog_result(state, code);
+}
+
+fn dismiss_error_dialog(state: &mut ProbeDispatchState) {
+    let sequence = state.services.error_dialog_sequence;
+    if sequence != 0 {
+        let _ = publish_gpu_event(remu_gpu::GpuEvent::HideHostDialog { sequence });
+        cancel_host_dialog(sequence);
+    }
+    apply_error_dialog_result(state, HostDialogResultCode::Cancel);
 }
 
 fn apply_message_dialog_result(state: &mut ProbeDispatchState, code: HostDialogResultCode) {
@@ -450,5 +560,14 @@ fn apply_save_data_dialog_result(state: &mut ProbeDispatchState, code: HostDialo
         HostDialogResultCode::Cancel
         | HostDialogResultCode::No
         | HostDialogResultCode::None => SAVE_DATA_DIALOG_RESULT_USER_CANCELED,
+    };
+}
+
+fn apply_error_dialog_result(state: &mut ProbeDispatchState, code: HostDialogResultCode) {
+    state.services.error_dialog_result_code = match code {
+        HostDialogResultCode::Ok | HostDialogResultCode::Yes => MESSAGE_DIALOG_RESULT_OK,
+        HostDialogResultCode::Cancel
+        | HostDialogResultCode::No
+        | HostDialogResultCode::None => MESSAGE_DIALOG_RESULT_USER_CANCELED,
     };
 }

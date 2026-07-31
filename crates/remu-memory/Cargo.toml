@@ -6,10 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-libc.workspace = true
 remu-core = { path = "../remu-core" }
 remu-loader = { path = "../remu-loader" }
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

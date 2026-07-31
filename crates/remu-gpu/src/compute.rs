@@ -143,7 +143,9 @@ pub fn decode_compute_launch(
     let register = |offset| {
         shader_registers
             .iter()
-            .find(|register| register.offset == offset)
+            .find(|register| {
+                register.offset == offset || (register.offset & !0x7000_0000) == offset
+            })
             .map_or(0, |register| register.value)
     };
     let thread_registers = [
@@ -151,6 +153,8 @@ pub fn decode_compute_launch(
         register(COMPUTE_NUM_THREAD_Y_REGISTER),
         register(COMPUTE_NUM_THREAD_Z_REGISTER),
     ];
+    // Low 16 bits are the full workgroup size. Missing/unmasked NUM_THREAD regs used to
+    // coerce to 1 and dispatch huge Gen5 dispatcher shaders one thread at a time.
     let threads_per_group = thread_registers.map(|value| (value & 0xffff).max(1));
     let base_group = if initiator & DISPATCH_FORCE_START_AT_ZERO != 0 {
         [0; 3]

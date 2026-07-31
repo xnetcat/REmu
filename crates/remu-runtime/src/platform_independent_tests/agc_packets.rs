@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG_INDIRECT,
-    AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT, AgcGraphicsState,
-    AgcShaderRegistry, GPU_EVENT_SINK_TEST, VideoOutState, agc_apply_submission_registers, agc_pm4,
-    compute_graphics_state, decode_agc_dma_data, decode_agc_memory_acquire, decode_agc_memory_wait,
-    low_u32,
+    AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT,
+    AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT,
+    AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry, GPU_EVENT_SINK_TEST, VideoOutState,
+    agc_apply_submission_registers, agc_pm4, compute_graphics_state, decode_agc_dma_data,
+    decode_agc_memory_acquire, decode_agc_memory_wait, low_u32,
 };
 
 fn append_native_memory_dma(
@@ -1119,6 +1119,74 @@ fn applies_native_gen5_indexed_uconfig_packet() {
 
     assert_eq!(graphics.user_config_registers.get(&0x243), Some(&0x481));
     assert_eq!(graphics.index_size, 1);
+}
+
+#[test]
+fn applies_direct_uconfig_vgt_index_type_to_graphics_index_size() {
+    // UE writes VGT_INDEX_TYPE through plain SET_UCONFIG_REG, often with the same selector
+    // high bits as the indexed packet (0x2000_0243). Mask those bits and update index_size.
+    let packet = [
+        agc_pm4(3, AGC_IT_SET_UCONFIG_REG, 0),
+        0x2000_0000 | AGC_VGT_INDEX_TYPE,
+        0x400 | 1 | (2 << 6),
+    ];
+    let mut graphics = AgcGraphicsState::default();
+    assert_eq!(graphics.index_size, 0);
+
+    agc_apply_submission_registers(
+        packet.as_ptr().addr() as u64,
+        3,
+        AGC_IT_SET_UCONFIG_REG,
+        0,
+        &mut graphics,
+    )
+    .expect("direct user-config VGT_INDEX_TYPE packet");
+
+    assert_eq!(graphics.user_config_registers.get(&AGC_VGT_INDEX_TYPE), Some(&0x481));
+    assert_eq!(graphics.index_size, 1);
+}
+
+#[test]
+fn applies_direct_sh_reg_with_selector_high_bits() {
+    // UE SET_SH_REG for compute threadgroup size uses the same 0x2000_ selector high bits as
+    // SET_SH_REG_INDIRECT tables. Without masking, COMPUTE_NUM_THREAD_* never match decode.
+    let packet = [
+        agc_pm4(5, AGC_IT_SET_SH_REG, 0),
+        0x2000_0000 | remu_gpu::COMPUTE_NUM_THREAD_X_REGISTER,
+        64,
+        1,
+        1,
+    ];
+    let mut graphics = AgcGraphicsState::default();
+
+    agc_apply_submission_registers(
+        packet.as_ptr().addr() as u64,
+        5,
+        AGC_IT_SET_SH_REG,
+        0,
+        &mut graphics,
+    )
+    .expect("direct shader NUM_THREAD packet");
+
+    assert_eq!(
+        graphics
+            .shader_registers
+            .get(&remu_gpu::COMPUTE_NUM_THREAD_X_REGISTER),
+        Some(&64)
+    );
+    assert_eq!(
+        graphics
+            .shader_registers
+            .get(&remu_gpu::COMPUTE_NUM_THREAD_Y_REGISTER),
+        Some(&1)
+    );
+    assert_eq!(
+        graphics
+            .shader_registers
+            .get(&remu_gpu::COMPUTE_NUM_THREAD_Z_REGISTER),
+        Some(&1)
+    );
+    assert!(!graphics.shader_registers.contains_key(&0x2000_0207));
 }
 
 #[test]

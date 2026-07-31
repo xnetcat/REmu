@@ -975,6 +975,10 @@ pub(crate) fn agc_cb_release_mem(arguments: [u64; 6], stack_arguments: [u64; 6])
     write_guest_u32(command + 20, low_u32(data));
     write_guest_u32(command + 24, (data >> 32) as u32);
     write_guest_u32(command + 28, low_u32(stack_arguments[5]));
+    // Keep the same recoverable-release marker as the command-ABI constructor. If this path is
+    // ever selected ahead of `agc_command_abi::cb_release_mem`, an unmarked release adjacent to a
+    // guest DCB tail is invisible to prefix recovery and deadlocks WAIT_REG_MEM.
+    agc_command_abi::mark_graphics_release_for_command_buffer(arguments[0], command);
     command
 }
 

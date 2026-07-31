@@ -22,7 +22,9 @@ use super::{
     image_component_class, missing_vertex_parameter_exports, ngg_export_uses_general_lds,
     ngg_mesh_draw_supported, ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage,
     ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
-    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
+    procedural_rectangle_stage_for_draw, rectangle_coordinate_parameter_mask,
+    rectangle_draw_has_incomplete_interface, sampler_lod_bias,
+    truncated_memoryless_ngg_rectangle_cover,
     sampler_uses_normalized_coordinates, shader_scalar_metadata,
     shader_scalar_metadata_for_registers, speculative_pipeline_compile_in_flight_capacity,
     validate_compute_launch_for_metal, wave64_split_blockers,
@@ -359,6 +361,10 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
 
     assert!(procedural_rectangle_export_stage(&program));
     assert!(
+        !truncated_memoryless_ngg_rectangle_cover(&program),
+        "full rectangle stages keep the strict recognizer"
+    );
+    assert!(
         ngg_mesh_export_stage(&program),
         "allocation plus primitive and position exports form an NGG contract even without LDS"
     );
@@ -406,6 +412,49 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
         Ok(false),
         "LDS-free indirect NGG stays off the mesh path"
     );
+}
+
+#[test]
+fn recognizes_poppy_truncated_memoryless_ngg_rectangle_cover() {
+    // Observed Poppy title ES 0x7480fe5600: GS_ALLOC + prim EXP only (no position half).
+    let words = [
+        0xbfa0_0001,
+        0x93ea_ff03,
+        0x0008_0008,
+        0x876b_ff03,
+        0x0000_00ff,
+        0x8f6a_8c6a,
+        0x887c_6a6b,
+        0xbf90_0009,
+        0x906a_8803,
+        0x81ea_6a80,
+        0x90fe_6ac1,
+        0xf800_0941,
+        0x0000_0000,
+        0x81ea_0380,
+        0xbf8c_ff0f,
+        0xbf81_0000,
+    ];
+    let program = decode_program(0x2000, &words).expect("Poppy truncated cover decodes");
+    assert!(truncated_memoryless_ngg_rectangle_cover(&program));
+    assert!(!procedural_rectangle_export_stage(&program));
+    let mut draw = super::indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    assert!(
+        procedural_rectangle_stage_for_draw(&program, &draw),
+        "truncated covers must use the synthesized rectangle VS so PARAMs carry UVs"
+    );
+
+    // UE ships ~288-byte allocations; undecoded padding after s_endpgm must not reject the cover.
+    let mut padded = words.to_vec();
+    padded.extend(std::iter::repeat_n(0_u32, 40));
+    let padded = decode_program(0x2000, &padded).expect("padded Poppy cover decodes");
+    assert!(
+        truncated_memoryless_ngg_rectangle_cover(&padded),
+        "padding after the live cover prefix must stay recognized"
+    );
+    assert!(procedural_rectangle_stage_for_draw(&padded, &draw));
 }
 
 #[test]

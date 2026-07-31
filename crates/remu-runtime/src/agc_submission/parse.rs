@@ -110,15 +110,17 @@ pub(crate) fn agc_parse_graphics_submission(
             agc_command_abi::consume_recorded_graphics_range(target_address, target_dword_count);
         }
     }
-    if !has_explicit_continuation {
-        if let Some((prefix_address, prefix_dword_count)) =
-            agc_command_abi::take_recorded_graphics_prefix(command_address)
-        {
-            eprintln!(
-                "[REMu][AGC] applying recorded graphics prefix address={prefix_address:#x} dwords={prefix_dword_count} before={command_address:#x}"
-            );
-            agc_parse_command_stream(prefix_address, prefix_dword_count, context, 1, false)?;
-        }
+    // Continuations cover the IB14 grow-split prefix. A separate HLE RELEASE can still sit
+    // immediately before the submitted tail (outside the continuation target). Suppressing prefix
+    // recovery whenever any continuation matched is what leaves Poppy title waits with
+    // producers=[none-ingested] after the IB path already consumed a different range.
+    if let Some((prefix_address, prefix_dword_count)) =
+        agc_command_abi::take_recorded_graphics_prefix(command_address)
+    {
+        eprintln!(
+            "[REMu][AGC] applying recorded graphics prefix address={prefix_address:#x} dwords={prefix_dword_count} before={command_address:#x} after_continuation={has_explicit_continuation}"
+        );
+        agc_parse_command_stream(prefix_address, prefix_dword_count, context, 1, false)?;
     }
     agc_parse_submission(command_address, dword_count, context)
 }

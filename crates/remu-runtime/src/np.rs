@@ -244,6 +244,55 @@ impl UniversalDataState {
         Ok(object)
     }
 
+    /// Creates a standalone property array the guest can fill before attaching it to an object.
+    pub fn create_property_array(&mut self, option: u64) -> Result<u64, u32> {
+        self.require_initialized()?;
+        let array = allocate_u64_id(&mut self.next_property);
+        self.arrays.insert(
+            array,
+            EventArray {
+                option,
+                values: Vec::new(),
+            },
+        );
+        Ok(array)
+    }
+
+    /// Drops a property array. `0` is a no-op so cleanup after a failed create stays safe.
+    pub fn destroy_property_array(&mut self, array: u64) -> Result<(), u32> {
+        self.require_initialized()?;
+        if array == 0 {
+            return Ok(());
+        }
+        let owner = self.event_owning_array(array);
+        if self.arrays.remove(&array).is_none() {
+            return Err(UDS_ERROR_INVALID_ARRAY);
+        }
+        if let Some(owner) = owner {
+            self.events
+                .get_mut(&owner)
+                .expect("event_owning_array established a live event")
+                .arrays
+                .remove(&array);
+            let objects = self
+                .events
+                .get(&owner)
+                .expect("the owner event remains live")
+                .objects
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            for object in objects {
+                if let Some(object) = self.objects.get_mut(&object) {
+                    object
+                        .properties
+                        .retain(|_, value| *value != EventValue::Array(array));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn object_set_i32(&mut self, object: u64, key: String, value: i32) -> Result<(), u32> {
         validate_property_key(&key)?;
         self.object_set_value(object, key, EventValue::Int32(value))
@@ -260,31 +309,60 @@ impl UniversalDataState {
         self.object_set_value(object, key, EventValue::String(value))
     }
 
-    pub fn object_set_array(&mut self, object: u64, key: String, option: u64) -> Result<u64, u32> {
+    /// Attaches `existing` to `object`, or creates a fresh array when `existing` is `None`.
+    ///
+    /// Matches the Gen5 ABI: `ObjectSetArray(object, key, value, value_ptr)` where `value` may
+    /// already be a live array from `CreateEventPropertyArray`.
+    pub fn object_set_array(
+        &mut self,
+        object: u64,
+        key: String,
+        existing: Option<u64>,
+    ) -> Result<u64, u32> {
         validate_property_key(&key)?;
         let owner = self
             .event_owning_object(object)
             .ok_or(UDS_ERROR_INVALID_OBJECT)?;
-        let array = allocate_u64_id(&mut self.next_property);
+        let created_new = existing.is_none();
+        let array = if let Some(array) = existing {
+            if !self.arrays.contains_key(&array) {
+                return Err(UDS_ERROR_INVALID_ARRAY);
+            }
+            if let Some(other) = self.event_owning_array(array) {
+                if other != owner {
+                    return Err(UDS_ERROR_INVALID_ARRAY);
+                }
+            } else {
+                self.events
+                    .get_mut(&owner)
+                    .expect("the owner lookup established a live event")
+                    .arrays
+                    .insert(array);
+            }
+            array
+        } else {
+            let array = allocate_u64_id(&mut self.next_property);
+            self.arrays.insert(
+                array,
+                EventArray {
+                    option: 0,
+                    values: Vec::new(),
+                },
+            );
+            self.events
+                .get_mut(&owner)
+                .expect("the owner lookup established a live event")
+                .arrays
+                .insert(array);
+            array
+        };
         let property_key = key.clone();
-        self.arrays.insert(
-            array,
-            EventArray {
-                option,
-                values: Vec::new(),
-            },
-        );
         let previous = self
             .objects
             .get_mut(&object)
             .expect("the owner lookup established a live property object")
             .properties
             .insert(key, EventValue::Array(array));
-        self.events
-            .get_mut(&owner)
-            .expect("the owner lookup established a live event")
-            .arrays
-            .insert(array);
         if let Err(error) = self.validate_event_size(owner) {
             let object = self
                 .objects
@@ -295,42 +373,51 @@ impl UniversalDataState {
             } else {
                 object.properties.remove(&property_key);
             }
-            self.arrays.remove(&array);
-            self.events
-                .get_mut(&owner)
-                .expect("the event remains live after a size rejection")
-                .arrays
-                .remove(&array);
+            if created_new {
+                self.arrays.remove(&array);
+                self.events
+                    .get_mut(&owner)
+                    .expect("the event remains live after a size rejection")
+                    .arrays
+                    .remove(&array);
+            }
             return Err(error);
         }
         if let Some(EventValue::Array(previous_array)) = previous {
-            self.arrays.remove(&previous_array);
-            self.events
-                .get_mut(&owner)
-                .expect("the owner event remains live after replacing an array")
-                .arrays
-                .remove(&previous_array);
+            if previous_array != array {
+                self.arrays.remove(&previous_array);
+                self.events
+                    .get_mut(&owner)
+                    .expect("the owner event remains live after replacing an array")
+                    .arrays
+                    .remove(&previous_array);
+            }
         }
         Ok(array)
     }
 
     pub fn array_append_string(&mut self, array: u64, value: String) -> Result<(), u32> {
+        self.require_initialized()?;
         validate_property_string(&value)?;
-        let owner = self
-            .event_owning_array(array)
-            .ok_or(UDS_ERROR_INVALID_ARRAY)?;
+        if !self.arrays.contains_key(&array) {
+            return Err(UDS_ERROR_INVALID_ARRAY);
+        }
         self.arrays
             .get_mut(&array)
-            .expect("the owner lookup established a live property array")
+            .expect("contains_key established a live property array")
             .values
             .push(EventValue::String(value));
-        if let Err(error) = self.validate_event_size(owner) {
-            self.arrays
-                .get_mut(&array)
-                .expect("the array remains live after a size rejection")
-                .values
-                .pop();
-            return Err(error);
+        // Orphan arrays (created before ObjectSetArray) have no owning event yet; size is
+        // enforced once they are attached.
+        if let Some(owner) = self.event_owning_array(array) {
+            if let Err(error) = self.validate_event_size(owner) {
+                self.arrays
+                    .get_mut(&array)
+                    .expect("the array remains live after a size rejection")
+                    .values
+                    .pop();
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -740,7 +827,7 @@ mod tests {
             .object_set_string(root, "result".to_owned(), "win".to_owned())
             .unwrap();
         let array = state
-            .object_set_array(root, "collectibles".to_owned(), 0)
+            .object_set_array(root, "collectibles".to_owned(), None)
             .unwrap();
         state.array_append_string(array, "key".to_owned()).unwrap();
         let posted = state.post_event(context, request, event, 0).unwrap();
@@ -754,6 +841,41 @@ mod tests {
         );
         assert_eq!(
             state.array_append_string(array, "coin".to_owned()),
+            Err(UDS_ERROR_INVALID_ARRAY)
+        );
+    }
+
+    #[test]
+    fn universal_data_property_arrays_can_be_filled_before_attach() {
+        let mut state = UniversalDataState::default();
+        state.initialize(vec![16; 16]).unwrap();
+        let context = state.create_context(0x1000_0000, 0).unwrap();
+        let registration_handle = state.create_handle().unwrap();
+        state
+            .register_context(context, registration_handle)
+            .unwrap();
+        state.destroy_handle(registration_handle).unwrap();
+
+        let request = state.create_handle().unwrap();
+        let (event, root) = state.create_event("telemetry".to_owned(), 0).unwrap();
+        let array = state.create_property_array(0).unwrap();
+        state
+            .array_append_string(array, "north".to_owned())
+            .unwrap();
+        state
+            .array_append_string(array, "south".to_owned())
+            .unwrap();
+        assert_eq!(
+            state.object_set_array(root, "regions".to_owned(), Some(array)),
+            Ok(array)
+        );
+        let posted = state.post_event(context, request, event, 0).unwrap();
+        assert!(posted.payload_size >= "telemetryregionsnorthsouth".len());
+        state.destroy_property_array(0).unwrap();
+        state.destroy_handle(request).unwrap();
+        state.destroy_event(event).unwrap();
+        assert_eq!(
+            state.destroy_property_array(array),
             Err(UDS_ERROR_INVALID_ARRAY)
         );
     }

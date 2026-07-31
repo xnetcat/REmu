@@ -524,6 +524,84 @@ fn np_web_api2_initialize_allocates_bounded_library_contexts() {
 }
 
 #[test]
+fn np_web_api2_push_event_create_handle_allocates_offline_handles() {
+    let mut state = ProbeDispatchState::default();
+    let handle = dispatch_probe_import("WV1GwM32NgY", [1, 0x1031_6681, 0, 0, 0, 0], [0; 6], &mut state);
+    assert_eq!(handle, 1);
+    assert_eq!(
+        crate::known_nid_name("WV1GwM32NgY"),
+        Some("sceNpWebApi2PushEventCreateHandle")
+    );
+    assert!(state.services.np_web_api2_push_event_handles.contains_key(&1));
+}
+
+#[test]
+fn np_get_online_id_writes_a_fixed_offline_id() {
+    let mut online_id = [0xff_u8; 16];
+    assert_eq!(
+        crate::dispatch_stateless_import(
+            "XDncXQIJUSk",
+            [0x1000_0000, online_id.as_mut_ptr().addr() as u64, 0, 0, 0, 0],
+            [0; 6],
+        ),
+        Some(0)
+    );
+    assert_eq!(&online_id[..8], b"REmuUser");
+    assert_eq!(online_id[8], 0);
+}
+
+#[test]
+fn voice_qos_init_accepts_a_caller_owned_workspace() {
+    let mut workspace = [0_u8; 64];
+    assert_eq!(
+        crate::dispatch_stateless_import(
+            "U8IfNl6-Css",
+            [workspace.as_mut_ptr().addr() as u64, 64, 0x2000_0000, 0, 0, 0],
+            [0; 6],
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        crate::known_nid_name("U8IfNl6-Css"),
+        Some("sceVoiceQoSInit")
+    );
+}
+
+#[test]
+fn error_dialog_update_status_reports_none_before_open() {
+    let mut state = ProbeDispatchState::default();
+    assert_eq!(
+        dispatch_probe_import("WWiGuh9XfgQ", [0; 6], [0; 6], &mut state),
+        0
+    );
+    assert_eq!(
+        crate::known_nid_name("WWiGuh9XfgQ"),
+        Some("sceErrorDialogUpdateStatus")
+    );
+}
+
+#[test]
+fn save_data_dir_name_search_ps4_shares_the_ps5_search_path() {
+    assert_eq!(
+        crate::known_nid_name("X4MYzukPc3g"),
+        Some("sceSaveDataDirNameSearchPs4")
+    );
+}
+
+#[test]
+fn ampr_write_address_04_00_measure_matches_the_on_completion_size() {
+    let mut state = ProbeDispatchState::default();
+    assert_eq!(
+        dispatch_probe_import("4fgtGfXDrFc", [0; 6], [0; 6], &mut state),
+        crate::AMPR_COMMAND_RECORD_SIZE
+    );
+    assert_eq!(
+        crate::known_nid_name("4fgtGfXDrFc"),
+        Some("sceAmprMeasureCommandSizeWriteAddress_04_00")
+    );
+}
+
+#[test]
 fn ajm_lifecycle_registers_codec_and_instances() {
     let mut state = ProbeDispatchState::default();
     let mut context = 0_u32;

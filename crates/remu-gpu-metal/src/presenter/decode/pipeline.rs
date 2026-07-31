@@ -935,8 +935,38 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             }
         },
         uses_procedural_rectangle_stage: {
-            ngg_fullscreen_cover_draw(export_program, draw)
-                || procedural_rectangle_stage_for_draw(export_program, draw)
+            let procedural = ngg_fullscreen_cover_draw(export_program, draw)
+                || procedural_rectangle_stage_for_draw(export_program, draw);
+            if !procedural
+                && !draw.indexed
+                && draw.indirect_arguments_address.is_none()
+                && draw.index_count == 3
+                && matches!(draw.primitive_type, 7 | 0x11)
+            {
+                static LOGGED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    let opcodes = export_program
+                        .instructions
+                        .iter()
+                        .map(|instruction| {
+                            instruction
+                                .opcode
+                                .known_name()
+                                .unwrap_or("unknown")
+                                .to_owned()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    eprintln!(
+                        "[REMu][METAL][RECT-MISS] draw={} es={:#x} instructions={} ops=[{opcodes}]",
+                        draw.sequence,
+                        draw.export_shader_address,
+                        export_program.instructions.len(),
+                    );
+                }
+            }
+            procedural
         },
         primitive_topology_class: metal_primitive_topology_class(draw.primitive_type)?,
     })
