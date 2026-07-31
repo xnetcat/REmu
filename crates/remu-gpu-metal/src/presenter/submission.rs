@@ -116,7 +116,7 @@ impl MetalPresenter {
                     pitch,
                     pixel_format,
                     tiling_mode,
-                    ..
+                    buffers,
                 } => {
                     self.display = Some(DisplayConfiguration {
                         width,
@@ -125,10 +125,12 @@ impl MetalPresenter {
                         pixel_format,
                         tiling_mode,
                     });
+                    self.registered_video_out_buffers = buffers;
                     self.frame_texture = None;
                     self.active_translated_scanout = None;
                     eprintln!(
-                        "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode}"
+                        "[REMu][METAL] display registered {width}x{height} pitch={pitch} format={pixel_format:#x} tiling={tiling_mode} buffers={:x?}",
+                        self.registered_video_out_buffers
                     );
                 }
                 GpuEvent::ShowHostSplash(image) => {
@@ -187,6 +189,7 @@ impl MetalPresenter {
                         sequence: self.next_flip_sequence,
                     });
                     self.pending_flip_target_written_since_boundary = false;
+                    self.pending_scanout_write_address = None;
                     self.active_translated_scanout = None;
                     self.pending_flip_queue = match source {
                         OrderedEventSource::GuestQueue(queue_id) => {

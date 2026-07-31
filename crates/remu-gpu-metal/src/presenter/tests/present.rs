@@ -293,6 +293,55 @@ fn pending_flip_without_a_source_retries_at_the_submission_boundary() {
 }
 
 #[test]
+fn alternate_registered_video_out_buffer_triggers_scanout_without_a_flip() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let front = GuestTextureDescriptor {
+        address: 0xefc0_0000_00,
+        width: 640,
+        height: 360,
+        pitch: 640,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let back = GuestTextureDescriptor {
+        address: 0xefc2_0000_00,
+        ..front
+    };
+    presenter.registered_video_out_buffers = vec![front.address, back.address];
+    presenter.display = Some(DisplayConfiguration {
+        width: front.width,
+        height: front.height,
+        pitch: front.pitch,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 27,
+    });
+    presenter.pending_flip = Some(PendingFlip {
+        address: front.address,
+        buffer_index: 0,
+        flip_argument: 0,
+        sequence: 1,
+    });
+    presenter.uploaded_flip_sequence = 1;
+    presenter.next_flip_sequence = 1;
+    presenter.ensure_direct_scanout_texture(&device, back);
+    presenter.mark_direct_scanout_initialized(back.address);
+
+    presenter.note_pending_flip_target_write(back);
+    assert!(presenter.pending_flip_target_written_since_boundary);
+    assert_eq!(presenter.pending_scanout_write_address, Some(back.address));
+
+    presenter.finalize_pending_flip_at_submission_boundary(OrderedEventSource::GuestQueue(7));
+    assert!(presenter.redraw_pending);
+    assert_eq!(
+        presenter.active_translated_scanout.map(|scanout| scanout.address),
+        Some(back.address)
+    );
+}
+
+#[test]
 fn a_cold_pipeline_cover_holds_its_frame_back_from_a_foreign_submission_boundary() {
     // Octopath's compositor clears the VideoOut allocation and then covers it with a fullscreen
     // NGG draw. When that cover parks on a cold pipeline, the compute queue's boundary must not

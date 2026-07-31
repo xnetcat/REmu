@@ -23,19 +23,56 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 impl MetalPresenter {
+    fn matches_registered_video_out_scanout(&self, descriptor: GuestTextureDescriptor) -> bool {
+        let Some(display) = self.display else {
+            return false;
+        };
+        if descriptor.width != display.width || descriptor.height != display.height {
+            return false;
+        }
+        if self
+            .registered_video_out_buffers
+            .iter()
+            .any(|address| *address == descriptor.address)
+        {
+            return true;
+        }
+        self.pending_flip
+            .is_some_and(|flip| flip.address == descriptor.address)
+    }
+
+    fn scanout_snapshot_address(&self) -> Option<u64> {
+        self.pending_scanout_write_address
+            .or_else(|| self.pending_flip.map(|flip| flip.address))
+    }
+
+    fn pipeline_blocked_scanout_address(&self) -> Option<u64> {
+        self.scanout_snapshot_address()
+            .filter(|address| self.receiver.pipeline_blocked_draw_writes(*address))
+    }
+
     pub(crate) fn finalize_pending_flip(&mut self) {
-        let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
+        let Some(display) = self.display else {
             return;
         };
+        let Some(address) = self.scanout_snapshot_address() else {
+            return;
+        };
+        let flip = self.pending_flip;
         let activation =
-            match self.activate_translated_scanout(flip.address, display.width, display.height) {
+            match self.activate_translated_scanout(address, display.width, display.height) {
                 Ok(true) => {
-                    self.uploaded_flip_sequence = flip.sequence;
+                    if let Some(flip) = flip {
+                        self.uploaded_flip_sequence = flip.sequence;
+                    }
                     "translated"
                 }
                 Ok(false) => {
-                    if let Err(error) = self.synchronize_flip_target(flip.address) {
+                    if let Err(error) = self.synchronize_flip_target(address) {
                         eprintln!("[REMu][METAL] flip synchronization failed: {error}");
+                    }
+                    if let Some(flip) = flip {
+                        self.uploaded_flip_sequence = flip.sequence;
                     }
                     "raw-pending"
                 }
@@ -44,18 +81,17 @@ impl MetalPresenter {
                     "translated-error"
                 }
             };
-        self.finalized_flip_sequence = flip.sequence;
+        if let Some(flip) = flip {
+            self.finalized_flip_sequence = flip.sequence;
+            self.garbage_collect_resident_textures(flip.sequence);
+        }
+        self.pending_scanout_write_address = None;
         self.redraw_pending = true;
-        // The scanout source has been copied into an immutable snapshot above. This ordered flip
-        // boundary is the first point at which completed-frame render targets can be downloaded
-        // and evicted without racing their producer command buffer.
-        self.garbage_collect_resident_textures(flip.sequence);
         if trace_scanout_writes() {
             eprintln!(
-                "[REMu][METAL][SCANOUT-FLIP] phase=finalize sequence={} buffer={} address={:#x} activation={activation} finalized={} uploaded={} submitted={} pending_queue={:?} target_written={}",
-                flip.sequence,
-                flip.buffer_index,
-                flip.address,
+                "[REMu][METAL][SCANOUT-FLIP] phase=finalize sequence={} buffer={} address={address:#x} activation={activation} finalized={} uploaded={} submitted={} pending_queue={:?} target_written={}",
+                flip.map_or(0, |flip| flip.sequence),
+                flip.map_or(0, |flip| flip.buffer_index),
                 self.finalized_flip_sequence,
                 self.uploaded_flip_sequence,
                 self.submitted_flip_sequence,
@@ -95,24 +131,21 @@ impl MetalPresenter {
     }
 
     pub(crate) fn note_pending_flip_target_write(&mut self, descriptor: GuestTextureDescriptor) {
-        let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
-            return;
-        };
-        if flip.sequence == self.uploaded_flip_sequence {
-            // This flip already owns an immutable GPU snapshot. Later writes target a future
-            // frame, even when the title reuses the same VideoOut allocation.
+        if !self.matches_registered_video_out_scanout(descriptor) {
             return;
         }
-        if flip.address == descriptor.address
-            && display.width == descriptor.width
-            && display.height == descriptor.height
-        {
-            // A guest submission can clear, composite, and decorate one VideoOut target through
-            // several render passes. Presenting the first write exposes the clear pass and can
-            // retire the flip before the interface/game image is complete. Coalesce all matching
-            // writes and activate the final resident at the ordered submission boundary.
-            self.pending_flip_target_written_since_boundary = true;
+        // Writes to the buffer already snapshotted for this flip belong to the next frame.
+        if self.pending_flip.is_some_and(|flip| {
+            flip.sequence == self.uploaded_flip_sequence && flip.address == descriptor.address
+        }) {
+            return;
         }
+        // A guest submission can clear, composite, and decorate one VideoOut target through
+        // several render passes. Presenting the first write exposes the clear pass and can
+        // retire the flip before the interface/game image is complete. Coalesce all matching
+        // writes and activate the final resident at the ordered submission boundary.
+        self.pending_flip_target_written_since_boundary = true;
+        self.pending_scanout_write_address = Some(descriptor.address);
     }
 
     pub(crate) fn finalize_pending_flip_at_submission_boundary(
@@ -132,9 +165,7 @@ impl MetalPresenter {
         // on a cold pipeline: that presents the compositor clear and then treats the cover's
         // output as the next frame. The parked draw's own boundary finalizes it instead.
         if !initial_flip_boundary
-            && self
-                .pending_flip
-                .is_some_and(|flip| self.receiver.pipeline_blocked_draw_writes(flip.address))
+            && self.pipeline_blocked_scanout_address().is_some()
         {
             return;
         }
@@ -438,21 +469,36 @@ impl MetalPresenter {
     }
 
     pub(crate) fn upload_pending_frame(&mut self) {
-        let (Some(display), Some(flip)) = (self.display, self.pending_flip) else {
+        let Some(display) = self.display else {
             return;
         };
-        if flip.sequence == self.uploaded_flip_sequence {
+        let Some(address) = self.scanout_snapshot_address() else {
+            return;
+        };
+        let flip = self.pending_flip;
+        if flip.is_some_and(|flip| flip.sequence == self.uploaded_flip_sequence)
+            && self.pending_scanout_write_address.is_none()
+        {
             return;
         }
-        match self.activate_translated_scanout(flip.address, display.width, display.height) {
+        match self.activate_translated_scanout(address, display.width, display.height) {
             Ok(true) => {
-                self.uploaded_flip_sequence = flip.sequence;
+                if let Some(flip) = flip {
+                    self.uploaded_flip_sequence = flip.sequence;
+                }
+                self.pending_scanout_write_address = None;
                 return;
             }
             Ok(false) => {}
             Err(error) => {
                 eprintln!("[REMu][METAL] translated scanout retry failed: {error}");
             }
+        }
+        let Some(flip) = flip else {
+            return;
+        };
+        if flip.sequence == self.uploaded_flip_sequence {
+            return;
         }
         // A translated render target is authoritative when one exists. Before the first GPU
         // render pass, however, splash screens and decoded videos can be written directly into a
