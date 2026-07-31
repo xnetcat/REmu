@@ -265,6 +265,38 @@ impl MetalPresenter {
     }
 }
 
+pub(crate) fn decoded_image_for_sampled_key(key: SampledTextureKey) -> DecodedImageDescriptor {
+    DecodedImageDescriptor {
+        guest: key.descriptor,
+        destination_select: 0,
+        base_mip_level: key.base_mip_level,
+        mip_level_count: key.mip_level_count,
+        texture_type: key.texture_type,
+        layer_count: key.layer_count,
+    }
+}
+
+/// Returns the GPU-authored resident that can still serve a cached sampled texture after ACQUIRE.
+pub(crate) fn gpu_written_resident_serving_sampled_key(
+    residents: &std::collections::HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    key: SampledTextureKey,
+) -> Option<GuestTextureDescriptor> {
+    let sampled = decoded_image_for_sampled_key(key);
+    residents
+        .iter()
+        .filter(|(_, resident)| resident.gpu_written)
+        .filter(|(descriptor, resident)| {
+            let descriptor = **descriptor;
+            guest_texture_descriptors_overlap(descriptor, key.descriptor)
+                || guest_texture_descriptors_share_gpu_sample_storage(descriptor, key.descriptor)
+                || resident_depth_sample_is_eligible(resident, sampled)
+                || resident_color_view_sample_is_eligible(resident, sampled, key.comparison)
+        })
+        .map(|(descriptor, resident)| (*descriptor, resident.content_version))
+        .max_by_key(|(descriptor, version)| (*version, descriptor.address))
+        .map(|(descriptor, _)| descriptor)
+}
+
 pub(crate) fn sampled_texture_key(
     descriptor: DecodedImageDescriptor,
     comparison: bool,

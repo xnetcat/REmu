@@ -78,8 +78,9 @@ pub(crate) use self::sampled::{
 };
 pub(crate) use self::sampled::{
     create_sampled_guest_texture, decode_sampled_texture_linear_from_raw,
-    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_texture_for_sample, sampled_texture_cache_needs_reload, sampled_texture_key,
+    gpu_written_resident_serving_sampled_key, resident_color_view_sample_is_eligible,
+    resident_depth_sample_is_eligible, resident_texture_for_sample,
+    sampled_texture_cache_needs_reload, sampled_texture_key,
 };
 pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
 #[cfg(test)]

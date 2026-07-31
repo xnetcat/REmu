@@ -10,10 +10,10 @@ use super::{
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, guest_texture_byte_count,
-    guest_texture_descriptors_overlap, mode5_mip_chain_layout, mode27_mip_chain_layout,
-    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
-    retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
-    trace_resident_texture_removal,
+    gpu_written_resident_serving_sampled_key, guest_texture_descriptors_overlap,
+    mode5_mip_chain_layout, mode27_mip_chain_layout, record_texture_dirty_work_detail,
+    record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
+    texture_alias_trace_match, trace_alias_correlated_acquire, trace_resident_texture_removal,
 };
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
@@ -257,6 +257,21 @@ impl MetalPresenter {
                 WriteWatchRefresh::Reprotecting => continue,
                 WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {}
             }
+            // Permission-only acquire renewals can mark the sampled watch dirty even when a
+            // GPU-authored resident still owns the pixels (Octopath 0x80f27e0000 snapshots).
+            // Prefer the resident's sparse content validation over the sampled watch dirty bit:
+            // pitch-mismatched SRDs and component-reordered views share the same GPU image.
+            if let Some(resident_descriptor) = gpu_written_resident_serving_sampled_key(
+                &self.resident_guest_textures,
+                key,
+            ) && let Some(resident) = self
+                .resident_guest_textures
+                .get_mut(&resident_descriptor)
+                && !resident.write_watch.content_has_changed()?
+            {
+                resident.note_gpu_write();
+                continue;
+            }
             if !self
                 .sampled_texture_cache
                 .get(&key)
@@ -264,21 +279,6 @@ impl MetalPresenter {
                 .write_watch
                 .content_has_changed()?
             {
-                continue;
-            }
-            // Permission-only acquire renewals can mark the sampled watch dirty even when a
-            // GPU-authored resident still owns the pixels (Octopath 0x80f27e0000 snapshots).
-            let resident_descriptor = self
-                .resident_guest_textures
-                .keys()
-                .copied()
-                .find(|descriptor| guest_texture_descriptors_overlap(*descriptor, key.descriptor));
-            if let Some(resident_descriptor) = resident_descriptor
-                && let Some(resident) = self.resident_guest_textures.get_mut(&resident_descriptor)
-                && resident.gpu_written
-                && !resident.write_watch.content_has_changed()?
-            {
-                resident.note_gpu_write();
                 continue;
             }
             // ACQUIRE_MEM makes CPU-authored bytes authoritative, but it does not require eagerly

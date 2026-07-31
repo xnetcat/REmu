@@ -2992,3 +2992,62 @@ fn persistent_target_removes_per_draw_full_surface_transfers() {
     assert_eq!(persistent_target_traffic, 66_355_200);
     assert_eq!(previous_target_traffic / persistent_target_traffic, 200);
 }
+
+#[test]
+fn gpu_written_resident_serving_sampled_key_prefers_the_newest_gpu_written_resident() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+    use super::super::texture::{
+        gpu_written_resident_serving_sampled_key, sampled_texture_key,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest texture mapping");
+    let rendered = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let sampled = GuestTextureDescriptor {
+        pitch: 128,
+        ..rendered
+    };
+    let key = sampled_texture_key(
+        DecodedImageDescriptor {
+            guest: sampled,
+            destination_select: 0,
+            base_mip_level: 0,
+            mip_level_count: 1,
+            texture_type: 9,
+            layer_count: 1,
+        },
+        false,
+    );
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, rendered)
+        .expect("render resident");
+    presenter.mark_resident_texture_written(rendered);
+    assert_eq!(
+        gpu_written_resident_serving_sampled_key(&presenter.resident_guest_textures, key),
+        Some(rendered)
+    );
+}
