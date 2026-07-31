@@ -350,8 +350,17 @@ windowed verify16 at `dfc1f40` completes on the in-process watchdog (`outcome=ti
 302s elapsed, 127 captured PPMs, 0 fully-black frames, no host SIGSEGV). Steady-state Draw
 ~320–360/s and RP-end key ~189–199/s remain ~4–15% below verify11 (~374/s); verify14/15
 ended at 143s/154s from orchestration SIGTERM/SIGKILL, not guest faults — `run-game.sh`
-now labels exit 137/143 as `host-sigkill`/`host-sigterm`. RP-end target-address churn is
-still the next throughput lever.
+now labels exit 137/143 as `host-sigkill`/`host-sigterm`. Side-by-side steady-state
+PERF-CAUSES at Pipe 75/0 shows RP-end key ~189/s in both verify11 and verify16 (not the
+regression lever); verify16 instead carries ~26–29 sampled `acquire_invalidate`/s where
+verify11 carries 0, plus slightly lower RP encode (~274 vs ~285/s). `ae9b141` keeps cached
+sampled textures across permission-only ACQUIRE when a GPU-written resident still serves
+the SRD (overlap, pitch-mismatched sample storage, depth/color view eligibility). A 180s
+windowed verify17 at `ae9b141` completes cleanly (63 PPMs, 0 black, `failed=0/0`); verify18
+(300s) measures whether Draw recovers toward verify11 without reintroducing black frames or
+Q W 457 queue depth changes. RP-end target-address churn (~180 addr/s) remains inherent to
+UE's render-target rotation and cannot be collapsed without incorrect Metal attachment reuse.
+Soft cursor/glow and post-composite sampling past title remain open graphics gaps.
 
 ### The runtime test suite is order-dependent
 
