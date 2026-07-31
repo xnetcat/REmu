@@ -520,6 +520,36 @@ impl GuestCommandBatch {
     }
 }
 
+pub(crate) fn guest_batch_produces_scanout(
+    batch: &GuestCommandBatch,
+    address: u64,
+    width: u32,
+    height: u32,
+) -> bool {
+    if batch.work.iter().any(|item| match item {
+        GuestBatchWork::Draw {
+            target,
+            extent,
+            ..
+        } => *target == address && extent[0] == width && extent[1] == height,
+        _ => false,
+    }) {
+        return true;
+    }
+    if batch.render_pass.as_ref().is_some_and(|pass| {
+        pass.key.targets.iter().any(|(descriptor, _, _, _, _, _, _, _)| {
+            descriptor.address == address && descriptor.width == width && descriptor.height == height
+        })
+    }) {
+        return true;
+    }
+    let byte_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .unwrap_or(u64::MAX);
+    guest_batch_writes_overlap(batch, address, byte_count)
+}
+
 pub(crate) fn guest_batch_writes_overlap(
     batch: &GuestCommandBatch,
     address: u64,

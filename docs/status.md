@@ -340,6 +340,11 @@ Visual confirmation past NEW GAME/character select without pad injection remains
 display is still black with healthy pipelines, the next suspect is post-process composite sampling
 (`INTERFACE-FILL` procedural draws, scanout vs resident color RT timing).
 
+Scanout presentation now waits on the ordered VideoOut snapshot blit (not a full guest-batch drain),
+re-snapshots at present when compositor output is still in flight or advances past a clear-only
+capture, and skips writing fully black PPM evidence frames until real pixels land. A 180s windowed
+verify captures 126 non-black frames at ~8.3–9.2 FPS with zero fully-black PPMs.
+
 ### The runtime test suite is order-dependent
 
 `cargo test -p remu-runtime --lib` fails intermittently, at roughly a one-in-three rate, in

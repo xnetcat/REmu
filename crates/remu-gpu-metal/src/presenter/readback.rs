@@ -174,6 +174,11 @@ impl MetalPresenter {
         let Some(directory) = self.capture_directory.as_deref() else {
             return;
         };
+        if guest_frame_is_fully_black(&self.guest_bgra_bytes) {
+            // A compositor clear can land in the private scanout snapshot before the cover draw
+            // finishes. Defer the capture interval until a later present produces real pixels.
+            return;
+        }
         if !begin_capture_attempt_if_due(
             &mut self.last_guest_capture,
             Instant::now(),
@@ -222,6 +227,9 @@ impl MetalPresenter {
             return;
         };
         debug_assert_eq!(bgra.len(), bgra_length);
+        if guest_frame_is_fully_black(&bgra) {
+            return;
+        }
         self.guest_bgra_bytes = bgra;
         self.capture_guest_frame_if_changed(descriptor);
     }
@@ -1096,6 +1104,11 @@ pub(super) fn guest_frame_fingerprint(bytes: &[u8]) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &value| {
             (hash ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01b3)
         })
+}
+
+fn guest_frame_is_fully_black(bgra: &[u8]) -> bool {
+    bgra.chunks_exact(4)
+        .all(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
 }
 
 pub(super) fn capture_guest_frame(

@@ -12,6 +12,8 @@ use super::{
     snapshot_guest_texture_raw, trace_resident_texture_removal, trace_scanout_writes,
     write_resident_texture_contents_to_guest,
 };
+use crate::presenter::completion::{settle_timeout_message, wait_until_settled};
+use crate::presenter::submission::guest_batch_produces_scanout;
 use crate::presenter::completion::command_buffer_failure_message;
 use metal::{
     MTLCommandBufferStatus, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode,
@@ -49,6 +51,15 @@ impl MetalPresenter {
     fn pipeline_blocked_scanout_address(&self) -> Option<u64> {
         self.scanout_snapshot_address()
             .filter(|address| self.receiver.pipeline_blocked_draw_writes(*address))
+    }
+
+    fn scanout_has_inflight_gpu_producers(&self, address: u64, width: u32, height: u32) -> bool {
+        self.open_guest_batch
+            .as_ref()
+            .is_some_and(|batch| guest_batch_produces_scanout(batch, address, width, height))
+            || self.committed_guest_batches.iter().any(|batch| {
+                guest_batch_produces_scanout(batch, address, width, height)
+            })
     }
 
     pub(crate) fn finalize_pending_flip(&mut self) {
@@ -419,6 +430,12 @@ impl MetalPresenter {
         );
         blit.end_encoding();
         command_buffer.commit();
+        if !wait_until_settled(&command_buffer) {
+            return Err(settle_timeout_message(
+                "Metal VideoOut snapshot blit",
+                &command_buffer,
+            ));
+        }
         self.frame_texture = Some(snapshot);
         self.frame_texture_size = (descriptor.width, descriptor.height);
         let sequence = self
@@ -481,11 +498,13 @@ impl MetalPresenter {
         let Some(active) = self.active_translated_scanout else {
             return;
         };
-        if !self.pending_flip_target_written_since_boundary
-            && self.pending_scanout_write_address.is_none()
-        {
-            return;
-        }
+        let pending_writes = self.pending_flip_target_written_since_boundary
+            || self.pending_scanout_write_address.is_some();
+        let inflight = self.scanout_has_inflight_gpu_producers(
+            active.address,
+            active.width,
+            active.height,
+        );
         let Some((descriptor, _, _)) =
             self.translated_scanout_source(active.address, active.width, active.height)
         else {
@@ -496,7 +515,10 @@ impl MetalPresenter {
             .get(&descriptor)
             .map(|resident| resident.content_version)
             .unwrap_or(0);
-        if current_version <= active.snapshotted_content_version {
+        if !pending_writes
+            && !inflight
+            && current_version <= active.snapshotted_content_version
+        {
             return;
         }
         if let Err(error) =
