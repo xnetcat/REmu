@@ -1714,6 +1714,22 @@ fn packs_ngg_meshlets_with_shared_vertex_indices() {
 }
 
 #[test]
+fn synthesizes_consecutive_ids_for_nonindexed_triangle_lists() {
+    let mut draw = indexed_draw(0, 0, 7);
+    draw.indexed = false;
+    draw.primitive_type = 4;
+    draw.index_offset = 10;
+    draw.base_vertex = 91;
+    let indices = prepare_nonindexed_ngg_indices(&draw).expect("list expands");
+    assert_eq!(
+        indices.as_ref(),
+        &[10, 11, 12, 13, 14, 15],
+        "partial trailing vertices are dropped; indexed base_vertex must not shift auto IDs"
+    );
+    assert_eq!(ngg_mesh_base_vertex(&draw), 0);
+}
+
+#[test]
 fn preserves_nonindexed_first_vertex_and_alternates_triangle_strip_winding() {
     let mut draw = indexed_draw(0, 0, 5);
     draw.indexed = false;

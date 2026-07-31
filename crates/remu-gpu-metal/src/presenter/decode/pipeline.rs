@@ -37,16 +37,20 @@ const NGG_MESHLET_STORAGE_VERTICES: usize = 256;
 const NGG_MESHLET_STORAGE_PRIMITIVES: usize = 256;
 const METAL_MESH_MAX_OUTPUTS: u32 = 256;
 
-/// Cover topologies that UE/Poppy emit as memoryless NGG stages and that currently shard under
-/// the meshlet ABI. Vertex-fetching NGG programs with the same topologies are excluded by
+/// Cover topologies that memoryless NGG stages emit for fullscreen blits and that currently shard
+/// under the meshlet ABI. Vertex-fetching NGG programs with the same topologies are excluded by
 /// [`ngg_memoryless_cover_export_stage`].
+///
+/// Indexed two-triangle quads (`count=6`) are not covers: positioned UI/sprite quads share that
+/// topology with memoryless NGG exports, and synthesizing a fullscreen triangle replaces their
+/// bounds with solid cells. Keep single-triangle (`count=3`) covers and non-indexed strip covers.
 pub(crate) fn ngg_fullscreen_cover_draw(program: &remu_shader::Program, draw: &IndexedDraw) -> bool {
     draw.indirect_arguments_address.is_none()
         && ngg_memoryless_cover_export_stage(program)
         && ((!draw.indexed && draw.primitive_type == 6 && draw.index_count == 4)
             || (draw.indexed
                 && draw.primitive_type == 4
-                && matches!(draw.index_count, 3 | 6)
+                && draw.index_count == 3
                 && draw.instance_count == 1))
 }
 
@@ -137,6 +141,7 @@ pub(crate) fn expand_point_list_indices(indices: &[u32]) -> Arc<[u32]> {
 pub(crate) fn prepare_nonindexed_ngg_indices(draw: &IndexedDraw) -> Result<Arc<[u32]>, String> {
     match (draw.indexed, draw.primitive_type) {
         (false, 6) => expand_nonindexed_triangle_strip(draw.index_offset, draw.index_count),
+        (false, 4) => expand_nonindexed_triangle_list(draw.index_offset, draw.index_count),
         (false, 1) => {
             let count = usize::try_from(draw.index_count)
                 .map_err(|_| "point-list vertex count does not fit usize")?;
@@ -153,8 +158,39 @@ pub(crate) fn prepare_nonindexed_ngg_indices(draw: &IndexedDraw) -> Result<Arc<[
             }
             Ok(expand_point_list_indices(&indices))
         }
-        _ => Err("NGG source is not a non-indexed triangle strip or point list".to_owned()),
+        _ => Err(
+            "NGG source is not a non-indexed triangle list/strip or point list".to_owned(),
+        ),
     }
+}
+
+/// Synthesizes consecutive vertex IDs for a non-indexed triangle list.
+///
+/// Incomplete trailing vertices (count not divisible by 3) are dropped, matching GFX10's
+/// ignore-partial-primitive rule.
+fn expand_nonindexed_triangle_list(
+    first_vertex: u32,
+    vertex_count: u32,
+) -> Result<Arc<[u32]>, String> {
+    let complete = vertex_count - vertex_count % 3;
+    if complete != 0 {
+        first_vertex
+            .checked_add(complete - 1)
+            .ok_or("triangle-list vertex ID overflow")?;
+    }
+    let index_count = usize::try_from(complete)
+        .map_err(|_| "triangle-list vertex count does not fit usize")?;
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(index_count)
+        .map_err(|_| format!("triangle-list index allocation failed for {index_count} entries"))?;
+    for offset in 0..complete {
+        let index = first_vertex
+            .checked_add(offset)
+            .ok_or("triangle-list vertex ID overflow")?;
+        indices.push(index);
+    }
+    Ok(indices.into())
 }
 
 /// Prepares triangle-list indices for an indexed NGG mesh draw.
