@@ -19,9 +19,9 @@ use super::{
     ShaderCompileResult, canonical_sampler_bindings, canonical_texture_bindings,
     compile_shader_request_catching_panics, compute_launch, export_resource_render_stage,
     fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
-    image_component_class, missing_vertex_parameter_exports, ngg_mesh_draw_supported,
-    ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
+    image_component_class, missing_vertex_parameter_exports, ngg_export_uses_general_lds,
+    ngg_mesh_draw_supported, ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
     rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
     sampler_uses_normalized_coordinates, shader_scalar_metadata,
     shader_scalar_metadata_for_registers, speculative_pipeline_compile_in_flight_capacity,
@@ -376,33 +376,43 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
     );
     draw.indexed = true;
     draw.primitive_type = 4;
-    draw.index_count = 6;
+    draw.index_count = 3;
     assert!(
         ngg_fullscreen_cover_draw(&program, &draw),
-        "memoryless NGG covers with indexed two-triangle topology keep the synthesized path"
+        "memoryless NGG single-triangle covers keep the synthesized path"
+    );
+    draw.index_count = 6;
+    assert!(
+        !ngg_fullscreen_cover_draw(&program, &draw),
+        "indexed two-triangle quads must stay off the cover path"
+    );
+    assert_eq!(
+        ngg_mesh_stage_for_draw(&program, &draw),
+        Ok(false),
+        "memoryless LDS-free quads keep the ordinary vertex-shader path"
     );
     draw.indexed = false;
     draw.primitive_type = 7;
     draw.index_count = 4;
-    assert!(
-        ngg_mesh_stage_for_draw(&program, &draw)
-            .expect_err("a non-exact NGG topology cannot silently fall back to vertex lowering")
-            .contains("unsupported topology")
+    assert_eq!(
+        ngg_mesh_stage_for_draw(&program, &draw),
+        Ok(false),
+        "LDS-free NGG keeps ordinary VS even for non-exact rectangle topologies"
     );
     draw.index_count = 3;
     draw.indirect_arguments_address = Some(0x4000);
-    assert!(
-        ngg_mesh_stage_for_draw(&program, &draw)
-            .expect_err("an indirect count cannot use the exact procedural rectangle path")
-            .contains("ordered GPU-side mesh geometry preparation is not implemented")
+    assert_eq!(
+        ngg_mesh_stage_for_draw(&program, &draw),
+        Ok(false),
+        "LDS-free indirect NGG stays off the mesh path"
     );
 }
 
 #[test]
-fn keeps_vertex_fetching_ngg_sprite_quads_on_the_mesh_path() {
-    // Minimal NGG contract (alloc + prim/pos export) plus a buffer fetch — the shape Dreaming
-    // Sarah uses for positioned UI quads. Topology matches the Poppy cover heuristic, but memory
-    // traffic must force the mesh path so sprite bounds are not replaced by a fullscreen triangle.
+fn keeps_lds_free_vertex_fetching_ngg_quads_off_the_mesh_path() {
+    // Minimal NGG contract (alloc + prim/pos export) plus a buffer fetch. Topology matches the
+    // memoryless cover heuristic, but without general LDS the draw stays on ordinary VS; cover
+    // must also stay off so per-draw bounds are not replaced by a fullscreen triangle.
     let program = Program::new(
         0x5000,
         vec![
@@ -470,9 +480,93 @@ fn keeps_vertex_fetching_ngg_sprite_quads_on_the_mesh_path() {
     draw.instance_count = 1;
     assert!(
         !ngg_fullscreen_cover_draw(&program, &draw),
-        "Sarah-style indexed NGG quads must not become procedural fullscreen covers"
+        "buffer-fetching indexed NGG quads must not become procedural fullscreen covers"
     );
+    assert_eq!(
+        ngg_mesh_stage_for_draw(&program, &draw),
+        Ok(false),
+        "LDS-free buffer-fetching NGG quads keep the ordinary VS path"
+    );
+}
+
+#[test]
+fn keeps_general_lds_ngg_triangle_lists_on_the_mesh_path() {
+    let program = Program::new(
+        0x6000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: Vec::new(),
+                sources: vec![Operand {
+                    kind: remu_shader::OperandKind::LiteralConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Ds,
+                opcode: Opcode::Known("DsWriteB32"),
+                words: Vec::new(),
+                sources: vec![Operand::vector(0)],
+                destinations: Vec::new(),
+                control: Some(InstructionControl::DataShare(
+                    remu_shader::DataShareControl {
+                        offset0: 0,
+                        offset1: 0,
+                        gds: false,
+                    },
+                )),
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::Known("Exp"),
+                words: Vec::new(),
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(remu_shader::ExportControl {
+                    target: 20,
+                    enable_mask: 0x1,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                })),
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::Known("Exp"),
+                words: Vec::new(),
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(remu_shader::ExportControl {
+                    target: 12,
+                    enable_mask: 0xf,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                })),
+            },
+        ],
+    );
+    assert!(ngg_mesh_export_stage(&program));
+    assert!(ngg_export_uses_general_lds(&program));
+    let mut draw = super::indexed_draw(0, 0, 6);
+    draw.indexed = true;
+    draw.primitive_type = 4;
     assert_eq!(ngg_mesh_stage_for_draw(&program, &draw), Ok(true));
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    draw.index_count = 4;
+    assert!(
+        ngg_mesh_stage_for_draw(&program, &draw)
+            .expect_err("general-LDS NGG with an unsupported topology must not silently fall back")
+            .contains("unsupported topology")
+    );
 }
 
 #[test]
@@ -503,6 +597,64 @@ fn accepts_native_ngg_triangle_lists_and_triangle_strips() {
     draw.primitive_type = 6;
     draw.index_count = 4;
     assert!(ngg_mesh_draw_supported(&draw));
+
+    draw.indexed = false;
+    draw.primitive_type = 4;
+    draw.index_count = 5040;
+    assert!(
+        !ngg_mesh_draw_supported(&draw),
+        "non-indexed triangle lists keep the ordinary vertex ABI (not meshlets)"
+    );
+
+    // NGG-marked Unity scene draws (Superliminal) must not error; they lower as ordinary VS.
+    let ngg_program = Program::new(
+        0x6000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: Vec::new(),
+                sources: vec![Operand {
+                    kind: remu_shader::OperandKind::LiteralConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::Known("Exp"),
+                words: Vec::new(),
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(remu_shader::ExportControl {
+                    target: 20,
+                    enable_mask: 0xf,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                })),
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::Known("Exp"),
+                words: Vec::new(),
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(remu_shader::ExportControl {
+                    target: 12,
+                    enable_mask: 0xf,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                })),
+            },
+        ],
+    );
+    assert_eq!(ngg_mesh_stage_for_draw(&ngg_program, &draw), Ok(false));
 
     draw.indirect_arguments_address = Some(0x4000);
     assert!(!ngg_mesh_draw_supported(&draw));

@@ -142,8 +142,8 @@ use self::shader::{
 };
 #[cfg(test)]
 use self::shader::{
-    missing_vertex_parameter_exports, ngg_mesh_draw_supported, ngg_mesh_export_stage,
-    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    missing_vertex_parameter_exports, ngg_export_uses_general_lds, ngg_mesh_draw_supported,
+    ngg_mesh_export_stage, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
     rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
 };
 #[cfg(test)]

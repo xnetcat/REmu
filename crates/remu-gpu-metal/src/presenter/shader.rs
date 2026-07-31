@@ -40,8 +40,9 @@ pub(crate) use self::program::{
 };
 #[cfg(test)]
 pub(crate) use self::program::{
-    ngg_mesh_draw_supported, ngg_mesh_export_stage, procedural_rectangle_export_stage,
-    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
+    ngg_export_uses_general_lds, ngg_mesh_draw_supported, ngg_mesh_export_stage,
+    procedural_rectangle_export_stage, rectangle_draw_has_incomplete_interface,
+    shader_scalar_metadata,
 };
 
 impl MetalPresenter {

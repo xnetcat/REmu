@@ -414,6 +414,22 @@ pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
     allocation_message && primitive_export && position_export
 }
 
+/// True when an NGG export stages geometry records through general LDS (not ADDTID spills).
+///
+/// GFX10 NGG recognition ([`ngg_mesh_export_stage`]) only needs alloc + prim/pos export. Mesh
+/// lowering additionally requires general LDS: LDS-free pass-through exports bind correctly as
+/// ordinary vertex shaders (GS_ALLOC_REQ is ignored on that path), while memoryless fullscreen
+/// covers use the separate procedural cover path.
+pub(crate) fn ngg_export_uses_general_lds(program: &Program) -> bool {
+    program.instructions.iter().any(|instruction| {
+        matches!(instruction.control, Some(InstructionControl::DataShare(_)))
+            && !matches!(
+                instruction.opcode.known_name(),
+                Some("DsSwizzleB32" | "DsWriteAddtidB32" | "DsReadAddtidB32")
+            )
+    })
+}
+
 /// True when an NGG export only computes cover geometry (no memory/image/LDS traffic).
 ///
 /// Poppy-style UE fullscreen covers arrive as NGG-shaped programs that derive position from the
@@ -473,6 +489,11 @@ pub(crate) fn ngg_mesh_stage_for_draw(
     if !ngg_mesh_export_stage(program) {
         return Ok(false);
     }
+    // Meshlets only when the export stages through general LDS. LDS-free NGG exports run as
+    // ordinary vertex shaders; memoryless fullscreen covers use [`ngg_fullscreen_cover_draw`].
+    if !ngg_export_uses_general_lds(program) {
+        return Ok(false);
+    }
     if ngg_mesh_draw_supported(draw) {
         return Ok(true);
     }
@@ -483,6 +504,13 @@ pub(crate) fn ngg_mesh_stage_for_draw(
         && draw.indirect_arguments_address.is_none()
         && draw.index_count == 3
         && matches!(draw.primitive_type, 7 | 0x11)
+    {
+        return Ok(false);
+    }
+    // Non-indexed triangle lists still prefer VS when the meshlet ABI cannot prepare them.
+    if !draw.indexed
+        && draw.indirect_arguments_address.is_none()
+        && draw.primitive_type == 4
     {
         return Ok(false);
     }
