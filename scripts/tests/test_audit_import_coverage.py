@@ -63,6 +63,13 @@ import_resolution=host-direct nid=P330P3dFF68 weak=false symbol=P330P3dFF68#A#B
         self.assertEqual(runtime.statuses["vcmNN+AAXnY"], "hle-native-agc")
         self.assertNotEqual(runtime.statuses["8zTFvBIAIN8"], "named-only")
 
+    def test_parse_known_names_follows_nid_table_module(self) -> None:
+        names = AUDIT.parse_known_names(
+            Path(__file__).resolve().parents[2] / "crates/remu-runtime/src/lib.rs"
+        )
+        self.assertEqual(names["T72hz6ffq08"], "scePthreadYield")
+        self.assertEqual(names["vSMAm3cxYTY"], "sceKernelMprotect")
+
     def test_missing_upstream_trees_yield_empty_reference_coverage(self) -> None:
         missing = Path("/definitely/missing/remu-upstream")
         stderr = io.StringIO()

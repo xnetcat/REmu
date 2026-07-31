@@ -141,8 +141,10 @@ def quoted_nids(source: str) -> set[str]:
     return set(QUOTED_NID_PATTERN.findall(source))
 
 
-def parse_known_names(source: str) -> dict[str, str]:
-    body = function_slice(source, "known_nid_name")
+def parse_known_names(runtime_path: Path) -> dict[str, str]:
+    """Read the hand-maintained NID name table, following modules from the crate root."""
+
+    body = sibling_function_slice(runtime_path, "known_nid_name")
     return dict(re.findall(r'"([A-Za-z0-9+-]{11})"\s*=>\s*"([^"]+)"', body))
 
 
@@ -205,9 +207,8 @@ def area_module_nids(runtime_path: Path) -> set[str]:
     inline.  Modules are discovered by reading the dispatch chain rather than from a hard-coded
     list, so adding an area to the runtime does not silently understate coverage here.
     """
-    source = runtime_path.read_text(encoding="utf-8")
     try:
-        chain = function_slice(source, "dispatch_extended_import")
+        chain = sibling_function_slice(runtime_path, "dispatch_extended_import")
     except ValueError:
         return set()
     served: set[str] = set()
@@ -223,13 +224,7 @@ def area_module_nids(runtime_path: Path) -> set[str]:
 
 
 def inspect_runtime_source(path: Path) -> RuntimeCoverage:
-    source = path.read_text(encoding="utf-8")
-    names = dict(
-        re.findall(
-            r'"([A-Za-z0-9+-]{11})"\s*=>\s*"([^"]+)"',
-            sibling_function_slice(path, "known_nid_name"),
-        )
-    )
+    names = parse_known_names(path)
     agc_command_source_path = path.with_name("agc_command_abi.rs")
     native_agc_nids: set[str] = set()
     if agc_command_source_path.is_file():
@@ -267,7 +262,10 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
         ("hle-area-module", area_module_nids(path)),
     ]
 
-    probe_dispatch = function_slice(source, "dispatch_probe_import")
+    # Resolve through sibling modules from the crate root. Handlers have already moved out of
+    # lib.rs once (nid_table, guest_sync, native_symbols); hard-coding lib.rs-only slices would
+    # silently undercount coverage the next time something relocates.
+    probe_dispatch = sibling_function_slice(path, "dispatch_probe_import")
     stubs = parse_flat_stub_arms(probe_dispatch, "0")
     passthrough_stubs = parse_flat_stub_arms(probe_dispatch, "arguments[0]")
     constant_stubs = parse_flat_stub_arms(probe_dispatch, "1")
@@ -278,13 +276,13 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
             ("stub-constant", constant_stubs),
             (
                 "hle-lock-aware",
-                quoted_nids(function_slice(source, "import_dispatch")),
+                quoted_nids(sibling_function_slice(path, "import_dispatch")),
             ),
             (
                 "hle",
                 quoted_nids(probe_dispatch)
-                | quoted_nids(function_slice(source, "dispatch_stateless_import"))
-                | quoted_nids(function_slice(source, "dispatch_kernel_file_import"))
+                | quoted_nids(sibling_function_slice(path, "dispatch_stateless_import"))
+                | quoted_nids(sibling_function_slice(path, "dispatch_kernel_file_import"))
                 | quoted_nids(sibling_function_slice(path, "is_guest_sync_import"))
                 | quoted_nids(sibling_function_slice(path, "dispatch_guest_sync_import")),
             ),

@@ -18,9 +18,11 @@ for data the compiler never reasons about.
 Usage:
     scripts/generate-nid-names.py <directory-of-elf-modules>... crates/remu-runtime/src/nid_names.bin
 
-Any directory of PS5 ELF modules works: link stubs from an SDK you are licensed to use, or
-the `sce_module` directory shipped inside a game.  Run it only when you have new modules to
-scan; the generated table is committed so a normal build needs neither this script nor its
+Inputs must expose plaintext C/C++ export names in ELF symbol tables (typically SDK link stubs
+you are licensed to use). Game `sce_module` SELF containers usually ship NID-encoded dynamic
+names (`nid#lib#ver`) and zero section headers, so scanning them yields nothing useful — use
+decrypted/raw ELF dumps with real symbol names instead.  Run this only when you have new modules
+to scan; the generated table is committed so a normal build needs neither this script nor its
 inputs.
 
 Table layout, all integers little-endian:
@@ -33,6 +35,8 @@ Table layout, all integers little-endian:
     names                 concatenated UTF-8 names, not separated
 """
 
+from __future__ import annotations
+
 import base64
 import hashlib
 import pathlib
@@ -42,13 +46,32 @@ import sys
 
 NID_SUFFIX = bytes.fromhex("518d64a635ded8c1e6b039b1c3e55230")
 REPO = pathlib.Path(__file__).resolve().parent.parent
-RUNTIME_SOURCE = REPO / "crates/remu-runtime/src/lib.rs"
+NID_TABLE_SOURCE = REPO / "crates/remu-runtime/src/nid_table.rs"
+RUNTIME_LIB_SOURCE = REPO / "crates/remu-runtime/src/lib.rs"
+PS5_CONTAINER_MAGIC = bytes.fromhex("4f153d1d")
+PS5_RETAIL_CONTAINER_MAGIC = bytes.fromhex("5414f5ee")
 
 
 def nid_of(name: str) -> str:
     """Returns the 11-character NID the loader will see for this symbol name."""
     digest = hashlib.sha1(name.encode() + NID_SUFFIX).digest()
     return base64.b64encode(struct.pack(">Q", struct.unpack("<Q", digest[:8])[0])).decode()[:11].replace("/", "-")
+
+
+def elf_image(data: bytes) -> bytes | None:
+    """Return a view of the ELF64 image, unwrapping a PS5 SELF container when needed."""
+
+    if data[:4] == b"\x7fELF":
+        return data if len(data) > 4 and data[4] == 2 else None
+    if data[:4] not in (PS5_CONTAINER_MAGIC, PS5_RETAIL_CONTAINER_MAGIC) or len(data) < 32:
+        return None
+    segment_count = struct.unpack_from("<H", data, 0x18)[0]
+    elf_offset = 32 + segment_count * 32
+    if elf_offset + 5 > len(data) or data[elf_offset : elf_offset + 4] != b"\x7fELF":
+        return None
+    if data[elf_offset + 4] != 2:
+        return None
+    return data[elf_offset:]
 
 
 def sections(data: bytes):
@@ -69,15 +92,16 @@ def exported_symbols(path: pathlib.Path):
         data = path.read_bytes()
     except OSError:
         return
-    if data[:4] != b"\x7fELF" or data[4] != 2:
+    image = elf_image(data)
+    if image is None:
         return
-    table = sections(data)
+    table = sections(image)
     for section in table:
         if section["type"] not in (2, 11) or not section["entsize"] or section["link"] >= len(table):
             continue
-        strings = data[table[section["link"]]["offset"]:][:table[section["link"]]["size"]]
+        strings = image[table[section["link"]]["offset"]:][:table[section["link"]]["size"]]
         for index in range(section["size"] // section["entsize"]):
-            offset, = struct.unpack_from("<I", data, section["offset"] + index * section["entsize"])
+            offset, = struct.unpack_from("<I", image, section["offset"] + index * section["entsize"])
             if not offset or offset >= len(strings):
                 continue
             name = strings[offset:strings.find(b"\0", offset)].decode("utf-8", "replace")
@@ -85,11 +109,80 @@ def exported_symbols(path: pathlib.Path):
                 yield name
 
 
+def function_slice(source: str, name: str) -> str:
+    declaration = re.search(
+        rf"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?"
+        rf'(?:extern\s+"C"\s+)?fn\s+{re.escape(name)}\s*\(',
+        source,
+    )
+    if declaration is None:
+        raise ValueError(f"Rust function not found: {name}")
+    following = re.search(
+        r"(?m)^((?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?"
+        r'(?:extern\s+"C"\s+)?fn\s+[A-Za-z0-9_]+\s*\()',
+        source[declaration.end() :],
+    )
+    end = len(source) if following is None else declaration.end() + following.start()
+    return source[declaration.start() : end]
+
+
+def sibling_function_slice(runtime_path: pathlib.Path, name: str) -> str:
+    """Find a function by following modules declared from a Rust crate root."""
+
+    pending = [runtime_path]
+    visited: set[pathlib.Path] = set()
+    root_error: ValueError | None = None
+    while pending:
+        source_path = pending.pop()
+        if source_path in visited:
+            continue
+        visited.add(source_path)
+        source = source_path.read_text(encoding="utf-8")
+        try:
+            return function_slice(source, name)
+        except ValueError as error:
+            if root_error is None:
+                root_error = error
+
+        module_base = (
+            source_path.parent
+            if source_path.stem in {"lib", "main", "mod"}
+            else source_path.parent / source_path.stem
+        )
+        modules = re.findall(
+            r"(?m)^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;",
+            source,
+        )
+        for module in modules:
+            candidates = (
+                module_base / f"{module}.rs",
+                module_base / module / "mod.rs",
+            )
+            pending.extend(candidate for candidate in candidates if candidate.is_file())
+
+    assert root_error is not None
+    raise root_error
+
+
 def already_named() -> set:
     """NIDs the hand-maintained table in the runtime already covers."""
-    source = RUNTIME_SOURCE.read_text()
-    start = source.index("pub fn known_nid_name(")
-    return set(re.findall(r'"([A-Za-z0-9+\-]{11})" =>', source[start:source.index("\n}\n", start)]))
+    # Prefer the module that owns the table, then fall back to walking from the crate root so a
+    # future move does not revive the old lib.rs-only crash.
+    for path in (NID_TABLE_SOURCE, RUNTIME_LIB_SOURCE):
+        if not path.is_file():
+            continue
+        try:
+            body = (
+                function_slice(path.read_text(encoding="utf-8"), "known_nid_name")
+                if path == NID_TABLE_SOURCE
+                else sibling_function_slice(path, "known_nid_name")
+            )
+        except ValueError:
+            continue
+        return set(re.findall(r'"([A-Za-z0-9+\-]{11})"\s*=>', body))
+    raise FileNotFoundError(
+        f"could not find known_nid_name in {NID_TABLE_SOURCE} or modules from {RUNTIME_LIB_SOURCE}"
+    )
 
 
 def main() -> int:
@@ -99,10 +192,24 @@ def main() -> int:
     *roots, destination = sys.argv[1:]
 
     names = set()
+    files_seen = 0
+    files_with_symbols = 0
     for root in roots:
         for path in sorted(pathlib.Path(root).rglob("*")):
-            if path.is_file():
-                names.update(exported_symbols(path))
+            if not path.is_file():
+                continue
+            files_seen += 1
+            found = set(exported_symbols(path))
+            if found:
+                files_with_symbols += 1
+                names.update(found)
+
+    if files_seen and not files_with_symbols:
+        print(
+            "warning: scanned files but recovered no ELF export names; "
+            "SELF/game modules usually lack plaintext symbol tables — use SDK ELF stubs instead",
+            file=sys.stderr,
+        )
 
     known = already_named()
     table = [(nid, name) for nid, name in sorted({nid_of(name): name for name in names}.items())
