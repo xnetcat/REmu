@@ -38,11 +38,12 @@ pub struct ModuleLinkReport {
 }
 
 pub(crate) fn discover_runtime_module_paths(app_root: &Path) -> Result<Vec<PathBuf>, LinkError> {
-    // Unreal plug-ins are commonly unpacked under Media/Plugins, while Wwise titles such as
-    // Silent Hill keep load-on-demand effect modules directly in /app0/prx. Both sets must be
-    // mapped up front because the process image is finalized before sceKernelLoadStartModule can
-    // ask to start one of them.
+    // Engine plug-ins commonly live under Media/Plugins. Some dumps keep a parallel decrypted
+    // overlay at decrypted/Media/Plugins; flattened app0 trees only expose Media/Plugins. Wwise
+    // effect modules often live in /app0/prx. All of these must be mapped up front because the
+    // process image is finalized before sceKernelLoadStartModule can ask to start one of them.
     let mut pending = [
+        app_root.join("Media/Plugins"),
         app_root.join("decrypted/Media/Plugins"),
         app_root.join("prx"),
     ]
