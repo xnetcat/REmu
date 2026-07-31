@@ -12,6 +12,10 @@ The audit deliberately separates four facts which runtime first-hit logs conflat
 Reference registrations are evidence to inspect, not proof that an implementation is complete.
 Game executables are supplied as repeatable ``--game LABEL=/path/to/eboot.bin`` arguments.
 Reference snapshot locations default to ``research/upstreams/`` and can be overridden.
+
+Optional pieces never abort the audit: missing SharpEmu/shadPS4/Kyty trees print a warning and
+leave reference columns empty, and a failed or skipped ``remu link`` (typical on Windows, where
+guest fixed-base mapping is unavailable) falls back to source-table classification only.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import base64
 import collections
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -298,15 +303,29 @@ def inspect_runtime_source(path: Path) -> RuntimeCoverage:
     return RuntimeCoverage(names=names, statuses=statuses)
 
 
-def run_import_inventory(command: Sequence[str], path: Path) -> str:
-    result = subprocess.run(
-        [*command, "imports", str(path)],
+def _run_remu(command: Sequence[str], subcommand: str, path: Path) -> subprocess.CompletedProcess[str]:
+    """Run a remu CLI subcommand with UTF-8 output, including on Windows code pages."""
+
+    return subprocess.run(
+        [*command, subcommand, str(path)],
         cwd=REPO_ROOT,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+
+
+def run_import_inventory(command: Sequence[str], path: Path) -> str:
+    try:
+        result = _run_remu(command, "imports", path)
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            f"remu CLI not found ({error}). Build remu-cli or pass --remu-binary "
+            f"to a remu executable that can run `imports`."
+        ) from error
     if result.returncode != 0:
         raise RuntimeError(
             f"import inventory failed for {path} (status {result.returncode}):\n{result.stderr}"
@@ -314,19 +333,33 @@ def run_import_inventory(command: Sequence[str], path: Path) -> str:
     return result.stdout
 
 
-def run_link_inventory(command: Sequence[str], path: Path) -> str:
-    result = subprocess.run(
-        [*command, "link", str(path)],
-        cwd=REPO_ROOT,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"link inventory failed for {path} (status {result.returncode}):\n{result.stderr}"
+def run_link_inventory(command: Sequence[str], path: Path) -> str | None:
+    """Return link inventory stdout, or ``None`` when linking is unavailable.
+
+    Linking materializes the guest image at a fixed virtual base. That fails on hosts that cannot
+    reserve that range — Windows in particular, and native arm64 macOS builds — even when
+    ``imports`` still works. The audit then continues without per-symbol link resolutions and
+    classifies NIDs from the runtime source tables alone.
+    """
+
+    try:
+        result = _run_remu(command, "link", path)
+    except FileNotFoundError as error:
+        print(
+            f"warning: remu CLI not found for link inventory ({error}); "
+            "continuing without link resolutions",
+            file=sys.stderr,
         )
+        return None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        print(
+            f"warning: link inventory unavailable for {path} "
+            f"(status {result.returncode}); continuing without link resolutions"
+            + (f":\n{detail}" if detail else ""),
+            file=sys.stderr,
+        )
+        return None
     return result.stdout
 
 
@@ -396,46 +429,120 @@ def read_reference_names(sharpemu: Path) -> dict[str, str]:
     names_file = sharpemu / "scripts/ps5_names.txt"
     if not names_file.is_file():
         return {}
+    try:
+        lines = names_file.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        print(f"warning: could not read reference names at {names_file}: {error}", file=sys.stderr)
+        return {}
     result: dict[str, str] = {}
-    for raw_name in names_file.read_text(encoding="utf-8").splitlines():
+    for raw_name in lines:
         name = raw_name.strip()
         if name:
             result.setdefault(compute_nid(name), name)
     return result
 
 
+def warn_missing_upstream(label: str, root: Path, required: Path) -> bool:
+    """Return True when ``required`` is usable; otherwise warn and return False."""
+
+    if required.is_dir():
+        return True
+    if root.is_dir():
+        try:
+            missing = required.relative_to(root)
+        except ValueError:
+            missing = required
+        print(
+            f"warning: {label} checkout at {root} is missing {missing}; "
+            "reference coverage for it will be empty",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"warning: {label} upstream not found at {root}; "
+            "reference coverage for it will be empty",
+            file=sys.stderr,
+        )
+    return False
+
+
 def inspect_references(
     sharpemu: Path, shadps4: Path, kyty: Path, kyty_ps5: Path
 ) -> ReferenceCoverage:
+    """Scan optional upstream checkouts. Missing trees yield empty sets, not an error."""
+
     sharp_pattern = re.compile(r'Nid\s*=\s*"([A-Za-z0-9+-]{11})"')
     cpp_pattern = re.compile(
         r'LIB_(?:FUNCTION|FUNC|OBJECT)\s*\(\s*"([A-Za-z0-9+-]{11})"'
     )
-    return ReferenceCoverage(
-        names=read_reference_names(sharpemu),
-        sharpemu=frozenset(
-            scan_pattern(sharpemu / "src/SharpEmu.Libs", (".cs",), sharp_pattern)
-        ),
-        shadps4=frozenset(scan_pattern(shadps4 / "src", (".c", ".cc", ".cpp", ".h"), cpp_pattern)),
-        kyty=frozenset(
-            scan_pattern(kyty / "source/emulator", (".c", ".cc", ".cpp", ".h"), cpp_pattern)
-        ),
-        kyty_ps5=frozenset(
-            scan_pattern(kyty_ps5 / "src", (".c", ".cc", ".cpp", ".h"), cpp_pattern)
-        ),
+    sharpemu_libs = sharpemu / "src/SharpEmu.Libs"
+    shadps4_src = shadps4 / "src"
+    kyty_src = kyty / "source/emulator"
+    kyty_ps5_src = kyty_ps5 / "src"
+
+    warn_missing_upstream("SharpEmu", sharpemu, sharpemu_libs)
+    warn_missing_upstream("shadPS4", shadps4, shadps4_src)
+    warn_missing_upstream("Kyty", kyty, kyty_src)
+    warn_missing_upstream("KytyPS5", kyty_ps5, kyty_ps5_src)
+
+    try:
+        return ReferenceCoverage(
+            names=read_reference_names(sharpemu),
+            sharpemu=frozenset(scan_pattern(sharpemu_libs, (".cs",), sharp_pattern)),
+            shadps4=frozenset(
+                scan_pattern(shadps4_src, (".c", ".cc", ".cpp", ".h"), cpp_pattern)
+            ),
+            kyty=frozenset(scan_pattern(kyty_src, (".c", ".cc", ".cpp", ".h"), cpp_pattern)),
+            kyty_ps5=frozenset(
+                scan_pattern(kyty_ps5_src, (".c", ".cc", ".cpp", ".h"), cpp_pattern)
+            ),
+        )
+    except OSError as error:
+        print(
+            f"warning: reference scan failed ({error}); continuing without upstream coverage",
+            file=sys.stderr,
+        )
+        return ReferenceCoverage(
+            names={},
+            sharpemu=frozenset(),
+            shadps4=frozenset(),
+            kyty=frozenset(),
+            kyty_ps5=frozenset(),
+        )
+
+
+def remu_executable_names() -> tuple[str, ...]:
+    """Return remu binary basenames for the current host (``.exe`` on Windows)."""
+
+    if os.name == "nt":
+        return ("remu.exe", "remu")
+    return ("remu",)
+
+
+def remu_candidate_binaries() -> tuple[Path, ...]:
+    """Ordered remu binary search paths for the current host."""
+
+    names = remu_executable_names()
+    host_dirs = (
+        REPO_ROOT / "target" / "release",
+        REPO_ROOT / "target" / "debug",
     )
+    # Apple Silicon developers often keep a Rosetta remu that can map the guest base; keep it
+    # after the native host dirs so a Windows/Linux checkout never prefers macOS artifacts.
+    apple_dirs = (
+        REPO_ROOT / "target" / "x86_64-apple-darwin" / "release",
+        REPO_ROOT / "target" / "x86_64-apple-darwin" / "debug",
+    )
+    ordered_dirs = host_dirs if os.name == "nt" else (*host_dirs, *apple_dirs)
+    return tuple(directory / name for directory in ordered_dirs for name in names)
 
 
 def resolve_command(explicit: Path | None) -> list[str]:
     if explicit is not None:
+        if not explicit.is_file():
+            raise FileNotFoundError(f"remu binary not found: {explicit}")
         return [str(explicit)]
-    candidates = (
-        REPO_ROOT / "target/x86_64-apple-darwin/debug/remu",
-        REPO_ROOT / "target/x86_64-apple-darwin/release/remu",
-        REPO_ROOT / "target/debug/remu",
-        REPO_ROOT / "target/release/remu",
-    )
-    for candidate in candidates:
+    for candidate in remu_candidate_binaries():
         if candidate.is_file():
             return [str(candidate)]
     return ["cargo", "run", "--quiet", "-p", "remu-cli", "--"]
@@ -488,6 +595,8 @@ def build_report(
     command: Sequence[str],
     runtime: RuntimeCoverage,
     references: ReferenceCoverage,
+    *,
+    skip_link: bool = False,
 ) -> dict[str, object]:
     titles = []
     all_rows: list[dict[str, object]] = []
@@ -495,7 +604,17 @@ def build_report(
         if not path.is_file():
             raise FileNotFoundError(f"game executable not found: {path}")
         dependencies, inventory = parse_import_inventory(run_import_inventory(command, path))
-        link_resolutions = parse_link_resolutions(run_link_inventory(command, path))
+        if skip_link:
+            print(
+                f"warning: skipping link inventory for {path}; "
+                "classifying from runtime source tables only",
+                file=sys.stderr,
+            )
+            link_output = None
+        else:
+            link_output = run_link_inventory(command, path)
+        link_available = link_output is not None
+        link_resolutions = parse_link_resolutions(link_output or "")
         for imported in inventory.values():
             for symbol in imported.symbols:
                 imported.link_resolutions.update(link_resolutions.get(symbol, ()))
@@ -514,6 +633,7 @@ def build_report(
                 "dependencies": sorted(dependencies),
                 "unique_nids": len(rows),
                 "callable_nids": len(callable_rows),
+                "link_inventory": link_available,
                 "status_counts": dict(sorted(counts.items())),
                 "callable_status_counts": dict(sorted(callable_counts.items())),
                 "callable_unknown_named": sum(bool(row["name"]) for row in unknown_rows),
@@ -534,9 +654,13 @@ def print_text_report(report: dict[str, object], details: bool) -> None:
     assert isinstance(titles, list)
     for title in titles:
         assert isinstance(title, dict)
+        link_note = (
+            "link_inventory=yes" if title.get("link_inventory", True) else "link_inventory=no"
+        )
         print(
             f"title={title['title']} dependencies={len(title['dependencies'])} "
-            f"unique_nids={title['unique_nids']} callable_nids={title['callable_nids']}"
+            f"unique_nids={title['unique_nids']} callable_nids={title['callable_nids']} "
+            f"{link_note}"
         )
         counts = title["callable_status_counts"]
         assert isinstance(counts, dict)
@@ -591,10 +715,33 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shadps4", type=Path, default=DEFAULT_SHADPS4)
     parser.add_argument("--kyty", type=Path, default=DEFAULT_KYTY)
     parser.add_argument("--kyty-ps5", type=Path, default=DEFAULT_KYTY_PS5)
+    link_group = parser.add_mutually_exclusive_group()
+    link_group.add_argument(
+        "--skip-link",
+        action="store_true",
+        default=None,
+        help="do not run `remu link`; classify from runtime source tables only",
+    )
+    link_group.add_argument(
+        "--link",
+        action="store_true",
+        default=None,
+        help="attempt `remu link` even on hosts where guest mapping usually fails",
+    )
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--details", action="store_true", help="print every callable gap")
     parser.add_argument("--output", type=Path, help="write the report instead of stdout")
     return parser
+
+
+def should_skip_link(skip_link: bool | None, force_link: bool | None) -> bool:
+    """Windows defaults to skipping link; elsewhere link is attempted unless opted out."""
+
+    if force_link:
+        return False
+    if skip_link:
+        return True
+    return os.name == "nt"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -609,7 +756,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         runtime = inspect_runtime_source(args.runtime_source)
         references = inspect_references(args.sharpemu, args.shadps4, args.kyty, args.kyty_ps5)
-        report = build_report(games, resolve_command(args.remu_binary), runtime, references)
+        report = build_report(
+            games,
+            resolve_command(args.remu_binary),
+            runtime,
+            references,
+            skip_link=should_skip_link(args.skip_link, args.link),
+        )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
