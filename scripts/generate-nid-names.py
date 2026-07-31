@@ -17,6 +17,7 @@ for data the compiler never reasons about.
 
 Usage:
     scripts/generate-nid-names.py <directory-of-elf-modules>... crates/remu-runtime/src/nid_names.bin
+    scripts/generate-nid-names.py --force <directory>... crates/remu-runtime/src/nid_names.bin
 
 Inputs must expose plaintext C/C++ export names in ELF symbol tables (typically SDK link stubs
 you are licensed to use). Game `sce_module` SELF containers usually ship NID-encoded dynamic
@@ -24,6 +25,10 @@ names (`nid#lib#ver`) and zero section headers, so scanning them yields nothing 
 decrypted/raw ELF dumps with real symbol names instead.  Run this only when you have new modules
 to scan; the generated table is committed so a normal build needs neither this script nor its
 inputs.
+
+By default the script refuses to overwrite an existing non-empty table with zero recovered names
+(so a game `sce_module` scan cannot wipe the committed blob). Pass `--force` only when you
+intentionally want that.
 
 Table layout, all integers little-endian:
 
@@ -185,11 +190,30 @@ def already_named() -> set:
     )
 
 
-def main() -> int:
-    if len(sys.argv) < 3:
+def existing_table_count(path: pathlib.Path) -> int | None:
+    """Return the entry count of an existing REMUNID1 blob, or None if absent/unreadable."""
+
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 16 or data[:8] != b"REMUNID1":
+        return None
+    count, = struct.unpack_from("<I", data, 8)
+    return count
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    force = False
+    if args and args[0] == "--force":
+        force = True
+        args = args[1:]
+    if len(args) < 2:
         print(__doc__, file=sys.stderr)
         return 2
-    *roots, destination = sys.argv[1:]
+    *roots, destination = args
+    destination_path = pathlib.Path(destination)
 
     names = set()
     files_seen = 0
@@ -215,6 +239,16 @@ def main() -> int:
     table = [(nid, name) for nid, name in sorted({nid_of(name): name for name in names}.items())
              if nid not in known and len(name) < 256]
 
+    previous = existing_table_count(destination_path)
+    if not force and not table and previous:
+        print(
+            f"error: recovered 0 names but `{destination_path}` already has {previous} entries; "
+            "refusing to overwrite (pass --force to replace anyway). "
+            "If you already wiped it: git restore -- crates/remu-runtime/src/nid_names.bin",
+            file=sys.stderr,
+        )
+        return 1
+
     index, blob = bytearray(), bytearray()
     for nid, name in table:
         encoded = name.encode()
@@ -222,7 +256,7 @@ def main() -> int:
         blob += encoded
 
     header = b"REMUNID1" + struct.pack("<II", len(table), 16 + len(index))
-    pathlib.Path(destination).write_bytes(header + index + blob)
+    destination_path.write_bytes(header + index + blob)
     print(f"{len(table)} names -> {destination} ({(len(header) + len(index) + len(blob)) / 1024:.0f} KiB)",
           file=sys.stderr)
     return 0

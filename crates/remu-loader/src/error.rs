@@ -3,6 +3,7 @@
 //! Failures raised while inspecting or loading a PS5 executable.
 
 use std::io;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -10,6 +11,20 @@ use thiserror::Error;
 pub enum InspectError {
     #[error("failed to read executable: {0}")]
     Io(#[from] io::Error),
+    #[error(
+        "failed to open executable `{}`: {source}",
+        path.display()
+    )]
+    Open {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "`{}` is a directory; pass eboot.bin or a .prx/.elf module",
+        path.display()
+    )]
+    PathIsDirectory { path: PathBuf },
     #[error("executable is truncated: expected at least {expected} bytes, found {actual}")]
     Truncated { expected: u64, actual: u64 },
     #[error("unsupported ELF class {0}; REmu currently accepts ELF64 only")]

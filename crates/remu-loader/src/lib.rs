@@ -78,13 +78,27 @@ const DT_SCE_EXPORT_LIBRARY_1: i64 = 0x6100_0047;
 const DT_SCE_IMPORT_LIBRARY_1: i64 = 0x6100_0049;
 
 pub fn inspect_path(path: impl AsRef<Path>) -> Result<ExecutableInfo, InspectError> {
-    let mut file = File::open(path)?;
+    let mut file = open_executable(path.as_ref())?;
     inspect_reader(&mut file)
 }
 
 pub fn load_path(path: impl AsRef<Path>) -> Result<LoadedExecutable, InspectError> {
-    let mut file = File::open(path)?;
+    let mut file = open_executable(path.as_ref())?;
     load_reader(&mut file)
+}
+
+fn open_executable(path: &Path) -> Result<File, InspectError> {
+    // On Windows, CreateFile on a directory returns ERROR_ACCESS_DENIED (os error 5) rather than
+    // "is a directory", which looks like a permissions mystery. Check first so the message is clear.
+    if path.is_dir() {
+        return Err(InspectError::PathIsDirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    File::open(path).map_err(|source| InspectError::Open {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub fn load_reader(reader: &mut (impl Read + Seek)) -> Result<LoadedExecutable, InspectError> {
@@ -190,13 +204,23 @@ pub fn inspect_reader(reader: &mut (impl Read + Seek)) -> Result<ExecutableInfo,
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::path::Path;
 
     use super::{
         CONTAINER_HEADER_SIZE, CONTAINER_SEGMENT_SIZE, DT_NEEDED, DT_NULL, DT_RELA, DT_RELA_SIZE,
         DT_SCE_SYMBOL_TABLE_SIZE, DT_STRING_TABLE, DT_STRING_TABLE_SIZE, DT_SYMBOL_TABLE,
-        ELF64_HEADER_SIZE, ELF64_PROGRAM_HEADER_SIZE, ExecutableKind, InspectError, inspect_reader,
-        load_reader,
+        ELF64_HEADER_SIZE, ELF64_PROGRAM_HEADER_SIZE, ExecutableKind, InspectError, inspect_path,
+        inspect_reader, load_reader,
     };
+
+    #[test]
+    fn opening_a_directory_reports_path_is_directory() {
+        let error = inspect_path(Path::new(".")).unwrap_err();
+        assert!(
+            matches!(error, InspectError::PathIsDirectory { .. }),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn identifies_an_observed_ps5_container_and_embedded_elf() {

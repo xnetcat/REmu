@@ -8,7 +8,34 @@ use std::process::ExitCode;
 
 use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
 
+fn reject_directory(path: &Path) -> Option<ExitCode> {
+    if !path.is_dir() {
+        return None;
+    }
+    let parent = path.parent().unwrap_or(path);
+    let eboot_hint = parent.join("eboot.bin");
+    eprintln!(
+        "error: `{}` is a directory; pass eboot.bin or a single .prx/.elf (for example `{}`)",
+        path.display(),
+        eboot_hint.display()
+    );
+    // sce_module itself is never the right target; if they passed that, suggest the title root.
+    if path
+        .file_name()
+        .is_some_and(|name| name == "sce_module" || name == "sce_modules")
+    {
+        eprintln!(
+            "hint: to inspect a shipped library, pass a file inside it, e.g. `{}`",
+            path.join("libc.prx").display()
+        );
+    }
+    Some(ExitCode::FAILURE)
+}
+
 pub(crate) fn inspect(path: &Path) -> ExitCode {
+    if let Some(code) = reject_directory(path) {
+        return code;
+    }
     match remu_loader::inspect_path(path) {
         Ok(info) => {
             println!("path={}", path.display());
@@ -125,6 +152,9 @@ fn print_dynamic_info(dynamic: remu_loader::DynamicInfo) {
 }
 
 pub(crate) fn imports(path: &Path) -> ExitCode {
+    if let Some(code) = reject_directory(path) {
+        return code;
+    }
     let info = match remu_loader::inspect_path(path) {
         Ok(info) => info,
         Err(error) => {

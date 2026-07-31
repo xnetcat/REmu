@@ -110,6 +110,30 @@ class GenerateNidNamesTests(unittest.TestCase):
         self.assertEqual(GEN.nid_of("scePthreadYield"), "T72hz6ffq08")
         self.assertEqual(GEN.nid_of("sceKernelMprotect"), "vSMAm3cxYTY")
 
+    def test_refuses_to_overwrite_existing_table_with_zero_names(self) -> None:
+        repo_table = Path(__file__).resolve().parents[2] / "crates/remu-runtime/src/nid_names.bin"
+        previous = GEN.existing_table_count(repo_table)
+        self.assertIsNotNone(previous)
+        self.assertGreater(previous or 0, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_root = Path(tmp) / "empty"
+            empty_root.mkdir()
+            destination = Path(tmp) / "nid_names.bin"
+            destination.write_bytes(repo_table.read_bytes())
+            rc = GEN.main([str(empty_root), str(destination)])
+            self.assertEqual(rc, 1)
+            self.assertEqual(GEN.existing_table_count(destination), previous)
+
+    def test_force_allows_empty_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_root = Path(tmp) / "empty"
+            empty_root.mkdir()
+            destination = Path(tmp) / "nid_names.bin"
+            destination.write_bytes(b"REMUNID1" + struct.pack("<II", 3, 16) + b"\0" * 48)
+            rc = GEN.main(["--force", str(empty_root), str(destination)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(GEN.existing_table_count(destination), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
