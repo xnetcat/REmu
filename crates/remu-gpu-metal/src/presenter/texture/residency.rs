@@ -1250,7 +1250,8 @@ pub(crate) fn ensure_resident_texture_in_map(
         // A discarded render target still needs a CPU-content baseline. Mapping a later coherent
         // alias retires this watch and requests validation; without initialized fingerprints an
         // unchanged guest allocation would look CPU-modified and could discard newer GPU output.
-        let _ = snapshot_watched_guest_texture_raw(descriptor, &write_watch)?;
+        // Fingerprint the live mapping in place — a full host snapshot Vec was pure overhead here.
+        write_watch.record_live_content_baseline()?;
         create_uninitialized_guest_texture(device, descriptor, usage)?
     };
     texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));

@@ -54,6 +54,34 @@ fn fused_shader_size_covers_the_back_half_registers() {
     );
 }
 
+/// Octopath calls the shader import three times at boot with arguments that cannot describe a
+/// shader. Refusing them must not dereference the pointer, and the refusal must stay distinct
+/// from a header that is readable but carries the wrong magic.
+#[test]
+fn create_shader_refuses_null_and_unmapped_headers_without_faulting() {
+    const UNMAPPED: u64 = 0x0000_7f00_0000_0000;
+    let mut destination = 0_u64;
+    let destination_address = (&raw mut destination).addr() as u64;
+    let code = [0xbf81_0000_u32; 4];
+    let code_address = code.as_ptr().addr() as u64;
+    let mut state = ProbeDispatchState::default();
+
+    for arguments in [
+        [destination_address, 0, code_address, 0, 0, 0],
+        [destination_address, UNMAPPED, 0, 0, 0, 0],
+        [destination_address, UNMAPPED, code_address, 0, 0, 0],
+    ] {
+        assert_eq!(
+            crate::agc_create_shader(arguments, &mut state),
+            u64::MAX,
+            "header={:#x} code={:#x} must be refused",
+            arguments[1],
+            arguments[2]
+        );
+    }
+    assert_eq!(destination, 0);
+}
+
 #[test]
 fn create_shader_registers_the_authoritative_agc_code_extent() {
     let mut header = [0_u8; 0x60];

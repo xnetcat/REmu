@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{
-    Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveTopologyClass,
-    MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
-    RenderPassDescriptor, TextureDescriptor,
+    Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLResourceOptions, MTLStorageMode,
+    MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
 };
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuMemoryAcquire,
@@ -26,8 +25,7 @@ use super::super::submission::{
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
 };
 use super::{
-    ComputePipelineKey, GLOBAL_UPLOAD_ALIGNMENT, GraphicsDiagnosticPipelineState,
-    GraphicsPipelineKey, GraphicsShaderResourceKey, GuestBatchFlushReason, GuestCommandBatch,
+    ComputePipelineKey, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason, GuestCommandBatch,
     GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
     GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor, MetalPresenter,
     OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
@@ -2093,46 +2091,7 @@ fn deferred_anonymous_guest_write_rejects_reused_mapping() {
 fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
     let (sender, receiver) = gpu_event_channel();
     let mut ordered = OrderedGpuEventReceiver::new(receiver);
-    let key = GraphicsPipelineKey {
-        export_shader_address: 0x1000,
-        pixel_shader_address: 0x2000,
-        export_program_identity: super::ProgramIdentity(std::sync::Arc::new(Program::new(
-            0x1000,
-            Vec::new(),
-        ))),
-        pixel_program_identity: super::ProgramIdentity(std::sync::Arc::new(Program::new(
-            0x2000,
-            Vec::new(),
-        ))),
-        export_resources: GraphicsShaderResourceKey {
-            initial_scalar_count: 0,
-            global_bindings: Vec::new(),
-            image_bindings: Vec::new(),
-            vertex_inputs: Vec::new(),
-        },
-        pixel_resources: GraphicsShaderResourceKey {
-            initial_scalar_count: 0,
-            global_bindings: Vec::new(),
-            image_bindings: Vec::new(),
-            vertex_inputs: Vec::new(),
-        },
-        export_allocated_vector_register_count: 256,
-        pixel_allocated_vector_register_count: 256,
-        vertex_output_control: 0,
-        pixel_input_controls: std::array::from_fn(|index| {
-            u32::try_from(index).expect("PS input index fits u32")
-        }),
-        pixel_depth_export: false,
-        ngg_subgroup_limits: None,
-        diagnostics: GraphicsDiagnosticPipelineState::default(),
-        targets: Vec::new(),
-        depth: None,
-        sample_count: 1,
-        render_target_array_length: 1,
-        uses_mesh_stage: false,
-        uses_procedural_rectangle_stage: false,
-        primitive_topology_class: MTLPrimitiveTopologyClass::Triangle,
-    };
+    let key = super::cold_graphics_pipeline_key();
     let mut capture_key = key.clone();
     capture_key.diagnostics.capture_vertex_position = true;
     capture_key.diagnostics.capture_pixel_output = true;
@@ -2842,14 +2801,13 @@ fn blocked_wait_dependency_ingress_has_a_finite_pending_event_bound() {
         ordered.pending_event_count() <= dependency_pending_capacity,
         "blocked-only ingress must retain a finite decoded-event bound"
     );
+    // The wait has no ingested producer, so the presenter keeps polling in case a CPU store
+    // satisfies it. That must not let the 64 blocked barrier submissions behind the wait run.
+    assert!(ordered.has_runnable_events());
     assert!(
-        !ordered.has_runnable_events(),
+        matches!(ordered.try_recv(|_| true), OrderedEventPoll::Blocked),
         "blocked queue tails must never become runnable ahead of their wait"
     );
-    assert!(matches!(
-        ordered.try_recv(|_| true),
-        OrderedEventPoll::Blocked
-    ));
 }
 
 #[test]
@@ -2912,6 +2870,9 @@ fn blocked_wait_diagnostics_report_both_edges_of_a_cross_queue_cycle() {
         ordered.try_recv(|_| true),
         OrderedEventPoll::Blocked
     ));
+    // Both waits already have an ingested producer, so no CPU store is expected to break the
+    // deadlock and the presenter may sleep on its idle deadline instead of spinning.
+    assert!(!ordered.has_runnable_events());
 }
 
 #[test]
@@ -2950,7 +2911,13 @@ fn ordered_receiver_reports_only_dependency_runnable_work() {
         GpuEvent::MemoryWait(wait),
         QueueBlockReason::GuestMemoryWait(wait),
     );
-    assert!(!ordered.has_runnable_events());
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Blocked
+    ));
+    // Nothing is runnable, but no ingested packet can write the label either, so only a CPU
+    // store can release this queue. Keep polling rather than sleeping on an AppKit deadline.
+    assert!(ordered.has_runnable_events());
 
     ordered.retry_guest_memory_waits();
     assert!(ordered.has_runnable_events());

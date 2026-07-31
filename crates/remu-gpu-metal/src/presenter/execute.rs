@@ -1606,7 +1606,12 @@ impl MetalPresenter {
             if depth.sample_count > 1 {
                 self.mark_multisample_texture_initialized(depth.texture, depth.sample_count);
             }
-            if depth.write_enabled || depth.clear_enabled {
+            // Any Metal depth store must claim GPU ownership. Explicit DB clears and Z writes
+            // already did; HTILE/metadata expansion and first-use clears also LoadAction::Clear
+            // the attachment. Leaving those unmarked kept Depth32Float residents at gpufalse/v0
+            // while an earlier R32Float sample SRD shadowed them and forced CPU snapshots
+            // (Octopath 0x8063d50000: depth_native=0 forever).
+            if depth.write_enabled || depth_clear_value.is_some() {
                 if depth.sample_count > 1 {
                     self.mark_resident_texture_written_preserving_multisample_at(
                         depth.texture,

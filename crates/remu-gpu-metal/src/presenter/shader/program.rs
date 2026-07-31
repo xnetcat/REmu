@@ -256,7 +256,44 @@ pub(crate) fn shader_scalar_metadata_for_registers(
         words[scalar_register] =
             register_value(shader_registers, user_data_register + offset).unwrap_or_default();
     }
+    // Live SH/user-data reloads restore guest NUM_RECORDS after evaluation expanded the Metal
+    // buffer for instanced vertex fetches. Without lifting NUM_RECORDS to the bound span,
+    // OOB_SELECT=0/1 still zeroes every instance past the guest record count (Poppy UI tofu).
+    lift_expanded_vertex_buffer_num_records(&mut words, evaluation);
     Ok(words)
+}
+
+/// When evaluation bound more bytes than `NUM_RECORDS * stride`, rewrite `NUM_RECORDS` so Metal
+/// buffer OOB checks accept the same instance-indexed records the host buffer now covers.
+pub(crate) fn lift_expanded_vertex_buffer_num_records(
+    scalar_metadata: &mut [u32],
+    evaluation: &ShaderEvaluation,
+) {
+    for binding in &evaluation.global_memory_bindings {
+        let scalar = usize::try_from(binding.scalar_address).unwrap_or(usize::MAX);
+        if scalar.saturating_add(3) >= scalar_metadata.len() || binding.byte_count <= 4 {
+            continue;
+        }
+        let stride = (scalar_metadata[scalar + 1] >> 16) & 0x3fff;
+        if stride == 0 {
+            continue;
+        }
+        let oob_select = (scalar_metadata[scalar + 3] >> 28) & 3;
+        // Raw (OOB_SELECT=3) stores a byte extent in word2; do not reinterpret it as records.
+        if oob_select == 3 {
+            continue;
+        }
+        let num_records = scalar_metadata[scalar + 2];
+        let descriptor_bytes = u64::from(num_records).saturating_mul(u64::from(stride));
+        let bound_bytes = u64::try_from(binding.byte_count).unwrap_or(0);
+        if bound_bytes <= descriptor_bytes {
+            continue;
+        }
+        let expanded_records = u32::try_from(bound_bytes / u64::from(stride)).unwrap_or(num_records);
+        if expanded_records > num_records {
+            scalar_metadata[scalar + 2] = expanded_records;
+        }
+    }
 }
 
 pub(crate) fn program_uses_lds(program: &remu_shader::Program) -> bool {
@@ -458,7 +495,9 @@ pub(crate) fn ngg_memoryless_cover_export_stage(program: &Program) -> bool {
                 || name.starts_with("Buffer")
                 || name.starts_with("SBuffer")
                 || name.starts_with("Global")
-                || name.starts_with("Flat")
+                // Flat scalar/constant traffic is common in UE fullscreen covers that still derive
+                // position from the vertex ID. Buffer/Image/Global fetches remain disqualifying so
+                // sprite quads that pull per-vertex attributes stay on the ordinary VS path.
                 || name.starts_with("Scratch"))
         {
             return false;
@@ -644,7 +683,6 @@ pub(crate) fn truncated_memoryless_ngg_rectangle_cover(program: &Program) -> boo
                     || name.starts_with("Buffer")
                     || name.starts_with("SBuffer")
                     || name.starts_with("Global")
-                    || name.starts_with("Flat")
                     || name.starts_with("Scratch") =>
             {
                 return false;

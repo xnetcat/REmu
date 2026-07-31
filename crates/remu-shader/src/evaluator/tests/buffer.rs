@@ -5,6 +5,7 @@
 //! unreadable resources, and the record range a draw's vertex buffers cover.
 
 use super::*;
+use crate::evaluator::resources::required_vertex_bytes;
 
 #[test]
 fn sizes_structured_buffer_descriptors_in_records() {
@@ -29,6 +30,29 @@ fn sizes_raw_buffer_descriptors_in_bytes() {
     assert_eq!(descriptor.stride, 16);
     assert_eq!(descriptor.record_count, 512);
     assert_eq!(descriptor.size_bytes, 512);
+}
+
+#[test]
+fn extends_vertex_bindings_across_draw_instances_for_all_oob_modes() {
+    let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+    registers[..4].copy_from_slice(&[0x2000, 24 << 16, 4, 2 << 28]);
+    let descriptor = decode_buffer_descriptor(&registers, 0).expect("descriptor");
+
+    assert_eq!(descriptor.oob_select, 2);
+    assert_eq!(descriptor.size_bytes, 96);
+    assert_eq!(
+        required_vertex_bytes(descriptor, 0, 4, Some(4 * 64)),
+        24 * 4 * 64,
+        "OOB_SELECT=2 permits instance-indexed records beyond NUM_RECORDS"
+    );
+
+    registers[3] = 1 << 28;
+    let bounded = decode_buffer_descriptor(&registers, 0).expect("bounded descriptor");
+    assert_eq!(
+        required_vertex_bytes(bounded, 0, 4, Some(4 * 64)),
+        24 * 4 * 64,
+        "host binding length must not preempt the shader's OOB selection semantics"
+    );
 }
 
 #[test]

@@ -765,6 +765,29 @@ impl GuestTextureWriteWatch {
         state.pending_dirty_ranges.clear();
     }
 
+    /// Fingerprint the live guest mapping in place without allocating a full host snapshot.
+    ///
+    /// Discarded render targets need an initialized CPU-content baseline so a later coherent
+    /// alias renewal does not look like a CPU rewrite. Copying multi-megabyte Unreal surfaces
+    /// into a throwaway `Vec` dominated texture snapshot time on title screens.
+    pub(crate) fn record_live_content_baseline(&self) -> Result<(), String> {
+        let chunks = snapshot_dirty_content_fingerprints(self, vec![self.range()])?;
+        let mut state = self
+            .content_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for chunk in chunks {
+            if let Some(slot) = state.chunk_fingerprints.get_mut(chunk.index) {
+                *slot = chunk.fingerprint;
+            }
+            if let Some(initialized) = state.initialized_chunks.get_mut(chunk.index) {
+                *initialized = true;
+            }
+        }
+        state.pending_dirty_ranges.clear();
+        Ok(())
+    }
+
     pub(crate) fn overlaps_alias_ranges(&self, ranges: &[(u64, u64)]) -> bool {
         ranges
             .iter()

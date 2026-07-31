@@ -527,3 +527,29 @@ fn repeated_watch_lifecycles_reclaim_registry_state() {
         assert!(!state.ranges.contains_key(&id));
     }
 }
+
+#[test]
+fn unrelated_fault_diagnostics_name_the_faulting_address() {
+    use super::signal::{UNRELATED_FAULT_MESSAGE_CAPACITY, format_unrelated_fault_message};
+
+    let render = |address: u64| {
+        let mut message = [0_u8; UNRELATED_FAULT_MESSAGE_CAPACITY];
+        let length = format_unrelated_fault_message(address, &mut message);
+        String::from_utf8(message[..length].to_vec()).expect("diagnostic is ASCII")
+    };
+
+    assert_eq!(
+        render(0x8063_d500_0000),
+        "[REMu][WATCH] unrelated fault outside watched memory at 0x8063d5000000; forwarding\n"
+    );
+    assert_eq!(
+        render(u64::MAX),
+        "[REMu][WATCH] unrelated fault outside watched memory at 0xffffffffffffffff; forwarding\n"
+    );
+    // A zero address is reported before this path, but the renderer must never produce an
+    // empty digit run for it.
+    assert_eq!(
+        render(0),
+        "[REMu][WATCH] unrelated fault outside watched memory at 0x0; forwarding\n"
+    );
+}

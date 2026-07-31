@@ -18,8 +18,9 @@ use super::{
     diagnostic_video_chain_selected_draw, evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count, image_component_class,
-    is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_stage_for_draw,
-    pixel_input_controls, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    is_storage_image_opcode, ngg_export_uses_general_lds, ngg_memoryless_cover_export_stage,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_input_controls,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base,
     register_value, video_target_binding_summary,
 };
 use metal::{
@@ -39,19 +40,35 @@ const METAL_MESH_MAX_OUTPUTS: u32 = 256;
 
 /// Cover topologies that memoryless NGG stages emit for fullscreen blits and that currently shard
 /// under the meshlet ABI. Vertex-fetching NGG programs with the same topologies are excluded by
-/// [`ngg_memoryless_cover_export_stage`].
+/// [`ngg_memoryless_cover_export_stage`] (indexed single-triangle) or any LDS-free NGG strip
+/// cover (`count=4`).
 ///
 /// Indexed two-triangle quads (`count=6`) are not covers: positioned UI/sprite quads share that
 /// topology with memoryless NGG exports, and synthesizing a fullscreen triangle replaces their
 /// bounds with solid cells. Keep single-triangle (`count=3`) covers and non-indexed strip covers.
+///
+/// Poppy/UE YUV converts arrive as LDS-free NGG strips that still Flat/Global-load a tiny vertex
+/// record. Those loads are often incomplete on the host, so PARAMs stay zero and the convert
+/// samples one constant texel (green/magenta factory). Synthesizing the covering triangle restores
+/// UVs; Buffer-backed sprite quads stay excluded via the `count=6` / mesh-LDS gates.
 pub(crate) fn ngg_fullscreen_cover_draw(program: &remu_shader::Program, draw: &IndexedDraw) -> bool {
-    draw.indirect_arguments_address.is_none()
-        && ngg_memoryless_cover_export_stage(program)
-        && ((!draw.indexed && draw.primitive_type == 6 && draw.index_count == 4)
-            || (draw.indexed
-                && draw.primitive_type == 4
-                && draw.index_count == 3
-                && draw.instance_count == 1))
+    if draw.indirect_arguments_address.is_some() {
+        return false;
+    }
+    let strip_cover = !draw.indexed && draw.primitive_type == 6 && draw.index_count == 4;
+    let indexed_triangle_cover = draw.indexed
+        && draw.primitive_type == 4
+        && draw.index_count == 3
+        && draw.instance_count == 1;
+    if strip_cover {
+        // Topology alone identifies UE fullscreen strips; tolerate Flat/Global traffic that only
+        // seeds the discarded guest vertex path.
+        ngg_mesh_export_stage(program) && !ngg_export_uses_general_lds(program)
+    } else if indexed_triangle_cover {
+        ngg_memoryless_cover_export_stage(program)
+    } else {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1053,6 +1070,7 @@ fn transparent_premultiplied_fill_clear_enabled() -> bool {
 /// are often intentional no-ops, and forcing an overwrite wipes scene layers (e.g. the player).
 ///
 /// Opt out with `REMU_DISABLE_TRANSPARENT_FILL_CLEAR=1`.
+#[cfg(test)]
 pub(crate) fn apply_transparent_premultiplied_fill_clear(
     targets: &mut [RenderTargetPipelineState],
     export_evaluation: &ShaderEvaluation,

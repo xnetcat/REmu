@@ -135,9 +135,7 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
         // This handler receives every process SIGSEGV/SIGBUS while CPU write watching is active.
         // A fault outside the immutable watch snapshot is not a write-watch failure; forward it
         // unchanged so the system crash report retains the guest RIP and register state.
-        write_signal_diagnostic(
-            b"[REMu][WATCH] unrelated fault outside watched memory; forwarding\n",
-        );
+        write_unrelated_fault_diagnostic(fault_address);
         return false;
     }
     let has_armed_owner = has_page
@@ -195,7 +193,55 @@ fn try_handle_write_fault(fault_address: u64) -> bool {
     true
 }
 
+/// Reports a fault the watch snapshot does not own, including the address the kernel supplied.
+///
+/// Every process SIGSEGV/SIGBUS reaches this handler while CPU write watching is active, so this
+/// line is normally the last output before an unrelated crash refaults under the previous action.
+/// Without the address the report says only that the watch layer declined the fault, which is not
+/// enough to identify the real faulting resource from a run log.
+fn write_unrelated_fault_diagnostic(fault_address: u64) {
+    let mut message = [0_u8; UNRELATED_FAULT_MESSAGE_CAPACITY];
+    let length = format_unrelated_fault_message(fault_address, &mut message);
+    write_signal_diagnostic_bytes(&message[..length]);
+}
+
+const UNRELATED_FAULT_PREFIX: &[u8] = b"[REMu][WATCH] unrelated fault outside watched memory at 0x";
+
+const UNRELATED_FAULT_SUFFIX: &[u8] = b"; forwarding\n";
+
+pub(super) const UNRELATED_FAULT_MESSAGE_CAPACITY: usize =
+    UNRELATED_FAULT_PREFIX.len() + 16 + UNRELATED_FAULT_SUFFIX.len();
+
+/// Renders the diagnostic into caller-owned storage, returning the used length.
+///
+/// Signal context forbids allocation and `core::fmt`, so the hexadecimal conversion is written by
+/// hand against a fixed stack buffer.
+pub(super) fn format_unrelated_fault_message(
+    fault_address: u64,
+    message: &mut [u8; UNRELATED_FAULT_MESSAGE_CAPACITY],
+) -> usize {
+    let mut length = UNRELATED_FAULT_PREFIX.len();
+    message[..length].copy_from_slice(UNRELATED_FAULT_PREFIX);
+    let mut digits = [0_u8; 16];
+    for (index, digit) in digits.iter_mut().enumerate() {
+        let nibble = (fault_address >> (60 - index * 4)) & 0xf;
+        *digit = b"0123456789abcdef"[nibble as usize];
+    }
+    let leading = digits
+        .iter()
+        .position(|&digit| digit != b'0')
+        .unwrap_or(digits.len() - 1);
+    message[length..length + digits.len() - leading].copy_from_slice(&digits[leading..]);
+    length += digits.len() - leading;
+    message[length..length + UNRELATED_FAULT_SUFFIX.len()].copy_from_slice(UNRELATED_FAULT_SUFFIX);
+    length + UNRELATED_FAULT_SUFFIX.len()
+}
+
 fn write_signal_diagnostic(message: &'static [u8]) {
+    write_signal_diagnostic_bytes(message);
+}
+
+fn write_signal_diagnostic_bytes(message: &[u8]) {
     // SAFETY: `write` is async-signal-safe, and the static byte slice remains live throughout the
     // call. Ignore short writes because this is a last-chance crash diagnostic.
     unsafe {

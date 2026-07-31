@@ -700,10 +700,11 @@ impl Compiler<'_> {
                          \x20   }\n",
                     );
                 }
+                // Metal mesh has no set_vertex_count; only set_primitive_count exists.
+                // Vertex occupancy comes from set_vertex + index references.
                 source.push_str(
                     "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
                      \x20   if (remu_thread_index == 0u) {\n\
-                     \x20       remu_mesh.set_vertex_count(remu_mesh_output_vertices);\n\
                      \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
                      \x20   }\n",
                 );

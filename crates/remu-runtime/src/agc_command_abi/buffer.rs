@@ -174,8 +174,31 @@ pub(super) fn pm4(length_dwords: u32, opcode: u32, register: u32) -> u32 {
         | ((register & 0x3f) << 2)
 }
 
+/// The command-buffer descriptor fields this module reads, through the reserved dword count.
+const COMMAND_BUFFER_DESCRIPTOR_BYTES: u64 = COMMAND_BUFFER_RESERVED_DWORDS_OFFSET + 4;
+
+/// Reports whether a guest range is live in this process before any raw pointer access.
+///
+/// The command-ABI entry points take pointers straight from guest registers, and titles do call
+/// them with pointers the guest itself would reject. Octopath's RHIThread reaches the register
+/// indirect-patch imports with a null descriptor; the surrounding validation returns
+/// `GRAPHICS5_ERROR_INVALID_PACKET` for that, but a non-null pointer into unmapped memory used to
+/// reach `read_u32` unchecked and fault the emulator instead. The other AGC command modules
+/// already gate every read this way.
+///
+/// This runs for every packet the guest builds, so it consults the cached kernel mapping table
+/// first and only falls back to a probing read for addresses that table does not describe.
+fn guest_range_is_readable(address: u64, length: u64) -> bool {
+    if address == 0 || address.checked_add(length).is_none() {
+        return false;
+    }
+    usize::try_from(length)
+        .is_ok_and(|length| crate::process_guest_range_has_read_access(address, length))
+}
+
 pub(super) fn packet_opcode(command: u64) -> Option<u32> {
-    (command != 0 && command.is_multiple_of(4)).then(|| (read_u32(command) >> 8) & 0xff)
+    (command != 0 && command.is_multiple_of(4) && guest_range_is_readable(command, 4))
+        .then(|| (read_u32(command) >> 8) & 0xff)
 }
 
 pub(super) fn packet_register(command: u64) -> u32 {
@@ -222,7 +245,11 @@ pub(super) fn write_words(address: u64, words: &[u32]) {
 }
 
 pub(super) fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
-    if command_buffer == 0 || command_buffer & 7 != 0 || dword_count == 0 {
+    if command_buffer == 0
+        || command_buffer & 7 != 0
+        || dword_count == 0
+        || !guest_range_is_readable(command_buffer, COMMAND_BUFFER_DESCRIPTOR_BYTES)
+    {
         return None;
     }
     let mut cursor_up = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET);

@@ -32,7 +32,8 @@ pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    missing_vertex_parameter_exports, ngg_memoryless_cover_export_stage, ngg_mesh_stage_for_draw,
+    missing_vertex_parameter_exports, ngg_export_uses_general_lds,
+    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
     pixel_interpolation_attribute_mask, pixel_scalars, procedural_rectangle_stage_for_draw,
     program_embeds_global_base, program_uses_lds, rectangle_coordinate_parameter_mask,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
@@ -40,7 +41,7 @@ pub(crate) use self::program::{
 };
 #[cfg(test)]
 pub(crate) use self::program::{
-    ngg_export_uses_general_lds, ngg_mesh_draw_supported, ngg_mesh_export_stage,
+    lift_expanded_vertex_buffer_num_records, ngg_mesh_draw_supported,
     procedural_rectangle_export_stage, rectangle_draw_has_incomplete_interface,
     shader_scalar_metadata, truncated_memoryless_ngg_rectangle_cover,
 };
@@ -443,6 +444,25 @@ impl MetalPresenter {
                 &key.pixel_input_controls,
             );
             if !missing.is_empty() {
+                let samples = pixel_evaluation
+                    .image_bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.opcode.starts_with("ImageSample")
+                            || binding.opcode.starts_with("ImageGather")
+                    })
+                    .map(|binding| {
+                        (
+                            binding.pc,
+                            binding.opcode,
+                            binding.resource_descriptor.clone(),
+                            binding.sampler_descriptor.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let rectangle_coordinate_mask = uses_procedural_rectangle_stage.then(|| {
+                    rectangle_coordinate_parameter_mask(pixel_program, &key.pixel_input_controls)
+                });
                 // NGG shaders may stage parameter exports through LDS/primitive export rather
                 // than exposing a conventional EXP PARAM instruction in the decoded program.
                 // Metal still requires the vertex and fragment interfaces to match exactly.
@@ -453,7 +473,7 @@ impl MetalPresenter {
                 // other backend's established required-output behavior while keeping the missing
                 // semantics explicit in the trace.
                 eprintln!(
-                    "[REMu][METAL][INTERFACE-FILL] draw={} indexed={} count={} instances={} primitive={:#x} target={:#x} es={:#x} exports={exported_parameters:#010x} ps={:#x} interpolates={interpolated_attributes:#010x} missing logical/physical/control={missing:08x?} vertex_inputs={:x?}",
+                    "[REMu][METAL][INTERFACE-FILL] draw={} indexed={} count={} instances={} primitive={:#x} target={:#x} es={:#x} exports={exported_parameters:#010x} ps={:#x} interpolates={interpolated_attributes:#010x} missing logical/physical/control={missing:08x?} procedural={} coordinate_mask={rectangle_coordinate_mask:08x?} vertex_inputs={:x?} samples={samples:08x?}",
                     draw.sequence,
                     draw.indexed,
                     draw.index_count,
@@ -462,6 +482,7 @@ impl MetalPresenter {
                     draw.color_target_address,
                     draw.export_shader_address,
                     draw.pixel_shader_address,
+                    uses_procedural_rectangle_stage,
                     export_evaluation.vertex_inputs,
                 );
             }
@@ -513,13 +534,16 @@ impl MetalPresenter {
             let coordinate_parameter_mask =
                 rectangle_coordinate_parameter_mask(pixel_program, &key.pixel_input_controls)
                     .unwrap_or_else(|| {
-                        // A sample-free procedural consumer has no data-flow evidence for
-                        // parameter roles. Preserve the previous convention for that unrelated
-                        // case: one input is UV, while input zero of a wider interface is tint.
-                        if pixel_msl.interpolated_attribute_count == 1 {
-                            1
+                        // UE fullscreen posts interpolate UV on attribute 0 (often with extra
+                        // tint/aux attrs). The old multi-param fallback put UV on param1+ and
+                        // unit tint on param0, so 3-attr Poppy/UE post covers sampled garbage
+                        // across the letterboxed mid-band. Default every live parameter to UV;
+                        // analysis still overrides when ImageSample provenance is complete.
+                        let count = pixel_msl.interpolated_attribute_count.min(32);
+                        if count == 0 {
+                            0
                         } else {
-                            u32::MAX & !1
+                            (1u32 << count) - 1
                         }
                     });
             remu_shader_metal::compile_procedural_rectangle_vertex(

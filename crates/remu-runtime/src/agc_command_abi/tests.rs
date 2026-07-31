@@ -879,3 +879,37 @@ fn writes_inline_data_and_marker_payloads() {
         unsafe { std::slice::from_raw_parts((marker_command + 4) as *const u8, marker.len()) };
     assert_eq!(payload, marker);
 }
+
+#[test]
+fn command_abi_entry_points_reject_unmapped_pointers_instead_of_faulting() {
+    // Octopath's RHIThread reaches the register indirect-patch imports with a null descriptor,
+    // and a title that miscomputes one supplies an ordinary unmapped pointer instead. Neither may
+    // dereference guest memory: this used to read straight through the argument and fault.
+    const UNMAPPED: u64 = 0x0000_7f00_0000_0000;
+
+    assert!(packet_opcode(UNMAPPED).is_none());
+    assert!(packet_opcode(0).is_none());
+    assert!(!is_packet(UNMAPPED, IT_NOP, None));
+    assert!(allocate_dwords(UNMAPPED, 4).is_none());
+
+    // Register indirect patching reports an invalid packet for both shapes.
+    for nid in [
+        "vcmNN+AAXnY",
+        "d-6uF9sZDIU",
+        "Qrj4c+61z4A",
+        "z2duB-hHQSM",
+        "6lNcCp+fxi4",
+        "vRoArM9zaIk",
+    ] {
+        assert_eq!(
+            call(nid, args(&[0, 0]), [0; 6]),
+            GRAPHICS5_ERROR_INVALID_PACKET,
+            "{nid} must reject a null descriptor"
+        );
+        assert_eq!(
+            call(nid, args(&[UNMAPPED, UNMAPPED]), [0; 6]),
+            GRAPHICS5_ERROR_INVALID_PACKET,
+            "{nid} must reject an unmapped descriptor"
+        );
+    }
+}

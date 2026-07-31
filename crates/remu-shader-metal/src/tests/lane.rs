@@ -87,7 +87,9 @@ fn lowers_rdna2_bitcount_and_u64_mad_with_carry_mask() {
     assert!(mad.source.contains(" < t"));
     assert!(mad.source.contains("simd_ballot(exec && t"));
     assert!(mad.source.contains("remu_s_20 = "));
-    assert!(mad.source.contains("remu_s_21 = "));
+    // A wave32 lane mask is a single SGPR. Writing the architectural high half would zero the
+    // adjacent SGPR that the guest still owns.
+    assert!(!mad.source.contains("remu_s_21 = "));
     assert!(mad.source.contains("if (exec) remu_v_8 = (uint)t"));
     assert!(mad.source.contains("if (exec) remu_v_9 = (uint)(t"));
     assert!(mad.source.contains(" >> 32)"));

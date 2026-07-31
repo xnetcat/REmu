@@ -449,9 +449,12 @@ impl OrderedGpuEventReceiver {
     ///
     /// The windowed presenter uses this to keep AppKit's event loop active while guest GPU work
     /// is runnable. A short `WaitUntil` deadline is heavily coalesced by macOS and otherwise turns
-    /// `GPU_EVENTS_PER_TICK` into an unintended throughput ceiling. Dependency-blocked queues do
-    /// not count as runnable, so a guest waiting on a CPU write or shader compilation still lets
-    /// the application sleep.
+    /// `GPU_EVENTS_PER_TICK` into an unintended throughput ceiling.
+    ///
+    /// A queue blocked on shader compilation, or on a memory wait whose producer is already
+    /// ingested, does not count as runnable: the application can sleep until the producer runs.
+    /// A memory wait with no ingested producer does keep polling, because only a CPU store or a
+    /// release still sitting in the channel can satisfy it.
     pub(crate) fn has_runnable_events(&self) -> bool {
         if self.host_block.is_none() && !self.host_events.is_empty() {
             return true;
@@ -470,6 +473,34 @@ impl OrderedGpuEventReceiver {
         // CPU store or a not-yet-ingested cross-queue release. Sleeping on WaitUntil here
         // turned title-menu fences into multi-second FPS collapses.
         self.blocked_memory_wait_missing_ingested_producer()
+    }
+
+    /// Returns whether a draw writing `address` is parked at a blocked queue front while its
+    /// Metal pipeline compiles.
+    ///
+    /// A cold pipeline gate preserves the draw, but it also holds back the submission boundary
+    /// that would normally order the frame. Another queue reaching its own boundary must not
+    /// publish the VideoOut allocation in that state: Octopath's compositor clears the target,
+    /// parks its fullscreen cover on a cold pipeline, and would otherwise present the bare clear
+    /// and then discard the cover's output as belonging to the next frame.
+    pub(crate) fn pipeline_blocked_draw_writes(&self, address: u64) -> bool {
+        self.queue_order.iter().any(|queue_id| {
+            matches!(
+                self.blocked_queues.get(queue_id),
+                Some(QueueBlockReason::GraphicsPipeline(_))
+            ) && self
+                .submissions
+                .get(queue_id)
+                .and_then(|submissions| {
+                    submissions
+                        .iter()
+                        .find_map(|submission| submission.events.front())
+                })
+                .is_some_and(|event| match event {
+                    GpuEvent::IndexedDraw(draw) => draw.color_target_address == address,
+                    _ => false,
+                })
+        })
     }
 
     pub(crate) fn block_reason_counts(&self) -> (usize, usize) {

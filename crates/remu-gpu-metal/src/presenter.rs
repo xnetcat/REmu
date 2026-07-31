@@ -135,15 +135,15 @@ use self::shader::{
     compute_pipeline_key, compute_program_can_split_wave64, dump_shader_pair_msl,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, ngg_memoryless_cover_export_stage,
-    ngg_mesh_stage_for_draw, pixel_scalars, procedural_rectangle_stage_for_draw,
-    program_embeds_global_base,
+    is_storage_image_opcode, is_writable_image_opcode, ngg_export_uses_general_lds,
+    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
-    missing_vertex_parameter_exports, ngg_export_uses_general_lds, ngg_mesh_draw_supported,
-    ngg_mesh_export_stage, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    lift_expanded_vertex_buffer_num_records, missing_vertex_parameter_exports,
+    ngg_mesh_draw_supported, procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
     rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
     truncated_memoryless_ngg_rectangle_cover,
 };
@@ -206,7 +206,8 @@ use self::tiling::{
     effective_linear_pitch, encode_mode27_mip_chain_into_raw, guest_physical_ranges_overlap,
     guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
-    guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_depth_sample_storage,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     mode5_mip_chain_layout, mode27_mip_chain_layout, render_resolve_candidate_matches,
     tiled_block_dimensions,
 };

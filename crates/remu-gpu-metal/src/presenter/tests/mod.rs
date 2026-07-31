@@ -45,7 +45,8 @@ use super::{
     guest_shared_mapping_identity, guest_texture_byte_count, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
-    guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_depth_sample_storage,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     guest_texture_raw_matches, guest_texture_raw_range, half_float_to_srgb_unorm8,
     half_float_to_unorm8, headless_metal_value_is_enabled, image_component_class,
     image_destination_select_is_native, image_resource_descriptor_is_null,
@@ -82,6 +83,7 @@ use super::{
     tiled_block_dimensions, unsigned_float_to_f32, upload_image_textures,
     validate_compute_launch_for_metal, watch_guest_texture, wave64_split_blockers,
     write_back_pending_globals, write_guest_texture_linear, write_watched_guest_texture_linear,
+    lift_expanded_vertex_buffer_num_records,
 };
 mod completion;
 mod decode;
@@ -140,6 +142,49 @@ fn append_color_target_registers(
             value: (tile_mode << 14) | (u32::from(height > 1) << 24),
         },
     ]);
+}
+
+/// A minimal graphics pipeline key, used where only its identity as a block reason matters.
+fn cold_graphics_pipeline_key() -> GraphicsPipelineKey {
+    GraphicsPipelineKey {
+        export_shader_address: 0x1000,
+        pixel_shader_address: 0x2000,
+        export_program_identity: ProgramIdentity(std::sync::Arc::new(
+            remu_shader::Program::new(0x1000, Vec::new()),
+        )),
+        pixel_program_identity: ProgramIdentity(std::sync::Arc::new(remu_shader::Program::new(
+            0x2000,
+            Vec::new(),
+        ))),
+        export_resources: GraphicsShaderResourceKey {
+            initial_scalar_count: 0,
+            global_bindings: Vec::new(),
+            image_bindings: Vec::new(),
+            vertex_inputs: Vec::new(),
+        },
+        pixel_resources: GraphicsShaderResourceKey {
+            initial_scalar_count: 0,
+            global_bindings: Vec::new(),
+            image_bindings: Vec::new(),
+            vertex_inputs: Vec::new(),
+        },
+        export_allocated_vector_register_count: 256,
+        pixel_allocated_vector_register_count: 256,
+        vertex_output_control: 0,
+        pixel_input_controls: std::array::from_fn(|index| {
+            u32::try_from(index).expect("PS input index fits u32")
+        }),
+        pixel_depth_export: false,
+        ngg_subgroup_limits: None,
+        diagnostics: GraphicsDiagnosticPipelineState::default(),
+        targets: Vec::new(),
+        depth: None,
+        sample_count: 1,
+        render_target_array_length: 1,
+        uses_mesh_stage: false,
+        uses_procedural_rectangle_stage: false,
+        primitive_topology_class: metal::MTLPrimitiveTopologyClass::Triangle,
+    }
 }
 
 fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {

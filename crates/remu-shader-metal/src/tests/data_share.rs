@@ -242,9 +242,8 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     assert!(shader.source.contains("remu_mesh.set_index("));
     assert!(shader.source.contains("remu_mesh.set_vertex("));
     assert!(
-        shader
-            .source
-            .contains("remu_mesh.set_vertex_count(remu_mesh_output_vertices)")
+        !shader.source.contains("remu_mesh.set_vertex_count("),
+        "Metal mesh has no set_vertex_count; vertex occupancy is from set_vertex"
     );
     assert!(
         shader
@@ -456,9 +455,8 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
             .contains("remu_mesh.set_index(remu_wave_lane * 3u")
     );
     assert!(
-        shader
-            .source
-            .contains("remu_mesh.set_vertex_count(remu_mesh_output_vertices)")
+        !shader.source.contains("remu_mesh.set_vertex_count("),
+        "Metal mesh has no set_vertex_count; vertex occupancy is from set_vertex"
     );
     assert!(
         shader
@@ -475,8 +473,8 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
         .expect("converged output-count publication barrier");
     let output_count = shader
         .source
-        .find("remu_mesh.set_vertex_count(remu_mesh_output_vertices)")
-        .expect("dynamic Metal vertex count");
+        .find("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
+        .expect("dynamic Metal primitive count");
     assert!(allocation < publication && publication < output_count);
     assert!(
         shader

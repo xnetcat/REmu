@@ -136,10 +136,18 @@ pub(crate) fn guest_texture_descriptors_share_color_view_storage(
                 | MTLPixelFormat::BGRA8Unorm_sRGB
         )
     };
+    let layout_compatible = guest_texture_descriptors_have_same_byte_layout(left, right)
+        || (left.address == right.address
+            && left.width == right.width
+            && left.height == right.height
+            && left.tile_mode == right.tile_mode
+            && left.bytes_per_pixel == right.bytes_per_pixel
+            && left.pitch >= left.width
+            && right.pitch >= right.width);
     left.pixel_format != right.pixel_format
         && is_view_compatible_color(left.pixel_format)
         && is_view_compatible_color(right.pixel_format)
-        && guest_texture_descriptors_have_same_byte_layout(left, right)
+        && layout_compatible
         && guest_texture_descriptors_share_byte_storage(left, right)
 }
 
@@ -179,14 +187,16 @@ pub(crate) fn guest_texture_descriptors_share_byte_storage(
     left: GuestTextureDescriptor,
     right: GuestTextureDescriptor,
 ) -> bool {
+    // Same virtual address always names one allocation. CB vs SRD pitch disagreements must not
+    // force a CPU writeback when a Metal resident already holds the authoritative image.
+    if left.address == right.address {
+        return true;
+    }
     let Some(byte_count) = guest_texture_byte_count(left) else {
         return false;
     };
     if guest_texture_byte_count(right) != Some(byte_count) {
         return false;
-    }
-    if left.address == right.address {
-        return true;
     }
     let Some(left_mapping) = guest_shared_mapping_identity(left.address, byte_count) else {
         return false;
@@ -195,6 +205,27 @@ pub(crate) fn guest_texture_descriptors_share_byte_storage(
         return false;
     };
     left_mapping == right_mapping
+}
+
+/// True when a GPU-authored resident can be sampled through an SRD that may disagree on pitch.
+///
+/// Pitch only matters for CPU tiling decode. Once the image lives in a Metal resident, same
+/// format + extent + physical storage is enough to bind it directly and skip alias writeback.
+pub(crate) fn guest_texture_descriptors_share_gpu_sample_storage(
+    rendered: GuestTextureDescriptor,
+    sampled: GuestTextureDescriptor,
+) -> bool {
+    if guest_texture_descriptors_share_storage(rendered, sampled) {
+        return true;
+    }
+    rendered.pixel_format == sampled.pixel_format
+        && rendered.width == sampled.width
+        && rendered.height == sampled.height
+        && rendered.tile_mode == sampled.tile_mode
+        && rendered.bytes_per_pixel == sampled.bytes_per_pixel
+        && rendered.pitch >= rendered.width
+        && sampled.pitch >= sampled.width
+        && guest_texture_descriptors_share_byte_storage(rendered, sampled)
 }
 
 pub(crate) fn guest_texture_descriptors_have_same_layout(

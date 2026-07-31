@@ -10,10 +10,10 @@ use remu_shader::PixelOutputKind;
 
 use super::{
     DecodedRenderTarget, DisplayConfiguration, GuestTextureDescriptor, MetalPresenter,
-    OrderedEventSource, PendingFlip, PresentationResolution, VIDEO_OUT_DISPLAY_TILE_MODE,
-    VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE, appkit_persistent_state_is_ignored,
-    clear_appkit_persistent_state_override, decode_scanout_target,
-    disable_appkit_state_restoration, headless_metal_value_is_enabled,
+    OrderedEventPoll, OrderedEventSource, PendingFlip, PresentationResolution, QueueBlockReason,
+    VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
+    appkit_persistent_state_is_ignored, clear_appkit_persistent_state_override,
+    decode_scanout_target, disable_appkit_state_restoration, headless_metal_value_is_enabled,
     parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
     process_memory_statistics, process_resident_bytes, raw_video_out_layout_is_linear,
     raw_video_out_texture_descriptor, read_texture_linear,
@@ -290,6 +290,88 @@ fn pending_flip_without_a_source_retries_at_the_submission_boundary() {
     assert!(!presenter.redraw_pending);
     presenter.finalize_pending_flip_at_submission_boundary(OrderedEventSource::GuestQueue(7));
     assert!(!presenter.redraw_pending);
+}
+
+#[test]
+fn a_cold_pipeline_cover_holds_its_frame_back_from_a_foreign_submission_boundary() {
+    // Octopath's compositor clears the VideoOut allocation and then covers it with a fullscreen
+    // NGG draw. When that cover parks on a cold pipeline, the compute queue's boundary must not
+    // publish the bare clear: the cover's own output would then look like the next frame.
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let descriptor = GuestTextureDescriptor {
+        address: 0x0070_1234_5600,
+        width: 640,
+        height: 360,
+        pitch: 640,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    presenter.ensure_direct_scanout_texture(&device, descriptor);
+    presenter.display = Some(DisplayConfiguration {
+        width: descriptor.width,
+        height: descriptor.height,
+        pitch: descriptor.pitch,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 0,
+    });
+    presenter.pending_flip = Some(PendingFlip {
+        address: descriptor.address,
+        buffer_index: 0,
+        flip_argument: 0,
+        sequence: 1,
+    });
+    presenter.pending_flip_queue = Some(7);
+    presenter.next_flip_sequence = 1;
+    presenter.mark_direct_scanout_initialized(descriptor.address);
+
+    let mut cover = super::indexed_draw(0x4000, 4, 3);
+    cover.color_target_address = descriptor.address;
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 7,
+            events: vec![GpuEvent::IndexedDraw(Box::new(cover.clone()))],
+        })
+        .expect("queue the cover draw");
+    let source = match presenter.receiver.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::IndexedDraw(_),
+        } => source,
+        other => panic!("expected the cover draw, got {other:?}"),
+    };
+    presenter.receiver.block_event(
+        source,
+        GpuEvent::IndexedDraw(Box::new(cover)),
+        QueueBlockReason::GraphicsPipeline(super::cold_graphics_pipeline_key()),
+    );
+    assert!(
+        presenter
+            .receiver
+            .pipeline_blocked_draw_writes(descriptor.address)
+    );
+
+    // The clear pass already wrote the allocation before the cover was gated.
+    presenter.note_pending_flip_target_write(descriptor);
+    assert!(presenter.pending_flip_target_written_since_boundary);
+    presenter.redraw_pending = false;
+    presenter.finalize_pending_flip_at_submission_boundary(OrderedEventSource::GuestQueue(33));
+    assert!(
+        !presenter.redraw_pending,
+        "a foreign boundary must not publish a frame whose cover is still parked"
+    );
+    assert_eq!(presenter.uploaded_flip_sequence, 0);
+    assert!(
+        presenter.pending_flip_target_written_since_boundary,
+        "the deferred boundary must keep the pending write so the frame is not lost"
+    );
+
+    // The cover's own queue still finalizes the frame once it drains.
+    presenter.finalize_pending_flip_at_submission_boundary(OrderedEventSource::GuestQueue(7));
+    assert!(presenter.redraw_pending);
+    assert_eq!(presenter.uploaded_flip_sequence, 1);
 }
 
 #[test]

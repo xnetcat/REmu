@@ -127,6 +127,17 @@ impl MetalPresenter {
         if !initial_flip_boundary && !self.pending_flip_target_written_since_boundary {
             return;
         }
+        // A foreign queue's boundary orders a compute or copy producer that completed this frame.
+        // It must not publish the allocation while a draw writing the same target is still parked
+        // on a cold pipeline: that presents the compositor clear and then treats the cover's
+        // output as the next frame. The parked draw's own boundary finalizes it instead.
+        if !initial_flip_boundary
+            && self
+                .pending_flip
+                .is_some_and(|flip| self.receiver.pipeline_blocked_draw_writes(flip.address))
+        {
+            return;
+        }
         if initial_flip_boundary {
             self.pending_flip_queue = None;
         }

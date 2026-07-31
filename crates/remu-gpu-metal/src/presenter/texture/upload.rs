@@ -283,7 +283,7 @@ pub(crate) fn upload_image_textures(
                 .flatten();
             let resident_descriptor = matches!(descriptor.texture_type, 9 | 10)
                 .then(|| {
-                    (!comparison)
+                    let exact = (!comparison)
                         .then(|| {
                             resident_guest_textures
                                 .get(&descriptor.guest)
@@ -292,34 +292,53 @@ pub(crate) fn upload_image_textures(
                                         && resident.layer_count == descriptor.layer_count
                                         && resident.mip_level_count >= underlying_mip_count
                                 })
-                                .map(|resident| resident.descriptor)
+                                .map(|resident| {
+                                    (resident.descriptor, resident.gpu_written, resident.content_version)
+                                })
                         })
-                        .flatten()
-                        .or_else(|| {
-                            (descriptor.texture_type == 9).then(|| {
-                                resident_guest_textures
-                                    .values()
-                                    .filter(|resident| {
-                                        resident.texture_type == 9
-                                            && resident.layer_count == 1
-                                            && resident.mip_level_count >= underlying_mip_count
-                                            && ((!comparison
-                                                && (guest_texture_descriptors_share_storage(
-                                                    resident.descriptor,
-                                                    descriptor.guest,
-                                                ) || resident_color_view_sample_is_eligible(
-                                                    resident,
-                                                    descriptor,
-                                                    comparison,
-                                                )))
-                                                || resident_depth_sample_is_eligible(
-                                                    resident, descriptor,
-                                                ))
-                                    })
-                                    .max_by_key(|resident| resident.content_version)
-                                    .map(|resident| resident.descriptor)
-                            })?
-                        })
+                        .flatten();
+                    let compatible = (descriptor.texture_type == 9).then(|| {
+                        resident_guest_textures
+                            .values()
+                            .filter(|resident| {
+                                resident.texture_type == 9
+                                    && resident.layer_count == 1
+                                    && resident.mip_level_count >= underlying_mip_count
+                                    && ((!comparison
+                                        && (guest_texture_descriptors_share_storage(
+                                            resident.descriptor,
+                                            descriptor.guest,
+                                        ) || resident_color_view_sample_is_eligible(
+                                            resident,
+                                            descriptor,
+                                            comparison,
+                                        )))
+                                        || resident_depth_sample_is_eligible(resident, descriptor))
+                            })
+                            .max_by_key(|resident| {
+                                (resident.gpu_written, resident.content_version)
+                            })
+                            .map(|resident| {
+                                (resident.descriptor, resident.gpu_written, resident.content_version)
+                            })
+                    })
+                    .flatten();
+                    // An earlier R32Float ImageLoad/sample can leave a clean exact resident on the
+                    // same address before the DB surface is created as Depth32Float. Prefer the
+                    // GPU-authored native depth view over that empty shadow so depth_native hits.
+                    match (exact, compatible) {
+                        (
+                            Some((exact_descriptor, exact_gpu_written, exact_version)),
+                            Some((compatible_descriptor, true, compatible_version)),
+                        ) if exact_descriptor != compatible_descriptor
+                            && (!exact_gpu_written || compatible_version >= exact_version) =>
+                        {
+                            Some(compatible_descriptor)
+                        }
+                        (Some((exact_descriptor, _, _)), _) => Some(exact_descriptor),
+                        (None, Some((compatible_descriptor, _, _))) => Some(compatible_descriptor),
+                        (None, None) => None,
+                    }
                 })
                 .flatten();
             let resident_resolve = resident_descriptor.and_then(|resident_descriptor| {

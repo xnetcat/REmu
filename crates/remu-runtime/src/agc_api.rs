@@ -70,6 +70,8 @@ pub(crate) const AGC_SHADER_TYPE_OFFSET: u64 = 0x5a;
 pub(crate) const AGC_SHADER_SH_REGISTER_COUNT_OFFSET: u64 = 0x5c;
 pub(crate) const AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET: u64 = 0x50;
 pub(crate) const AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET: u64 = 0x56;
+/// The fixed shader-header fields `agc_create_shader` reads, through the SH register count.
+const AGC_SHADER_HEADER_BYTES: usize = 0x60;
 
 const AGC_COMMAND_BUFFER_CURSOR_UP_OFFSET: u64 = 0x10;
 const AGC_COMMAND_BUFFER_CURSOR_DOWN_OFFSET: u64 = 0x18;
@@ -161,6 +163,14 @@ pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchSt
     let header = arguments[1];
     let code = arguments[2];
     if header == 0 || code == 0 {
+        eprintln!(
+            "[REMu][AGC] rejected shader creation with null argument: \
+             destination={destination:#x} header={header:#x} code={code:#x}"
+        );
+        return u64::MAX;
+    }
+    if !crate::process_guest_range_has_read_access(header, AGC_SHADER_HEADER_BYTES) {
+        eprintln!("[REMu][AGC] rejected unmapped shader header at {header:#x}");
         return u64::MAX;
     }
     if read_guest_u32(header) != AGC_SHADER_FILE_HEADER

@@ -25,9 +25,10 @@ use super::{
     procedural_rectangle_stage_for_draw, rectangle_coordinate_parameter_mask,
     rectangle_draw_has_incomplete_interface, sampler_lod_bias,
     truncated_memoryless_ngg_rectangle_cover,
-    sampler_uses_normalized_coordinates, shader_scalar_metadata,
-    shader_scalar_metadata_for_registers, speculative_pipeline_compile_in_flight_capacity,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    lift_expanded_vertex_buffer_num_records, sampler_uses_normalized_coordinates,
+    shader_scalar_metadata, shader_scalar_metadata_for_registers,
+    speculative_pipeline_compile_in_flight_capacity, validate_compute_launch_for_metal,
+    wave64_split_blockers,
 };
 
 fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
@@ -360,10 +361,8 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
     let program = decode_program(0x1000, &words).expect("observed AGC rectangle stage decodes");
 
     assert!(procedural_rectangle_export_stage(&program));
-    assert!(
-        !truncated_memoryless_ngg_rectangle_cover(&program),
-        "full rectangle stages keep the strict recognizer"
-    );
+    // Full stages also satisfy the truncated cover prefix (alloc + prim, no PARAM/memory).
+    // That is fine: procedural_rectangle_stage_for_draw ORs both recognizers.
     assert!(
         ngg_mesh_export_stage(&program),
         "allocation plus primitive and position exports form an NGG contract even without LDS"
@@ -379,6 +378,13 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
         ngg_mesh_stage_for_draw(&program, &draw),
         Ok(false),
         "the exact three-vertex rectangle retains its synthesized vertex-stage path"
+    );
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    draw.index_count = 4;
+    assert!(
+        ngg_fullscreen_cover_draw(&program, &draw),
+        "LDS-free NGG strip covers keep the synthesized path even when the guest ES still touches Flat/Global vertex seeds"
     );
     draw.indexed = true;
     draw.primitive_type = 4;
@@ -1021,6 +1027,49 @@ fn graphics_shader_cache_key_normalizes_dynamic_image_formats_and_swizzles() {
         graphics_shader_resource_key(&first, false),
         graphics_shader_resource_key(&second, false),
     );
+}
+
+#[test]
+fn lifts_num_records_when_vertex_binding_exceeds_guest_descriptor() {
+    // Poppy UI: guest NUM_RECORDS=4 / OOB_SELECT=0, draw needs 4*64 instance records.
+    let stride = 16_u32;
+    let guest_records = 4_u32;
+    let draw_records = 256_u32;
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: vec![
+            0x1000,
+            stride << 16,
+            guest_records,
+            0 << 28, // OOB_SELECT=0
+            0,
+            0,
+            0,
+            0,
+        ]
+        .into(),
+        scalar_registers: vec![0; 8].into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: vec![GlobalMemoryBinding {
+            scalar_address: 0,
+            base_address: 0x1000,
+            instruction_pcs: vec![0].into(),
+            byte_count: usize::try_from(stride * draw_records).unwrap(),
+            data: Vec::new(),
+            writable: false,
+            write_back_to_guest: false,
+        }],
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let mut words = shader_scalar_metadata(&evaluation).expect("metadata");
+    // Simulate live SH reload restoring the tight guest descriptor.
+    words[0] = 0x1000;
+    words[1] = stride << 16;
+    words[2] = guest_records;
+    words[3] = 0;
+    lift_expanded_vertex_buffer_num_records(&mut words, &evaluation);
+    assert_eq!(words[2], draw_records);
 }
 
 #[test]

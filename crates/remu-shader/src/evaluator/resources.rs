@@ -23,6 +23,7 @@ pub(crate) struct BufferDescriptor {
     pub(crate) base_address: u64,
     pub(crate) stride: u32,
     pub(crate) swizzle_enabled: bool,
+    pub(crate) oob_select: u32,
     pub(crate) record_count: u32,
     pub(crate) size_bytes: u64,
     pub(crate) number_format: u32,
@@ -56,6 +57,7 @@ pub(crate) fn decode_buffer_descriptor(
             base_address: 0,
             stride: 0,
             swizzle_enabled: false,
+            oob_select: 0,
             record_count: 0,
             size_bytes: 0,
             number_format: 0,
@@ -81,6 +83,7 @@ pub(crate) fn decode_buffer_descriptor(
         base_address,
         stride,
         swizzle_enabled,
+        oob_select,
         record_count: word2,
         size_bytes,
         number_format,
@@ -108,20 +111,40 @@ pub(crate) fn required_vertex_bytes(
     component_count: u32,
     record_count: Option<u32>,
 ) -> u64 {
-    let Some(record_count) = record_count
-        .filter(|count| *count != 0)
-        .map(|count| count.min(descriptor.record_count))
-        .filter(|count| *count != 0)
-    else {
+    let Some(record_count) = record_count.filter(|count| *count != 0) else {
         return descriptor.size_bytes;
     };
+    if descriptor.record_count == 0 {
+        return descriptor.size_bytes;
+    }
+    // Bind the draw-required span independently of NUM_RECORDS. The generated shader applies the
+    // descriptor's OOB_SELECT rules itself; clamping the Metal buffer first turns otherwise
+    // addressable instance records into host-range zeroes before those guest semantics run.
+    // `maximum_binding_bytes` caps this requested span at the evaluator boundary.
     let last_record = u64::from(record_count - 1).saturating_mul(u64::from(descriptor.stride));
     let element_bytes = u64::from(component_count.max(1)).saturating_mul(4);
     let record_span =
         u64::from(descriptor.stride).max(u64::from(binding_offset).saturating_add(element_bytes));
-    descriptor
-        .size_bytes
-        .min(last_record.saturating_add(record_span))
+    let required = last_record.saturating_add(record_span);
+    if required > descriptor.size_bytes {
+        static LOGGED_VERTEX_EXPANSIONS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let sequence =
+            LOGGED_VERTEX_EXPANSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if sequence <= 32 || sequence.is_power_of_two() {
+            eprintln!(
+                "[REMu][SHADER][VERTEX-BINDING] sequence={sequence} base={:#x} stride={} \
+                 num_records={} oob_select={} descriptor_bytes={} draw_records={record_count} \
+                 required_bytes={required}",
+                descriptor.base_address,
+                descriptor.stride,
+                descriptor.record_count,
+                descriptor.oob_select,
+                descriptor.size_bytes,
+            );
+        }
+    }
+    required
 }
 
 pub(crate) fn uses_sampler(opcode: Opcode) -> bool {
@@ -271,6 +294,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 base_address: 0,
                 stride: 0,
                 swizzle_enabled: false,
+                oob_select: 0,
                 record_count: 0,
                 size_bytes: 0,
                 number_format: 0,

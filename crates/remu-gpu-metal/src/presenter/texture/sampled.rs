@@ -8,7 +8,8 @@ use super::{
     WriteWatchRefresh, comparison_depth32_upload, compressed_texture_block_extent,
     decode_guest_texture_linear_from_raw_at_z, guest_frame_fingerprint, guest_texture_byte_count,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
-    guest_texture_descriptors_share_depth_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_depth_sample_storage,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
     resident_is_depth_array_face, retire_multisample_textures_overlapping_writeback,
@@ -81,6 +82,10 @@ impl MetalPresenter {
                             let aliases_sample = overlaps_resident
                                 && resident.descriptor != sampled.guest
                                 && !guest_texture_descriptors_share_storage(
+                                    resident.descriptor,
+                                    sampled.guest,
+                                )
+                                && !guest_texture_descriptors_share_gpu_sample_storage(
                                     resident.descriptor,
                                     sampled.guest,
                                 )
@@ -379,7 +384,9 @@ pub(crate) fn resident_texture_for_sample(
             NSRange::new(0, 1),
         ));
     }
-    if guest_texture_descriptors_share_storage(resident.descriptor, sampled.guest) {
+    if guest_texture_descriptors_share_storage(resident.descriptor, sampled.guest)
+        || guest_texture_descriptors_share_gpu_sample_storage(resident.descriptor, sampled.guest)
+    {
         if sampled.base_mip_level == 0 && sampled.mip_level_count.max(1) == resident.mip_level_count
         {
             return Some(resident.texture.clone());

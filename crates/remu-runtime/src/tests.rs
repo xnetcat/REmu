@@ -14,14 +14,14 @@ type TlsHelper = unsafe extern "C" fn() -> u64;
 type TlsStoreHelper = unsafe extern "C" fn();
 
 #[test]
-fn av_player_nv12_layout_matches_linear_gpu_texture_pitch() {
+fn av_player_nv12_layout_matches_linear_gpu_texture_storage_extent() {
     assert_eq!(
         super::av_player_nv12_layout(1_440, 1_080, true),
-        Some((1_536, 2_488_320))
+        Some((1_536, 2_506_752))
     );
     assert_eq!(
         super::av_player_nv12_layout(1_920, 1_080, true),
-        Some((2_048, 3_317_760))
+        Some((2_048, 3_342_336))
     );
 }
 

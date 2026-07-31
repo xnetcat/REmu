@@ -21,7 +21,9 @@ use super::{
     guest_texture_byte_count, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
-    guest_texture_descriptors_share_storage, guest_texture_raw_matches, guest_texture_raw_range,
+    guest_texture_descriptors_share_depth_sample_storage,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_raw_matches, guest_texture_raw_range,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
     mode27_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
     render_resolve_candidate_matches, resident_texture_activity_stats,
@@ -201,6 +203,142 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
             .resident_guest_textures
             .contains_key(&storage_alias),
         "binding a coherent alias must not materialize stale guest memory under an exact key"
+    );
+}
+
+#[test]
+fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
+    // Octopath samples DB depth through an R32Float SRD (dest select 0x204). An earlier
+    // ImageLoad/ensure can leave a clean R32Float resident on the same address before the
+    // Depth32Float render target is written. Sampling must bind the native Z plane.
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest texture mapping");
+    let sampled = GuestTextureDescriptor {
+        address: address.get(),
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 24,
+        pixel_format: MTLPixelFormat::R32Float,
+        bytes_per_pixel: 4,
+    };
+    let rendered = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::Depth32Float,
+        ..sampled
+    };
+    assert!(guest_texture_descriptors_share_depth_sample_storage(
+        rendered, sampled, 0x204
+    ));
+    assert!(!guest_texture_descriptors_share_storage(rendered, sampled));
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    presenter
+        .ensure_resident_texture(&device, sampled)
+        .expect("clean R32Float shadow");
+    presenter
+        .ensure_resident_texture(&device, rendered)
+        .expect("depth render target");
+    presenter.mark_resident_texture_written(rendered);
+    assert!(
+        presenter
+            .resident_guest_textures
+            .get(&rendered)
+            .is_some_and(|resident| resident.gpu_written),
+        "depth target must be GPU-authored"
+    );
+
+    let address_words = sampled.address >> 8;
+    let width_minus_one = sampled.width - 1;
+    let height_minus_one = sampled.height - 1;
+    let resource_descriptor = vec![
+        address_words as u32,
+        ((address_words >> 32) as u32 & 0xff)
+            | (22 << 20)
+            | ((width_minus_one & 3) << 30),
+        (width_minus_one >> 2) | (height_minus_one << 14),
+        0x204 | (24 << 20) | (9 << 28),
+        sampled.pitch - 1,
+        0,
+        0,
+        0,
+    ];
+    let decoded = decode_image_descriptor(&resource_descriptor).expect("R32 depth SRD");
+    assert_eq!(decoded.guest.pixel_format, MTLPixelFormat::R32Float);
+    assert_eq!(decoded.destination_select, 0x204);
+    assert_eq!(decoded.guest.tile_mode, 24);
+
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            pc: 0x80,
+            opcode: Opcode::Known("ImageSample"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 12,
+                scalar_sampler: 20,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: resource_descriptor.into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let uploaded = upload_image_textures(
+        "test",
+        &device,
+        &queue,
+        &evaluation,
+        &mut presenter.resident_guest_textures,
+        &presenter.depth_array_textures,
+        &presenter.multisample_textures,
+        &mut presenter.sampled_texture_cache,
+        &mut presenter.sampled_texture_write_watches,
+        &mut presenter.fallback_texture_cache,
+        &mut presenter.next_sampled_texture_use,
+        ResidentTextureActivityStamp::default(),
+    )
+    .expect("native depth sample upload");
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(
+        uploaded[0].texture.pixel_format(),
+        MTLPixelFormat::Depth32Float,
+        "R32 depth SRD must sample the GPU-written Depth32Float resident, not the clean R32 shadow"
     );
 }
 
@@ -852,6 +990,63 @@ fn texture_content_validation_avoids_clean_whole_resource_reloads() {
         !watch
             .content_has_changed()
             .expect("validate repeated updated value")
+    );
+}
+
+#[test]
+fn live_content_baseline_skips_full_host_snapshot_copy() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("contiguous texture mapping");
+    memory
+        .write(address, &[0x11, 0x22, 0x33, 0x44])
+        .expect("seed guest texels");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let watch = watch_guest_texture(descriptor).expect("contiguous texture watch");
+    watch
+        .record_live_content_baseline()
+        .expect("fingerprint live mapping in place");
+
+    memory
+        .write(address, &[0x11, 0x22, 0x33, 0x44])
+        .expect("identical rewrite faults the watch");
+    assert!(
+        !watch
+            .content_has_changed()
+            .expect("validate identical rewrite"),
+        "in-place baseline must treat unchanged guest bytes as clean"
+    );
+
+    memory
+        .write(address, &[0xaa, 0xbb, 0xcc, 0xdd])
+        .expect("changed rewrite faults the watch");
+    assert!(
+        watch
+            .content_has_changed()
+            .expect("validate changed rewrite"),
+        "in-place baseline must still detect real CPU rewrites"
     );
 }
 
@@ -2250,6 +2445,51 @@ fn rgba_bgra_and_transfer_variants_can_share_typed_color_view_storage() {
     assert!(guest_texture_descriptors_share_color_view_storage(
         bgra_srgb,
         bgra_linear,
+    ));
+}
+
+#[test]
+fn same_format_pitch_mismatch_can_share_gpu_sample_storage() {
+    // UE HDR color targets often keep RDNA2 padded pitch while the SRD reports visible width.
+    // Same address + format must still sample the Metal resident without a CPU writeback.
+    let rendered = GuestTextureDescriptor {
+        address: 0x8006_b7b00,
+        width: 3_840,
+        height: 2_160,
+        pitch: 3_968,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA16Float,
+        bytes_per_pixel: 8,
+    };
+    let sampled = GuestTextureDescriptor {
+        pitch: 3_840,
+        ..rendered
+    };
+    assert!(!guest_texture_descriptors_share_storage(rendered, sampled));
+    assert!(guest_texture_descriptors_share_gpu_sample_storage(
+        rendered, sampled
+    ));
+}
+
+#[test]
+fn color_view_pitch_mismatch_can_share_typed_storage() {
+    let rendered = GuestTextureDescriptor {
+        address: 0x8006_b7b00,
+        width: 3_840,
+        height: 2_160,
+        pitch: 3_968,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::BGRA8Unorm_sRGB,
+        bytes_per_pixel: 4,
+    };
+    let sampled = GuestTextureDescriptor {
+        pitch: 3_840,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        ..rendered
+    };
+    assert!(!guest_texture_descriptors_share_storage(rendered, sampled));
+    assert!(guest_texture_descriptors_share_color_view_storage(
+        rendered, sampled
     ));
 }
 
