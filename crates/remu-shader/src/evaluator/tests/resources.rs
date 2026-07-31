@@ -77,6 +77,191 @@ fn gives_unreachable_scalar_memory_a_zero_binding_without_reading_it() {
 }
 
 #[test]
+fn inactive_buffer_loads_reuse_live_sibling_binding_for_same_sgpr_slot() {
+    // Poppy glyph PS: one control-flow island discovers a live V# in s[4], while a sibling
+    // island's BufferLoad on the same slot stays inactive during snapshot evaluation. Metal
+    // must still bind those PCs to the live buffer (not a 4-byte null stub) or SDF table loads
+    // return OOB zeroes and the menu glyphs render as solid tofu.
+    let mut memory = TestMemory::default();
+    let mut payload = vec![0_u8; 336];
+    payload[0x100..0x104].copy_from_slice(&0x3f80_0000_u32.to_le_bytes());
+    memory.write(0x1_0000, &payload);
+
+    let buffer_load = |pc| {
+        instruction(
+            pc,
+            ShaderEncoding::Mubuf,
+            "BufferLoadDword",
+            vec![
+                Operand::vector(0),
+                Operand::scalar(4),
+                Operand::source(128, None),
+            ],
+            vec![Operand::vector(1)],
+            Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                dword_count: 1,
+                vector_address: 0,
+                vector_data: 1,
+                scalar_resource: 4,
+                instruction_format: None,
+                offset_bytes: 0x100,
+                index_enabled: false,
+                offset_enabled: false,
+                dlc: false,
+                lds: false,
+                glc: false,
+                slc: false,
+                tfe: false,
+            })),
+        )
+    };
+    let mut branch = instruction(
+        4,
+        ShaderEncoding::Sopp,
+        "SCbranchScc1",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    branch.words[0] = 2;
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sopk,
+                "SCmpkEqI32",
+                vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 1,
+                }],
+                vec![Operand::scalar(8)],
+                None,
+            ),
+            branch,
+            buffer_load(8),  // inactive when s[8] == 1
+            buffer_load(16), // active
+            end(24),
+        ],
+        // s[4..7] = live buffer V# (base=0x10000, stride=0, records/bytes=336, OOB_SELECT=3 raw)
+        // s[8] = 1 so the branch skips PC 8.
+        vec![
+            0, 0, 0, 0, 0x1_0000, 0, 336, 0x3000_0000, 1, 0, 0, 0,
+        ],
+    );
+
+    let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
+        .expect("sibling buffer loads on one V# slot should share the live binding");
+
+    assert_eq!(evaluation.global_memory_bindings.len(), 1);
+    let binding = &evaluation.global_memory_bindings[0];
+    assert_eq!(binding.base_address, 0x1_0000);
+    assert!(binding.byte_count >= 336);
+    assert!(binding.instruction_pcs.contains(&8));
+    assert!(binding.instruction_pcs.contains(&16));
+}
+
+#[test]
+fn same_path_null_vsharp_then_live_reload_collapses_to_one_binding() {
+    // Poppy glyph PS: an early BufferLoad sees a null/sentinel in s[4], then SMEM/user code
+    // reloads a live V# into the same slot and loads again. The null stub must not remain as a
+    // separate Metal buffer with remu_initial_s length 4 (OOB zeroes → tofu).
+    let mut memory = TestMemory::default();
+    let mut payload = vec![0_u8; 336];
+    payload[0x80..0x84].copy_from_slice(&0x3f00_0000_u32.to_le_bytes());
+    memory.write(0x1_0000, &payload);
+
+    let buffer_load = |pc| {
+        instruction(
+            pc,
+            ShaderEncoding::Mubuf,
+            "BufferLoadDword",
+            vec![
+                Operand::vector(0),
+                Operand::scalar(4),
+                Operand::source(128, None),
+            ],
+            vec![Operand::vector(1)],
+            Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                dword_count: 1,
+                vector_address: 0,
+                vector_data: 1,
+                scalar_resource: 4,
+                instruction_format: None,
+                offset_bytes: 0x80,
+                index_enabled: false,
+                offset_enabled: false,
+                dlc: false,
+                lds: false,
+                glc: false,
+                slc: false,
+                tfe: false,
+            })),
+        )
+    };
+    let shader = state(
+        vec![
+            buffer_load(0), // null V# in s[4..7]
+            instruction(
+                8,
+                ShaderEncoding::Sop1,
+                "SMovB32",
+                vec![Operand {
+                    kind: OperandKind::LiteralConstant,
+                    value: 0x1_0000,
+                }],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            instruction(
+                16,
+                ShaderEncoding::Sop1,
+                "SMovB32",
+                vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 128,
+                }],
+                vec![Operand::scalar(5)],
+                None,
+            ),
+            instruction(
+                20,
+                ShaderEncoding::Sop1,
+                "SMovB32",
+                vec![Operand {
+                    kind: OperandKind::LiteralConstant,
+                    value: 336,
+                }],
+                vec![Operand::scalar(6)],
+                None,
+            ),
+            instruction(
+                28,
+                ShaderEncoding::Sop1,
+                "SMovB32",
+                vec![Operand {
+                    kind: OperandKind::LiteralConstant,
+                    value: 0x3000_0000,
+                }],
+                vec![Operand::scalar(7)],
+                None,
+            ),
+            buffer_load(36),
+            end(44),
+        ],
+        vec![0, 0, 0, 0],
+    );
+
+    let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
+        .expect("null-then-live V# reload should collapse bindings");
+    assert_eq!(evaluation.global_memory_bindings.len(), 1);
+    let binding = &evaluation.global_memory_bindings[0];
+    assert_eq!(binding.base_address, 0x1_0000);
+    assert!(binding.byte_count >= 336);
+    assert!(binding.instruction_pcs.contains(&0));
+    assert!(binding.instruction_pcs.contains(&36));
+}
+
+#[test]
 fn executes_scalar_loads_and_records_the_backing_binding() {
     let mut memory = TestMemory::default();
     memory.write(0x2000, &0x1122_3344_u32.to_le_bytes());

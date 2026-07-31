@@ -6,8 +6,8 @@ use super::{
     GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, NggSubgroupLimits,
     PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey,
     UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
-    describe_guest_batch, guest_batch_writes_overlap, guest_physical_ranges_overlap,
-    metal_buffer_with_bytes, prepare_ngg_meshlets,
+    describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
+    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -315,8 +315,14 @@ impl MetalPresenter {
         device: &Device,
         evaluation: &ShaderEvaluation,
     ) -> Result<Vec<UploadedGlobalBuffer>, String> {
-        let sources = evaluation
+        // Alias null stubs to a live sibling on the same SGPR slot so draw-time Metal buffers and
+        // remu_initial_s lengths stay coherent even if evaluation left both entries (glyph tofu).
+        let effective_bindings = evaluation
             .global_memory_bindings
+            .iter()
+            .map(|binding| effective_global_memory_binding(evaluation, binding))
+            .collect::<Vec<_>>();
+        let sources = effective_bindings
             .iter()
             .map(|binding| self.queued_global_read_source(binding))
             .collect::<Result<Vec<_>, _>>()?;
@@ -331,9 +337,8 @@ impl MetalPresenter {
                 .clone();
             self.wait_for_guest_command_batches()?;
             self.ensure_open_guest_batch(&queue);
-            return evaluation
-                .global_memory_bindings
-                .iter()
+            return effective_bindings
+                .into_iter()
                 .zip(sources)
                 .map(|(binding, source)| {
                     if matches!(source, QueuedGlobalReadSource::None) {
@@ -345,9 +350,8 @@ impl MetalPresenter {
                 })
                 .collect();
         }
-        evaluation
-            .global_memory_bindings
-            .iter()
+        effective_bindings
+            .into_iter()
             .zip(sources)
             .map(|(binding, source)| self.upload_global_buffer_from_source(device, binding, source))
             .collect()

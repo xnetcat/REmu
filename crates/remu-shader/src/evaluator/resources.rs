@@ -184,9 +184,12 @@ pub(crate) fn resolve_image_mip_level(
 }
 impl<M: GuestMemoryReader> Evaluator<'_, M> {
     pub(crate) fn bind_statically_inactive_resources(&mut self) -> Result<(), EvaluationError> {
-        let mut instruction_pcs = SmallVec::<[u32; 8]>::new();
-        let mut scalar_address = 0;
-        let mut writable = false;
+        // Group unbound memory ops by the V#/S# slot they read. Poppy Slate's glyph PS reuses the
+        // same SGPR quartet across control-flow islands: one island evaluates a live buffer while
+        // a sibling island stays inactive during snapshot evaluation and previously received a
+        // four-byte null stub. At draw time that sibling runs after the same slot holds the live
+        // V#, so attach those PCs to the discovered binding instead of forcing OOB zeroes (tofu).
+        let mut unbound: Vec<(u32, u32, bool)> = Vec::new();
         for instruction in &self.state.program.instructions {
             let candidate_scalar_address = match instruction.control.as_ref() {
                 Some(InstructionControl::ScalarMemory(_)) => instruction
@@ -208,33 +211,93 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             {
                 continue;
             }
-            if instruction_pcs.is_empty() {
-                scalar_address = candidate_scalar_address;
-            }
-            instruction_pcs.push(instruction.pc);
-            writable |=
+            let writable =
                 instruction.opcode.contains("Store") || instruction.opcode.contains("Atomic");
+            unbound.push((candidate_scalar_address, instruction.pc, writable));
         }
-        if instruction_pcs.is_empty() {
-            self.bind_statically_inactive_images()?;
-            return Ok(());
+        for (scalar_address, pc, writable) in unbound {
+            if let Some(live) = self.global_bindings.iter_mut().find(|binding| {
+                binding.scalar_address == scalar_address && binding.base_address != 0
+            }) {
+                if !live.instruction_pcs.contains(&pc) {
+                    live.instruction_pcs.push(pc);
+                }
+                live.writable |= writable;
+                continue;
+            }
+            if let Some(null_binding) = self.global_bindings.iter_mut().find(|binding| {
+                binding.scalar_address == scalar_address
+                    && binding.base_address == 0
+                    && binding.byte_count <= 4
+            }) {
+                if !null_binding.instruction_pcs.contains(&pc) {
+                    null_binding.instruction_pcs.push(pc);
+                }
+                null_binding.writable |= writable;
+                continue;
+            }
+            let mut instruction_pcs = SmallVec::new();
+            instruction_pcs.push(pc);
+            self.global_bindings.push(GlobalMemoryBinding {
+                scalar_address,
+                base_address: 0,
+                instruction_pcs,
+                byte_count: 4,
+                data: vec![0; 4],
+                writable,
+                write_back_to_guest: false,
+            });
         }
-        // Scalar control flow is evaluated exactly for the current descriptor and dependency
-        // snapshot, but Metal must still type-check every basic block in the shader. Give memory
-        // instructions on statically inactive scalar paths one bounds-checked zero buffer. If a
-        // dependency changes and activates the path, evaluation creates a new real binding and a
-        // different pipeline key before that dispatch is encoded.
-        self.global_bindings.push(GlobalMemoryBinding {
-            scalar_address,
-            base_address: 0,
-            instruction_pcs,
-            byte_count: 4,
-            data: vec![0; 4],
-            writable,
-            write_back_to_guest: false,
-        });
+        self.coalesce_null_global_bindings_into_live();
         self.bind_statically_inactive_images()?;
         Ok(())
+    }
+
+    /// Fold null placeholder bindings into a live binding that already covers the same SGPR slot.
+    ///
+    /// Evaluation can record a real V# for `s[N]` on one path and a four-byte null stub for the
+    /// same slot on another (inactive block, failed SMEM, or sentinel descriptor). Metal binds by
+    /// evaluation entry, so leaving both makes later islands read OOB zeroes even when the live
+    /// draw reuses the discovered buffer through that slot (Poppy glyph PS b2→b0).
+    pub(crate) fn coalesce_null_global_bindings_into_live(&mut self) {
+        let mut index = 0;
+        while index < self.global_bindings.len() {
+            let is_null_placeholder = self.global_bindings[index].base_address == 0
+                && self.global_bindings[index].byte_count <= 4;
+            if !is_null_placeholder {
+                index += 1;
+                continue;
+            }
+            let scalar_address = self.global_bindings[index].scalar_address;
+            let Some(live_index) = self.global_bindings.iter().enumerate().find_map(
+                |(candidate, binding)| {
+                    (candidate != index
+                        && binding.scalar_address == scalar_address
+                        && binding.base_address != 0)
+                    .then_some(candidate)
+                },
+            ) else {
+                index += 1;
+                continue;
+            };
+            let null_pcs = self.global_bindings[index].instruction_pcs.clone();
+            let null_writable = self.global_bindings[index].writable;
+            let null_pc_count = null_pcs.len();
+            let live_base = self.global_bindings[live_index].base_address;
+            let live = &mut self.global_bindings[live_index];
+            for pc in null_pcs {
+                if !live.instruction_pcs.contains(&pc) {
+                    live.instruction_pcs.push(pc);
+                }
+            }
+            live.writable |= null_writable;
+            eprintln!(
+                "[REMu][SHADER] coalesce null global binding scalar={scalar_address} pcs={null_pc_count} into live base={live_base:#x} (removed placeholder)"
+            );
+            self.global_bindings.remove(index);
+            // Removing either a later null or an earlier one that shifted `live` still leaves the
+            // next unchecked entry at `index`.
+        }
     }
 
     pub(crate) fn bind_statically_inactive_images(&mut self) -> Result<(), EvaluationError> {
@@ -675,6 +738,23 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         instruction: &Instruction,
         request: BindingRequest,
     ) -> Result<(), EvaluationError> {
+        // Prefer a live sibling for the same SGPR slot over creating/updating a four-byte null
+        // placeholder. Poppy's glyph PS discovers the real V# on one scalar path and later hits the
+        // same slot while it still holds a null/sentinel; a separate Metal buffer with length 4
+        // makes every SDF table load OOB-zero (solid tofu) even though the live buffer is bound.
+        let null_placeholder = request.base_address == 0 && request.requested_bytes <= 4;
+        if null_placeholder
+            && let Some(index) = self.global_bindings.iter().position(|binding| {
+                binding.scalar_address == request.scalar_address && binding.base_address != 0
+            })
+        {
+            let binding = &mut self.global_bindings[index];
+            if !binding.instruction_pcs.contains(&instruction.pc) {
+                binding.instruction_pcs.push(instruction.pc);
+            }
+            binding.writable |= request.writable;
+            return Ok(());
+        }
         if let Some(index) = self.global_bindings.iter().position(|binding| {
             binding.scalar_address == request.scalar_address
                 && binding.base_address == request.base_address
@@ -691,6 +771,34 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 binding.instruction_pcs.push(instruction.pc);
             }
             binding.writable |= request.writable;
+            return Ok(());
+        }
+        // Recording a live V# for a slot that already has a null stub: fold the stub's PCs into the
+        // new live entry and drop the placeholder immediately (same end state as coalesce).
+        if request.base_address != 0
+            && let Some(null_index) = self.global_bindings.iter().position(|binding| {
+                binding.scalar_address == request.scalar_address
+                    && binding.base_address == 0
+                    && binding.byte_count <= 4
+            })
+        {
+            let null_pcs = self.global_bindings[null_index].instruction_pcs.clone();
+            let null_writable = self.global_bindings[null_index].writable;
+            self.global_bindings.remove(null_index);
+            let (byte_count, data) = self.read_binding_request(instruction.pc, request)?;
+            let mut instruction_pcs = null_pcs;
+            if !instruction_pcs.contains(&instruction.pc) {
+                instruction_pcs.push(instruction.pc);
+            }
+            self.global_bindings.push(GlobalMemoryBinding {
+                scalar_address: request.scalar_address,
+                base_address: request.base_address,
+                instruction_pcs,
+                byte_count,
+                data,
+                writable: request.writable || null_writable,
+                write_back_to_guest: true,
+            });
             return Ok(());
         }
         let (byte_count, data) = self.read_binding_request(instruction.pc, request)?;

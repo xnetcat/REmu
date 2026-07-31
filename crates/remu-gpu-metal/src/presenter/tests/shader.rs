@@ -1117,6 +1117,54 @@ fn lifts_num_records_when_vertex_binding_exceeds_guest_descriptor() {
 }
 
 #[test]
+fn null_global_metadata_aliases_live_sibling_on_same_sgpr_slot() {
+    // Poppy glyph PS keeps a 4-byte null stub (b2) beside the live 336-byte table (b0) for s[4].
+    // remu_initial_s lengths must publish the live span or every b2 SDF load stays OOB-zero.
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: vec![0; 4].into(),
+        scalar_registers: vec![0; 4].into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: vec![
+            GlobalMemoryBinding {
+                scalar_address: 4,
+                base_address: 0x1_0000,
+                instruction_pcs: vec![0x10].into(),
+                byte_count: 336,
+                data: vec![0; 336],
+                writable: false,
+                write_back_to_guest: true,
+            },
+            GlobalMemoryBinding {
+                scalar_address: 0,
+                base_address: 0x2_0000,
+                instruction_pcs: vec![0x20].into(),
+                byte_count: 672,
+                data: vec![0; 672],
+                writable: false,
+                write_back_to_guest: true,
+            },
+            GlobalMemoryBinding {
+                scalar_address: 4,
+                base_address: 0,
+                instruction_pcs: vec![0x30].into(),
+                byte_count: 4,
+                data: vec![0; 4],
+                writable: false,
+                write_back_to_guest: false,
+            },
+        ],
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let words = shader_scalar_metadata(&evaluation).expect("aliased metadata");
+    // initial[4] + 3 bindings * (base_lo, base_hi, bytes, writable)
+    assert_eq!(&words[4..8], &[0x1_0000, 0, 336, 0]);
+    assert_eq!(&words[8..12], &[0x2_0000, 0, 672, 0]);
+    assert_eq!(&words[12..16], &[0x1_0000, 0, 336, 0]);
+}
+
+#[test]
 fn appends_dynamic_global_base_and_size_metadata_after_guest_scalars() {
     let evaluation = ShaderEvaluation {
         initial_scalar_registers: vec![10, 20].into(),

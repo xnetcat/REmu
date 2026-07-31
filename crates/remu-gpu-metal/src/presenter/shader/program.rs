@@ -220,16 +220,49 @@ pub(crate) fn wave64_split_blockers(program: &Program) -> Vec<String> {
     blockers
 }
 
+/// When evaluation left a four-byte null stub beside a live binding for the same SGPR slot,
+/// prefer the live span for Metal length/base metadata (Poppy glyph PS b2→b0 tofu).
+pub(crate) fn effective_global_memory_binding<'a>(
+    evaluation: &'a ShaderEvaluation,
+    binding: &'a remu_shader::GlobalMemoryBinding,
+) -> &'a remu_shader::GlobalMemoryBinding {
+    if binding.base_address != 0 || binding.byte_count > 4 {
+        return binding;
+    }
+    evaluation
+        .global_memory_bindings
+        .iter()
+        .find(|candidate| {
+            candidate.scalar_address == binding.scalar_address && candidate.base_address != 0
+        })
+        .unwrap_or(binding)
+}
+
 pub(crate) fn shader_scalar_metadata(evaluation: &ShaderEvaluation) -> Result<Vec<u32>, String> {
     let mut words = evaluation.initial_scalar_registers.to_vec();
     words.reserve(evaluation.global_memory_bindings.len().saturating_mul(4));
     for binding in &evaluation.global_memory_bindings {
+        let effective = effective_global_memory_binding(evaluation, binding);
+        if !std::ptr::eq(effective, binding) {
+            static ALIASED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let sequence = ALIASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if sequence <= 16 || sequence.is_power_of_two() {
+                eprintln!(
+                    "[REMu][METAL] alias null global metadata sequence={sequence} scalar={} placeholder_bytes={} -> live base={:#x} bytes={}",
+                    binding.scalar_address,
+                    binding.byte_count,
+                    effective.base_address,
+                    effective.byte_count
+                );
+            }
+        }
         words.extend([
-            binding.base_address as u32,
-            (binding.base_address >> 32) as u32,
-            u32::try_from(binding.byte_count)
+            effective.base_address as u32,
+            (effective.base_address >> 32) as u32,
+            u32::try_from(effective.byte_count)
                 .map_err(|_| "shader global binding exceeds the 32-bit Metal byte range")?,
-            u32::from(binding.writable),
+            u32::from(effective.writable),
         ]);
     }
     Ok(words)
