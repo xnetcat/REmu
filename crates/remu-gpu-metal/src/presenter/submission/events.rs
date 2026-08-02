@@ -31,6 +31,82 @@ fn dependency_ingress_budget() -> usize {
 const BLOCKED_DEPENDENCY_LOOKAHEAD_CAPACITY: usize =
     remu_gpu::GPU_EVENT_QUEUE_CAPACITY * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE * 2;
 
+/// Largest producer write, in bytes, indexed per 8-byte cell in `producer_labels`.
+///
+/// Fence labels and release/write payloads are a few dwords; indexing a multi-megabyte DMA or
+/// storage binding per cell would be as expensive as the scan this index replaces. Skipping
+/// wide producers undercounts, which only widens dependency ingress — the safe direction.
+const PRODUCER_LABEL_MAX_BYTES: u64 = 512;
+
+/// Visits the 8-byte label cells of one producer write, or nothing if it is too wide.
+fn for_each_producer_label_cell(address: u64, byte_count: u64, mut visit: impl FnMut(u64)) {
+    if byte_count == 0 || byte_count > PRODUCER_LABEL_MAX_BYTES {
+        return;
+    }
+    let first = address >> 3;
+    let last = address.saturating_add(byte_count - 1) >> 3;
+    for cell in first..=last {
+        visit(cell);
+    }
+}
+
+/// Visits every small producer write in `event`: the release/write/copy destinations and the
+/// writable global bindings the exact diagnostic scan also recognises as producers.
+fn for_each_event_producer_cell(event: &GpuEvent, mut visit: impl FnMut(u64)) {
+    match event {
+        GpuEvent::MemoryRelease(release) => {
+            let byte_count = match release.value {
+                GpuMemoryReleaseValue::Immediate32(_) => 4,
+                GpuMemoryReleaseValue::Immediate64(_) | GpuMemoryReleaseValue::Timestamp => 8,
+            };
+            for_each_producer_label_cell(release.address, byte_count, &mut visit);
+        }
+        GpuEvent::MemoryWrite(write) => {
+            let byte_count = if write.increment_address {
+                u64::try_from(write.values.len())
+                    .unwrap_or(u64::MAX / 4)
+                    .saturating_mul(4)
+            } else {
+                4
+            };
+            for_each_producer_label_cell(write.address, byte_count, &mut visit);
+        }
+        GpuEvent::MemoryCopy(copy) => {
+            for_each_producer_label_cell(copy.destination_address, copy.byte_count, &mut visit);
+        }
+        GpuEvent::ComputeDispatch(dispatch) => {
+            for binding in dispatch
+                .shader_evaluation
+                .iter()
+                .flat_map(|evaluation| &evaluation.global_memory_bindings)
+                .filter(|binding| binding.writable)
+            {
+                for_each_producer_label_cell(
+                    binding.base_address,
+                    u64::try_from(binding.byte_count).unwrap_or(u64::MAX),
+                    &mut visit,
+                );
+            }
+        }
+        GpuEvent::IndexedDraw(draw) => {
+            for binding in draw
+                .export_shader_evaluation
+                .iter()
+                .chain(draw.pixel_shader_evaluation.iter())
+                .flat_map(|evaluation| &evaluation.global_memory_bindings)
+                .filter(|binding| binding.writable)
+            {
+                for_each_producer_label_cell(
+                    binding.base_address,
+                    u64::try_from(binding.byte_count).unwrap_or(u64::MAX),
+                    &mut visit,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 impl OrderedGpuEventReceiver {
     pub(crate) fn new(receiver: Receiver<GpuEvent>) -> Self {
         Self {
@@ -45,7 +121,25 @@ impl OrderedGpuEventReceiver {
             host_block: None,
             next_ingress_sequence: 0,
             disconnected: false,
+            producer_labels: HashMap::new(),
         }
+    }
+
+    fn index_queued_event_producers(&mut self, event: &GpuEvent) {
+        for_each_event_producer_cell(event, |cell| {
+            *self.producer_labels.entry(cell).or_insert(0) += 1;
+        });
+    }
+
+    fn unindex_queued_event_producers(&mut self, event: &GpuEvent) {
+        for_each_event_producer_cell(event, |cell| {
+            if let Some(count) = self.producer_labels.get_mut(&cell) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.producer_labels.remove(&cell);
+                }
+            }
+        });
     }
 
     pub(crate) fn ingest(&mut self, receive_limit: usize) {
@@ -53,6 +147,9 @@ impl OrderedGpuEventReceiver {
             return;
         }
         for _ in 0..receive_limit {
+            // Elevated ingress must stand down the moment a just-ingested chunk makes the
+            // producer visible, so the decision is per received event. The producer index
+            // keeps this evaluation O(blocked queues), not O(queued events).
             let pending_capacity = if self.needs_dependency_ingress() {
                 remu_gpu::GPU_PENDING_EVENT_CAPACITY
                     .saturating_add(BLOCKED_DEPENDENCY_LOOKAHEAD_CAPACITY)
@@ -84,6 +181,9 @@ impl OrderedGpuEventReceiver {
                     }
                     if !self.submissions.contains_key(&queue_id) {
                         self.queue_order.push(queue_id);
+                    }
+                    for event in &events {
+                        self.index_queued_event_producers(event);
                     }
                     self.submissions.entry(queue_id).or_default().push_back(
                         ScheduledGpuSubmission {
@@ -139,10 +239,24 @@ impl OrderedGpuEventReceiver {
             .chain(self.host_block.iter())
             .any(|reason| match reason {
                 QueueBlockReason::GuestMemoryWait(wait) => {
-                    self.describe_queued_wait_producers(*wait) == "none-ingested"
+                    !self.queued_wait_has_indexed_producer(*wait)
                 }
                 _ => false,
             })
+    }
+
+    /// O(1) form of "does any ingested queue still hold a producer for this wait".
+    ///
+    /// Wide producers are not indexed, so a miss can be an undercount — that only elevates
+    /// dependency ingress, the direction the elevated path exists to guarantee. A hit can be
+    /// aliased at cell granularity (a disjoint write in the same 8-byte cell), which merely
+    /// keeps the ordinary ingress cap; the exact scan had the same self-queue blindness. The
+    /// exact scan survives as `describe_queued_wait_producers` for the rate-limited log line.
+    fn queued_wait_has_indexed_producer(&self, wait: GpuMemoryWait) -> bool {
+        let wait_bytes = if wait.is_64_bit { 8 } else { 4 };
+        let first = wait.address >> 3;
+        let last = wait.address.saturating_add(wait_bytes - 1) >> 3;
+        (first..=last).any(|cell| self.producer_labels.contains_key(&cell))
     }
 
     /// Returns whether one current queue front can execute without first polling a memory wait.
@@ -287,7 +401,9 @@ impl OrderedGpuEventReceiver {
         {
             queue.pop_front();
         }
-        queue.front_mut()?.events.pop_front()
+        let event = queue.front_mut()?.events.pop_front()?;
+        self.unindex_queued_event_producers(&event);
+        Some(event)
     }
 
     pub(crate) fn finish_event(&mut self, source: OrderedEventSource) {
@@ -328,6 +444,7 @@ impl OrderedGpuEventReceiver {
                 self.host_block = Some(reason);
             }
             OrderedEventSource::GuestQueue(queue_id) => {
+                self.index_queued_event_producers(&event);
                 self.submissions
                     .get_mut(&queue_id)
                     .and_then(|queue| queue.front_mut())
