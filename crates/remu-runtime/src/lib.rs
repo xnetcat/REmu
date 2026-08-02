@@ -7976,6 +7976,59 @@ const fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
     }
 }
 
+/// Raises the process descriptor limit to the hard maximum and reports the budget once.
+///
+/// launchd hands a 256-descriptor soft limit to the processes it starts, while the APR handle
+/// cache retains one open descriptor per file a title has ever read. The budget therefore has to
+/// be claimed before the guest starts opening files: past exhaustion every open fails, and the
+/// titles that read through APR parse the untouched destination instead.
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn raise_open_file_budget_once() {
+    // macOS refuses RLIM_INFINITY for RLIMIT_NOFILE; the granted ceiling is kern.maxfilesperproc,
+    // which OPEN_MAX bounds. Without this fallback an unlimited hard limit leaves the soft limit
+    // exactly where it was.
+    const DESCRIPTOR_CEILING: libc::rlim_t = 10240;
+    static BUDGET: OnceLock<libc::rlim_t> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes the named resource's limits into the caller's storage.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+            eprintln!(
+                "[REMu] warning: file descriptor budget unavailable: {}",
+                std::io::Error::last_os_error()
+            );
+            return 0;
+        }
+        for target in [limit.rlim_max, DESCRIPTOR_CEILING] {
+            if target <= limit.rlim_cur {
+                continue;
+            }
+            let raised = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: limit.rlim_max,
+            };
+            // SAFETY: setrlimit reads the limits from the caller's storage.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } == 0 {
+                limit.rlim_cur = target;
+                break;
+            }
+        }
+        let hard = if limit.rlim_max == libc::RLIM_INFINITY {
+            "unlimited".to_owned()
+        } else {
+            limit.rlim_max.to_string()
+        };
+        eprintln!(
+            "[REMu] file descriptor budget: {} open files (hard limit {hard})",
+            limit.rlim_cur
+        );
+        limit.rlim_cur
+    });
+}
+
 #[cfg(target_arch = "x86_64")]
 fn probe_entry(
     image: &LinkedImage,
@@ -7992,6 +8045,9 @@ fn probe_entry(
         argument1: u64,
         argument2: u64,
     }
+    // Claim the budget before the process opens anything on the guest's behalf.
+    #[cfg(unix)]
+    raise_open_file_budget_once();
     let image_name =
         CString::new(process_image_name).map_err(|_| LinkError::InvalidProcessImageName)?;
     let parameters = EntryParameters {
