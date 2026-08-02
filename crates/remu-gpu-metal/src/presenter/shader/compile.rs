@@ -5,7 +5,7 @@ use metal::{CompileOptions, Device, Library};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub(crate) const METAL_LIBRARY_CACHE_FORMAT: &[u8] = b"remu-metal-library-v1\0";
 
@@ -113,6 +113,7 @@ pub(crate) fn compile_metal_library_with_tools(
 ) -> Result<Library, String> {
     static NEXT_COMPILE_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
     static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+    static REPORTED_MULTICALL_LINKER: AtomicBool = AtomicBool::new(false);
     let compiler = canonical_tool_path(
         std::env::var_os("REMU_METAL_COMPILER")
             .map(PathBuf::from)
@@ -121,9 +122,19 @@ pub(crate) fn compile_metal_library_with_tools(
     if !compiler.is_file() {
         return Err(format!("{} is not a file", compiler.display()));
     }
-    let linker = canonical_tool_path(compiler.with_file_name("metallib"));
+    // `metallib` in Apple's downloadable Metal toolchain is a multicall symlink to `air-lld`.
+    // Keep that final path component intact: the linker selects its legacy metallib mode from
+    // argv[0]. Canonicalizing the symlink invokes it as `air-lld`, which accepts the AIR input but
+    // emits only a 92-byte header with no entry points.
+    let linker = metallib_tool_path(&compiler);
     if !linker.is_file() {
         return Err(format!("{} is not a file", linker.display()));
+    }
+    if !REPORTED_MULTICALL_LINKER.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[REMu][METAL] offline linker selected through metallib multicall entry path={}",
+            linker.display()
+        );
     }
     let cache_path = metal_library_cache_path(source);
     if cache_path.is_file() {
@@ -246,6 +257,51 @@ pub(crate) fn metal_compile_failure_is_transient(error: &str) -> bool {
 
 fn canonical_tool_path(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn metallib_tool_path(compiler: &Path) -> PathBuf {
+    compiler.with_file_name("metallib")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MetalCompileDirectory, canonical_tool_path, metallib_tool_path};
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn metallib_tool_path_preserves_the_multicall_symlink_name() {
+        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "remu-metallib-path-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create linker path test directory");
+        let directory = MetalCompileDirectory(directory);
+        let compiler = directory.0.join("metal");
+        let linker_target = directory.0.join("air-lld");
+        File::create(&compiler).expect("create compiler placeholder");
+        File::create(&linker_target).expect("create linker placeholder");
+        symlink("air-lld", directory.0.join("metallib")).expect("create multicall linker symlink");
+
+        let compiler = canonical_tool_path(compiler);
+        let linker = metallib_tool_path(&compiler);
+        assert_eq!(linker.file_name(), Some(OsStr::new("metallib")));
+        assert!(
+            std::fs::symlink_metadata(&linker)
+                .expect("inspect linker path")
+                .file_type()
+                .is_symlink(),
+            "the executable path must retain the multicall symlink"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&linker).expect("resolve linker symlink"),
+            std::fs::canonicalize(linker_target).expect("resolve linker target")
+        );
+    }
 }
 
 pub(crate) fn run_metal_tool(command: &mut Command, operation: &str) -> Result<(), String> {
