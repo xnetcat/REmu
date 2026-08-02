@@ -213,7 +213,7 @@ impl MetalPresenter {
         let pending_flips = remu_gpu::gpu_flips_pending();
         let title = format!(
             "REMu | FPS {flip_rate:.1} ({frame_milliseconds:.1} ms) | Present {present_rate:.1}/s | GPU {gpu_utilization:.0}% Lat {presentation_latency_milliseconds:.1} ms | {memory} MTL {metal_allocated_mib}/{metal_recommended_mib} MiB | Draw {draw_rate:.0}/s RP {render_pass_rate:.0}/s CS {compute_rate:.0}/s | CB {guest_batch_rate:.0}/s PB {pipeline_barrier_rate:.0}/s ({}) | Q W{} P{} F{} | Tex {}/{sampled_texture_cache_mib} MiB | Pipe {}/{} | Audio {audio_output_rate:.0}/s U {audio_underrun_percent:.1}%",
-            self.committed_guest_batches.len(),
+            self.committed_guest_batch_count(),
             pending_gpu_events,
             self.pending_presentations.len(),
             pending_flips,
@@ -378,23 +378,30 @@ impl MetalPresenter {
             if !wait_dependencies.is_empty() {
                 eprintln!("[REMu][PERF-QUEUE-WAITS] {wait_dependencies}");
             }
-            if !self.committed_guest_batches.is_empty() {
-                let batches = self
-                    .committed_guest_batches
+            let committed_batches = self.committed_guest_batches_for_diagnostics();
+            if !committed_batches.is_empty() {
+                let batches = committed_batches
                     .iter()
-                    .enumerate()
-                    .map(|(index, batch)| {
-                        format!(
-                            "{index}:{:?}:[{}]",
-                            batch.command_buffer.status(),
-                            describe_guest_batch(&batch.work),
-                        )
+                    .map(|(queue_id, index, batch)| {
+                        if let Some(queue_id) = queue_id {
+                            format!(
+                                "q{queue_id}/{index}:{:?}:[{}]",
+                                batch.command_buffer.status(),
+                                describe_guest_batch(&batch.work),
+                            )
+                        } else {
+                            format!(
+                                "{index}:{:?}:[{}]",
+                                batch.command_buffer.status(),
+                                describe_guest_batch(&batch.work),
+                            )
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
                 eprintln!("[REMu][PERF-BATCHES] {batches}");
                 if trace_metal_command_stalls() {
-                    for (index, batch) in self.committed_guest_batches.iter().enumerate() {
+                    for (queue_id, index, batch) in committed_batches {
                         let Some(age) = batch.committed_at.map(|committed| committed.elapsed())
                         else {
                             continue;
@@ -403,8 +410,10 @@ impl MetalPresenter {
                         if !command_buffer_is_stall_candidate(status, age) {
                             continue;
                         }
+                        let queue = queue_id
+                            .map_or_else(String::new, |queue_id| format!(" queue={queue_id}"));
                         eprintln!(
-                            "[REMu][METAL][STALL] batch={index} status={status:?} age_ms={} {} work=[{}]",
+                            "[REMu][METAL][STALL]{queue} batch={index} status={status:?} age_ms={} {} work=[{}]",
                             age.as_millis(),
                             command_buffer_native_state_summary(&batch.command_buffer),
                             describe_guest_batch(&batch.work),

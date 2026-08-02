@@ -663,16 +663,10 @@ impl MetalPresenter {
         );
         target_linear.set_label("REMu mode-27 rematerialisation target linear");
 
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
-        self.ensure_open_guest_batch(&queue);
+        self.ensure_active_open_guest_batch()?;
         let command_buffer = {
             let batch = self
-                .open_guest_batch
-                .as_mut()
+                .active_open_guest_batch_mut()
                 .expect("guest batch was opened for texture rematerialisation");
             batch.close_active_pass_encoders();
             batch.command_buffer.clone()
@@ -1255,16 +1249,10 @@ impl MetalPresenter {
             source_origin_y,
         } = &rematerialisation
         {
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
-            self.ensure_open_guest_batch(&queue);
+            self.ensure_active_open_guest_batch()?;
             let command_buffer = {
                 let batch = self
-                    .open_guest_batch
-                    .as_mut()
+                    .active_open_guest_batch_mut()
                     .expect("guest batch was opened for texture rematerialisation");
                 batch.close_active_pass_encoders();
                 batch.command_buffer.clone()
@@ -1449,16 +1437,10 @@ impl MetalPresenter {
                     && resident.mip_level_count < underlying_mip_count
             });
         if needs_gpu_promotion {
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
-            self.ensure_open_guest_batch(&queue);
+            self.ensure_active_open_guest_batch()?;
             let command_buffer = {
                 let batch = self
-                    .open_guest_batch
-                    .as_mut()
+                    .active_open_guest_batch_mut()
                     .expect("guest batch was opened for mip promotion");
                 batch.close_active_pass_encoders();
                 batch.command_buffer.clone()
@@ -1505,15 +1487,9 @@ impl MetalPresenter {
                     && resident.mip_level_count < underlying_mip_count
             });
         let promotion_command_buffer = if needs_clean_promotion {
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
-            self.ensure_open_guest_batch(&queue);
+            self.ensure_active_open_guest_batch()?;
             let batch = self
-                .open_guest_batch
-                .as_mut()
+                .active_open_guest_batch_mut()
                 .expect("guest batch was opened for mip promotion");
             batch.end_compute_pass();
             batch.close_active_pass_encoders();
@@ -1812,16 +1788,10 @@ impl MetalPresenter {
             .get(&target.texture)
             .is_some_and(|resident| resident.gpu_written())
         {
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
-            self.ensure_open_guest_batch(&queue);
+            self.ensure_active_open_guest_batch()?;
             let command_buffer = {
                 let batch = self
-                    .open_guest_batch
-                    .as_mut()
+                    .active_open_guest_batch_mut()
                     .expect("guest batch was opened for mip promotion");
                 batch.close_active_pass_encoders();
                 batch.command_buffer.clone()

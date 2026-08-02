@@ -18,9 +18,11 @@ use remu_memory::{
 };
 use remu_shader::{GlobalMemoryBinding, Program, ShaderEvaluation};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::super::{FlipTerminalSource, UploadedGlobalBuffer};
+use super::super::{
+    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, UploadedGlobalBuffer,
+};
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
@@ -37,6 +39,56 @@ use super::{
     QueueBlockReason, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
     read_texture_linear, write_back_pending_globals,
 };
+
+fn enable_per_queue_batches(presenter: &mut MetalPresenter) {
+    presenter.per_queue_guest_batches = true;
+    presenter.active_guest_queue = None;
+    assert!(presenter.open_guest_batch.is_none());
+    assert!(presenter.committed_guest_batches.is_empty());
+}
+
+fn open_per_queue_batch(presenter: &mut MetalPresenter, queue_id: u64) {
+    presenter.set_active_guest_queue(Some(queue_id));
+    presenter
+        .ensure_active_open_guest_batch()
+        .expect("queue-local guest batch opens");
+}
+
+fn committed_per_queue_test_batch(
+    presenter: &mut MetalPresenter,
+    queue_id: u64,
+    memory_writes: Vec<PendingGuestMemoryWrite>,
+    wait: Option<(&metal::SharedEventRef, u64)>,
+) -> metal::CommandBuffer {
+    presenter.set_active_guest_queue(Some(queue_id));
+    let queue = presenter
+        .active_guest_command_queue()
+        .expect("queue-local Metal queue");
+    let command_buffer = queue.new_command_buffer().to_owned();
+    if let Some((event, value)) = wait {
+        command_buffer.encode_wait_for_event(event, value);
+    }
+    command_buffer.commit();
+    presenter
+        .guest_queue_batches
+        .get_mut(&queue_id)
+        .expect("queue state exists")
+        .committed_batches
+        .push_back(GuestCommandBatch {
+            queue_id: Some(queue_id),
+            command_buffer: command_buffer.clone(),
+            work: Vec::new(),
+            committed_at: Some(Instant::now()),
+            global_upload_chunks: Vec::new(),
+            global_writebacks: Vec::new(),
+            guest_write_ranges: Vec::new(),
+            memory_writes,
+            render_pass: None,
+            compute_encoder: None,
+            completion_sequences: Vec::new(),
+        });
+    command_buffer
+}
 
 #[test]
 fn flip_wait_blocks_only_its_queue_front_and_preserves_the_following_boundary() {
@@ -393,6 +445,7 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
         .new_render_command_encoder(render_pass)
         .to_owned();
     presenter.open_guest_batch = Some(GuestCommandBatch {
+        queue_id: None,
         command_buffer,
         work: Vec::new(),
         committed_at: None,
@@ -602,6 +655,7 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
         .new_render_command_encoder(render_pass)
         .to_owned();
     presenter.open_guest_batch = Some(GuestCommandBatch {
+        queue_id: None,
         command_buffer,
         work: Vec::new(),
         committed_at: None,
@@ -661,6 +715,7 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
     let command_buffer = queue.new_command_buffer().to_owned();
     let original_command_buffer = command_buffer.clone();
     presenter.open_guest_batch = Some(GuestCommandBatch {
+        queue_id: None,
         command_buffer,
         work: Vec::new(),
         committed_at: None,
@@ -1509,6 +1564,7 @@ fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
         .expect("Metal queue")
         .clone();
     presenter.open_guest_batch = Some(GuestCommandBatch {
+        queue_id: None,
         command_buffer: queue.new_command_buffer().to_owned(),
         work: Vec::new(),
         committed_at: None,
@@ -1693,6 +1749,7 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
         presenter
             .committed_guest_batches
             .push_back(GuestCommandBatch {
+                queue_id: None,
                 command_buffer,
                 work: Vec::new(),
                 committed_at: None,
@@ -1742,6 +1799,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
     presenter
         .committed_guest_batches
         .push_back(GuestCommandBatch {
+            queue_id: None,
             command_buffer,
             work: Vec::new(),
             committed_at: None,
@@ -1807,6 +1865,7 @@ fn fill_committed_guest_batch_budget(
         presenter
             .committed_guest_batches
             .push_back(GuestCommandBatch {
+                queue_id: None,
                 command_buffer,
                 work: Vec::new(),
                 committed_at: None,
@@ -1927,6 +1986,7 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
     let device = Device::system_default().expect("Metal device");
     let queue = device.new_command_queue();
     let mut batch = GuestCommandBatch {
+        queue_id: None,
         command_buffer: queue.new_command_buffer().to_owned(),
         work: Vec::new(),
         committed_at: None,
@@ -2060,6 +2120,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
     presenter
         .committed_guest_batches
         .push_back(GuestCommandBatch {
+            queue_id: None,
             command_buffer: first_command_buffer,
             work: Vec::new(),
             committed_at: None,
@@ -2097,6 +2158,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
     presenter
         .committed_guest_batches
         .push_back(GuestCommandBatch {
+            queue_id: None,
             command_buffer: second_command_buffer,
             work: Vec::new(),
             committed_at: None,
@@ -3790,4 +3852,379 @@ fn guest_wait_does_not_latch_missing_or_nonmatching_producers() {
         wrong.observe_unsatisfied(key),
         GuestMemoryWaitRecovery::None
     );
+}
+
+#[test]
+fn per_queue_boundary_attaches_only_to_its_source_queue() {
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+
+    open_per_queue_batch(&mut presenter, 41);
+    open_per_queue_batch(&mut presenter, 42);
+    presenter
+        .flush_guest_command_batch(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CommandProcessorBarrier,
+        )
+        .expect("foreign queue batch commits");
+    open_per_queue_batch(&mut presenter, 0);
+    presenter.record_guest_submission_boundary(OrderedEventSource::GuestQueue(0), 0x100);
+
+    assert_eq!(
+        presenter.guest_queue_batches[&0]
+            .open_batch
+            .as_ref()
+            .expect("q0 remains open")
+            .completion_sequences,
+        [0x100]
+    );
+    assert!(
+        presenter.guest_queue_batches[&41]
+            .open_batch
+            .as_ref()
+            .expect("q41 remains open")
+            .completion_sequences
+            .is_empty(),
+        "q0 boundary must not attach to q41's open batch"
+    );
+    assert!(
+        presenter.guest_queue_batches[&42]
+            .committed_batches
+            .back()
+            .expect("q42 committed batch")
+            .completion_sequences
+            .is_empty(),
+        "q0 boundary must not attach to another queue's newest committed batch"
+    );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("test queues drain");
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
+}
+
+#[test]
+fn per_queue_blocked_wait_flushes_only_its_queue_and_preserves_foreign_render_pass() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    open_per_queue_batch(&mut presenter, 0);
+
+    let texture_descriptor = TextureDescriptor::new();
+    texture_descriptor.set_texture_type(MTLTextureType::D2);
+    texture_descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+    texture_descriptor.set_width(4);
+    texture_descriptor.set_height(4);
+    texture_descriptor.set_storage_mode(MTLStorageMode::Private);
+    texture_descriptor.set_usage(MTLTextureUsage::RenderTarget);
+    let texture = device.new_texture(&texture_descriptor);
+    let render_pass = RenderPassDescriptor::new();
+    let attachment = render_pass
+        .color_attachments()
+        .object_at(0)
+        .expect("color attachment zero");
+    attachment.set_texture(Some(&texture));
+    attachment.set_load_action(MTLLoadAction::Clear);
+    attachment.set_store_action(MTLStoreAction::Store);
+    let q0_command_buffer = presenter.guest_queue_batches[&0]
+        .open_batch
+        .as_ref()
+        .expect("q0 open batch")
+        .command_buffer
+        .clone();
+    let encoder = q0_command_buffer
+        .new_render_command_encoder(render_pass)
+        .to_owned();
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("q0 state")
+        .open_batch
+        .as_mut()
+        .expect("q0 open batch")
+        .render_pass = Some(OpenGuestRenderPass {
+            key: GuestRenderPassKey {
+                targets: Vec::new(),
+                depth: None,
+            },
+            encoder,
+        });
+
+    open_per_queue_batch(&mut presenter, 41);
+    let (_label_space, address) = mapped_test_label();
+    let wait = GpuMemoryWait {
+        address,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    assert_eq!(
+        presenter
+            .execute_guest_memory_wait(OrderedEventSource::GuestQueue(41), None, wait)
+            .expect("blocked q41 wait flushes its preceding work"),
+        GuestMemoryWaitStatus::Blocked
+    );
+
+    assert!(presenter.guest_queue_batches[&41].open_batch.is_none());
+    assert_eq!(
+        presenter.guest_queue_batches[&41]
+            .committed_batches
+            .len(),
+        1
+    );
+    assert!(
+        presenter.guest_queue_batches[&0]
+            .open_batch
+            .as_ref()
+            .is_some_and(|batch| batch.render_pass.is_some()),
+        "q41's CPU-fallback wait must not end q0's live render pass"
+    );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("test queues drain");
+}
+
+#[test]
+fn per_queue_terminal_fronts_retire_independently_and_remain_fifo_within_a_queue() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let blocker = device.new_shared_event();
+    committed_per_queue_test_batch(&mut presenter, 0, Vec::new(), Some((&blocker, 1)));
+
+    let (_label_space, address) = mapped_test_label();
+    let mut q41_buffers = Vec::new();
+    for value in [1, 2] {
+        let write = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+            GpuMemoryRelease {
+                address,
+                value: GpuMemoryReleaseValue::Immediate32(value),
+            },
+        ))
+        .expect("pin ordered q41 label");
+        q41_buffers.push(committed_per_queue_test_batch(
+            &mut presenter,
+            41,
+            vec![write],
+            None,
+        ));
+    }
+    for command_buffer in &q41_buffers {
+        command_buffer.wait_until_completed();
+    }
+
+    presenter.retire_completed_guest_batches();
+    assert_eq!(
+        presenter.guest_queue_batches[&0]
+            .committed_batches
+            .len(),
+        1,
+        "pending q0 front remains queued"
+    );
+    assert!(
+        presenter.guest_queue_batches[&41]
+            .committed_batches
+            .is_empty(),
+        "terminal q41 fronts retire independently of q0"
+    );
+    assert_eq!(
+        read_test_label(address),
+        2,
+        "q41 terminal effects publish in strict queue FIFO order"
+    );
+    blocker.set_signaled_value(1);
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("pending q0 batch drains after its dependency signals");
+}
+
+#[test]
+fn per_queue_empty_boundary_ignores_foreign_outstanding_batches() {
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    open_per_queue_batch(&mut presenter, 0);
+
+    presenter.record_guest_submission_boundary(OrderedEventSource::GuestQueue(41), 0x4100);
+    assert_eq!(
+        remu_gpu::take_gpu_completed_submission_ids(),
+        [0x4100],
+        "an empty q41 completes immediately despite outstanding q0 work"
+    );
+    assert!(
+        presenter.guest_queue_batches[&0]
+            .open_batch
+            .as_ref()
+            .expect("q0 remains open")
+            .completion_sequences
+            .is_empty()
+    );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("test queue drains");
+}
+
+#[test]
+fn per_queue_committed_batch_cap_is_global() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let blocker = device.new_shared_event();
+    for index in 0..MAX_COMMITTED_GUEST_BATCHES {
+        let queue_id = if index.is_multiple_of(2) { 0 } else { 41 };
+        committed_per_queue_test_batch(
+            &mut presenter,
+            queue_id,
+            Vec::new(),
+            Some((&blocker, 1)),
+        );
+    }
+    assert_eq!(
+        presenter.committed_guest_batch_count(),
+        MAX_COMMITTED_GUEST_BATCHES
+    );
+    open_per_queue_batch(&mut presenter, 2);
+    let q2_open = presenter.guest_queue_batches[&2]
+        .open_batch
+        .as_ref()
+        .expect("q2 open batch")
+        .command_buffer
+        .clone();
+
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
+        .expect("global cap applies without failing opportunistic submission");
+    assert_eq!(
+        presenter.committed_guest_batch_count(),
+        MAX_COMMITTED_GUEST_BATCHES
+    );
+    assert!(std::ptr::eq(
+        presenter.guest_queue_batches[&2]
+            .open_batch
+            .as_ref()
+            .expect("global cap retains q2 open batch")
+            .command_buffer
+            .as_ref(),
+        q2_open.as_ref()
+    ));
+    blocker.set_signaled_value(1);
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("capped test queues drain");
+}
+
+#[test]
+fn per_queue_required_drain_has_one_deadline_and_continues_after_terminal_error() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+
+    let invalid = PendingGuestMemoryWrite {
+        operation: GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+            address: 2,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        }),
+        mapping_identity: None,
+        write_watch: None,
+    };
+    let (_label_space, completion_address) = mapped_test_label();
+    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+        GpuMemoryRelease {
+            address: completion_address,
+            value: GpuMemoryReleaseValue::Immediate32(9),
+        },
+    ))
+    .expect("pin later queue completion label");
+    let first = committed_per_queue_test_batch(&mut presenter, 0, vec![invalid], None);
+    let later = committed_per_queue_test_batch(&mut presenter, 41, vec![completion], None);
+    first.wait_until_completed();
+    later.wait_until_completed();
+    let error = presenter
+        .wait_for_guest_command_batches()
+        .expect_err("first queue's invalid terminal write remains visible");
+    assert!(error.contains("unaligned"));
+    assert_eq!(
+        read_test_label(completion_address),
+        9,
+        "a terminal error must not abandon a later queue's completion effects"
+    );
+
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let q0_blocker = device.new_shared_event();
+    let q41_blocker = device.new_shared_event();
+    committed_per_queue_test_batch(&mut presenter, 0, Vec::new(), Some((&q0_blocker, 1)));
+    committed_per_queue_test_batch(&mut presenter, 41, Vec::new(), Some((&q41_blocker, 1)));
+    let timeout = Duration::from_millis(250);
+    let started = Instant::now();
+    presenter
+        .wait_for_guest_command_batches_within(timeout)
+        .expect_err("both queue fronts remain blocked");
+    assert!(
+        started.elapsed() < Duration::from_millis(430),
+        "one 250 ms deadline must cover both queues instead of charging each queue separately"
+    );
+    q0_blocker.set_signaled_value(1);
+    q41_blocker.set_signaled_value(1);
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("timed-out queue fronts remain drainable");
+}
+
+#[test]
+fn per_queue_flush_clears_only_its_transient_bindings() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let key = GlobalBufferCacheKey {
+        base_address: 0x7000_0000,
+        byte_count: 4,
+    };
+
+    for queue_id in [0, 41] {
+        open_per_queue_batch(&mut presenter, queue_id);
+        presenter
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .expect("queue state")
+            .transient_global_buffer_cache
+            .insert(
+                key,
+                CachedGlobalBuffer {
+                    bytes: vec![queue_id as u8; 4],
+                    buffer: device.new_buffer(4, MTLResourceOptions::StorageModeShared),
+                    offset: 0,
+                },
+            );
+    }
+    presenter.set_active_guest_queue(Some(41));
+    presenter
+        .flush_guest_command_batch(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CommandProcessorBarrier,
+        )
+        .expect("q41 flush commits");
+
+    assert!(
+        presenter.guest_queue_batches[&0]
+            .transient_global_buffer_cache
+            .contains_key(&key),
+        "q41 flush must retain q0 transient bindings"
+    );
+    assert!(
+        presenter.guest_queue_batches[&41]
+            .transient_global_buffer_cache
+            .is_empty(),
+        "the flushed queue rotates its own transient bindings"
+    );
+    assert!(presenter.guest_queue_batches[&0].open_batch.is_some());
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("test queues drain");
 }

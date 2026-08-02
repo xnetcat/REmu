@@ -116,6 +116,10 @@ impl MetalPresenter {
                     return PresenterFlow::Shutdown;
                 }
             };
+            self.set_active_guest_queue(match source {
+                OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
+                OrderedEventSource::Host { .. } => None,
+            });
             match event {
                 GpuEvent::QueueSubmission { .. } => {
                     eprintln!("[REMu][METAL] ignored invalid nested GPU queue submission");
@@ -526,18 +530,7 @@ impl MetalPresenter {
                     // Batch across guest submissions without losing their individual completion
                     // identities. Graphics and compute queues can retire out of global sequence
                     // order, and the shared completion tracker exposes only the contiguous prefix.
-                    if let Some(batch) = self.open_guest_batch.as_mut() {
-                        batch.completion_sequences.push(sequence);
-                    } else if let Some(batch) = self.committed_guest_batches.back_mut() {
-                        // Empty submissions and boundaries following a forced flush still depend
-                        // on all earlier ordered work. Attaching them to the newest committed
-                        // batch avoids publishing completion before that work reaches Metal.
-                        batch.completion_sequences.push(sequence);
-                    } else {
-                        // No open or committed work remains, so this submission is genuinely
-                        // empty and can complete immediately.
-                        self.publish_guest_submission_completion(sequence);
-                    }
+                    self.record_guest_submission_boundary(source, sequence);
                     self.finalize_pending_flip_at_submission_boundary(source);
                 }
                 GpuEvent::Shutdown => {
@@ -565,7 +558,7 @@ impl MetalPresenter {
     }
 
     pub(super) fn end_guest_pipeline_barrier(&mut self, _barrier: remu_gpu::GpuPipelineBarrier) {
-        let Some(batch) = self.open_guest_batch.as_mut() else {
+        let Some(batch) = self.active_open_guest_batch_mut() else {
             return;
         };
         // EVENT_WRITE partial flushes are memory dependencies, not submission boundaries. Kyty

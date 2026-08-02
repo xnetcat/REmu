@@ -138,9 +138,7 @@ impl MetalPresenter {
                     descriptor.address,
                 )
             });
-            let pending_source_write = self.open_guest_batch.as_ref().is_some_and(|batch| {
-                guest_batch_writes_overlap(batch, copy.source_address, copy.byte_count)
-            }) || self.committed_guest_batches.iter().any(|batch| {
+            let pending_source_write = self.any_guest_batch(|batch| {
                 guest_batch_writes_overlap(batch, copy.source_address, copy.byte_count)
             });
             let mut authoritative_gpu_source = pending_source_write;
@@ -334,11 +332,11 @@ impl MetalPresenter {
         // in this batch, but do not themselves require a new Metal submission. Publish them when
         // the owning command buffer retires. A later wait can inspect the deferred value, while
         // a genuinely blocked wait and the event-loop boundary still commit the batch.
-        if let Some(batch) = self.open_guest_batch.as_mut() {
+        if let Some(batch) = self.active_open_guest_batch_mut() {
             batch.memory_writes.push(write);
             return Ok(());
         }
-        if let Some(batch) = self.committed_guest_batches.back_mut() {
+        if let Some(batch) = self.active_committed_guest_batches_mut().back_mut() {
             batch.memory_writes.push(write);
         } else {
             apply_pending_guest_memory_writes(std::slice::from_ref(&write))?;

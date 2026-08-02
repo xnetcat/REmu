@@ -162,13 +162,8 @@ impl MetalPresenter {
             );
         }
         if matches!(source, QueuedGlobalReadSource::Synchronize) {
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
             self.wait_for_guest_command_batches()?;
-            self.ensure_open_guest_batch(&queue);
+            self.ensure_active_open_guest_batch()?;
             return self.upload_fresh_global_buffer(device, &binding);
         }
         self.upload_global_buffer_from_source(device, &binding, source)
@@ -201,12 +196,11 @@ impl MetalPresenter {
         }
         let byte_count_u64 = u64::try_from(byte_count).unwrap_or(u64::MAX);
         let selected = self
-            .open_guest_batch
-            .as_ref()
+            .active_open_guest_batch()
             .filter(|batch| guest_batch_writes_overlap(batch, address, byte_count_u64))
             .map(|batch| ("open", 0, batch))
             .or_else(|| {
-                self.committed_guest_batches
+                self.active_committed_guest_batches()
                     .iter()
                     .rev()
                     .enumerate()
@@ -330,13 +324,8 @@ impl MetalPresenter {
             .iter()
             .any(|source| matches!(source, QueuedGlobalReadSource::Synchronize))
         {
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
             self.wait_for_guest_command_batches()?;
-            self.ensure_open_guest_batch(&queue);
+            self.ensure_active_open_guest_batch()?;
             return effective_bindings
                 .into_iter()
                 .zip(sources)
@@ -365,13 +354,8 @@ impl MetalPresenter {
     ) -> Result<UploadedGlobalBuffer, String> {
         let source = self.queued_global_read_source(binding)?;
         if matches!(source, QueuedGlobalReadSource::Synchronize) {
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
             self.wait_for_guest_command_batches()?;
-            self.ensure_open_guest_batch(&queue);
+            self.ensure_active_open_guest_batch()?;
             trace_global_coherence(binding, "synchronized");
             return self.upload_fresh_global_buffer(device, binding);
         }
@@ -448,7 +432,7 @@ impl MetalPresenter {
             byte_count: binding.data.len(),
         };
         if binding.data.len() > GLOBAL_BUFFER_CACHE_BYTE_CAPACITY {
-            if let Some(cached) = self.transient_global_buffer_cache.get(&key)
+            if let Some(cached) = self.active_transient_global_buffer_cache().get(&key)
                 && cached.bytes == binding.data
             {
                 return Ok(UploadedGlobalBuffer {
@@ -459,11 +443,10 @@ impl MetalPresenter {
                 });
             }
             let (buffer, offset) = self
-                .open_guest_batch
-                .as_mut()
+                .active_open_guest_batch_mut()
                 .ok_or("captured global upload has no open guest batch")?
                 .upload_global_bytes(device, &binding.data)?;
-            self.transient_global_buffer_cache.insert(
+            self.active_transient_global_buffer_cache_mut().insert(
                 key,
                 CachedGlobalBuffer {
                     bytes: binding.data.clone(),
@@ -494,8 +477,7 @@ impl MetalPresenter {
         // MTLBuffer for every draw.
         if self.global_buffer_cache.contains_key(&key) {
             let (buffer, offset) = self
-                .open_guest_batch
-                .as_mut()
+                .active_open_guest_batch_mut()
                 .ok_or("captured global upload has no open guest batch")?
                 .upload_global_bytes(device, &binding.data)?;
             return Ok(UploadedGlobalBuffer {
@@ -512,8 +494,7 @@ impl MetalPresenter {
                 > GLOBAL_BUFFER_CACHE_BYTE_CAPACITY
         {
             let (buffer, offset) = self
-                .open_guest_batch
-                .as_mut()
+                .active_open_guest_batch_mut()
                 .ok_or("captured global upload has no open guest batch")?
                 .upload_global_bytes(device, &binding.data)?;
             return Ok(UploadedGlobalBuffer {
@@ -670,8 +651,7 @@ impl MetalPresenter {
             return self.upload_writable_global_buffer_from_packet(device, binding);
         }
         let (buffer, offset) = self
-            .open_guest_batch
-            .as_mut()
+            .active_open_guest_batch_mut()
             .ok_or("synchronized global upload has no open guest batch")?
             .upload_guest_global_bytes(device, binding.base_address, binding.byte_count)?;
         Ok(UploadedGlobalBuffer {
@@ -688,14 +668,14 @@ impl MetalPresenter {
     ) -> Result<QueuedGlobalReadSource, String> {
         let byte_count = u64::try_from(binding.byte_count)
             .map_err(|_| "global binding byte count does not fit u64")?;
-        if let Some(batch) = self.open_guest_batch.as_ref() {
+        if let Some(batch) = self.active_open_guest_batch() {
             let source =
                 queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
             if !matches!(source, QueuedGlobalReadSource::None) {
                 return Ok(synchronize_writable_global_source(binding, source));
             }
         }
-        for batch in self.committed_guest_batches.iter().rev() {
+        for batch in self.active_committed_guest_batches().iter().rev() {
             let source =
                 queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
             if !matches!(source, QueuedGlobalReadSource::None) {

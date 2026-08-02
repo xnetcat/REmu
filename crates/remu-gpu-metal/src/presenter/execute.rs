@@ -142,8 +142,7 @@ impl MetalPresenter {
             // materializes the logical CMASK clear before later geometry loads the attachment.
             super::stats::NOOP_DRAWS_COLOR_OPERATION.fetch_add(1, Ordering::Relaxed);
             if self
-                .open_guest_batch
-                .as_mut()
+                .active_open_guest_batch_mut()
                 .is_some_and(|batch| {
                     batch.end_compute_pass();
                     batch.end_render_pass()
@@ -418,11 +417,7 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
+        let queue = self.active_guest_command_queue()?;
         // Color attachments determine the framebuffer extent when present. Unreal's early-Z and
         // masked-depth passes intentionally program CB_TARGET_MASK=0, so a depth-only pass derives
         // its extent from DB instead. Rejecting those passes leaves the later depth-equal base
@@ -661,7 +656,7 @@ impl MetalPresenter {
         }
         self.synchronize_sampled_aliases(&[export_evaluation, pixel_evaluation])?;
 
-        self.ensure_open_guest_batch(&queue);
+        self.ensure_active_open_guest_batch()?;
         self.prepare_depth_array_textures(&device, &[export_evaluation, pixel_evaluation])?;
         let export_buffers = self.upload_global_buffers(&device, export_evaluation)?;
         let pixel_buffers = self.upload_global_buffers(&device, pixel_evaluation)?;
@@ -1255,8 +1250,7 @@ impl MetalPresenter {
             }),
         };
         let needs_new_render_pass = self
-            .open_guest_batch
-            .as_ref()
+            .active_open_guest_batch()
             .and_then(|batch| batch.render_pass.as_ref())
             .is_none_or(|open| open.key != render_pass_key);
         let pass = if needs_new_render_pass {
@@ -1325,9 +1319,8 @@ impl MetalPresenter {
             None
         };
         {
-            let batch = self
-                .open_guest_batch
-                .as_mut()
+            let (batch, statistics) = self.active_open_guest_batch_and_statistics();
+            let batch = batch
                 .expect("guest command batch was opened above");
             batch.work.push(GuestBatchWork::Draw {
                 sequence: draw.sequence,
@@ -1356,11 +1349,10 @@ impl MetalPresenter {
                     .map(|open| open.key.transition_to(&render_pass_key));
                 batch.end_compute_pass();
                 if batch.end_render_pass() {
-                    self.statistics.render_pass_ends_for_target_change = self
-                        .statistics
+                    statistics.render_pass_ends_for_target_change = statistics
                         .render_pass_ends_for_target_change
                         .saturating_add(1);
-                    self.statistics
+                    statistics
                         .render_pass_key_transitions
                         .record(key_transition.expect("an ended render pass had a key"));
                 }
@@ -1375,8 +1367,8 @@ impl MetalPresenter {
                     key: render_pass_key,
                     encoder,
                 });
-                self.statistics.encoded_render_passes =
-                    self.statistics.encoded_render_passes.saturating_add(1);
+                statistics.encoded_render_passes =
+                    statistics.encoded_render_passes.saturating_add(1);
             }
             let encoder = &batch
                 .render_pass
@@ -2763,8 +2755,7 @@ impl MetalPresenter {
             }
         }
         let batch_full = self
-            .open_guest_batch
-            .as_ref()
+            .active_open_guest_batch()
             .is_some_and(|batch| batch.work.len() >= GUEST_BATCH_WORK_CAPACITY);
         if batch_full {
             self.flush_guest_command_batch(
@@ -2928,11 +2919,6 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
         let source_texture = self
             .ensure_layered_render_target_texture(&device, source, false)?
             .texture;
@@ -2945,10 +2931,9 @@ impl MetalPresenter {
         };
         self.note_resident_texture_read_at(source.texture, activity_stamp);
 
-        self.ensure_open_guest_batch(&queue);
+        self.ensure_active_open_guest_batch()?;
         let batch = self
-            .open_guest_batch
-            .as_mut()
+            .active_open_guest_batch_mut()
             .expect("color resolve opened a guest command batch");
         batch.close_active_pass_encoders();
         let encoder = batch.command_buffer.new_blit_command_encoder();
@@ -3038,11 +3023,6 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
         let selected = self.ensure_layered_render_target_texture(&device, target, true)?;
         let resolved = selected.texture.clone();
         let (attachment_texture, resolve_texture) = if target.sample_count > 1 {
@@ -3058,7 +3038,7 @@ impl MetalPresenter {
             (resolved, None)
         };
 
-        self.ensure_open_guest_batch(&queue);
+        self.ensure_active_open_guest_batch()?;
         let pass = RenderPassDescriptor::new();
         pass.set_render_target_width(u64::from(target.texture.width));
         pass.set_render_target_height(u64::from(target.texture.height));
@@ -3077,8 +3057,7 @@ impl MetalPresenter {
         }
 
         let batch = self
-            .open_guest_batch
-            .as_mut()
+            .active_open_guest_batch_mut()
             .expect("fast-clear elimination opened a guest command batch");
         batch.close_active_pass_encoders();
         let encoder = batch.command_buffer.new_render_command_encoder(pass);

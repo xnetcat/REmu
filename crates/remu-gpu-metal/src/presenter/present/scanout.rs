@@ -774,11 +774,7 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
+        let queue = self.active_guest_command_queue()?;
         let snapshot = self.ensure_scanout_snapshot_texture(&device, descriptor);
         // End and commit every encoder before the flip. The single Metal queue then orders this
         // private-to-private copy between the frame's producer work and any later command stream
