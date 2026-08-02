@@ -3067,6 +3067,122 @@ fn mode27_gpu_retile_preserves_cross_format_alias_bytes_without_a_batch_boundary
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn mode24_depth_rematerialisation_is_byte_exact_and_stays_in_the_guest_batch() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    const SOURCE_BYTES: u64 = 2 * 65_536;
+    let mut memory = GuestAddressSpace::new(4 * SOURCE_BYTES).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(SOURCE_BYTES).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            SOURCE_BYTES,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let source = GuestTextureDescriptor {
+        address,
+        width: 256,
+        height: 128,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let target = GuestTextureDescriptor {
+        address,
+        width: 128,
+        height: 128,
+        pitch: 128,
+        tile_mode: 24,
+        pixel_format: MTLPixelFormat::Depth32Float,
+        bytes_per_pixel: 4,
+    };
+    assert_eq!(guest_texture_byte_count(source), Some(SOURCE_BYTES));
+    assert_eq!(guest_texture_byte_count(target), Some(65_536));
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    presenter
+        .ensure_resident_texture(&device, source)
+        .expect("source resident");
+    let old_target = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("mode-24 depth target")
+        .texture;
+
+    let mut source_linear = vec![0_u8; 256 * 128 * 4];
+    for (index, byte) in source_linear.iter_mut().enumerate() {
+        *byte = u8::try_from((index * 29 + index / 127) & 0xff).expect("byte pattern");
+    }
+    presenter.resident_guest_textures[&source]
+        .texture
+        .replace_region(
+            MTLRegion::new_2d(0, 0, 256, 128),
+            0,
+            source_linear.as_ptr().cast::<std::ffi::c_void>(),
+            256 * 4,
+        );
+    presenter.mark_resident_texture_written(source);
+    assert!(matches!(
+        presenter.resident_guest_textures[&target].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+    ));
+
+    let detiles_before = OWNED_REMATERIALISE_DETILE.load(AtomicOrdering::Relaxed);
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let rematerialised = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("mode-24 depth target rematerialises")
+        .texture;
+    assert!(std::ptr::eq(
+        old_target.as_ref(),
+        rematerialised.as_ref()
+    ));
+    assert_eq!(
+        OWNED_REMATERIALISE_DETILE.load(AtomicOrdering::Relaxed),
+        detiles_before + 1
+    );
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before,
+        "mode-24 GPU rematerialisation must not snapshot guest RAM"
+    );
+    let batch = presenter
+        .open_guest_batch
+        .take()
+        .expect("mode-24 retile/de-tile remains in the open guest batch");
+    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    batch.command_buffer.commit();
+    batch.command_buffer.wait_until_completed();
+
+    let actual = read_texture_linear(&device, &queue, &rematerialised, target)
+        .expect("rematerialised depth readback");
+    let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
+    copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
+        .expect("CPU mode-27 retile oracle");
+    let expected = decode_guest_texture_linear_from_raw(target, &source_raw[..65_536])
+        .expect("CPU mode-24 detile oracle");
+    assert_eq!(actual, expected, "mode-24 GPU detile must be byte exact");
+    assert!(presenter.resident_guest_textures[&target].serves_reads());
+    assert!(presenter.resident_guest_textures[&target].gpu_written());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn mode27_gpu_retile_merges_disjoint_current_owners_in_physical_byte_order() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,

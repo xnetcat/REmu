@@ -114,7 +114,7 @@ enum RemuMode27Parameter {
     kResourceBase = 4, kTargetBase = 5, kLevelOffset = 6, kPitch = 7,
     kBytesPerElement = 8, kBlockWidth = 9, kBlockHeight = 10,
     kTailX = 11, kTailY = 12, kSurfaceZXor = 13, kInTail = 14,
-    kTargetLength = 15, kRunCount = 16
+    kTargetLength = 15, kRunCount = 16, kTileMode = 17
 };
 
 static uint remu_mode27_within_block(uint x, uint y, uint log2_bytes) {
@@ -153,7 +153,42 @@ static uint remu_mode27_within_block(uint x, uint y, uint log2_bytes) {
     }
 }
 
-static ulong remu_mode27_physical(constant ulong* p, uint2 gid) {
+static uint remu_mode24_within_block(uint x, uint y, uint log2_bytes) {
+    switch (log2_bytes) {
+        case 0:
+            return (x & 0x0001u) ^ ((x << 1) & 0x0004u)
+                ^ ((x << 2) & 0x0010u) ^ ((x << 3) & 0x0040u)
+                ^ ((x << 5) & 0x0300u) ^ ((x << 4) & 0x0400u)
+                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
+                ^ ((x << 8) & 0x8000u) ^ ((y << 1) & 0x0002u)
+                ^ ((y << 2) & 0x0008u) ^ ((y << 3) & 0x00a0u)
+                ^ ((y << 5) & 0x0f00u) ^ ((y << 6) & 0x1000u)
+                ^ ((y << 7) & 0x4000u);
+        case 1:
+            return ((x << 1) & 0x0002u) ^ ((x << 2) & 0x0008u)
+                ^ ((x << 3) & 0x0020u) ^ ((x << 4) & 0x0480u)
+                ^ ((x << 5) & 0x0300u) ^ ((x << 6) & 0x0800u)
+                ^ ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u)
+                ^ ((y << 2) & 0x0004u) ^ ((y << 3) & 0x0010u)
+                ^ ((y << 4) & 0x0040u) ^ ((y << 5) & 0x0f00u)
+                ^ ((y << 8) & 0x5000u);
+        case 2:
+            return ((x << 2) & 0x0004u) ^ ((x << 3) & 0x0010u)
+                ^ ((x << 4) & 0x0440u) ^ ((x << 5) & 0x0300u)
+                ^ ((x << 6) & 0x0800u) ^ ((x << 9) & 0xa000u)
+                ^ ((y << 3) & 0x0008u) ^ ((y << 4) & 0x0020u)
+                ^ ((y << 5) & 0x0f80u) ^ ((y << 9) & 0x1000u)
+                ^ ((y << 8) & 0x4000u);
+        default:
+            return ((x << 3) & 0x0008u) ^ ((x << 4) & 0x0420u)
+                ^ ((x << 5) & 0x0380u) ^ ((x << 6) & 0x0800u)
+                ^ ((x << 10) & 0x2000u) ^ ((x << 9) & 0x8000u)
+                ^ ((y << 4) & 0x0010u) ^ ((y << 5) & 0x0f40u)
+                ^ ((y << 10) & 0x5000u);
+    }
+}
+
+static ulong remu_tiled_physical(constant ulong* p, uint2 gid) {
     const uint block_width = uint(p[kBlockWidth]);
     const uint block_height = uint(p[kBlockHeight]);
     const bool tail = p[kInTail] != 0;
@@ -164,8 +199,9 @@ static ulong remu_mode27_physical(constant ulong* p, uint2 gid) {
     const ulong blocks_per_row = (p[kPitch] + block_width - 1u) / block_width;
     const ulong block = tail ? 0ul : ulong(block_y) * blocks_per_row + block_x;
     const uint log2_bytes = ctz(uint(p[kBytesPerElement]));
-    const uint within = remu_mode27_within_block(x, y, log2_bytes)
-        ^ uint(p[kSurfaceZXor]);
+    const uint within = p[kTileMode] == 24ul
+        ? remu_mode24_within_block(x, y, log2_bytes)
+        : remu_mode27_within_block(x, y, log2_bytes) ^ uint(p[kSurfaceZXor]);
     return p[kResourceBase] + p[kLevelOffset] + block * 65536ul + within;
 }
 
@@ -181,7 +217,7 @@ kernel void remu_mode27_scatter(
     device const ulong2* debt [[buffer(2)]], constant ulong* p [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
-    const ulong physical = remu_mode27_physical(p, gid);
+    const ulong physical = remu_tiled_physical(p, gid);
     const ulong source = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
         + ulong(gid.x) * p[kBytesPerElement];
     for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
@@ -198,7 +234,7 @@ kernel void remu_mode27_gather(
     device const uchar* tiled [[buffer(0)]], device uchar* linear [[buffer(1)]],
     constant ulong* p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
-    const ulong physical = remu_mode27_physical(p, gid);
+    const ulong physical = remu_tiled_physical(p, gid);
     const ulong destination = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
         + ulong(gid.x) * p[kBytesPerElement];
     if (physical < p[kTargetBase]
@@ -228,6 +264,7 @@ struct Mode27RematerialisationSubresource {
     metal_slice: u64,
     metal_level: u64,
     metal_z: u64,
+    tile_mode: u64,
 }
 
 fn align_256(value: u64) -> Option<u64> {
@@ -238,21 +275,26 @@ fn align_256(value: u64) -> Option<u64> {
 fn mode27_rematerialisation_subresources(
     resident: &ResidentGuestTexture,
 ) -> Result<(Vec<Mode27RematerialisationSubresource>, u64), String> {
-    if resident.descriptor.tile_mode != 27
+    let tile_mode = resident.descriptor.tile_mode;
+    let valid_element_size = match tile_mode {
+        24 => matches!(resident.descriptor.bytes_per_pixel, 1 | 2 | 4 | 8),
+        27 => matches!(resident.descriptor.bytes_per_pixel, 1 | 2 | 4 | 8 | 16),
+        _ => false,
+    };
+    if !valid_element_size
         || resident.layer_count == 0
         || resident.mip_level_count == 0
-        || !matches!(resident.descriptor.bytes_per_pixel, 1 | 2 | 4 | 8 | 16)
     {
         return Err(format!(
-            "GPU retile requires mode-27 1/2/4/8/16-byte storage, got mode={} bpe={} layers={} mips={}",
-            resident.descriptor.tile_mode,
+            "GPU retile requires mode-24 1/2/4/8-byte or mode-27 1/2/4/8/16-byte storage, got mode={} bpe={} layers={} mips={}",
+            tile_mode,
             resident.descriptor.bytes_per_pixel,
             resident.layer_count,
             resident.mip_level_count,
         ));
     }
     if resident.mip_level_count > 1
-        && (resident.texture_type != 9 || resident.layer_count != 1)
+        && (tile_mode != 27 || resident.texture_type != 9 || resident.layer_count != 1)
     {
         return Err(format!(
             "GPU retile cannot represent mipmapped type={} layers={}",
@@ -303,7 +345,7 @@ fn mode27_rematerialisation_subresources(
         ));
     }
     let bytes_per_element = u64::from(resident.descriptor.bytes_per_pixel);
-    let block_bytes = tiled_block_bytes(27).ok_or("mode-27 block size is unavailable")?;
+    let block_bytes = tiled_block_bytes(tile_mode).ok_or("tiled block size is unavailable")?;
     let (base_block_width, base_block_height) = tiled_block_dimensions(
         block_bytes,
         usize::try_from(bytes_per_element).map_err(|_| "element size does not fit usize")?,
@@ -362,6 +404,7 @@ fn mode27_rematerialisation_subresources(
             metal_slice,
             metal_level,
             metal_z,
+            tile_mode: u64::from(tile_mode),
         });
         linear_offset = linear_offset
             .checked_add(linear_image_bytes)
@@ -430,7 +473,7 @@ fn mode27_rematerialisation_parameters(
     resource_base: u64,
     target_span: ResourceSpan,
     run_count: usize,
-) -> Result<[u64; 17], String> {
+) -> Result<[u64; 18], String> {
     Ok([
         subresource.width,
         subresource.height,
@@ -449,6 +492,7 @@ fn mode27_rematerialisation_parameters(
         u64::from(subresource.in_tail),
         target_span.len(),
         u64::try_from(run_count).map_err(|_| "GPU retile run count does not fit u64")?,
+        subresource.tile_mode,
     ])
 }
 
