@@ -18,7 +18,6 @@ mod control_flow;
 mod conversion;
 mod data_share;
 mod dpp;
-mod glyph_uv;
 mod golden;
 mod image;
 mod interface;

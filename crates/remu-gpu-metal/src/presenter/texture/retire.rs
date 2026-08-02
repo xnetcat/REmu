@@ -4,7 +4,7 @@
 use super::{
     CachedSampledTexture, GuestTextureDescriptor, GuestTextureOverlapQuery,
     MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture, SampledTextureKey,
-    guest_ranges_overlap, guest_texture_byte_count,
+    guest_ranges_overlap, guest_texture_byte_count, quarantine_retired_resident,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -126,6 +126,7 @@ pub(crate) fn retire_sampled_textures_overlapping_writeback(
 
 pub(crate) fn retire_resident_textures_overlapping_writeback(
     cache: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     alias_ranges: &[(u64, u64)],
     source_descriptor: GuestTextureDescriptor,
     source_content_version: u64,
@@ -142,6 +143,9 @@ pub(crate) fn retire_resident_textures_overlapping_writeback(
     for descriptor in retired {
         if let Some(resident) = cache.remove(&descriptor) {
             trace_resident_texture_removal("overlapping-writeback", &resident);
+            // A clean tenant of the same pooled allocation survives in quarantine. If the
+            // writeback really rewrote its bytes, adoption's content validation rejects it.
+            quarantine_retired_resident(retired_texture_quarantine, resident);
         }
     }
 }

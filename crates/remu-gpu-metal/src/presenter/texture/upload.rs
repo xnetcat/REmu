@@ -22,8 +22,8 @@ use super::{
     sampled_texture_key, sampled_texture_uses_exact_mode5_mips,
     sampled_texture_uses_exact_mode27_mips, sampler_uses_normalized_coordinates,
     snapshot_watched_sampled_texture_raw, storage_image_requires_mip_hierarchy,
-    texture_element_layout, trace_alias_correlated_image_bindings, trace_resident_texture_removal,
-    trace_target_sampling,
+    texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
+    trace_resident_texture_removal, trace_target_sampling,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
@@ -154,6 +154,44 @@ pub(crate) fn upload_image_textures(
             let descriptor = decoded
                 .or_else(|_| fallback_image_descriptor(binding))
                 .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+            // Slate/UMG font atlases are single-channel sampled images whose whole glyph
+            // rendering depends on the T# destination select reaching the shader. Log the raw
+            // descriptor words and the decoded swizzle once per atlas so a tofu report can be
+            // split into "wrong atlas bytes" versus "lost channel routing".
+            if trace_glyph_atlas()
+                && !writable
+                && matches!(
+                    descriptor.guest.pixel_format,
+                    MTLPixelFormat::R8Unorm | MTLPixelFormat::A8Unorm
+                )
+            {
+                static LOGGED: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
+                let mut logged = LOGGED
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if logged.len() < 64
+                    && logged.insert((descriptor.guest.address, descriptor.destination_select))
+                {
+                    eprintln!(
+                        "[REMu][METAL][GLYPH-ATLAS] stage={trace_stage} pc={:#x} fallback={fallback} words={:08x?} address={:#x} extent={}x{} pitch={} format={:?} tile={} dst_sel={:#x} mips={}..={} type={}",
+                        binding.pc,
+                        binding.resource_descriptor,
+                        descriptor.guest.address,
+                        descriptor.guest.width,
+                        descriptor.guest.height,
+                        descriptor.guest.pitch,
+                        descriptor.guest.pixel_format,
+                        descriptor.guest.tile_mode,
+                        descriptor.destination_select,
+                        descriptor.base_mip_level,
+                        descriptor
+                            .base_mip_level
+                            .saturating_add(descriptor.mip_level_count.saturating_sub(1)),
+                        descriptor.texture_type,
+                    );
+                }
+            }
             if trace_target_sampling()
                 && descriptor.guest.width == 1_920
                 && descriptor.guest.height == 1_080

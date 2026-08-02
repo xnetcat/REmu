@@ -214,8 +214,11 @@ impl MetalPresenter {
                     &mut self.sampled_texture_cache,
                     &alias_ranges,
                 );
+                // Pressure eviction reclaims memory; parking casualties in the quarantine the
+                // pass just cleared would keep their allocations alive, so discard them.
                 retire_resident_textures_overlapping_writeback(
                     &mut self.resident_guest_textures,
+                    &mut HashMap::new(),
                     &alias_ranges,
                     descriptor,
                     content_version,
@@ -528,6 +531,7 @@ impl MetalPresenter {
                     );
                     retire_resident_textures_overlapping_writeback(
                         &mut self.resident_guest_textures,
+                        &mut self.retired_texture_quarantine,
                         &alias_ranges,
                         resident.descriptor,
                         resident.content_version,
@@ -1204,7 +1208,7 @@ impl MetalPresenter {
                     // Unreal sub-allocates many live surfaces inside one pooled allocation, so
                     // most "stale" aliases here are untouched neighbours of the written range.
                     // Keep them adoptable while their watch can still prove the bytes unchanged.
-                    self.quarantine_clean_resident(resident);
+                    quarantine_retired_resident(&mut self.retired_texture_quarantine, resident);
                 }
             }
             let resident = self
@@ -1217,36 +1221,6 @@ impl MetalPresenter {
             resident.note_gpu_write();
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
-    }
-
-    /// Holds a retired clean resident for adoption while its write watch stays armed.
-    ///
-    /// Only residents the GPU never wrote enter the quarantine, so an adoption can never skip
-    /// a writeback the guest is owed. A watch whose mapping was replaced can no longer prove
-    /// anything about its bytes and is dropped instead.
-    fn quarantine_clean_resident(&mut self, resident: ResidentGuestTexture) {
-        if resident.gpu_written
-            || resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced)
-        {
-            return;
-        }
-        if self.retired_texture_quarantine.len() >= RETIRED_TEXTURE_QUARANTINE_CAPACITY
-            && !self
-                .retired_texture_quarantine
-                .contains_key(&resident.descriptor)
-        {
-            let oldest = self
-                .retired_texture_quarantine
-                .iter()
-                .min_by_key(|(_, candidate)| (candidate.last_use.flip, candidate.last_use.work))
-                .map(|(descriptor, _)| *descriptor);
-            let Some(oldest) = oldest else {
-                return;
-            };
-            self.retired_texture_quarantine.remove(&oldest);
-        }
-        self.retired_texture_quarantine
-            .insert(resident.descriptor, resident);
     }
 
     pub(crate) fn note_resident_texture_read_at(
@@ -1280,6 +1254,36 @@ impl MetalPresenter {
 /// not thousands — and every entry pins a Metal allocation, so the bound stays small and
 /// eviction prefers the least recently used surface.
 pub(crate) const RETIRED_TEXTURE_QUARANTINE_CAPACITY: usize = 64;
+
+/// Holds a retired clean resident for adoption while its write watch stays armed.
+///
+/// Only residents the GPU never wrote enter the quarantine, so an adoption can never skip a
+/// writeback the guest is owed. A watch whose mapping was replaced can no longer prove
+/// anything about its bytes and is dropped instead, and the bounded map evicts its least
+/// recently used surface first.
+pub(crate) fn quarantine_retired_resident(
+    retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    resident: ResidentGuestTexture,
+) {
+    if resident.gpu_written
+        || resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced)
+    {
+        return;
+    }
+    if retired_texture_quarantine.len() >= RETIRED_TEXTURE_QUARANTINE_CAPACITY
+        && !retired_texture_quarantine.contains_key(&resident.descriptor)
+    {
+        let oldest = retired_texture_quarantine
+            .iter()
+            .min_by_key(|(_, candidate)| (candidate.last_use.flip, candidate.last_use.work))
+            .map(|(descriptor, _)| *descriptor);
+        let Some(oldest) = oldest else {
+            return;
+        };
+        retired_texture_quarantine.remove(&oldest);
+    }
+    retired_texture_quarantine.insert(resident.descriptor, resident);
+}
 
 /// Re-adopts a quarantined clean resident whose watch proves its bytes are unchanged.
 ///

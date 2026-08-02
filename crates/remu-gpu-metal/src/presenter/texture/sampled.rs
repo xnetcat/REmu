@@ -237,6 +237,7 @@ impl MetalPresenter {
             );
             retire_resident_textures_overlapping_writeback(
                 &mut self.resident_guest_textures,
+                &mut self.retired_texture_quarantine,
                 &alias_ranges,
                 descriptor,
                 content_version,

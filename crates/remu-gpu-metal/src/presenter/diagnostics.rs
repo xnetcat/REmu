@@ -37,6 +37,16 @@ pub(super) fn trace_image_descriptors() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_IMAGES").is_some_and(|value| value == "1"))
 }
 
+/// Traces single-channel sampled images (Slate/UMG font atlases) at descriptor decode time:
+/// the raw T# words, the decoded destination select, and the uploaded payload occupancy. The
+/// glyph-tofu class of defect needs exactly this evidence to separate wrong atlas bytes from a
+/// lost channel swizzle.
+pub(super) fn trace_glyph_atlas() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("REMU_TRACE_GLYPH_ATLAS").is_some_and(|value| value == "1"))
+}
+
 pub(super) fn trace_target_sampling() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {

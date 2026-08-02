@@ -99,7 +99,8 @@ use self::diagnostics::{
     record_diagnostic_global_writers, record_diagnostic_memory_copy,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer,
     should_record_diagnostic_target_writer, trace_image_descriptors, trace_msaa_writes,
-    trace_scanout_writes, trace_target_sampling, trace_video_target_compute_consumer,
+    trace_glyph_atlas, trace_scanout_writes, trace_target_sampling,
+    trace_video_target_compute_consumer,
     trace_video_target_consumers, trace_video_target_draw_consumer, video_target_binding_summary,
 };
 #[cfg(test)]

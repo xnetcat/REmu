@@ -31,7 +31,8 @@ use super::{
     record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, render_resolve_candidate_matches,
     sampled_alias_descriptor, sampler_uses_normalized_coordinates, texture_element_layout,
-    trace_image_descriptors, trace_target_sampling, trace_video_target_consumers,
+    trace_glyph_atlas, trace_image_descriptors, trace_target_sampling,
+    trace_video_target_consumers,
     write_resident_texture_contents_to_guest,
 };
 #[cfg(test)]
@@ -64,7 +65,8 @@ pub(crate) use self::mips::{
 };
 pub(crate) use self::residency::{
     RETIRED_TEXTURE_QUARANTINE_CAPACITY, adopt_quarantined_resident,
-    ensure_resident_texture_in_map, resident_texture_ownership_stats,
+    ensure_resident_texture_in_map, quarantine_retired_resident,
+    resident_texture_ownership_stats,
 };
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
