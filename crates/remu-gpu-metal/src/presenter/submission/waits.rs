@@ -175,7 +175,10 @@ impl MetalPresenter {
             }
             return Err(error);
         }
-        if self.per_queue_guest_batches && ticket_id.is_some() {
+        if self.per_queue_guest_batches
+            && let Some(ticket_id) = ticket_id
+            && self.gpu_wait_fences.note_missing_once(ticket_id)
+        {
             self.statistics.shared_event_fallbacks_no_exact_producer = self
                 .statistics
                 .shared_event_fallbacks_no_exact_producer

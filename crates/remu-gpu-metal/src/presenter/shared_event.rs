@@ -8,7 +8,7 @@
 
 use metal::{DeviceRef, SharedEvent, SharedEventRef};
 use remu_gpu::GpuWaitId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -147,6 +147,7 @@ pub(crate) enum GpuWaitFenceBindResult {
 #[derive(Default)]
 pub(crate) struct GpuWaitFenceMap {
     by_wait: HashMap<GpuWaitId, SharedEventFence>,
+    missing_once: HashSet<GpuWaitId>,
 }
 
 impl GpuWaitFenceMap {
@@ -159,6 +160,7 @@ impl GpuWaitFenceMap {
 
         match self.by_wait.entry(wait_id) {
             Entry::Vacant(entry) => {
+                self.missing_once.remove(&wait_id);
                 entry.insert(fence);
                 GpuWaitFenceBindResult::Bound
             }
@@ -172,7 +174,21 @@ impl GpuWaitFenceMap {
     }
 
     pub(crate) fn take(&mut self, wait_id: GpuWaitId) -> Option<SharedEventFence> {
+        self.missing_once.remove(&wait_id);
         self.by_wait.remove(&wait_id)
+    }
+
+    /// Records the first execution of one exact submitted wait before a producer fence is bound.
+    ///
+    /// Periodic producerless polling can execute the same queue-front ticket hundreds of times per
+    /// second. Counting those attempts as distinct producer misses made the B17 telemetry look like
+    /// hundreds of unrelated generations were unbound. The process-unique `GpuWaitId`, not its
+    /// recyclable guest label address, is the identity for this diagnostic.
+    pub(crate) fn note_missing_once(&mut self, wait_id: GpuWaitId) -> bool {
+        if self.by_wait.contains_key(&wait_id) {
+            return false;
+        }
+        self.missing_once.insert(wait_id)
     }
 
     pub(crate) fn fences(&self) -> impl Iterator<Item = SharedEventFence> + '_ {
@@ -358,6 +374,9 @@ mod tests {
         let replacement = first_timeline.allocate_fence().expect("replacement fence");
         let mut bindings = GpuWaitFenceMap::default();
 
+        assert!(bindings.note_missing_once(old_generation));
+        assert!(!bindings.note_missing_once(old_generation));
+        assert!(bindings.note_missing_once(new_generation));
         assert_eq!(
             bindings.bind_if_unbound(old_generation, old_fence),
             GpuWaitFenceBindResult::Bound
@@ -374,6 +393,7 @@ mod tests {
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings.get(old_generation), Some(old_fence));
         assert_eq!(bindings.get(new_generation), Some(new_fence));
+        assert!(!bindings.note_missing_once(old_generation));
         assert_eq!(bindings.take(old_generation), Some(old_fence));
         assert_eq!(bindings.get(old_generation), None);
         assert_eq!(bindings.get(new_generation), Some(new_fence));

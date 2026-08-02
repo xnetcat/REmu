@@ -4293,13 +4293,12 @@ fn per_queue_flush_clears_only_its_transient_bindings() {
 }
 
 #[test]
-fn per_queue_registered_wait_uses_shared_events_and_host_ack_without_early_publication() {
+fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
     remu_gpu::clear_event_sink();
     let (sender, receiver) = gpu_event_channel();
     remu_gpu::install_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
-    open_per_queue_batch(&mut presenter, 41);
     let (_label_space, label) = mapped_test_label();
     let wait = GpuMemoryWait {
         address: label,
@@ -4333,7 +4332,17 @@ fn per_queue_registered_wait_uses_shared_events_and_host_ack_without_early_publi
 
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
     assert_eq!(presenter.statistics.shared_event_waits, 1);
+    assert_eq!(
+        presenter
+            .statistics
+            .shared_event_fallbacks_no_exact_producer,
+        0
+    );
     assert_eq!(presenter.statistics.batch_flushes_for_blocked_wait, 0);
+    assert!(
+        presenter.guest_queue_batches[&41].open_batch.is_some(),
+        "a release-only producer still needs a queue-local signal batch"
+    );
     assert_eq!(
         read_test_label(label),
         0,
@@ -4378,5 +4387,78 @@ fn per_queue_registered_wait_uses_shared_events_and_host_ack_without_early_publi
             .is_empty(),
         "retired fence ranges are pruned after the last wait/resource reference"
     );
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_label_space, label) = mapped_test_label();
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    // The consumer is older in ingress order and reaches the wait before the producer release is
+    // executed. The release must bind and wake this exact ticket, rather than waiting for the next
+    // periodic address poll.
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+                engine: 0,
+                cb_db_control: 0,
+                base_address: label,
+                size_bytes: 4,
+                poll_interval: 0,
+                gcr_control: 0,
+            }),
+        ],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(
+        presenter.statistics.shared_event_waits, 1,
+        "the newly bound ticket should resume before receive_events returns"
+    );
+    assert_eq!(
+        presenter
+            .statistics
+            .shared_event_fallbacks_no_exact_producer,
+        1,
+        "one exact ticket missed on its first execution; retries are not new generations"
+    );
+    assert!(matches!(
+        presenter.receiver.blocked_queues.get(&0),
+        Some(QueueBlockReason::GuestSharedEventHostEffect { .. })
+    ));
+    assert_eq!(
+        read_test_label(label),
+        0,
+        "release remains terminal-deferred"
+    );
+
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("producer and consumer batches commit");
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("cross-queue release and acknowledgement settle");
+    assert_eq!(read_test_label(label), 1);
     remu_gpu::clear_event_sink();
 }
