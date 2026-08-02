@@ -1274,6 +1274,55 @@ fn appends_dynamic_global_base_and_size_metadata_after_guest_scalars() {
 }
 
 #[test]
+fn pixel_scalar_metadata_delivers_the_font_atlas_destination_select() {
+    // Poppy Playtime binds its Slate/UMG font atlas straight out of the pixel stage's user-data
+    // SGPRs (`scalar_resource = 0`), so the descriptor's word three lives at scalar index 3. The
+    // translated pixel shader reads its T# destination select from `remu_initial_s[3]`, which
+    // makes this metadata build the only carrier between the guest descriptor and the in-shader
+    // swizzle. 0x800 routes red into ALPHA (PF_A8); if it arrived as zero the shader's 0xFAC
+    // identity fallback would sample the R8 atlas as (r, 0, 0, 1) and turn every glyph into a
+    // solid opaque block.
+    const FONT_ATLAS_DESCRIPTOR: [u32; 8] = [
+        0x912f_2a00,
+        0xc010_0000,
+        0x00ff_c0ff,
+        0x9090_0800,
+        0,
+        0x0070_0000,
+        0,
+        0,
+    ];
+    let mut seeded = vec![0_u32; 128];
+    seeded[..FONT_ATLAS_DESCRIPTOR.len()].copy_from_slice(&FONT_ATLAS_DESCRIPTOR);
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: seeded.clone().into(),
+        scalar_registers: seeded.into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    // SPI_SHADER_USER_DATA_PS_0 is 0x00c; the presenter refreshes the seeded scalars from the
+    // live SH register snapshot immediately before the draw is encoded.
+    let registers = FONT_ATLAS_DESCRIPTOR
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| GpuRegister {
+            offset: 0x00c + u32::try_from(index).expect("descriptor index fits u32"),
+            value,
+        })
+        .collect::<Vec<_>>();
+
+    let words = shader_scalar_metadata_for_registers(&evaluation, &registers, 0x00c, 0)
+        .expect("pixel scalar metadata fits");
+
+    assert_eq!(&words[..FONT_ATLAS_DESCRIPTOR.len()], &FONT_ATLAS_DESCRIPTOR);
+    assert_eq!(words[3], 0x9090_0800);
+    assert_eq!(words[3] & 0xfff, 0x800);
+}
+
+#[test]
 fn live_scalar_metadata_matches_sorted_register_snapshot_values() {
     let evaluation = ShaderEvaluation {
         initial_scalar_registers: vec![u32::MAX; 64].into(),
