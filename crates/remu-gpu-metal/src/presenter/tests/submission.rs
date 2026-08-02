@@ -9,14 +9,17 @@ use metal::{
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuFlipWait,
     GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
+    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, ShaderSnapshot, gpu_event_channel,
 };
 
 use remu_memory::{
     CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
     GuestProtection, guest_shared_backing_identity, guest_shared_backing_range,
 };
-use remu_shader::{GlobalMemoryBinding, Program, ShaderEvaluation};
+use remu_shader::{
+    GlobalMemoryBinding, GlobalMemoryControl, Instruction, InstructionControl, Opcode, Program,
+    ShaderEncoding, ShaderEvaluation,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -4382,6 +4385,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
     assert_eq!(uploaded.buffer.as_ptr(), before_signal.as_ptr());
     assert_ne!(uploaded.buffer.as_ptr(), after_signal.as_ptr());
 
+    let program = Arc::new(Program::new(0x5000, Vec::new()));
     let dispatch = ComputeDispatch {
         sequence: 1,
         source: ComputeDispatchSource::Direct,
@@ -4396,7 +4400,12 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         },
         shader_address: 0x5000,
         shader_prefix: [0; 4],
-        shader: None,
+        shader: Some(ShaderSnapshot {
+            header_address: 0x5000,
+            program,
+            supplemental_programs: Arc::from([]),
+            metadata: None,
+        }),
         shader_evaluation: Some(Arc::new(evaluation)),
         shader_registers: Vec::new(),
     };
@@ -4404,6 +4413,42 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         OrderedEventSource::GuestQueue(0),
         &GpuEvent::ComputeDispatch(Box::new(dispatch.clone())),
     ));
+    let mut uncovered = dispatch.clone();
+    uncovered.shader = Some(ShaderSnapshot {
+        header_address: 0x5000,
+        program: Arc::new(Program::new(
+            0x5000,
+            vec![Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Flat,
+                opcode: Opcode::Known("GlobalLoadDword"),
+                words: Vec::new(),
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                    dword_count: 1,
+                    vector_address: 0,
+                    vector_data: 0,
+                    vector_destination: 0,
+                    scalar_address: Some(0),
+                    offset_bytes: 0,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                })),
+            }],
+        )),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    });
+    assert!(
+        !presenter.event_is_shared_event_gpu_orderable(
+            OrderedEventSource::GuestQueue(0),
+            &GpuEvent::ComputeDispatch(Box::new(uncovered)),
+        ),
+        "a memory instruction omitted by partial evaluation must remain behind the host gate"
+    );
     let mut indirect = dispatch;
     indirect.source = ComputeDispatchSource::Indirect {
         dimensions_address: guest_address + 0x100,

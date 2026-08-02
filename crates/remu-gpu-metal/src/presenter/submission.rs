@@ -748,13 +748,17 @@ impl MetalPresenter {
             GpuEvent::MemoryAcquire(acquire) => !acquire.invalidates_guest_resources(),
             GpuEvent::ComputeDispatch(dispatch) => {
                 matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct)
-                    && dispatch
-                        .shader_evaluation
-                        .as_ref()
-                        .is_some_and(|evaluation| {
-                            evaluation.image_bindings.is_empty()
-                                && self.shared_event_dependencies_supply_compute_globals(evaluation)
-                        })
+                    && dispatch.shader.as_ref().is_some_and(|snapshot| {
+                        dispatch
+                            .shader_evaluation
+                            .as_ref()
+                            .is_some_and(|evaluation| {
+                                compute_program_has_only_covered_readonly_buffers(
+                                    snapshot, evaluation,
+                                ) && self
+                                    .shared_event_dependencies_supply_compute_globals(evaluation)
+                            })
+                    })
             }
             GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
                 self.active_open_guest_batch().is_some()
@@ -780,4 +784,36 @@ impl MetalPresenter {
             _ => false,
         }
     }
+}
+
+fn compute_program_has_only_covered_readonly_buffers(
+    snapshot: &remu_gpu::ShaderSnapshot,
+    evaluation: &remu_shader::ShaderEvaluation,
+) -> bool {
+    if !snapshot.supplemental_programs.is_empty()
+        || evaluation.global_memory_bindings.is_empty()
+        || !evaluation.image_bindings.is_empty()
+    {
+        return false;
+    }
+    snapshot
+        .program
+        .instructions
+        .iter()
+        .all(|instruction| match instruction.control {
+            Some(remu_shader::InstructionControl::Image(_)) => false,
+            Some(
+                remu_shader::InstructionControl::GlobalMemory(_)
+                | remu_shader::InstructionControl::BufferMemory(_)
+                | remu_shader::InstructionControl::ScalarMemory(_),
+            ) => {
+                !instruction.opcode.contains("Store")
+                    && !instruction.opcode.contains("Atomic")
+                    && evaluation
+                        .global_memory_bindings
+                        .iter()
+                        .any(|binding| binding.instruction_pcs.contains(&instruction.pc))
+            }
+            _ => true,
+        })
 }
