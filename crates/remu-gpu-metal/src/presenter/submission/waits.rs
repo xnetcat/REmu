@@ -63,6 +63,8 @@ impl MetalPresenter {
         // The producer publication also latches registered waits, so the normal ticket path above
         // resumes without polling a recycled label generation.
         let pending_value = self.pending_guest_memory_value(wait.address, wait.is_64_bit);
+        let pending_satisfying_producer =
+            pending_value.is_some_and(|value| wait.is_satisfied_by(value));
         match pending_value {
             Some(value) => {
                 if wait.is_satisfied_by(value) {
@@ -140,7 +142,15 @@ impl MetalPresenter {
                 wait.address, wait.mask, wait.reference, wait.compare_function
             );
         }
-        Ok(GuestMemoryWaitStatus::Blocked)
+        if pending_satisfying_producer
+            && self
+                .pending_guest_memory_value(wait.address, wait.is_64_bit)
+                .is_some_and(|value| wait.is_satisfied_by(value))
+        {
+            Ok(GuestMemoryWaitStatus::BlockedOnPendingTerminal)
+        } else {
+            Ok(GuestMemoryWaitStatus::Blocked)
+        }
     }
 
     pub(crate) fn record_submitted_gpu_waits_in_range(&mut self, address: u64, byte_count: u64) {

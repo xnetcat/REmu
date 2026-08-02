@@ -965,6 +965,11 @@ struct ScheduledHostEvent {
 #[derive(Clone, Debug)]
 enum QueueBlockReason {
     GuestMemoryWait(GpuMemoryWait),
+    /// The satisfying value is already ordered behind a submitted Metal batch.
+    ///
+    /// Unlike a producerless wait, this queue does not need periodic CPU polling. Terminal
+    /// publication wakes the exact overlapping wait after the label becomes guest-visible.
+    GuestMemoryWaitPendingTerminal(GpuMemoryWait),
     FlipSafetyWait(GpuFlipWait),
     GraphicsPipeline(GraphicsPipelineKey),
     ComputePipeline(ComputePipelineKey),
@@ -1533,6 +1538,7 @@ struct PendingGuestMemoryWrite {
 enum GuestMemoryWaitStatus {
     Satisfied,
     Blocked,
+    BlockedOnPendingTerminal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -85,7 +85,8 @@ impl MetalPresenter {
                     self.compiled_compute_pipelines.contains_key(key)
                         || self.failed_compute_pipelines.contains(key)
                 }
-                QueueBlockReason::GuestMemoryWait(_) => false,
+                QueueBlockReason::GuestMemoryWait(_)
+                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
                 QueueBlockReason::FlipSafetyWait(wait) => wait
                     .required_flip_sequence
                     .is_none_or(|sequence| {
@@ -332,6 +333,14 @@ impl MetalPresenter {
                             );
                             continue;
                         }
+                        Ok(GuestMemoryWaitStatus::BlockedOnPendingTerminal) => {
+                            self.receiver.block_event(
+                                source,
+                                GpuEvent::MemoryWait(wait),
+                                QueueBlockReason::GuestMemoryWaitPendingTerminal(wait),
+                            );
+                            continue;
+                        }
                         Err(error) => {
                             eprintln!("[REMu][METAL] WAIT_REG_MEM synchronization failed: {error}");
                         }
@@ -345,6 +354,14 @@ impl MetalPresenter {
                                 source,
                                 GpuEvent::RegisteredMemoryWait { id, wait },
                                 QueueBlockReason::GuestMemoryWait(wait),
+                            );
+                            continue;
+                        }
+                        Ok(GuestMemoryWaitStatus::BlockedOnPendingTerminal) => {
+                            self.receiver.block_event(
+                                source,
+                                GpuEvent::RegisteredMemoryWait { id, wait },
+                                QueueBlockReason::GuestMemoryWaitPendingTerminal(wait),
                             );
                             continue;
                         }
