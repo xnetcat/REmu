@@ -31,6 +31,10 @@ mod present;
 mod readback;
 mod sampler;
 mod shader;
+// B17 consumes these primitives when presenter batches become guest-queue-owned. Keep the layer
+// compiled and tested before that structural integration without pretending it is active yet.
+#[allow(dead_code)]
+mod shared_event;
 mod stats;
 mod submission;
 mod texture;
