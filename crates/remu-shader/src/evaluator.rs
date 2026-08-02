@@ -1,8 +1,8 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::BTreeMap;
-use std::sync::{Mutex, PoisonError};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use smallvec::SmallVec;
 
@@ -20,7 +20,7 @@ use crate::{
 use crate::{Operand, OperandKind};
 use control_flow::{
     ScalarPath, VisitedPaths, branch_condition_depends_on_vector_state, branch_taken,
-    branch_target, is_scalar_branch, scalar_state_hash,
+    branch_target, is_scalar_branch, scalar_recurrence_state, scalar_state_hash,
 };
 #[cfg(test)]
 use resources::decode_buffer_descriptor;
@@ -162,6 +162,7 @@ struct Evaluator<'a, M> {
     final_registers: [u32; SCALAR_REGISTER_COUNT],
     pending_paths: Vec<ScalarPath>,
     visited_paths: VisitedPaths,
+    backward_branch_vector_control: BTreeMap<u32, bool>,
     image_bindings: Vec<ImageBinding>,
     scalar_memory_reads: ScalarMemoryReads,
     global_bindings: Vec<GlobalMemoryBinding>,
@@ -188,9 +189,10 @@ fn record_truncated_evaluation(reason: &'static str, address: u64) {
 
 /// Renders abandoned evaluation paths as report lines, one per reason, without a log prefix.
 ///
-/// `vector-loop-followed-once` is the deliberate discovery strategy for EXEC/VCC loops — one
-/// iteration finds loop-invariant resources — so its line is expected on most titles; a binding
-/// that changes per iteration is the case it can miss. The other reasons abandon a path outright.
+/// Vector-controlled loops whose evaluation-live scalar state reaches an exact recurrence are
+/// complete for resource discovery and are not listed. `vector-loop-scalar-state-changed` means
+/// the loop changed state that can affect a later descriptor or scalar branch, so stopping remains
+/// a real semantic gap. The other reasons abandon a path outright.
 #[must_use]
 pub fn truncated_evaluation_report() -> Vec<String> {
     let truncations = TRUNCATED_EVALUATIONS
@@ -264,6 +266,7 @@ fn evaluate_shader_within(
         final_registers: registers,
         pending_paths: Vec::with_capacity(4),
         visited_paths: VisitedPaths::new(),
+        backward_branch_vector_control: BTreeMap::new(),
         image_bindings: Vec::with_capacity(state.program.image_binding_capacity_hint()),
         scalar_memory_reads: ScalarMemoryReads::with_capacity(
             state.program.scalar_memory_read_capacity_hint(),
@@ -281,6 +284,7 @@ fn evaluate_shader_within(
             scalar_condition: false,
             supplemental: false,
             backward_branch_visits: SmallVec::new(),
+            backward_branch_recurrences: SmallVec::new(),
         });
     }
     while let Some(path) = evaluator.pending_paths.pop() {
@@ -308,6 +312,78 @@ fn evaluate_shader_within(
 }
 
 impl<M: GuestMemoryReader> Evaluator<'_, M> {
+    fn trace_scalar_loop_latch(&self, instruction: &Instruction, header_pc: u32) {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static SITES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("REMU_TRACE_SHADER_LOOPS").is_some_and(|value| value == "1")
+        }) {
+            return;
+        }
+        let address = self.state.program.instruction_address(instruction.pc);
+        if !SITES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(address)
+        {
+            return;
+        }
+        eprintln!(
+            "[REMu][SHADER][SCALAR-LOOP] program={:#x} latch={address:#x} pc={:#x} header={header_pc:#x}",
+            self.state.program.address, instruction.pc
+        );
+    }
+
+    fn trace_vector_loop_fixed_point(&self, instruction: &Instruction, header_pc: u32) {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static SITES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("REMU_TRACE_SHADER_LOOPS").is_some_and(|value| value == "1")
+        }) {
+            return;
+        }
+        let address = self.state.program.instruction_address(instruction.pc);
+        if !SITES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(address)
+        {
+            return;
+        }
+        eprintln!(
+            "[REMu][SHADER][VECTOR-LOOP-FIXED-POINT] program={:#x} latch={address:#x} pc={:#x} header={header_pc:#x}",
+            self.state.program.address, instruction.pc
+        );
+    }
+
+    /// Returns whether an unconditional latch closes a loop whose exit depends on lane state.
+    ///
+    /// LLVM represents many divergent loops as a forward EXEC/VCC exit followed by an
+    /// unconditional backward latch. The latch itself carries no condition, so classifying every
+    /// backward `S_BRANCH` as vector-controlled also misclassifies ordinary scalar counted loops.
+    /// An EXEC/VCC edge that leaves the latch's natural-loop interval is the distinguishing fact.
+    fn unconditional_latch_is_vector_controlled(
+        &self,
+        header_index: usize,
+        latch_index: usize,
+    ) -> Result<bool, EvaluationError> {
+        let header_pc = self.state.program.instructions[header_index].pc;
+        let latch_pc = self.state.program.instructions[latch_index].pc;
+        for instruction in &self.state.program.instructions[header_index..latch_index] {
+            if instruction.encoding != ShaderEncoding::Sopp
+                || !is_scalar_branch(instruction.opcode)
+                || !branch_condition_depends_on_vector_state(instruction.opcode)
+            {
+                continue;
+            }
+            let target_pc = branch_target(instruction)?;
+            if target_pc < header_pc || target_pc > latch_pc {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn queue_path(&mut self, mut path: ScalarPath) {
         let Some(instruction_index) = self
             .state
@@ -427,34 +503,67 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                         // EXEC/VCC loops are controlled by vector lane state that static scalar
                         // evaluation intentionally does not execute. Follow one iteration to
                         // discover in-loop resources, then continue through the already queued
-                        // exit path. Scalar SCC loops can still initialize bounded tables exactly.
-                        let maximum_visits = if matches!(
-                            instruction.opcode.known_name(),
-                            Some(
-                                "SBranch"
-                                    | "SCbranchVccz"
-                                    | "SCbranchVccnz"
-                                    | "SCbranchExecz"
-                                    | "SCbranchExecnz"
-                            )
-                        ) {
-                            1
+                        // exit path. Scalar SCC loops have an exact direction and run until that
+                        // direction exits; the evaluator-wide instruction budget remains the
+                        // safety bound for malformed or genuinely non-terminating scalar code.
+                        let unconditional_latch_is_vector_controlled = if instruction
+                            .opcode
+                            .is("SBranch")
+                        {
+                            if let Some(vector_controlled) = self
+                                .backward_branch_vector_control
+                                .get(&instruction.pc)
+                                .copied()
+                            {
+                                vector_controlled
+                            } else {
+                                let vector_controlled = self
+                                    .unconditional_latch_is_vector_controlled(
+                                        target_index,
+                                        instruction_index,
+                                    )?;
+                                self.backward_branch_vector_control
+                                    .insert(instruction.pc, vector_controlled);
+                                vector_controlled
+                            }
                         } else {
-                            4_096
+                            false
                         };
-                        if backward_visits >= maximum_visits {
-                            record_truncated_evaluation(
-                                if maximum_visits == 1 {
-                                    "vector-loop-followed-once"
-                                } else {
-                                    "scalar-loop-cap"
-                                },
-                                self.state.program.instruction_address(instruction.pc),
-                            );
-                            path.instruction_index = path.instruction_index.saturating_add(1);
-                            continue;
+                        let vector_controlled =
+                            branch_condition_depends_on_vector_state(instruction.opcode)
+                                || unconditional_latch_is_vector_controlled;
+                        if instruction.opcode.is("SBranch")
+                            && !unconditional_latch_is_vector_controlled
+                        {
+                            self.trace_scalar_loop_latch(instruction, target_pc);
                         }
-                        path.record_backward_branch_visit(instruction.pc);
+                        if vector_controlled {
+                            let recurrence = scalar_recurrence_state(
+                                &path.registers,
+                                self.state
+                                    .program
+                                    .evaluation_live_scalar_register_indices(target_index),
+                                path.exec_mask,
+                                path.scalar_condition,
+                            );
+                            if let Some(previous) =
+                                path.backward_branch_recurrence(instruction.pc)
+                            {
+                                if previous == &recurrence {
+                                    self.trace_vector_loop_fixed_point(instruction, target_pc);
+                                } else {
+                                    record_truncated_evaluation(
+                                        "vector-loop-scalar-state-changed",
+                                        self.state.program.instruction_address(instruction.pc),
+                                    );
+                                }
+                                path.instruction_index =
+                                    path.instruction_index.saturating_add(1);
+                                continue;
+                            }
+                            path.record_backward_branch_recurrence(instruction.pc, recurrence);
+                            path.record_backward_branch_visit(instruction.pc);
+                        }
                     }
                     path.instruction_index = target_index;
                 } else {

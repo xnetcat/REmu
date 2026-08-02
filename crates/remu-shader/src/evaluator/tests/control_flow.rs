@@ -218,6 +218,74 @@ fn exits_an_unconditional_back_edge_after_discovering_the_vector_loop_once() {
 }
 
 #[test]
+fn executes_a_scalar_counted_loop_closed_by_an_unconditional_latch() {
+    let mut exit = instruction(
+        8,
+        ShaderEncoding::Sopp,
+        "SCbranchScc0",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    exit.words[0] = 2;
+    let mut back_edge = instruction(
+        16,
+        ShaderEncoding::Sopp,
+        "SBranch",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    back_edge.words[0] = u32::from((-4_i16).cast_unsigned());
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SMovB32",
+                vec![Operand::source(128, None)],
+                vec![Operand::scalar(107)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sopc,
+                "SCmpLtU32",
+                vec![Operand::scalar(107), Operand::scalar(20)],
+                Vec::new(),
+                None,
+            ),
+            exit,
+            instruction(
+                12,
+                ShaderEncoding::Sop2,
+                "SAddU32",
+                vec![Operand::scalar(107), Operand::source(132, None)],
+                vec![Operand::scalar(107)],
+                None,
+            ),
+            back_edge,
+            end(20),
+        ],
+        {
+            let mut registers = vec![0; 21];
+            registers[20] = 16_388;
+            registers
+        },
+    );
+
+    let evaluation = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        20_000,
+    )
+    .expect("scalar counted loop should run to its SCC exit");
+
+    assert_eq!(evaluation.scalar_registers[107], 16_388);
+}
+
+#[test]
 fn linked_setpc_preserves_scalar_state_and_continuation_absolute_pc() {
     let front = Program::new(
         0x1000,
