@@ -47,6 +47,26 @@ impl AgcRegisterFile {
     }
 }
 
+fn agc_indirect_register_destination(
+    packet_destination: AgcRegisterFile,
+    normalized_offset: u32,
+) -> AgcRegisterFile {
+    // Gen5 UC indirect packets are unified state tables rather than a promise that every pair is
+    // a UCONFIG write. The independent KytyPS5 command processor first dispatches a normalized
+    // UC-table offset to its matching context-register handler, then falls back to UCONFIG. REmu
+    // previously put every such pair in `user_config_registers`, making a guest-authored blend
+    // control invisible to draw snapshots. Route the complete eight-slot fixed-function blend
+    // family into the context file; ordinary UC offsets retain their packet-selected file.
+    if packet_destination == AgcRegisterFile::UserConfig
+        && (AGC_CB_BLEND0_CONTROL..AGC_CB_BLEND0_CONTROL + AGC_CB_BLEND_CONTROL_COUNT)
+            .contains(&normalized_offset)
+    {
+        AgcRegisterFile::Context
+    } else {
+        packet_destination
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn agc_apply_register_value(
     graphics: &mut AgcGraphicsState,
@@ -407,10 +427,18 @@ fn agc_apply_indirect_register_table(
         {
             traced_pixel_inputs.push((raw_offset, offset, value));
         }
+        let applied_destination = agc_indirect_register_destination(destination, offset);
+        let source = if destination == AgcRegisterFile::UserConfig
+            && applied_destination == AgcRegisterFile::Context
+        {
+            "indirect-uc-routed-cx"
+        } else {
+            "indirect"
+        };
         agc_apply_register_value(
             graphics,
-            destination,
-            "indirect",
+            applied_destination,
+            source,
             packet_address,
             registers_address,
             Some(table_index),
@@ -418,7 +446,7 @@ fn agc_apply_indirect_register_table(
             offset,
             value,
         );
-        if destination == AgcRegisterFile::UserConfig && offset == AGC_VGT_INDEX_TYPE {
+        if applied_destination == AgcRegisterFile::UserConfig && offset == AGC_VGT_INDEX_TYPE {
             index_type_value = Some(value);
         }
     }
