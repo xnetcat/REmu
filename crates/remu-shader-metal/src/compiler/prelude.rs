@@ -422,7 +422,13 @@ pub(crate) fn emit_format_prelude(source: &mut String) {
          \x20   return ((exponent + 112u) << 23) | (mantissa << shift);\n}\n\n\
          static inline uint remu_format_one(uint nfmt) {\n\
          \x20   return (nfmt == 4u || nfmt == 5u) ? 1u : 0x3F800000u;\n}\n\n\
-         static inline uint remu_format_convert(uint raw, uint bits, uint nfmt, uint dfmt) {\n\
+         static inline float remu_srgb_decode(float encoded) {\n\
+         \x20   encoded = clamp(encoded, 0.0f, 1.0f);\n\
+         \x20   return encoded <= 0.04045f ? encoded / 12.92f : pow((encoded + 0.055f) / 1.055f, 2.4f);\n}\n\n\
+         static inline float remu_srgb_encode(float linear) {\n\
+         \x20   linear = clamp(linear, 0.0f, 1.0f);\n\
+         \x20   return linear <= 0.0031308f ? linear * 12.92f : 1.055f * pow(linear, 1.0f / 2.4f) - 0.055f;\n}\n\n\
+         static inline uint remu_format_convert(uint raw, uint bits, uint nfmt, uint dfmt, uint component) {\n\
          \x20   uint low_mask = bits >= 32u ? 0xFFFFFFFFu : ((1u << bits) - 1u);\n\
          \x20   int signed_raw = extract_bits(as_type<int>(raw), 0u, bits);\n\
          \x20   switch (nfmt) {\n\
@@ -435,6 +441,10 @@ pub(crate) fn emit_format_prelude(source: &mut String) {
          \x20       if (dfmt == 6u || dfmt == 7u) return remu_minifloat(raw, bits);\n\
          \x20       if (bits == 16u) return as_type<uint>((float)as_type<half>((ushort)(raw & 0xFFFFu)));\n\
          \x20       return raw;\n\
+         \x20   case 9u: {\n\
+         \x20       float normalized = (float)raw / (float)low_mask;\n\
+         \x20       return as_type<uint>(component == 3u ? normalized : remu_srgb_decode(normalized));\n\
+         \x20   }\n\
          \x20   default: return raw;\n\
          \x20   }\n}\n\n",
     );
@@ -498,7 +508,7 @@ static inline uint remu_format_minifloat_pack(uint value, uint bits) {
     return (exponent << mantissa_bits) | truncated;
 }
 
-static inline uint remu_format_pack(uint value, uint bits, uint nfmt, uint dfmt) {
+static inline uint remu_format_pack(uint value, uint bits, uint nfmt, uint dfmt, uint component) {
     uint mask = bits >= 32u ? 0xFFFFFFFFu : ((1u << bits) - 1u);
     float floating = as_type<float>(value);
     switch (nfmt) {
@@ -522,6 +532,11 @@ static inline uint remu_format_pack(uint value, uint bits, uint nfmt, uint dfmt)
         if (dfmt == 6u || dfmt == 7u) return remu_format_minifloat_pack(value, bits);
         if (bits == 16u) return (uint)as_type<ushort>(half(floating));
         return value;
+    case 9u: {
+        float encoded = component == 3u ? clamp(floating, 0.0f, 1.0f)
+                                        : remu_srgb_encode(floating);
+        return (uint)rint(encoded * (float)mask) & mask;
+    }
     default: return value & mask;
     }
 }

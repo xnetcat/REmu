@@ -464,6 +464,56 @@ fn formatted_elements_use_record_stride_without_total_size_alignment() {
     );
 }
 
+#[test]
+fn formatted_srgb_buffers_decode_color_and_preserve_linear_alpha() {
+    fn decode(encoded: f32) -> f32 {
+        if encoded <= 0.04045 {
+            encoded / 12.92
+        } else {
+            ((encoded + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn encode(linear: f32) -> f32 {
+        if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    assert!((decode(0.04045) - 0.003_130_8).abs() < 1.0e-7);
+    assert!((decode(0.5) - 0.214_041_14).abs() < 1.0e-7);
+    assert!((encode(0.003_130_8) - 0.040_449_936).abs() < 1.0e-7);
+    assert!((encode(0.214_041_14) - 0.5).abs() < 1.0e-7);
+
+    let (program, evaluation) = complete_memory_program();
+    let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
+        .expect("formatted buffer shader should lower");
+    assert!(
+        shader.source.contains(
+            "static inline uint remu_format_convert(uint raw, uint bits, uint nfmt, uint dfmt, uint component)"
+        )
+    );
+    assert!(shader.source.contains("case 9u: {"));
+    assert!(
+        shader
+            .source
+            .contains("component == 3u ? normalized : remu_srgb_decode(normalized)")
+    );
+    assert!(
+        shader
+            .source
+            .contains("component == 3u ? clamp(floating, 0.0f, 1.0f)")
+    );
+    for component in 0..4 {
+        assert!(
+            shader.source.contains(&format!(", {component}u)")),
+            "formatted calls must identify component {component} so only alpha bypasses gamma"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn generated_memory_msl_compiles_with_apple_metal() {

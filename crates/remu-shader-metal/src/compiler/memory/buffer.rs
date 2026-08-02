@@ -476,7 +476,7 @@ impl Compiler<'_> {
             canonical.push(self.temp(
                 "uint",
                 &format!(
-                    "{bits} == 0u ? {missing} : remu_format_convert({raw}, {bits}, {number_format}, {data_format})"
+                    "{bits} == 0u ? {missing} : remu_format_convert({raw}, {bits}, {number_format}, {data_format}, {component}u)"
                 ),
             ));
         }
@@ -655,7 +655,9 @@ impl Compiler<'_> {
             }
             let packed = self.temp(
                 "uint",
-                &format!("remu_format_pack({canonical}, {bits}, {number_format}, {data_format})"),
+                &format!(
+                    "remu_format_pack({canonical}, {bits}, {number_format}, {data_format}, {memory_component}u)"
+                ),
             );
             self.line(
                 3,
