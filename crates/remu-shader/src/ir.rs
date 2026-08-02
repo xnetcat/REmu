@@ -312,6 +312,7 @@ pub struct Program {
     pixel_color_export_masks: u32,
     next_evaluation_instruction_indices: Vec<u32>,
     evaluation_live_scalar_register_indices: Vec<Vec<u8>>,
+    evaluation_live_scalar_conditions: Vec<bool>,
     scalar_memory_read_capacity_hint: usize,
     image_binding_capacity_hint: usize,
     global_binding_capacity_hint: usize,
@@ -523,11 +524,12 @@ impl Program {
             }
             next_evaluation_instruction_indices[index] = next;
         }
-        let evaluation_live_scalar_register_indices = evaluation_scalar_liveness(
-            &instructions,
-            &next_evaluation_instruction_indices,
-            &BTreeMap::new(),
-        );
+        let (evaluation_live_scalar_register_indices, evaluation_live_scalar_conditions) =
+            evaluation_scalar_liveness(
+                &instructions,
+                &next_evaluation_instruction_indices,
+                &BTreeMap::new(),
+            );
         Self {
             address,
             instructions,
@@ -536,6 +538,7 @@ impl Program {
             pixel_color_export_masks,
             next_evaluation_instruction_indices,
             evaluation_live_scalar_register_indices,
+            evaluation_live_scalar_conditions,
             scalar_memory_read_capacity_hint,
             image_binding_capacity_hint,
             global_binding_capacity_hint,
@@ -587,6 +590,14 @@ impl Program {
         self.evaluation_live_scalar_register_indices
             .get(index)
             .map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn evaluation_live_scalar_condition(&self, index: usize) -> bool {
+        self.evaluation_live_scalar_conditions
+            .get(index)
+            .copied()
+            .unwrap_or(false)
     }
 
     #[must_use]
@@ -728,7 +739,10 @@ pub fn link_program_continuation(
             Ok((linked_pc, address))
         })
         .collect::<Result<_, _>>()?;
-    linked.evaluation_live_scalar_register_indices = evaluation_scalar_liveness(
+    (
+        linked.evaluation_live_scalar_register_indices,
+        linked.evaluation_live_scalar_conditions,
+    ) = evaluation_scalar_liveness(
         &linked.instructions,
         &linked.next_evaluation_instruction_indices,
         &linked.linked_transfer_targets,
