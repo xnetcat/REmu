@@ -353,3 +353,149 @@ fn linked_program_resources_keep_distinct_front_and_continuation_pcs() {
         vec![0, 8]
     );
 }
+
+/// The control-flow shape of the Poppy Playtime compute shader at 0x77C0F10000: nested
+/// vector-condition branches wrapped around a vector-controlled loop whose body advances a live
+/// scalar induction register, so no two loop iterations share a memoization key.
+fn nested_vector_loop_program() -> Vec<Instruction> {
+    let branch = |pc: u32, opcode: &'static str, target: u32| {
+        let mut branch = instruction(
+            pc,
+            ShaderEncoding::Sopp,
+            opcode,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let offset = (i64::from(target) - i64::from(pc) - 4) / 4;
+        let offset = i16::try_from(offset).expect("branch offset");
+        branch.words[0] = u32::from(offset.cast_unsigned());
+        branch
+    };
+    let move_zero = |pc: u32, destination: u32| {
+        instruction(
+            pc,
+            ShaderEncoding::Sop1,
+            "SMovB32",
+            vec![Operand::source(128, None)],
+            vec![Operand::scalar(destination)],
+            None,
+        )
+    };
+    let move_one = |pc: u32, destination: u32| {
+        instruction(
+            pc,
+            ShaderEncoding::Sopk,
+            "SMovkI32",
+            vec![Operand {
+                kind: OperandKind::LiteralConstant,
+                value: 1,
+            }],
+            vec![Operand::scalar(destination)],
+            None,
+        )
+    };
+    let compare = |pc: u32, register: u32| {
+        instruction(
+            pc,
+            ShaderEncoding::Sopk,
+            "SCmpkEqI32",
+            vec![Operand {
+                kind: OperandKind::EncodedConstant,
+                value: 1,
+            }],
+            vec![Operand::scalar(register)],
+            None,
+        )
+    };
+    let scalar_load = |pc: u32, base: u32, dynamic_offset_register: Option<u32>| {
+        instruction(
+            pc,
+            ShaderEncoding::Smem,
+            "SLoadDwordx2",
+            vec![Operand::scalar(base)],
+            vec![Operand::scalar(16), Operand::scalar(17)],
+            Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                destination_count: 2,
+                immediate_offset_bytes: 0,
+                dynamic_offset_register,
+            })),
+        )
+    };
+    vec![
+        move_zero(0x30, 12),
+        branch(0x34, "SCbranchScc1", 0x76c),
+        compare(0x54, 13),
+        branch(0x58, "SCbranchScc0", 0x750),
+        branch(0x70, "SCbranchExecz", 0xb8),
+        move_zero(0x74, 14),
+        move_one(0xb8, 15),
+        compare(0xc0, 15),
+        branch(0xc4, "SCbranchScc0", 0x11c),
+        instruction(
+            0xc8,
+            ShaderEncoding::Sop1,
+            "SMovB64",
+            vec![Operand::source(128, None)],
+            vec![Operand::scalar(126)],
+            None,
+        ),
+        branch(0xcc, "SCbranchExecz", 0x114),
+        scalar_load(0xd0, 4, Some(12)),
+        branch(0xe8, "SCbranchVccz", 0x114),
+        instruction(
+            0xec,
+            ShaderEncoding::Sop2,
+            "SAddU32",
+            vec![
+                Operand::scalar(12),
+                Operand {
+                    kind: OperandKind::LiteralConstant,
+                    value: 8,
+                },
+            ],
+            vec![Operand::scalar(12)],
+            None,
+        ),
+        branch(0x110, "SCbranchExecnz", 0xcc),
+        move_zero(0x114, 20),
+        branch(0x118, "SBranch", 0x71c),
+        move_zero(0x11c, 21),
+        move_zero(0x71c, 22),
+        branch(0x74c, "SBranch", 0x76c),
+        move_zero(0x750, 23),
+        move_zero(0x76c, 24),
+        branch(0x770, "SCbranchExecz", 0x798),
+        scalar_load(0x774, 8, None),
+        end(0x798),
+    ]
+}
+
+#[test]
+fn nested_vector_branches_around_a_loop_stay_within_the_evaluation_budget() {
+    let mut memory = TestMemory::default();
+    memory.write(0x2000, &[0xab; 512]);
+    memory.write(0x4000, &[0xcd; 512]);
+    let mut user_data = vec![0_u32; 14];
+    user_data[4] = 0x2000;
+    user_data[8] = 0x4000;
+    user_data[13] = 1;
+    let shader = state(nested_vector_loop_program(), user_data);
+
+    let evaluation = evaluate_shader_within(&memory, &shader, EvaluationOptions::default(), 4096)
+        .expect("nested vector control flow must terminate within a small step budget");
+
+    let bindings = evaluation
+        .global_memory_bindings
+        .iter()
+        .map(|binding| (binding.scalar_address, binding.base_address))
+        .collect::<Vec<_>>();
+    assert!(
+        bindings.contains(&(4, 0x2000)),
+        "loop-body binding missing: {bindings:?}"
+    );
+    assert!(
+        bindings.contains(&(8, 0x4000)),
+        "tail binding missing: {bindings:?}"
+    );
+}

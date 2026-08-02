@@ -10,9 +10,9 @@ use crate::{
     AGC_IT_NUM_INSTANCES, AGC_IT_PFP_SYNC_ME, AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE,
     AGC_IT_WAIT_REG_MEM, AGC_IT_WRITE_DATA, AGC_R_ACB_RESET, AGC_R_ACQUIRE_MEM, AGC_R_DMA_DATA,
     AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_WAIT_MEM_32,
-    AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA, AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError,
-    AgcVideoOutTarget, ProcessGuestMemory, VideoOutState, agc_apply_set_base,
-    agc_apply_submission_registers, agc_decode_compute_dispatch, agc_emit_draw,
+    AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA, AgcComputeDispatchError, AgcGraphicsState,
+    AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory, VideoOutState,
+    agc_apply_set_base, agc_apply_submission_registers, agc_decode_compute_dispatch, agc_emit_draw,
     agc_emit_draw_with_indirect_arguments, agc_emit_indexed_draw, agc_image_binding_address,
     agc_submit_ordered_video_out_flip, emit_agc_gpu_event, read_guest_u32, read_guest_u64,
     trace_agc_programs, trace_agc_registers, trace_agc_shaders, trace_guest_sync,
@@ -553,90 +553,7 @@ pub(crate) fn agc_handle_submission_packet(
         );
     }
     if matches!(opcode, AGC_IT_DISPATCH_DIRECT | AGC_IT_DISPATCH_INDIRECT) {
-        let dispatch =
-            agc_decode_compute_dispatch(packet_address, length, opcode, graphics, shaders)
-                .map_err(|source| AgcSubmissionError::Compute {
-                    packet_address,
-                    source,
-                })?;
-        if trace_agc_programs() || trace_logarithmic_sequence(dispatch.sequence, 8) {
-            eprintln!(
-                "[REMu][AGC] compute={} source={:?} grid={:?} base={:?} local={:?} wave={} cs={:#x}",
-                dispatch.sequence,
-                dispatch.source,
-                dispatch.launch.grid,
-                dispatch.launch.base_group,
-                dispatch.launch.threads_per_group,
-                dispatch.launch.wave_lane_count,
-                dispatch.shader_address,
-            );
-        }
-        if trace_agc_shaders()
-            && dispatch.sequence <= 4
-            && let Some(shader) = dispatch.shader.as_ref()
-        {
-            let opcodes = shader
-                .program
-                .instructions
-                .iter()
-                .map(|instruction| instruction.opcode.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            eprintln!(
-                "[REMu][AGC][SHADER][COMPUTE] cs={:#x} wave={} ir={} ops=[{opcodes}] instructions={:#?}",
-                dispatch.shader_address,
-                dispatch.launch.wave_lane_count,
-                shader.program.instructions.len(),
-                shader.program.instructions,
-            );
-        }
-        if trace_agc_shaders()
-            && let Some(evaluation) = dispatch.shader_evaluation.as_deref()
-            && evaluation.image_bindings.iter().any(|binding| {
-                agc_image_binding_address(binding)
-                    .is_some_and(|address| graphics.sampled_texture_addresses.contains(&address))
-            })
-            && graphics
-                .traced_sampled_compute_shaders
-                .insert(dispatch.shader_address)
-        {
-            let images = evaluation
-                .image_bindings
-                .iter()
-                .map(|binding| {
-                    format!(
-                        "{:#x}:{}@{:#x}:r={:x?}",
-                        binding.pc,
-                        binding.opcode,
-                        agc_image_binding_address(binding).unwrap_or_default(),
-                        binding.resource_descriptor,
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            eprintln!(
-                "[REMu][AGC][SHADER][COMPUTE-SAMPLED] dispatch={} cs={:#x} images=[{images}]",
-                dispatch.sequence, dispatch.shader_address,
-            );
-        }
-        // Direct dimensions are immutable packet data, so a zero extent is genuinely empty.
-        // Indirect dwords can be produced by earlier GPU work and the packet-time CPU snapshot
-        // can still be zero here. Preserve that event so a backend with native indirect dispatch
-        // reads the live dimensions at its ordered execution point.
-        if dispatch.launch.is_empty()
-            && matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct)
-        {
-            eprintln!(
-                "[REMu][AGC] skipped empty compute dispatch={} source={:?} grid={:?} base={:?} cs={:#x}",
-                dispatch.sequence,
-                dispatch.source,
-                dispatch.launch.grid,
-                dispatch.launch.base_group,
-                dispatch.shader_address,
-            );
-        } else {
-            emit_agc_gpu_event(remu_gpu::GpuEvent::ComputeDispatch(Box::new(dispatch)));
-        }
+        agc_handle_compute_dispatch_packet(packet_address, length, opcode, graphics, shaders)?;
     }
     if opcode == AGC_IT_NOP && register == AGC_R_FLIP && length >= 6 {
         let handle = read_guest_u32(packet_address + 4);
@@ -646,6 +563,138 @@ pub(crate) fn agc_handle_submission_packet(
         if agc_submit_ordered_video_out_flip(video_out, handle, buffer_index, flip_argument) {
             flips.push((handle, buffer_index, flip_argument));
         }
+    }
+    Ok(())
+}
+
+/// Report a dispatch REmu executed nothing for. Rate-limited per shader address so a dispatch
+/// repeated every frame cannot flood the log while every distinct shader is still named once.
+fn report_skipped_compute_dispatch(packet_address: u64, source: &AgcComputeDispatchError) {
+    static REPORTED: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> =
+        std::sync::Mutex::new(None);
+    let shader_address = source.shader_address().unwrap_or_default();
+    let Ok(mut reported) = REPORTED.lock() else {
+        return;
+    };
+    let occurrences = reported
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(shader_address)
+        .or_default();
+    *occurrences = occurrences.saturating_add(1);
+    let occurrences = *occurrences;
+    drop(reported);
+    if !trace_logarithmic_sequence(occurrences, 1) {
+        return;
+    }
+    eprintln!(
+        "[REMu][AGC] skipped compute dispatch at {packet_address:#018x} (occurrence \
+         {occurrences}): {source}. The rest of the submission still executes."
+    );
+}
+
+fn agc_handle_compute_dispatch_packet(
+    packet_address: u64,
+    length: u32,
+    opcode: u32,
+    graphics: &mut AgcGraphicsState,
+    shaders: &mut AgcShaderRegistry,
+) -> Result<(), AgcSubmissionError> {
+    let dispatch =
+        match agc_decode_compute_dispatch(packet_address, length, opcode, graphics, shaders) {
+            Ok(dispatch) => dispatch,
+            // One shader REmu cannot decode or evaluate is a capability gap in this emulator, not
+            // a malformed command stream: the packets around it are intact and executable. Unreal
+            // turns a failed graphics submit into LowLevelFatalError, so rejecting the whole DCB
+            // over one dispatch kills the title over work the guest never depended on being
+            // rejected. Skip only this dispatch; every other error class still rejects.
+            Err(source) if source.shader_is_unsupported() => {
+                report_skipped_compute_dispatch(packet_address, &source);
+                return Ok(());
+            }
+            Err(source) => {
+                return Err(AgcSubmissionError::Compute {
+                    packet_address,
+                    source,
+                });
+            }
+        };
+    if trace_agc_programs() || trace_logarithmic_sequence(dispatch.sequence, 8) {
+        eprintln!(
+            "[REMu][AGC] compute={} source={:?} grid={:?} base={:?} local={:?} wave={} cs={:#x}",
+            dispatch.sequence,
+            dispatch.source,
+            dispatch.launch.grid,
+            dispatch.launch.base_group,
+            dispatch.launch.threads_per_group,
+            dispatch.launch.wave_lane_count,
+            dispatch.shader_address,
+        );
+    }
+    if trace_agc_shaders()
+        && dispatch.sequence <= 4
+        && let Some(shader) = dispatch.shader.as_ref()
+    {
+        let opcodes = shader
+            .program
+            .instructions
+            .iter()
+            .map(|instruction| instruction.opcode.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "[REMu][AGC][SHADER][COMPUTE] cs={:#x} wave={} ir={} ops=[{opcodes}] instructions={:#?}",
+            dispatch.shader_address,
+            dispatch.launch.wave_lane_count,
+            shader.program.instructions.len(),
+            shader.program.instructions,
+        );
+    }
+    if trace_agc_shaders()
+        && let Some(evaluation) = dispatch.shader_evaluation.as_deref()
+        && evaluation.image_bindings.iter().any(|binding| {
+            agc_image_binding_address(binding)
+                .is_some_and(|address| graphics.sampled_texture_addresses.contains(&address))
+        })
+        && graphics
+            .traced_sampled_compute_shaders
+            .insert(dispatch.shader_address)
+    {
+        let images = evaluation
+            .image_bindings
+            .iter()
+            .map(|binding| {
+                format!(
+                    "{:#x}:{}@{:#x}:r={:x?}",
+                    binding.pc,
+                    binding.opcode,
+                    agc_image_binding_address(binding).unwrap_or_default(),
+                    binding.resource_descriptor,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "[REMu][AGC][SHADER][COMPUTE-SAMPLED] dispatch={} cs={:#x} images=[{images}]",
+            dispatch.sequence, dispatch.shader_address,
+        );
+    }
+    // Direct dimensions are immutable packet data, so a zero extent is genuinely empty.
+    // Indirect dwords can be produced by earlier GPU work and the packet-time CPU snapshot
+    // can still be zero here. Preserve that event so a backend with native indirect dispatch
+    // reads the live dimensions at its ordered execution point.
+    if dispatch.launch.is_empty()
+        && matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct)
+    {
+        eprintln!(
+            "[REMu][AGC] skipped empty compute dispatch={} source={:?} grid={:?} base={:?} cs={:#x}",
+            dispatch.sequence,
+            dispatch.source,
+            dispatch.launch.grid,
+            dispatch.launch.base_group,
+            dispatch.shader_address,
+        );
+    } else {
+        emit_agc_gpu_event(remu_gpu::GpuEvent::ComputeDispatch(Box::new(dispatch)));
     }
     Ok(())
 }

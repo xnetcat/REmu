@@ -866,6 +866,23 @@ pub(crate) enum AgcComputeDispatchError {
     ShaderEvaluation { address: u64, reason: String },
 }
 
+impl AgcComputeDispatchError {
+    /// The dispatch names a shader REmu cannot yet translate, as opposed to a command stream or
+    /// register state REmu cannot parse. Only this class is safe to skip: the packet stream around
+    /// it is intact, so the remaining work in the submission is still exactly what the guest asked
+    /// for.
+    pub(crate) const fn shader_is_unsupported(&self) -> bool {
+        matches!(self, Self::ShaderDecode(_) | Self::ShaderEvaluation { .. })
+    }
+
+    pub(crate) const fn shader_address(&self) -> Option<u64> {
+        match self {
+            Self::ShaderDecode(address) | Self::ShaderEvaluation { address, .. } => Some(*address),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum AgcSubmissionError {
     #[error(

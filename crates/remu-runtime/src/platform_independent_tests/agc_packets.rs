@@ -1284,3 +1284,39 @@ fn clear_state_rejects_non_native_layouts() {
         Err(crate::AgcSubmissionError::ClearStatePacketLength { actual: 3 })
     ));
 }
+
+#[test]
+fn an_unevaluatable_compute_dispatch_skips_only_that_dispatch() {
+    // s_add_u32 s0, s1, 0x1234 followed by a backward branch onto that instruction's literal
+    // dword. The program decodes cleanly and evaluation rejects the branch target, which is the
+    // shape of a shader REmu cannot translate yet rather than a malformed command stream.
+    let program =
+        super::AlignedComputeProgram([0x8000_01ff, 0x0000_1234, 0xbf82_fffe, 0xbf81_0000]);
+    let program_address = program.0.as_ptr().addr() as u64;
+    let (mut graphics, mut shaders) = compute_graphics_state(program_address);
+    shaders.snapshots.remove(&program_address);
+
+    let mut commands = vec![agc_pm4(2, crate::AGC_IT_PFP_SYNC_ME, 0), 0];
+    commands.extend([
+        agc_pm4(5, crate::AGC_IT_DISPATCH_DIRECT, 0),
+        10,
+        4,
+        2,
+        0x8045,
+    ]);
+    commands.extend([agc_pm4(2, crate::AGC_IT_PFP_SYNC_ME, 0), 0]);
+
+    // `capture_submission_events` asserts the parse succeeded, which is what
+    // `sceAgcDriverSubmitDcb` reports to the guest.
+    let events = capture_submission_events(&commands, &mut graphics, &mut shaders);
+
+    assert_eq!(
+        events,
+        [
+            remu_gpu::GpuEvent::CommandProcessorBarrier,
+            remu_gpu::GpuEvent::CommandProcessorBarrier,
+        ],
+        "the packets around an unevaluatable dispatch must still execute: {events:?}"
+    );
+    assert_eq!(graphics.emitted_compute_dispatches, 0);
+}
