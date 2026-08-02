@@ -309,6 +309,22 @@ pub fn dump_guest_write_journal(fault_address: u64, anchors: &[u64]) {
     if ENABLED.load(Ordering::Relaxed) != ENABLED_YES {
         return;
     }
+    // A fault raised by the dump's own probing must not recurse into a second dump.
+    static DUMPING: AtomicU8 = AtomicU8::new(0);
+    if DUMPING.swap(1, Ordering::AcqRel) != 0 {
+        let mut buffer = DiagnosticBuffer::new();
+        buffer.push_bytes(b"[REMu][JOURNAL] nested fault during dump; skipping\n");
+        write_diagnostic(&buffer);
+        return;
+    }
+    dump_guest_write_journal_locked(fault_address, anchors);
+    DUMPING.store(0, Ordering::Release);
+}
+
+fn dump_guest_write_journal_locked(fault_address: u64, anchors: &[u64]) {
+    /// Matched-entry print ceiling; the counters in the end line stay exact.
+    const REGISTER_PRINT_CAP: u64 = 200;
+    const NEAR_PRINT_CAP: u64 = 100;
     let recorded = NEXT_SEQUENCE.load(Ordering::Acquire);
     let mut buffer = DiagnosticBuffer::new();
     buffer.push_bytes(b"[REMu][JOURNAL] fault=");
@@ -328,29 +344,34 @@ pub fn dump_guest_write_journal(fault_address: u64, anchors: &[u64]) {
 
     let live_from = recorded.saturating_sub(CAPACITY as u64);
     let mut covering = 0_u64;
-    let mut matched = 0_u64;
+    let mut register_matches = 0_u64;
+    let mut near_matches = 0_u64;
     for sequence in live_from..recorded {
         let Some(entry) = read_slot(sequence) else {
             continue;
         };
         if entry.covers(fault_address) {
             covering += 1;
-            matched += 1;
             emit_entry(b"covering", &entry, None, &mut buffer);
         } else if let Some(anchor) = anchors.iter().copied().find(|&anchor| {
             anchor >= ANCHOR_FLOOR
                 && entry.intersects(anchor, anchor.saturating_add(REGISTER_ANCHOR_WINDOW))
         }) {
-            matched += 1;
-            emit_entry(b"register", &entry, Some(anchor), &mut buffer);
+            register_matches += 1;
+            if register_matches <= REGISTER_PRINT_CAP {
+                emit_entry(b"register", &entry, Some(anchor), &mut buffer);
+            }
         } else if entry.intersects(
             fault_address.saturating_sub(NEAR_FAULT_WINDOW),
             fault_address.saturating_add(NEAR_FAULT_WINDOW),
         ) {
-            matched += 1;
-            emit_entry(b"near-fault", &entry, None, &mut buffer);
+            near_matches += 1;
+            if near_matches <= NEAR_PRINT_CAP {
+                emit_entry(b"near-fault", &entry, None, &mut buffer);
+            }
         }
     }
+    let matched = covering + register_matches + near_matches;
     let recent_from = recorded.saturating_sub(RECENT_DUMP_ENTRIES).max(live_from);
     for sequence in recent_from..recorded {
         if let Some(entry) = read_slot(sequence) {
@@ -403,19 +424,25 @@ pub fn dump_guest_write_journal(fault_address: u64, anchors: &[u64]) {
 /// Hex-dumps the bytes around each guest-plausible anchor and the fault address, clamped to each
 /// anchor's own 4 KiB page.
 ///
-/// Readability is proven with `write(devnull, window, len)` before any load: the kernel reports
-/// EFAULT for an unreadable window instead of faulting the handler, and both `open` and `write`
-/// are async-signal-safe. This matters because the interesting anchors are frequently garbage —
-/// the poison pointer itself sits in a register, and a BUS_ADRERR fault address is mapped but
-/// unreadable.
+/// Readability is proven with `write(pipe, window, len)` before any load: a pipe write must copy
+/// the window into the pipe buffer, so an unreadable window reports EFAULT instead of faulting
+/// the handler. This matters because the interesting anchors are frequently garbage — the poison
+/// pointer itself sits in a register, and a BUS_ADRERR fault address is mapped but unreadable.
+/// (`/dev/null` cannot serve as the probe sink: Darwin's null driver discards writes without
+/// reading the buffer, so the probe passed and the load faulted inside the handler.)
+///
+/// The probed windows total at most 33 × 128 bytes, far below the pipe's capacity, so the unread
+/// pipe never blocks the writer.
 #[cfg(unix)]
 fn dump_anchor_neighbourhoods(fault_address: u64, anchors: &[u64], buffer: &mut DiagnosticBuffer) {
     const HALF_WINDOW: u64 = 64;
-    // SAFETY: open is async-signal-safe; the descriptor is closed before returning.
-    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
-    if devnull < 0 {
+    let mut probe = [0_i32; 2];
+    // SAFETY: pipe is a plain syscall filling the two-descriptor array; both ends are closed
+    // before returning.
+    if unsafe { libc::pipe(probe.as_mut_ptr()) } != 0 {
         return;
     }
+    let probe_writer = probe[1];
     let mut printed = [0_u64; 33];
     let mut printed_count = 0;
     for &anchor in anchors.iter().chain(std::iter::once(&fault_address)) {
@@ -436,10 +463,10 @@ fn dump_anchor_neighbourhoods(fault_address: u64, anchors: &[u64], buffer: &mut 
             .saturating_add(HALF_WINDOW)
             .min(page.saturating_add(0x1000));
         let length = (end - start) as usize;
-        // SAFETY: writing the window to /dev/null only requires the kernel to read it; an
-        // unreadable window returns EFAULT rather than raising a nested fault.
+        // SAFETY: the pipe write copies the window into the pipe buffer; an unreadable window
+        // returns EFAULT rather than raising a nested fault.
         let probed = unsafe {
-            libc::write(devnull, start as *const std::ffi::c_void, length)
+            libc::write(probe_writer, start as *const std::ffi::c_void, length)
         };
         buffer.clear();
         buffer.push_bytes(b"[REMu][JOURNAL] bytes at ");
@@ -464,8 +491,11 @@ fn dump_anchor_neighbourhoods(fault_address: u64, anchors: &[u64], buffer: &mut 
         buffer.push_bytes(b"\n");
         write_diagnostic(buffer);
     }
-    // SAFETY: close is async-signal-safe and the descriptor came from the open above.
-    unsafe { libc::close(devnull) };
+    // SAFETY: close is async-signal-safe and both descriptors came from the pipe above.
+    unsafe {
+        libc::close(probe[0]);
+        libc::close(probe[1]);
+    }
 }
 
 #[cfg(not(unix))]

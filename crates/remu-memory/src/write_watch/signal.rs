@@ -248,6 +248,11 @@ fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) 
     let mut anchor_count = 0;
     if let Some(registers) = registers.as_ref() {
         for register in registers {
+            // The stack pointers anchor thousands of legitimate HLE out-parameter writes near
+            // the faulting thread's own frames; they can never name a heap victim.
+            if register.name == b"rsp" || register.name == b"rbp" {
+                continue;
+            }
             anchors[anchor_count] = register.value;
             anchor_count += 1;
         }

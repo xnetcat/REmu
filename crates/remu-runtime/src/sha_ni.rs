@@ -278,10 +278,11 @@ fn report_unrecovered_sigill(information: *mut libc::siginfo_t, context: *mut st
             // SAFETY: uc_mcontext points at the faulting thread's Darwin mcontext.
             let state = unsafe { &(*ucontext.uc_mcontext).__ss };
             pc = state.__rip;
+            // rsp/rbp are omitted: stack anchors only match legitimate out-parameter writes.
             for value in [
                 state.__rax, state.__rbx, state.__rcx, state.__rdx, state.__rdi, state.__rsi,
-                state.__rbp, state.__rsp, state.__r8, state.__r9, state.__r10, state.__r11,
-                state.__r12, state.__r13, state.__r14, state.__r15,
+                state.__r8, state.__r9, state.__r10, state.__r11, state.__r12, state.__r13,
+                state.__r14, state.__r15,
             ] {
                 anchors[anchor_count] = value;
                 anchor_count += 1;
