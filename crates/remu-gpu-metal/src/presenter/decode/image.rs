@@ -11,6 +11,23 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescriptor, String> {
+    decode_image_descriptor_impl(words, true)
+}
+
+/// Decodes an image SRD without emitting optional descriptor diagnostics.
+///
+/// Shared-event draw preflight must be observational: it may classify immutable packet state but
+/// cannot log or mutate a process-global diagnostic cache before the producer has host-retired.
+pub(crate) fn decode_image_descriptor_without_diagnostics(
+    words: &[u32],
+) -> Result<DecodedImageDescriptor, String> {
+    decode_image_descriptor_impl(words, false)
+}
+
+fn decode_image_descriptor_impl(
+    words: &[u32],
+    emit_diagnostics: bool,
+) -> Result<DecodedImageDescriptor, String> {
     if words.len() < 4 {
         return Err(format!(
             "image resource descriptor has {} dwords, expected at least four",
@@ -48,7 +65,10 @@ pub(crate) fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescr
     } else {
         width
     };
-    if trace_image_descriptors() && (tile_mode == 9 || (width >= 700 && height >= 500)) {
+    if emit_diagnostics
+        && trace_image_descriptors()
+        && (tile_mode == 9 || (width >= 700 && height >= 500))
+    {
         static LOGGED_IMAGES: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, u32, u32, u32, u32)>>> =
             OnceLock::new();
         let key = (

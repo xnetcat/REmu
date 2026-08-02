@@ -6,25 +6,21 @@ use super::{
     DepthTargetPipelineState, DisplayConfiguration, GraphicsDiagnosticPipelineState,
     GraphicsPipelineKey, GraphicsShaderResourceKey, GuestScissor, GuestTextureDescriptor,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, ProgramIdentity,
-    RenderTargetFormat, RenderTargetPipelineState, ResourceSpan,
-    decode_sampled_texture_format,
+    RenderTargetFormat, RenderTargetPipelineState, ResourceSpan, decode_sampled_texture_format,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
     diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer,
-    diagnostic_dump_target_pixel_instruction_count,
-    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
-    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
-    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
-    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
-    diagnostic_video_chain_selected_draw, effective_linear_pitch,
-    evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison,
-    fragmentless_pixel_evaluation, fragmentless_pixel_program,
-    graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
-    is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw, program_embeds_global_base,
-    tiled_block_dimensions,
-    trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
-    video_target_binding_summary,
+    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
+    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
+    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
+    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
+    diagnostic_force_visible_clip_depth, diagnostic_video_chain_selected_draw,
+    effective_linear_pitch, evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
+    evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
+    fragmentless_pixel_program, graphics_allocated_vector_register_count, guest_texture_byte_count,
+    half_float_to_f32, is_storage_image_opcode, ngg_memoryless_cover_export_stage,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw,
+    program_embeds_global_base, tiled_block_dimensions, trace_image_descriptors,
+    trace_target_sampling, unsigned_float_to_f32, video_target_binding_summary,
 };
 use metal::{MTLScissorRect, MTLViewport};
 use remu_gpu::{GpuRegister, IndexedDraw};
@@ -34,14 +30,14 @@ mod pipeline;
 mod scanout;
 mod targets;
 pub(crate) use self::image::{
-    decode_image_descriptor, fallback_image_descriptor, image_component_class,
-    sampled_alias_descriptor,
+    decode_image_descriptor, decode_image_descriptor_without_diagnostics,
+    fallback_image_descriptor, image_component_class, sampled_alias_descriptor,
 };
 pub(crate) use self::pipeline::{
     ColorOperationMode, color_operation_is_raster_noop, decode_color_operation_mode,
     decode_metal_blend_attachment, decode_raster_state, graphics_pipeline_key,
     metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
-    noop_placeholder_cover_draw, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
+    ngg_mesh_base_vertex, noop_placeholder_cover_draw, prepare_indexed_ngg_indices,
     prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
 };
 #[cfg(test)]
@@ -59,9 +55,10 @@ pub(crate) use self::scanout::{
 pub(crate) use self::scanout::{decode_scanout_target, raw_video_out_texture_descriptor};
 pub(crate) use self::targets::{
     common_render_target_array_length, decode_color_eliminate_fast_clear_target,
-    decode_color_resolve_targets, decode_depth_target, decode_render_target_format,
-    decode_render_target_state, decode_render_targets, initial_depth_clear_for_target,
-    initial_render_target_clear_color, render_target_cmask_address, render_target_fast_clear_color,
+    decode_color_resolve_targets, decode_depth_target, decode_depth_target_without_diagnostics,
+    decode_render_target_format, decode_render_target_state, decode_render_targets,
+    initial_depth_clear_for_target, initial_render_target_clear_color, render_target_cmask_address,
+    render_target_fast_clear_color,
 };
 #[cfg(test)]
 pub(crate) use self::targets::{
@@ -406,6 +403,8 @@ fn read_draw_indices_with_element_size(
 fn indices_look_like_u32_read_as_u16(indices: &[u32]) -> bool {
     indices.len() >= 4
         && indices.len() % 2 == 0
-        && indices.chunks_exact(2).all(|pair| pair[1] == 0 && pair[0] < 0x1_0000)
+        && indices
+            .chunks_exact(2)
+            .all(|pair| pair[1] == 0 && pair[0] < 0x1_0000)
         && indices.iter().step_by(2).any(|value| *value != 0)
 }
