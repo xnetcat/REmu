@@ -277,6 +277,7 @@ fn dispatch_draw_command(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 
             | "-HOOCn0JY48"
             | "hvUfkUIQcOE"
             | "GIIW2J37e70"
+            | "-KRzWekV120"
             | "8N2tmT3jmC8"
             | "mljzuGDZRQ4"
             | "tSBxhAPyytQ"
@@ -311,7 +312,13 @@ fn dispatch_draw_command(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 
         "ZvwO9euwYzc" => set_registers_indirect(arguments, IndirectRegisterKind::Context),
         "-HOOCn0JY48" => set_registers_indirect(arguments, IndirectRegisterKind::Shader),
         "hvUfkUIQcOE" => set_registers_indirect(arguments, IndirectRegisterKind::UserConfig),
-        "GIIW2J37e70" => set_index_size(arguments),
+        // Two NIDs, one function. `-KRzWekV120` is the identifier libSceAgc's export table
+        // actually carries for sceAgcDcbSetIndexSize; it is one of a handful of AGC exports whose
+        // NID is NOT the SHA-1 of its own name, so every table built by hashing symbol names —
+        // including the one that produced `GIIW2J37e70` — invents an identifier no shipping title
+        // ever calls. Unreal calls the real one about 1139 times per run. The hashed alias is kept
+        // in case some SDK revision does emit it.
+        "GIIW2J37e70" | "-KRzWekV120" => set_index_size(arguments),
         // DcbSetIndexBuffer stays in the parent runtime because its four-argument ABI associates
         // a CPU index pointer with a GPU resource address.
         "8N2tmT3jmC8" => set_index_count(arguments),

@@ -488,7 +488,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "n2fD4A+pb+g" => "sceAgcCbSetShRegisterRangeDirect",
         "V++UgBtQhn0" => "sceAgcGetDataPacketPayloadAddress",
         "qj7QZpgr9Uw" => "sceAgcUnknownQj7QZpgr9Uw",
-        "-KRzWekV120" => "sceAgcDriverUnknown_KRzWekV120",
+        "-KRzWekV120" => "sceAgcDcbSetIndexSize",
         "X-Nm5KLREeg" => "sceAgcDriverRegisterOwner",
         "W5z4eZrjEas" => "sceAgcDriverRegisterResource",
         "w6Dj1VJt5qY" => "sceAgcSetPacketPredication",
