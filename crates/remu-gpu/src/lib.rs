@@ -33,6 +33,14 @@ pub use diagnostics::{
     take_pixel_pipe_stat_release_trace,
 };
 
+mod dispatch_telemetry;
+pub use dispatch_telemetry::{
+    DISPATCH_IMPORT_FAMILY_COUNT, DISPATCH_LATENCY_BUCKET_COUNT,
+    DISPATCH_LATENCY_BUCKET_UPPER_NS, DispatchImportFamily, DispatchLatencyHistogram,
+    DispatchTelemetrySample, record_dispatch_import, record_dispatch_lock_acquire_wait,
+    record_dispatch_lock_hold, record_gpu_publication_wait, take_dispatch_telemetry_sample,
+};
+
 mod waits;
 #[cfg(test)]
 use waits::gpu_wait_registry;
