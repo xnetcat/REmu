@@ -23,7 +23,7 @@ use super::{
 };
 use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
-use remu_gpu::GpuEvent;
+use remu_gpu::{GpuEvent, GpuMemoryAcquire};
 use std::sync::atomic::{AtomicUsize, Ordering};
 mod batch;
 mod events;
@@ -746,6 +746,21 @@ fn shared_event_host_effect_kind(event: &GpuEvent) -> usize {
 }
 
 impl MetalPresenter {
+    /// Returns whether an invalidating acquire has any live cached guest resource to inspect.
+    ///
+    /// This is intentionally only an overlap test. Proving that an overlapping write watch is
+    /// clean requires a stable generation snapshot; in contrast, an empty overlap set makes the
+    /// existing acquire executor a strict no-op because it visits no resident or sampled entry.
+    fn invalidating_acquire_has_watched_resource(&self, acquire: GpuMemoryAcquire) -> bool {
+        self.resident_guest_textures.values().any(|resident| {
+            let (address, byte_count) = resident.write_watch.range();
+            acquire.overlaps(address, byte_count)
+        }) || self.sampled_texture_cache.values().any(|cached| {
+            let (address, byte_count) = cached.write_watch.range();
+            acquire.overlaps(address, byte_count)
+        })
+    }
+
     /// Conservative host-effect gate for commands following an encoded Metal wait.
     pub(super) fn event_is_shared_event_gpu_orderable(
         &self,
@@ -754,11 +769,29 @@ impl MetalPresenter {
     ) -> bool {
         match event {
             GpuEvent::CommandProcessorBarrier | GpuEvent::PipelineBarrier(_) => true,
-            // With no invalidation bits, ACQUIRE_MEM has no presenter-side resource effect at
-            // all. It is safe to consume after encoding the queue's Metal wait: the normal
-            // handler returns immediately, so no cache or guest-visible state can overtake the
-            // producer. Invalidating acquires remain behind the host acknowledgement below.
-            GpuEvent::MemoryAcquire(acquire) => !acquire.invalidates_guest_resources(),
+            // With no invalidation bits, or with no live cached resource in its effective range,
+            // ACQUIRE_MEM has no presenter-side resource effect. It is safe to consume after
+            // encoding the queue's Metal wait: the normal handler either returns immediately or
+            // visits empty overlap sets, so no cache or guest-visible state can overtake the
+            // producer. Invalidating acquires which touch a live watch remain host-gated.
+            GpuEvent::MemoryAcquire(acquire) => {
+                if !acquire.invalidates_guest_resources() {
+                    true
+                } else if !self.invalidating_acquire_has_watched_resource(*acquire) {
+                    static EMPTY_INVALIDATING_ACQUIRE_COUNT: AtomicUsize = AtomicUsize::new(0);
+                    let occurrence =
+                        EMPTY_INVALIDATING_ACQUIRE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if occurrence <= 16 || occurrence.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][METAL][ACQUIRE-NOOP] occurrence={occurrence} base={:#x} bytes={:#x} gcr={:#x} watched-overlap=none",
+                            acquire.base_address, acquire.size_bytes, acquire.gcr_control,
+                        );
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
             // A registered wait can extend an already GPU-ordered consumer segment without
             // making the presenter observe label RAM. Admission is generation-safe only when
             // this exact submitted wait ticket is still bound to a retained producer checkpoint;
