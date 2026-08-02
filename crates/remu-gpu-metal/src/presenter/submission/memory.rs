@@ -19,6 +19,7 @@ use remu_memory::{
     notify_guest_memory_written, read_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 impl MetalPresenter {
@@ -655,7 +656,29 @@ fn apply_guest_memory_operation_direct(
             value,
             dword_count,
         } => {
-            // SAFETY: the caller pins the complete original mapping against replacement.
+            // A DMA fill is the one publication path that wrote raw to the guest VA. Every other
+            // path proves the destination is a live mapping first, and a fill is the most
+            // damaging thing to get wrong: DCC clear keys are hundreds of kilobytes of one
+            // repeated dword, so a stale or short destination sprays that pattern across whatever
+            // now occupies the range. Prove the whole range resolves to one live shared mapping
+            // before writing a single dword, and refuse loudly rather than scribble.
+            let byte_count = dword_count
+                .checked_mul(4)
+                .ok_or("DMA fill byte count overflowed")?;
+            if guest_shared_mapping_identity(*address, byte_count).is_none() {
+                static REFUSED: AtomicU64 = AtomicU64::new(0);
+                let sequence = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][VM] refused DMA fill sequence={sequence} address={address:#x} bytes={byte_count:#x} value={value:#010x}: no single live mapping covers the range"
+                    );
+                }
+                return Err(format!(
+                    "DMA fill destination {address:#x}+{byte_count:#x} is not one live mapping"
+                ));
+            }
+            // SAFETY: the range above resolved to one live shared mapping covering every byte,
+            // and the caller pins that mapping against replacement for the write.
             unsafe {
                 for index in 0..*dword_count {
                     let offset = index
