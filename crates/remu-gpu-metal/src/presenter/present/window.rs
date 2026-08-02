@@ -1002,6 +1002,32 @@ pub(crate) fn presenter_window_attributes() -> winit::window::WindowAttributes {
         .with_active(true)
 }
 
+impl MetalPresenter {
+    pub(crate) fn service_interactive_presenter_before_wait(&mut self) -> PresenterFlow {
+        let flow = self.receive_events();
+        if flow == PresenterFlow::Shutdown {
+            return flow;
+        }
+        if let Err(error) = self
+            .flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
+        {
+            eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
+        }
+        self.retire_completed_presentations();
+        self.update_window_title();
+        crate::presenter::host_ui::poll_host_ui();
+        // `request_redraw` deliberately makes no promise that RedrawRequested arrives in this or
+        // the next event-loop iteration. On macOS it is additionally queued when called from an
+        // ApplicationHandler callback. A continuously runnable GPU receiver could therefore enter
+        // AboutToWait again, accept the next flip, and replace the finalized scanout before the
+        // queued redraw ever ran. Render here, on the same AppKit event-loop thread, before any
+        // later callback can drain another GPU event. RedrawRequested remains the retry path when
+        // CAMetalLayer has no drawable; `render` leaves `redraw_pending` set in that case.
+        self.render();
+        flow
+    }
+}
+
 impl ApplicationHandler for MetalPresenter {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() || self.startup_error.is_some() {
@@ -1070,18 +1096,10 @@ impl ApplicationHandler for MetalPresenter {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.receive_events() == PresenterFlow::Shutdown {
+        if self.service_interactive_presenter_before_wait() == PresenterFlow::Shutdown {
             event_loop.exit();
             return;
         }
-        if let Err(error) = self
-            .flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
-        {
-            eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
-        }
-        self.retire_completed_presentations();
-        self.update_window_title();
-        crate::presenter::host_ui::poll_host_ui();
         if self.redraw_pending
             && let Some(window) = self.window.as_ref()
         {
