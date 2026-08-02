@@ -190,9 +190,9 @@ pub(crate) use av_player::{
     av_player_jump_to_time, av_player_pause, av_player_post_init, av_player_resume,
     av_player_set_av_sync_mode, av_player_set_log_callback, av_player_set_looping,
     av_player_set_trick_speed, av_player_start, av_player_stop, av_player_stream_count,
-    av_player_validate_handle, invoke_av_player_event_callbacks,
+    av_player_validate_handle, invoke_av_player_event_callback, invoke_av_player_event_callbacks,
     invoke_av_player_texture_deallocations, prepare_av_player_video_buffers,
-    take_av_player_calling_thread_callbacks,
+    take_av_player_calling_thread_callbacks, take_av_player_controller_callbacks,
 };
 #[cfg(test)]
 pub(crate) use dialog::{
@@ -1570,6 +1570,242 @@ fn retire_detached_guest_thread(handle: u64) {
     if let Some(object) = object {
         guest_free(object.handle);
     }
+}
+
+/// Spawns a REmu-owned thread that is allowed to call guest code.
+///
+/// Guest functions read `%fs` and may call imports, so such a thread needs the same identity a
+/// `scePthreadCreate` thread receives: its own copy of the linked TLS image, a pthread object of
+/// its own, and registration in the runtime's thread bookkeeping. Returns the guest thread handle.
+fn spawn_guest_capable_thread(
+    name: &str,
+    state: &mut ProbeDispatchState,
+    body: fn(),
+) -> Option<u64> {
+    // A thread started before an image is linked has no TLS to install. Refusing to start would
+    // discard the work the thread owns, so it runs without a guest thread pointer instead.
+    let guest_tls = u64::try_from(state.tls_template.len())
+        .is_ok_and(|length| length == GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
+        .then(|| clone_guest_tls(&state.tls_template));
+    let handle = allocate_pthread_thread_object(state, name)?;
+    let trace_name = name.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name(trace_name.clone())
+        .stack_size(HOST_PTHREAD_STACK_FLOOR)
+        .spawn(move || {
+            set_current_guest_thread_handle(handle);
+            set_current_guest_thread_name(Some(trace_name));
+            if let Some(guest_tls) = guest_tls.as_ref() {
+                set_current_guest_thread_pointer(guest_tls.thread_pointer);
+            }
+            body();
+            run_guest_thread_destructors();
+            retire_current_guest_import_trace();
+            set_current_guest_thread_pointer(0);
+            set_current_guest_thread_handle(0);
+            drop(guest_tls);
+            0
+        });
+    match spawned {
+        Ok(thread) => {
+            state
+                .thread_attributes
+                .insert(handle, PthreadAttrState::default());
+            state.thread_handles.insert(handle, thread);
+            Some(handle)
+        }
+        Err(error) => {
+            eprintln!("[REMu][THREAD] host spawn refused name={name:?}: {error}");
+            if let Some(object) = state.pthread_threads.remove(&handle) {
+                guest_free(object.handle);
+            }
+            None
+        }
+    }
+}
+
+const AV_PLAYER_CONTROLLER_THREAD_NAME: &str = "AvPlayerController";
+
+/// Owner of the `AvPlayerEventDelivery::Controller` queue.
+///
+/// `libSceAvPlayer` issues Ready and end-of-stream from its own controller thread. A queue drained
+/// by whichever guest thread happens to run the next stateful import instead re-enters that
+/// thread's own `AvPlayer` frame, and strands every later notification once the guest stops issuing
+/// such imports, so delivery needs a thread the runtime owns.
+static AV_PLAYER_CONTROLLER: OnceLock<AvPlayerController> = OnceLock::new();
+
+#[derive(Default)]
+struct AvPlayerController {
+    signal: Mutex<AvPlayerControllerSignal>,
+    wakeup: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AvPlayerControllerState {
+    #[default]
+    NotStarted,
+    Running,
+    /// Exit requested; the thread leaves once the callback it is inside returns.
+    Stopping,
+    Finished,
+}
+
+#[derive(Default)]
+struct AvPlayerControllerSignal {
+    state: AvPlayerControllerState,
+    /// Published under the dispatch write lock by every queue site, so it is never observed clear
+    /// while a controller callback is still parked in `ProbeDispatchState`.
+    queued: bool,
+    delivered: u64,
+    /// Event id and entry time of the callback currently executing guest code.
+    in_flight: Option<(u64, Instant)>,
+}
+
+fn av_player_controller() -> &'static AvPlayerController {
+    AV_PLAYER_CONTROLLER.get_or_init(AvPlayerController::default)
+}
+
+/// Publishes a queued controller notification, starting the controller thread on first use.
+///
+/// The caller holds the dispatch write lock. The callback itself runs on the controller thread,
+/// which holds no runtime lock while it is inside guest code.
+pub(crate) fn wake_av_player_controller(state: &mut ProbeDispatchState) {
+    let controller = av_player_controller();
+    let mut signal = controller
+        .signal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    signal.queued = true;
+    if signal.state == AvPlayerControllerState::NotStarted {
+        if let Some(handle) = spawn_guest_capable_thread(
+            AV_PLAYER_CONTROLLER_THREAD_NAME,
+            state,
+            run_av_player_controller,
+        ) {
+            eprintln!("[REMu][AVPLAYER] controller thread started handle={handle:#x}");
+            signal.state = AvPlayerControllerState::Running;
+        } else {
+            eprintln!(
+                "[REMu][AVPLAYER] controller thread could not start; asynchronous events stay queued"
+            );
+        }
+    }
+    controller.wakeup.notify_all();
+}
+
+/// Delivers queued controller notifications until the process tears down.
+fn run_av_player_controller() {
+    // The wait is bounded so shutdown is observed without a notification, and so a queue site that
+    // publishes without signalling still has its callback delivered.
+    const IDLE_POLL: Duration = Duration::from_millis(250);
+    let controller = av_player_controller();
+    loop {
+        {
+            let mut signal = controller
+                .signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !signal.queued && signal.state == AvPlayerControllerState::Running {
+                signal = controller
+                    .wakeup
+                    .wait_timeout(signal, IDLE_POLL)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+            if signal.state != AvPlayerControllerState::Running {
+                break;
+            }
+            signal.queued = false;
+        }
+        let Some(dispatch) = PROBE_DISPATCH.get() else {
+            continue;
+        };
+        // The dispatch lock is taken only to move the callbacks out. A guest event handler may
+        // block indefinitely, and holding the process-wide lock across one would stop every import.
+        let callbacks = {
+            let mut state = lock_probe_dispatch_for_write(dispatch);
+            take_av_player_controller_callbacks(&mut state)
+        };
+        for callback in callbacks {
+            controller
+                .signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .in_flight = Some((callback.event, Instant::now()));
+            invoke_av_player_event_callback(callback);
+            let mut signal = controller
+                .signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            signal.in_flight = None;
+            signal.delivered = signal.delivered.saturating_add(1);
+        }
+    }
+    controller
+        .signal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .state = AvPlayerControllerState::Finished;
+    controller.wakeup.notify_all();
+}
+
+/// Asks the controller thread to exit and waits a bounded interval for it.
+///
+/// A guest event handler can block forever, so teardown reports a wedged controller rather than
+/// joining it: this runs on the paths that terminate the process, including the stall watchdog.
+fn stop_av_player_controller() {
+    const STOP_WAIT: Duration = Duration::from_millis(100);
+    let Some(controller) = AV_PLAYER_CONTROLLER.get() else {
+        return;
+    };
+    let mut signal = controller
+        .signal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if signal.state != AvPlayerControllerState::Running {
+        return;
+    }
+    signal.state = AvPlayerControllerState::Stopping;
+    controller.wakeup.notify_all();
+    let (signal, _) = controller
+        .wakeup
+        .wait_timeout_while(signal, STOP_WAIT, |signal| {
+            signal.state != AvPlayerControllerState::Finished
+        })
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if signal.state != AvPlayerControllerState::Finished {
+        eprintln!(
+            "[REMu][AVPLAYER] controller thread still running after {}ms in_flight={:?}",
+            STOP_WAIT.as_millis(),
+            signal
+                .in_flight
+                .map(|(event, since)| (event, since.elapsed()))
+        );
+    }
+}
+
+/// Reports controller-thread liveness alongside the per-player stall snapshot.
+///
+/// A notification that was queued but never delivered is invisible in the player state: a player
+/// waiting for Ready reports the same `inactive` decoder state as one that was never started.
+fn report_av_player_controller_stall_attribution(queued: Option<usize>) {
+    let queued = queued.map_or_else(|| "dispatch-busy".to_owned(), |queued| queued.to_string());
+    let Some(controller) = AV_PLAYER_CONTROLLER.get() else {
+        eprintln!("[REMu][STALL-AVPLAYER] controller=not-started queued={queued}");
+        return;
+    };
+    let Ok(signal) = controller.signal.try_lock() else {
+        eprintln!("[REMu][STALL-AVPLAYER] controller=signal-busy queued={queued}");
+        return;
+    };
+    eprintln!(
+        "[REMu][STALL-AVPLAYER] controller={:?} queued={queued} delivered={} in_flight={:?}",
+        signal.state,
+        signal.delivered,
+        signal
+            .in_flight
+            .map(|(event, since)| (event, since.elapsed().as_millis())),
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3047,13 +3283,12 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         }
         return ProbeImportReturn::integer(0);
     }
-    // Ready originates asynchronously on the native library's controller thread. Deliver only
-    // controller callbacks queued by an earlier import so AddSource returns before Ready can
-    // re-enter the guest. Playback-state callbacks are different: the native implementation
-    // emits Play/Pause/Stop synchronously from their initiating game-thread calls. Keeping those
-    // in this process-wide deferred queue lets an unrelated renderer or audio worker steal the
-    // callback and mutate its thread-local media state.
-    let av_player_callbacks = std::mem::take(&mut state.av_player.pending_callbacks);
+    // Asynchronous AvPlayer notifications belong to the controller thread and must not be drained
+    // here: a guest event handler may block, and a guest thread that delivers one re-enters its own
+    // AvPlayer frame. Playback-state callbacks are different, because the native implementation
+    // emits Play/Pause/Stop synchronously from their initiating game-thread calls. Keeping those in
+    // a process-wide deferred queue would let an unrelated renderer or audio worker steal the
+    // callback and mutate its thread-local media state, so they are taken back below by delivery.
     let dispatch_started = trace_lock_stall.then(Instant::now);
     begin_deferred_gpu_publication();
     let result = dispatch_probe_import(nid, call_args, stack_args, &mut state);
@@ -3088,7 +3323,6 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     }
     {
         let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::ImportCallbacks);
-        invoke_av_player_event_callbacks(av_player_callbacks);
         invoke_av_player_event_callbacks(av_player_calling_thread_callbacks);
         invoke_av_player_texture_deallocations(av_player_texture_deallocations);
     }
@@ -8328,12 +8562,22 @@ fn report_diagnostic_stall_attribution() {
     }
     guest_sync::report_condition_stall_attribution();
 
-    let players = PROBE_DISPATCH
+    let dispatch_state = PROBE_DISPATCH
         .get()
-        .and_then(|dispatch| dispatch.try_read().ok())
-        .map_or_else(Vec::new, |state| {
-            av_player::av_player_stall_snapshots(&state)
-        });
+        .and_then(|dispatch| dispatch.try_read().ok());
+    let players = dispatch_state.as_ref().map_or_else(Vec::new, |state| {
+        av_player::av_player_stall_snapshots(state)
+    });
+    let queued_controller_callbacks = dispatch_state.as_ref().map(|state| {
+        state
+            .av_player
+            .pending_callbacks
+            .iter()
+            .filter(|callback| callback.delivery == AvPlayerEventDelivery::Controller)
+            .count()
+    });
+    drop(dispatch_state);
+    report_av_player_controller_stall_attribution(queued_controller_callbacks);
     if players.is_empty() {
         eprintln!("[REMu][STALL-AVPLAYER] players=none-or-dispatch-busy");
     }
@@ -8410,6 +8654,7 @@ fn start_diagnostic_timeout(timeout_seconds: u32) {
 
 fn terminate_probe(code: i32) -> ! {
     report_shader_opcode_coverage();
+    stop_av_player_controller();
     #[cfg(unix)]
     // SAFETY: `_exit` terminates the isolated CLI probe without unwinding across guest frames.
     unsafe {
