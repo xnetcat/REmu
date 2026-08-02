@@ -7,6 +7,9 @@ pub use channel::{
     install_event_sink, pipeline_barrier,
 };
 
+mod startup;
+pub use startup::{StartupMilestone, begin_startup_timeline, record_startup_milestone};
+
 mod compute;
 pub use compute::{
     COMPUTE_NUM_THREAD_X_REGISTER, COMPUTE_NUM_THREAD_Y_REGISTER, COMPUTE_NUM_THREAD_Z_REGISTER,

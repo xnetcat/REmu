@@ -122,6 +122,7 @@ impl MetalPresenter {
         window.focus_window();
         self.window = Some(window);
         self.layer = Some(layer);
+        remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::WindowReady);
         Ok(())
     }
 

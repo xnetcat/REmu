@@ -176,6 +176,9 @@ impl OrderedGpuEventReceiver {
             self.next_ingress_sequence = self.next_ingress_sequence.saturating_add(1);
             match event {
                 GpuEvent::QueueSubmission { queue_id, events } => {
+                    remu_gpu::record_startup_milestone(
+                        remu_gpu::StartupMilestone::FirstQueueSubmission,
+                    );
                     if events.is_empty() {
                         continue;
                     }

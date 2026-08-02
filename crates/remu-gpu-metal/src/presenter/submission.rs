@@ -300,6 +300,9 @@ impl MetalPresenter {
                     tiling_mode,
                     ..
                 } => {
+                    remu_gpu::record_startup_milestone(
+                        remu_gpu::StartupMilestone::FirstFlipAccepted,
+                    );
                     self.statistics.guest_flips = self.statistics.guest_flips.saturating_add(1);
                     self.display = Some(DisplayConfiguration {
                         width,
@@ -647,6 +650,9 @@ impl MetalPresenter {
                             );
                         }
                     } else {
+                        remu_gpu::record_startup_milestone(
+                            remu_gpu::StartupMilestone::FirstEncodedDraw,
+                        );
                         self.statistics.encoded_draws =
                             self.statistics.encoded_draws.saturating_add(1);
                     }

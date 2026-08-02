@@ -2298,12 +2298,14 @@ struct GuestMipChainLayout {
 }
 
 pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::PresenterEnter);
     if headless_metal_requested() {
         return run_headless_presenter(receiver);
     }
     disable_appkit_state_restoration();
     eprintln!("[REMu][METAL] starting AppKit event loop");
     let mut presenter = MetalPresenter::new(receiver)?;
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::PresenterResourcesReady);
     let mut builder = EventLoop::builder();
     builder
         .with_activation_policy(ActivationPolicy::Regular)

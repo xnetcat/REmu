@@ -279,6 +279,11 @@ impl MetalPresenter {
         // Presentation is where a finalized flip becomes guest-visible; an unfinalized flip has no
         // snapshot in this drawable and stays pending.
         let flip_sequence = self.claim_flip_terminal(self.finalized_flip_sequence);
+        if flip_sequence.is_some() {
+            remu_gpu::record_startup_milestone(
+                remu_gpu::StartupMilestone::FirstGuestPresentSubmitted,
+            );
+        }
         self.pending_presentations.push_back(PendingPresentation {
             command_buffer,
             submitted_at: Instant::now(),
