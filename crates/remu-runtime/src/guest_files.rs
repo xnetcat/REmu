@@ -19,9 +19,9 @@ use crate::{
     ProbeDispatchState, SCE_KERNEL_ERROR_ALREADY_EXISTS, SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
     SCE_KERNEL_ERROR_NOT_DIRECTORY, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_PERMISSION_DENIED,
-    SCE_KERNEL_STAT_SIZE, low_i32, low_u32, read_guest_cstring, sce_kernel_error,
-    sce_kernel_io_error, signed_i32_return, trace_guest_vfs, trace_guest_vfs_miss,
-    write_guest_bytes, write_guest_u64,
+    SCE_KERNEL_STAT_SIZE, low_i32, low_u32, read_guest_cstring, save_data_mount_is_writable,
+    sce_kernel_error, sce_kernel_io_error, signed_i32_return, trace_guest_vfs,
+    trace_guest_vfs_miss, write_guest_bytes, write_guest_u64,
 };
 
 pub(crate) static KERNEL_FILES: OnceLock<Mutex<KernelFileState>> = OnceLock::new();
@@ -437,12 +437,13 @@ pub(crate) fn resolve_probe_guest_path(
         return resolve_path_beneath(&download_root, relative).map(|path| (path, true));
     }
     for (mount_point, mounted) in &state.save_mounts {
+        let writable = save_data_mount_is_writable(mounted, state);
         if normalized == *mount_point {
-            return Some((mounted.path.clone(), !mounted.read_only));
+            return Some((mounted.path.clone(), writable));
         }
         if let Some(relative) = normalized.strip_prefix(&format!("{mount_point}/")) {
             return resolve_path_beneath(&mounted.path, relative)
-                .map(|path| (path, !mounted.read_only));
+                .map(|path| (path, writable));
         }
     }
     resolve_guest_path(&state.game_root, &normalized).map(|path| (path, false))

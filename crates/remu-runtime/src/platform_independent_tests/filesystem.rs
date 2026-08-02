@@ -7,15 +7,18 @@ use std::sync::Mutex;
 
 use super::{
     AMPR_INVALID_FILE_ID, AprResolveOutputs, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, KERNEL_FILES,
-    KernelDirectory, KernelFileState, ProbeDispatchState, SAVE_DATA_ERROR_EXISTS,
-    SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_FOUND,
+    KernelDirectory, KernelFileState, ProbeDispatchState, SAVE_DATA_ERROR_BUSY,
+    SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_ERROR_RESOURCE_BUSY,
+    SAVE_DATA_ERROR_RESOURCE_FULL, SAVE_DATA_ERROR_RESOURCE_INVALID, SAVE_DATA_PARAM_SIZE,
+    SCE_KERNEL_ERROR_NOT_FOUND, SaveDataMount,
     TemporaryTestDirectory, ampr_resolve_file_paths, ampr_resolve_paths_core,
     discover_runtime_module_paths, guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_lseek,
     guest_kernel_read, guest_posix_file_result, join_guest_path, kernel_stat_payload,
     read_guest_u32, resolve_guest_path, resolve_probe_guest_path, sanitize_save_segment,
-    save_data_commit, save_data_create_transaction_resource, save_data_dir_name_search,
-    save_data_mount3, save_data_pattern_matches, save_data_prepare, save_data_save_icon,
-    save_data_set_param, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
+    save_data_commit, save_data_create_transaction_resource, save_data_delete,
+    save_data_delete_transaction_resource, save_data_dir_name_search, save_data_mount3,
+    save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
+    save_data_terminate, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
     write_guest_u32, write_guest_u64,
 };
 
@@ -242,6 +245,108 @@ fn temporary_app_content_mount_is_not_a_save_data_slot() {
 }
 
 #[test]
+fn bounds_and_reuses_transaction_resources_without_deleting_live_ones() {
+    let temporary = TemporaryTestDirectory::new("savedata-resource-lifecycle");
+    let mut state = ProbeDispatchState {
+        save_root: temporary.path.clone(),
+        save_data_initialized: true,
+        next_save_transaction_resource: 1,
+        ..ProbeDispatchState::default()
+    };
+
+    assert_eq!(
+        save_data_create_transaction_resource([0xb_ffff, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(0x809f_0000)
+    );
+    for expected in 1..=16 {
+        assert_eq!(
+            save_data_create_transaction_resource([0xc_0000, 0, 0, 0, 0, 0], &mut state),
+            expected
+        );
+    }
+    assert_eq!(
+        save_data_create_transaction_resource([0xc_0000, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_FULL)
+    );
+
+    state.save_mounts.insert(
+        "/savedata0".to_owned(),
+        SaveDataMount {
+            path: state.save_root.join("slot"),
+            committed_path: state.save_root.join("slot"),
+            dir_name: "slot".to_owned(),
+            user_id: 0x1000_0000,
+            resource: 1,
+            read_only: false,
+        },
+    );
+    assert_eq!(
+        save_data_delete_transaction_resource([1, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_BUSY)
+    );
+    state.save_mounts.clear();
+    assert_eq!(
+        save_data_delete_transaction_resource([1, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(
+        save_data_delete_transaction_resource([1, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_INVALID)
+    );
+    assert_eq!(
+        save_data_create_transaction_resource([0xc_0000, 0, 0, 0, 0, 0], &mut state),
+        1,
+        "the bounded allocator reuses a released resource ID"
+    );
+}
+
+#[test]
+fn deletes_only_unmounted_save_data_slots() {
+    let temporary = TemporaryTestDirectory::new("savedata-delete");
+    let mut state = ProbeDispatchState {
+        save_root: temporary.path.clone(),
+        save_data_initialized: true,
+        ..ProbeDispatchState::default()
+    };
+    let slot = state.save_root.join("SAVEDATA00");
+    std::fs::create_dir_all(&slot).unwrap();
+    std::fs::write(slot.join("save.bin"), b"data").unwrap();
+
+    let mut dir_name = [0_u8; 32];
+    dir_name[..10].copy_from_slice(b"SAVEDATA00");
+    let mut delete = [0_u8; 0x40];
+    let delete_address = delete.as_mut_ptr().addr() as u64;
+    write_guest_u32(delete_address, 0x1000_0000);
+    write_guest_u64(delete_address + 0x10, dir_name.as_ptr().addr() as u64);
+
+    state.save_mounts.insert(
+        "/savedata0".to_owned(),
+        SaveDataMount {
+            path: slot.clone(),
+            committed_path: slot.clone(),
+            dir_name: "SAVEDATA00".to_owned(),
+            user_id: 0x1000_0000,
+            resource: u32::MAX,
+            read_only: true,
+        },
+    );
+    assert_eq!(
+        save_data_delete([delete_address, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(SAVE_DATA_ERROR_BUSY)
+    );
+    state.save_mounts.clear();
+    assert_eq!(
+        save_data_delete([delete_address, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert!(!slot.exists());
+    assert_eq!(
+        save_data_delete([delete_address, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(SAVE_DATA_ERROR_NOT_FOUND)
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn persists_and_searches_transactional_save_data() {
     let temporary = TemporaryTestDirectory::new("savedata-transaction");
@@ -276,6 +381,13 @@ fn persists_and_searches_transactional_save_data() {
         u32::from_le_bytes(mount_result[0x1c..0x20].try_into().unwrap()),
         1
     );
+    assert_eq!(
+        resolve_probe_guest_path(&state, "/savedata0/save.bin")
+            .unwrap()
+            .1,
+        false,
+        "a transaction mount is not writable before Prepare"
+    );
 
     let mut prepare = [0_u8; 0x28];
     prepare[..4].copy_from_slice(&resource.to_le_bytes());
@@ -285,6 +397,12 @@ fn persists_and_searches_transactional_save_data() {
             &mut state,
         ),
         0
+    );
+    assert!(
+        resolve_probe_guest_path(&state, "/savedata0/save.bin")
+            .unwrap()
+            .1,
+        "Prepare exposes the staging tree for writes"
     );
 
     let mut param = [0_u8; SAVE_DATA_PARAM_SIZE];
@@ -328,6 +446,13 @@ fn persists_and_searches_transactional_save_data() {
     assert_eq!(
         save_data_commit([commit.as_ptr().addr() as u64, 0, 0, 0, 0, 0], &mut state,),
         0
+    );
+    assert_eq!(
+        resolve_probe_guest_path(&state, "/savedata0/save.bin")
+            .unwrap()
+            .1,
+        false,
+        "Commit closes the writable transaction window"
     );
     assert_eq!(
         &std::fs::read(&committed_param).unwrap()[..14],
@@ -395,9 +520,25 @@ fn persists_and_searches_transactional_save_data() {
         0
     );
     assert_eq!(
-        save_data_umount2([0, result_address, 0, 0, 0, 0], &mut state),
+        save_data_prepare(
+            [result_address, prepare.as_ptr().addr() as u64, 0, 0, 0, 0,],
+            &mut state,
+        ),
         0
     );
+    let committed_by_umount = state
+        .save_root
+        .join("SAVEDATA00/committed-by-umount.bin");
+    let staging_file = resolve_probe_guest_path(&state, "/savedata0/committed-by-umount.bin")
+        .unwrap()
+        .0;
+    std::fs::write(staging_file, b"committed").unwrap();
+    assert_eq!(
+        save_data_umount2([1, result_address, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(std::fs::read(committed_by_umount).unwrap(), b"committed");
+    assert!(!state.save_mounts.contains_key("/savedata0"));
     write_guest_u32(mount_address + 0x20, 1 << 2);
     assert_eq!(
         save_data_mount3([mount_address, result_address, 0, 0, 0, 0], &mut state),
@@ -410,6 +551,9 @@ fn persists_and_searches_transactional_save_data() {
         save_data_mount3([mount_address, result_address, 0, 0, 0, 0], &mut state),
         sce_kernel_error(SAVE_DATA_ERROR_NOT_FOUND)
     );
+    assert_eq!(save_data_terminate(&mut state), 0);
+    assert!(!state.save_data_initialized);
+    assert!(state.save_transaction_resources.is_empty());
 }
 
 #[test]

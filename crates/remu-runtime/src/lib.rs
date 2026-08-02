@@ -315,15 +315,17 @@ use remu_shader::GuestMemoryReader;
 pub(crate) use save_data::save_data_root;
 #[cfg(test)]
 pub(crate) use save_data::{
-    SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
-    enumerate_save_data_entries, sanitize_save_segment, save_data_pattern_matches,
+    SAVE_DATA_ERROR_BUSY, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND,
+    SAVE_DATA_ERROR_RESOURCE_BUSY, SAVE_DATA_ERROR_RESOURCE_FULL,
+    SAVE_DATA_ERROR_RESOURCE_INVALID, SAVE_DATA_PARAM_SIZE, enumerate_save_data_entries,
+    sanitize_save_segment, save_data_pattern_matches,
 };
 pub(crate) use save_data::{
     current_unix_seconds, read_guest_bytes, save_data_commit,
     save_data_create_transaction_resource, save_data_delete_transaction_resource,
-    save_data_dir_name_search, save_data_initialize,
-    save_data_mount3, save_data_prepare, save_data_save_icon, save_data_set_param,
-    save_data_umount2, write_guest_bytes,
+    save_data_delete, save_data_dir_name_search, save_data_initialize, save_data_mount3,
+    save_data_mount_is_writable, save_data_prepare, save_data_save_icon, save_data_set_param,
+    save_data_terminate, save_data_umount2, write_guest_bytes,
 };
 use sha1::{Digest, Sha1};
 pub(crate) use shader_cache::{
@@ -5146,6 +5148,7 @@ fn dispatch_probe_import(
         }
         // libSceSaveData uses durable host-side transactions while preserving the guest ABI.
         "TywrFKCoLGY" => save_data_initialize(state),
+        "yKDy8S5yLA0" => save_data_terminate(state),
         "dyIhnXq-0SM" | "X4MYzukPc3g" => save_data_dir_name_search(arguments, state),
         "ZP4e7rlzOUk" => save_data_mount3(arguments, state),
         "gjRZNnw0JPE" => save_data_create_transaction_resource(arguments, state),
@@ -5155,6 +5158,7 @@ fn dispatch_probe_import(
         "85zul--eGXs" => save_data_set_param(arguments, state),
         "c88Yy54Mx0w" => save_data_save_icon(arguments, state),
         "ie7qhZ4X0Cc" => save_data_commit(arguments, state),
+        "S1GkePI17zQ" => save_data_delete(arguments, state),
         // User-service IDs use the retail slot encoding expected by the game's controller layer.
         "CdWp0oHWGr0" => write_output_i32(arguments[0], 0x1000_0000),
         "fPhymKNvK-A" => user_service_get_login_user_id_list(arguments),
