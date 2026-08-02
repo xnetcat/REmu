@@ -1500,7 +1500,7 @@ fn remapped_zero_copy_writer_address_synchronizes_before_reuse() {
 }
 
 #[test]
-fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
+fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     let queue = presenter
@@ -1551,7 +1551,7 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
     assert!(presenter.committed_guest_batches.is_empty());
     assert_eq!(presenter.statistics.submitted_guest_batches, 0);
 
-    let satisfied = GpuMemoryWait {
+    let wait = GpuMemoryWait {
         address,
         reference: 2,
         mask: u64::from(u32::MAX),
@@ -1560,21 +1560,8 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
     };
     assert_eq!(
         presenter
-            .execute_guest_memory_wait(OrderedEventSource::GuestQueue(77), None, satisfied)
-            .expect("latest deferred value satisfies the ordered wait"),
-        GuestMemoryWaitStatus::Satisfied
-    );
-    assert!(presenter.open_guest_batch.is_some());
-    assert_eq!(presenter.statistics.submitted_guest_batches, 0);
-
-    let blocked = GpuMemoryWait {
-        reference: 3,
-        ..satisfied
-    };
-    assert_eq!(
-        presenter
-            .execute_guest_memory_wait(OrderedEventSource::GuestQueue(77), None, blocked)
-            .expect("nonmatching deferred value blocks"),
+            .execute_guest_memory_wait(OrderedEventSource::GuestQueue(77), None, wait)
+            .expect("future deferred value parks the consuming queue"),
         GuestMemoryWaitStatus::Blocked
     );
     assert!(presenter.open_guest_batch.is_none());
@@ -1599,6 +1586,12 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
         read_test_label(address),
         2,
         "deferred writes publish in exact packet order"
+    );
+    assert_eq!(
+        presenter
+            .execute_guest_memory_wait(OrderedEventSource::GuestQueue(77), None, wait)
+            .expect("terminally published value satisfies the ordered wait"),
+        GuestMemoryWaitStatus::Satisfied
     );
 }
 
