@@ -110,7 +110,10 @@ impl Compiler<'_> {
         if kind.storage {
             return Err("sample operation resolved to a storage image".to_owned());
         }
-        if image.is_array || !matches!(image.dimension, 0 | 1 | 2 | 3) {
+        let native_2d_array = image.dimension == 5 && kind.texture_type == 13;
+        if (image.is_array && !native_2d_array)
+            || (!native_2d_array && !matches!(image.dimension, 0 | 1 | 2 | 3))
+        {
             return Err(format!(
                 "sampled image dimension {} array={} requires its matching Metal texture type",
                 image.dimension, image.is_array
@@ -424,9 +427,10 @@ impl Compiler<'_> {
         let kind = self.image_kinds[binding_index];
         let metal_dim = metal_image_dimension(kind);
         let is_gather = name.starts_with("ImageGather4");
-        if is_gather && metal_dim != 1 {
+        let gathers_from_2d_array = metal_dim == 3 && matches!(image.dimension, 2 | 5);
+        if is_gather && metal_dim != 1 && !gathers_from_2d_array {
             return Err(format!(
-                "gather image dimension {} requires a 2D Metal texture",
+                "gather image dimension {} requires a 2D or 2D-array Metal texture",
                 image.dimension
             ));
         }
@@ -525,14 +529,14 @@ impl Compiler<'_> {
             );
             cursor += gradient_components * 2;
         }
-        let coordinate_kind = if matches!(image.dimension, 2 | 3) {
+        let coordinate_kind = if matches!(image.dimension, 2 | 3 | 5) {
             "float3"
         } else {
             "float2"
         };
         let mut coordinates = self.temp(
             coordinate_kind,
-            &if matches!(image.dimension, 2 | 3) {
+            &if matches!(image.dimension, 2 | 3 | 5) {
                 format!(
                     "float3({}, {}, {})",
                     self.image_float_address(image, cursor),
@@ -555,7 +559,7 @@ impl Compiler<'_> {
                 &self.image_float_address(
                     image,
                     cursor
-                        + if matches!(image.dimension, 2 | 3) {
+                        + if matches!(image.dimension, 2 | 3 | 5) {
                             3
                         } else {
                             2
@@ -565,7 +569,7 @@ impl Compiler<'_> {
         } else {
             bias.clone()
         };
-        if has_offset {
+        if has_offset && metal_dim == 2 {
             if image.dimension == 3 {
                 return Err("cube sampling does not support integer texel offsets".to_owned());
             }
@@ -576,22 +580,12 @@ impl Compiler<'_> {
             };
             let mip = self.temp("uint", &format!("(uint)max((int)({offset_lod}), 0)"));
             coordinates = if image.dimension == 2 {
-                if metal_dim == 2 {
-                    self.temp(
-                        "float3",
-                        &format!(
-                            "{coordinates} + float3((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}), (float){offset_z} / (float)tex{binding_index}.get_depth({mip}))"
-                        ),
-                    )
-                } else {
-                    // SRD rematerialized to 2D: keep the guest Z lane, offset only XY.
-                    self.temp(
-                        "float3",
-                        &format!(
-                            "float3({coordinates}.x + (float){offset_x} / (float)tex{binding_index}.get_width({mip}), {coordinates}.y + (float){offset_y} / (float)tex{binding_index}.get_height({mip}), {coordinates}.z)"
-                        ),
-                    )
-                }
+                self.temp(
+                    "float3",
+                    &format!(
+                        "{coordinates} + float3((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}), (float){offset_z} / (float)tex{binding_index}.get_depth({mip}))"
+                    ),
+                )
             } else {
                 self.temp(
                     "float2",
@@ -600,6 +594,8 @@ impl Compiler<'_> {
                     ),
                 )
             };
+        } else if has_offset && image.dimension == 3 {
+            return Err("cube sampling does not support integer texel offsets".to_owned());
         }
         // GCN cube sampling receives face-atlas coordinates per the ISA contract established by
         // V_CUBEID/V_CUBESC/V_CUBETC/V_CUBEMA: x = sc/(2|ma|) + 1.5, y = tc/(2|ma|) + 1.5 and
@@ -611,7 +607,7 @@ impl Compiler<'_> {
         // When the SRD TYPE rematerializes a DIM=3D address layout onto a 2D texture (UE Slate
         // font atlases), keep the guest float3 parse for VGPR layout but sample with .xy.
         let mut sample_coordinates = coordinates.clone();
-        if metal_dim == 1 && matches!(image.dimension, 2 | 3) {
+        if metal_dim == 1 && matches!(image.dimension, 2 | 3 | 5) {
             sample_coordinates = self.temp("float2", &format!("{coordinates}.xy"));
         }
         let coordinate_arguments = if metal_dim == 3 {
@@ -631,9 +627,10 @@ impl Compiler<'_> {
                         ),
                     ),
                 )
-            } else if image.dimension == 2 {
+            } else if matches!(image.dimension, 2 | 5) {
                 // A 3D MIMG address rematerialized by an array SRD retains Z as the discrete
-                // layer. Metal still requires the coordinate and layer as separate arguments.
+                // layer. A native 2D-array MIMG address has the same UV-plus-layer shape. Metal
+                // requires the coordinate and layer as separate arguments in both cases.
                 (
                     self.temp("float2", &format!("{coordinates}.xy")),
                     self.temp(
@@ -689,11 +686,21 @@ impl Compiler<'_> {
         } else {
             format!("remu_samplers.s{sampler_slot}")
         };
+        let native_offset = if has_offset && metal_dim != 2 {
+            format!("int2({offset_x}, {offset_y})")
+        } else {
+            "int2(0)".to_owned()
+        };
+        let sample_offset = if has_offset && metal_dim != 2 {
+            format!(", {native_offset}")
+        } else {
+            String::new()
+        };
         let physical = if is_gather && has_compare {
             self.temp(
                 &vector_kind,
                 &format!(
-                    "tex{binding_index}.gather_compare({sampler}, {coordinate_arguments}, {compare}, int2(0))"
+                    "tex{binding_index}.gather_compare({sampler}, {coordinate_arguments}, {compare}, {native_offset})"
                 ),
             )
         } else if is_gather {
@@ -707,7 +714,7 @@ impl Compiler<'_> {
                 self.temp(
                     &vector_kind,
                     &format!(
-                        "tex{binding_index}.gather({sampler}, {coordinate_arguments}, int2(0), component::{component})"
+                        "tex{binding_index}.gather({sampler}, {coordinate_arguments}, {native_offset}, component::{component})"
                     ),
                 )
             });
@@ -736,7 +743,7 @@ impl Compiler<'_> {
             let compared = self.temp(
                 "float",
                 &format!(
-                    "tex{binding_index}.sample_compare({sampler}, {coordinate_arguments}, {compare}{extra})"
+                    "tex{binding_index}.sample_compare({sampler}, {coordinate_arguments}, {compare}{extra}{sample_offset})"
                 ),
             );
             self.temp(
@@ -746,7 +753,9 @@ impl Compiler<'_> {
         } else {
             self.temp(
                 &vector_kind,
-                &format!("tex{binding_index}.sample({sampler}, {coordinate_arguments}{extra})"),
+                &format!(
+                    "tex{binding_index}.sample({sampler}, {coordinate_arguments}{extra}{sample_offset})"
+                ),
             )
         };
         if is_gather {

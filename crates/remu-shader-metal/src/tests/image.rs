@@ -205,6 +205,245 @@ fn zero_lod_gather_returns_four_neighbor_values_from_the_selected_component() {
     assert!(shader.source.contains("remu_v_7 = "));
 }
 
+fn compile_offset_sample(name: &'static str, dimension: u32, texture_type: u32) -> MetalShader {
+    let comparison = name.contains("SampleC") || name.contains("Gather4C");
+    let coordinate_count = if matches!(dimension, 2 | 3 | 5) { 3 } else { 2 };
+    let address_count = 1 + usize::from(comparison) + coordinate_count;
+    let control = ImageControl {
+        dmask: 1,
+        vector_address: 0,
+        address_registers: (0..u32::try_from(address_count).expect("address count fits u32"))
+            .collect(),
+        vector_data: 8,
+        scalar_resource: 0,
+        scalar_sampler: 8,
+        dimension,
+        is_array: matches!(dimension, 4 | 5 | 7),
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known(name),
+        words: vec![0, 0],
+        sources: (0..u32::try_from(address_count).expect("address count fits u32"))
+            .map(Operand::vector)
+            .chain([Operand::scalar(0), Operand::scalar(8)])
+            .collect(),
+        destinations: vec![Operand::vector(8)],
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let mut evaluation = empty_evaluation();
+    let mut resource_descriptor = vec![0; 8];
+    resource_descriptor[3] = 0x204 | (texture_type << 28);
+    evaluation.image_bindings.push(ImageBinding {
+        pc: 0,
+        opcode: Opcode::Known(name),
+        control,
+        resource_descriptor: resource_descriptor.into(),
+        sampler_descriptor: vec![3 << 12, 0, 0, 0].into(),
+        mip_level: None,
+    });
+    compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::compute(0),
+    )
+    .unwrap_or_else(|error| panic!("{name} should lower: {error}"))
+}
+
+#[test]
+fn zero_lod_sample_offset_uses_the_native_metal_integer_operand() {
+    let shader = compile_offset_sample("ImageSampleLzO", 1, 9);
+
+    assert!(shader.source.contains("texture2d<float> tex0"));
+    assert!(shader.source.contains(".sample("));
+    assert!(shader.source.contains("level(0.0f), int2("));
+    assert!(shader.source.contains("extract_bits("));
+    assert!(shader.source.contains(", 0u, 6u)"));
+    assert!(shader.source.contains(", 8u, 6u)"));
+    assert!(!shader.source.contains("tex0.get_width("));
+    assert!(!shader.source.contains("tex0.get_height("));
+}
+
+#[test]
+fn zero_lod_gather_offset_reaches_every_native_component_gather() {
+    let shader = compile_offset_sample("ImageGather4LzO", 1, 9);
+
+    for component in ["x", "y", "z", "w"] {
+        assert!(
+            shader
+                .source
+                .contains(&format!("), component::{component})")),
+            "missing offset gather for component {component}"
+        );
+    }
+    assert!(!shader.source.contains("int2(0), component::"));
+    assert!(!shader.source.contains("tex0.get_width("));
+}
+
+#[test]
+fn zero_lod_comparison_gather_uses_its_packed_native_offset() {
+    let shader = compile_offset_sample("ImageGather4CLzO", 1, 9);
+
+    assert!(shader.source.contains("depth2d<float> tex0"));
+    assert!(shader.source.contains(".gather_compare("));
+    assert!(shader.source.contains(", int2("));
+    assert!(!shader.source.contains(", int2(0))"));
+    assert!(!shader.source.contains("tex0.get_width("));
+}
+
+#[test]
+fn native_2d_array_offsets_preserve_the_discrete_layer_operand() {
+    let shader = compile_offset_sample("ImageSampleLzO", 5, 13);
+
+    assert!(shader.source.contains("texture2d_array<float> tex0"));
+    assert!(shader.source.contains(".sample("));
+    assert!(shader.source.contains(".xy"));
+    assert!(shader.source.contains("tex0.get_array_size() - 1u"));
+    assert!(shader.source.contains("level(0.0f), int2("));
+    assert!(!shader.source.contains("tex0.get_width("));
+    assert!(!shader.source.contains("tex0.get_height("));
+}
+
+#[test]
+fn native_2d_array_gather_offsets_use_array_texture_overloads() {
+    let ordinary = compile_offset_sample("ImageGather4LzO", 5, 13);
+    let comparison = compile_offset_sample("ImageGather4CLzO", 5, 13);
+
+    assert!(ordinary.source.contains("texture2d_array<float> tex0"));
+    assert!(ordinary.source.contains(".gather("));
+    assert!(ordinary.source.contains("tex0.get_array_size() - 1u"));
+    assert!(!ordinary.source.contains("int2(0), component::"));
+    assert!(comparison.source.contains("depth2d_array<float> tex0"));
+    assert!(comparison.source.contains(".gather_compare("));
+    assert!(comparison.source.contains("tex0.get_array_size() - 1u"));
+    assert!(!comparison.source.contains(", int2(0))"));
+}
+
+#[test]
+fn true_3d_offsets_keep_the_three_axis_coordinate_lowering() {
+    let shader = compile_offset_sample("ImageSampleLzO", 2, 10);
+
+    assert!(shader.source.contains("texture3d<float> tex0"));
+    assert!(shader.source.contains("tex0.get_width("));
+    assert!(shader.source.contains("tex0.get_height("));
+    assert!(shader.source.contains("tex0.get_depth("));
+    assert!(shader.source.contains(".sample("));
+    assert!(!shader.source.contains("level(0.0f), int2("));
+}
+
+#[test]
+fn cube_offsets_remain_a_loud_translation_error() {
+    let control = cube_image_control(vec![0, 1, 2, 3], 8);
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSampleLzO"),
+        words: vec![0, 0],
+        sources: (0..4)
+            .map(Operand::vector)
+            .chain([Operand::scalar(0), Operand::scalar(8)])
+            .collect(),
+        destinations: vec![Operand::vector(8)],
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let evaluation = cube_evaluation(Opcode::Known("ImageSampleLzO"), &control);
+    let error = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::compute(0),
+    )
+    .expect_err("cube integer offsets must not be silently approximated");
+    assert!(error.to_string().contains("cube sampling does not support"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn generated_offset_image_msl_compiles_with_apple_metal() {
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    fn find_metal_compiler() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("REMU_METAL_COMPILER").map(PathBuf::from)
+            && path.is_file()
+        {
+            return Some(path);
+        }
+        let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.remu/toolchains/Metal.xctoolchain/usr/bin/metal");
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+        let output = Command::new("xcrun")
+            .args(["--find", "metal"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+    }
+
+    let Some(compiler) = find_metal_compiler() else {
+        eprintln!("skipping Apple Metal image-offset compile test: no metal compiler found");
+        return;
+    };
+    let shaders = [
+        ("sample-2d", compile_offset_sample("ImageSampleLzO", 1, 9)),
+        ("gather-2d", compile_offset_sample("ImageGather4LzO", 1, 9)),
+        (
+            "gather-compare-2d",
+            compile_offset_sample("ImageGather4CLzO", 1, 9),
+        ),
+        (
+            "sample-2d-array",
+            compile_offset_sample("ImageSampleLzO", 5, 13),
+        ),
+        (
+            "gather-2d-array",
+            compile_offset_sample("ImageGather4LzO", 5, 13),
+        ),
+        (
+            "gather-compare-2d-array",
+            compile_offset_sample("ImageGather4CLzO", 5, 13),
+        ),
+    ];
+    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "remu-image-offset-metal-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).expect("create Metal image-offset test directory");
+    for (name, shader) in shaders {
+        let source = directory.join(format!("{name}.metal"));
+        let air = directory.join(format!("{name}.air"));
+        std::fs::write(&source, shader.source).expect("write generated image-offset MSL");
+        let output = Command::new(&compiler)
+            .args(["-c", "-target", "air64-apple-macosx15.0"])
+            .arg("-fmetal-math-mode=safe")
+            .arg("-o")
+            .arg(&air)
+            .arg(&source)
+            .output()
+            .expect("run Apple Metal compiler");
+        assert!(
+            output.status.success(),
+            "{name} image-offset MSL failed to compile:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(directory).expect("remove Metal image-offset test directory");
+}
+
 #[test]
 fn canonicalizes_silent_hill_scale_image_uses_below_the_direct_texture_limit() {
     const IMAGE_INSTRUCTION_COUNT: usize = 147;
