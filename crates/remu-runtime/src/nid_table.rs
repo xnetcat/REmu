@@ -599,6 +599,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "UvtA3FAiF4Y" => "sceVideodec2ReleaseComputeQueue",
         "XDncXQIJUSk" => "sceNpGetOnlineId",
         "WV1GwM32NgY" => "sceNpWebApi2PushEventCreateHandle",
+        "3Tt9zL3tkoc" => "sceNpWebApi2CheckTimeout",
         "U8IfNl6-Css" => "sceVoiceQoSInit",
         "I88KChlynSs" => "sceErrorDialogInitialize",
         "9XAxK2PMwk8" => "sceErrorDialogTerminate",

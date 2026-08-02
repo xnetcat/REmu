@@ -956,7 +956,9 @@ struct RuntimeServiceState {
     next_np_web_api2_user_context: i32,
     np_web_api2_user_contexts: BTreeMap<i32, (i32, i32)>,
     next_np_web_api2_push_event_handle: i32,
-    np_web_api2_push_event_handles: BTreeMap<i32, i32>,
+    np_web_api2_push_event_handles: BTreeMap<i32, NpWebApi2PushEventHandleState>,
+    np_web_api2_requests: BTreeMap<i64, NpWebApi2TimeoutState>,
+    np_web_api2_last_timeout_check_microseconds: Option<u64>,
     np_callback_polls: u64,
     np_title_id: Option<[u8; 16]>,
     share_feature_permitted: bool,
@@ -965,6 +967,32 @@ struct RuntimeServiceState {
     error_dialog_status: u32,
     error_dialog_sequence: u64,
     error_dialog_result_code: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NpWebApi2TimeoutState {
+    deadline_microseconds: Option<u64>,
+    aborted: bool,
+    timed_out: bool,
+}
+
+impl NpWebApi2TimeoutState {
+    fn expire_if_due(&mut self, now_microseconds: u64) {
+        if !self.timed_out
+            && self
+                .deadline_microseconds
+                .is_some_and(|deadline| deadline < now_microseconds)
+        {
+            self.timed_out = true;
+            self.aborted = true;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NpWebApi2PushEventHandleState {
+    library_context: i32,
+    timeout: NpWebApi2TimeoutState,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -5134,6 +5162,7 @@ fn dispatch_probe_import(
         "ysmw6J-P8Ak" => np_session_signaling_initialize(arguments, state),
         "sk54bi6FtYM" => np_web_api2_create_user_context(arguments, state),
         "WV1GwM32NgY" => np_web_api2_push_event_create_handle(arguments, state),
+        "3Tt9zL3tkoc" => np_web_api2_check_timeout(state),
         "3Zl8BePTh9Y" => np_check_callback(state),
         "Ec63y59l9tw" => np_set_np_title_id(arguments, state),
         "YBiIdcDPrxs" => share_feature_permit(state),
@@ -6007,7 +6036,7 @@ fn np_web_api2_create_user_context(arguments: [u64; 6], state: &mut ProbeDispatc
     signed_i32_return(context)
 }
 
-/// `sceNpWebApi2PushEventCreateHandle(userCtxId) -> handle`.
+/// `sceNpWebApi2PushEventCreateHandle(libCtxId) -> handle`.
 ///
 /// Offline titles still allocate push-event handles so later register/unregister calls have a
 /// stable identifier. No push traffic is ever delivered. The handle is returned like
@@ -6017,18 +6046,56 @@ fn np_web_api2_push_event_create_handle(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
 ) -> u64 {
-    const INVALID_USER_CONTEXT: u32 = 0x8055_3404;
-    let user_context = low_i32(arguments[0]);
-    if user_context <= 0 || user_context >= 0x8000 {
-        return sce_kernel_error(INVALID_USER_CONTEXT);
+    const INVALID_LIBRARY_CONTEXT: u32 = 0x8055_3403;
+    let library_context = low_i32(arguments[0]);
+    if library_context <= 0 || library_context >= 0x8000 {
+        return sce_kernel_error(INVALID_LIBRARY_CONTEXT);
     }
     let handle = state.services.next_np_web_api2_push_event_handle.max(1);
     state.services.next_np_web_api2_push_event_handle = handle.saturating_add(1);
     state
         .services
         .np_web_api2_push_event_handles
-        .insert(handle, user_context);
+        .insert(
+            handle,
+            NpWebApi2PushEventHandleState {
+                library_context,
+                timeout: NpWebApi2TimeoutState::default(),
+            },
+        );
     signed_i32_return(handle)
+}
+
+/// Advances the deadline state owned by libSceNpWebApi2.
+///
+/// The guest ABI is `void sceNpWebApi2CheckTimeout(void)`: the dispatcher result is therefore not
+/// guest-observable. Requests and push-event handles transition to timed-out and aborted together,
+/// matching the library's cancellation semantics, and repeated maintenance ticks are idempotent.
+fn np_web_api2_check_timeout_at(now_microseconds: u64, state: &mut ProbeDispatchState) {
+    const MINIMUM_CHECK_INTERVAL_MICROSECONDS: u64 = 1_000;
+
+    if state
+        .services
+        .np_web_api2_last_timeout_check_microseconds
+        .is_some_and(|last| {
+            now_microseconds.saturating_sub(last) < MINIMUM_CHECK_INTERVAL_MICROSECONDS
+        })
+    {
+        return;
+    }
+    state.services.np_web_api2_last_timeout_check_microseconds = Some(now_microseconds);
+    for request in state.services.np_web_api2_requests.values_mut() {
+        request.expire_if_due(now_microseconds);
+    }
+    for handle in state.services.np_web_api2_push_event_handles.values_mut() {
+        debug_assert!((1..0x8000).contains(&handle.library_context));
+        handle.timeout.expire_if_due(now_microseconds);
+    }
+}
+
+fn np_web_api2_check_timeout(state: &mut ProbeDispatchState) -> u64 {
+    np_web_api2_check_timeout_at(kernel_process_time(false), state);
+    0
 }
 
 fn np_check_callback(state: &mut ProbeDispatchState) -> u64 {
