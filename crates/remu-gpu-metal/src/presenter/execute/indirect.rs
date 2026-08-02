@@ -59,10 +59,9 @@ impl MetalPresenter {
             .as_ref()
             .expect("rectangle indirect pipeline was initialized")
             .clone();
-            let (destination, destination_offset, ended_render_pass) = {
+        let (destination, destination_offset, ended_render_pass) = {
             let batch = self
-                .open_guest_batch
-                .as_mut()
+                .active_open_guest_batch_mut()
                 .ok_or("rectangle indirect conversion has no open guest batch")?;
             let (destination, destination_offset) = batch.upload_global_bytes(device, &[0; 16])?;
             batch.end_compute_pass();

@@ -929,6 +929,7 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
     presenter
         .committed_guest_batches
         .push_back(GuestCommandBatch {
+            queue_id: None,
             command_buffer: outstanding.clone(),
             work: Vec::new(),
             committed_at: None,

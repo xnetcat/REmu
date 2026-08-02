@@ -246,9 +246,12 @@ impl MetalPresenter {
                 if stale.is_empty() {
                     continue;
                 }
+                let destination = entry.texture.clone();
+                for &index in &stale {
+                    entry.slice_versions[index] = faces[index].1;
+                }
                 let batch = self
-                    .open_guest_batch
-                    .as_mut()
+                    .active_open_guest_batch_mut()
                     .ok_or("layered depth-sample assembly requires an open guest batch")?;
                 batch.close_active_pass_encoders();
                 let blit = batch.command_buffer.new_blit_command_encoder();
@@ -264,12 +267,11 @@ impl MetalPresenter {
                             u64::from(descriptor.guest.height),
                             1,
                         ),
-                        &entry.texture,
+                        &destination,
                         u64::try_from(index).expect("layer index fits u64"),
                         0,
                         MTLOrigin { x: 0, y: 0, z: 0 },
                     );
-                    entry.slice_versions[index] = faces[index].1;
                 }
                 blit.end_encoding();
             }

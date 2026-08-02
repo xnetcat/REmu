@@ -1371,6 +1371,18 @@ struct CachedGlobalBuffer {
     offset: u64,
 }
 
+/// Metal submission state owned by one logical guest GPU queue.
+///
+/// The feature-gated B17 path deliberately keeps this separate from the legacy shared queue
+/// fields below. That makes disabling `REMU_PER_QUEUE_BATCHES` preserve the old object graph and
+/// submission behaviour exactly while the queue-local path can be validated independently.
+struct GuestQueueBatchState {
+    command_queue: metal::CommandQueue,
+    open_batch: Option<GuestCommandBatch>,
+    committed_batches: VecDeque<GuestCommandBatch>,
+    transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
+}
+
 struct UploadedGlobalBuffer {
     buffer: Buffer,
     offset: u64,
@@ -1480,6 +1492,7 @@ enum GuestBatchWork {
 }
 
 struct GuestCommandBatch {
+    queue_id: Option<u64>,
     command_buffer: CommandBuffer,
     work: Vec<GuestBatchWork>,
     committed_at: Option<Instant>,
@@ -1855,6 +1868,9 @@ struct MetalPresenter {
     device: Option<Device>,
     layer: Option<MetalLayer>,
     command_queue: Option<metal::CommandQueue>,
+    per_queue_guest_batches: bool,
+    active_guest_queue: Option<u64>,
+    guest_queue_batches: HashMap<u64, GuestQueueBatchState>,
     presentation: Option<PresentationResources>,
     presentation_resolution: PresentationResolution,
     guest_bgra_bytes: Vec<u8>,
@@ -2055,6 +2071,10 @@ impl MetalPresenter {
             device: Some(device),
             layer: None,
             command_queue: Some(command_queue),
+            per_queue_guest_batches: std::env::var_os("REMU_PER_QUEUE_BATCHES")
+                .is_some_and(|value| value == "1"),
+            active_guest_queue: None,
+            guest_queue_batches: HashMap::new(),
             presentation,
             presentation_resolution,
             guest_bgra_bytes: Vec::new(),

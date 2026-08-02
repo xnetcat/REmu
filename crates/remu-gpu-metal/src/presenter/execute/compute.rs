@@ -57,11 +57,7 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
+        let queue = self.active_guest_command_queue()?;
 
         let pipeline_key = compute_pipeline_key(dispatch, evaluation, &snapshot.program);
         if self.failed_compute_pipelines.contains(&pipeline_key) {
@@ -206,7 +202,7 @@ impl MetalPresenter {
         }
         self.synchronize_sampled_aliases(&[evaluation])?;
 
-        self.ensure_open_guest_batch(&queue);
+        self.ensure_active_open_guest_batch()?;
         self.prepare_depth_array_textures(&device, &[evaluation])?;
         let buffers = self.upload_global_buffers(&device, evaluation)?;
         // DISPATCH_INDIRECT arguments are read by the GPU at this point in queue order. The
@@ -268,13 +264,11 @@ impl MetalPresenter {
         let mut pending_guest_write_ranges = Vec::new();
         collect_pending_guest_write_ranges(&buffers, evaluation, &mut pending_guest_write_ranges)?;
         {
-            let batch = self
-                .open_guest_batch
-                .as_mut()
+            let (batch, statistics) = self.active_open_guest_batch_and_statistics();
+            let batch = batch
                 .expect("guest command batch was opened above");
             if batch.end_render_pass() {
-                self.statistics.render_pass_ends_for_compute = self
-                    .statistics
+                statistics.render_pass_ends_for_compute = statistics
                     .render_pass_ends_for_compute
                     .saturating_add(1);
             }
@@ -456,8 +450,7 @@ impl MetalPresenter {
             }
         }
         if self
-            .open_guest_batch
-            .as_ref()
+            .active_open_guest_batch()
             .is_some_and(|batch| batch.work.len() >= GUEST_BATCH_WORK_CAPACITY)
         {
             self.flush_guest_command_batch(

@@ -16,6 +16,10 @@ impl MetalPresenter {
         ticket_id: Option<GpuWaitId>,
         wait: GpuMemoryWait,
     ) -> Result<GuestMemoryWaitStatus, String> {
+        self.set_active_guest_queue(match source {
+            OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
+            OrderedEventSource::Host { .. } => None,
+        });
         let key = GuestMemoryWaitKey::new(source, wait);
         if let Some(ticket_id) = ticket_id
             && let Some(value) = remu_gpu::take_gpu_wait_latch(ticket_id)
@@ -75,8 +79,8 @@ impl MetalPresenter {
                         eprintln!(
                             "[REMu][LIFETIME-ORDER] phase=defer-future-wait sequence={sequence} address={:#x} value={value:#x} open_batch={} committed_batches={}",
                             wait.address,
-                            self.open_guest_batch.is_some(),
-                            self.committed_guest_batches.len()
+                            self.active_open_guest_batch().is_some(),
+                            self.active_committed_guest_batches().len()
                         );
                     }
                 }
@@ -162,11 +166,11 @@ impl MetalPresenter {
     }
 
     pub(crate) fn pending_guest_memory_value(&self, address: u64, is_64_bit: bool) -> Option<u64> {
-        self.open_guest_batch
+        self.active_open_guest_batch()
             .iter()
             .flat_map(|batch| batch.memory_writes.iter().rev())
             .chain(
-                self.committed_guest_batches
+                self.active_committed_guest_batches()
                     .iter()
                     .rev()
                     .flat_map(|batch| batch.memory_writes.iter().rev()),

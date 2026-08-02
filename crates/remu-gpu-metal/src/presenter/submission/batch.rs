@@ -5,11 +5,12 @@ use super::super::completion::{
     COMMAND_BUFFER_SETTLE_TIMEOUT, command_buffer_failure_message, settle_timeout_message,
     wait_until_settled_within,
 };
-use super::super::FlushPolicy;
+use super::super::{FlushPolicy, GuestQueueBatchState, PresenterStatistics};
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter,
+    OrderedEventSource,
     PendingGlobalWriteback, PendingGuestWriteRange, UploadedGlobalBuffer,
     guest_physical_ranges_overlap, guest_ranges_overlap,
 };
@@ -50,27 +51,327 @@ enum GlobalWritebackOutcome {
 }
 
 impl MetalPresenter {
+    pub(crate) fn set_active_guest_queue(&mut self, queue_id: Option<u64>) {
+        self.active_guest_queue = if self.per_queue_guest_batches {
+            queue_id
+        } else {
+            None
+        };
+        if let Some(queue_id) = self.active_guest_queue
+            && let Err(error) = self.ensure_guest_queue_batch_state(queue_id)
+        {
+            eprintln!("[REMu][METAL] could not initialize guest queue {queue_id}: {error}");
+        }
+    }
+
+    fn ensure_guest_queue_batch_state(&mut self, queue_id: u64) -> Result<(), String> {
+        if self.guest_queue_batches.contains_key(&queue_id) {
+            return Ok(());
+        }
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?;
+        let command_queue = device.new_command_queue();
+        command_queue.set_label(&format!("REMu guest command queue {queue_id}"));
+        self.guest_queue_batches.insert(
+            queue_id,
+            GuestQueueBatchState {
+                command_queue,
+                open_batch: None,
+                committed_batches: std::collections::VecDeque::new(),
+                transient_global_buffer_cache: std::collections::HashMap::new(),
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn active_guest_command_queue(
+        &mut self,
+    ) -> Result<metal::CommandQueue, String> {
+        if !self.per_queue_guest_batches {
+            return self
+                .command_queue
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "Metal command queue is unavailable".to_owned());
+        }
+        let queue_id = self
+            .active_guest_queue
+            .ok_or("guest command has no logical queue identity")?;
+        self.ensure_guest_queue_batch_state(queue_id)?;
+        Ok(self
+            .guest_queue_batches
+            .get(&queue_id)
+            .expect("queue state was just created")
+            .command_queue
+            .clone())
+    }
+
+    pub(crate) fn ensure_active_open_guest_batch(&mut self) -> Result<(), String> {
+        if !self.per_queue_guest_batches {
+            let queue = self
+                .command_queue
+                .as_ref()
+                .cloned()
+                .ok_or("Metal command queue is unavailable")?;
+            self.ensure_open_guest_batch(&queue);
+            return Ok(());
+        }
+        let queue_id = self
+            .active_guest_queue
+            .ok_or("guest command has no logical queue identity")?;
+        self.ensure_guest_queue_batch_state(queue_id)?;
+        let state = self
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .expect("queue state was just created");
+        if state.open_batch.is_none() {
+            let command_buffer = state.command_queue.new_command_buffer().to_owned();
+            command_buffer.set_label(&format!("REMu translated guest batch queue {queue_id}"));
+            state.open_batch = Some(new_guest_command_batch(Some(queue_id), command_buffer));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn active_open_guest_batch(&self) -> Option<&GuestCommandBatch> {
+        if !self.per_queue_guest_batches {
+            return self.open_guest_batch.as_ref();
+        }
+        self.active_guest_queue
+            .and_then(|queue_id| self.guest_queue_batches.get(&queue_id))
+            .and_then(|state| state.open_batch.as_ref())
+    }
+
+    pub(crate) fn active_open_guest_batch_mut(&mut self) -> Option<&mut GuestCommandBatch> {
+        if !self.per_queue_guest_batches {
+            return self.open_guest_batch.as_mut();
+        }
+        self.active_guest_queue
+            .and_then(|queue_id| self.guest_queue_batches.get_mut(&queue_id))
+            .and_then(|state| state.open_batch.as_mut())
+    }
+
+    pub(crate) fn active_open_guest_batch_and_statistics(
+        &mut self,
+    ) -> (Option<&mut GuestCommandBatch>, &mut PresenterStatistics) {
+        let statistics = &mut self.statistics;
+        let batch = if !self.per_queue_guest_batches {
+            self.open_guest_batch.as_mut()
+        } else {
+            self.active_guest_queue
+                .and_then(|queue_id| self.guest_queue_batches.get_mut(&queue_id))
+                .and_then(|state| state.open_batch.as_mut())
+        };
+        (batch, statistics)
+    }
+
+    pub(crate) fn active_committed_guest_batches(
+        &self,
+    ) -> &std::collections::VecDeque<GuestCommandBatch> {
+        if !self.per_queue_guest_batches {
+            return &self.committed_guest_batches;
+        }
+        let queue_id = self
+            .active_guest_queue
+            .expect("queue-local batch access requires an active guest queue");
+        self.guest_queue_batches
+            .get(&queue_id)
+            .map_or(&self.committed_guest_batches, |state| {
+                &state.committed_batches
+            })
+    }
+
+    pub(crate) fn active_committed_guest_batches_mut(
+        &mut self,
+    ) -> &mut std::collections::VecDeque<GuestCommandBatch> {
+        if !self.per_queue_guest_batches {
+            return &mut self.committed_guest_batches;
+        }
+        let queue_id = self
+            .active_guest_queue
+            .expect("queue-local batch access requires an active guest queue");
+        &mut self
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .expect("active guest queue has batch state")
+            .committed_batches
+    }
+
+    pub(crate) fn committed_guest_batch_count(&self) -> usize {
+        if !self.per_queue_guest_batches {
+            self.committed_guest_batches.len()
+        } else {
+            self.guest_queue_batches
+                .values()
+                .map(|state| state.committed_batches.len())
+                .sum()
+        }
+    }
+
+    pub(crate) fn committed_guest_batches_for_diagnostics(
+        &self,
+    ) -> Vec<(Option<u64>, usize, &GuestCommandBatch)> {
+        if !self.per_queue_guest_batches {
+            return self
+                .committed_guest_batches
+                .iter()
+                .enumerate()
+                .map(|(index, batch)| (None, index, batch))
+                .collect();
+        }
+        let mut queues = self.guest_queue_batches.iter().collect::<Vec<_>>();
+        queues.sort_unstable_by_key(|(queue_id, _)| **queue_id);
+        queues
+            .into_iter()
+            .flat_map(|(&queue_id, state)| {
+                state
+                    .committed_batches
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, batch)| (Some(queue_id), index, batch))
+            })
+            .collect()
+    }
+
+    pub(crate) fn any_guest_batch(
+        &self,
+        mut predicate: impl FnMut(&GuestCommandBatch) -> bool,
+    ) -> bool {
+        if !self.per_queue_guest_batches {
+            return self.open_guest_batch.as_ref().is_some_and(&mut predicate)
+                || self.committed_guest_batches.iter().any(predicate);
+        }
+        self.guest_queue_batches.values().any(|state| {
+            state.open_batch.as_ref().is_some_and(&mut predicate)
+                || state.committed_batches.iter().any(&mut predicate)
+        })
+    }
+
+    pub(crate) fn record_guest_submission_boundary(
+        &mut self,
+        source: OrderedEventSource,
+        sequence: u64,
+    ) {
+        if !self.per_queue_guest_batches {
+            if let Some(batch) = self.open_guest_batch.as_mut() {
+                batch.completion_sequences.push(sequence);
+            } else if let Some(batch) = self.committed_guest_batches.back_mut() {
+                batch.completion_sequences.push(sequence);
+            } else {
+                self.publish_guest_submission_completion(sequence);
+            }
+            return;
+        }
+        let OrderedEventSource::GuestQueue(queue_id) = source else {
+            self.publish_guest_submission_completion(sequence);
+            return;
+        };
+        if let Some(state) = self.guest_queue_batches.get_mut(&queue_id) {
+            if let Some(batch) = state.open_batch.as_mut() {
+                batch.completion_sequences.push(sequence);
+                return;
+            }
+            if let Some(batch) = state.committed_batches.back_mut() {
+                batch.completion_sequences.push(sequence);
+                return;
+            }
+        }
+        self.publish_guest_submission_completion(sequence);
+    }
+
+    pub(crate) fn active_transient_global_buffer_cache(
+        &self,
+    ) -> &std::collections::HashMap<super::super::GlobalBufferCacheKey, super::super::CachedGlobalBuffer>
+    {
+        if !self.per_queue_guest_batches {
+            return &self.transient_global_buffer_cache;
+        }
+        let queue_id = self
+            .active_guest_queue
+            .expect("queue-local cache access requires an active guest queue");
+        &self
+            .guest_queue_batches
+            .get(&queue_id)
+            .expect("active guest queue has batch state")
+            .transient_global_buffer_cache
+    }
+
+    pub(crate) fn active_transient_global_buffer_cache_mut(
+        &mut self,
+    ) -> &mut std::collections::HashMap<super::super::GlobalBufferCacheKey, super::super::CachedGlobalBuffer>
+    {
+        if !self.per_queue_guest_batches {
+            return &mut self.transient_global_buffer_cache;
+        }
+        let queue_id = self
+            .active_guest_queue
+            .expect("queue-local cache access requires an active guest queue");
+        &mut self
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .expect("active guest queue has batch state")
+            .transient_global_buffer_cache
+    }
+
     pub(crate) fn ensure_open_guest_batch(&mut self, queue: &metal::CommandQueue) {
         if self.open_guest_batch.is_some() {
             return;
         }
         let command_buffer = queue.new_command_buffer().to_owned();
         command_buffer.set_label("REMu translated guest batch");
-        self.open_guest_batch = Some(GuestCommandBatch {
-            command_buffer,
-            work: Vec::new(),
-            committed_at: None,
-            global_upload_chunks: Vec::new(),
-            global_writebacks: Vec::new(),
-            guest_write_ranges: Vec::new(),
-            memory_writes: Vec::new(),
-            render_pass: None,
-            compute_encoder: None,
-            completion_sequences: Vec::new(),
-        });
+        self.open_guest_batch = Some(new_guest_command_batch(None, command_buffer));
     }
 
     pub(crate) fn retire_completed_guest_batches(&mut self) {
+        if self.per_queue_guest_batches {
+            let mut queue_ids = self.guest_queue_batches.keys().copied().collect::<Vec<_>>();
+            queue_ids.sort_unstable();
+            for queue_id in queue_ids {
+                loop {
+                    let terminal = self
+                        .guest_queue_batches
+                        .get(&queue_id)
+                        .and_then(|state| state.committed_batches.front())
+                        .is_some_and(|batch| {
+                            matches!(
+                                batch.command_buffer.status(),
+                                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+                            )
+                        });
+                    if !terminal {
+                        break;
+                    }
+                    let batch = self
+                        .guest_queue_batches
+                        .get_mut(&queue_id)
+                        .expect("enumerated queue exists")
+                        .committed_batches
+                        .pop_front()
+                        .expect("terminal front exists");
+                    let execution_error = (batch.command_buffer.status()
+                        == MTLCommandBufferStatus::Error)
+                        .then(|| {
+                            command_buffer_failure_message(
+                                &format!(
+                                    "Metal guest command batch queue={} [{}]",
+                                    queue_id,
+                                    describe_guest_batch(&batch.work)
+                                ),
+                                &batch.command_buffer,
+                            )
+                        });
+                    let result = self.finish_terminal_guest_batch(&batch, execution_error);
+                    self.statistics.gpu_execution_time +=
+                        completed_command_buffer_gpu_duration(&batch.command_buffer);
+                    self.publish_guest_batch_completion(&batch);
+                    if let Err(error) = result {
+                        eprintln!("[REMu][METAL] queue {queue_id} guest batch finalization failed: {error}");
+                    }
+                }
+            }
+            return;
+        }
         loop {
             let Some(batch) = self.committed_guest_batches.front() else {
                 return;
@@ -152,11 +453,10 @@ impl MetalPresenter {
     }
 
     pub(super) fn guest_submission_backpressure_full(&self) -> bool {
-        self.committed_guest_batches.len() >= super::super::MAX_COMMITTED_GUEST_BATCHES
-            && self
-                .open_guest_batch
-                .as_ref()
-                .is_none_or(|batch| batch.work.len() >= super::super::GUEST_BATCH_WORK_CAPACITY)
+        self.committed_guest_batch_count() >= super::super::MAX_COMMITTED_GUEST_BATCHES
+            && self.active_open_guest_batch().is_none_or(|batch| {
+                batch.work.len() >= super::super::GUEST_BATCH_WORK_CAPACITY
+            })
     }
 
     pub(crate) fn flush_guest_command_batch(
@@ -164,6 +464,16 @@ impl MetalPresenter {
         policy: FlushPolicy,
         reason: GuestBatchFlushReason,
     ) -> Result<(), String> {
+        if self.per_queue_guest_batches {
+            let deadline = Instant::now() + COMMAND_BUFFER_SETTLE_TIMEOUT;
+            if reason == GuestBatchFlushReason::EventLoop {
+                return self.flush_all_guest_command_batches_by(policy, reason, deadline);
+            }
+            let queue_id = self
+                .active_guest_queue
+                .ok_or("queue-local guest batch flush has no active guest queue")?;
+            return self.flush_guest_queue_command_batch_by(queue_id, policy, reason, deadline);
+        }
         self.flush_guest_command_batch_by(
             policy,
             reason,
@@ -257,6 +567,130 @@ impl MetalPresenter {
         settlement
     }
 
+    fn flush_guest_queue_command_batch_by(
+        &mut self,
+        queue_id: u64,
+        policy: FlushPolicy,
+        reason: GuestBatchFlushReason,
+        settle_deadline: Instant,
+    ) -> Result<(), String> {
+        if !self
+            .guest_queue_batches
+            .get(&queue_id)
+            .is_some_and(|state| state.open_batch.is_some())
+        {
+            return Ok(());
+        }
+        self.retire_completed_guest_batches();
+        let mut settlement = Ok(());
+        let committed_before_reclaim = self.committed_guest_batch_count();
+        if committed_before_reclaim >= super::super::MAX_COMMITTED_GUEST_BATCHES {
+            match policy {
+                FlushPolicy::Opportunistic => return Ok(()),
+                FlushPolicy::Required => {
+                    let settled = self.settle_next_global_guest_batch(settle_deadline);
+                    if committed_before_reclaim > super::super::MAX_COMMITTED_GUEST_BATCHES
+                        && let FrontBatchSettlement::Pending(error) = &settled
+                    {
+                        // A required flush may temporarily occupy the legacy one emergency slot,
+                        // but that slot is global. Do not grow one extra batch per guest queue when
+                        // the device has already exhausted the shared settle deadline.
+                        return Err(error.clone());
+                    }
+                    settlement = match settled {
+                        FrontBatchSettlement::Empty => Ok(()),
+                        FrontBatchSettlement::Retired(result) => result,
+                        FrontBatchSettlement::Pending(error) => Err(error),
+                    };
+                }
+            }
+        }
+        let state = self
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .expect("open queue state exists");
+        let Some(mut batch) = state.open_batch.take() else {
+            return settlement;
+        };
+        batch.end_compute_pass();
+        if batch.end_render_pass() {
+            self.statistics.render_pass_ends_for_batch_flush = self
+                .statistics
+                .render_pass_ends_for_batch_flush
+                .saturating_add(1);
+        }
+        state.transient_global_buffer_cache.clear();
+        batch.committed_at = Some(Instant::now());
+        batch.command_buffer.commit();
+        state.committed_batches.push_back(batch);
+        self.record_guest_batch_flush(reason);
+        settlement
+    }
+
+    fn flush_all_guest_command_batches_by(
+        &mut self,
+        policy: FlushPolicy,
+        reason: GuestBatchFlushReason,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let mut queue_ids = self.guest_queue_batches.keys().copied().collect::<Vec<_>>();
+        queue_ids.sort_unstable();
+        let mut result = Ok(());
+        for queue_id in queue_ids {
+            let flushed = self.flush_guest_queue_command_batch_by(
+                queue_id,
+                policy,
+                reason,
+                deadline,
+            );
+            result = merge_guest_batch_result(result, "later guest queue flush", flushed);
+        }
+        result
+    }
+
+    fn record_guest_batch_flush(&mut self, reason: GuestBatchFlushReason) {
+        match reason {
+            GuestBatchFlushReason::EventLoop => {
+                self.statistics.batch_flushes_from_event_loop = self
+                    .statistics
+                    .batch_flushes_from_event_loop
+                    .saturating_add(1);
+            }
+            GuestBatchFlushReason::BlockedWait => {
+                self.statistics.batch_flushes_for_blocked_wait = self
+                    .statistics
+                    .batch_flushes_for_blocked_wait
+                    .saturating_add(1);
+            }
+            GuestBatchFlushReason::FlipSnapshot => {
+                self.statistics.batch_flushes_for_flip_snapshot = self
+                    .statistics
+                    .batch_flushes_for_flip_snapshot
+                    .saturating_add(1);
+            }
+            GuestBatchFlushReason::WorkCapacity => {
+                self.statistics.batch_flushes_for_work_capacity = self
+                    .statistics
+                    .batch_flushes_for_work_capacity
+                    .saturating_add(1);
+            }
+            GuestBatchFlushReason::CommandProcessorBarrier => {
+                self.statistics.batch_flushes_for_command_processor_barrier = self
+                    .statistics
+                    .batch_flushes_for_command_processor_barrier
+                    .saturating_add(1);
+            }
+            GuestBatchFlushReason::CpuSynchronization => {
+                self.statistics.batch_flushes_for_cpu_synchronization = self
+                    .statistics
+                    .batch_flushes_for_cpu_synchronization
+                    .saturating_add(1);
+            }
+        }
+        self.statistics.submitted_guest_batches =
+            self.statistics.submitted_guest_batches.saturating_add(1);
+    }
+
     /// Settles the oldest committed batch and publishes its completion effects.
     ///
     /// A batch that outlives `deadline` is put back at the front: later buffers from the same queue
@@ -280,6 +714,66 @@ impl MetalPresenter {
         FrontBatchSettlement::Retired(result)
     }
 
+    fn settle_front_guest_queue_batch(
+        &mut self,
+        queue_id: u64,
+        deadline: Instant,
+    ) -> FrontBatchSettlement {
+        let Some(batch) = self
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .and_then(|state| state.committed_batches.pop_front())
+        else {
+            return FrontBatchSettlement::Empty;
+        };
+        let execution_error = match settle_guest_batch_by(&batch, deadline) {
+            GuestBatchSettlement::Completed => None,
+            GuestBatchSettlement::Failed(error) => Some(error),
+            GuestBatchSettlement::Pending(error) => {
+                self.guest_queue_batches
+                    .get_mut(&queue_id)
+                    .expect("settled queue exists")
+                    .committed_batches
+                    .push_front(batch);
+                return FrontBatchSettlement::Pending(error);
+            }
+        };
+        let result = self.finish_terminal_guest_batch(&batch, execution_error);
+        self.statistics.gpu_execution_time +=
+            completed_command_buffer_gpu_duration(&batch.command_buffer);
+        self.publish_guest_batch_completion(&batch);
+        FrontBatchSettlement::Retired(result)
+    }
+
+    fn next_global_guest_batch_queue(&self) -> Option<u64> {
+        self.guest_queue_batches
+            .iter()
+            .filter_map(|(&queue_id, state)| {
+                state
+                    .committed_batches
+                    .front()
+                    .map(|batch| (queue_id, batch))
+            })
+            .min_by_key(|(queue_id, batch)| {
+                (
+                    !matches!(
+                        batch.command_buffer.status(),
+                        MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+                    ),
+                    batch.committed_at,
+                    *queue_id,
+                )
+            })
+            .map(|(queue_id, _)| queue_id)
+    }
+
+    fn settle_next_global_guest_batch(&mut self, deadline: Instant) -> FrontBatchSettlement {
+        self.next_global_guest_batch_queue().map_or(
+            FrontBatchSettlement::Empty,
+            |queue_id| self.settle_front_guest_queue_batch(queue_id, deadline),
+        )
+    }
+
     pub(crate) fn wait_for_guest_command_batches(&mut self) -> Result<(), String> {
         self.wait_for_guest_command_batches_within(COMMAND_BUFFER_SETTLE_TIMEOUT)
     }
@@ -288,6 +782,9 @@ impl MetalPresenter {
         &mut self,
         timeout: Duration,
     ) -> Result<(), String> {
+        if self.per_queue_guest_batches {
+            return self.wait_for_guest_queue_command_batches_within(timeout);
+        }
         // One budget covers the whole drain, including the flush's own slot reclaim. Charging every
         // queued batch its own timeout would sum to far past the host watchdog window this bound
         // exists to stay inside, and a device that stalled on the first batch will not retire the
@@ -321,6 +818,85 @@ impl MetalPresenter {
             }
         }
     }
+
+    fn wait_for_guest_queue_command_batches_within(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut result = self.flush_all_guest_command_batches_by(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CpuSynchronization,
+            deadline,
+        );
+        debug_assert!(
+            result.is_err()
+                || self
+                    .guest_queue_batches
+                    .values()
+                    .all(|state| state.open_batch.is_none())
+        );
+        loop {
+            let mut queue_ids = self
+                .guest_queue_batches
+                .iter()
+                .filter_map(|(&queue_id, state)| {
+                    (!state.committed_batches.is_empty()).then_some(queue_id)
+                })
+                .collect::<Vec<_>>();
+            queue_ids.sort_unstable();
+            if queue_ids.is_empty() {
+                return result;
+            }
+            let mut retired_any = false;
+            let mut pending_error = None;
+            for queue_id in queue_ids {
+                match self.settle_front_guest_queue_batch(queue_id, deadline) {
+                    FrontBatchSettlement::Empty => {}
+                    FrontBatchSettlement::Retired(batch_result) => {
+                        retired_any = true;
+                        result = merge_guest_batch_result(
+                            result,
+                            "later ordered guest queue batch",
+                            batch_result,
+                        );
+                    }
+                    FrontBatchSettlement::Pending(error) => {
+                        pending_error.get_or_insert(error);
+                    }
+                }
+            }
+            if !retired_any {
+                return match pending_error {
+                    Some(error) => merge_guest_batch_result(
+                        result,
+                        "pending ordered guest queue batch",
+                        Err(error),
+                    ),
+                    None => result,
+                };
+            }
+        }
+    }
+}
+
+fn new_guest_command_batch(
+    queue_id: Option<u64>,
+    command_buffer: CommandBuffer,
+) -> GuestCommandBatch {
+    GuestCommandBatch {
+        queue_id,
+        command_buffer,
+        work: Vec::new(),
+        committed_at: None,
+        global_upload_chunks: Vec::new(),
+        global_writebacks: Vec::new(),
+        guest_write_ranges: Vec::new(),
+        memory_writes: Vec::new(),
+        render_pass: None,
+        compute_encoder: None,
+        completion_sequences: Vec::new(),
+    }
 }
 
 /// Waits for one committed guest batch until `deadline` and describes why it failed, when it did.
@@ -330,8 +906,11 @@ impl MetalPresenter {
 fn settle_guest_batch_by(batch: &GuestCommandBatch, deadline: Instant) -> GuestBatchSettlement {
     let budget = deadline.saturating_duration_since(Instant::now());
     let settled = wait_until_settled_within(&batch.command_buffer, budget);
+    let queue = batch
+        .queue_id
+        .map_or_else(String::new, |queue_id| format!(" queue={queue_id}"));
     let operation = format!(
-        "Metal guest command batch [{}]",
+        "Metal guest command batch{queue} [{}]",
         describe_guest_batch(&batch.work)
     );
     if !settled {
