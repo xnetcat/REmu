@@ -224,6 +224,20 @@ fn try_handle_write_fault(fault_address: u64, state: impl Fn() -> FaultState) ->
         watched_page.dirty.store(true, Ordering::Release);
         range.dirty.store(true, Ordering::Release);
     }
+    // The page is about to resume at the faulting guest store and remain writable until every
+    // owner rearms it. Preserve the exact opening PC in the env-gated crash journal: if a later
+    // allocator failure names this page, one crash can identify which guest code first took CPU
+    // write ownership after the last GPU snapshot. Recording the whole page is intentional — the
+    // signal layer cannot observe subsequent stores while it is disarmed.
+    if crate::guest_write_journal::guest_cpu_page_journal_armed() {
+        let (report, _) = state();
+        crate::guest_write_journal::record_guest_cpu_page_open(
+            page_address,
+            page_size,
+            fault_address,
+            report.program_counter,
+        );
+    }
     true
 }
 

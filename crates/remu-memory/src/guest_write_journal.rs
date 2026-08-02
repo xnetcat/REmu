@@ -1,12 +1,13 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Env-gated ring buffer naming every host-authored write into guest memory.
+//! Env-gated ring buffer naming host-authored writes and watched guest page openings.
 //!
 //! A guest crash on a pointer read out of recycled heap names the victim address but not the
 //! writer. Recording each host->guest publication with its site tag, span and payload shape lets
-//! the fault handler answer "which emulator path last wrote these bytes" from the address alone,
-//! which no after-the-fact log correlation can do.
+//! the fault handler answer "which emulator path last wrote these bytes" from the address alone.
+//! Recording the first trapped guest store after each watched-page rearm additionally identifies
+//! guest code which took CPU ownership of a later victim page.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -74,6 +75,14 @@ pub enum GuestWriteSite {
     MapZero,
     /// Commit-on-protect remap: the range's contents are replaced by the committed backing's.
     MapCommit,
+    /// The first guest CPU store which opened one protected host page for later writes.
+    ///
+    /// Write watching traps once per page/rearm, not once per instruction. The journal therefore
+    /// records the whole page as potentially changed while retaining the exact fault address and
+    /// guest instruction pointer separately. This lets a later poison crash identify the guest
+    /// code which first acquired write ownership of the victim page without pretending that one
+    /// fault names every subsequent store on it.
+    GuestCpuPageOpen,
 }
 
 impl GuestWriteSite {
@@ -100,6 +109,7 @@ impl GuestWriteSite {
             Self::ShaderPatch => b"shader-patch",
             Self::MapZero => b"map-zero",
             Self::MapCommit => b"map-commit",
+            Self::GuestCpuPageOpen => b"guest-cpu-page-open",
         }
     }
 
@@ -125,6 +135,8 @@ impl GuestWriteSite {
             17 => Self::MspaceCopy,
             18 => Self::ShaderPatch,
             19 => Self::MapZero,
+            20 => Self::MapCommit,
+            21 => Self::GuestCpuPageOpen,
             _ => Self::MapCommit,
         }
     }
@@ -152,6 +164,7 @@ impl GuestWriteSite {
             Self::ShaderPatch => 18,
             Self::MapZero => 19,
             Self::MapCommit => 20,
+            Self::GuestCpuPageOpen => 21,
         }
     }
 }
@@ -253,6 +266,48 @@ pub fn record_guest_write(
     slot.site.store(site.index(), Ordering::Relaxed);
     slot.uniform.store(uniform, Ordering::Relaxed);
     slot.stamp.store(sequence.wrapping_add(1), Ordering::Release);
+}
+
+/// Records the guest instruction which opened a watched host page for CPU writes.
+///
+/// This is called from the SIGBUS/SIGSEGV write-watch handler after the page is proven live. It
+/// must remain async-signal-safe: the journal allocation and environment lookup happen when the
+/// handler is installed, and this path performs only atomic operations on that existing ring.
+/// `payload` stores the exact faulting byte address and `submission` stores the interrupted guest
+/// instruction pointer; [`emit_entry`] gives those fields their precise names for this site.
+pub(crate) fn record_guest_cpu_page_open(
+    page_address: u64,
+    page_byte_count: u64,
+    fault_address: u64,
+    program_counter: u64,
+) {
+    if ENABLED.load(Ordering::Relaxed) != ENABLED_YES || page_byte_count == 0 {
+        return;
+    }
+    let Some(slots) = SLOTS.get() else {
+        return;
+    };
+    let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let slot = &slots[(sequence as usize) & (CAPACITY - 1)];
+    slot.stamp.store(0, Ordering::Release);
+    slot.address.store(page_address, Ordering::Relaxed);
+    slot.byte_count.store(page_byte_count, Ordering::Relaxed);
+    slot.payload.store(fault_address, Ordering::Relaxed);
+    slot.submission.store(program_counter, Ordering::Relaxed);
+    slot
+        .site
+        .store(GuestWriteSite::GuestCpuPageOpen.index(), Ordering::Relaxed);
+    slot.uniform.store(MIXED_PAYLOAD, Ordering::Relaxed);
+    slot.stamp.store(sequence.wrapping_add(1), Ordering::Release);
+}
+
+/// Returns the already-resolved journal state without consulting the environment.
+///
+/// Fault handlers use this to avoid decoding a machine context on every ordinary watched write
+/// when diagnostics are disabled. [`guest_write_journal_enabled`] resolves this state before the
+/// handlers are installed.
+pub(crate) fn guest_cpu_page_journal_armed() -> bool {
+    ENABLED.load(Ordering::Relaxed) == ENABLED_YES
 }
 
 fn payload_prefix(payload: &[u8]) -> u64 {
@@ -598,19 +653,26 @@ fn emit_entry(
     buffer.push_hexadecimal(entry.address);
     buffer.push_bytes(b" bytes=");
     buffer.push_hexadecimal(entry.byte_count);
-    buffer.push_bytes(b" payload=");
-    buffer.push_hexadecimal(entry.payload);
-    buffer.push_bytes(b" uniform=");
-    if entry.uniform & MIXED_PAYLOAD != 0 {
-        buffer.push_bytes(b"mixed");
+    if entry.site == GuestWriteSite::GuestCpuPageOpen {
+        buffer.push_bytes(b" fault=");
+        buffer.push_hexadecimal(entry.payload);
+        buffer.push_bytes(b" pc=");
+        buffer.push_hexadecimal(entry.submission);
     } else {
-        buffer.push_hexadecimal(u64::from(entry.uniform & 0xff));
+        buffer.push_bytes(b" payload=");
+        buffer.push_hexadecimal(entry.payload);
+        buffer.push_bytes(b" uniform=");
+        if entry.uniform & MIXED_PAYLOAD != 0 {
+            buffer.push_bytes(b"mixed");
+        } else {
+            buffer.push_hexadecimal(u64::from(entry.uniform & 0xff));
+        }
+        if entry.uniform & SAMPLED_PAYLOAD != 0 {
+            buffer.push_bytes(b"(prefix)");
+        }
+        buffer.push_bytes(b" submission=");
+        buffer.push_signed(entry.submission.try_into().unwrap_or(i64::MAX));
     }
-    if entry.uniform & SAMPLED_PAYLOAD != 0 {
-        buffer.push_bytes(b"(prefix)");
-    }
-    buffer.push_bytes(b" submission=");
-    buffer.push_signed(entry.submission.try_into().unwrap_or(i64::MAX));
     buffer.push_bytes(b"\n");
     write_diagnostic(buffer);
 }
@@ -636,8 +698,8 @@ fn write_diagnostic(_buffer: &DiagnosticBuffer) {}
 mod tests {
     use super::{
         CAPACITY, ENABLED, ENABLED_YES, GuestWriteSite, JournalEntry, MIXED_PAYLOAD, NEXT_SEQUENCE,
-        SAMPLED_PAYLOAD, address_looks_poisoned, payload_prefix, read_slot, record_guest_write,
-        uniform_byte,
+        SAMPLED_PAYLOAD, address_looks_poisoned, payload_prefix, read_slot,
+        record_guest_cpu_page_open, record_guest_write, slots_for_recording, uniform_byte,
     };
     use std::sync::atomic::Ordering;
 
@@ -729,5 +791,25 @@ mod tests {
             .expect("the newest entry is live");
         assert_eq!(entry.uniform, 0x00 | SAMPLED_PAYLOAD);
         assert_eq!(entry.byte_count, 0x2000);
+    }
+
+    #[test]
+    fn watched_guest_page_open_retains_the_exact_fault_and_guest_pc() {
+        enable_journal();
+        let _ = slots_for_recording();
+        record_guest_cpu_page_open(
+            0x900c_8d00_00,
+            0x4000,
+            0x900c_8d05_a0,
+            0x8012_3456_7,
+        );
+        let entry = read_slot(NEXT_SEQUENCE.load(Ordering::Relaxed) - 1)
+            .expect("the watched guest page opening is live");
+        assert!(entry.site == GuestWriteSite::GuestCpuPageOpen);
+        assert_eq!(entry.address, 0x900c_8d00_00);
+        assert_eq!(entry.byte_count, 0x4000);
+        assert_eq!(entry.payload, 0x900c_8d05_a0);
+        assert_eq!(entry.submission, 0x8012_3456_7);
+        assert!(entry.covers(0x900c_8d05_a0));
     }
 }
