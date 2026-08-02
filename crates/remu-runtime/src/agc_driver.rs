@@ -177,6 +177,18 @@ fn dispatch_resource_registration(nid: &str) -> Option<u64> {
         | "emP3ckeS2uo" | "5l3IfCFJxBs" | "LepGrgk77sM" | "M9yBzRKkjPc" | "NghWEUXp1qM"
         | "mXn+K9E-wOA" | "rI9lNAXPMIw" | "ls4jfY576lw" | "VOMSpd9+vxU" | "SCoAN5fYlUM"
         | "ZLJk9r2+2Aw" | "pWLG7WOpVcw" | "F0ZXt5q0ZTA" | "uJziRsODk1c" => {
+            // The refusal is policy, not a defect, but its error code surfaces in [REMu][FAIL]
+            // lines that otherwise read as a broken import. Say so once.
+            static EXPLAINED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !EXPLAINED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[REMu][AGC] declining resource registration (first: nid={nid}): REmu \
+                     presents no PA Debug target, so the whole cluster reports \
+                     {AGC_ERROR_RESOURCE_REGISTRATION_NO_PA_DEBUG:#x}; this is expected, \
+                     registration only labels memory for Razor GPU"
+                );
+            }
             AGC_ERROR_RESOURCE_REGISTRATION_NO_PA_DEBUG
         }
         _ => return None,

@@ -137,6 +137,7 @@ pub(crate) fn guest_kernel_rmdir(arguments: [u64; 6], state: &ProbeDispatchState
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     if !writable {
+        report_read_only_directory_write("rmdir", &guest_path);
         return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
     }
     if !host_path.exists() {
@@ -152,6 +153,21 @@ pub(crate) fn guest_kernel_rmdir(arguments: [u64; 6], state: &ProbeDispatchState
     }
 }
 
+/// Names the path a directory write was denied on. The read-only game mount answers every
+/// mkdir/rmdir under /app0 with EACCES by design; the path is what tells a title probing for
+/// scratch space (harmless) from one that genuinely needs a writable overlay REmu lacks.
+fn report_read_only_directory_write(operation: &str, guest_path: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+    let sequence = REPORTED.fetch_add(1, Ordering::Relaxed) + 1;
+    if crate::trace_logarithmic_sequence(sequence, 16) {
+        eprintln!(
+            "[REMu][FILES] denied {operation} on read-only mount sequence={sequence} \
+             path={guest_path:?}"
+        );
+    }
+}
+
 pub(crate) fn guest_kernel_mkdir(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
@@ -160,6 +176,7 @@ pub(crate) fn guest_kernel_mkdir(arguments: [u64; 6], state: &ProbeDispatchState
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     if !writable {
+        report_read_only_directory_write("mkdir", &guest_path);
         return sce_kernel_error(SCE_KERNEL_ERROR_PERMISSION_DENIED);
     }
     if host_path.exists() {

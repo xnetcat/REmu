@@ -23,7 +23,7 @@ use self::buffer::{
     register_graphics_continuation, trace_failed_sync_command, write_u32, write_u64, write_words,
 };
 pub(crate) use self::buffer::{
-    consume_recorded_graphics_range, graphics_continuation_was_consumed,
+    consume_recorded_graphics_range, decline_reservation, graphics_continuation_was_consumed,
     mark_graphics_release_allocation, mark_graphics_release_for_command_buffer,
     retire_pending_graphics_continuation, take_graphics_continuations_before,
     take_recorded_graphics_prefix, track_graphics_command_allocation, track_graphics_submission,

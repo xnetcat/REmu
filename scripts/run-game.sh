@@ -325,6 +325,9 @@ unimplemented_count=$(grep -c '\[REMu\]\[IMPORT\] unimplemented' "$run_dir/guest
     echo "captured_frames=$frame_count"
     echo "unimplemented_nids=$unimplemented_count"
 } > "$run_dir/summary.txt"
+# The runtime prints exact ABI-gap totals ([REMu][REPORT] lines) on every exit path; copying
+# them here makes each run summary self-auditing without re-parsing the full log.
+grep '\[REMu\]\[REPORT\]' "$run_dir/guest.log" >> "$run_dir/summary.txt" || true
 
 tail -n 30 "$run_dir/guest.log" || true
 cat "$run_dir/summary.txt"

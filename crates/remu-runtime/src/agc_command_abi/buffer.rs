@@ -244,13 +244,33 @@ pub(super) fn write_words(address: u64, words: &[u32]) {
     }
 }
 
+/// Names why a packet reservation was refused. A refused reservation makes the builder return a
+/// null packet address, which the import-failure predicate cannot see — the guest simply loses
+/// the packet and with it a draw, dispatch, or fence — so the reason is named here or nowhere.
+pub(crate) fn decline_reservation(
+    reason: &str,
+    command_buffer: u64,
+    dword_count: u32,
+) -> Option<u64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DECLINED: AtomicU64 = AtomicU64::new(0);
+    let sequence = DECLINED.fetch_add(1, Ordering::Relaxed) + 1;
+    if crate::trace_logarithmic_sequence(sequence, 16) {
+        eprintln!(
+            "[REMu][AGC] declined packet reservation sequence={sequence} \
+             descriptor={command_buffer:#x} dwords={dword_count} reason={reason}"
+        );
+    }
+    None
+}
+
 pub(super) fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
     if command_buffer == 0
         || command_buffer & 7 != 0
         || dword_count == 0
         || !guest_range_is_readable(command_buffer, COMMAND_BUFFER_DESCRIPTOR_BYTES)
     {
-        return None;
+        return decline_reservation("unusable-descriptor", command_buffer, dword_count);
     }
     let mut cursor_up = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET);
     let mut cursor_down = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
@@ -261,7 +281,7 @@ pub(super) fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u
         let previous_cursor_down = cursor_down;
         let callback = read_u64(command_buffer + COMMAND_BUFFER_CALLBACK_OFFSET);
         if callback == 0 {
-            return None;
+            return decline_reservation("full-without-grow-callback", command_buffer, dword_count);
         }
         let requested = dword_count.checked_add(reserved)?;
         let user_data = read_u64(command_buffer + COMMAND_BUFFER_USER_DATA_OFFSET);
@@ -271,7 +291,7 @@ pub(super) fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u
         let callback: GrowCallback = unsafe { std::mem::transmute(callback_address) };
         // SAFETY: the callback ABI and arguments are defined by the Gen5 CommandBuffer layout.
         if !unsafe { callback(command_buffer, requested, user_data) } {
-            return None;
+            return decline_reservation("grow-refused", command_buffer, dword_count);
         }
         grew = true;
         cursor_up = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET);
@@ -280,7 +300,7 @@ pub(super) fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u
             "[REMu][AGC] command-buffer grow descriptor={command_buffer:#x} requested={dword_count} reserved={reserved} old={previous_cursor_up:#x}..{previous_cursor_down:#x} new={cursor_up:#x}..{cursor_down:#x}"
         );
         if !has_capacity(cursor_up, cursor_down, reserved, dword_count) {
-            return None;
+            return decline_reservation("short-after-grow", command_buffer, dword_count);
         }
     }
     let byte_count = u64::from(dword_count).checked_mul(4)?;

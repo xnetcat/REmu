@@ -305,7 +305,11 @@ pub(crate) const fn agc_packet_dword_count(header: u32) -> Option<u32> {
 
 pub(crate) fn agc_allocate_command_dwords(command_buffer: u64, size_dwords: u32) -> Option<u64> {
     if command_buffer == 0 || size_dwords == 0 {
-        return None;
+        return agc_command_abi::decline_reservation(
+            "unusable-descriptor",
+            command_buffer,
+            size_dwords,
+        );
     }
     let cursor_up = read_guest_u64(command_buffer + AGC_COMMAND_BUFFER_CURSOR_UP_OFFSET);
     let cursor_down = read_guest_u64(command_buffer + AGC_COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
@@ -363,27 +367,6 @@ pub(crate) fn agc_dcb_set_registers_indirect(arguments: [u64; 6], packet_registe
     command
 }
 
-pub(crate) fn agc_set_indirect_patch_address(arguments: [u64; 6]) -> u64 {
-    let command = arguments[0];
-    let registers = arguments[1];
-    if command == 0 || registers == 0 {
-        return u64::MAX;
-    }
-    write_guest_u32(command + 8, low_u32(registers));
-    write_guest_u32(command + 12, (registers >> 32) as u32);
-    0
-}
-
-pub(crate) fn agc_add_indirect_patch_registers(arguments: [u64; 6]) -> u64 {
-    let command = arguments[0];
-    if command == 0 {
-        return u64::MAX;
-    }
-    let register_count = low_u32(arguments[1]);
-    let current_count = read_guest_u32(command + 4);
-    write_guest_u32(command + 4, current_count.wrapping_add(register_count));
-    0
-}
 
 fn agc_copy_shader_register(source: u64, destination: u64) {
     write_guest_u32(destination, read_guest_u32(source));

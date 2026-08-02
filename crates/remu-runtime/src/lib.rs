@@ -93,13 +93,13 @@ pub(crate) use agc_api::{
     AGC_SHADER_SPECIALS_OFFSET, AGC_SHADER_TYPE_OFFSET, AGC_SPI_PS_INPUT_CNTL_0,
     AGC_SPI_SHADER_PGM_HI_ES, AGC_SPI_SHADER_PGM_HI_PS, AGC_SPI_SHADER_PGM_LO_ES,
     AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_INDEX_TYPE, AGC_VGT_PRIMITIVE_TYPE,
-    agc_add_indirect_patch_registers, agc_allocate_command_dwords, agc_cb_nop, agc_cb_release_mem,
+    agc_allocate_command_dwords, agc_cb_nop, agc_cb_release_mem,
     agc_cb_set_sh_register_range_direct, agc_create_interpolant_mapping,
     agc_create_primitive_state, agc_create_shader, agc_dcb_acquire_mem, agc_dcb_dma_data,
     agc_dcb_event_write, agc_dcb_reset_queue, agc_dcb_set_registers_indirect, agc_dcb_wait_reg_mem,
     agc_dma_data_patch_destination, agc_fuse_shader_halves, agc_get_data_packet_payload_address,
     agc_get_fused_shader_size, agc_packet_dword_count, agc_pm4, agc_register_defaults,
-    agc_release_mem_patch_address, agc_set_indirect_patch_address, agc_wait_reg_mem_patch_address,
+    agc_release_mem_patch_address, agc_wait_reg_mem_patch_address,
 };
 #[cfg(test)]
 pub(crate) use agc_api::{
@@ -2612,8 +2612,42 @@ fn trace_dispatch_stalls() -> bool {
     })
 }
 
-/// How many times each dispatch site has reported a failure, so the log stays bounded.
-static IMPORT_FAILURE_COUNTS: OnceLock<Mutex<BTreeMap<u64, u64>>> = OnceLock::new();
+/// Everything the end-of-run report needs about one failing import: how often it failed and
+/// which error codes it produced. Distinct results are capped so a pathological import cannot
+/// grow the map without bound; overflow counts collapse into the reserved key `0`, which no
+/// failed call can produce (the failure predicate requires a nonzero facility).
+#[derive(Default)]
+struct ImportFailureRecord {
+    total: u64,
+    results: BTreeMap<u64, u64>,
+}
+
+impl ImportFailureRecord {
+    const MAXIMUM_DISTINCT_RESULTS: usize = 8;
+    const OVERFLOW_RESULT_KEY: u64 = 0;
+
+    fn record(&mut self, result: u64) -> u64 {
+        self.total += 1;
+        let key = if self.results.len() >= Self::MAXIMUM_DISTINCT_RESULTS
+            && !self.results.contains_key(&result)
+        {
+            Self::OVERFLOW_RESULT_KEY
+        } else {
+            result
+        };
+        *self.results.entry(key).or_insert(0) += 1;
+        self.total
+    }
+}
+
+/// How many times each dispatch site has reported a failure, so the log stays bounded and the
+/// end-of-run report can name every failing import with exact counts.
+static IMPORT_FAILURE_COUNTS: OnceLock<Mutex<BTreeMap<u64, ImportFailureRecord>>> = OnceLock::new();
+
+/// Every NID that reached the unimplemented fallback, for the end-of-run report. The dispatch
+/// state keeps its own set for first-report dedup, but that state is unreachable from the exit
+/// paths, so the process-wide registry lives here.
+static UNIMPLEMENTED_IMPORTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 /// Reports an import that returned a console error code or a negative status.
 fn report_failed_import(frame: *const ImportCallFrame) -> ProbeImportReturn {
@@ -2637,10 +2671,12 @@ fn report_failed_import(frame: *const ImportCallFrame) -> ProbeImportReturn {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(index)
-            .and_modify(|count| *count += 1_u64)
-            .or_insert(1_u64)
-            .to_owned();
-        trace_import_errors() || seen.is_power_of_two()
+            .or_default()
+            .record(value);
+        // The first sixteen failures of a call site print individually — 388 declined shaders
+        // once hid behind nine pure power-of-two lines — and the exact totals always reach the
+        // end-of-run report regardless of what printed here.
+        trace_import_errors() || trace_logarithmic_sequence(seen, 16)
     };
     if failed {
         // SAFETY: the telemetry Arc is retained by this thread's cache for the whole call.
@@ -2695,6 +2731,11 @@ extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImpor
     }
     let sequence = IMPORT_CALL_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     if sequence > limit || frame.is_null() {
+        // A run whose call-trace budget is spent still deserves failure reporting: the trace
+        // exists to read the boot sequence, not to silence [REMu][FAIL] for the rest of the run.
+        if !frame.is_null() {
+            return report_failed_import(frame);
+        }
         return import_dispatch(frame);
     }
     // SAFETY: the caller supplies one aligned, fully initialized frame that stays live for the
@@ -4497,10 +4538,6 @@ fn dispatch_stateless_import(
         "ZvwO9euwYzc" => agc_dcb_set_registers_indirect(arguments, AGC_R_CX_REGS_INDIRECT),
         "-HOOCn0JY48" => agc_dcb_set_registers_indirect(arguments, AGC_R_SH_REGS_INDIRECT),
         "hvUfkUIQcOE" => agc_dcb_set_registers_indirect(arguments, AGC_R_UC_REGS_INDIRECT),
-        "vcmNN+AAXnY" | "Qrj4c+61z4A" | "6lNcCp+fxi4" => agc_set_indirect_patch_address(arguments),
-        "d-6uF9sZDIU" | "z2duB-hHQSM" | "vRoArM9zaIk" => {
-            agc_add_indirect_patch_registers(arguments)
-        }
         "D9sr1xGUriE" => agc_create_primitive_state(arguments),
         "HV4j+E0MBHE" => agc_create_interpolant_mapping(arguments),
         "n2fD4A+pb+g" => agc_cb_set_sh_register_range_direct(arguments),
@@ -4974,10 +5011,6 @@ fn dispatch_probe_import(
         "ZvwO9euwYzc" => agc_dcb_set_registers_indirect(arguments, AGC_R_CX_REGS_INDIRECT),
         "-HOOCn0JY48" => agc_dcb_set_registers_indirect(arguments, AGC_R_SH_REGS_INDIRECT),
         "hvUfkUIQcOE" => agc_dcb_set_registers_indirect(arguments, AGC_R_UC_REGS_INDIRECT),
-        "vcmNN+AAXnY" | "Qrj4c+61z4A" | "6lNcCp+fxi4" => agc_set_indirect_patch_address(arguments),
-        "d-6uF9sZDIU" | "z2duB-hHQSM" | "vRoArM9zaIk" => {
-            agc_add_indirect_patch_registers(arguments)
-        }
         "D9sr1xGUriE" => agc_create_primitive_state(arguments),
         "HV4j+E0MBHE" => agc_create_interpolant_mapping(arguments),
         "fd5Bp5tGTgo" => agc_fuse_shader_halves(arguments, state),
@@ -5187,6 +5220,11 @@ fn dispatch_probe_import(
             // to the first report instead of every one, under the process-wide write lock.
             if !state.unimplemented_nids.contains(nid) {
                 state.unimplemented_nids.insert(nid.to_owned());
+                UNIMPLEMENTED_IMPORTS
+                    .get_or_init(|| Mutex::new(BTreeSet::new()))
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(nid.to_owned());
                 eprintln!(
                     "[REMu][IMPORT] unimplemented nid={nid} name={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
                     nid_display_name(nid).unwrap_or("unknown"),
@@ -6746,6 +6784,18 @@ fn relocate_guest_pointer(field: u64) {
     }
 }
 
+/// Names for the three registration-decline reasons, indexed like
+/// [`DECLINED_SHADER_REGISTRATIONS`] so the end-of-run report can print exact per-reason counts.
+const DECLINED_SHADER_REASONS: [&str; 3] = [
+    "unusable-sh-register-block",
+    "unmapped-shader-stage",
+    "unexpected-program-registers",
+];
+
+/// Declined shader registrations by reason, reported at exit.
+static DECLINED_SHADER_REGISTRATIONS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
 fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
     let registers = read_guest_u64(header + AGC_SHADER_SH_REGISTERS_OFFSET);
     let shader_type = read_guest_u8(header + AGC_SHADER_TYPE_OFFSET);
@@ -6753,10 +6803,12 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
     // Every rejection here fails sceAgcCreateShader, and the guest treats that as a shader it
     // cannot use. Reporting the reason is the difference between "REmu declined 388 shaders" and
     // a silent rendering gap: the counts below are how a missing draw becomes attributable.
-    let reject = |reason: &str, detail: String| {
+    let reject = |reason_index: usize, detail: String| {
         static REJECTED: AtomicU64 = AtomicU64::new(0);
+        let reason = DECLINED_SHADER_REASONS[reason_index];
+        DECLINED_SHADER_REGISTRATIONS[reason_index].fetch_add(1, Ordering::Relaxed);
         let sequence = REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
-        if sequence <= 16 || sequence.is_power_of_two() {
+        if trace_logarithmic_sequence(sequence, 16) {
             eprintln!(
                 "[REMu][AGC] declined shader registration sequence={sequence} header={header:#x} \
                  type={shader_type} reason={reason} {detail}"
@@ -6765,10 +6817,7 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
         false
     };
     if registers == 0 || register_count < 2 {
-        return reject(
-            "unusable-sh-register-block",
-            format!("registers={registers:#x} count={register_count}"),
-        );
+        return reject(0, format!("registers={registers:#x} count={register_count}"));
     }
     let expected = match shader_type {
         0 => (0x20c, 0x20d),
@@ -6777,13 +6826,24 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
         4 => (0x08a, 0x08b),
         7 => (0x148, 0x149),
         // Gen5 defines shader stages REmu has no register mapping for yet; a title using one
-        // loses those draws entirely, so name the stage rather than dropping it quietly.
-        _ => return reject("unmapped-shader-stage", String::new()),
+        // loses those draws entirely, so name the stage rather than dropping it quietly. The
+        // header's own (lo, hi) register indices identify the stage the guest expects, which is
+        // exactly the datum needed to add the missing mapping.
+        _ => {
+            return reject(
+                1,
+                format!(
+                    "observed=({:#x}, {:#x}) count={register_count}",
+                    read_guest_u32(registers),
+                    read_guest_u32(registers + 8)
+                ),
+            );
+        }
     };
     let observed = (read_guest_u32(registers), read_guest_u32(registers + 8));
     if observed != expected {
         return reject(
-            "unexpected-program-registers",
+            2,
             format!("observed={observed:#x?} expected={expected:#x?}"),
         );
     }
@@ -8432,16 +8492,9 @@ fn probe_entry(
     ) as i32;
     run_guest_thread_destructors();
     set_current_guest_thread_pointer(0);
-    let recovered = sha_ni::recovered_sha_ni_count();
-    if recovered != 0 {
-        eprintln!("[REMu][CPU] recovered {recovered} SHA-NI instructions via SIGILL emulation");
-    }
-    let recovered_sse4a = sha_ni::recovered_sse4a_count();
-    if recovered_sse4a != 0 {
-        eprintln!(
-            "[REMu][CPU] recovered {recovered_sse4a} SSE4a instructions via SIGILL emulation"
-        );
-    }
+    // The SIGILL-recovery counters print inside the summary, which also covers the common case
+    // where the guest never returns here because it exits through terminate_probe.
+    report_abi_gap_summary();
     DIAGNOSTIC_TIMEOUT_CANCELLED.store(true, Ordering::Release);
     DIAGNOSTIC_TIMEOUT_SECONDS.store(0, Ordering::Release);
     remu_gpu::set_progress_telemetry_enabled(false);
@@ -8484,6 +8537,119 @@ extern "C" fn guest_exit(code: i32) {
 pub fn report_shader_opcode_coverage() {
     for line in remu_shader::opcode_coverage_report() {
         eprintln!("[REMu][SHADER-OPCODES] {line}");
+    }
+}
+
+/// Prints one `[REMu][REPORT]` line per ABI gap this run observed: every unimplemented import
+/// with its exact call count, every import that returned failures with per-result totals, the
+/// declined shader registrations by reason, and the SIGILL-recovery counters.
+///
+/// The per-event lines are rate-limited — 388 declined shaders once hid behind nine log lines —
+/// so this summary is the only place exact totals appear. It prints at most once per process and
+/// runs on every exit path via [`terminate_probe`], because the runs that need it most are the
+/// ones that die early.
+pub fn report_abi_gap_summary() {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    for (reason, count) in DECLINED_SHADER_REASONS
+        .iter()
+        .zip(&DECLINED_SHADER_REGISTRATIONS)
+    {
+        let count = count.load(Ordering::Relaxed);
+        if count != 0 {
+            eprintln!(
+                "[REMu][REPORT] declined shader registrations reason={reason} count={count}"
+            );
+        }
+    }
+    let recovered_sha_ni = sha_ni::recovered_sha_ni_count();
+    let recovered_sse4a = sha_ni::recovered_sse4a_count();
+    if recovered_sha_ni != 0 || recovered_sse4a != 0 {
+        eprintln!(
+            "[REMu][REPORT] recovered instructions via SIGILL emulation sha_ni={recovered_sha_ni} sse4a={recovered_sse4a}"
+        );
+    }
+    let telemetry = IMPORT_TELEMETRY.get().map(|telemetry| {
+        telemetry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    });
+    // One NID can occupy several dispatch slots (each importing module gets its own), so a
+    // name-based count must sum them; per-slot counts come straight from the failing index.
+    let calls_for_nid = |nid: &str| {
+        telemetry.as_ref().map(|telemetry| {
+            telemetry
+                .nids
+                .iter()
+                .zip(&telemetry.counts)
+                .filter(|(candidate, _)| candidate.as_str() == nid)
+                .map(|(_, count)| count.load(Ordering::Relaxed))
+                .sum::<usize>()
+        })
+    };
+    if let Some(unimplemented) = UNIMPLEMENTED_IMPORTS.get() {
+        let unimplemented = unimplemented
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for nid in unimplemented.iter() {
+            eprintln!(
+                "[REMu][REPORT] unimplemented import nid={nid} name={} calls={}",
+                nid_display_name(nid).unwrap_or("unknown"),
+                calls_for_nid(nid).map_or_else(|| "?".to_owned(), |calls| calls.to_string()),
+            );
+        }
+    }
+    let Some(failures) = IMPORT_FAILURE_COUNTS.get() else {
+        return;
+    };
+    // The watchdog thread can reach this while a guest thread holds the registry mid-update; a
+    // summary that hangs the exit would be worse than a summary that names its own absence.
+    let Ok(failures) = failures.try_lock() else {
+        eprintln!("[REMu][REPORT] import failure summary unavailable: registry lock contended");
+        return;
+    };
+    /// Enough for every failing import observed in practice; the overflow line keeps a longer
+    /// tail countable rather than silently truncated.
+    const MAXIMUM_REPORTED_IMPORTS: usize = 40;
+    let mut ranked = failures.iter().collect::<Vec<_>>();
+    ranked.sort_by_key(|(_, record)| std::cmp::Reverse(record.total));
+    for (index, record) in ranked.iter().take(MAXIMUM_REPORTED_IMPORTS) {
+        let slot = telemetry.as_ref().and_then(|telemetry| {
+            usize::try_from(**index)
+                .ok()
+                .and_then(|index| Some((telemetry.nids.get(index)?, &telemetry.counts[index])))
+        });
+        let nid = slot.map_or("?", |(nid, _)| nid.as_str());
+        let calls = slot.map_or_else(
+            || "?".to_owned(),
+            |(_, count)| count.load(Ordering::Relaxed).to_string(),
+        );
+        let results = record
+            .results
+            .iter()
+            .map(|(result, count)| {
+                if *result == ImportFailureRecord::OVERFLOW_RESULT_KEY {
+                    format!("other:{count}")
+                } else {
+                    format!("{result:#x}:{count}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "[REMu][REPORT] failing import name={} nid={nid} failures={} calls={calls} results={results}",
+            nid_display_name(nid).unwrap_or("unknown"),
+            record.total,
+        );
+    }
+    if ranked.len() > MAXIMUM_REPORTED_IMPORTS {
+        eprintln!(
+            "[REMu][REPORT] {} more failing imports omitted from this summary",
+            ranked.len() - MAXIMUM_REPORTED_IMPORTS
+        );
     }
 }
 
@@ -8718,6 +8884,7 @@ fn start_diagnostic_timeout(timeout_seconds: u32) {
 
 fn terminate_probe(code: i32) -> ! {
     report_shader_opcode_coverage();
+    report_abi_gap_summary();
     stop_av_player_controller();
     #[cfg(unix)]
     // SAFETY: `_exit` terminates the isolated CLI probe without unwinding across guest frames.

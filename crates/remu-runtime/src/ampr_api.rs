@@ -425,6 +425,10 @@ pub(crate) fn ampr_resolve_paths_core(
         results,
     } = outputs;
     if path_list == 0 || count == 0 || count > 1024 || (ids == 0 && sizes == 0 && results == 0) {
+        eprintln!(
+            "[REMu][AMPR] resolve rejected arguments path_list={path_list:#x} count={count} \
+             ids={ids:#x} sizes={sizes:#x} results={results:#x}"
+        );
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     for index in 0..count {
@@ -445,7 +449,13 @@ pub(crate) fn ampr_resolve_paths_core(
                 .flatten()
         });
         let entry_error = match path {
-            None => sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT),
+            None => {
+                eprintln!(
+                    "[REMu][AMPR] resolve entry unreadable index={index} of {count} \
+                     entry={candidate:#x} list={path_list:#x}"
+                );
+                sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT)
+            }
             Some(guest_path) => {
                 let guest_path = match prefix.as_deref() {
                     Some(prefix) => join_guest_path(prefix, &guest_path),
@@ -537,9 +547,14 @@ pub(crate) fn ampr_get_file_size(arguments: [u64; 6], state: &ProbeDispatchState
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let Some(host_path) = state.ampr_files.get(&file_id) else {
+        eprintln!("[REMu][AMPR] get-file-size unknown id={file_id:#x}");
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     let Ok(metadata) = host_path.metadata() else {
+        eprintln!(
+            "[REMu][AMPR] get-file-size missing id={file_id:#x} host={:?}",
+            host_path.display()
+        );
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     write_guest_u64(output, metadata.len());
@@ -553,9 +568,14 @@ pub(crate) fn ampr_get_file_stat(arguments: [u64; 6], state: &ProbeDispatchState
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let Some(host_path) = state.ampr_files.get(&file_id).cloned() else {
+        eprintln!("[REMu][AMPR] get-file-stat unknown id={file_id:#x}");
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     let Ok(metadata) = host_path.metadata() else {
+        eprintln!(
+            "[REMu][AMPR] get-file-stat missing id={file_id:#x} host={:?}",
+            host_path.display()
+        );
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     let payload = kernel_stat_payload_from_metadata(&metadata, &file_id.to_le_bytes());

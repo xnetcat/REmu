@@ -8,11 +8,36 @@ use super::{
     packet_register, read_u32, write_u32, write_u64,
 };
 
+/// Names why an indirect-patch import declined its packet. The 0x8a6c000c return is visible in
+/// `[REMu][FAIL]`, but several distinct causes collapse into that one constant — and at least one
+/// title (Octopath) reaches these imports with a null descriptor as apparently ordinary guest
+/// behaviour, so telling a null descriptor from a wrong opcode is what makes the line readable.
+fn decline_indirect_patch(reason: &str, command: u64, expected_opcode: u32) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DECLINED: AtomicU64 = AtomicU64::new(0);
+    let sequence = DECLINED.fetch_add(1, Ordering::Relaxed) + 1;
+    if crate::trace_logarithmic_sequence(sequence, 16) {
+        let header = (command != 0 && command.is_multiple_of(4))
+            .then(|| crate::try_read_process_guest_u32(command))
+            .flatten()
+            .map_or_else(|| "unreadable".to_owned(), |header| format!("{header:#010x}"));
+        eprintln!(
+            "[REMu][AGC] declined indirect-register patch sequence={sequence} \
+             command={command:#x} header={header} expected-opcode={expected_opcode:#x} \
+             reason={reason}"
+        );
+    }
+    GRAPHICS5_ERROR_INVALID_PACKET
+}
+
 pub(super) fn patch_indirect_address(arguments: [u64; 6], kind: IndirectRegisterKind) -> u64 {
     let command = arguments[0];
     let address = arguments[1];
-    if address == 0 || address & 3 != 0 || !is_packet(command, kind.opcode(), None) {
-        return GRAPHICS5_ERROR_INVALID_PACKET;
+    if address == 0 || address & 3 != 0 {
+        return decline_indirect_patch("unusable-register-block-address", command, kind.opcode());
+    }
+    if !is_packet(command, kind.opcode(), None) {
+        return decline_indirect_patch("packet-mismatch", command, kind.opcode());
     }
     write_u32(
         command + 4,
@@ -29,11 +54,11 @@ pub(super) fn patch_indirect_count(
 ) -> u64 {
     let command = arguments[0];
     if !is_packet(command, kind.opcode(), None) {
-        return GRAPHICS5_ERROR_INVALID_PACKET;
+        return decline_indirect_patch("packet-mismatch", command, kind.opcode());
     }
     let count = low_u32(arguments[1]);
     if count > 0x3fff {
-        return GRAPHICS5_ERROR_INVALID_PACKET;
+        return decline_indirect_patch("register-count-too-large", command, kind.opcode());
     }
     let previous = read_u32(command + 16);
     let next = if add {

@@ -218,12 +218,23 @@ pub(crate) fn save_data_delete_transaction_resource(
 
 pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     const MOUNT_RESULT_SIZE: usize = 0x40;
+    // Mounting happens a handful of times per run and its failures previously shared one
+    // anonymous error line each; naming the reason and the slot makes a first-launch probe for
+    // an absent save (NOT_FOUND with no create bit — normal) readable as such.
+    let declined = |error: u32, reason: &str, detail: String| {
+        eprintln!("[REMu][SAVEDATA] mount3 declined reason={reason} {detail}");
+        sce_kernel_error(error)
+    };
     if !state.save_data_initialized {
-        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+        return declined(SAVE_DATA_ERROR_NOT_INITIALIZED, "not-initialized", String::new());
     }
     let (mount, result) = (arguments[0], arguments[1]);
     if mount == 0 || result == 0 {
-        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        return declined(
+            SAVE_DATA_ERROR_PARAMETER,
+            "null-argument",
+            format!("mount={mount:#x} result={result:#x}"),
+        );
     }
     let user_id = low_i32(u64::from(read_guest_u32(mount)));
     let dir_name_address = read_guest_u64(mount + 0x08);
@@ -233,13 +244,25 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
     let mode = read_guest_u32(mount + 0x24);
     let resource = read_guest_u32(mount + 0x28);
     let Some(dir_name) = read_guest_fixed_ascii(dir_name_address, SAVE_DATA_DIR_NAME_SIZE) else {
-        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        return declined(
+            SAVE_DATA_ERROR_PARAMETER,
+            "unreadable-dir-name",
+            format!("address={dir_name_address:#x}"),
+        );
     };
     if user_id < 0 || dir_name.is_empty() {
-        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        return declined(
+            SAVE_DATA_ERROR_PARAMETER,
+            "unusable-user-or-dir",
+            format!("user={user_id} dir={dir_name:?}"),
+        );
     }
     if resource != 0 && !state.save_transaction_resources.contains(&resource) {
-        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        return declined(
+            SAVE_DATA_ERROR_PARAMETER,
+            "unknown-transaction-resource",
+            format!("resource={resource}"),
+        );
     }
 
     let slot = state.save_root.join(sanitize_save_segment(&dir_name));
@@ -247,10 +270,21 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
     let create = mount_mode & SAVE_DATA_MOUNT_MODE_CREATE != 0;
     let create_if_missing = mount_mode & SAVE_DATA_MOUNT_MODE_CREATE_IF_MISSING != 0;
     if !existed && !create && !create_if_missing {
-        return sce_kernel_error(SAVE_DATA_ERROR_NOT_FOUND);
+        return declined(
+            SAVE_DATA_ERROR_NOT_FOUND,
+            "absent-without-create-bit",
+            format!(
+                "dir={dir_name:?} mount_mode={mount_mode:#x} host={:?} (normal on first launch)",
+                slot.display()
+            ),
+        );
     }
     if existed && create {
-        return sce_kernel_error(SAVE_DATA_ERROR_EXISTS);
+        return declined(
+            SAVE_DATA_ERROR_EXISTS,
+            "exists-with-exclusive-create",
+            format!("dir={dir_name:?} host={:?}", slot.display()),
+        );
     }
     // A prepared mount points `path` at its staging tree, so comparing only `path` would let the
     // same slot be mounted a second time and have the committed directory renamed out from under
@@ -260,7 +294,11 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
         .values()
         .any(|mounted| mounted.path == slot || mounted.committed_path == slot)
     {
-        return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+        return declined(
+            SAVE_DATA_ERROR_BUSY,
+            "slot-already-mounted",
+            format!("dir={dir_name:?}"),
+        );
     }
     if !existed && let Err(error) = create_save_data_slot(&slot, &dir_name, blocks) {
         eprintln!(
@@ -273,7 +311,11 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
     let Some(mount_index) =
         (0_u8..16).find(|index| !state.save_mounts.contains_key(&format!("/savedata{index}")))
     else {
-        return sce_kernel_error(SAVE_DATA_ERROR_MOUNT_FULL);
+        return declined(
+            SAVE_DATA_ERROR_MOUNT_FULL,
+            "all-mount-points-in-use",
+            format!("dir={dir_name:?}"),
+        );
     };
     let mount_point = format!("/savedata{mount_index}");
 

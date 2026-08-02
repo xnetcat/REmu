@@ -292,12 +292,13 @@ fn write_u64(address: u64, value: u64) {
 /// Reserves `dword_count` dwords at the head of a command buffer, growing it if the guest supplied
 /// a callback, and returns the address the packet must be written to.
 fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
+    use crate::agc_command_abi::decline_reservation;
     if command_buffer == 0
         || command_buffer & 7 != 0
         || dword_count == 0
         || !guest_range_is_readable(command_buffer, COMMAND_BUFFER_DESCRIPTOR_BYTES)
     {
-        return None;
+        return decline_reservation("unusable-descriptor", command_buffer, dword_count);
     }
     let mut cursor_up = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET);
     let mut cursor_down = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
@@ -305,7 +306,7 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
     if !has_capacity(cursor_up, cursor_down, reserved, dword_count) {
         let callback = read_u64(command_buffer + COMMAND_BUFFER_CALLBACK_OFFSET);
         if callback == 0 {
-            return None;
+            return decline_reservation("full-without-grow-callback", command_buffer, dword_count);
         }
         let requested = dword_count.checked_add(reserved)?;
         let user_data = read_u64(command_buffer + COMMAND_BUFFER_USER_DATA_OFFSET);
@@ -315,18 +316,18 @@ fn allocate_dwords(command_buffer: u64, dword_count: u32) -> Option<u64> {
         let callback: GrowCallback = unsafe { std::mem::transmute(callback_address) };
         // SAFETY: the callback owns the cursors it rewrites and reports whether it grew the buffer.
         if !unsafe { callback(command_buffer, requested, user_data) } {
-            return None;
+            return decline_reservation("grow-refused", command_buffer, dword_count);
         }
         cursor_up = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET);
         cursor_down = read_u64(command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET);
         if !has_capacity(cursor_up, cursor_down, reserved, dword_count) {
-            return None;
+            return decline_reservation("short-after-grow", command_buffer, dword_count);
         }
     }
     let byte_count = u64::from(dword_count).checked_mul(4)?;
     let next = cursor_up.checked_add(byte_count)?;
     if !guest_range_is_readable(cursor_up, byte_count) {
-        return None;
+        return decline_reservation("unreadable-packet-range", command_buffer, dword_count);
     }
     write_u64(command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET, next);
     Some(cursor_up)
