@@ -1663,8 +1663,8 @@ impl MetalPresenter {
             // boundary so later compositor and interface passes cannot be skipped.
             self.note_pending_flip_target_write(target.texture);
         }
-        let dump_target_before_pixel_shader =
-            diagnostic_dump_target_before_pixel_shader().is_some();
+        let dump_target_before_pixel_shader = diagnostic_dump_target_before_pixel_shader().is_some()
+            || diagnostic_dump_glyph_draw();
         let trace_scanout_writers = trace_scanout_writes();
         for target in &targets {
             if should_record_diagnostic_target_writer(
@@ -1887,7 +1887,7 @@ impl MetalPresenter {
                     draw.sequence, draw.export_shader_address, draw.pixel_shader_address, target,
                 );
                 eprintln!(
-                    "[REMu][METAL][TARGET-DRAW-STATE] draw={} indexed={} count={} instances={} primitive={:#x} color_target={:#x} scanout_target={:?} context={context_registers:08x?} shaders={shaders:08x?} shader_registers={:08x?} user_config_registers={:08x?} vs_out={:#010x} resolved_ps_inputs={:08x?} hooks=(pre_target_ps={:x?},post_target=true,vertex_output={},pixel_output={},sample_textures={})",
+                    "[REMu][METAL][TARGET-DRAW-STATE] draw={} indexed={} count={} instances={} primitive={:#x} color_target={:#x} scanout_target={:?} context={context_registers:08x?} shaders={shaders:08x?} shader_registers={:08x?} user_config_registers={:08x?} vs_out={:#010x} resolved_ps_inputs={:08x?} hooks=(pre_target={},post_target=true,vertex_output={},pixel_output={},sample_textures={})",
                     draw.sequence,
                     draw.indexed,
                     draw.index_count,
@@ -1899,7 +1899,8 @@ impl MetalPresenter {
                     draw.user_config_registers,
                     key.vertex_output_control,
                     key.pixel_input_controls,
-                    diagnostic_dump_target_before_pixel_shader(),
+                    diagnostic_dump_target_before_pixel_shader().is_some()
+                        || diagnostic_dump_glyph_draw(),
                     diagnostic_capture_vertex_position(),
                     diagnostic_capture_pixel_output(),
                     capture_target_sample_textures(),
@@ -2044,6 +2045,34 @@ impl MetalPresenter {
                 };
                 let nonzero = bytes.iter().filter(|&&value| value != 0).count();
                 let fingerprint = guest_frame_fingerprint(&bytes);
+                if diagnostic_dump_glyph_draw()
+                    && evaluation_samples_glyph_atlas(pixel_evaluation)
+                    && let Some(directory) = self.capture_directory.as_deref()
+                {
+                    match native_texture_capture_to_bgra(&bytes, descriptor) {
+                        Some(bgra) => match capture_guest_frame(
+                            directory,
+                            &bgra,
+                            descriptor,
+                            fingerprint,
+                        ) {
+                            Ok(path) => eprintln!(
+                                "[REMu][METAL][GLYPH-POST-TARGET] draw={} fingerprint={fingerprint:016x} captured={}",
+                                draw.sequence,
+                                path.display(),
+                            ),
+                            Err(error) => eprintln!(
+                                "[REMu][METAL][GLYPH-POST-TARGET] draw={} capture failed: {error}",
+                                draw.sequence,
+                            ),
+                        },
+                        None => eprintln!(
+                            "[REMu][METAL][GLYPH-POST-TARGET] draw={} conversion failed for {:?}",
+                            draw.sequence,
+                            descriptor.pixel_format,
+                        ),
+                    }
+                }
                 let sampled_summaries = pixel_evaluation
                     .image_bindings
                     .iter()
