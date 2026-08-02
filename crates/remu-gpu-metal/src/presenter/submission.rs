@@ -724,13 +724,18 @@ fn shared_event_host_effect_kind(event: &GpuEvent) -> usize {
 
 impl MetalPresenter {
     /// Conservative host-effect gate for commands following an encoded Metal wait.
-    fn event_is_shared_event_gpu_orderable(
+    pub(super) fn event_is_shared_event_gpu_orderable(
         &self,
         source: OrderedEventSource,
         event: &GpuEvent,
     ) -> bool {
         match event {
             GpuEvent::CommandProcessorBarrier | GpuEvent::PipelineBarrier(_) => true,
+            // With no invalidation bits, ACQUIRE_MEM has no presenter-side resource effect at
+            // all. It is safe to consume after encoding the queue's Metal wait: the normal
+            // handler returns immediately, so no cache or guest-visible state can overtake the
+            // producer. Invalidating acquires remain behind the host acknowledgement below.
+            GpuEvent::MemoryAcquire(acquire) => !acquire.invalidates_guest_resources(),
             GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
                 self.active_open_guest_batch().is_some()
                     || !self.active_committed_guest_batches().is_empty()
@@ -749,7 +754,7 @@ impl MetalPresenter {
                 !initial_flip_boundary && !write_completes_pending_flip
             }
             // Draw/compute preparation snapshots guest bytes and mutates shared residency/cache
-            // state on the presenter thread. DMA, acquire, waits, flips and host UI have still
+            // state on the presenter thread. DMA, invalidating acquires, waits, flips and host UI have still
             // more direct CPU-visible effects. They must observe the producer event first.
             _ => false,
         }

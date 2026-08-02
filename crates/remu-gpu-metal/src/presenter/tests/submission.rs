@@ -4325,7 +4325,7 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
                 base_address: label,
                 size_bytes: 4,
                 poll_interval: 0,
-                gcr_control: 0,
+                gcr_control: 1,
             }),
         ],
     }));
@@ -4391,6 +4391,31 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
 }
 
 #[test]
+fn noninvalidating_acquire_is_gpu_orderable_but_invalidation_requires_host_ack() {
+    let (_sender, receiver) = gpu_event_channel();
+    let presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let acquire = GpuMemoryAcquire {
+        engine: 0,
+        cb_db_control: 0,
+        base_address: 0x1234_0000,
+        size_bytes: 0x4000,
+        poll_interval: 0,
+        gcr_control: 0,
+    };
+    assert!(presenter.event_is_shared_event_gpu_orderable(
+        OrderedEventSource::GuestQueue(0),
+        &GpuEvent::MemoryAcquire(acquire),
+    ));
+    assert!(!presenter.event_is_shared_event_gpu_orderable(
+        OrderedEventSource::GuestQueue(0),
+        &GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+            gcr_control: 1,
+            ..acquire
+        }),
+    ));
+}
+
+#[test]
 fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain() {
     remu_gpu::clear_event_sink();
     let (sender, receiver) = gpu_event_channel();
@@ -4419,7 +4444,7 @@ fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain()
                 base_address: label,
                 size_bytes: 4,
                 poll_interval: 0,
-                gcr_control: 0,
+                gcr_control: 1,
             }),
         ],
     }));
