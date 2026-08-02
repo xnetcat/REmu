@@ -114,8 +114,9 @@ pub(crate) fn agc_parse_graphics_submission(
     // immediately before the submitted tail (outside the continuation target). Suppressing prefix
     // recovery whenever any continuation matched is what leaves Poppy title waits with
     // producers=[none-ingested] after the IB path already consumed a different range.
-    if let Some((prefix_address, prefix_dword_count)) =
-        agc_command_abi::take_recorded_graphics_prefix(command_address)
+    if let Some((prefix_address, prefix_dword_count)) = (!recorded_prefix_replay_disabled())
+        .then(|| agc_command_abi::take_recorded_graphics_prefix(command_address))
+        .flatten()
     {
         eprintln!(
             "[REMu][AGC] applying recorded graphics prefix address={prefix_address:#x} dwords={prefix_dword_count} before={command_address:#x} after_continuation={has_explicit_continuation}"
@@ -123,6 +124,20 @@ pub(crate) fn agc_parse_graphics_submission(
         agc_parse_command_stream(prefix_address, prefix_dword_count, context, 1, false)?;
     }
     agc_parse_submission(command_address, dword_count, context)
+}
+
+
+/// Suppresses replay of recorded graphics prefixes.
+///
+/// Prefix recovery re-executes PM4 that was recorded earlier and validated only by shape. A
+/// replayed DCC clear names a destination that was correct when recorded and may be ordinary
+/// guest heap by the time it executes — mapped, so every liveness check passes, and wrong. This
+/// switch exists to attribute that: run with it set and compare crash frequency.
+fn recorded_prefix_replay_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var_os("REMU_DISABLE_PREFIX_REPLAY").is_some_and(|value| value == "1")
+    })
 }
 
 pub(super) fn agc_parse_command_stream(
