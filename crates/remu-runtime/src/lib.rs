@@ -1417,7 +1417,7 @@ thread_local! {
     static CURRENT_GUEST_THREAD_HANDLE: Cell<u64> = const { Cell::new(0) };
     static CURRENT_GUEST_THREAD_UNIQUE_ID: Cell<u32> = const { Cell::new(0) };
     static CURRENT_GUEST_THREAD_EXIT_CONTEXT: Cell<*mut GuestThreadExitContext> = const { Cell::new(std::ptr::null_mut()) };
-    static GUEST_PTHREAD_SPECIFIC: RefCell<BTreeMap<u32, (u64, u64)>> = const { RefCell::new(BTreeMap::new()) };
+    static GUEST_PTHREAD_SPECIFIC: RefCell<[(u64, u64); 256]> = const { RefCell::new([(0, 0); 256]) };
     static IMPORT_TELEMETRY_CACHE: RefCell<Option<(usize, Arc<ImportTelemetry>)>> = const { RefCell::new(None) };
     static PROCESS_TIME_CALLSITES: RefCell<[(u64, u64); 8]> = const { RefCell::new([(0, 0); 8]) };
     static GUEST_IMPORT_TRACE_RECORD: Cell<*const GuestImportTraceRecord> = const { Cell::new(std::ptr::null()) };
@@ -1952,7 +1952,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     for generation in &PTHREAD_KEY_GENERATIONS {
         generation.store(0, Ordering::Release);
     }
-    GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
+    GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| values.fill((0, 0)));
     state.exit_callbacks.clear();
     state.process_param_address = image.process_param.map_or(0, GuestAddress::get);
     state.thread_atexit_count_callback = 0;
