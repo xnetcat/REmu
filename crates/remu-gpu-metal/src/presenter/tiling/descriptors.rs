@@ -69,6 +69,18 @@ impl ResourceSpan {
         self.range_start().saturating_add(self.len)
     }
 
+    /// True when both spans keep their `RangeSet` runs in the same offset space.
+    ///
+    /// Runs of two resolved spans are only comparable inside one backing object; an unresolved
+    /// span stays in guest virtual space, where only another unresolved span can meet it.
+    pub(crate) fn shares_offset_space(&self, other: &Self) -> bool {
+        match (self.backing, other.backing) {
+            (Some(left), Some(right)) => left.backing_id == right.backing_id,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn overlaps_texture(&self, other: GuestTextureDescriptor) -> bool {
         Self::for_texture(other).is_some_and(|other| self.overlaps(&other))

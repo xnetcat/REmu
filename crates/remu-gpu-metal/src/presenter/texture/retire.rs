@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedSampledTexture, GuestTextureDescriptor, MultisampleResidentTexture,
-    MultisampleTextureKey, ResidentGuestTexture, ResidentTextureMap, ResourceSpan,
-    SampledTextureKey, guest_ranges_overlap, guest_texture_byte_count,
-    quarantine_retired_resident,
+    CachedSampledTexture, MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture,
+    ResourceSpan, SampledTextureKey, guest_ranges_overlap, guest_texture_byte_count,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -13,6 +11,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self};
 
 pub(crate) fn trace_resident_texture_removal(reason: &str, resident: &ResidentGuestTexture) {
+    trace_resident_texture_exit("RESIDENCY-REMOVE", reason, resident);
+}
+
+/// Traces an allocation losing its last owned byte while keeping its Metal storage and watch.
+pub(crate) fn trace_resident_texture_demotion(reason: &str, resident: &ResidentGuestTexture) {
+    trace_resident_texture_exit("RESIDENCY-DEMOTE", reason, resident);
+}
+
+fn trace_resident_texture_exit(kind: &str, reason: &str, resident: &ResidentGuestTexture) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_TEXTURE_RESIDENCY").is_some()) {
         return;
@@ -38,7 +45,7 @@ pub(crate) fn trace_resident_texture_removal(reason: &str, resident: &ResidentGu
         },
     );
     eprintln!(
-        "[REMu][METAL][RESIDENCY-REMOVE] reason={reason} texture={:#x}/{}x{}/p{}/{:?}/tile{}/type{}/layers{}/mips{}/gpu{}/v{} dirty={} read={} write={}",
+        "[REMu][METAL][{kind}] reason={reason} texture={:#x}/{}x{}/p{}/{:?}/tile{}/type{}/layers{}/mips{}/gpu{}/v{} dirty={} read={} write={}",
         descriptor.address,
         descriptor.width,
         descriptor.height,
@@ -128,36 +135,6 @@ pub(crate) fn retire_sampled_textures_overlapping_writeback(
     for key in retired {
         if let Some(texture) = cache.remove(&key) {
             retire_sampled_texture(texture);
-        }
-    }
-}
-
-pub(crate) fn retire_resident_textures_overlapping_writeback(
-    cache: &mut ResidentTextureMap,
-    retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
-    alias_ranges: &[(u64, u64)],
-    source_descriptor: GuestTextureDescriptor,
-    source_content_version: u64,
-) {
-    let retired = cache
-        .iter()
-        .filter_map(|(descriptor, resident)| {
-            (*descriptor != source_descriptor
-                && resident.content_version <= source_content_version
-                && resident.write_watch.overlaps_alias_ranges(alias_ranges))
-            .then_some(*descriptor)
-        })
-        .collect::<Vec<_>>();
-    for descriptor in retired {
-        if let Some(mut resident) = cache.remove(&descriptor) {
-            trace_resident_texture_removal("overlapping-writeback", &resident);
-            // The imminent writeback supersedes this resident's pixels, so it stops being
-            // GPU-owned here, and its shape, watch and fingerprints stay adoptable. The
-            // writeback notifies every intersecting watch, so a content-consuming adoption
-            // revalidates and a stale entry can never serve pixels; a discarded-render-target
-            // adoption reuses the allocation without reading them.
-            resident.clear_gpu_authored();
-            quarantine_retired_resident(retired_texture_quarantine, resident);
         }
     }
 }

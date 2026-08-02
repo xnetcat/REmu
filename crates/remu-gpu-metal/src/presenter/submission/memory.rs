@@ -3,13 +3,12 @@
 
 use super::{
     GuestMemoryWriteOperation, MetalPresenter, PendingGlobalWriteback, PendingGuestMemoryWrite,
-    WriteWatchRefresh, guest_batch_writes_overlap, guest_ranges_overlap, guest_texture_byte_count,
-    merge_guest_batch_result, read_guest_memory_wait_value, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear, record_diagnostic_memory_copy,
+    RangeSet, ResourceSpan, WriteWatchRefresh, guest_batch_writes_overlap, guest_ranges_overlap,
+    guest_texture_byte_count, merge_guest_batch_result, read_guest_memory_wait_value,
+    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_memory_copy,
     refresh_resident_texture_write_watch, retire_multisample_textures_overlapping_writeback,
-    retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
-    retire_sampled_textures_overlapping_writeback, trace_resident_texture_removal,
-    write_resident_texture_contents_to_guest,
+    retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
+    trace_resident_texture_removal, write_resident_texture_contents_to_guest,
 };
 use crate::presenter::diagnostics::trace_diagnostic_guest_write;
 use remu_gpu::{
@@ -185,27 +184,17 @@ impl MetalPresenter {
                         continue;
                     }
                     authoritative_gpu_source = true;
-                    let (alias_ranges, content_version) = {
-                        let resident = self
-                            .resident_guest_textures
-                            .get(&descriptor)
-                            .expect("collected DMA source texture exists");
-                        (
-                            resident.write_watch.alias_ranges(),
-                            resident.content_version,
-                        )
-                    };
+                    let alias_ranges = self
+                        .resident_guest_textures
+                        .get(&descriptor)
+                        .expect("collected DMA source texture exists")
+                        .write_watch
+                        .alias_ranges();
                     retire_sampled_textures_overlapping_writeback(
                         &mut self.sampled_texture_cache,
                         &alias_ranges,
                     );
-                    retire_resident_textures_overlapping_writeback(
-                        &mut self.resident_guest_textures,
-                        &mut self.retired_texture_quarantine,
-                        &alias_ranges,
-                        descriptor,
-                        content_version,
-                    );
+                    self.note_resident_writeback_published(descriptor);
                     retire_multisample_textures_overlapping_writeback(
                         &mut self.multisample_textures,
                         &alias_ranges,
@@ -245,26 +234,16 @@ impl MetalPresenter {
             self.record_submitted_gpu_waits_in_range(copy.destination_address, copy.byte_count);
         }
 
-        let destination_descriptors = self
-            .resident_guest_textures
-            .keys()
-            .copied()
-            .filter(|descriptor| {
-                guest_texture_byte_count(*descriptor).is_some_and(|length| {
-                    guest_ranges_overlap(
-                        descriptor.address,
-                        length,
-                        copy.destination_address,
-                        copy.byte_count,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        for descriptor in destination_descriptors {
-            if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
-                trace_resident_texture_removal("dma-destination-write", &resident);
-            }
-        }
+        // The copy made guest RAM authoritative for its destination. Resolving that range
+        // physically also reaches residents mapped at an unrelated virtual address, which the
+        // virtual-address scan this replaces could not see.
+        let destination_span = ResourceSpan::new(copy.destination_address, copy.byte_count);
+        self.note_guest_memory_authoritative(
+            &destination_span,
+            &RangeSet::for_span(&destination_span),
+            None,
+            "dma-destination-write",
+        );
         self.multisample_textures.retain(|key, _| {
             guest_texture_byte_count(key.descriptor).is_none_or(|length| {
                 !guest_ranges_overlap(

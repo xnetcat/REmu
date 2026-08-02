@@ -7,7 +7,7 @@ use super::{
     GuestScissor, GuestTextureDescriptor, GuestTextureWatchRange,
     GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
     MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED,
+    OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_SUBTRACT_TENANTS_SURVIVED,
     RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
     RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidencyState, ResidentGuestTexture,
     ResourceSpan,
@@ -15,7 +15,7 @@ use super::{
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
-    SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_DIRTY_VALIDATION_BYTES,
+    SampledTextureKey, ScanoutSnapshotTexture, StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES,
     TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
     TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
@@ -40,8 +40,10 @@ use super::{
     write_resident_texture_contents_to_guest,
 };
 #[cfg(test)]
-use remu_memory::guest_shared_mapping_identity;
-use remu_memory::{CpuWriteWatchRetirement, read_guest_shared_backing, write_guest_shared_backing};
+use remu_memory::{guest_shared_mapping_identity, write_guest_shared_backing};
+use remu_memory::{
+    CpuWriteWatchRetirement, read_guest_shared_backing, write_guest_shared_backing_scattered,
+};
 mod correlation;
 mod depth_array;
 mod extent;
@@ -77,12 +79,12 @@ pub(crate) use self::resident_map::{ResidentTextureMap, SpanQueryOrder};
 pub(crate) use self::resident_map::ResidentSpanIndex;
 pub(crate) use self::residency::{
     QuarantineAdoption, RETIRED_TEXTURE_QUARANTINE_CAPACITY, adopt_quarantined_resident,
-    ensure_resident_texture_in_map, quarantine_retired_resident, resident_texture_ownership_stats,
+    ensure_resident_texture_in_map, resident_texture_ownership_stats,
 };
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
-    retire_resident_textures_overlapping_writeback, retire_sampled_texture,
-    retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
+    retire_sampled_texture, retire_sampled_textures_matching,
+    retire_sampled_textures_overlapping_writeback, trace_resident_texture_demotion,
     trace_resident_texture_removal,
 };
 #[cfg(test)]
@@ -110,7 +112,7 @@ pub(crate) use self::watch::{
     sampled_texture_uses_exact_mode27_mips, snapshot_guest_texture_raw,
     snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
     snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
-    watch_sampled_texture, write_watched_guest_range,
+    authored_segments, watch_sampled_texture, write_watched_guest_range,
 };
 
 /// Metal exposes this C structure by value in the swizzled texture-view Objective-C method.
@@ -221,9 +223,15 @@ pub(super) fn write_guest_texture_linear_into_raw_at_z(
     Ok(())
 }
 
+/// Publishes a decoded image into its guest bytes.
+///
+/// `authored` names the runs the GPU actually wrote, as offsets from `descriptor.address`; `None`
+/// publishes the whole declared range. Only the tiled path consults it — a linear image already
+/// publishes exactly its visible rows and never touches the padding between them.
 pub(super) fn write_watched_guest_texture_linear(
     descriptor: GuestTextureDescriptor,
     linear: &[u8],
+    authored: Option<&[(u64, u64)]>,
     write_watch: &GuestTextureWriteWatch,
 ) -> Result<(), String> {
     if write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced) {
@@ -313,15 +321,35 @@ pub(super) fn write_watched_guest_texture_linear(
                     descriptor.address
                 ));
             }
-            if !write_guest_shared_backing(descriptor.address, &destination) {
-                return Err(format!(
-                    "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
-                    descriptor.address
-                ));
-            }
-            Ok(destination)
+            // The retile filled `destination` over a snapshot of the whole padded footprint.
+            // Publishing all of it republishes bytes the GPU never authored, which is how a
+            // freed render target's stale capture lands on live guest heap.
+            let published = {
+                let segments = match authored {
+                    Some(runs) => authored_segments(&destination, runs),
+                    None => vec![(0, destination.as_slice())],
+                };
+                if !segments.is_empty()
+                    && !write_guest_shared_backing_scattered(
+                        descriptor.address,
+                        byte_count,
+                        &segments,
+                    )
+                {
+                    return Err(format!(
+                        "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
+                        descriptor.address
+                    ));
+                }
+                segments
+                    .iter()
+                    .map(|(offset, bytes)| (*offset, bytes.len()))
+                    .collect::<Vec<_>>()
+            };
+            Ok((destination, published))
         })
         .and_then(|result| result)?;
+    let (raw, published) = raw;
     // See write_watched_guest_range: a backing write is invisible to armed pages, so every
     // other intersecting watch must hear about it before this watch re-baselines itself.
     let _ = remu_memory::notify_guest_memory_written_excluding(
@@ -329,7 +357,11 @@ pub(super) fn write_watched_guest_texture_linear(
         byte_count,
         &write_watch.cpu_watches(),
     );
-    write_watch.record_content_snapshot(descriptor.address, &raw);
+    for (offset, length) in published {
+        let start = usize::try_from(offset).map_err(|_| "published offset does not fit usize")?;
+        write_watch
+            .record_content_snapshot(descriptor.address + offset, &raw[start..start + length]);
+    }
     Ok(())
 }
 

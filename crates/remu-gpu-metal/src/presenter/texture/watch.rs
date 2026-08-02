@@ -13,13 +13,14 @@ use super::{
     gpu_written_resident_serving_sampled_key,
     mode5_mip_chain_layout, mode27_mip_chain_layout, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
-    texture_alias_trace_match, trace_alias_correlated_acquire, trace_resident_texture_removal,
+    StaleSource, texture_alias_trace_match, trace_alias_correlated_acquire,
+    trace_resident_texture_demotion, trace_resident_texture_removal,
 };
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
     CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_backing_alias_segments,
     guest_shared_mapping_epoch, guest_shared_mapping_identity, read_guest_shared_backing,
-    write_guest_shared_backing,
+    write_guest_shared_backing_scattered,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -190,10 +191,10 @@ impl MetalPresenter {
             // An acquire only invalidates the old Metal copy; it does not require materializing a
             // replacement here. Rebuilding eagerly decoded whole multi-megabyte Unreal render
             // allocations even when several more acquires arrived before the image was used, and
-            // even when the next render pass discards those guest bytes anyway. Drop the stale
-            // resident and let the ordinary render/sample path materialize one stable snapshot on
-            // demand. A GPU-authored resident is safe to drop as well: the reload it replaces
-            // overwrote every pixel with guest bytes, so no Metal-only content survived it either.
+            // even when the next render pass discards those guest bytes anyway. Demote instead of
+            // destroying: the allocation, its watch, its `mprotect` state and its fingerprint
+            // baseline survive, so a later bind either overwrites it outright or rebuilds it from
+            // RAM through a validation the baseline usually answers for free.
             invalidated_multisample_descriptors.push(descriptor);
             trace_acquire(
                 resident,
@@ -206,16 +207,15 @@ impl MetalPresenter {
                     "removed-cpu-dirty"
                 },
             );
-            if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
-                trace_resident_texture_removal(
-                    if gpu_written {
-                        "acquire-gpu-dirty"
-                    } else {
-                        "acquire-cpu-dirty"
-                    },
-                    &resident,
-                );
-            }
+            resident.demote(StaleSource::GuestMemory);
+            trace_resident_texture_demotion(
+                if gpu_written {
+                    "acquire-gpu-dirty"
+                } else {
+                    "acquire-cpu-dirty"
+                },
+                resident,
+            );
             RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
         }
         // Resolve each invalidated descriptor once instead of once per multisample entry.
@@ -1373,9 +1373,17 @@ pub(crate) fn snapshot_watched_guest_texture_raw(
     snapshot_watched_guest_range(descriptor.address, source_length, write_watch)
 }
 
+/// Publishes a whole-range image assembled from a guest snapshot back into guest memory.
+///
+/// `authored` names, as byte offsets from `address`, the runs the GPU actually wrote; every other
+/// byte of `raw` came from the snapshot and is republished only because `None` asks for it. That
+/// republication is how a read-modify-write writeback overwrites bytes this allocation does not
+/// answer for — pitch and chain padding, a neighbouring tenant's surface, or, once the guest has
+/// freed the render target, whatever its heap put there since.
 pub(crate) fn write_watched_guest_range(
     address: u64,
     raw: &[u8],
+    authored: Option<&[(u64, u64)]>,
     write_watch: &GuestTextureWriteWatch,
     expected_generations: Option<&[u64]>,
 ) -> Result<(), String> {
@@ -1395,7 +1403,16 @@ pub(crate) fn write_watched_guest_range(
         ));
     }
     let byte_count = u64::try_from(raw.len()).map_err(|_| "guest range length does not fit u64")?;
-    let wrote = write_watch.with_live_backing(|| write_guest_shared_backing(address, raw))?;
+    let segments = match authored {
+        Some(runs) => authored_segments(raw, runs),
+        None => vec![(0, raw)],
+    };
+    if segments.is_empty() {
+        return Ok(());
+    }
+    let wrote = write_watch.with_live_backing(|| {
+        write_guest_shared_backing_scattered(address, byte_count, &segments)
+    })?;
     if wrote {
         // A backing write bypasses every armed page, so watches on other aliases of these
         // bytes would keep validating as clean against content that just changed. Publish the
@@ -1406,13 +1423,26 @@ pub(crate) fn write_watched_guest_range(
             byte_count,
             &write_watch.cpu_watches(),
         );
-        write_watch.record_content_snapshot(address, raw);
+        for (offset, bytes) in &segments {
+            write_watch.record_content_snapshot(address.saturating_add(*offset), bytes);
+        }
         Ok(())
     } else {
         Err(format!(
             "guest range {address:#x}+{byte_count:#x} lost shared backing during writeback"
         ))
     }
+}
+
+/// Clamps `runs` to `raw` and slices it, dropping anything that names no byte of the image.
+pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(u64, &'a [u8])> {
+    runs.iter()
+        .filter_map(|&(start, end)| {
+            let start = usize::try_from(start).ok()?;
+            let end = usize::try_from(end).ok()?.min(raw.len());
+            (start < end).then(|| (start as u64, &raw[start..end]))
+        })
+        .collect()
 }
 
 #[cfg(test)]

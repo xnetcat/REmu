@@ -16,7 +16,8 @@ use super::super::texture::{
     adopt_quarantined_resident, ensure_resident_texture_in_map,
 };
 use super::super::{
-    RESIDENT_WRITE_ATTRIBUTION_MISSES, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
+    RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidencyState, StaleSource, TEXTURE_QUARANTINE_ADOPTED,
+    TEXTURE_QUARANTINE_REJECTED, TEXTURE_SNAPSHOT_COUNT,
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
 use super::super::WrittenRegion;
@@ -1056,7 +1057,7 @@ fn contiguous_texture_snapshot_and_writeback_retain_direct_mapping_semantics() {
 
     let linear = vec![0x3c; 64 * 64 * 4];
     let generations = watch.generations();
-    write_watched_guest_texture_linear(descriptor, &linear, &watch)
+    write_watched_guest_texture_linear(descriptor, &linear, None, &watch)
         .expect("guarded direct writeback");
     assert_eq!(watch.generations(), generations);
     assert!(!watch.is_dirty());
@@ -2157,6 +2158,100 @@ fn resident_pressure_eviction_retiles_gpu_pixels_before_removal() {
 }
 
 #[test]
+fn resident_writeback_publishes_only_the_bytes_the_gpu_authored() {
+    use metal::MTLScissorRect;
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+    use std::ffi::c_void;
+
+    // Mode-27 tiles are 64 KiB, 128x128 texels at four bytes each, so a 256x256 surface is a
+    // 2x2 block grid and a write of its top half authors exactly the first block row.
+    const SURFACE_BYTES: usize = 256 * 256 * 4;
+    const AUTHORED_BYTES: usize = 2 * 65_536;
+    let allocation_size = SURFACE_BYTES as u64 + GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(4 * allocation_size).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+    let mapping = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            allocation_size,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("resident mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: mapping.get(),
+        width: 256,
+        height: 256,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let guest_pattern = (0..SURFACE_BYTES).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+    memory
+        .write(mapping, &guest_pattern)
+        .expect("seed the guest allocation");
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let texture = presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("resident texture")
+        .texture;
+    let rendered = vec![0xa5_u8; SURFACE_BYTES];
+    texture.replace_region(
+        MTLRegion::new_2d(0, 0, 256, 256),
+        0,
+        rendered.as_ptr().cast::<c_void>(),
+        256 * 4,
+    );
+    presenter.mark_resident_texture_written_at(
+        descriptor,
+        ResourceSpan::for_texture(descriptor),
+        None,
+        WrittenRegion {
+            rect: Some(MTLScissorRect {
+                x: 0,
+                y: 0,
+                width: 256,
+                height: 128,
+            }),
+            ..WrittenRegion::whole_resource()
+        },
+        ResidentTextureActivityStamp { work: 10, flip: 1 },
+    );
+    assert_eq!(
+        presenter.resident_guest_textures[&descriptor]
+            .gpu_authored
+            .byte_count(),
+        AUTHORED_BYTES as u64
+    );
+
+    let (count, _) = presenter
+        .garbage_collect_resident_textures_to_budget(0, 2, 8)
+        .expect("pressure writeback");
+    assert_eq!(count, 1);
+
+    let published = snapshot_guest_texture_raw(descriptor).expect("published guest bytes");
+    assert_eq!(
+        &published[AUTHORED_BYTES..],
+        &guest_pattern[AUTHORED_BYTES..],
+        "bytes outside the written region must keep whatever guest memory held"
+    );
+    assert!(
+        published[..AUTHORED_BYTES] != guest_pattern[..AUTHORED_BYTES]
+            && published[..AUTHORED_BYTES].iter().all(|&byte| byte == 0xa5),
+        "the written region must carry the rendered pixels"
+    );
+}
+
+#[test]
 fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -2303,13 +2398,390 @@ fn clean_overlapping_render_views_coexist_until_one_is_written() {
     assert!(presenter.resident_guest_textures.contains_key(&second));
 
     presenter.mark_resident_texture_written(second);
-    assert!(!presenter.resident_guest_textures.contains_key(&first));
+    // `second` reinterprets every byte `first` declares, so `first` loses all of them. It is
+    // demoted in place rather than destroyed: the allocation, its watch and its fingerprints
+    // survive, and it stops serving reads.
+    assert!(presenter.resident_guest_textures.contains_key(&first));
+    assert!(matches!(
+        presenter.resident_guest_textures[&first].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == second
+    ));
+    assert!(presenter.resident_guest_textures[&first].owned.is_empty());
+    assert!(!presenter.resident_guest_textures[&first].serves_reads());
+    assert!(presenter.resident_guest_textures[&second].gpu_written());
+}
+
+#[test]
+fn a_disjoint_tenant_survives_an_overlapping_neighbours_write() {
+    use metal::MTLScissorRect;
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    // A pooled parent's declared range contains its neighbour, so the descriptor-overlap rule
+    // this replaces destroyed the neighbour on every write. The write itself covers only the
+    // parent's top block row, which is a range the neighbour does not own a byte of.
+    const SURFACE_BYTES: u64 = 256 * 256 * 4;
+    let allocation_size = SURFACE_BYTES + GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(4 * allocation_size).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            allocation_size,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let parent = GuestTextureDescriptor {
+        address,
+        width: 256,
+        height: 256,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let tenant = GuestTextureDescriptor {
+        address: address + SURFACE_BYTES / 2,
+        height: 128,
+        ..parent
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, parent)
+        .expect("pooled parent");
+    let survivor = presenter
+        .ensure_resident_texture(&device, tenant)
+        .expect("contained tenant")
+        .texture;
+    let owned_before = presenter.resident_guest_textures[&tenant].owned.clone();
     assert!(
-        presenter
-            .resident_guest_textures
-            .get(&second)
-            .is_some_and(|resident| resident.gpu_written())
+        guest_texture_descriptors_overlap(parent, tenant),
+        "the two declared ranges really do overlap"
     );
+
+    presenter.mark_resident_texture_written_at(
+        parent,
+        ResourceSpan::for_texture(parent),
+        None,
+        WrittenRegion {
+            rect: Some(MTLScissorRect {
+                x: 0,
+                y: 0,
+                width: 256,
+                height: 128,
+            }),
+            ..WrittenRegion::whole_resource()
+        },
+        ResidentTextureActivityStamp { work: 10, flip: 1 },
+    );
+
+    let neighbour = &presenter.resident_guest_textures[&tenant];
+    assert!(neighbour.is_live(), "a disjoint tenant is not superseded");
+    assert!(neighbour.serves_reads());
+    assert_eq!(neighbour.owned, owned_before, "no byte changed hands");
+    assert!(!neighbour.gpu_written());
+    assert!(
+        std::ptr::eq(survivor.as_ref(), neighbour.texture.as_ref()),
+        "the survivor keeps its Metal allocation"
+    );
+    // Re-ensuring it must be a reuse, not a rebuild.
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let reused = presenter
+        .ensure_resident_texture(&device, tenant)
+        .expect("surviving tenant serves the next bind")
+        .texture;
+    assert!(std::ptr::eq(survivor.as_ref(), reused.as_ref()));
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before
+    );
+}
+
+#[test]
+fn a_contained_tenant_is_demoted_and_rebuilds_from_guest_memory() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let parent = GuestTextureDescriptor {
+        address,
+        width: 32,
+        height: 32,
+        pitch: 32,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let tenant = GuestTextureDescriptor {
+        address: address + 1024,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        ..parent
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, parent)
+        .expect("pooled parent");
+    let tenant_texture = presenter
+        .ensure_resident_texture(&device, tenant)
+        .expect("contained tenant")
+        .texture;
+
+    presenter.mark_resident_texture_written(parent);
+
+    let demoted = &presenter.resident_guest_textures[&tenant];
+    assert!(matches!(
+        demoted.state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == parent
+    ));
+    assert!(demoted.owned.is_empty() && !demoted.gpu_written());
+    assert!(
+        std::ptr::eq(tenant_texture.as_ref(), demoted.texture.as_ref()),
+        "demotion keeps the Metal allocation in place"
+    );
+
+    // A read bind of a demoted resident rebuilds it from guest RAM: the superseding allocation is
+    // authoritative for the overlapping bytes and has not published them, so RAM is the only
+    // answer available until PR3 re-materialises on the GPU.
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let rebuilt = presenter
+        .ensure_resident_texture(&device, tenant)
+        .expect("demoted tenant rebuilds")
+        .texture;
+    assert!(!std::ptr::eq(tenant_texture.as_ref(), rebuilt.as_ref()));
+    assert!(TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed) > snapshots_before);
+    assert!(presenter.resident_guest_textures[&tenant].serves_reads());
+}
+
+#[test]
+fn a_discarded_bind_reclaims_a_demoted_target_without_a_rebuild() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let parent = GuestTextureDescriptor {
+        address,
+        width: 32,
+        height: 32,
+        pitch: 32,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let tenant = GuestTextureDescriptor {
+        address: address + 1024,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        ..parent
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, parent)
+        .expect("pooled parent");
+    let tenant_texture = presenter
+        .ensure_resident_texture(&device, tenant)
+        .expect("contained tenant")
+        .texture;
+    presenter.mark_resident_texture_written(parent);
+    assert!(!presenter.resident_guest_textures[&tenant].is_live());
+
+    // This is the transient-allocator re-bind: a fresh target with a clear. It must cost one
+    // state flip — no snapshot, no rebuild, no new allocation.
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let reclaimed = presenter
+        .ensure_resident_texture_with_initial_contents(
+            &device,
+            tenant,
+            ResourceSpan::for_texture(tenant),
+            false,
+        )
+        .expect("discarded re-bind")
+        .texture;
+    assert!(std::ptr::eq(tenant_texture.as_ref(), reclaimed.as_ref()));
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before
+    );
+    assert!(presenter.resident_guest_textures[&tenant].is_live());
+    assert!(
+        !presenter.resident_guest_textures[&tenant].serves_reads(),
+        "an owner-less Live target is legal only until the mark that follows it"
+    );
+
+    presenter.mark_resident_texture_written(tenant);
+    assert!(presenter.resident_guest_textures[&tenant].serves_reads());
+    assert!(presenter.resident_guest_textures[&tenant].gpu_written());
+    // Authority is exclusive: the parent gave those bytes back.
+    assert!(
+        !presenter.resident_guest_textures[&parent]
+            .owned
+            .intersects(&presenter.resident_guest_textures[&tenant].owned)
+    );
+}
+
+#[test]
+fn a_partially_superseded_tenant_stays_live_but_stops_serving_reads() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    // The tenant spans 2 KiB from `address`; the writer covers only its first kilobyte.
+    let tenant = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 32,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let writer = GuestTextureDescriptor {
+        height: 16,
+        ..tenant
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, tenant)
+        .expect("tenant");
+    let owned_before = presenter.resident_guest_textures[&tenant]
+        .owned
+        .byte_count();
+    presenter
+        .ensure_resident_texture(&device, writer)
+        .expect("writer");
+
+    presenter.mark_resident_texture_written(writer);
+
+    let tenant_resident = &presenter.resident_guest_textures[&tenant];
+    assert!(tenant_resident.is_live(), "half its bytes are still its own");
+    assert!(!tenant_resident.serves_reads());
+    assert_eq!(tenant_resident.owned.byte_count(), owned_before / 2);
+}
+
+#[test]
+fn writes_across_overlapping_descriptors_keep_owned_sets_disjoint() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let base = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let descriptors = [0_u64, 512, 1024, 1536, 2048]
+        .map(|offset| GuestTextureDescriptor {
+            address: address + offset,
+            ..base
+        });
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    for descriptor in descriptors {
+        presenter
+            .ensure_resident_texture(&device, descriptor)
+            .expect("overlapping resident");
+    }
+    // Creation hands every resident its whole declared range, so the claims start overlapping;
+    // one write each is what establishes exclusivity, and no later interleaving may break it.
+    for index in [3_usize, 0, 4, 1, 2, 0, 3, 2, 4] {
+        presenter.mark_resident_texture_written(descriptors[index]);
+        if index == 2 {
+            for (left, right) in descriptors.iter().enumerate().flat_map(|(left, descriptor)| {
+                descriptors[left + 1..]
+                    .iter()
+                    .map(move |other| (*descriptor, *other))
+            }) {
+                assert!(
+                    !presenter.resident_guest_textures[&left]
+                        .owned
+                        .intersects(&presenter.resident_guest_textures[&right].owned),
+                    "exactly one allocation may answer for any guest byte"
+                );
+            }
+        }
+    }
 }
 
 #[test]

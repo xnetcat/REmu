@@ -9,7 +9,7 @@ use super::{
     diagnostic_scanout_writer, diagnostic_texture_writer, raw_video_out_texture_descriptor,
     read_texture_linear, refresh_resident_texture_write_watch,
     retire_multisample_textures_overlapping_writeback,
-    retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
+    retire_sampled_textures_overlapping_writeback,
     snapshot_guest_texture_raw, trace_resident_texture_removal, trace_scanout_writes,
     write_resident_texture_contents_to_guest,
 };
@@ -315,7 +315,11 @@ impl MetalPresenter {
         let descriptor = self
             .resident_guest_textures
             .values()
-            .filter(|resident| resident.descriptor.address == address && resident.gpu_written())
+            .filter(|resident| {
+                resident.descriptor.address == address
+                    && resident.gpu_written()
+                    && resident.serves_reads()
+            })
             .filter(|resident| {
                 display.is_none_or(|display| {
                     resident.descriptor.width == display.width
@@ -364,27 +368,17 @@ impl MetalPresenter {
             }
             return Ok(());
         }
-        let (alias_ranges, content_version) = {
-            let resident = self
-                .resident_guest_textures
-                .get(&descriptor)
-                .expect("refreshed resident texture exists");
-            (
-                resident.write_watch.alias_ranges(),
-                resident.content_version,
-            )
-        };
+        let alias_ranges = self
+            .resident_guest_textures
+            .get(&descriptor)
+            .expect("refreshed resident texture exists")
+            .write_watch
+            .alias_ranges();
         retire_sampled_textures_overlapping_writeback(
             &mut self.sampled_texture_cache,
             &alias_ranges,
         );
-        retire_resident_textures_overlapping_writeback(
-            &mut self.resident_guest_textures,
-            &mut self.retired_texture_quarantine,
-            &alias_ranges,
-            descriptor,
-            content_version,
-        );
+        self.note_resident_writeback_published(descriptor);
         retire_multisample_textures_overlapping_writeback(
             &mut self.multisample_textures,
             &alias_ranges,
@@ -412,7 +406,8 @@ impl MetalPresenter {
             .resident_guest_textures
             .values()
             .filter(|resident| {
-                resident.descriptor.address == address
+                resident.serves_reads()
+                    && resident.descriptor.address == address
                     && resident.descriptor.width == width
                     && resident.descriptor.height == height
             })

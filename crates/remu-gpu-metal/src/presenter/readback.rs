@@ -54,10 +54,12 @@ impl MetalPresenter {
                 self.resident_guest_textures
                     .overlapping(&span, SpanQueryOrder::ResidentFirst)
                     .into_iter()
+                    .filter_map(|alias| self.resident_guest_textures.get(&alias))
+                    .filter(|resident| resident.serves_reads())
                     .any(|resident| {
-                        resident.address == address
-                            && resident.width == width
-                            && resident.height == height
+                        resident.descriptor.address == address
+                            && resident.descriptor.width == width
+                            && resident.descriptor.height == height
                     })
             })
         };
@@ -89,6 +91,7 @@ impl MetalPresenter {
             .or_else(|| {
                 self.resident_guest_textures
                     .get(&target.texture)
+                    .filter(|resident| resident.serves_reads())
                     .map(|resident| resident.texture.clone())
             })
     }
@@ -871,11 +874,10 @@ pub(super) fn read_texture_array_linear(
 
 /// Suppresses every resident-texture writeback into guest memory.
 ///
-/// A writeback republishes a host-captured span whose guest tenancy may have changed since
-/// capture — `free()` never touches a mapping, so no liveness check can see the change. This
-/// switch exists to attribute guest heap corruption: with it set, GPU-authored pixels never
-/// reach guest RAM (so readback-dependent rendering degrades), and a run that stops crashing
-/// names this family as the writer.
+/// A writeback republishes host-captured bytes into a guest range whose tenancy may have
+/// changed since capture — `free()` never touches a mapping, so no liveness check can see the
+/// change. Bounding publication to `gpu_authored` removes most of that exposure; this switch
+/// removes all of it, so a soak can still attribute any residual corruption to this family.
 fn texture_writeback_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
@@ -883,6 +885,11 @@ fn texture_writeback_disabled() -> bool {
     })
 }
 
+/// Publishes a resident's Metal pixels back into the guest bytes it owes them for.
+///
+/// Only `gpu_authored` is published: everything else in the declared range is either padding the
+/// GPU never wrote or bytes another allocation — or the guest heap, once the render target was
+/// freed — answers for, and a whole-span read-modify-write republishes all of it.
 pub(super) fn write_resident_texture_contents_to_guest(
     device: &Device,
     queue: &metal::CommandQueue,
@@ -897,6 +904,10 @@ pub(super) fn write_resident_texture_contents_to_guest(
         }
         return Ok(());
     }
+    if !resident.gpu_written() {
+        return Ok(());
+    }
+    let authored = resident.gpu_authored_offsets();
     if resident.mip_level_count == 1 {
         match resident.texture.texture_type() {
             MTLTextureType::D2 => {
@@ -905,6 +916,7 @@ pub(super) fn write_resident_texture_contents_to_guest(
                 return write_watched_guest_texture_linear(
                     resident.descriptor,
                     &linear,
+                    authored.as_deref(),
                     &resident.write_watch,
                 );
             }
@@ -915,7 +927,11 @@ pub(super) fn write_resident_texture_contents_to_guest(
                     &resident.texture,
                     resident.descriptor,
                 )?;
-                return write_layered_resident_texture_contents_to_guest(resident, &linear);
+                return write_layered_resident_texture_contents_to_guest(
+                    resident,
+                    &linear,
+                    authored.as_deref(),
+                );
             }
             MTLTextureType::D3 => {
                 let linear = read_texture_volume_linear(
@@ -924,7 +940,11 @@ pub(super) fn write_resident_texture_contents_to_guest(
                     &resident.texture,
                     resident.descriptor,
                 )?;
-                return write_layered_resident_texture_contents_to_guest(resident, &linear);
+                return write_layered_resident_texture_contents_to_guest(
+                    resident,
+                    &linear,
+                    authored.as_deref(),
+                );
             }
             texture_type => {
                 return Err(format!(
@@ -962,6 +982,7 @@ pub(super) fn write_resident_texture_contents_to_guest(
     write_watched_guest_range(
         resident.descriptor.address,
         &raw,
+        authored.as_deref(),
         &resident.write_watch,
         Some(&entry_generations),
     )
@@ -970,6 +991,7 @@ pub(super) fn write_resident_texture_contents_to_guest(
 fn write_layered_resident_texture_contents_to_guest(
     resident: &ResidentGuestTexture,
     linear: &[u8],
+    authored: Option<&[(u64, u64)]>,
 ) -> Result<(), String> {
     let face_raw_bytes = usize::try_from(
         super::guest_texture_byte_count(resident.descriptor)
@@ -1014,6 +1036,7 @@ fn write_layered_resident_texture_contents_to_guest(
     write_watched_guest_range(
         resident.descriptor.address,
         &raw,
+        authored,
         &resident.write_watch,
         Some(&entry_generations),
     )

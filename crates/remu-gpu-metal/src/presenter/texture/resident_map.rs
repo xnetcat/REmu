@@ -86,6 +86,15 @@ impl ResidentTextureMap {
     }
 }
 
+#[cfg(test)]
+impl std::ops::Index<&GuestTextureDescriptor> for ResidentTextureMap {
+    type Output = ResidentGuestTexture;
+
+    fn index(&self, descriptor: &GuestTextureDescriptor) -> &Self::Output {
+        &self.textures[descriptor]
+    }
+}
+
 /// Which operand the overlap predicate's asymmetric registry fallback resolves first.
 ///
 /// The fallback walks the aliases of its *left* operand's backing, so it can answer true for

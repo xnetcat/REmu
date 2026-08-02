@@ -68,9 +68,12 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             WriteWatchRefresh::Active
             | WriteWatchRefresh::Reprotecting
             | WriteWatchRefresh::Renewed { .. } => {
-                return resident_texture_for_sample(resident, descriptor).ok_or_else(|| {
-                    "resident mip hierarchy cannot represent storage view".to_owned()
-                });
+                // A storage image is read as well as written, so a superseded hierarchy rebuilds.
+                if resident.reclaim_for_bind(false) {
+                    return resident_texture_for_sample(resident, descriptor).ok_or_else(|| {
+                        "resident mip hierarchy cannot represent storage view".to_owned()
+                    });
+                }
             }
             WriteWatchRefresh::Replaced => {}
         }
@@ -87,7 +90,8 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     let clean_promotion = resident_guest_textures
         .get(&descriptor.guest)
         .is_some_and(|resident| {
-            resident.texture_type == 9
+            resident.is_live()
+                && resident.texture_type == 9
                 && resident.layer_count == 1
                 && resident.mip_level_count < underlying_mip_count
         });

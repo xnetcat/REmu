@@ -18,7 +18,7 @@ use metal::{
 use remu_gpu::{
     ComputeDispatch, GpuEvent, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite, IndexedDraw,
 };
-use remu_memory::{CpuWriteWatch, GuestSharedMappingIdentity};
+use remu_memory::{CpuWriteWatch, CpuWriteWatchRetirement, GuestSharedMappingIdentity};
 mod cache;
 mod completion;
 mod decode;
@@ -153,8 +153,9 @@ use self::shader::{
 use self::stats::process_resident_bytes;
 use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
-    MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, OWNED_FALLBACK_FULL_RANGE,
-    OWNED_RANGE_SET_COARSENED, OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED,
+    MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE,
+    OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD, OWNED_SUBTRACT_TENANTS_SURVIVED,
+    OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WRITE_ATTRIBUTION_MISSES,
@@ -186,8 +187,7 @@ use self::texture::{
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_declared_span, resident_depth_sample_is_eligible, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
-    retire_multisample_textures_overlapping_writeback,
-    retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
+    retire_multisample_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
     snapshot_watched_guest_range, storage_image_requires_mip_hierarchy,
     ResidentTextureMap, SpanQueryOrder, trace_resident_texture_removal, upload_image_textures,
@@ -1018,16 +1018,12 @@ struct ResidentGuestTexture {
 /// Whether an allocation still answers for any of its guest bytes, and where they went if not.
 ///
 /// The field has no `Default` on purpose: every construction site must name it.
-// `Stale` is only reachable once the subtraction that empties an `owned` set is live; until then
-// every resident is constructed `Live` and nothing demotes.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResidencyState {
     Live,
     Stale(StaleSource),
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaleSource {
     /// Another resident wrote every byte, and its texels are recoverable on the GPU.
@@ -1091,7 +1087,63 @@ impl ResidentGuestTexture {
 
     /// True while any guest byte's current value exists only in Metal.
     fn gpu_written(&self) -> bool {
+        debug_assert!(
+            self.is_live() || self.gpu_authored.is_empty(),
+            "a demoted allocation answers for no byte and can owe none"
+        );
         !self.gpu_authored.is_empty()
+    }
+
+    fn is_live(&self) -> bool {
+        matches!(self.state, ResidencyState::Live)
+    }
+
+    /// True when this allocation can serve a read of its whole declared range.
+    ///
+    /// Coverage must be total: a partially superseded tenant holds a mixture of current and
+    /// superseded texels, and no read path can bind part of a Metal texture.
+    fn serves_reads(&self) -> bool {
+        self.is_live() && self.span.is_none_or(|span| self.owned.covers(&span))
+    }
+
+    /// Gives up `taken`, demoting to `source` when the last owned byte goes with it.
+    fn subtract_authority(&mut self, taken: &RangeSet, source: StaleSource) {
+        self.owned.subtract(taken);
+        // A byte another allocation answers for can never be published from here.
+        self.gpu_authored.subtract(taken);
+        if self.owned.is_empty() {
+            self.demote(source);
+        }
+    }
+
+    /// Stops answering for any byte, in place: the Metal allocation, the write watch, its
+    /// `mprotect` state and its fingerprint baseline all survive.
+    fn demote(&mut self, source: StaleSource) {
+        debug_assert!(
+            self.write_watch.retirement() != Some(CpuWriteWatchRetirement::Replaced),
+            "a replaced mapping proves nothing about its bytes and must be removed, not demoted"
+        );
+        self.owned = RangeSet::default();
+        self.gpu_authored = RangeSet::default();
+        self.state = ResidencyState::Stale(source);
+        OWNED_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Prepares a possibly demoted allocation for a bind, reporting whether it may serve it.
+    ///
+    /// A discarded target has every texel overwritten before one is read, so it needs no bytes —
+    /// only the shape, the live watch and its fingerprints. `owned` stays empty until the mark
+    /// that follows, which is the one window in which a `Live` resident owns nothing.
+    fn reclaim_for_bind(&mut self, discard_guest_contents: bool) -> bool {
+        if self.serves_reads() {
+            return true;
+        }
+        if !discard_guest_contents {
+            return false;
+        }
+        self.state = ResidencyState::Live;
+        OWNED_RECLAIM_DISCARD.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     #[cfg(test)]
@@ -1114,6 +1166,23 @@ impl ResidentGuestTexture {
                 .is_none_or(|span| RangeSet::for_span(&span).contains_all(&self.owned)),
             "a resident may only claim bytes inside its own declared span"
         );
+    }
+
+    /// The publication debt as byte offsets from this resident's declared base address.
+    ///
+    /// `None` means the debt cannot be expressed in that space and the caller must publish the
+    /// whole declared range, which is what every writeback did before the algebra existed.
+    fn gpu_authored_offsets(&self) -> Option<Vec<(u64, u64)>> {
+        let base = self.span?.range_start();
+        Some(
+            self.gpu_authored
+                .runs()
+                .iter()
+                .filter_map(|&(start, end)| {
+                    Some((start.checked_sub(base)?, end.checked_sub(base)?))
+                })
+                .collect(),
+        )
     }
 
     /// Drops the publication debt after guest RAM was made to agree with Metal.
