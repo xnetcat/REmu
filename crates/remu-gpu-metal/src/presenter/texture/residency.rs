@@ -4,7 +4,8 @@
 use super::super::completion::commit_and_settle;
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::{
-    FlushPolicy, GuestBatchFlushReason, WritebackTrigger, compile_metal_compute_library,
+    FlushPolicy, GuestBatchFlushReason, SharedEventWriteKind, WritebackTrigger,
+    compile_metal_compute_library,
 };
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
@@ -774,6 +775,12 @@ impl MetalPresenter {
             &target_subresources,
         );
         upload.end_encoding();
+        self.active_open_guest_batch_mut()
+            .expect("rematerialisation batch remains open")
+            .record_resident_write_footprint(
+                SharedEventWriteKind::InternalResidentDestination,
+                Some(target_span),
+            );
         Ok(destination)
     }
 }
@@ -1279,6 +1286,12 @@ impl MetalPresenter {
                 MTLOrigin { x: 0, y: 0, z: 0 },
             );
             blit.end_encoding();
+            self.active_open_guest_batch_mut()
+                .expect("rematerialisation batch remains open")
+                .record_resident_write_footprint(
+                    SharedEventWriteKind::InternalResidentDestination,
+                    Some(target_span),
+                );
         }
 
         // The transfer becomes visible to the residency algebra only after view creation or blit
@@ -1464,6 +1477,12 @@ impl MetalPresenter {
                 )?;
                 self.resident_guest_textures
                     .insert(descriptor.guest, promoted);
+                self.active_open_guest_batch_mut()
+                    .expect("mip-promotion batch remains open")
+                    .record_resident_write_footprint(
+                        SharedEventWriteKind::InternalResidentDestination,
+                        descriptor.span,
+                    );
                 return resident_texture_for_sample(
                     self.resident_guest_textures
                         .get_mut(&descriptor.guest)
@@ -1497,13 +1516,22 @@ impl MetalPresenter {
         } else {
             None
         };
-        super::ensure_mipmapped_resident_texture_in_map(
+        let texture = super::ensure_mipmapped_resident_texture_in_map(
             device,
             promotion_command_buffer.as_deref(),
             descriptor,
             &mut self.resident_guest_textures,
             Mode27WorkOrigin::StorageCreate,
-        )
+        )?;
+        if promotion_command_buffer.is_some() {
+            self.active_open_guest_batch_mut()
+                .expect("mip-promotion batch remains open")
+                .record_resident_write_footprint(
+                    SharedEventWriteKind::InternalResidentDestination,
+                    descriptor.span,
+                );
+        }
+        Ok(texture)
     }
 
     /// Ensures a resident for a descriptor no decoded structure carries a span for.
@@ -1820,6 +1848,12 @@ impl MetalPresenter {
             let texture = promoted.texture.clone();
             self.resident_guest_textures
                 .insert(target.texture, promoted);
+            self.active_open_guest_batch_mut()
+                .expect("mip-promotion batch remains open")
+                .record_resident_write_footprint(
+                    SharedEventWriteKind::InternalResidentDestination,
+                    target.span,
+                );
             return Ok(SelectedResidentTexture {
                 texture,
                 descriptor: target.texture,
@@ -2481,6 +2515,7 @@ impl MetalPresenter {
             // caller did not carry its key here. Ownership and content version are now lost.
             RESIDENT_WRITE_ATTRIBUTION_MISSES.fetch_add(1, Ordering::Relaxed);
         }
+        let mut footprint_span = None;
         if let Some(writer) = resident_descriptor {
             let (written, writer_span) = {
                 let resident = self
@@ -2508,6 +2543,7 @@ impl MetalPresenter {
                     ),
                 }
             };
+            footprint_span = writer_span;
             {
                 let resident = self
                     .resident_guest_textures
@@ -2534,6 +2570,12 @@ impl MetalPresenter {
                     "gpu-write-supersedes-alias",
                 );
             }
+        }
+        if let Some(batch) = self.active_open_guest_batch_mut() {
+            batch.record_resident_write_footprint(
+                SharedEventWriteKind::ResidentDestination,
+                footprint_span,
+            );
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, span);
     }

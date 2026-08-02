@@ -29,8 +29,9 @@ use super::super::submission::{
     collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, SHARED_HOST_KIND_ACQUIRE,
-    SHARED_HOST_KIND_WAIT, SharedEventSignalCheckpoint, UploadedGlobalBuffer,
+    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PhysicalFootprintRange,
+    PendingGuestWriteRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_WAIT,
+    SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -39,8 +40,8 @@ use super::{
     MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OpenGuestRenderPass, OrderedEventPoll,
     OrderedEventSource, OrderedGpuEventReceiver, PendingFlip, PendingGlobalWriteback,
     PendingGuestMemoryWrite, PipelineCompileCandidate, ProgramIdentity, QueueBlockReason,
-    apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write, read_texture_linear,
-    write_back_pending_globals,
+    ResourceSpan, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
+    read_texture_linear, write_back_pending_globals,
 };
 
 fn enable_per_queue_batches(presenter: &mut MetalPresenter) {
@@ -86,6 +87,8 @@ fn committed_per_queue_test_batch(
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes,
+            resident_write_footprint: Vec::new(),
+            resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
             max_encoded_signal: None,
@@ -474,6 +477,8 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: Some(OpenGuestRenderPass {
             key: GuestRenderPassKey {
                 targets: Vec::new(),
@@ -692,6 +697,8 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: Some(OpenGuestRenderPass {
             key: GuestRenderPassKey {
                 targets: Vec::new(),
@@ -754,6 +761,8 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
         max_encoded_signal: None,
@@ -1605,6 +1614,8 @@ fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
         max_encoded_signal: None,
@@ -1795,6 +1806,8 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
                 global_writebacks: Vec::new(),
                 guest_write_ranges: Vec::new(),
                 memory_writes,
+                resident_write_footprint: Vec::new(),
+                resident_write_footprint_complete: true,
                 render_pass: None,
                 compute_encoder: None,
                 max_encoded_signal: None,
@@ -1853,6 +1866,8 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
                 }))
                 .expect("pin completion label mapping"),
             ],
+            resident_write_footprint: Vec::new(),
+            resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
             max_encoded_signal: None,
@@ -1915,6 +1930,8 @@ fn fill_committed_guest_batch_budget(
                 global_writebacks: Vec::new(),
                 guest_write_ranges: Vec::new(),
                 memory_writes,
+                resident_write_footprint: Vec::new(),
+                resident_write_footprint_complete: true,
                 render_pass: None,
                 compute_encoder: None,
                 max_encoded_signal: None,
@@ -2044,6 +2061,8 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
         max_encoded_signal: None,
@@ -2199,6 +2218,8 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             ],
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),
+            resident_write_footprint: Vec::new(),
+            resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
             max_encoded_signal: None,
@@ -2226,6 +2247,8 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                 }))
                 .expect("pin later completion label"),
             ],
+            resident_write_footprint: Vec::new(),
+            resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
             max_encoded_signal: None,
@@ -4352,13 +4375,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         .shared_event_timeline
         .allocate_fence()
         .expect("producer fence");
-    let checkpoint = SharedEventSignalCheckpoint::capture(
-        producer
-            .open_batch
-            .as_ref()
-            .expect("producer batch remains open"),
-        fence,
-    );
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(producer, fence);
     producer
         .open_batch
         .as_mut()
@@ -4546,6 +4563,22 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
         presenter.guest_queue_batches[&41].open_batch.is_some(),
         "a release-only producer still needs a queue-local signal batch"
     );
+    let checkpoint = presenter.guest_queue_batches[&41]
+        .open_batch
+        .as_ref()
+        .expect("release producer remains open")
+        .signal_checkpoints
+        .last()
+        .expect("release producer retained its signal checkpoint");
+    assert!(checkpoint.footprint_complete);
+    assert!(
+        checkpoint.pending_write_footprint.iter().any(|range| {
+            range.kind == SharedEventWriteKind::TerminalGuestWrite
+                && range.guest_address == label
+                && range.byte_count == 4
+        }),
+        "the exact release label must be captured before the signal checkpoint is frozen"
+    );
     assert_eq!(
         read_test_label(label),
         0,
@@ -4591,6 +4624,262 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
         "retired fence ranges are pruned after the last wait/resource reference"
     );
     remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn shared_event_checkpoint_includes_earlier_unretired_queue_writes() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest footprint address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest footprint backing");
+    let address = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest footprint mapping")
+        .get();
+
+    open_per_queue_batch(&mut presenter, 41);
+    presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists")
+        .open_batch
+        .as_mut()
+        .expect("producer batch is open")
+        .record_resident_write_footprint(
+            SharedEventWriteKind::ResidentDestination,
+            Some(ResourceSpan::new(address + 64, 128)),
+        );
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("earlier producer batch commits");
+    assert_eq!(presenter.guest_queue_batches[&41].committed_batches.len(), 1);
+
+    open_per_queue_batch(&mut presenter, 41);
+    let state = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue remains live");
+    let fence = state
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("release-only fence");
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+    let identity = guest_shared_backing_identity(address + 64, 128)
+        .expect("earlier producer has physical identity");
+    assert!(checkpoint.footprint_complete);
+    assert!(checkpoint.pending_write_footprint.iter().any(|range| {
+        range.kind == SharedEventWriteKind::ResidentDestination
+            && range.mapping == identity
+            && range.byte_count == 128
+    }));
+}
+
+#[test]
+fn shared_event_checkpoint_collects_resident_global_and_terminal_writes() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let (_address_space, address) = mapped_test_label();
+    let buffer = device.new_buffer(256, MTLResourceOptions::StorageModeShared);
+    let copied_identity = guest_shared_backing_identity(address, 32)
+        .expect("copied global physical identity");
+    let zero_copy_identity = guest_shared_backing_identity(address + 64, 32)
+        .expect("zero-copy global physical identity");
+
+    open_per_queue_batch(&mut presenter, 41);
+    let state = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists");
+    let batch = state.open_batch.as_mut().expect("producer batch is open");
+    batch.global_writebacks.push(PendingGlobalWriteback {
+        buffer: buffer.clone(),
+        offset: 0,
+        guest_address: address,
+        byte_count: 32,
+        mapping_identity: Some(copied_identity),
+        write_watch: None,
+        original_bytes: vec![0; 32],
+    });
+    batch.guest_write_ranges.push(PendingGuestWriteRange {
+        address: address + 64,
+        byte_count: 32,
+        buffer,
+        offset: 64,
+        physical_identity: zero_copy_identity,
+    });
+    batch.memory_writes.push(
+        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+            address: address + 128,
+            value: GpuMemoryReleaseValue::Immediate32(7),
+        }))
+        .expect("terminal label mapping is pinned"),
+    );
+    batch.record_resident_write_footprint(
+        SharedEventWriteKind::ResidentDestination,
+        Some(ResourceSpan::new(address + 192, 32)),
+    );
+    let fence = state
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("producer fence");
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+    assert!(checkpoint.footprint_complete);
+    for kind in [
+        SharedEventWriteKind::ResidentDestination,
+        SharedEventWriteKind::CopiedGlobal,
+        SharedEventWriteKind::ZeroCopyGlobal,
+        SharedEventWriteKind::TerminalGuestWrite,
+    ] {
+        assert!(
+            checkpoint
+                .pending_write_footprint
+                .iter()
+                .any(|range| range.kind == kind),
+            "checkpoint omitted {kind:?}"
+        );
+    }
+}
+
+#[test]
+fn shared_event_footprints_compare_physical_aliases() {
+    let mut address_space =
+        GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest alias address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest alias backing");
+    let first = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(address_space.base()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("first physical alias")
+        .get();
+    let second = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(
+                address_space
+                    .base()
+                    .checked_add(2 * GUEST_PAGE_SIZE)
+                    .expect("second alias address"),
+            ),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("second physical alias")
+        .get();
+    let left = PhysicalFootprintRange::new(
+        SharedEventWriteKind::ResidentDestination,
+        first + 64,
+        128,
+        guest_shared_backing_identity(first + 64, 128),
+    )
+    .expect("first physical footprint");
+    let aliased = PhysicalFootprintRange::new(
+        SharedEventWriteKind::CopiedGlobal,
+        second + 96,
+        32,
+        guest_shared_backing_identity(second + 96, 32),
+    )
+    .expect("aliased physical footprint");
+    let disjoint = PhysicalFootprintRange::new(
+        SharedEventWriteKind::CopiedGlobal,
+        second + 256,
+        32,
+        guest_shared_backing_identity(second + 256, 32),
+    )
+    .expect("disjoint physical footprint");
+    assert_ne!(left.guest_address, aliased.guest_address);
+    assert!(left.overlaps(aliased));
+    assert!(!left.overlaps(disjoint));
+}
+
+#[test]
+fn unresolved_or_ambiguous_signal_writes_make_the_checkpoint_unsafe() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    open_per_queue_batch(&mut presenter, 41);
+
+    let state = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists");
+    state
+        .open_batch
+        .as_mut()
+        .expect("producer batch is open")
+        .record_resident_write_footprint(
+            SharedEventWriteKind::InternalResidentDestination,
+            None,
+        );
+    let fence = state
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("unresolved producer fence");
+    let unresolved = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+    assert!(!unresolved.footprint_complete);
+
+    let mut address_space =
+        GuestAddressSpace::new(3 * GUEST_PAGE_SIZE).expect("ambiguous footprint address space");
+    let first_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("first footprint backing");
+    let second_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("second footprint backing");
+    let base = address_space.base();
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &first_backing,
+            0,
+        )
+        .expect("first footprint mapping");
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(
+                base.checked_add(GUEST_PAGE_SIZE)
+                    .expect("second footprint address"),
+            ),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &second_backing,
+            0,
+        )
+        .expect("second footprint mapping");
+    let ambiguous_span = ResourceSpan::new(base.get() + GUEST_PAGE_SIZE as u64 - 16, 32);
+    assert!(ambiguous_span.backing().is_none());
+    let batch = state.open_batch.as_mut().expect("producer batch remains open");
+    batch.resident_write_footprint.clear();
+    batch.resident_write_footprint_complete = true;
+    batch.record_resident_write_footprint(
+        SharedEventWriteKind::InternalResidentDestination,
+        Some(ambiguous_span),
+    );
+    let fence = state
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("ambiguous producer fence");
+    let ambiguous = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+    assert!(!ambiguous.footprint_complete);
 }
 
 #[test]
