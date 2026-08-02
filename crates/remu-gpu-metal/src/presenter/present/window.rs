@@ -304,13 +304,14 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
             );
             eprintln!(
-                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s gpu-ordered-waits={:.0}/s gpu-ordered-compute={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
+                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s gpu-ordered-waits={:.0}/s gpu-ordered-compute={:.0}/s footprint-incomplete={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
                 f64::from(self.statistics.shared_event_signals) / seconds,
                 f64::from(self.statistics.shared_event_waits) / seconds,
                 f64::from(self.statistics.shared_event_host_blocks) / seconds,
                 f64::from(self.statistics.shared_event_host_wakes) / seconds,
                 f64::from(self.statistics.shared_event_gpu_ordered_registered_waits) / seconds,
                 f64::from(self.statistics.shared_event_gpu_ordered_compute_dispatches,) / seconds,
+                f64::from(self.statistics.shared_event_incomplete_signal_footprints) / seconds,
                 self.statistics.shared_event_error_advances,
                 f64::from(self.statistics.shared_event_fallbacks_no_exact_producer) / seconds,
                 self.statistics.shared_event_fallbacks_timeline_overflow,
@@ -978,6 +979,7 @@ impl MetalPresenter {
         self.statistics.shared_event_host_wakes = 0;
         self.statistics.shared_event_gpu_ordered_registered_waits = 0;
         self.statistics.shared_event_gpu_ordered_compute_dispatches = 0;
+        self.statistics.shared_event_incomplete_signal_footprints = 0;
         self.statistics.shared_event_error_advances = 0;
         self.statistics.shared_event_fallbacks_no_exact_producer = 0;
         self.statistics.shared_event_fallbacks_timeline_overflow = 0;
