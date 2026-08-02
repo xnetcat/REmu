@@ -100,11 +100,13 @@ pub(super) enum FaultReason {
     AddressConversion,
     LengthConversion,
     ProtectFailed,
+    IllegalInstruction,
 }
 
 impl FaultReason {
     const fn label(self) -> &'static [u8] {
         match self {
+            Self::IllegalInstruction => b"illegal-instruction",
             Self::NullAddress => b"null-address",
             Self::NoSnapshot => b"no-watch-snapshot",
             Self::Unwatched => b"outside-watched-memory",

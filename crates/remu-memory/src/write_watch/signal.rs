@@ -93,6 +93,15 @@ unsafe fn install_fault_handlers_once() -> Result<(), i32> {
         }
         return Err(error);
     }
+    // A guest that jumps into data, or a translated instruction Rosetta refuses, raises SIGILL
+    // or SIGTRAP rather than a protection fault. These can never be write faults, so the handler
+    // forwards them — but only after reporting the faulting pc and registers, which is the
+    // difference between an attributable failure and a process that vanishes with exit 132.
+    for signal in [libc::SIGILL, libc::SIGTRAP] {
+        // SAFETY: the action is valid; the previous disposition is deliberately not captured
+        // because these signals are always forwarded to the default handler after reporting.
+        unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) };
+    }
     Ok(())
 }
 
@@ -117,6 +126,39 @@ extern "C" fn write_fault_signal_handler(
             )
         }
     };
+    if signal == libc::SIGILL || signal == libc::SIGTRAP {
+        // Not a memory fault: si_addr carries the faulting instruction, not a data address, so
+        // the write-watch path would misclassify it. Report the machine state and forward.
+        // SAFETY: SA_SIGINFO supplies a live ucontext_t for the duration of this callback.
+        let (program_counter, registers) = unsafe { fault_machine_state(context) };
+        write_fault_diagnostic(
+            (
+                FaultReport {
+                    signal,
+                    code: fault_code,
+                    address: fault_address,
+                    program_counter,
+                    space: if contains_guest_address(program_counter) {
+                        FaultSpace::Guest
+                    } else {
+                        FaultSpace::Host
+                    },
+                },
+                registers,
+            ),
+            FaultReason::IllegalInstruction,
+        );
+        ACTIVE_HANDLERS.fetch_sub(1, Ordering::SeqCst);
+        // Restore the default disposition and return: the instruction re-executes, re-faults,
+        // and the process dies with the true signal and an intact crash report.
+        // SAFETY: a zeroed sigaction with SIG_DFL is valid for these signals.
+        unsafe {
+            let mut default_action = std::mem::zeroed::<libc::sigaction>();
+            default_action.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(signal, &raw const default_action, std::ptr::null_mut());
+        }
+        return;
+    }
     let handled = try_handle_write_fault(fault_address, || {
         // SAFETY: SA_SIGINFO supplies a live ucontext_t for the duration of this callback.
         let (program_counter, registers) = unsafe { fault_machine_state(context) };
