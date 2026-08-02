@@ -314,6 +314,7 @@ impl MetalPresenter {
                     resident,
                     Mode27WorkOrigin::StorageCreate,
                 )?;
+                self.retired_texture_quarantine.remove(&descriptor.guest);
                 self.resident_guest_textures
                     .insert(descriptor.guest, promoted);
                 return resident_texture_for_sample(
@@ -691,6 +692,7 @@ impl MetalPresenter {
             "REMu {}-level guest image {:#x}",
             target.mip_level_count, target.texture.address
         ));
+        self.retired_texture_quarantine.remove(&target.texture);
         self.resident_guest_textures.insert(
             target.texture,
             ResidentGuestTexture {
@@ -790,6 +792,7 @@ impl MetalPresenter {
             "REMu {}-layer guest volume {:#x}",
             target.layer_count, target.texture.address
         ));
+        self.retired_texture_quarantine.remove(&target.texture);
         self.resident_guest_textures.insert(
             target.texture,
             ResidentGuestTexture {
@@ -1031,6 +1034,7 @@ impl MetalPresenter {
             "REMu {}-layer guest depth image {:#x}",
             depth.layer_count, depth.texture.address
         ));
+        self.retired_texture_quarantine.remove(&depth.texture);
         self.resident_guest_textures.insert(
             depth.texture,
             ResidentGuestTexture {
@@ -1408,6 +1412,7 @@ pub(crate) fn ensure_resident_texture_in_map(
         create_uninitialized_guest_texture(device, descriptor, usage)?
     };
     texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));
+    retired_texture_quarantine.remove(&descriptor);
     resident_guest_textures.insert(
         descriptor,
         ResidentGuestTexture {

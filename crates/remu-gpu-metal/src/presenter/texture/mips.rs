@@ -102,6 +102,9 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             .expect("selected clean mip resident exists");
         let promoted =
             promote_resident_mip_hierarchy(device, command_buffer, descriptor, resident, origin)?;
+        // A fresh insert supersedes any quarantined duplicate; adopting one later would
+        // resurrect older pixels out of order.
+        retired_texture_quarantine.remove(&descriptor.guest);
         resident_guest_textures.insert(descriptor.guest, promoted);
         return resident_texture_for_sample(
             resident_guest_textures
@@ -143,6 +146,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
         "REMu {}-level storage image {:#x}",
         underlying_mip_count, descriptor.guest.address
     ));
+    retired_texture_quarantine.remove(&descriptor.guest);
     resident_guest_textures.insert(
         descriptor.guest,
         ResidentGuestTexture {
