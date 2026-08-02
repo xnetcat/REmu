@@ -230,6 +230,59 @@ pub(super) fn write_watched_guest_texture_linear(
     );
     let destination_length =
         usize::try_from(byte_count).map_err(|_| "guest texture byte count does not fit usize")?;
+    let entry_generations = write_watch.generations();
+    let (width, _, pitch, bytes_per_element) = texture_element_layout(descriptor)?;
+    if descriptor.tile_mode == 0 {
+        // A linear image owns only its visible row bytes; the pitch padding between rows
+        // belongs to whoever else lives in the pooled allocation. Publish exactly the rows —
+        // no read-modify-write, so a concurrent guest store to the padding can never be
+        // reverted (the MallocBinned3 canary corruption mechanism).
+        let row_bytes = width
+            .checked_mul(bytes_per_element)
+            .ok_or("source row byte count overflows")?;
+        let destination_row_bytes = pitch
+            .checked_mul(bytes_per_element)
+            .ok_or("destination row byte count overflows")?;
+        if row_bytes == 0 || !linear.len().is_multiple_of(row_bytes) {
+            return Err(format!(
+                "linear writeback payload of {} bytes is not whole {row_bytes}-byte rows",
+                linear.len()
+            ));
+        }
+        let segments = linear
+            .chunks_exact(row_bytes)
+            .enumerate()
+            .map(|(row, bytes)| (row as u64 * destination_row_bytes as u64, bytes))
+            .collect::<Vec<_>>();
+        if write_watch.generations() != entry_generations {
+            return Err(format!(
+                "guest wrote texture range {:#x} during writeback; publishing would revert it",
+                descriptor.address
+            ));
+        }
+        let wrote = write_watch.with_live_backing(|| {
+            remu_memory::write_guest_shared_backing_scattered(
+                descriptor.address,
+                byte_count,
+                &segments,
+            )
+        })?;
+        if !wrote {
+            return Err(format!(
+                "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
+                descriptor.address
+            ));
+        }
+        let _ = remu_memory::notify_guest_memory_written_excluding(
+            descriptor.address,
+            byte_count,
+            &write_watch.cpu_watches(),
+        );
+        for (offset, bytes) in &segments {
+            write_watch.record_content_snapshot(descriptor.address + offset, bytes);
+        }
+        return Ok(());
+    }
     let raw = write_watch
         .with_live_backing(|| {
             let mut destination = vec![0; destination_length];
@@ -240,6 +293,15 @@ pub(super) fn write_watched_guest_texture_linear(
                 ));
             }
             write_guest_texture_linear_into_raw(descriptor, linear, &mut destination)?;
+            // The tiled footprint is re-encoded through a read-modify-write, so a guest store
+            // between the read above and this write would be reverted. Detect that store by
+            // its fault generation and abort loudly rather than publish over it.
+            if write_watch.generations() != entry_generations {
+                return Err(format!(
+                    "guest wrote texture range {:#x} during writeback; publishing would revert it",
+                    descriptor.address
+                ));
+            }
             if !write_guest_shared_backing(descriptor.address, &destination) {
                 return Err(format!(
                     "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",

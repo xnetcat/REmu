@@ -916,6 +916,9 @@ pub(super) fn write_resident_texture_contents_to_guest(
         ));
     }
     let layout = mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
+    // The chain snapshot below seeds the published bytes; a guest store between it and the
+    // publish would be reverted. Capture the fault generations here so the publish can abort.
+    let entry_generations = resident.write_watch.generations();
     let mut raw = snapshot_watched_guest_range(
         resident.descriptor.address,
         layout.byte_count,
@@ -932,7 +935,12 @@ pub(super) fn write_resident_texture_contents_to_guest(
         )?);
     }
     encode_mode27_mip_chain_into_raw(&layout, &levels, &mut raw)?;
-    write_watched_guest_range(resident.descriptor.address, &raw, &resident.write_watch)
+    write_watched_guest_range(
+        resident.descriptor.address,
+        &raw,
+        &resident.write_watch,
+        Some(&entry_generations),
+    )
 }
 
 fn write_layered_resident_texture_contents_to_guest(
@@ -963,6 +971,7 @@ fn write_layered_resident_texture_contents_to_guest(
     let raw_bytes = face_raw_bytes
         .checked_mul(layer_count)
         .ok_or("layered guest texture raw size overflows")?;
+    let entry_generations = resident.write_watch.generations();
     let mut raw = snapshot_watched_guest_range(
         resident.descriptor.address,
         raw_bytes,
@@ -978,7 +987,12 @@ fn write_layered_resident_texture_contents_to_guest(
             layer,
         )?;
     }
-    write_watched_guest_range(resident.descriptor.address, &raw, &resident.write_watch)
+    write_watched_guest_range(
+        resident.descriptor.address,
+        &raw,
+        &resident.write_watch,
+        Some(&entry_generations),
+    )
 }
 
 pub(super) fn read_texture_volume_linear(

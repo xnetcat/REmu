@@ -524,6 +524,45 @@ pub fn read_guest_shared_backing(address: u64, destination: &mut [u8]) -> bool {
     backing.read_exact_at(offset, destination)
 }
 
+/// Copies disjoint byte segments into one guest range's shared backing.
+///
+/// A texture writeback authors only the bytes the GPU owns — for a linear image, the visible
+/// row bytes, never the pitch padding between rows. Publishing through one contiguous write
+/// required reading the whole span first and writing foreign padding bytes back, and a guest
+/// store landing between that read and write was silently reverted: allocator canaries in a
+/// pooled heap were the observed casualty. Segments are offsets into `address`'s range; the
+/// range is resolved once and every segment is written under that single resolution.
+pub fn write_guest_shared_backing_scattered(
+    address: u64,
+    byte_count: u64,
+    segments: &[(u64, &[u8])],
+) -> bool {
+    let Some((backing, base_offset, _)) = ({
+        let mappings = shared_mappings()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolve_shared_backing_range(&mappings, address, byte_count)
+    }) else {
+        return false;
+    };
+    for (segment_offset, bytes) in segments {
+        let in_range = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|len| segment_offset.checked_add(len))
+            .is_some_and(|end| end <= byte_count);
+        if !in_range {
+            return false;
+        }
+        let Some(offset) = base_offset.checked_add(*segment_offset) else {
+            return false;
+        };
+        if !backing.write_all_at(offset, bytes) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Copies bytes into a GPU-physical resource range in shared direct-memory backing.
 ///
 /// CPU aliases observe the write coherently because they map this same shared backing object.

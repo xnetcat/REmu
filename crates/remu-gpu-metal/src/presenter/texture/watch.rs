@@ -1368,10 +1368,21 @@ pub(crate) fn write_watched_guest_range(
     address: u64,
     raw: &[u8],
     write_watch: &GuestTextureWriteWatch,
+    expected_generations: Option<&[u64]>,
 ) -> Result<(), String> {
     if write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced) {
         return Err(format!(
             "guest range mapping {address:#x} was retired before writeback"
+        ));
+    }
+    // `raw` was assembled from a guest snapshot taken before a multi-millisecond GPU
+    // readback. A guest store in that window would be reverted by publishing; the caller's
+    // pre-snapshot fault generations detect it, and aborting loudly beats silent corruption.
+    if let Some(expected) = expected_generations
+        && write_watch.generations() != expected
+    {
+        return Err(format!(
+            "guest wrote range {address:#x} during writeback; publishing would revert it"
         ));
     }
     let byte_count = u64::try_from(raw.len()).map_err(|_| "guest range length does not fit u64")?;
