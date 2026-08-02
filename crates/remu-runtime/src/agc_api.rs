@@ -11,24 +11,28 @@ pub(crate) fn agc_register_defaults(
     internal: bool,
     state: &mut ProbeDispatchState,
 ) -> u64 {
-    if !matches!(low_u32(version), 7 | 8 | 10 | 13) {
+    let version = low_u32(version);
+    let cache_index = match version {
+        7 => 0,
+        8 => 1,
+        10 => 2,
+        _ => return 0,
+    };
+    let Some(layout) =
+        crate::agc_register_defaults::RegisterDefaultsLayout::for_version(version, internal)
+    else {
         return 0;
-    }
+    };
 
     let cached = if internal {
-        &mut state.agc_internal_register_defaults
+        &mut state.agc_internal_register_defaults[cache_index]
     } else {
-        &mut state.agc_primary_register_defaults
+        &mut state.agc_primary_register_defaults[cache_index]
     };
     if *cached != 0 {
         return *cached;
     }
 
-    let layout = if internal {
-        crate::agc_register_defaults::RegisterDefaultsLayout::internal()
-    } else {
-        crate::agc_register_defaults::RegisterDefaultsLayout::primary()
-    };
     let blob_length = layout.blob_length();
     let Ok(blob_length_u64) = u64::try_from(blob_length) else {
         return 0;
@@ -50,7 +54,7 @@ pub(crate) fn agc_register_defaults(
     *cached = address;
     eprintln!(
         "[REMu][AGC] register defaults internal={internal} version={} groups={} address=0x{address:016x}",
-        low_u32(version),
+        version,
         layout.group_count()
     );
     address

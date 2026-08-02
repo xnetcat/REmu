@@ -9,6 +9,141 @@
 const DESCRIPTOR_SIZE: usize = 0x40;
 const REGISTER_BLOCK_SIZE: usize = 16 * 8;
 
+mod v10;
+
+#[derive(Clone, Copy)]
+struct CompactRegisterDefaultTable {
+    registers: &'static [(u32, u32)],
+    pointer_offsets: &'static [u16],
+}
+
+impl CompactRegisterDefaultTable {
+    const fn new(registers: &'static [(u32, u32)], pointer_offsets: &'static [u16]) -> Self {
+        Self {
+            registers,
+            pointer_offsets,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CompactRegisterDefaults {
+    tables: [CompactRegisterDefaultTable; 4],
+    /// Exact guest ABI triples: kind, metadata, and reserved.
+    types: &'static [u32],
+}
+
+impl CompactRegisterDefaults {
+    const fn new(tables: [CompactRegisterDefaultTable; 4], types: &'static [u32]) -> Self {
+        Self { tables, types }
+    }
+
+    fn type_count(self) -> usize {
+        self.types.len() / 3
+    }
+
+    fn offsets(self) -> CompactRegisterDefaultsOffsets {
+        let mut cursor = DESCRIPTOR_SIZE;
+        let mut pointer_tables = [0_usize; 4];
+        let mut table_index = 0;
+        while table_index < self.tables.len() {
+            cursor = align_up(cursor, 8);
+            pointer_tables[table_index] = cursor;
+            cursor += self.tables[table_index].pointer_offsets.len() * 8;
+            table_index += 1;
+        }
+
+        let types = align_up(cursor, 4);
+        cursor = types + self.types.len() * 4;
+
+        let mut register_blocks = [0_usize; 4];
+        table_index = 0;
+        while table_index < self.tables.len() {
+            cursor = align_up(cursor, 8);
+            register_blocks[table_index] = cursor;
+            cursor += self.tables[table_index].registers.len() * 8;
+            table_index += 1;
+        }
+
+        CompactRegisterDefaultsOffsets {
+            pointer_tables,
+            types,
+            register_blocks,
+            blob_length: cursor,
+        }
+    }
+
+    fn build(self, address: u64) -> Option<Vec<u8>> {
+        if self.types.len() % 3 != 0 {
+            return None;
+        }
+        let offsets = self.offsets();
+        let mut blob = vec![0_u8; offsets.blob_length];
+
+        for (table_index, table) in self.tables.iter().enumerate() {
+            let pointer_count = table.pointer_offsets.len();
+            if pointer_count != 0 {
+                write_u64(
+                    &mut blob,
+                    table_index.checked_mul(8)?,
+                    address.checked_add(offsets.pointer_tables[table_index] as u64)?,
+                )?;
+            }
+            write_u32(
+                &mut blob,
+                0x20_usize.checked_add(table_index.checked_mul(4)?)?,
+                u32::try_from(table.registers.len()).ok()?,
+            )?;
+
+            for (pointer_index, &register_offset) in table.pointer_offsets.iter().enumerate() {
+                let register_offset = usize::from(register_offset);
+                if register_offset >= table.registers.len() {
+                    return None;
+                }
+                write_u64(
+                    &mut blob,
+                    offsets.pointer_tables[table_index]
+                        .checked_add(pointer_index.checked_mul(8)?)?,
+                    address.checked_add(
+                        offsets.register_blocks[table_index]
+                            .checked_add(register_offset.checked_mul(8)?)?
+                            as u64,
+                    )?,
+                )?;
+            }
+
+            for (register_index, &(register, value)) in table.registers.iter().enumerate() {
+                let destination = offsets.register_blocks[table_index]
+                    .checked_add(register_index.checked_mul(8)?)?;
+                write_u32(&mut blob, destination, register)?;
+                write_u32(&mut blob, destination.checked_add(4)?, value)?;
+            }
+        }
+
+        if !self.types.is_empty() {
+            write_u64(&mut blob, 0x30, address.checked_add(offsets.types as u64)?)?;
+        }
+        write_u32(&mut blob, 0x38, u32::try_from(self.type_count()).ok()?)?;
+        for (type_index, &value) in self.types.iter().enumerate() {
+            write_u32(
+                &mut blob,
+                offsets.types.checked_add(type_index.checked_mul(4)?)?,
+                value,
+            )?;
+        }
+
+        Some(blob)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompactRegisterDefaultsOffsets {
+    pointer_tables: [usize; 4],
+    types: usize,
+    register_blocks: [usize; 4],
+    blob_length: usize,
+}
+
 #[derive(Clone, Copy)]
 struct RegisterDefaultGroup {
     space: u32,
@@ -45,15 +180,16 @@ impl RegisterDefaultGroup {
     }
 }
 
-pub(crate) struct RegisterDefaultsLayout {
+#[derive(Clone, Copy)]
+pub(crate) struct LegacyRegisterDefaultsLayout {
     groups: &'static [RegisterDefaultGroup],
     cx_table_length: usize,
     sh_table_length: usize,
     uc_table_length: usize,
 }
 
-impl RegisterDefaultsLayout {
-    pub(crate) const fn primary() -> Self {
+impl LegacyRegisterDefaultsLayout {
+    const fn primary() -> Self {
         Self {
             groups: PRIMARY_REGISTER_DEFAULTS,
             cx_table_length: 78,
@@ -62,7 +198,7 @@ impl RegisterDefaultsLayout {
         }
     }
 
-    pub(crate) const fn internal() -> Self {
+    const fn internal() -> Self {
         Self {
             groups: INTERNAL_REGISTER_DEFAULTS,
             cx_table_length: 4,
@@ -71,7 +207,7 @@ impl RegisterDefaultsLayout {
         }
     }
 
-    pub(crate) const fn group_count(&self) -> usize {
+    const fn group_count(&self) -> usize {
         self.groups.len()
     }
 
@@ -136,6 +272,45 @@ impl RegisterDefaultsLayout {
         let register_blocks_offset = align_up(types_offset + self.groups.len() * 12, 8);
         let blob_length = register_blocks_offset + self.groups.len() * REGISTER_BLOCK_SIZE;
         (cx_offset, sh_offset, uc_offset, types_offset, blob_length)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RegisterDefaultsLayout {
+    Legacy(LegacyRegisterDefaultsLayout),
+    Compact(CompactRegisterDefaults),
+}
+
+impl RegisterDefaultsLayout {
+    pub(crate) const fn for_version(version: u32, internal: bool) -> Option<Self> {
+        match (version, internal) {
+            (7 | 8, false) => Some(Self::Legacy(LegacyRegisterDefaultsLayout::primary())),
+            (7 | 8, true) => Some(Self::Legacy(LegacyRegisterDefaultsLayout::internal())),
+            (10, false) => Some(Self::Compact(v10::PUBLIC)),
+            (10, true) => Some(Self::Compact(v10::INTERNAL)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn group_count(self) -> usize {
+        match self {
+            Self::Legacy(layout) => layout.group_count(),
+            Self::Compact(layout) => layout.type_count(),
+        }
+    }
+
+    pub(crate) fn blob_length(self) -> usize {
+        match self {
+            Self::Legacy(layout) => layout.blob_length(),
+            Self::Compact(layout) => layout.offsets().blob_length,
+        }
+    }
+
+    pub(crate) fn build(self, address: u64) -> Option<Vec<u8>> {
+        match self {
+            Self::Legacy(layout) => layout.build(address),
+            Self::Compact(layout) => layout.build(address),
+        }
     }
 }
 
@@ -546,7 +721,30 @@ const INTERNAL_REGISTER_DEFAULTS: &[RegisterDefaultGroup] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{PRIMARY_REGISTER_DEFAULTS, RegisterDefaultsLayout};
+    use super::{
+        INTERNAL_REGISTER_DEFAULTS, LegacyRegisterDefaultsLayout, PRIMARY_REGISTER_DEFAULTS,
+        RegisterDefaultsLayout, v10,
+    };
+
+    const BASE_ADDRESS: u64 = 0x7000_0000;
+
+    fn read_u32(blob: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(blob[offset..offset + 4].try_into().expect("u32"))
+    }
+
+    fn read_u64(blob: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(blob[offset..offset + 8].try_into().expect("u64"))
+    }
+
+    fn blob_offset(address: u64) -> usize {
+        usize::try_from(address - BASE_ADDRESS).expect("pointer inside blob")
+    }
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
 
     #[test]
     fn encodes_group_class_count_and_table_selector() {
@@ -571,15 +769,170 @@ mod tests {
     #[test]
     fn builds_primary_and_internal_pointer_graphs() {
         for layout in [
-            RegisterDefaultsLayout::primary(),
-            RegisterDefaultsLayout::internal(),
+            LegacyRegisterDefaultsLayout::primary(),
+            LegacyRegisterDefaultsLayout::internal(),
         ] {
-            let blob = layout.build(0x7000_0000).expect("valid register defaults");
+            let blob = layout.build(BASE_ADDRESS).expect("valid register defaults");
             assert_eq!(blob.len(), layout.blob_length());
             assert_eq!(
                 u32::from_le_bytes(blob[0x38..0x3c].try_into().expect("group count")) as usize,
                 layout.group_count()
             );
         }
+    }
+
+    #[test]
+    fn selects_only_truthful_register_default_versions() {
+        assert!(matches!(
+            RegisterDefaultsLayout::for_version(7, false),
+            Some(RegisterDefaultsLayout::Legacy(_))
+        ));
+        assert!(matches!(
+            RegisterDefaultsLayout::for_version(8, true),
+            Some(RegisterDefaultsLayout::Legacy(_))
+        ));
+        assert!(matches!(
+            RegisterDefaultsLayout::for_version(10, false),
+            Some(RegisterDefaultsLayout::Compact(_))
+        ));
+        assert!(RegisterDefaultsLayout::for_version(9, false).is_none());
+        assert!(RegisterDefaultsLayout::for_version(13, false).is_none());
+    }
+
+    #[test]
+    fn serializes_exact_version_ten_public_descriptor_and_blend_group() {
+        let layout = v10::PUBLIC;
+        assert_eq!(
+            layout.tables.map(|table| table.registers.len()),
+            [482, 159, 55, 0]
+        );
+        assert_eq!(
+            layout.tables.map(|table| table.pointer_offsets.len()),
+            [79, 29, 20, 0]
+        );
+        assert_eq!(layout.type_count(), 128);
+
+        let offsets = layout.offsets();
+        let blob = layout.build(BASE_ADDRESS).expect("valid v10 public layout");
+        assert_eq!(blob.len(), offsets.blob_length);
+        assert_eq!(
+            read_u64(&blob, 0x00),
+            BASE_ADDRESS + offsets.pointer_tables[0] as u64
+        );
+        assert_eq!(
+            read_u64(&blob, 0x08),
+            BASE_ADDRESS + offsets.pointer_tables[1] as u64
+        );
+        assert_eq!(
+            read_u64(&blob, 0x10),
+            BASE_ADDRESS + offsets.pointer_tables[2] as u64
+        );
+        assert_eq!(read_u64(&blob, 0x18), 0);
+        assert_eq!(
+            [
+                read_u32(&blob, 0x20),
+                read_u32(&blob, 0x24),
+                read_u32(&blob, 0x28),
+                read_u32(&blob, 0x2c),
+            ],
+            [482, 159, 55, 0]
+        );
+        assert_eq!(read_u64(&blob, 0x30), BASE_ADDRESS + offsets.types as u64);
+        assert_eq!(read_u32(&blob, 0x38), 128);
+
+        let missing_group = offsets.types + 2 * 12;
+        assert_eq!(
+            [
+                read_u32(&blob, missing_group),
+                read_u32(&blob, missing_group + 4),
+                read_u32(&blob, missing_group + 8),
+            ],
+            [0xa6d1_2629, 0x0004_0408, 0]
+        );
+
+        let blend_group = offsets.types + 60 * 12;
+        assert_eq!(read_u32(&blob, blend_group), 0xef55_0356);
+        assert_eq!(read_u32(&blob, blend_group + 4), 0x0020_04f0);
+        assert_eq!(read_u32(&blob, blend_group + 8), 0);
+
+        let blend_pointer = read_u64(&blob, offsets.pointer_tables[0] + 60 * 8);
+        assert_eq!(
+            blend_pointer,
+            BASE_ADDRESS + offsets.register_blocks[0] as u64 + 0x51 * 8
+        );
+        let blend_registers = blob_offset(blend_pointer);
+        for slot in 0..8 {
+            assert_eq!(
+                read_u32(&blob, blend_registers + slot * 8),
+                0x1e0 + slot as u32
+            );
+            assert_eq!(read_u32(&blob, blend_registers + slot * 8 + 4), 0x2001_0001);
+        }
+    }
+
+    #[test]
+    fn serializes_exact_version_ten_internal_fourth_table() {
+        let layout = v10::INTERNAL;
+        assert_eq!(
+            layout.tables.map(|table| table.registers.len()),
+            [9, 15, 1, 6]
+        );
+        assert_eq!(
+            layout.tables.map(|table| table.pointer_offsets.len()),
+            [9, 15, 1, 3]
+        );
+        assert_eq!(layout.type_count(), 28);
+
+        let offsets = layout.offsets();
+        let blob = layout
+            .build(BASE_ADDRESS)
+            .expect("valid v10 internal layout");
+        assert_eq!(
+            [
+                read_u32(&blob, 0x20),
+                read_u32(&blob, 0x24),
+                read_u32(&blob, 0x28),
+                read_u32(&blob, 0x2c),
+            ],
+            [9, 15, 1, 6]
+        );
+        assert_eq!(read_u32(&blob, 0x38), 28);
+        assert_eq!(
+            read_u64(&blob, 0x18),
+            BASE_ADDRESS + offsets.pointer_tables[3] as u64
+        );
+
+        let table_three_pointers = (0..3)
+            .map(|index| blob_offset(read_u64(&blob, offsets.pointer_tables[3] + index * 8)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            table_three_pointers,
+            [0, 1, 3]
+                .map(|index| offsets.register_blocks[3] + index * 8)
+                .to_vec()
+        );
+        assert_eq!(
+            (0..6)
+                .map(|index| read_u32(&blob, offsets.register_blocks[3] + index * 8))
+                .collect::<Vec<_>>(),
+            [0x26c, 0x094, 0x095, 0x26e, 0x278, 0x262]
+        );
+
+        // The legacy internal table has no fourth pointer table and only 22 types. Keeping this
+        // assertion ties the version switch to the ABI discrepancy that motivated it.
+        assert_eq!(INTERNAL_REGISTER_DEFAULTS.len(), 22);
+    }
+
+    #[test]
+    fn version_ten_blobs_match_the_complete_independent_tables() {
+        let public = v10::PUBLIC.build(BASE_ADDRESS).expect("v10 public blob");
+        let internal = v10::INTERNAL
+            .build(BASE_ADDRESS)
+            .expect("v10 internal blob");
+
+        assert_eq!(public.len(), 8192);
+        assert_eq!(fnv1a64(&public), 0xaa1a_1758_16e7_a905);
+        assert_eq!(internal.len(), 872);
+        assert_eq!(fnv1a64(&internal), 0xc289_54cb_1176_32d3);
     }
 }
