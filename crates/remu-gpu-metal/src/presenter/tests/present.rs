@@ -1149,6 +1149,100 @@ fn translated_scanout_resolution_prefers_the_current_resident_object() {
 }
 
 #[test]
+fn interactive_tick_captures_a_finalized_flip_before_accepting_its_replacement() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let descriptor = GuestTextureDescriptor {
+        address: 0x0070_1234_5600,
+        width: 4,
+        height: 4,
+        pitch: 4,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let texture = presenter.ensure_direct_scanout_texture(&device, descriptor);
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let pass = RenderPassDescriptor::new();
+    let attachment = pass
+        .color_attachments()
+        .object_at(0)
+        .expect("color attachment zero");
+    attachment.set_texture(Some(&texture));
+    attachment.set_load_action(MTLLoadAction::Clear);
+    attachment.set_store_action(MTLStoreAction::Store);
+    attachment.set_clear_color(MTLClearColor::new(0.25, 0.5, 1.0, 1.0));
+    let paint = queue.new_command_buffer().to_owned();
+    let encoder = paint.new_render_command_encoder(pass);
+    encoder.end_encoding();
+    paint.commit();
+    presenter.mark_direct_scanout_initialized(descriptor.address);
+
+    let capture_directory = std::env::temp_dir().join(format!(
+        "remu-redraw-starvation-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock follows Unix epoch")
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&capture_directory).expect("create capture directory");
+    presenter.capture_directory = Some(capture_directory.clone());
+
+    for flip_argument in [0x11, 0x22] {
+        sender
+            .send(GpuEvent::Flip {
+                address: descriptor.address,
+                buffer_index: 0,
+                flip_argument,
+                submission_sequence: None,
+                width: descriptor.width,
+                height: descriptor.height,
+                pitch: descriptor.pitch,
+                pixel_format: 0x8000_0000_0000_0000,
+                tiling_mode: 0,
+            })
+            .expect("flip event reaches presenter");
+    }
+
+    assert_eq!(
+        presenter.service_interactive_presenter_before_wait(),
+        super::PresenterFlow::Continue
+    );
+    assert_eq!(presenter.next_flip_sequence, 1);
+    assert_eq!(presenter.captured_guest_frames.len(), 1);
+    assert!(
+        std::fs::read_dir(&capture_directory)
+            .expect("read capture directory")
+            .any(|entry| entry
+                .expect("capture directory entry")
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "ppm")),
+        "the finalized first flip must be captured in the same event-loop tick"
+    );
+
+    assert_eq!(
+        presenter.service_interactive_presenter_before_wait(),
+        super::PresenterFlow::Continue
+    );
+    assert_eq!(presenter.next_flip_sequence, 2);
+    assert_eq!(
+        presenter
+            .active_translated_scanout
+            .expect("replacement scanout")
+            .sequence,
+        2
+    );
+    let _ = std::fs::remove_dir_all(capture_directory);
+}
+
+#[test]
 fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = super::MetalPresenter::new(receiver).expect("Metal presenter state");
