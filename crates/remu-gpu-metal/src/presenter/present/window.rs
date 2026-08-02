@@ -353,6 +353,34 @@ impl MetalPresenter {
                     self.dropped_compute_executions.len(),
                 );
             }
+            {
+                // Draws consumed without rasterizing report success, so neither the drop counters
+                // nor any failure log sees them; these cumulative totals are their only footprint.
+                use super::super::stats::{
+                    NOOP_DRAWS_COLOR_OPERATION, NOOP_DRAWS_COVER_PLACEHOLDER,
+                    NOOP_DRAWS_EMPTY_SCISSOR, NOOP_DRAWS_FAST_CLEAR_NOT_PENDING,
+                    NOOP_DRAWS_MESH_DISPATCH_SKIPPED, NOOP_DRAWS_RASTER_DISABLED,
+                };
+                let noop_draws = [
+                    ("cover", &NOOP_DRAWS_COVER_PLACEHOLDER),
+                    ("raster-off", &NOOP_DRAWS_RASTER_DISABLED),
+                    ("color-op", &NOOP_DRAWS_COLOR_OPERATION),
+                    ("empty-scissor", &NOOP_DRAWS_EMPTY_SCISSOR),
+                    ("mesh-skip", &NOOP_DRAWS_MESH_DISPATCH_SKIPPED),
+                    ("fce-idle", &NOOP_DRAWS_FAST_CLEAR_NOT_PENDING),
+                ];
+                let summary = noop_draws
+                    .iter()
+                    .filter_map(|(kind, count)| {
+                        let count = count.load(Ordering::Relaxed);
+                        (count != 0).then(|| format!("{kind}={count}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !summary.is_empty() {
+                    eprintln!("[REMu][PERF-NOOP] draws consumed without rasterizing: {summary}");
+                }
+            }
             let snapshot_count = TEXTURE_SNAPSHOT_COUNT.swap(0, Ordering::Relaxed);
             let snapshot_bytes = TEXTURE_SNAPSHOT_BYTES.swap(0, Ordering::Relaxed);
             let snapshot_nanoseconds = TEXTURE_SNAPSHOT_NANOSECONDS.swap(0, Ordering::Relaxed);

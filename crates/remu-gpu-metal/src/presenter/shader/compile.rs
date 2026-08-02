@@ -1,7 +1,6 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::PIPELINE_COMPILE_FAILED;
 use metal::{CompileOptions, Device, Library};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
@@ -39,12 +38,35 @@ fn compile_metal_library_in_process(
         .map_err(|error| format!("Metal {stage} compilation: {error}"))
 }
 
+/// Preserves MSL that Metal refused to compile, so the compiler's line-numbered error keeps
+/// referring to text that still exists. The success-path dump only fires after both lowerings
+/// succeed, which is exactly never for the sources that need reading.
+fn dump_failed_metal_source(stage: &str, source: &str) {
+    let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR") else {
+        return;
+    };
+    let mut digest = Sha1::new();
+    digest.update(source.as_bytes());
+    let digest = digest.finalize();
+    let path = PathBuf::from(directory).join(format!(
+        "failed-{stage}-{:02x}{:02x}{:02x}{:02x}.metal",
+        digest[0], digest[1], digest[2], digest[3]
+    ));
+    match std::fs::write(&path, source) {
+        Ok(()) => eprintln!("[REMu][METAL] wrote failing {stage} MSL to {}", path.display()),
+        Err(error) => eprintln!(
+            "[REMu][METAL] could not write failing {stage} MSL to {}: {error}",
+            path.display()
+        ),
+    }
+}
+
 pub(crate) fn compile_metal_shader_library(
     device: &Device,
     stage: &str,
     source: &str,
 ) -> Result<Library, String> {
-    if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+    let result = if std::env::var_os("REMU_METAL_COMPILER").is_some() {
         match compile_metal_library_with_tools(device, stage, source) {
             Ok(library) => Ok(library),
             Err(error) if metal_compile_failure_is_transient(&error) => Err(error),
@@ -57,7 +79,11 @@ pub(crate) fn compile_metal_shader_library(
         }
     } else {
         compile_metal_library_in_process(device, stage, source)
+    };
+    if result.is_err() {
+        dump_failed_metal_source(stage, source);
     }
+    result
 }
 
 pub(crate) fn compile_metal_compute_library(
@@ -121,7 +147,9 @@ pub(crate) fn compile_metal_library_with_tools(
                     return Ok(library);
                 }
                 Err(error) => {
-                    PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
+                    // Not a compile failure: the eviction falls through to a fresh compile that
+                    // usually succeeds, and counting it here made [PERF-PIPELINE] failed:N
+                    // disagree with the set of genuinely failing shader pairs.
                     eprintln!(
                         "[REMu][METAL] discarding unreadable cached {stage} library {}: {error}",
                         cache_path.display()

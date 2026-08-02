@@ -1,8 +1,8 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#[cfg(test)]
 use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
 
 use smallvec::SmallVec;
 
@@ -170,6 +170,56 @@ struct Evaluator<'a, M> {
     maximum_steps: usize,
 }
 
+/// Evaluation paths abandoned before their end, keyed by reason and the guest address of the
+/// abandoning instruction. A truncated evaluation returns a partial binding list that is
+/// indistinguishable from a complete one — the draw simply renders with whatever resources were
+/// discovered first — so this registry is the only place the gap is visible at all. Always on:
+/// entries are bounded by distinct sites and recording happens off the draw path.
+static TRUNCATED_EVALUATIONS: Mutex<BTreeMap<(&'static str, u64), u64>> =
+    Mutex::new(BTreeMap::new());
+
+fn record_truncated_evaluation(reason: &'static str, address: u64) {
+    *TRUNCATED_EVALUATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry((reason, address))
+        .or_insert(0) += 1;
+}
+
+/// Renders abandoned evaluation paths as report lines, one per reason, without a log prefix.
+///
+/// `vector-loop-followed-once` is the deliberate discovery strategy for EXEC/VCC loops — one
+/// iteration finds loop-invariant resources — so its line is expected on most titles; a binding
+/// that changes per iteration is the case it can miss. The other reasons abandon a path outright.
+#[must_use]
+pub fn truncated_evaluation_report() -> Vec<String> {
+    let truncations = TRUNCATED_EVALUATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut by_reason: BTreeMap<&'static str, (u64, Vec<(u64, u64)>)> = BTreeMap::new();
+    for (&(reason, address), &count) in truncations.iter() {
+        let entry = by_reason.entry(reason).or_default();
+        entry.0 += count;
+        entry.1.push((count, address));
+    }
+    by_reason
+        .into_iter()
+        .map(|(reason, (total, mut sites))| {
+            sites.sort_unstable_by_key(|&(count, _)| std::cmp::Reverse(count));
+            let worst = sites
+                .iter()
+                .take(4)
+                .map(|(count, address)| format!("{address:#x}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "reason={reason} paths={total} sites={} worst=[{worst}]",
+                sites.len()
+            )
+        })
+        .collect()
+}
+
 pub fn evaluate_shader(
     memory: &impl GuestMemoryReader,
     state: &ShaderState,
@@ -307,6 +357,10 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             if instruction.opcode.is("SSetpcB64") {
                 let Some(target_pc) = self.state.program.linked_transfer_target(instruction.pc)
                 else {
+                    record_truncated_evaluation(
+                        "unlinked-indirect-branch",
+                        self.state.program.instruction_address(instruction.pc),
+                    );
                     break;
                 };
                 path.instruction_index = self
@@ -389,6 +443,14 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                             4_096
                         };
                         if backward_visits >= maximum_visits {
+                            record_truncated_evaluation(
+                                if maximum_visits == 1 {
+                                    "vector-loop-followed-once"
+                                } else {
+                                    "scalar-loop-cap"
+                                },
+                                self.state.program.instruction_address(instruction.pc),
+                            );
                             path.instruction_index = path.instruction_index.saturating_add(1);
                             continue;
                         }
@@ -412,6 +474,10 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 ShaderEncoding::Sop1 | ShaderEncoding::Sop2 | ShaderEncoding::Sopk
             ) {
                 if instruction.opcode.is("SSwappcB64") {
+                    record_truncated_evaluation(
+                        "subroutine-call",
+                        self.state.program.instruction_address(instruction.pc),
+                    );
                     break;
                 }
                 execute_scalar_alu(

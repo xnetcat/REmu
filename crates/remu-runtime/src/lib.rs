@@ -8576,6 +8576,9 @@ pub fn report_abi_gap_summary() {
             "[REMu][REPORT] recovered instructions via SIGILL emulation sha_ni={recovered_sha_ni} sse4a={recovered_sse4a}"
         );
     }
+    for line in remu_shader::truncated_evaluation_report() {
+        eprintln!("[REMu][REPORT] truncated shader evaluation {line}");
+    }
     let telemetry = IMPORT_TELEMETRY.get().map(|telemetry| {
         telemetry
             .read()

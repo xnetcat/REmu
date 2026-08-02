@@ -147,6 +147,18 @@ pub(super) static PIPELINE_COMPILE_FAILED: AtomicU64 = AtomicU64::new(0);
 pub(super) static PIPELINE_DRAW_GATES: AtomicU64 = AtomicU64::new(0);
 pub(super) static PIPELINE_COMPUTE_GATES: AtomicU64 = AtomicU64::new(0);
 
+/// Draw packets consumed without rasterizing anything, by cause. Every one of these paths
+/// reports success, so no drop counter or once-per-key failure log ever sees them; the periodic
+/// `[REMu][PERF-NOOP]` line is their only footprint. Most are correct emulation (trigger
+/// packets, empty scissors), which is exactly why a misclassification here — real geometry
+/// deleted with zero trace — needs a number to falsify against.
+pub(super) static NOOP_DRAWS_COVER_PLACEHOLDER: AtomicU64 = AtomicU64::new(0);
+pub(super) static NOOP_DRAWS_RASTER_DISABLED: AtomicU64 = AtomicU64::new(0);
+pub(super) static NOOP_DRAWS_COLOR_OPERATION: AtomicU64 = AtomicU64::new(0);
+pub(super) static NOOP_DRAWS_EMPTY_SCISSOR: AtomicU64 = AtomicU64::new(0);
+pub(super) static NOOP_DRAWS_MESH_DISPATCH_SKIPPED: AtomicU64 = AtomicU64::new(0);
+pub(super) static NOOP_DRAWS_FAST_CLEAR_NOT_PENDING: AtomicU64 = AtomicU64::new(0);
+
 pub(super) fn record_texture_work(
     count: &AtomicU64,
     bytes: &AtomicU64,

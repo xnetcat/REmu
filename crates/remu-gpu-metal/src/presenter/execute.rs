@@ -123,6 +123,7 @@ impl MetalPresenter {
             // nothing for the draw to rasterize. In particular, AGC uses position-only rectangle
             // programs for such trigger/no-op packets while leaving an unrelated pixel program
             // bound; executing that program would overwrite the target.
+            super::stats::NOOP_DRAWS_RASTER_DISABLED.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         if matches!(
@@ -136,6 +137,7 @@ impl MetalPresenter {
             // normal draw overwrites the color target. Ordinary passes maintain a single-sample
             // MRT0 resident. Resolve transfers that resident to MRT1; EliminateFastClear
             // materializes the logical CMASK clear before later geometry loads the attachment.
+            super::stats::NOOP_DRAWS_COLOR_OPERATION.fetch_add(1, Ordering::Relaxed);
             if self
                 .open_guest_batch
                 .as_mut()
@@ -1561,12 +1563,17 @@ impl MetalPresenter {
                             1,
                         ),
                     );
+                } else {
+                    // A mesh-stage draw whose dispatch predicate declines encodes nothing at
+                    // all; without a count that whole draw disappears without a trace.
+                    super::stats::NOOP_DRAWS_MESH_DISPATCH_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 }
             } else if diagnostic_force_triangle {
                 encoder.draw_primitives_instanced(MTLPrimitiveType::Triangle, 0, 3, 1);
             } else if matches!(scissor, GuestScissor::Empty) {
                 // Metal rejects an empty scissor, so a guest empty-scissor draw encodes no
                 // primitive while preserving command-stream ordering.
+                super::stats::NOOP_DRAWS_EMPTY_SCISSOR.fetch_add(1, Ordering::Relaxed);
             } else if let Some(arguments) = indirect_arguments.as_ref() {
                 if let Some((index_buffer, index_type)) = indirect_index_buffer.as_ref() {
                     encoder.draw_indexed_primitives_indirect(
@@ -2937,6 +2944,7 @@ impl MetalPresenter {
         draw: &IndexedDraw,
     ) -> Result<Option<GuestTextureDescriptor>, String> {
         let Some(target) = decode_color_eliminate_fast_clear_target(draw)? else {
+            super::stats::NOOP_DRAWS_FAST_CLEAR_NOT_PENDING.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
         if !consume_color_metadata_clear(
@@ -2944,6 +2952,7 @@ impl MetalPresenter {
             render_target_cmask_address(&target, &draw.context_registers)?,
             target.base_layer,
         ) {
+            super::stats::NOOP_DRAWS_FAST_CLEAR_NOT_PENDING.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
         let activity_stamp = ResidentTextureActivityStamp {
