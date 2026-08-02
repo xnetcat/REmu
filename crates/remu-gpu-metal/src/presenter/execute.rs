@@ -14,7 +14,7 @@ use super::{
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
     NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
+    ResidencyState, ResidentTextureActivityStamp, SharedEventWriteKind, SpanQueryOrder, StaleSource,
     append_unique_global_writebacks,
     append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
@@ -1677,6 +1677,12 @@ impl MetalPresenter {
 
         for (target, resident_descriptor) in targets.iter().zip(&target_resident_descriptors) {
             if target.direct_scanout {
+                if let Some(batch) = self.active_open_guest_batch_mut() {
+                    batch.record_resident_write_footprint(
+                        SharedEventWriteKind::DirectScanoutTarget,
+                        target.span,
+                    );
+                }
                 self.mark_direct_scanout_initialized(target.texture.address);
             } else {
                 let region = WrittenRegion::render_target(*target, scissor);

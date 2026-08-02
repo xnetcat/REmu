@@ -70,7 +70,12 @@ impl MetalPresenter {
             // through host polling. Open a queue-local batch for the signal; Metal FIFO order keeps
             // it behind earlier committed work, and host retirement remains FIFO as well.
             self.ensure_active_open_guest_batch()?;
+            // The release label is a terminal command-processor write owned by this exact queue
+            // point. Attach it before freezing the signal checkpoint so a consumer touching the
+            // label cannot be misclassified as disjoint while the store remains unpublished.
+            self.queue_pinned_guest_memory_write(pending)?;
             self.encode_guest_release_shared_event(queue_id, &matching_waits)?;
+            return Ok(());
         }
         self.queue_pinned_guest_memory_write(pending)
     }
@@ -383,17 +388,35 @@ impl MetalPresenter {
                 return Ok(());
             }
         };
-        let batch = state
+        {
+            let batch = state
+                .open_batch
+                .as_mut()
+                .ok_or("shared-event release has no open producer batch")?;
+            batch.close_active_pass_encoders();
+            batch
+                .command_buffer
+                .encode_signal_event(state.shared_event_timeline.event(), fence.value());
+            batch.max_encoded_signal = Some(fence);
+        }
+        let checkpoint =
+            super::super::SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+        if !checkpoint.footprint_complete {
+            self.statistics.shared_event_incomplete_signal_footprints = self
+                .statistics
+                .shared_event_incomplete_signal_footprints
+                .saturating_add(1);
+        }
+        debug_assert!(
+            checkpoint.footprint_complete,
+            "shared-event RELEASE_MEM has an incomplete producer footprint"
+        );
+        state
             .open_batch
             .as_mut()
-            .ok_or("shared-event release has no open producer batch")?;
-        batch.close_active_pass_encoders();
-        batch
-            .command_buffer
-            .encode_signal_event(state.shared_event_timeline.event(), fence.value());
-        batch.max_encoded_signal = Some(fence);
-        let checkpoint = super::super::SharedEventSignalCheckpoint::capture(batch, fence);
-        batch.signal_checkpoints.push(checkpoint);
+            .expect("shared-event release batch remains open")
+            .signal_checkpoints
+            .push(checkpoint);
         for &wait_id in matching_waits {
             let _ = self.gpu_wait_fences.bind_if_unbound(wait_id, fence);
         }

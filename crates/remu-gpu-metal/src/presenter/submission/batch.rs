@@ -18,7 +18,8 @@ use super::{
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use crate::presenter::{
-    SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint, SharedEventUnresolvedWriteRange,
+    PhysicalFootprintRange, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
+    SharedEventUnresolvedWriteRange, SharedEventWriteKind,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -61,13 +62,55 @@ enum GlobalWritebackOutcome {
 }
 
 impl SharedEventSignalCheckpoint {
-    pub(crate) fn capture(batch: &GuestCommandBatch, fence: SharedEventFence) -> Self {
-        let global_writeback_count = batch.global_writebacks.len();
-        let guest_write_range_count = batch.guest_write_ranges.len();
-        let memory_write_count = batch.memory_writes.len();
-        let mut global_versions: Vec<SharedEventGlobalBufferVersion> = Vec::new();
-        for writeback in &batch.global_writebacks {
+    pub(crate) fn capture_queue_prefix(
+        state: &GuestQueueBatchState,
+        fence: SharedEventFence,
+    ) -> Self {
+        let batch = state
+            .open_batch
+            .as_ref()
+            .expect("a queue signal has an open batch");
+        let mut checkpoint = Self {
+            fence,
+            global_writeback_count: batch.global_writebacks.len(),
+            guest_write_range_count: batch.guest_write_ranges.len(),
+            memory_write_count: batch.memory_writes.len(),
+            global_versions: Vec::new(),
+            unresolved_write_ranges: Vec::new(),
+            pending_write_footprint: Vec::new(),
+            footprint_complete: true,
+        };
+        for earlier in &state.committed_batches {
+            checkpoint.capture_batch_prefix(
+                earlier,
+                earlier.global_writebacks.len(),
+                earlier.guest_write_ranges.len(),
+                earlier.memory_writes.len(),
+            );
+        }
+        checkpoint.capture_batch_prefix(
+            batch,
+            checkpoint.global_writeback_count,
+            checkpoint.guest_write_range_count,
+            checkpoint.memory_write_count,
+        );
+        checkpoint
+    }
+
+    fn capture_batch_prefix(
+        &mut self,
+        batch: &GuestCommandBatch,
+        global_writeback_count: usize,
+        guest_write_range_count: usize,
+        memory_write_count: usize,
+    ) {
+        self.footprint_complete &= batch.resident_write_footprint_complete;
+        for &range in &batch.resident_write_footprint {
+            append_unique_physical_footprint(&mut self.pending_write_footprint, range);
+        }
+        for writeback in &batch.global_writebacks[..global_writeback_count] {
             let Ok(byte_count) = u64::try_from(writeback.byte_count) else {
+                self.footprint_complete = false;
                 continue;
             };
             let version = SharedEventGlobalBufferVersion {
@@ -80,7 +123,7 @@ impl SharedEventSignalCheckpoint {
             // Each writable copied binding gets fresh Metal storage. Replacing only the same
             // exact guest-physical interval materializes the latest version as of this signal;
             // partially overlapping intervals remain separate so consumers reject ambiguity.
-            if let Some(existing) = global_versions.iter_mut().find(|existing| {
+            if let Some(existing) = self.global_versions.iter_mut().find(|existing| {
                 existing.byte_count == version.byte_count
                     && match (existing.mapping_identity, version.mapping_identity) {
                         (Some(existing), Some(version)) => existing == version,
@@ -90,34 +133,126 @@ impl SharedEventSignalCheckpoint {
             }) {
                 *existing = version;
             } else {
-                global_versions.push(version);
+                self.global_versions.push(version);
             }
+            self.capture_physical_range(
+                SharedEventWriteKind::CopiedGlobal,
+                writeback.guest_address,
+                byte_count,
+                writeback.mapping_identity,
+            );
         }
-        let mut unresolved_write_ranges = batch
-            .guest_write_ranges
-            .iter()
-            .map(|range| SharedEventUnresolvedWriteRange {
+        for range in &batch.guest_write_ranges[..guest_write_range_count] {
+            self.unresolved_write_ranges.push(SharedEventUnresolvedWriteRange {
                 guest_address: range.address,
                 byte_count: range.byte_count,
                 mapping_identity: Some(range.physical_identity),
-            })
-            .collect::<Vec<_>>();
-        unresolved_write_ranges.extend(batch.memory_writes.iter().map(|write| {
+            });
+            self.capture_physical_range(
+                SharedEventWriteKind::ZeroCopyGlobal,
+                range.address,
+                range.byte_count,
+                Some(range.physical_identity),
+            );
+        }
+        for write in &batch.memory_writes[..memory_write_count] {
             let (guest_address, byte_count) = write.range();
-            SharedEventUnresolvedWriteRange {
+            self.unresolved_write_ranges.push(SharedEventUnresolvedWriteRange {
                 guest_address,
                 byte_count,
                 mapping_identity: write.mapping_identity,
-            }
-        }));
-        Self {
-            fence,
-            global_writeback_count,
-            guest_write_range_count,
-            memory_write_count,
-            global_versions,
-            unresolved_write_ranges,
+            });
+            self.capture_physical_range(
+                SharedEventWriteKind::TerminalGuestWrite,
+                guest_address,
+                byte_count,
+                write.mapping_identity,
+            );
         }
+    }
+
+    fn capture_physical_range(
+        &mut self,
+        kind: SharedEventWriteKind,
+        guest_address: u64,
+        byte_count: u64,
+        mapping: Option<GuestSharedMappingIdentity>,
+    ) {
+        match PhysicalFootprintRange::new(kind, guest_address, byte_count, mapping) {
+            Some(range) => {
+                append_unique_physical_footprint(&mut self.pending_write_footprint, range);
+            }
+            None => self.footprint_complete = false,
+        }
+    }
+}
+
+impl PhysicalFootprintRange {
+    pub(crate) fn new(
+        kind: SharedEventWriteKind,
+        guest_address: u64,
+        byte_count: u64,
+        mapping: Option<GuestSharedMappingIdentity>,
+    ) -> Option<Self> {
+        let mapping = mapping?;
+        if byte_count == 0 || guest_address.checked_add(byte_count).is_none() {
+            return None;
+        }
+        mapping.backing_offset.checked_add(byte_count)?;
+        Some(Self {
+            kind,
+            guest_address,
+            byte_count,
+            mapping,
+        })
+    }
+
+    // This is the canonical physical comparator for the next disjoint-draw slice. The producer
+    // journal lands first so no draw is whitelisted against an incomplete footprint.
+    #[allow(dead_code)]
+    pub(crate) fn overlaps(self, other: Self) -> bool {
+        if self.mapping.backing_id != other.mapping.backing_id {
+            return false;
+        }
+        let Some(self_end) = self.mapping.backing_offset.checked_add(self.byte_count) else {
+            return true;
+        };
+        let Some(other_end) = other.mapping.backing_offset.checked_add(other.byte_count) else {
+            return true;
+        };
+        self.mapping.backing_offset < other_end && other.mapping.backing_offset < self_end
+    }
+}
+
+fn append_unique_physical_footprint(
+    destination: &mut Vec<PhysicalFootprintRange>,
+    range: PhysicalFootprintRange,
+) {
+    if !destination.contains(&range) {
+        destination.push(range);
+    }
+}
+
+impl GuestCommandBatch {
+    pub(crate) fn record_resident_write_footprint(
+        &mut self,
+        kind: SharedEventWriteKind,
+        span: Option<super::super::ResourceSpan>,
+    ) {
+        let Some(span) = span else {
+            self.resident_write_footprint_complete = false;
+            return;
+        };
+        let Some(range) = PhysicalFootprintRange::new(
+            kind,
+            span.address(),
+            span.len(),
+            span.backing(),
+        ) else {
+            self.resident_write_footprint_complete = false;
+            return;
+        };
+        append_unique_physical_footprint(&mut self.resident_write_footprint, range);
     }
 }
 
@@ -143,17 +278,34 @@ impl MetalPresenter {
                 return Ok(None);
             }
         };
-        let batch = state
+        {
+            let batch = state
+                .open_batch
+                .as_mut()
+                .expect("host acknowledgement opened a consumer batch");
+            batch.close_active_pass_encoders();
+            batch
+                .command_buffer
+                .encode_signal_event(state.shared_event_timeline.event(), fence.value());
+            batch.max_encoded_signal = Some(fence);
+        }
+        let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+        if !checkpoint.footprint_complete {
+            self.statistics.shared_event_incomplete_signal_footprints = self
+                .statistics
+                .shared_event_incomplete_signal_footprints
+                .saturating_add(1);
+        }
+        debug_assert!(
+            checkpoint.footprint_complete,
+            "shared-event host acknowledgement has an incomplete producer footprint"
+        );
+        state
             .open_batch
             .as_mut()
-            .expect("host acknowledgement opened a consumer batch");
-        batch.close_active_pass_encoders();
-        batch
-            .command_buffer
-            .encode_signal_event(state.shared_event_timeline.event(), fence.value());
-        batch.max_encoded_signal = Some(fence);
-        let checkpoint = SharedEventSignalCheckpoint::capture(batch, fence);
-        batch.signal_checkpoints.push(checkpoint);
+            .expect("host acknowledgement batch remains open")
+            .signal_checkpoints
+            .push(checkpoint);
         self.statistics.shared_event_signals =
             self.statistics.shared_event_signals.saturating_add(1);
         Ok(Some(fence))
@@ -1164,6 +1316,8 @@ fn new_guest_command_batch(
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
         max_encoded_signal: None,

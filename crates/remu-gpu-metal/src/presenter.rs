@@ -1492,6 +1492,7 @@ struct PresenterStatistics {
     shared_event_host_wakes: u32,
     shared_event_gpu_ordered_registered_waits: u32,
     shared_event_gpu_ordered_compute_dispatches: u32,
+    shared_event_incomplete_signal_footprints: u32,
     shared_event_error_advances: u32,
     shared_event_fallbacks_no_exact_producer: u32,
     shared_event_fallbacks_timeline_overflow: u32,
@@ -1538,6 +1539,16 @@ struct GuestCommandBatch {
     global_writebacks: Vec<PendingGlobalWriteback>,
     guest_write_ranges: Vec<PendingGuestWriteRange>,
     memory_writes: Vec<PendingGuestMemoryWrite>,
+    /// Immutable physical destinations written by native work encoded in this batch.
+    ///
+    /// CPU-published globals and command-processor writes remain in their existing vectors and
+    /// are folded into a signal checkpoint at capture time. This journal covers resident/cache
+    /// destinations whose Metal commands can still be in flight when a later queue waits on the
+    /// signal.
+    resident_write_footprint: Vec<PhysicalFootprintRange>,
+    /// False once native work was encoded for a destination without a stable physical identity.
+    /// Unknown identity must remain a host dependency; virtual non-overlap is not a proof.
+    resident_write_footprint_complete: bool,
     render_pass: Option<OpenGuestRenderPass>,
     compute_encoder: Option<ComputeCommandEncoder>,
     /// Highest SharedEvent signal encoded at an exact command-stream point in this batch.
@@ -1564,6 +1575,28 @@ struct SharedEventSignalCheckpoint {
     /// storage remains mutable and therefore cannot cross a queue on a GPU wait alone.
     global_versions: Vec<SharedEventGlobalBufferVersion>,
     unresolved_write_ranges: Vec<SharedEventUnresolvedWriteRange>,
+    /// Complete physical write footprint of every unretired producer batch ordered before this
+    /// exact queue signal, including the signal-owning RELEASE_MEM label.
+    pending_write_footprint: Vec<PhysicalFootprintRange>,
+    footprint_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedEventWriteKind {
+    ResidentDestination,
+    DirectScanoutTarget,
+    CopiedGlobal,
+    ZeroCopyGlobal,
+    TerminalGuestWrite,
+    InternalResidentDestination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhysicalFootprintRange {
+    kind: SharedEventWriteKind,
+    guest_address: u64,
+    byte_count: u64,
+    mapping: GuestSharedMappingIdentity,
 }
 
 #[derive(Clone, Debug)]
