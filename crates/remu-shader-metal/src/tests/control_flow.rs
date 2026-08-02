@@ -481,7 +481,60 @@ fn backward_conditional_control_flow_keeps_the_bounded_dispatcher() {
     assert!(!shader.register_footprint.direct_control_flow);
     assert!(shader.source.contains("while (active)"));
     assert!(shader.source.contains("switch (pc)"));
+    // Small programs keep the 16k floor; larger glyph-class shaders scale with insn count.
     assert!(shader.source.contains("if (steps >= 16384u)"));
+}
+
+#[test]
+fn large_dispatcher_programs_scale_the_step_limit_with_instruction_count() {
+    let mut instructions = Vec::new();
+    for index in 0..600 {
+        let pc = u32::try_from(index * 4).expect("pc fits");
+        instructions.push(Instruction {
+            pc,
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VMovB32"),
+            words: vec![0],
+            sources: vec![Operand::vector(1)],
+            destinations: vec![Operand::vector(2)],
+            control: None,
+        });
+    }
+    // Backward branch so lowering keeps the PC dispatcher.
+    instructions.push(Instruction {
+        pc: u32::try_from(instructions.len() * 4).expect("pc fits"),
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::Known("SCbranchScc1"),
+        words: vec![0xfffe],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    });
+    instructions.push(Instruction {
+        pc: u32::try_from(instructions.len() * 4).expect("pc fits"),
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::END_PROGRAM,
+        words: vec![0xbf81_0000],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    });
+    let shader = compile_msl(
+        &Program::new(0x1000, instructions),
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("large backward program should lower");
+    // 602 instructions * 32 = 19264 > 16384 floor.
+    assert!(
+        shader.source.contains("if (steps >= 19264u)"),
+        "expected scaled step limit, got a source snippet around steps: {}",
+        shader
+            .source
+            .lines()
+            .find(|line| line.contains("steps >="))
+            .unwrap_or("<missing>")
+    );
 }
 
 #[test]

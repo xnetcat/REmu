@@ -78,6 +78,21 @@ impl Compiler<'_> {
                 .expect("masked immediate fits u16")
                 .cast_signed();
             if name.starts_with("SCmpk") {
+                // Poppy UI NGG: `S_CMPK_LE_U32 s4, 0xFFFF` begins the empty-workaround sequence that
+                // clobbers the packed `(verts<<16)|prims` value because wave 0 still holds wave id
+                // in `s2`. Snapshot the packed counts before SCC is consumed by the following
+                // cselects so we can restore verts/prims after `S_MAX`.
+                if name == "SCmpkLeU32"
+                    && immediate == -1
+                    && self.mesh_ngg_packed_export_sgpr == Some(destination)
+                {
+                    self.line(
+                        3,
+                        &format!("remu_ngg_packed_export_counts = s[{destination}];"),
+                    );
+                    self.line(3, "remu_ngg_export_counts_pending = true;");
+                    self.mesh_ngg_export_counts_pending = true;
+                }
                 return self.emit_scalar_compare_values(
                     name,
                     "SCmpk",
@@ -251,10 +266,68 @@ impl Compiler<'_> {
                 format!("min({left}, {right})"),
                 Some(format!("{left} < {right}")),
             ),
-            "SMaxU32" => (
-                format!("max({left}, {right})"),
-                Some(format!("{left} > {right}")),
-            ),
+            "SMaxU32" => {
+                let expression = format!("max({left}, {right})");
+                let scc_expr = format!("{left} > {right}");
+                let result = self.temp("uint", &expression);
+                self.store_scalar(destination, &result);
+                self.line(3, &format!("scc = {scc_expr};"));
+                // After the empty-workaround `S_MAX_U32 s_prim, 1, s2`, restore real export counts
+                // from the packed snapshot so GS_ALLOC and the later `V_CMPX` gates see verts/prims
+                // instead of the wave-0 forced (1, 1). Match only `max(1, …)` so unrelated S_MAX
+                // ops between the compare and alloc cannot steal the restore.
+                let max_with_one = instruction.sources.first().is_some_and(|source| {
+                    source.kind == OperandKind::EncodedConstant && source.value == 129
+                });
+                if max_with_one
+                    && self.mesh_ngg_export_counts_pending
+                    && let Some(packed_sgpr) = self.mesh_ngg_packed_export_sgpr
+                {
+                    // Poppy UI NGG packs a live-prim ballot into the high half (often 2 for a
+                    // quad), not the meshlet output vertex count (4). The empty-workaround
+                    // sequence then forces (1,1) on wave 0. Prefer meshlet header counts when
+                    // present, accept flat low-half scans, and clear s0 so the workaround cannot
+                    // zero prim indices after a non-empty restore.
+                    self.line(3, "if (remu_ngg_export_counts_pending) {");
+                    self.line(
+                        4,
+                        "uint remu_ngg_hi = (remu_ngg_packed_export_counts >> 16) & 0x7ffu;",
+                    );
+                    self.line(
+                        4,
+                        "uint remu_ngg_lo = remu_ngg_packed_export_counts & 0x7ffu;",
+                    );
+                    self.line(
+                        4,
+                        "uint remu_ngg_verts = remu_ngg_hi != 0u ? remu_ngg_hi : remu_ngg_lo;",
+                    );
+                    self.line(
+                        4,
+                        "uint remu_ngg_prims = remu_ngg_hi != 0u ? (remu_ngg_lo == 0u ? 1u : remu_ngg_lo) : max(1u, remu_ngg_lo >> 1u);",
+                    );
+                    self.line(4, "if (remu_mesh_input_vertex_count != 0u && remu_mesh_input_vertex_count < 256u) {");
+                    self.line(5, "remu_ngg_verts = remu_mesh_input_vertex_count;");
+                    self.line(4, "}");
+                    self.line(4, "if (remu_mesh_input_primitive_count != 0u && remu_mesh_input_primitive_count < 256u) {");
+                    self.line(5, "remu_ngg_prims = remu_mesh_input_primitive_count;");
+                    self.line(4, "}");
+                    self.line(4, "if (remu_ngg_verts != 0u || remu_ngg_prims != 0u) {");
+                    self.line(
+                        5,
+                        &format!("s[{packed_sgpr}] = remu_ngg_verts == 0u ? 1u : remu_ngg_verts;"),
+                    );
+                    self.line(
+                        5,
+                        &format!("s[{destination}] = remu_ngg_prims == 0u ? 1u : remu_ngg_prims;"),
+                    );
+                    self.line(5, "s[0] = 0u;");
+                    self.line(4, "}");
+                    self.line(4, "remu_ngg_export_counts_pending = false;");
+                    self.line(3, "}");
+                    self.mesh_ngg_export_counts_pending = false;
+                }
+                return Ok(());
+            }
             "SMinI32" => (
                 format!("as_type<uint>(min(as_type<int>({left}), as_type<int>({right})))"),
                 Some(format!("as_type<int>({left}) < as_type<int>({right})")),

@@ -47,6 +47,19 @@ fn compile_pixel_export_mask(
 }
 
 #[test]
+fn compressed_pixel_export_recovers_coverage_when_guest_packs_zero_alpha() {
+    // Poppy glyph PS packs compressed MRT0 as (R,G,B,0). Emit coverage recovery for A==0.
+    let shader = compile_pixel_export(PixelOutputKind::Float, true);
+    assert!(
+        shader.source.contains(
+            "if (exec && remu_out.mrt0.a == 0.0f) remu_out.mrt0.a = max(max(fabs(remu_out.mrt0.r), fabs(remu_out.mrt0.g)), fabs(remu_out.mrt0.b));"
+        ),
+        "expected premul coverage recovery for A=0 compressed export:\n{}",
+        shader.source
+    );
+}
+
+#[test]
 fn routes_rdna2_mrtz_component_zero_to_fragment_depth() {
     // AMD RDNA2 EXP target 8 is Z. Silent Hill's captured gameplay shaders use EN=1,
     // uncompressed, with VSRC0 carrying the replacement depth.

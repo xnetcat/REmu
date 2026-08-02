@@ -331,6 +331,153 @@ fn packs_wave64_merged_wave_info_for_split_ngg_mesh_exports() {
 }
 
 #[test]
+fn restores_ngg_packed_export_counts_after_empty_workaround_clobber() {
+    // Poppy glyph mesh packs `(verts<<16)|prims` into s4, then runs the GFX10 empty workaround
+    // keyed off `s2 == 0`. On remu, s2 still holds wave id 0 for the allocating wave, so the
+    // guest forces GS_ALLOC / V_CMPX counts to 1 and only vertex 0 exports (solid tofu quads).
+    // Lowering must snapshot the packed value at S_CMPK_LE and restore after S_MAX_U32 s*, 1, *.
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopk,
+                opcode: Opcode::Known("SCmpkLeU32"),
+                words: vec![0xb704_ffff],
+                sources: vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 65535,
+                }],
+                destinations: vec![Operand::scalar(4)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SCselectB32"),
+                words: vec![0x8502_6a81],
+                sources: vec![
+                    Operand {
+                        kind: OperandKind::EncodedConstant,
+                        value: 129,
+                    },
+                    Operand::scalar(106),
+                ],
+                destinations: vec![Operand::scalar(2)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SMaxU32"),
+                words: vec![0x8506_6a81],
+                sources: vec![
+                    Operand {
+                        kind: OperandKind::EncodedConstant,
+                        value: 129,
+                    },
+                    Operand::scalar(2),
+                ],
+                destinations: vec![Operand::scalar(107)],
+                control: None,
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known("SOrB32"),
+                words: vec![0x887c_6a04],
+                sources: vec![Operand::scalar(4), Operand::scalar(106)],
+                destinations: vec![Operand::scalar(124)],
+                control: None,
+            },
+            Instruction {
+                pc: 16,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: vec![0xbf90_0009],
+                sources: vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 20,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 192, 64, 192);
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("NGG packed-count restore should lower");
+    assert!(
+        shader
+            .source
+            .contains("uint remu_ngg_packed_export_counts = 0u;"),
+        "packed export counts need function-scoped storage across CF blocks"
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_ngg_packed_export_counts = remu_s_4;"),
+        "S_CMPK_LE must snapshot packed (verts<<16)|prims before the empty workaround"
+    );
+    assert!(
+        shader
+            .source
+            .contains("uint remu_ngg_hi = (remu_ngg_packed_export_counts >> 16) & 0x7ffu;"),
+        "restore must read the high half of the pre-alloc SGPR"
+    );
+    assert!(
+        shader
+            .source
+            .contains("uint remu_ngg_lo = remu_ngg_packed_export_counts & 0x7ffu;"),
+        "restore must read the low half of the pre-alloc SGPR"
+    );
+    assert!(
+        shader.source.contains(
+            "uint remu_ngg_verts = remu_ngg_hi != 0u ? remu_ngg_hi : remu_ngg_lo;"
+        ),
+        "flat scan counts live in the low half; packed counts put verts in the high half"
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_ngg_verts = remu_mesh_input_vertex_count;"),
+        "meshlet vertex count is authoritative for passthrough NGG UI quads"
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_ngg_prims = remu_mesh_input_primitive_count;"),
+        "meshlet primitive count is authoritative for passthrough NGG UI quads"
+    );
+    assert!(
+        shader.source.contains("remu_s_0 = 0u;"),
+        "restore must clear the empty-workaround flag so prim indices are not forced to zero"
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_s_4 = remu_ngg_verts == 0u ? 1u : remu_ngg_verts;"),
+        "s4 must become the vertex count used by GS_ALLOC low bits and V_CMPX"
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_s_107 = remu_ngg_prims == 0u ? 1u : remu_ngg_prims;"),
+        "s107 must become the primitive count used by GS_ALLOC[22:12] and prim V_CMPX"
+    );
+}
+
+#[test]
 fn stages_ngg_mesh_vertex_exports_by_compacted_vertex_vgpr() {
     // Poppy Slate UI: EXP is gated by `V_CMPX_GT_U32 s4, v18` where v18 is the compacted
     // vertex id. Publishing remu_out via remu_thread_index swaps UV/position across slots.

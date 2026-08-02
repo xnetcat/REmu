@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use remu_shader::{ImageBindingSlotMap, Program, ShaderEvaluation};
+use remu_shader::{ImageBindingSlotMap, OperandKind, Program, ShaderEvaluation};
 
 use crate::compiler::control_flow::ControlFlowLowering;
 use crate::compiler::image::ImageKind;
@@ -51,6 +51,16 @@ pub(crate) struct Compiler<'a> {
     /// `remu_mesh_staged_vertices[vN]` so the epilogue can `set_vertex` by compacted index
     /// instead of `remu_thread_index` (Poppy Slate UI tofu).
     mesh_export_vertex_vgpr: Option<u32>,
+    /// SGPR that holds the pre-GS_ALLOC packed export counts `(verts << 16) | prims` when the
+    /// mesh program uses the GFX10 empty-workaround sequence. Wave 0 still holds the merged wave
+    /// id in `s2`, so the guest `s2 == 0` check always forces counts to 1 and starves EXP; we
+    /// save the packed value at `S_CMPK_LE` and restore verts/prims after the following `S_MAX`.
+    mesh_ngg_packed_export_sgpr: Option<u32>,
+    mesh_ngg_export_counts_pending: bool,
+    /// Pixel-stage `V_READFIRSTLANE`/`V_CMPX`/`S_MOV M0`/`V_MOVRELS` serialization leaves the
+    /// per-lane index VGPR here so `V_MOVRELS` can index without relying on a uniform M0 after
+    /// `V_CMPX` has killed every non-matching fragment lane.
+    pending_movrels_lane_index_vgpr: Option<u32>,
 }
 
 impl Compiler<'_> {
@@ -63,6 +73,16 @@ impl Compiler<'_> {
 
     fn split_wave64(&self) -> bool {
         self.is_threadgroup_stage() && self.options.wave_lane_count == 64
+    }
+
+    /// Upper bound on dispatcher loop iterations before the shader aborts.
+    ///
+    /// Poppy's Slate glyph PS is ~2.7k guest instructions with dozens of relative-move
+    /// serialization loops. A fixed 16k budget is only a few single walks of that program and
+    /// can `active = false` mid-SDF, leaving the default opaque clear color (solid tofu quads).
+    fn dispatcher_step_limit(&self) -> u32 {
+        let instructions = u32::try_from(self.program.instructions.len()).unwrap_or(u32::MAX);
+        instructions.saturating_mul(32).max(16_384)
     }
 
     fn readfirstlane_site_count(&self) -> usize {
@@ -139,6 +159,30 @@ impl Compiler<'_> {
             .iter()
             .filter(|instruction| instruction.opcode.is("DsWriteAddtidB32"))
             .count()
+    }
+
+    /// VGPRs that Poppy's glyph PS (and similar) fill via `V_WRITELANE` then reload with
+    /// `V_READLANE` as a wave-wide constant table. Metal fragment/vertex simdgroups do not
+    /// guarantee those architectural lanes are occupied, so `simd_shuffle` cannot emulate the
+    /// table — each invocation keeps a private copy instead.
+    fn graphics_lane_file_vgprs(&self) -> BTreeSet<u32> {
+        if self.is_threadgroup_stage() {
+            return BTreeSet::new();
+        }
+        self.program
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.opcode.is("VWritelaneB32"))
+            .filter_map(|instruction| {
+                instruction.destinations.first().and_then(|destination| {
+                    (destination.kind == OperandKind::VectorRegister).then_some(destination.value)
+                })
+            })
+            .collect()
+    }
+
+    fn graphics_lane_file_vgpr(&self, vgpr: u32) -> bool {
+        self.graphics_lane_file_vgprs().contains(&vgpr)
     }
 
     fn graphics_addtid_write_slot(&self, pc: u32) -> Option<usize> {

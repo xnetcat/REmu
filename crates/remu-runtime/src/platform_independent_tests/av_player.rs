@@ -354,8 +354,13 @@ fn av_player_gen5_extended_stream_info_preserves_size_and_reports_frame_rate() {
 fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
     assert_eq!(
         crate::av_player::av_player_nv12_layout(378, 150, true),
-        Some((512, 115_200)),
-        "the extended ABI uses its explicit 256-byte-aligned pitch"
+        Some((512, 122_880)),
+        "the extended ABI uses its explicit pitch and the GPU-aligned storage height"
+    );
+    assert_eq!(
+        crate::av_player::av_player_nv12_layout(1_920, 1_080, true),
+        Some((2_048, 3_342_336)),
+        "1080-line NV12 must reserve the 1088-line texture extent consumed by the guest"
     );
     let mut frame_info = [0xab_u8; 112];
     crate::av_player_write_video_frame_info(

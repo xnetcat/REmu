@@ -73,6 +73,81 @@ fn lowers_relative_vector_moves_with_m0_and_the_allocated_register_limit() {
 }
 
 #[test]
+fn pixel_movrels_serialization_indexes_per_lane_without_killing_exec() {
+    // Guest wave-serializes divergent relative VGPR banks:
+    //   v_readfirstlane_b32 s4, v5
+    //   v_cmpx_eq_u32 s4, v5
+    //   s_mov_b32 m0, s4
+    //   v_movrels_b32 v2, v0
+    // On Metal fragments that must not permanently clear non-matching lanes.
+    let mut options = MetalCompileOptions::pixel(Vec::new(), 0, 0);
+    options.allocated_vector_register_count = 8;
+    let shader = compile_msl(
+        &Program::new(
+            0x1000,
+            vec![
+                Instruction {
+                    pc: 0x1000,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VReadfirstlaneB32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(5)],
+                    destinations: vec![Operand::scalar(4)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 0x1004,
+                    encoding: ShaderEncoding::Vopc,
+                    opcode: Opcode::Known("VCmpxEqU32"),
+                    words: vec![0],
+                    sources: vec![Operand::scalar(4), Operand::vector(5)],
+                    destinations: vec![],
+                    control: None,
+                },
+                Instruction {
+                    pc: 0x1008,
+                    encoding: ShaderEncoding::Sop1,
+                    opcode: Opcode::Known("SMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand::scalar(4)],
+                    destinations: vec![Operand::scalar(124)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 0x100c,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovrelsB32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(0)],
+                    destinations: vec![Operand::vector(2)],
+                    control: None,
+                },
+            ],
+        ),
+        &empty_evaluation(),
+        &options,
+    )
+    .expect("pixel movrels serialization should lower");
+
+    assert!(
+        shader.source.contains("switch (remu_v_5)"),
+        "expected per-lane index switch, got:\n{}",
+        shader.source
+    );
+    assert!(
+        !shader.source.contains("switch (remu_s_124)"),
+        "must not index MOVRELS by uniform M0 in the serialization idiom:\n{}",
+        shader.source
+    );
+    assert!(
+        !shader.source.contains("== (remu_v_5)"),
+        "V_CMPX must not kill EXEC for non-matching lanes:\n{}",
+        shader.source
+    );
+    assert!(shader.source.contains("if (exec) remu_v_2 ="));
+}
+
+#[test]
 fn lowers_unsigned_vector_bitfield_extract_without_overrunning_the_word() {
     let shader = compile_vector_instruction(
         Instruction {

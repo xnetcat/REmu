@@ -14,6 +14,18 @@ impl Compiler<'_> {
         instruction: &Instruction,
         name: &str,
     ) -> Result<(), String> {
+        // Poppy glyph PS serializes divergent `V_MOVRELS` indices with
+        // `V_READFIRSTLANE` → `V_CMPX_EQ` → `S_MOV M0` → `V_MOVRELS` and a work-mask loop.
+        // On Metal fragment simdgroups, pixels that need different unique indices diverge the
+        // interpreter PC; later `simd_ballot`/`simd_shuffle` then starve SDF segment lanes into
+        // solid fills. Keep EXEC intact here and let `V_MOVRELS` index by the per-lane VGPR so
+        // every active lane completes in one pass and the work-mask clears uniformly.
+        if name.starts_with("VCmpx")
+            && let Some(index_vgpr) = self.pixel_movrels_serialization_index_vgpr(instruction)
+        {
+            self.pending_movrels_lane_index_vgpr = Some(index_vgpr);
+            return Ok(());
+        }
         let float_source = |index| {
             if name.ends_with("F16") {
                 self.half_float_source(instruction, index)

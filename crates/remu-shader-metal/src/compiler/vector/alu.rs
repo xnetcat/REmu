@@ -58,6 +58,9 @@ impl Compiler<'_> {
             let destination = destination_scalar(instruction)?;
             let value = self.raw_source(instruction, 0)?;
             let lane = self.raw_source(instruction, 1)?;
+            let source_vgpr = instruction.sources.first().and_then(|source| {
+                (source.kind == OperandKind::VectorRegister).then_some(source.value)
+            });
             let selected = if self.split_wave64() {
                 self.line(
                     3,
@@ -74,6 +77,20 @@ impl Compiler<'_> {
                 // have consumed the current value.
                 self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
                 selected
+            } else if let Some(vgpr) = source_vgpr.filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr))
+            {
+                // Pixel/vertex: read the private wave-VGPR table filled by V_WRITELANE. Metal
+                // fragment simdgroups often have only a 2x2 quad of active lanes, so shuffling
+                // from lane 9+ would miss Poppy Slate's SDF constant table and solid-fill tofu.
+                let lane_mask = if self.options.wave_lane_count == 64 {
+                    63
+                } else {
+                    31
+                };
+                self.temp(
+                    "uint",
+                    &format!("remu_v_{vgpr}_lanes[({lane}) & {lane_mask}u]"),
+                )
             } else {
                 self.temp(
                     "uint",
@@ -82,6 +99,23 @@ impl Compiler<'_> {
             };
             // V_READLANE is a wave operation and is architecturally independent of EXEC.
             self.store_scalar(destination, &selected);
+            // Poppy glyph NGG: the lane-3 reduce into the packed export SGPR can be 0 when the
+            // per-wave LDS totals never load (wave-count mask edge). Without verts in the high
+            // half, the later `v18 < (s4>>16)` prim-rebuild gate is skipped and PLAY/SETTINGS
+            // keep culled indices. Fall back to the meshlet header before that compare runs.
+            if self.mesh_ngg_packed_export_sgpr == Some(destination) {
+                self.line(
+                    3,
+                    &format!("if (((s[{destination}] >> 16) & 0xFFFFu) == 0u && remu_mesh_input_vertex_count != 0u && remu_mesh_input_vertex_count < 256u) {{"),
+                );
+                self.line(
+                    4,
+                    &format!(
+                        "s[{destination}] = ((remu_mesh_input_vertex_count & 0xFFFFu) << 16) | (remu_mesh_input_primitive_count & 0xFFFFu);"
+                    ),
+                );
+                self.line(3, "}");
+            }
             return Ok(());
         }
         if name == "VReadfirstlaneB32" {
@@ -151,10 +185,20 @@ impl Compiler<'_> {
             } else {
                 31
             };
+            let lane_index = format!("({lane}) & {lane_mask}u");
+            if self.graphics_lane_file_vgpr(destination) {
+                // Every graphics invocation executes the same uniform writelane stream, so each
+                // thread can keep a complete private copy of the wave VGPR without needing the
+                // destination architectural lane to be occupied in the Metal simdgroup.
+                self.line(
+                    3,
+                    &format!("remu_v_{destination}_lanes[{lane_index}] = {value};"),
+                );
+            }
             self.line(
                 3,
                 &format!(
-                    "if ({architectural_lane} == (({lane}) & {lane_mask}u)) v[{destination}] = {value};"
+                    "if ({architectural_lane} == ({lane_index})) v[{destination}] = {value};"
                 ),
             );
             return Ok(());
@@ -860,25 +904,92 @@ impl Compiler<'_> {
             .ok_or_else(|| "missing relative-move source operand".to_owned())?;
         let relative_source = matches!(name, "VMovrelsB32" | "VMovrelsdB32");
         let relative_destination = matches!(name, "VMovreldB32" | "VMovrelsdB32");
+        let relative_index = self.relative_vector_index_expression();
         let value = if relative_source {
             if source.kind != OperandKind::VectorRegister {
                 return Err(format!(
                     "{name} requires a vector-register source, found {source}"
                 ));
             }
-            self.relative_vector_source(source.value)?
+            self.relative_vector_source(source.value, &relative_index)?
         } else {
             self.raw_source(instruction, 0)?
         };
         if relative_destination {
-            self.store_relative_vector(destination, &value);
+            self.store_relative_vector(destination, &value, &relative_index);
         } else {
             self.store_vector(destination, &value);
         }
+        self.pending_movrels_lane_index_vgpr = None;
         Ok(())
     }
 
-    fn relative_vector_source(&mut self, base: u32) -> Result<String, String> {
+    /// Selector for `V_MOVREL*`: architectural M0 (`s[124]`), or the per-lane index VGPR when the
+    /// pixel-stage serialization idiom was recognized at the preceding `V_CMPX`.
+    fn relative_vector_index_expression(&self) -> String {
+        self.pending_movrels_lane_index_vgpr
+            .map_or_else(|| "s[124]".to_owned(), |vgpr| format!("v[{vgpr}]"))
+    }
+
+    /// Detects `V_READFIRSTLANE vIdx → sTmp; V_CMPX_EQ sTmp, vIdx; S_MOV M0, sTmp; V_MOVRELS`.
+    ///
+    /// Returns the per-lane index VGPR when the pixel shader uses that AMD wave-serialization
+    /// pattern so Metal can keep divergent fragment lanes alive.
+    pub(crate) fn pixel_movrels_serialization_index_vgpr(
+        &self,
+        cmpx: &Instruction,
+    ) -> Option<u32> {
+        if self.options.stage != crate::MetalShaderStage::Pixel {
+            return None;
+        }
+        if !cmpx.opcode.is("VCmpxEqU32") {
+            return None;
+        }
+        let index = self
+            .program
+            .instructions
+            .iter()
+            .position(|instruction| instruction.pc == cmpx.pc)?;
+        if index == 0 {
+            return None;
+        }
+        let readfirst = &self.program.instructions[index - 1];
+        let mov_m0 = self.program.instructions.get(index + 1)?;
+        let movrels = self.program.instructions.get(index + 2)?;
+        if !readfirst.opcode.is("VReadfirstlaneB32")
+            || !mov_m0.opcode.is("SMovB32")
+            || !(movrels.opcode.is("VMovrelsB32") || movrels.opcode.is("VMovrelsdB32"))
+        {
+            return None;
+        }
+        let index_vgpr = readfirst.sources.first().and_then(|source| {
+            (source.kind == OperandKind::VectorRegister).then_some(source.value)
+        })?;
+        let tmp_sgpr = readfirst.destinations.first().and_then(|destination| {
+            (destination.kind == OperandKind::ScalarRegister).then_some(destination.value)
+        })?;
+        let cmp_scalar = cmpx.sources.first()?;
+        let cmp_vector = cmpx.sources.get(1)?;
+        if cmp_scalar.kind != OperandKind::ScalarRegister
+            || cmp_scalar.value != tmp_sgpr
+            || cmp_vector.kind != OperandKind::VectorRegister
+            || cmp_vector.value != index_vgpr
+        {
+            return None;
+        }
+        let m0_source = mov_m0.sources.first()?;
+        let m0_destination = mov_m0.destinations.first()?;
+        if m0_source.kind != OperandKind::ScalarRegister
+            || m0_source.value != tmp_sgpr
+            || m0_destination.kind != OperandKind::ScalarRegister
+            || m0_destination.value != 124
+        {
+            return None;
+        }
+        Some(index_vgpr)
+    }
+
+    fn relative_vector_source(&mut self, base: u32, index: &str) -> Result<String, String> {
         if base >= crate::VECTOR_REGISTER_COUNT {
             return Err(format!(
                 "relative vector source v{base} exceeds the vector register file"
@@ -888,7 +999,7 @@ impl Compiler<'_> {
         // fixed cases preserves that behavior and lets module scalarization keep independent
         // register locals instead of materializing a 256-word addressable array per Metal lane.
         let selected = self.temp("uint", "v[0]");
-        self.line(3, "switch (s[124]) {");
+        self.line(3, &format!("switch ({index}) {{"));
         for register in base..self.options.allocated_vector_register_count {
             self.line(
                 4,
@@ -903,12 +1014,12 @@ impl Compiler<'_> {
         Ok(selected)
     }
 
-    fn store_relative_vector(&mut self, base: u32, value: &str) {
+    fn store_relative_vector(&mut self, base: u32, value: &str, index: &str) {
         for register in base..self.options.allocated_vector_register_count {
             self.line(
                 3,
                 &format!(
-                    "if (exec && s[124] == {}u) v[{register}] = {value};",
+                    "if (exec && {index} == {}u) v[{register}] = {value};",
                     register - base
                 ),
             );

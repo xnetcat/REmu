@@ -19,7 +19,7 @@ use crate::compiler::image::{
 };
 use crate::compiler::interface::{PixelInterpolation, interpolation_for_barycentric_vgpr};
 use crate::compiler::memory::is_lds_memory_instruction;
-use crate::compiler::export::mesh_export_vertex_vgpr;
+use crate::compiler::export::{mesh_export_vertex_vgpr, mesh_ngg_packed_export_sgpr};
 use crate::{
     Compiler, METAL_DIRECT_TEXTURE_LIMIT, MetalBindingLayout, MetalCompileError,
     MetalCompileOptions, MetalRegisterFootprint, MetalShader, MetalShaderStage,
@@ -184,6 +184,9 @@ impl<'a> Compiler<'a> {
         let mesh_export_vertex_vgpr = (options.stage == MetalShaderStage::Mesh)
             .then(|| mesh_export_vertex_vgpr(program))
             .flatten();
+        let mesh_ngg_packed_export_sgpr = (options.stage == MetalShaderStage::Mesh)
+            .then(|| mesh_ngg_packed_export_sgpr(program))
+            .flatten();
 
         Ok(Self {
             program,
@@ -198,6 +201,9 @@ impl<'a> Compiler<'a> {
             image_slots,
             control_flow,
             mesh_export_vertex_vgpr,
+            mesh_ngg_packed_export_sgpr,
+            mesh_ngg_export_counts_pending: false,
+            pending_movrels_lane_index_vgpr: None,
         })
     }
 

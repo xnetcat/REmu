@@ -350,6 +350,14 @@ impl Compiler<'_> {
                      \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n",
                 );
             }
+            if self.mesh_ngg_packed_export_sgpr.is_some() {
+                // Function-scoped so dispatcher / forward CF blocks can save at S_CMPK and restore
+                // after S_MAX without crossing Metal lexical scopes.
+                source.push_str(
+                    "    uint remu_ngg_packed_export_counts = 0u;\n\
+                     \x20   bool remu_ngg_export_counts_pending = false;\n",
+                );
+            }
         }
         if self.split_wave64() {
             source.push_str(
@@ -407,6 +415,20 @@ impl Compiler<'_> {
             // of one is the architectural lane index. Wave operations are emitted before the
             // EXEC-guarded write, keeping every host lane converged at simdgroup intrinsics.
             source.push_str("    uint remu_lane = simd_prefix_exclusive_sum(1u);\n");
+            let lane_file_width = if self.options.wave_lane_count == 64 {
+                64
+            } else {
+                32
+            };
+            for vgpr in self.graphics_lane_file_vgprs() {
+                // Private wave-VGPR tables for V_WRITELANE/V_READLANE constant packing. Metal
+                // fragment quads rarely occupy architectural lanes past the first few, so a
+                // simd_shuffle-based table would leave Poppy Slate SDF constants as zeroes.
+                let _ = writeln!(
+                    source,
+                    "    uint remu_v_{vgpr}_lanes[{lane_file_width}] = {{}};"
+                );
+            }
         }
         let graphics_addtid_slots = self.graphics_addtid_write_slot_count();
         if graphics_addtid_slots != 0 {
@@ -573,11 +595,13 @@ impl Compiler<'_> {
             ControlFlowLowering::Direct(_) => source.push_str(&self.body),
             ControlFlowLowering::Forward => source.push_str(&self.body),
             ControlFlowLowering::Dispatcher => {
+                let step_limit = self.dispatcher_step_limit();
                 source.push_str("    while (active) {\n        switch (pc) {\n");
                 source.push_str(&self.body);
-                source.push_str(
-                    "        default: active = false; break;\n        }\n\
-                     \x20       if (steps >= 16384u) active = false;\n    }\n",
+                let _ = writeln!(
+                    source,
+                    "        default: active = false; break;\n        }}\n\
+                     \x20       if (steps >= {step_limit}u) active = false;\n    }}"
                 );
             }
         }

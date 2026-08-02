@@ -12,6 +12,35 @@ use crate::compiler::interface::vertex_clip_distance_mask;
 use crate::compiler::vector::{destination_vector, vector_operand};
 use crate::{Compiler, MetalShaderStage};
 
+/// Locate the SGPR that holds packed NGG export counts `(verts << 16) | prims` immediately before
+/// the GFX10 empty-workaround / `GS_ALLOC_REQ` sequence (`S_CMPK_LE_U32 sN, 0xFFFF` then later
+/// `S_SENDMSG` message 9).
+pub(crate) fn mesh_ngg_packed_export_sgpr(program: &Program) -> Option<u32> {
+    let has_gs_alloc = program.instructions.iter().any(|instruction| {
+        instruction.opcode.is("SSendmsg")
+            && instruction.sources.first().is_some_and(|source| {
+                source.kind == OperandKind::EncodedConstant && source.value == 9
+            })
+    });
+    if !has_gs_alloc {
+        return None;
+    }
+    program.instructions.iter().find_map(|instruction| {
+        if !instruction.opcode.is("SCmpkLeU32") {
+            return None;
+        }
+        let imm = instruction.words.first().copied().unwrap_or(0) & 0xffff;
+        if imm != 0xffff {
+            return None;
+        }
+        instruction
+            .destinations
+            .first()
+            .filter(|operand| operand.kind == OperandKind::ScalarRegister)
+            .map(|operand| operand.value)
+    })
+}
+
 /// Locate the VGPR that carries the NGG compacted vertex id used to gate POS export
 /// (typically `V_CMPX_* sN, vM` immediately before the first `EXP POS`).
 pub(crate) fn mesh_export_vertex_vgpr(program: &Program) -> Option<u32> {
@@ -334,6 +363,21 @@ impl Compiler<'_> {
                 values[0], values[1], values[2], values[3]
             ),
         );
+        // Poppy Slate SDF packs compressed MRT0 as (R,G,B,0) after V_CVT_PKRTZ …, 0. Premul RGB
+        // still carries coverage, but A=0 makes SrcAlpha / OneMinusSrcAlpha compositing a no-op
+        // or leaves the default opaque alpha from init — both read as solid letter boxes. Recover
+        // coverage from premul RGB when the guest explicitly exported a zero alpha.
+        if export.compressed
+            && matches!(output.kind, PixelOutputKind::Float)
+            && export.enable_mask & 0b0100 != 0
+        {
+            self.line(
+                3,
+                &format!(
+                    "if (exec && {field}.a == 0.0f) {field}.a = max(max(fabs({field}.r), fabs({field}.g)), fabs({field}.b));"
+                ),
+            );
+        }
         Ok(())
     }
 

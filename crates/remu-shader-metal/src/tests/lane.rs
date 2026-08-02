@@ -366,6 +366,7 @@ fn memory_heavy_acyclic_readfirstlane_retains_shared_records() {
 
 #[test]
 fn lowers_readlane_and_writelane_independently_of_exec() {
+    // Bare V_READLANE of a non-writelane VGPR still uses simd_shuffle.
     let read = compile_vector_instruction(
         Instruction {
             pc: 0,
@@ -399,9 +400,96 @@ fn lowers_readlane_and_writelane_independently_of_exec() {
     assert!(
         write
             .source
+            .contains("uint remu_v_8_lanes[32] = {};"),
+        "pixel V_WRITELANE needs a private lane table"
+    );
+    assert!(
+        write
+            .source
+            .contains("remu_v_8_lanes[(remu_s_4) & 31u] = remu_s_2;"),
+        "every fragment must record the writelane even when its remu_lane is not the target"
+    );
+    assert!(
+        write
+            .source
             .contains("if (remu_lane == ((remu_s_4) & 31u)) remu_v_8 = remu_s_2;")
     );
     assert!(!write.source.contains("if (exec) remu_v_8 ="));
+}
+
+#[test]
+fn pixel_readlane_uses_writelane_private_lane_file() {
+    // Poppy glyph PS packs SDF float constants with V_WRITELANE into v12 then V_READLANE.
+    // Metal fragment simdgroups do not occupy lanes 0..21, so simd_shuffle cannot see them.
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VWritelaneB32"),
+                words: vec![0, 0],
+                sources: vec![Operand::scalar(2), Operand::scalar(4)],
+                destinations: vec![Operand::vector(12)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VReadlaneB32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(12), Operand::scalar(4)],
+                destinations: vec![Operand::scalar(8)],
+                control: None,
+            },
+        ],
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions {
+            stage: MetalShaderStage::Pixel,
+            required_vertex_output_count: 0,
+            vertex_output_control: 0,
+            render_target_array_length: 1,
+            pixel_outputs: Vec::new(),
+            pixel_depth_export: false,
+            pixel_input_enable: 0,
+            pixel_input_address: 0,
+            pixel_input_controls: identity_pixel_input_controls(),
+            diagnostic_force_visible_clip_depth: false,
+            diagnostic_force_vertex_pattern: false,
+            diagnostic_force_vertex_fetch_id: false,
+            diagnostic_capture_vertex_position: false,
+            diagnostic_capture_pixel_output: false,
+            diagnostic_force_pixel_color: false,
+            mesh_max_vertex_count: 0,
+            mesh_max_primitive_count: 0,
+            mesh_threadgroup_size: 0,
+            lds_size_bytes: 0,
+            wave_lane_count: 32,
+            allocated_vector_register_count: 256,
+        },
+    )
+    .expect("pixel writelane/readlane pair should lower");
+    assert!(shader.source.contains("uint remu_v_12_lanes[32] = {};"));
+    assert!(
+        shader
+            .source
+            .contains("remu_v_12_lanes[(remu_s_4) & 31u] = remu_s_2;")
+    );
+    assert!(
+        shader.source.contains("remu_s_8 = remu_v_12_lanes[(remu_s_4) & 31u]")
+            || shader
+                .source
+                .contains("remu_v_12_lanes[(remu_s_4) & 31u];"),
+        "readlane must load the private table, not simd_shuffle: {}",
+        shader.source
+    );
+    assert!(
+        !shader.source.contains("simd_shuffle(remu_v_12"),
+        "simd_shuffle cannot see inactive fragment lanes for the SDF constant table"
+    );
 }
 
 #[test]
