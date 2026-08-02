@@ -6,7 +6,8 @@ use super::super::GuestBatchFlushReason;
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture,
-    ResidentTextureActivityStamp, ScanoutSnapshotTexture, WriteWatchRefresh,
+    ResidentTextureActivityStamp, ScanoutSnapshotTexture, TEXTURE_QUARANTINE_ADOPTED,
+    TEXTURE_QUARANTINE_REJECTED, WriteWatchRefresh,
     create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
     decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
     guest_texture_byte_count, guest_texture_descriptors_overlap,
@@ -28,6 +29,7 @@ use metal::{
 use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 /// Read-only attribution for persistent Metal render/storage targets.
@@ -132,6 +134,9 @@ impl MetalPresenter {
         current_flip: u64,
         maximum_evictions: usize,
     ) -> Result<(usize, u64), String> {
+        // Quarantined allocations are the cheapest memory to reclaim, and an adoption must
+        // never resurrect an allocation the budget pass deliberately released.
+        self.retired_texture_quarantine.clear();
         let plan = resident_texture_eviction_plan(
             &self.resident_guest_textures,
             byte_capacity,
@@ -351,6 +356,7 @@ impl MetalPresenter {
             promotion_command_buffer.as_deref(),
             descriptor,
             &mut self.resident_guest_textures,
+            &mut self.retired_texture_quarantine,
             Mode27WorkOrigin::StorageCreate,
         )
     }
@@ -544,6 +550,7 @@ impl MetalPresenter {
             device,
             descriptor,
             &mut self.resident_guest_textures,
+            &mut self.retired_texture_quarantine,
             upload_guest_contents,
         )
     }
@@ -1194,6 +1201,10 @@ impl MetalPresenter {
             for stale_alias in stale_aliases {
                 if let Some(resident) = self.resident_guest_textures.remove(&stale_alias) {
                     trace_resident_texture_removal("gpu-write-invalidates-clean-alias", &resident);
+                    // Unreal sub-allocates many live surfaces inside one pooled allocation, so
+                    // most "stale" aliases here are untouched neighbours of the written range.
+                    // Keep them adoptable while their watch can still prove the bytes unchanged.
+                    self.quarantine_clean_resident(resident);
                 }
             }
             let resident = self
@@ -1206,6 +1217,36 @@ impl MetalPresenter {
             resident.note_gpu_write();
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
+    }
+
+    /// Holds a retired clean resident for adoption while its write watch stays armed.
+    ///
+    /// Only residents the GPU never wrote enter the quarantine, so an adoption can never skip
+    /// a writeback the guest is owed. A watch whose mapping was replaced can no longer prove
+    /// anything about its bytes and is dropped instead.
+    fn quarantine_clean_resident(&mut self, resident: ResidentGuestTexture) {
+        if resident.gpu_written
+            || resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced)
+        {
+            return;
+        }
+        if self.retired_texture_quarantine.len() >= RETIRED_TEXTURE_QUARANTINE_CAPACITY
+            && !self
+                .retired_texture_quarantine
+                .contains_key(&resident.descriptor)
+        {
+            let oldest = self
+                .retired_texture_quarantine
+                .iter()
+                .min_by_key(|(_, candidate)| (candidate.last_use.flip, candidate.last_use.work))
+                .map(|(descriptor, _)| *descriptor);
+            let Some(oldest) = oldest else {
+                return;
+            };
+            self.retired_texture_quarantine.remove(&oldest);
+        }
+        self.retired_texture_quarantine
+            .insert(resident.descriptor, resident);
     }
 
     pub(crate) fn note_resident_texture_read_at(
@@ -1233,12 +1274,51 @@ impl MetalPresenter {
     }
 }
 
+/// Entries the retirement quarantine holds at most.
+///
+/// The population is the live tenant set of the guest's pooled render-target heaps — dozens,
+/// not thousands — and every entry pins a Metal allocation, so the bound stays small and
+/// eviction prefers the least recently used surface.
+pub(crate) const RETIRED_TEXTURE_QUARANTINE_CAPACITY: usize = 64;
+
+/// Re-adopts a quarantined clean resident whose watch proves its bytes are unchanged.
+///
+/// Adoption restores the exact pre-retirement resident, so the caller's normal reuse and
+/// promotion logic applies unchanged afterwards. A stale entry — replaced mapping, mid-flight
+/// reprotect, or validated content change — is dropped so the ordinary rebuild runs.
+pub(crate) fn adopt_quarantined_resident(
+    descriptor: GuestTextureDescriptor,
+    resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+) -> Result<(), String> {
+    if resident_guest_textures.contains_key(&descriptor) {
+        return Ok(());
+    }
+    let Some(mut quarantined) = retired_texture_quarantine.remove(&descriptor) else {
+        return Ok(());
+    };
+    let watch_usable = matches!(
+        refresh_resident_texture_write_watch(&mut quarantined)?,
+        WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. }
+    );
+    if watch_usable && !quarantined.write_watch.content_has_changed()? {
+        TEXTURE_QUARANTINE_ADOPTED.fetch_add(1, Ordering::Relaxed);
+        resident_guest_textures.insert(descriptor, quarantined);
+    } else {
+        TEXTURE_QUARANTINE_REJECTED.fetch_add(1, Ordering::Relaxed);
+        trace_resident_texture_removal("quarantine-stale", &quarantined);
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_resident_texture_in_map(
     device: &Device,
     descriptor: GuestTextureDescriptor,
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     upload_guest_contents: bool,
 ) -> Result<Texture, String> {
+    adopt_quarantined_resident(descriptor, resident_guest_textures, retired_texture_quarantine)?;
     if let Some(resident) = resident_guest_textures
         .get_mut(&descriptor)
         .filter(|resident| {

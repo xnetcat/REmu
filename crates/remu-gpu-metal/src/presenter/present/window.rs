@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::{command_buffer_native_state_summary, trace_metal_command_stalls};
+use super::super::texture::RETIRED_TEXTURE_QUARANTINE_CAPACITY;
+use super::super::{TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED};
 use super::{
     EVENT_POLL_INTERVAL, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS,
@@ -386,8 +388,10 @@ impl MetalPresenter {
             let alias_writeback_bytes = SAMPLED_ALIAS_WRITEBACK_BYTES.swap(0, Ordering::Relaxed);
             let alias_writeback_nanoseconds =
                 SAMPLED_ALIAS_WRITEBACK_NANOSECONDS.swap(0, Ordering::Relaxed);
+            let quarantine_adopted = TEXTURE_QUARANTINE_ADOPTED.swap(0, Ordering::Relaxed);
+            let quarantine_rejected = TEXTURE_QUARANTINE_REJECTED.swap(0, Ordering::Relaxed);
             eprintln!(
-                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB guest={}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms",
+                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB guest={}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms quarantine={}/{} adopt={} stale={}",
                 self.sampled_texture_cache.len(),
                 sampled_texture_cache_mib,
                 sampled_texture_cache_guest_mib,
@@ -404,6 +408,10 @@ impl MetalPresenter {
                 alias_writeback_count,
                 alias_writeback_bytes as f64 / (1024.0 * 1024.0),
                 alias_writeback_nanoseconds as f64 / 1_000_000.0,
+                self.retired_texture_quarantine.len(),
+                RETIRED_TEXTURE_QUARANTINE_CAPACITY,
+                quarantine_adopted,
+                quarantine_rejected,
             );
             let texture_allocated_bytes = |texture: &metal::Texture| {
                 u64::try_from(texture.allocated_size()).unwrap_or(u64::MAX)

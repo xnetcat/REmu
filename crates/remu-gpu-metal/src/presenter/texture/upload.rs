@@ -117,6 +117,7 @@ pub(crate) fn upload_image_textures(
     queue: &metal::CommandQueue,
     evaluation: &ShaderEvaluation,
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     depth_array_textures: &HashMap<DepthArrayKey, DepthArrayResidentTexture>,
     multisample_textures: &HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
     sampled_texture_cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
@@ -537,6 +538,7 @@ pub(crate) fn upload_image_textures(
                         None,
                         descriptor,
                         resident_guest_textures,
+                        retired_texture_quarantine,
                         Mode27WorkOrigin::StorageCreate,
                     )?
                 } else {
@@ -544,6 +546,7 @@ pub(crate) fn upload_image_textures(
                         device,
                         descriptor.guest,
                         resident_guest_textures,
+                        retired_texture_quarantine,
                         true,
                     )?
                 }

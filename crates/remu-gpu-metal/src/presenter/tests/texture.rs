@@ -11,7 +11,9 @@ use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
 use std::collections::HashMap;
 
 use super::super::refresh_resident_texture_write_watch;
-use super::super::texture::ensure_resident_texture_in_map;
+use super::super::texture::{adopt_quarantined_resident, ensure_resident_texture_in_map};
+use super::super::{TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter,
     ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
@@ -178,6 +180,7 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
         &queue,
         &evaluation,
         &mut presenter.resident_guest_textures,
+        &mut presenter.retired_texture_quarantine,
         &presenter.depth_array_textures,
         &presenter.multisample_textures,
         &mut presenter.sampled_texture_cache,
@@ -325,6 +328,7 @@ fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
         &queue,
         &evaluation,
         &mut presenter.resident_guest_textures,
+        &mut presenter.retired_texture_quarantine,
         &presenter.depth_array_textures,
         &presenter.multisample_textures,
         &mut presenter.sampled_texture_cache,
@@ -733,6 +737,129 @@ fn texture_write_watch_renews_after_a_late_physical_alias_and_validates_early_wr
 }
 
 #[test]
+fn a_clean_retired_resident_is_adopted_from_quarantine_without_a_rebuild() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let base = memory.base();
+    let mapping = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: mapping.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let mut residents = HashMap::new();
+    let mut quarantine = HashMap::new();
+    let original =
+        ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut quarantine, true)
+            .expect("initial resident");
+
+    // Retire the clean resident the way a pooled neighbour's GPU write does, then re-ensure.
+    let retired = residents.remove(&descriptor).expect("resident exists");
+    assert!(!retired.gpu_written, "the retired resident must be clean");
+    quarantine.insert(descriptor, retired);
+    let adopted_before = TEXTURE_QUARANTINE_ADOPTED.load(AtomicOrdering::Relaxed);
+    let adopted =
+        ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut quarantine, true)
+            .expect("re-ensured resident");
+    assert!(
+        std::ptr::eq(original.as_ref(), adopted.as_ref()),
+        "adoption must return the quarantined Metal allocation, not a rebuild"
+    );
+    assert!(quarantine.is_empty(), "adoption consumes the entry");
+    assert!(residents.contains_key(&descriptor));
+    assert_eq!(
+        TEXTURE_QUARANTINE_ADOPTED.load(AtomicOrdering::Relaxed),
+        adopted_before + 1
+    );
+}
+
+#[test]
+fn a_guest_write_makes_a_quarantined_resident_rebuild_instead_of_adopt() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let base = memory.base();
+    let mapping = memory
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: mapping.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let mut residents = HashMap::new();
+    let mut quarantine = HashMap::new();
+    let original =
+        ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut quarantine, true)
+            .expect("initial resident");
+    let retired = residents.remove(&descriptor).expect("resident exists");
+    quarantine.insert(descriptor, retired);
+
+    // A guest write to the watched range invalidates the quarantined bytes.
+    memory
+        .write(mapping, &[0xa5; 64])
+        .expect("guest writes through the mapping");
+    let rejected_before = TEXTURE_QUARANTINE_REJECTED.load(AtomicOrdering::Relaxed);
+    adopt_quarantined_resident(descriptor, &mut residents, &mut quarantine)
+        .expect("stale adoption check");
+    assert!(
+        !residents.contains_key(&descriptor),
+        "a changed range must not be adopted"
+    );
+    assert!(quarantine.is_empty(), "the stale entry is dropped");
+    assert_eq!(
+        TEXTURE_QUARANTINE_REJECTED.load(AtomicOrdering::Relaxed),
+        rejected_before + 1
+    );
+    let rebuilt =
+        ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut quarantine, true)
+            .expect("rebuilt resident");
+    assert!(
+        !std::ptr::eq(original.as_ref(), rebuilt.as_ref()),
+        "a stale quarantined allocation must not be reused"
+    );
+}
+
+#[test]
 fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -765,7 +892,7 @@ fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
         bytes_per_pixel: 4,
     };
     let mut residents = HashMap::new();
-    ensure_resident_texture_in_map(&device, descriptor, &mut residents, true)
+    ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut HashMap::new(), true)
         .expect("resident with initialized content baseline");
     {
         let resident = residents.get_mut(&descriptor).expect("resident exists");
@@ -843,7 +970,7 @@ fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
         bytes_per_pixel: 4,
     };
     let mut residents = HashMap::new();
-    ensure_resident_texture_in_map(&device, descriptor, &mut residents, false)
+    ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut HashMap::new(), false)
         .expect("discarded render target with a CPU baseline");
     {
         let resident = residents.get_mut(&descriptor).expect("resident exists");
@@ -2060,6 +2187,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
         None,
         descriptor,
         &mut presenter.resident_guest_textures,
+        &mut presenter.retired_texture_quarantine,
         super::Mode27WorkOrigin::StorageCreate,
     )
     .expect_err("promotion without an ordered command buffer must be rejected");
@@ -2075,6 +2203,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
         Some(&command_buffer),
         descriptor,
         &mut presenter.resident_guest_textures,
+        &mut presenter.retired_texture_quarantine,
         super::Mode27WorkOrigin::StorageCreate,
     )
     .expect("ordered clean mip promotion");
@@ -2212,6 +2341,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
         None,
         complete,
         &mut presenter.resident_guest_textures,
+        &mut presenter.retired_texture_quarantine,
         super::Mode27WorkOrigin::StorageCreate,
     )
     .expect("declared complete mip hierarchy becomes resident");
@@ -2222,6 +2352,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
         None,
         complete,
         &mut presenter.resident_guest_textures,
+        &mut presenter.retired_texture_quarantine,
         super::Mode27WorkOrigin::StorageCreate,
     )
     .expect("later complete mip view reuses first residency");
@@ -2248,6 +2379,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
         None,
         sampled,
         &mut presenter.resident_guest_textures,
+        &mut presenter.retired_texture_quarantine,
         super::Mode27WorkOrigin::StorageCreate,
     )
     .expect("larger resident hierarchy covers the sampled mip range");

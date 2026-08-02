@@ -161,6 +161,7 @@ use self::stats::{
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
+    TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT,
     process_memory_statistics, record_mode27_work_detail, record_texture_dirty_work_detail,
@@ -1629,6 +1630,12 @@ struct MetalPresenter {
     /// `dropped_draw_executions`.
     dropped_compute_executions: HashMap<u64, u64>,
     resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    /// Clean residents retired by an overlapping GPU write, kept adoptable while their write
+    /// watch stays armed. Unreal sub-allocates many live surfaces inside one pooled guest
+    /// allocation, so byte-overlap retirement constantly destroys clean neighbours; re-adopting
+    /// a quarantined resident whose watch proves its bytes unchanged skips the full guest
+    /// snapshot, de-tile, upload and per-page `mprotect` rebuild.
+    retired_texture_quarantine: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     depth_array_textures: HashMap<DepthArrayKey, DepthArrayResidentTexture>,
     direct_scanout_textures: HashMap<u64, DirectScanoutTexture>,
     scanout_snapshot_textures: HashMap<u64, ScanoutSnapshotTexture>,
@@ -1808,6 +1815,7 @@ impl MetalPresenter {
             failed_compute_execution: HashSet::new(),
             dropped_compute_executions: HashMap::new(),
             resident_guest_textures: HashMap::new(),
+            retired_texture_quarantine: HashMap::new(),
             depth_array_textures: HashMap::new(),
             direct_scanout_textures: HashMap::new(),
             scanout_snapshot_textures: HashMap::new(),

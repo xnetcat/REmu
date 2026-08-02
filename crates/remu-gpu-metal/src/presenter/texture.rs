@@ -14,7 +14,8 @@ use super::{
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     SampledTextureKey, ScanoutSnapshotTexture, TEXTURE_DIRTY_VALIDATION_BYTES,
     TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
-    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
+    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
+    TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT, UploadedImageTexture,
     WriteWatchRefresh,
     canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled_at_z,
@@ -62,6 +63,7 @@ pub(crate) use self::mips::{
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::residency::{
+    RETIRED_TEXTURE_QUARANTINE_CAPACITY, adopt_quarantined_resident,
     ensure_resident_texture_in_map, resident_texture_ownership_stats,
 };
 pub(crate) use self::retire::{
