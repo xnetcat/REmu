@@ -592,6 +592,31 @@ fn decodes_silent_hill_ds_write_addtid_words_without_an_address_source() {
 }
 
 #[test]
+fn decodes_poppy_ds_read_b64_into_a_two_register_destination() {
+    // Live word from Poppy Playtime's glyph-prep compute shader; rejecting it failed the whole
+    // DCB submission, which Unreal treats as fatal.
+    let extra = 5u32 | (12u32 << 24);
+    let program = decode_program(0x1000, &[0xd9d8_0000, extra, 0xbf81_0000])
+        .expect("observed Poppy Playtime DS_READ_B64 stream");
+    let instruction = &program.instructions[0];
+
+    assert!(instruction.opcode.is("DsReadB64"));
+    assert_eq!(instruction.sources, [Operand::vector(5)]);
+    assert_eq!(
+        instruction.destinations,
+        [Operand::vector(12), Operand::vector(13)]
+    );
+    assert_eq!(
+        instruction.control,
+        Some(InstructionControl::DataShare(DataShareControl {
+            offset0: 0,
+            offset1: 0,
+            gds: false,
+        }))
+    );
+}
+
+#[test]
 fn decodes_complete_mubuf_and_mtbuf_surfaces_with_all_control_fields() {
     const MUBUF: &[(u32, &str)] = &[
         (0x00, "BufferLoadFormatX"),

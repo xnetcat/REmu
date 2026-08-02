@@ -66,6 +66,7 @@ impl Compiler<'_> {
             "DsWrite2B32" => self.emit_ds_write_pair(instruction, control, false),
             "DsWrite2St64B32" => self.emit_ds_write_pair(instruction, control, true),
             "DsReadB32" => self.emit_ds_read(instruction, control, 1),
+            "DsReadB64" => self.emit_ds_read(instruction, control, 2),
             "DsReadB96" => self.emit_ds_read(instruction, control, 3),
             "DsReadB128" => self.emit_ds_read(instruction, control, 4),
             "DsRead2B32" => self.emit_ds_read_pair(instruction, control, false),

@@ -46,6 +46,9 @@ pub(crate) fn decode_ds(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x37 => Some("DsRead2B32"),
         0x38 => Some("DsRead2St64B32"),
         0x4d => Some("DsWriteB64"),
+        // The 64-bit DS block mirrors the 32-bit block at +0x40 (0x0d/0x4d writes, 0x36/0x76
+        // reads). Poppy Playtime's glyph-prep compute reads LDS pairs through 0x76.
+        0x76 => Some("DsReadB64"),
         0xb0 => Some("DsWriteAddtidB32"),
         0xb1 => Some("DsReadAddtidB32"),
         0xde => Some("DsWriteB96"),
@@ -288,7 +291,7 @@ pub(crate) fn decode_data_share(
 
     if opcode.is("DsReadB32") || opcode.is("DsReadAddtidB32") || opcode.is("DsSwizzleB32") {
         destinations.push(Operand::vector(vector_destination));
-    } else if opcode.is("DsRead2B32") || opcode.is("DsRead2St64B32") {
+    } else if opcode.is("DsRead2B32") || opcode.is("DsRead2St64B32") || opcode.is("DsReadB64") {
         push_vector_range(destinations, vector_destination, 2);
     } else if opcode.is("DsReadB96") {
         push_vector_range(destinations, vector_destination, 3);
