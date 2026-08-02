@@ -11,7 +11,9 @@ use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
 use std::collections::HashMap;
 
 use super::super::refresh_resident_texture_write_watch;
-use super::super::texture::{adopt_quarantined_resident, ensure_resident_texture_in_map};
+use super::super::texture::{
+    QuarantineAdoption, adopt_quarantined_resident, ensure_resident_texture_in_map,
+};
 use super::super::{TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use super::{
@@ -839,7 +841,12 @@ fn a_guest_write_makes_a_quarantined_resident_rebuild_instead_of_adopt() {
         .write(mapping, &[0xa5; 64])
         .expect("guest writes through the mapping");
     let rejected_before = TEXTURE_QUARANTINE_REJECTED.load(AtomicOrdering::Relaxed);
-    adopt_quarantined_resident(descriptor, &mut residents, &mut quarantine)
+    adopt_quarantined_resident(
+        descriptor,
+        &mut residents,
+        &mut quarantine,
+        QuarantineAdoption::CurrentContent,
+    )
         .expect("stale adoption check");
     assert!(
         !residents.contains_key(&descriptor),

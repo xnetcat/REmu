@@ -1297,10 +1297,22 @@ pub(crate) fn quarantine_retired_resident(
 /// Adoption restores the exact pre-retirement resident, so the caller's normal reuse and
 /// promotion logic applies unchanged afterwards. A stale entry — replaced mapping, mid-flight
 /// reprotect, or validated content change — is dropped so the ordinary rebuild runs.
+/// What an adoption from the quarantine must guarantee about the texture's pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuarantineAdoption {
+    /// The caller reads the pixels, so the watch must prove the guest bytes are unchanged.
+    CurrentContent,
+    /// The caller fully overwrites the pixels (a discarded render target); only the shape,
+    /// the live watch and its fingerprint state are reused, and any pending validation the
+    /// stale bytes would need stays pending on the adopted watch.
+    ShapeOnly,
+}
+
 pub(crate) fn adopt_quarantined_resident(
     descriptor: GuestTextureDescriptor,
     resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    adoption: QuarantineAdoption,
 ) -> Result<(), String> {
     if resident_guest_textures.contains_key(&descriptor) {
         return Ok(());
@@ -1312,7 +1324,10 @@ pub(crate) fn adopt_quarantined_resident(
         refresh_resident_texture_write_watch(&mut quarantined)?,
         WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. }
     );
-    if watch_usable && !quarantined.write_watch.content_has_changed()? {
+    let adoptable = watch_usable
+        && (adoption == QuarantineAdoption::ShapeOnly
+            || !quarantined.write_watch.content_has_changed()?);
+    if adoptable {
         TEXTURE_QUARANTINE_ADOPTED.fetch_add(1, Ordering::Relaxed);
         resident_guest_textures.insert(descriptor, quarantined);
     } else {
@@ -1329,7 +1344,16 @@ pub(crate) fn ensure_resident_texture_in_map(
     retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     upload_guest_contents: bool,
 ) -> Result<Texture, String> {
-    adopt_quarantined_resident(descriptor, resident_guest_textures, retired_texture_quarantine)?;
+    adopt_quarantined_resident(
+        descriptor,
+        resident_guest_textures,
+        retired_texture_quarantine,
+        if upload_guest_contents {
+            QuarantineAdoption::CurrentContent
+        } else {
+            QuarantineAdoption::ShapeOnly
+        },
+    )?;
     if let Some(resident) = resident_guest_textures
         .get_mut(&descriptor)
         .filter(|resident| {

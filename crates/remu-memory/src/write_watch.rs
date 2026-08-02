@@ -37,6 +37,21 @@ use state::{
 /// any coherent physical alias. Pages remain armed: a later guest store must still fault normally.
 #[must_use]
 pub fn notify_guest_memory_written(address: u64, byte_count: u64) -> bool {
+    notify_guest_memory_written_excluding(address, byte_count, &[])
+}
+
+/// Publishes host-written bytes to every live watch except the writer's own.
+///
+/// A writer that immediately re-baselines its own fingerprints must not see its own store as
+/// a foreign modification: dirtying its pages and bumping its generation would ripple through
+/// every consumer keyed on that state. Every *other* watch intersecting the write or one of
+/// its physical aliases still needs the notification, exactly as for an ordinary HLE write.
+#[must_use]
+pub fn notify_guest_memory_written_excluding(
+    address: u64,
+    byte_count: u64,
+    excluded: &[&CpuWriteWatch],
+) -> bool {
     let aliases = crate::address_space::guest_write_alias_segments(address, byte_count);
     if aliases.is_empty() {
         return false;
@@ -46,6 +61,12 @@ pub fn notify_guest_memory_written(address: u64, byte_count: u64) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for range in state.ranges.values() {
+        if excluded
+            .iter()
+            .any(|watch| Arc::ptr_eq(&watch.range, range))
+        {
+            continue;
+        }
         let range_end = range.address.saturating_add(range.byte_count);
         let mut range_notified = false;
         for page in &range.pages {

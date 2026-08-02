@@ -597,6 +597,11 @@ impl GuestTextureWriteWatch {
         Ok(())
     }
 
+    /// The CPU watches backing this texture watch, for self-exclusion in write notifications.
+    pub(crate) fn cpu_watches(&self) -> Vec<&remu_memory::CpuWriteWatch> {
+        self.ranges.iter().map(|range| &range.watch).collect()
+    }
+
     pub(crate) fn overlaps_alias_range(&self, address: u64, byte_count: u64) -> bool {
         Self::ranges_overlap_alias(&self.ranges, address, byte_count, |range| {
             range.watch.range()
@@ -1372,6 +1377,15 @@ pub(crate) fn write_watched_guest_range(
     let byte_count = u64::try_from(raw.len()).map_err(|_| "guest range length does not fit u64")?;
     let wrote = write_watch.with_live_backing(|| write_guest_shared_backing(address, raw))?;
     if wrote {
+        // A backing write bypasses every armed page, so watches on other aliases of these
+        // bytes would keep validating as clean against content that just changed. Publish the
+        // write to every intersecting watch except the writer's own — a self-writeback must
+        // leave the writer quiescent — then re-baseline its fingerprints.
+        let _ = remu_memory::notify_guest_memory_written_excluding(
+            address,
+            byte_count,
+            &write_watch.cpu_watches(),
+        );
         write_watch.record_content_snapshot(address, raw);
         Ok(())
     } else {

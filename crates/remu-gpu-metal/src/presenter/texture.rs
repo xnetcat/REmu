@@ -64,7 +64,7 @@ pub(crate) use self::mips::{
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::residency::{
-    RETIRED_TEXTURE_QUARANTINE_CAPACITY, adopt_quarantined_resident,
+    QuarantineAdoption, RETIRED_TEXTURE_QUARANTINE_CAPACITY, adopt_quarantined_resident,
     ensure_resident_texture_in_map, quarantine_retired_resident,
     resident_texture_ownership_stats,
 };
@@ -249,6 +249,13 @@ pub(super) fn write_watched_guest_texture_linear(
             Ok(destination)
         })
         .and_then(|result| result)?;
+    // See write_watched_guest_range: a backing write is invisible to armed pages, so every
+    // other intersecting watch must hear about it before this watch re-baselines itself.
+    let _ = remu_memory::notify_guest_memory_written_excluding(
+        descriptor.address,
+        byte_count,
+        &write_watch.cpu_watches(),
+    );
     write_watch.record_content_snapshot(descriptor.address, &raw);
     Ok(())
 }

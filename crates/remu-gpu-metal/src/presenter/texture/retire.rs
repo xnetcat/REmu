@@ -141,10 +141,14 @@ pub(crate) fn retire_resident_textures_overlapping_writeback(
         })
         .collect::<Vec<_>>();
     for descriptor in retired {
-        if let Some(resident) = cache.remove(&descriptor) {
+        if let Some(mut resident) = cache.remove(&descriptor) {
             trace_resident_texture_removal("overlapping-writeback", &resident);
-            // A clean tenant of the same pooled allocation survives in quarantine. If the
-            // writeback really rewrote its bytes, adoption's content validation rejects it.
+            // The imminent writeback supersedes this resident's pixels, so it stops being
+            // GPU-owned here, and its shape, watch and fingerprints stay adoptable. The
+            // writeback notifies every intersecting watch, so a content-consuming adoption
+            // revalidates and a stale entry can never serve pixels; a discarded-render-target
+            // adoption reuses the allocation without reading them.
+            resident.gpu_written = false;
             quarantine_retired_resident(retired_texture_quarantine, resident);
         }
     }
