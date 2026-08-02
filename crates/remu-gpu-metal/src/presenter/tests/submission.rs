@@ -163,6 +163,22 @@ fn read_test_label(address: u64) -> u32 {
     unsafe { std::ptr::read_volatile(address as *const u32) }
 }
 
+fn ensure_watched_test_resident(presenter: &mut MetalPresenter, address: u64) {
+    let descriptor = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("watched test resident");
+}
+
 #[test]
 fn dma_uses_packet_time_cpu_snapshot_after_source_reuse() {
     let mut address_space =
@@ -4486,6 +4502,7 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let (_label_space, label) = mapped_test_label();
+    ensure_watched_test_resident(&mut presenter, label);
     let wait = GpuMemoryWait {
         address: label,
         reference: 1,
@@ -4584,6 +4601,7 @@ fn exact_registered_waits_chain_without_intermediate_host_acknowledgements() {
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let (_label_space, first_label) = mapped_test_label();
+    ensure_watched_test_resident(&mut presenter, first_label);
     let second_label = first_label + 8;
     let wait = |address| GpuMemoryWait {
         address,
@@ -4735,9 +4753,35 @@ fn registered_wait_ordering_rejects_missing_checkpoint_and_recycled_label() {
 }
 
 #[test]
-fn noninvalidating_acquire_is_gpu_orderable_but_invalidation_requires_host_ack() {
+fn acquire_without_an_effective_cached_resource_is_gpu_orderable() {
     let (_sender, receiver) = gpu_event_channel();
-    let presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest texture mapping")
+        .get();
+    let descriptor = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("resident texture");
     let acquire = GpuMemoryAcquire {
         engine: 0,
         cb_db_control: 0,
@@ -4749,6 +4793,25 @@ fn noninvalidating_acquire_is_gpu_orderable_but_invalidation_requires_host_ack()
     assert!(presenter.event_is_shared_event_gpu_orderable(
         OrderedEventSource::GuestQueue(0),
         &GpuEvent::MemoryAcquire(acquire),
+    ));
+    assert!(presenter.event_is_shared_event_gpu_orderable(
+        OrderedEventSource::GuestQueue(0),
+        &GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+            base_address: address + 0x800,
+            size_bytes: 0x100,
+            // GL1 invalidate with an explicit range, rather than the all-memory range mode.
+            gcr_control: (1 << 9) | (1 << 2),
+            ..acquire
+        }),
+    ));
+    assert!(!presenter.event_is_shared_event_gpu_orderable(
+        OrderedEventSource::GuestQueue(0),
+        &GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+            base_address: address,
+            size_bytes: 0x100,
+            gcr_control: (1 << 9) | (1 << 2),
+            ..acquire
+        }),
     ));
     assert!(!presenter.event_is_shared_event_gpu_orderable(
         OrderedEventSource::GuestQueue(0),
@@ -4767,6 +4830,7 @@ fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain()
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let (_label_space, label) = mapped_test_label();
+    ensure_watched_test_resident(&mut presenter, label);
     let wait = GpuMemoryWait {
         address: label,
         reference: 1,
