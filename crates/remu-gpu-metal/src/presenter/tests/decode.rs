@@ -53,6 +53,42 @@ fn empty_shader_evaluation() -> Arc<ShaderEvaluation> {
 }
 
 #[test]
+fn programs_full_scissor_after_a_restricted_draw() {
+    let restricted = super::super::execute::metal_scissor_rect_for_draw(
+        GuestScissor::Rect(metal::MTLScissorRect {
+            x: 32,
+            y: 16,
+            width: 640,
+            height: 360,
+        }),
+        3_840,
+        2_160,
+    )
+    .expect("restricted draw programs its guest scissor");
+    assert_eq!(
+        (
+            restricted.x,
+            restricted.y,
+            restricted.width,
+            restricted.height
+        ),
+        (32, 16, 640, 360)
+    );
+
+    let full = super::super::execute::metal_scissor_rect_for_draw(GuestScissor::Full, 3_840, 2_160)
+        .expect("full draw must reset persistent Metal scissor state");
+    assert_eq!(
+        (full.x, full.y, full.width, full.height),
+        (0, 0, 3_840, 2_160)
+    );
+    assert!(
+        super::super::execute::metal_scissor_rect_for_draw(GuestScissor::Empty, 3_840, 2_160)
+            .is_none(),
+        "empty guest scissors remain draw suppression instead of invalid Metal rectangles"
+    );
+}
+
+#[test]
 fn accepts_fragmentless_depth_only_pipeline() {
     let mut draw = indexed_draw(0, 0, 3);
     draw.indexed = false;

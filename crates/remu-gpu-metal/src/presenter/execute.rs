@@ -64,8 +64,8 @@ use super::{
 };
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
-    MTLPrimitiveType, MTLRenderStages, MTLResourceOptions, MTLResourceUsage, MTLSize,
-    MTLStoreAction, MTLTextureType, MTLViewport, MTLWinding, RenderPassDescriptor,
+    MTLPrimitiveType, MTLRenderStages, MTLResourceOptions, MTLResourceUsage, MTLScissorRect,
+    MTLSize, MTLStoreAction, MTLTextureType, MTLViewport, MTLWinding, RenderPassDescriptor,
 };
 use remu_gpu::IndexedDraw;
 use std::collections::{HashMap, HashSet};
@@ -94,6 +94,23 @@ pub(super) const fn ngg_mesh_dispatch_required(
     has_meshlets: bool,
 ) -> bool {
     !matches!(scissor, GuestScissor::Empty) && instance_count != 0 && has_meshlets
+}
+
+pub(super) const fn metal_scissor_rect_for_draw(
+    scissor: GuestScissor,
+    render_width: u32,
+    render_height: u32,
+) -> Option<MTLScissorRect> {
+    match scissor {
+        GuestScissor::Full => Some(MTLScissorRect {
+            x: 0,
+            y: 0,
+            width: render_width as u64,
+            height: render_height as u64,
+        }),
+        GuestScissor::Rect(rect) => Some(rect),
+        GuestScissor::Empty => None,
+    }
 }
 
 impl MetalPresenter {
@@ -1405,7 +1422,13 @@ impl MetalPresenter {
                 ),
             );
             encoder.set_viewport(viewport);
-            if !diagnostic_force_triangle && let GuestScissor::Rect(rect) = scissor {
+            if !diagnostic_force_triangle
+                && let Some(rect) =
+                    metal_scissor_rect_for_draw(scissor, render_width, render_height)
+            {
+                // Scissor state persists for the lifetime of a Metal render encoder. A full
+                // guest scissor must therefore be programmed explicitly: otherwise a preceding
+                // restricted draw clips this draw when their compatible render pass is reused.
                 encoder.set_scissor_rect(rect);
             }
             if let (Some(index), Some(argument_buffer)) = (
