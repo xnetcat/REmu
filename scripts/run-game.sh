@@ -189,6 +189,10 @@ fi
 # Separate button edges keep title UIs from rejecting the two-button chord. Set
 # REMU_AUTO_CROSS_REPEAT_MS=0 to keep an explicit schedule one-shot.
 auto_cross=${REMU_AUTO_CROSS:-}
+# Scripted runs must never gate on a guest dialog waiting for a human. The runtime
+# auto-completes dialogs when this is set; pass an explicit 0 to restore interactive dialogs.
+REMU_AUTO_DISMISS_DIALOGS=${REMU_AUTO_DISMISS_DIALOGS:-1}
+export REMU_AUTO_DISMISS_DIALOGS
 # Capturing a 4K PPM writes roughly 32 MiB per image and fingerprints the full frame on the
 # presenter thread. Keep it explicit so ordinary game runs measure the emulator rather than the
 # diagnostic I/O path.
