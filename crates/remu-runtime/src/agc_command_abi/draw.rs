@@ -58,7 +58,11 @@ pub(super) fn set_register_direct(arguments: [u64; 6], opcode: u32) -> u64 {
 pub(super) fn set_registers_indirect(arguments: [u64; 6], kind: IndirectRegisterKind) -> u64 {
     let registers = arguments[1];
     let register_count = low_u32(arguments[2]);
-    if registers == 0 || registers & 3 != 0 || register_count > 0x3fff {
+    // UE creates an empty indirect-register packet with `(nullptr, 0)`, then patches the address
+    // and adds the real count once its state-buffer span is known. The fetch address is unused
+    // while the packet count is zero, so requiring a non-null pointer here turns that valid
+    // build-then-patch sequence into a null packet and makes both patch imports fail afterward.
+    if (register_count != 0 && registers == 0) || registers & 3 != 0 || register_count > 0x3fff {
         return 0;
     }
     let Some(command) = allocate_dwords(arguments[0], 5) else {
