@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    ActiveTranslatedScanout, GuestBatchFlushReason, GuestTextureDescriptor, HostSplashTexture,
+    ActiveTranslatedScanout, FlushPolicy, GuestBatchFlushReason, GuestTextureDescriptor,
+    HostSplashTexture,
     MetalPresenter, OrderedEventSource, WriteWatchRefresh, capture_interval,
     completed_command_buffer_gpu_duration, decode_guest_texture_linear_from_raw,
     diagnostic_scanout_writer, diagnostic_texture_writer, raw_video_out_texture_descriptor,
@@ -401,7 +402,7 @@ impl MetalPresenter {
         // End and commit every encoder before the flip. The single Metal queue then orders this
         // private-to-private copy between the frame's producer work and any later command stream
         // that clears or reuses the same VideoOut allocation.
-        self.flush_guest_command_batch(false, GuestBatchFlushReason::FlipSnapshot)?;
+        self.flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::FlipSnapshot)?;
         let command_buffer = queue.new_command_buffer().to_owned();
         command_buffer.set_label("REMu ordered VideoOut snapshot");
         let blit = command_buffer.new_blit_command_encoder();

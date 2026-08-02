@@ -8,7 +8,8 @@ use super::{
     DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
-    DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
+    DiagnosticScanoutWriter, FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey,
+    GuestBatchFlushReason,
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
     NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
@@ -2765,7 +2766,10 @@ impl MetalPresenter {
             .as_ref()
             .is_some_and(|batch| batch.work.len() >= GUEST_BATCH_WORK_CAPACITY);
         if batch_full {
-            self.flush_guest_command_batch(false, GuestBatchFlushReason::WorkCapacity)?;
+            self.flush_guest_command_batch(
+                FlushPolicy::Opportunistic,
+                GuestBatchFlushReason::WorkCapacity,
+            )?;
         }
         if let Some(directory) = std::env::var_os("REMU_DUMP_VIDEO_TARGET_DIR")
             && evaluation_samples_large_linear_video(pixel_evaluation)

@@ -18,7 +18,7 @@ use super::{
     trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
     write_resident_texture_contents_to_guest,
 };
-use super::super::GuestBatchFlushReason;
+use super::super::{FlushPolicy, GuestBatchFlushReason};
 use metal::foreign_types::ForeignType;
 use metal::{
     Device, MTLPixelFormat, MTLRegion, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange,
@@ -177,8 +177,12 @@ impl MetalPresenter {
         // End the open render pass and commit the current batch, but do not drain every in-flight
         // guest batch on the CPU. The following texture readbacks are encoded on the same Metal
         // queue and `PendingTextureReadback::finish` waits only for that blit, which implicitly
-        // orders after the producer work already queued ahead of it.
-        self.flush_guest_command_batch(false, GuestBatchFlushReason::CpuSynchronization)?;
+        // orders after the producer work already queued ahead of it. That ordering holds only if
+        // the producer really was committed, so the flush may not defer.
+        self.flush_guest_command_batch(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CpuSynchronization,
+        )?;
         let device = self
             .device
             .as_ref()

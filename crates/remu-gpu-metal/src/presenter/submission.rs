@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    ActiveGuestMemoryWait, DisplayConfiguration, GLOBAL_UPLOAD_ALIGNMENT,
+    ActiveGuestMemoryWait, DisplayConfiguration, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT,
     GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk, GuestBatchFlushReason,
     GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery,
     GuestMemoryWaitStatus, GuestMemoryWaitTracker, GuestMemoryWriteOperation,
@@ -531,6 +531,9 @@ impl MetalPresenter {
         // preceding ME producer. Commit the preceding work without waiting on the CPU. Metal
         // command queues preserve command-buffer order, while later indirect bindings can still
         // forward the exact pending writer buffer across the committed-batch boundary.
-        self.flush_guest_command_batch(false, GuestBatchFlushReason::CommandProcessorBarrier)
+        self.flush_guest_command_batch(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CommandProcessorBarrier,
+        )
     }
 }

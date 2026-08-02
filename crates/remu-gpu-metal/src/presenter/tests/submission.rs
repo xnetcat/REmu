@@ -25,9 +25,11 @@ use super::super::submission::{
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
 };
 use super::{
-    ComputePipelineKey, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason, GuestCommandBatch,
+    ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
+    GuestCommandBatch,
     GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
-    GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor, MetalPresenter,
+    GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor,
+    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter,
     OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PipelineCompileCandidate, ProgramIdentity,
     QueueBlockReason, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
@@ -435,7 +437,7 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
     assert_eq!(presenter.statistics.render_pass_ends_for_target_change, 0);
 
     presenter
-        .flush_guest_command_batch(false, GuestBatchFlushReason::EventLoop)
+        .flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
         .expect("event loop commits deferred work");
     assert!(presenter.open_guest_batch.is_none());
     assert_eq!(presenter.statistics.submitted_guest_batches, 1);
@@ -1661,6 +1663,145 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
         .expect("the retained batch retires after Metal completes it");
     assert!(presenter.committed_guest_batches.is_empty());
     assert_eq!(read_test_label(completion_address), 9);
+}
+
+/// Fills the in-flight budget with committed no-op batches, the oldest carrying `label_value`.
+fn fill_committed_guest_batch_budget(
+    presenter: &mut MetalPresenter,
+    queue: &metal::CommandQueue,
+    label_address: u64,
+    label_value: u32,
+) {
+    for index in 0..MAX_COMMITTED_GUEST_BATCHES {
+        let command_buffer = queue.new_command_buffer().to_owned();
+        command_buffer.commit();
+        let memory_writes = if index == 0 {
+            vec![
+                pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+                    address: label_address,
+                    value: GpuMemoryReleaseValue::Immediate32(label_value),
+                }))
+                .expect("pin oldest completion label"),
+            ]
+        } else {
+            Vec::new()
+        };
+        presenter
+            .committed_guest_batches
+            .push_back(GuestCommandBatch {
+                command_buffer,
+                work: Vec::new(),
+                committed_at: None,
+                global_upload_chunks: Vec::new(),
+                global_writebacks: Vec::new(),
+                guest_write_ranges: Vec::new(),
+                memory_writes,
+                render_pass: None,
+                compute_encoder: None,
+                completion_sequences: Vec::new(),
+            });
+    }
+}
+
+#[test]
+fn required_flush_commits_at_the_in_flight_batch_budget() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let (_label_space, label_address) = mapped_test_label();
+    fill_committed_guest_batch_budget(&mut presenter, &queue, label_address, 7);
+    presenter.ensure_open_guest_batch(&queue);
+    let flushed = presenter
+        .open_guest_batch
+        .as_ref()
+        .expect("open batch")
+        .command_buffer
+        .clone();
+
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::CpuSynchronization)
+        .expect("a required flush commits at the in-flight budget");
+
+    assert!(
+        presenter.open_guest_batch.is_none(),
+        "a synchronization site must not be handed an uncommitted batch"
+    );
+    assert_eq!(presenter.statistics.submitted_guest_batches, 1);
+    assert_eq!(presenter.statistics.batch_flushes_for_cpu_synchronization, 1);
+    assert_eq!(
+        read_test_label(label_address),
+        7,
+        "the oldest committed batch is settled to reclaim its in-flight slot"
+    );
+    assert_eq!(
+        presenter.committed_guest_batches.len(),
+        MAX_COMMITTED_GUEST_BATCHES
+    );
+    assert!(std::ptr::eq(
+        presenter
+            .committed_guest_batches
+            .back()
+            .expect("the flushed batch is queued last")
+            .command_buffer
+            .as_ref(),
+        flushed.as_ref()
+    ));
+    flushed.wait_until_completed();
+    assert_eq!(
+        flushed.status(),
+        metal::MTLCommandBufferStatus::Completed,
+        "the required flush actually submitted the open batch"
+    );
+}
+
+#[test]
+fn opportunistic_flush_defers_at_the_in_flight_batch_budget() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let (_label_space, label_address) = mapped_test_label();
+    fill_committed_guest_batch_budget(&mut presenter, &queue, label_address, 7);
+    presenter.ensure_open_guest_batch(&queue);
+    let open = presenter
+        .open_guest_batch
+        .as_ref()
+        .expect("open batch")
+        .command_buffer
+        .clone();
+
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
+        .expect("an opportunistic flush defers instead of failing");
+
+    assert!(std::ptr::eq(
+        presenter
+            .open_guest_batch
+            .as_ref()
+            .expect("backpressure keeps the batch open")
+            .command_buffer
+            .as_ref(),
+        open.as_ref()
+    ));
+    assert_eq!(presenter.statistics.submitted_guest_batches, 0);
+    assert_eq!(presenter.statistics.batch_flushes_from_event_loop, 0);
+    assert_eq!(
+        presenter.committed_guest_batches.len(),
+        MAX_COMMITTED_GUEST_BATCHES,
+        "deferring must not settle an in-flight batch"
+    );
+    assert_eq!(
+        read_test_label(label_address),
+        0,
+        "deferring must not publish ordered completion effects"
+    );
 }
 
 #[test]

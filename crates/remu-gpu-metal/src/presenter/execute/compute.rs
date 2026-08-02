@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
+    FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
     ResidentTextureActivityStamp, append_unique_global_writebacks,
     append_unique_guest_write_ranges, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, compute_pipeline_key, compute_program_can_split_wave64,
@@ -426,7 +426,10 @@ impl MetalPresenter {
             .as_ref()
             .is_some_and(|batch| batch.work.len() >= GUEST_BATCH_WORK_CAPACITY)
         {
-            self.flush_guest_command_batch(false, GuestBatchFlushReason::WorkCapacity)?;
+            self.flush_guest_command_batch(
+                FlushPolicy::Opportunistic,
+                GuestBatchFlushReason::WorkCapacity,
+            )?;
         }
         Ok(())
     }

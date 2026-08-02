@@ -1154,6 +1154,18 @@ struct PendingPresentation {
     flip_completion: Option<remu_gpu::GpuFlipCompletion>,
 }
 
+/// Whether a flush may decline to commit the open guest batch.
+///
+/// `Opportunistic` treats `MAX_COMMITTED_GUEST_BATCHES` as backpressure and leaves the batch open
+/// when the budget is exhausted. `Required` is for callers that then read GPU results the open
+/// batch produces — a readback, a scanout snapshot, a CPU drain — so it must leave
+/// `open_guest_batch` empty, settling the oldest committed batch to reclaim a slot when needed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlushPolicy {
+    Opportunistic,
+    Required,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuestBatchFlushReason {
     EventLoop,
