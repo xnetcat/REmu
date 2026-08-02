@@ -174,11 +174,12 @@ impl MetalPresenter {
                 OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
                 OrderedEventSource::Host { .. } => None,
             });
+            let mut shared_event_gpu_ordered_compute = false;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
                 let dependencies = self.unsignaled_host_dependencies(queue_id);
-                if !dependencies.is_empty()
-                    && !self.event_is_shared_event_gpu_orderable(source, &event)
-                {
+                let gpu_orderable = dependencies.is_empty()
+                    || self.event_is_shared_event_gpu_orderable(source, &event);
+                if !gpu_orderable {
                     let acknowledgement = match self.encode_active_guest_queue_host_ack() {
                         Ok(acknowledgement) => acknowledgement,
                         Err(error) => {
@@ -208,6 +209,9 @@ impl MetalPresenter {
                         },
                     );
                     continue;
+                }
+                if !dependencies.is_empty() && matches!(&event, GpuEvent::ComputeDispatch(_)) {
+                    shared_event_gpu_ordered_compute = true;
                 }
             }
             match event {
@@ -497,6 +501,12 @@ impl MetalPresenter {
                         Ok(()) => {
                             self.statistics.encoded_compute_dispatches =
                                 self.statistics.encoded_compute_dispatches.saturating_add(1);
+                            if shared_event_gpu_ordered_compute {
+                                self.statistics.shared_event_gpu_ordered_compute_dispatches = self
+                                    .statistics
+                                    .shared_event_gpu_ordered_compute_dispatches
+                                    .saturating_add(1);
+                            }
                         }
                         Err(error) => {
                             // Every dropped dispatch is counted so a pass failing each frame
@@ -697,13 +707,27 @@ impl MetalPresenter {
 
 impl MetalPresenter {
     /// Conservative host-effect gate for commands following an encoded Metal wait.
-    fn event_is_shared_event_gpu_orderable(
+    pub(super) fn event_is_shared_event_gpu_orderable(
         &self,
         source: OrderedEventSource,
         event: &GpuEvent,
     ) -> bool {
         match event {
             GpuEvent::CommandProcessorBarrier | GpuEvent::PipelineBarrier(_) => true,
+            GpuEvent::ComputeDispatch(dispatch) => {
+                matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct)
+                    && dispatch.shader.as_ref().is_some_and(|snapshot| {
+                        dispatch
+                            .shader_evaluation
+                            .as_ref()
+                            .is_some_and(|evaluation| {
+                                compute_program_has_only_covered_readonly_buffers(
+                                    snapshot, evaluation,
+                                ) && self
+                                    .shared_event_dependencies_supply_compute_globals(evaluation)
+                            })
+                    })
+            }
             GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
                 self.active_open_guest_batch().is_some()
                     || !self.active_committed_guest_batches().is_empty()
@@ -721,10 +745,43 @@ impl MetalPresenter {
                     });
                 !initial_flip_boundary && !write_completes_pending_flip
             }
-            // Draw/compute preparation snapshots guest bytes and mutates shared residency/cache
-            // state on the presenter thread. DMA, acquire, waits, flips and host UI have still
-            // more direct CPU-visible effects. They must observe the producer event first.
+            // Draw and image-backed/indirect/writable compute preparation snapshots guest bytes
+            // and mutates shared residency/cache state on the presenter thread. DMA, acquire,
+            // waits, flips and host UI have still more direct CPU-visible effects. They must
+            // observe the producer event first.
             _ => false,
         }
     }
+}
+
+fn compute_program_has_only_covered_readonly_buffers(
+    snapshot: &remu_gpu::ShaderSnapshot,
+    evaluation: &remu_shader::ShaderEvaluation,
+) -> bool {
+    if !snapshot.supplemental_programs.is_empty()
+        || evaluation.global_memory_bindings.is_empty()
+        || !evaluation.image_bindings.is_empty()
+    {
+        return false;
+    }
+    snapshot
+        .program
+        .instructions
+        .iter()
+        .all(|instruction| match instruction.control {
+            Some(remu_shader::InstructionControl::Image(_)) => false,
+            Some(
+                remu_shader::InstructionControl::GlobalMemory(_)
+                | remu_shader::InstructionControl::BufferMemory(_)
+                | remu_shader::InstructionControl::ScalarMemory(_),
+            ) => {
+                !instruction.opcode.contains("Store")
+                    && !instruction.opcode.contains("Atomic")
+                    && evaluation
+                        .global_memory_bindings
+                        .iter()
+                        .any(|binding| binding.instruction_pcs.contains(&instruction.pc))
+            }
+            _ => true,
+        })
 }

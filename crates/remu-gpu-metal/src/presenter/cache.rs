@@ -5,9 +5,10 @@ use super::{
     CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
     GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, NggSubgroupLimits,
     PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey,
-    UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
-    describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
-    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
+    SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint, UploadedGlobalBuffer,
+    canonical_sampler_bindings, create_sampler_argument_buffer, describe_guest_batch,
+    effective_global_memory_binding, guest_batch_writes_overlap, guest_physical_ranges_overlap,
+    metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -688,83 +689,78 @@ impl MetalPresenter {
         let Some(consumer_queue_id) = self.active_guest_queue else {
             return Ok(QueuedGlobalReadSource::None);
         };
-        let dependencies = self
-            .guest_queue_batches
-            .get(&consumer_queue_id)
-            .map(|state| state.resource_dependencies.clone())
-            .unwrap_or_default();
+        let selected = self.shared_event_dependency_global_read_source(
+            consumer_queue_id,
+            binding.base_address,
+            byte_count,
+        );
+        Ok(synchronize_writable_global_source(binding, selected))
+    }
+
+    fn shared_event_dependency_global_read_source(
+        &self,
+        consumer_queue_id: u64,
+        address: u64,
+        byte_count: u64,
+    ) -> QueuedGlobalReadSource {
+        let Some(consumer) = self.guest_queue_batches.get(&consumer_queue_id) else {
+            return QueuedGlobalReadSource::None;
+        };
         let mut selected = QueuedGlobalReadSource::None;
-        for (producer, fence_value) in dependencies {
+        for (&producer, checkpoint) in &consumer.resource_dependencies {
             if producer.queue_id() == consumer_queue_id {
                 continue;
             }
-            let Some(state) = self.guest_queue_batches.get(&producer.queue_id()) else {
-                continue;
-            };
-            let batches = state
-                .committed_batches
-                .iter()
-                .chain(state.open_batch.iter())
-                .collect::<Vec<_>>();
-            let Some((fence_batch_index, checkpoint)) =
-                batches.iter().enumerate().find_map(|(index, batch)| {
-                    batch
-                        .signal_checkpoints
-                        .iter()
-                        .find(|checkpoint| checkpoint.fence.value() == fence_value)
-                        .copied()
-                        .map(|checkpoint| (index, checkpoint))
-                })
-            else {
-                if state
-                    .retired_fence_write_ranges
-                    .get(&fence_value)
-                    .is_some_and(|ranges| {
-                        ranges.iter().any(|&(address, length)| {
-                            guest_physical_ranges_overlap(
-                                address,
-                                length,
-                                binding.base_address,
-                                byte_count,
-                            )
-                        })
-                    })
-                {
-                    selected = QueuedGlobalReadSource::Synchronize;
-                    break;
-                }
-                continue;
-            };
-            let producer_source = (0..=fence_batch_index)
-                .rev()
-                .find_map(|index| {
-                    let batch = batches[index];
-                    let source = if index == fence_batch_index {
-                        queued_global_read_source_in_batch_prefix(
-                            batch,
-                            checkpoint.global_writeback_count,
-                            checkpoint.guest_write_range_count,
-                            checkpoint.memory_write_count,
-                            binding.base_address,
-                            byte_count,
-                        )
-                    } else {
-                        queued_global_read_source_in_batch(batch, binding.base_address, byte_count)
-                    };
-                    (!matches!(source, QueuedGlobalReadSource::None)).then_some(source)
-                })
-                .unwrap_or(QueuedGlobalReadSource::None);
-            // Fence checkpoints name ordering points, not immutable snapshots. A later packet in
-            // the producer batch may append to or replace the same Metal buffer after the signal,
-            // so forwarding that live buffer across queues would expose post-fence bytes. Until
-            // writable resources are fence-versioned, conservatively force the host-effect gate
-            // to retire the producer and rematerialize from truthful guest memory.
-            if !matches!(producer_source, QueuedGlobalReadSource::None) {
-                selected = QueuedGlobalReadSource::Synchronize;
-                break;
+            let source = queued_global_read_source_in_checkpoint(checkpoint, address, byte_count);
+            if !merge_queued_global_read_source(&mut selected, source, byte_count) {
+                return QueuedGlobalReadSource::Synchronize;
             }
         }
-        Ok(synchronize_writable_global_source(binding, selected))
+        selected
+    }
+
+    /// A direct compute dispatch can cross a GPU wait only when every global input is an exact
+    /// immutable version retained by that wait and no earlier local writer competes with it.
+    pub(super) fn shared_event_dependencies_supply_compute_globals(
+        &self,
+        evaluation: &ShaderEvaluation,
+    ) -> bool {
+        let Some(consumer_queue_id) = self.active_guest_queue else {
+            return false;
+        };
+        evaluation.global_memory_bindings.iter().all(|binding| {
+            let binding = effective_global_memory_binding(evaluation, binding);
+            if binding.writable {
+                return false;
+            }
+            let Ok(byte_count) = u64::try_from(binding.byte_count) else {
+                return false;
+            };
+            if self.active_open_guest_batch().is_some_and(|batch| {
+                !matches!(
+                    queued_global_read_source_in_batch(batch, binding.base_address, byte_count),
+                    QueuedGlobalReadSource::None
+                )
+            }) || self.active_committed_guest_batches().iter().any(|batch| {
+                !matches!(
+                    queued_global_read_source_in_batch(batch, binding.base_address, byte_count),
+                    QueuedGlobalReadSource::None
+                )
+            }) {
+                return false;
+            }
+            matches!(
+                self.shared_event_dependency_global_read_source(
+                    consumer_queue_id,
+                    binding.base_address,
+                    byte_count,
+                ),
+                QueuedGlobalReadSource::Buffer {
+                    guest_memory: false,
+                    ..
+                }
+            )
+        })
     }
 
     pub(super) fn cached_index_buffer(
@@ -947,6 +943,124 @@ fn queued_global_read_source_in_batch_prefix(
     }
 }
 
+fn queued_global_read_source_in_checkpoint(
+    checkpoint: &SharedEventSignalCheckpoint,
+    address: u64,
+    byte_count: u64,
+) -> QueuedGlobalReadSource {
+    if checkpoint
+        .unresolved_write_ranges
+        .iter()
+        .any(|write| unresolved_checkpoint_range_overlaps(write, address, byte_count))
+    {
+        return QueuedGlobalReadSource::Synchronize;
+    }
+    let mut candidate = None;
+    for version in &checkpoint.global_versions {
+        match contained_global_version_offset(version, address, byte_count) {
+            QueuedWriteReadMatch::None => {}
+            QueuedWriteReadMatch::Synchronize => {
+                return QueuedGlobalReadSource::Synchronize;
+            }
+            QueuedWriteReadMatch::Buffer {
+                offset,
+                physical_identity,
+            } => {
+                if !merge_global_read_candidate(
+                    &mut candidate,
+                    &version.buffer,
+                    offset,
+                    false,
+                    physical_identity,
+                    byte_count,
+                ) {
+                    return QueuedGlobalReadSource::Synchronize;
+                }
+            }
+        }
+    }
+    match candidate {
+        Some((buffer, offset, guest_memory, physical_identity)) => QueuedGlobalReadSource::Buffer {
+            buffer,
+            offset,
+            guest_memory,
+            physical_identity,
+        },
+        None => QueuedGlobalReadSource::None,
+    }
+}
+
+fn unresolved_checkpoint_range_overlaps(
+    write: &super::SharedEventUnresolvedWriteRange,
+    address: u64,
+    byte_count: u64,
+) -> bool {
+    if super::guest_ranges_overlap(write.guest_address, write.byte_count, address, byte_count) {
+        return true;
+    }
+    let Some(write_identity) = write.mapping_identity else {
+        return guest_physical_ranges_overlap(
+            write.guest_address,
+            write.byte_count,
+            address,
+            byte_count,
+        );
+    };
+    let Some(read_identity) = guest_shared_backing_identity(address, byte_count) else {
+        return false;
+    };
+    write_identity.backing_id == read_identity.backing_id
+        && super::guest_ranges_overlap(
+            write_identity.backing_offset,
+            write.byte_count,
+            read_identity.backing_offset,
+            byte_count,
+        )
+}
+
+fn merge_queued_global_read_source(
+    selected: &mut QueuedGlobalReadSource,
+    source: QueuedGlobalReadSource,
+    byte_count: u64,
+) -> bool {
+    match source {
+        QueuedGlobalReadSource::None => true,
+        QueuedGlobalReadSource::Synchronize => false,
+        QueuedGlobalReadSource::Buffer {
+            buffer,
+            offset,
+            guest_memory,
+            physical_identity,
+        } => match selected {
+            QueuedGlobalReadSource::None => {
+                *selected = QueuedGlobalReadSource::Buffer {
+                    buffer,
+                    offset,
+                    guest_memory,
+                    physical_identity,
+                };
+                true
+            }
+            QueuedGlobalReadSource::Buffer {
+                buffer: existing,
+                offset: existing_offset,
+                guest_memory: existing_guest_memory,
+                physical_identity: existing_identity,
+            } => {
+                let Some(end) = offset.checked_add(byte_count) else {
+                    return false;
+                };
+                end <= buffer.length()
+                    && existing.as_ptr() == buffer.as_ptr()
+                    && *existing_offset == offset
+                    && *existing_guest_memory == guest_memory
+                    && *existing_identity == physical_identity
+            }
+            QueuedGlobalReadSource::Synchronize => false,
+        },
+    }
+}
+
 enum QueuedWriteReadMatch {
     None,
     Buffer {
@@ -954,6 +1068,80 @@ enum QueuedWriteReadMatch {
         physical_identity: Option<GuestSharedMappingIdentity>,
     },
     Synchronize,
+}
+
+fn contained_global_version_offset(
+    version: &SharedEventGlobalBufferVersion,
+    address: u64,
+    byte_count: u64,
+) -> QueuedWriteReadMatch {
+    let virtual_overlap = super::guest_ranges_overlap(
+        version.guest_address,
+        version.byte_count,
+        address,
+        byte_count,
+    );
+    if let Some(producer_identity) = version.mapping_identity {
+        if let Some(read_identity) = guest_shared_backing_identity(address, byte_count)
+            && read_identity.backing_id == producer_identity.backing_id
+        {
+            let producer_start = producer_identity.backing_offset;
+            if let (Some(producer_end), Some(read_end)) = (
+                producer_start.checked_add(version.byte_count),
+                read_identity.backing_offset.checked_add(byte_count),
+            ) {
+                let read_start = read_identity.backing_offset;
+                if producer_start < read_end && read_start < producer_end {
+                    if read_start >= producer_start && read_end <= producer_end {
+                        if let Some(offset) =
+                            version.offset.checked_add(read_start - producer_start)
+                            && offset
+                                .checked_add(byte_count)
+                                .is_some_and(|end| end <= version.buffer.length())
+                        {
+                            return QueuedWriteReadMatch::Buffer {
+                                offset,
+                                physical_identity: Some(read_identity),
+                            };
+                        }
+                    }
+                    return QueuedWriteReadMatch::Synchronize;
+                }
+            }
+        }
+        if !virtual_overlap {
+            return QueuedWriteReadMatch::None;
+        }
+    } else if !guest_physical_ranges_overlap(
+        version.guest_address,
+        version.byte_count,
+        address,
+        byte_count,
+    ) {
+        return QueuedWriteReadMatch::None;
+    }
+    let Some(version_end) = version.guest_address.checked_add(version.byte_count) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    let Some(read_end) = address.checked_add(byte_count) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    if address < version.guest_address || read_end > version_end {
+        return QueuedWriteReadMatch::Synchronize;
+    }
+    let Some(offset) = version.offset.checked_add(address - version.guest_address) else {
+        return QueuedWriteReadMatch::Synchronize;
+    };
+    if offset
+        .checked_add(byte_count)
+        .is_none_or(|end| end > version.buffer.length())
+    {
+        return QueuedWriteReadMatch::Synchronize;
+    }
+    QueuedWriteReadMatch::Buffer {
+        offset,
+        physical_identity: version.mapping_identity,
+    }
 }
 
 fn contained_guest_write_offset(

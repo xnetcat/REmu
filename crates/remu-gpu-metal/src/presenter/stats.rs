@@ -400,6 +400,7 @@ impl PresenterStatistics {
             shared_event_waits: 0,
             shared_event_host_blocks: 0,
             shared_event_host_wakes: 0,
+            shared_event_gpu_ordered_compute_dispatches: 0,
             shared_event_error_advances: 0,
             shared_event_fallbacks_no_exact_producer: 0,
             shared_event_fallbacks_timeline_overflow: 0,
