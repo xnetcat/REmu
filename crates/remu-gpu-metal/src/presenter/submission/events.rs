@@ -241,6 +241,7 @@ impl OrderedGpuEventReceiver {
                 QueueBlockReason::GuestMemoryWait(wait) => {
                     !self.queued_wait_has_indexed_producer(*wait)
                 }
+                QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
                 _ => false,
             })
     }
@@ -311,13 +312,15 @@ impl OrderedGpuEventReceiver {
     ) -> OrderedEventPoll {
         self.ingest(dependency_ingress_budget());
         self.blocked_queues.retain(|_, reason| match reason {
-            QueueBlockReason::GuestMemoryWait(_) => true,
+            QueueBlockReason::GuestMemoryWait(_)
+            | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => true,
             reason @ (QueueBlockReason::FlipSafetyWait(_)
             | QueueBlockReason::GraphicsPipeline(_)
             | QueueBlockReason::ComputePipeline(_)) => !block_resolved(reason),
         });
         if self.host_block.as_ref().is_some_and(|reason| match reason {
-            QueueBlockReason::GuestMemoryWait(_) => false,
+            QueueBlockReason::GuestMemoryWait(_)
+            | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
             reason @ (QueueBlockReason::FlipSafetyWait(_)
             | QueueBlockReason::GraphicsPipeline(_)
             | QueueBlockReason::ComputePipeline(_)) => block_resolved(reason),
@@ -338,6 +341,7 @@ impl OrderedGpuEventReceiver {
                         self.blocked_queues.get(queue_id),
                         Some(
                             QueueBlockReason::GuestMemoryWait(_)
+                                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
                                 | QueueBlockReason::FlipSafetyWait(_)
                         )
                     )
@@ -471,6 +475,9 @@ impl OrderedGpuEventReceiver {
 
     pub(crate) fn retry_guest_memory_waits(&mut self) {
         self.ingest_guest_memory_wait_dependencies();
+        // Producerless waits may be satisfied by an external CPU store, so retain their periodic
+        // polling. A wait whose satisfying value is already in a Metal batch is instead woken by
+        // exact-range terminal publication; re-polling it here only spins on the same future.
         self.blocked_queues
             .retain(|_, reason| !matches!(reason, QueueBlockReason::GuestMemoryWait(_)));
         if matches!(self.host_block, Some(QueueBlockReason::GuestMemoryWait(_))) {
@@ -483,6 +490,7 @@ impl OrderedGpuEventReceiver {
             !matches!(
                 reason,
                 QueueBlockReason::GuestMemoryWait(wait)
+                    | QueueBlockReason::GuestMemoryWaitPendingTerminal(wait)
                     if guest_wait_overlaps_range(*wait, address, byte_count)
             )
         });
@@ -490,6 +498,7 @@ impl OrderedGpuEventReceiver {
             matches!(
                 reason,
                 QueueBlockReason::GuestMemoryWait(wait)
+                    | QueueBlockReason::GuestMemoryWaitPendingTerminal(wait)
                     if guest_wait_overlaps_range(*wait, address, byte_count)
             )
         }) {
@@ -646,7 +655,8 @@ impl OrderedGpuEventReceiver {
                 QueueBlockReason::GraphicsPipeline(_) | QueueBlockReason::ComputePipeline(_) => {
                     pipeline += 1;
                 }
-                QueueBlockReason::GuestMemoryWait(_) => memory += 1,
+                QueueBlockReason::GuestMemoryWait(_)
+                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => memory += 1,
                 QueueBlockReason::FlipSafetyWait(_) => flip += 1,
             }
         }
@@ -707,6 +717,9 @@ impl OrderedGpuEventReceiver {
                             QueueBlockReason::GuestMemoryWait(wait) => {
                                 format!("memory:{:#x}", wait.address)
                             }
+                            QueueBlockReason::GuestMemoryWaitPendingTerminal(wait) => {
+                                format!("memory-terminal:{:#x}", wait.address)
+                            }
                             QueueBlockReason::FlipSafetyWait(wait) => format!(
                                 "flip-safety:{:#x}/index:{}/required:{:?}",
                                 wait.address, wait.buffer_index, wait.required_flip_sequence
@@ -732,9 +745,10 @@ impl OrderedGpuEventReceiver {
         self.queue_order
             .iter()
             .filter_map(|queue_id| {
-                let QueueBlockReason::GuestMemoryWait(wait) = self.blocked_queues.get(queue_id)?
-                else {
-                    return None;
+                let wait = match self.blocked_queues.get(queue_id)? {
+                    QueueBlockReason::GuestMemoryWait(wait)
+                    | QueueBlockReason::GuestMemoryWaitPendingTerminal(wait) => wait,
+                    _ => return None,
                 };
                 Some(format!(
                     "q{queue_id}:wait@{:#x}/ref:{:#x}/mask:{:#x}/cmp:{}/producers:[{}]",

@@ -32,6 +32,11 @@ impl MetalPresenter {
         let publication = apply_pending_guest_memory_writes(pending);
         if publication.is_ok() {
             self.record_produced_guest_memory_writes(pending);
+            for write in pending {
+                let (address, byte_count) = write.range();
+                self.receiver
+                    .retry_guest_memory_waits_overlapping(address, byte_count);
+            }
         }
         merge_guest_batch_result(result, "ordered guest memory publication", publication)
     }

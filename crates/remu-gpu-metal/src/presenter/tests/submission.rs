@@ -1562,7 +1562,7 @@ fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
         presenter
             .execute_guest_memory_wait(OrderedEventSource::GuestQueue(77), None, wait)
             .expect("future deferred value parks the consuming queue"),
-        GuestMemoryWaitStatus::Blocked
+        GuestMemoryWaitStatus::BlockedOnPendingTerminal
     );
     assert!(presenter.open_guest_batch.is_none());
     assert_eq!(presenter.committed_guest_batches.len(), 1);
@@ -3181,6 +3181,129 @@ fn blocked_wait_dependency_ingress_has_a_finite_pending_event_bound() {
         matches!(ordered.try_recv(|_| true), OrderedEventPoll::Blocked),
         "blocked queue tails must never become runnable ahead of their wait"
     );
+}
+
+#[test]
+fn pending_terminal_wait_skips_periodic_poll_and_wakes_on_exact_publication() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let wait = GpuMemoryWait {
+        address: 0x5080,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("queue terminally pending wait");
+
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            source
+        }
+        other => panic!("expected memory wait, got {other:?}"),
+    };
+    ordered.block_event(
+        source,
+        GpuEvent::MemoryWait(wait),
+        QueueBlockReason::GuestMemoryWaitPendingTerminal(wait),
+    );
+
+    assert!(
+        !ordered.has_runnable_events(),
+        "an in-flight Metal producer is not producerless runnable work"
+    );
+    ordered.retry_guest_memory_waits();
+    assert!(matches!(
+        ordered.blocked_queues.get(&0),
+        Some(QueueBlockReason::GuestMemoryWaitPendingTerminal(actual)) if *actual == wait
+    ));
+    ordered.retry_guest_memory_waits_overlapping(wait.address + 4, 4);
+    assert!(ordered.blocked_queues.contains_key(&0));
+
+    ordered.retry_guest_memory_waits_overlapping(wait.address, 4);
+    assert!(!ordered.blocked_queues.contains_key(&0));
+    assert!(ordered.has_runnable_events());
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Event {
+            source: OrderedEventSource::GuestQueue(0),
+            event: GpuEvent::MemoryWait(actual),
+        } if actual == wait
+    ));
+}
+
+#[test]
+fn terminal_guest_memory_publication_wakes_the_exact_parked_wait() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let (_label_space, address) = mapped_test_label();
+    let wait = GpuMemoryWait {
+        address,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("queue terminal wait");
+
+    let (source, event) = match presenter.receiver.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: event @ GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            (source, event)
+        }
+        other => panic!("expected memory wait, got {other:?}"),
+    };
+    presenter.receiver.block_event(
+        source,
+        event,
+        QueueBlockReason::GuestMemoryWaitPendingTerminal(wait),
+    );
+    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+        address,
+        value: GpuMemoryReleaseValue::Immediate32(1),
+    }))
+    .expect("pin terminal release");
+
+    presenter
+        .publish_terminal_guest_memory_writes(&[pending], Ok(()))
+        .expect("publish terminal label");
+    assert_eq!(read_test_label(address), 1);
+    assert!(!presenter.receiver.blocked_queues.contains_key(&0));
+
+    let source = match presenter.receiver.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            source
+        }
+        other => panic!("expected terminally woken wait, got {other:?}"),
+    };
+    assert_eq!(
+        presenter
+            .execute_guest_memory_wait(source, None, wait)
+            .expect("terminal producer latch satisfies the wait"),
+        GuestMemoryWaitStatus::Satisfied
+    );
+    presenter.receiver.finish_event(source);
 }
 
 #[test]
