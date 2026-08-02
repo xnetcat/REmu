@@ -128,6 +128,26 @@ fn try_recover_sha_ni(context: *mut std::ffi::c_void) -> bool {
             sha1_nexte_apply_src1(&mut dst, src1);
             write_xmm(mcontext, decoded.dest, dst);
         }
+        Sha1Op::Sha256Msg1 => {
+            let mut dst = read_xmm(mcontext, decoded.dest);
+            let src = read_xmm(mcontext, decoded.src);
+            sha256_msg1(&mut dst, src);
+            write_xmm(mcontext, decoded.dest, dst);
+        }
+        Sha1Op::Sha256Msg2 => {
+            let mut dst = read_xmm(mcontext, decoded.dest);
+            let src = read_xmm(mcontext, decoded.src);
+            sha256_msg2(&mut dst, src);
+            write_xmm(mcontext, decoded.dest, dst);
+        }
+        Sha1Op::Sha256Rnds2 => {
+            let mut dst = read_xmm(mcontext, decoded.dest);
+            let src = read_xmm(mcontext, decoded.src);
+            // The round constants are an implicit XMM0 operand, not encoded in the ModRM.
+            let constants = read_xmm(mcontext, 0);
+            sha256_rnds2(&mut dst, src, constants);
+            write_xmm(mcontext, decoded.dest, dst);
+        }
         Sha1Op::Rnds4 { imm } => {
             let mut dst = read_xmm(mcontext, decoded.dest);
             let src = read_xmm(mcontext, decoded.src);
@@ -201,6 +221,12 @@ unsafe fn chain_previous_sigill(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Sha1Op {
+    /// `SHA256RNDS2 xmm1, xmm2` — two SHA-256 rounds; the round constants come from XMM0.
+    Sha256Rnds2,
+    /// `SHA256MSG1 xmm1, xmm2` — message schedule, sigma0 stage.
+    Sha256Msg1,
+    /// `SHA256MSG2 xmm1, xmm2` — message schedule, sigma1 stage.
+    Sha256Msg2,
     Msg1,
     Msg2,
     Nexte,
@@ -239,6 +265,9 @@ fn decode_sha1_ni(bytes: &[u8]) -> Option<DecodedSha1> {
             0xc8 => Sha1Op::Nexte,
             0xc9 => Sha1Op::Msg1,
             0xca => Sha1Op::Msg2,
+            0xcb => Sha1Op::Sha256Rnds2,
+            0xcc => Sha1Op::Sha256Msg1,
+            0xcd => Sha1Op::Sha256Msg2,
             _ => return None,
         };
         let mut dest = (modrm >> 3) & 0b111;
@@ -284,6 +313,87 @@ fn decode_sha1_ni(bytes: &[u8]) -> Option<DecodedSha1> {
 }
 
 /// `SHA1MSG1 xmm1, xmm2` — Bochs / Intel SDM dword-lane semantics (`lane0` = bits\[31:0\]).
+/// SHA-256 `sigma0`: the message-schedule mixer applied to W[i+1].
+const fn sha256_small_sigma0(value: u32) -> u32 {
+    value.rotate_right(7) ^ value.rotate_right(18) ^ (value >> 3)
+}
+
+/// SHA-256 `sigma1`: the message-schedule mixer applied to W[i+14].
+const fn sha256_small_sigma1(value: u32) -> u32 {
+    value.rotate_right(17) ^ value.rotate_right(19) ^ (value >> 10)
+}
+
+/// SHA-256 `Sigma0`, the round mixer applied to state word A.
+const fn sha256_big_sigma0(value: u32) -> u32 {
+    value.rotate_right(2) ^ value.rotate_right(13) ^ value.rotate_right(22)
+}
+
+/// SHA-256 `Sigma1`, the round mixer applied to state word E.
+const fn sha256_big_sigma1(value: u32) -> u32 {
+    value.rotate_right(6) ^ value.rotate_right(11) ^ value.rotate_right(25)
+}
+
+const fn sha256_choose(e: u32, f: u32, g: u32) -> u32 {
+    (e & f) ^ (!e & g)
+}
+
+const fn sha256_majority(a: u32, b: u32, c: u32) -> u32 {
+    (a & b) ^ (a & c) ^ (b & c)
+}
+
+/// `SHA256MSG1 xmm1, xmm2` — Intel SDM: dword lane `i` becomes `W[i] + sigma0(W[i+1])`, where
+/// `W[4]` is the low lane of the source.
+pub(crate) fn sha256_msg1(dst: &mut [u32; 4], src: [u32; 4]) {
+    let w4 = src[0];
+    let next = [dst[1], dst[2], dst[3], w4];
+    for lane in 0..4 {
+        dst[lane] = dst[lane].wrapping_add(sha256_small_sigma0(next[lane]));
+    }
+}
+
+/// `SHA256MSG2 xmm1, xmm2` — Intel SDM: the sigma1 stage, whose two upper results feed the two
+/// lower ones, so the lanes must be evaluated in order.
+pub(crate) fn sha256_msg2(dst: &mut [u32; 4], src: [u32; 4]) {
+    let w14 = src[2];
+    let w15 = src[3];
+    let w16 = dst[0].wrapping_add(sha256_small_sigma1(w14));
+    let w17 = dst[1].wrapping_add(sha256_small_sigma1(w15));
+    let w18 = dst[2].wrapping_add(sha256_small_sigma1(w16));
+    let w19 = dst[3].wrapping_add(sha256_small_sigma1(w17));
+    *dst = [w16, w17, w18, w19];
+}
+
+/// `SHA256RNDS2 xmm1, xmm2, <XMM0>` — two SHA-256 rounds.
+///
+/// Intel SDM operand mapping: the destination carries `{C, D, G, H}` from high to low lane and
+/// the source `{A, B, E, F}`; the pre-added `W + K` pair arrives in the low two lanes of the
+/// implicit XMM0. The result is `{A, B, E, F}` after two rounds.
+pub(crate) fn sha256_rnds2(dst: &mut [u32; 4], src: [u32; 4], constants: [u32; 4]) {
+    let (mut a, mut b) = (src[3], src[2]);
+    let (mut c, mut d) = (dst[3], dst[2]);
+    let (mut e, mut f) = (src[1], src[0]);
+    let (mut g, mut h) = (dst[1], dst[0]);
+    for round_constant in [constants[0], constants[1]] {
+        let common = sha256_choose(e, f, g)
+            .wrapping_add(sha256_big_sigma1(e))
+            .wrapping_add(round_constant)
+            .wrapping_add(h);
+        let next_a = common
+            .wrapping_add(sha256_majority(a, b, c))
+            .wrapping_add(sha256_big_sigma0(a));
+        let next_e = common.wrapping_add(d);
+        h = g;
+        g = f;
+        f = e;
+        e = next_e;
+        d = c;
+        c = b;
+        b = a;
+        a = next_a;
+    }
+    *dst = [f, e, b, a];
+}
+
 pub(crate) fn sha1_msg1(dst: &mut [u32; 4], src: [u32; 4]) {
     dst[3] ^= dst[1];
     dst[2] ^= dst[0];
@@ -353,6 +463,94 @@ pub(crate) fn sha1_rnds4(dst: &mut [u32; 4], src: [u32; 4], imm: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_ni_opcodes_decode_with_their_operands() {
+        // The three SHA-256 opcodes share the 0f 38 map with SHA-1.
+        for (opcode, expected) in [
+            (0xcb_u8, Sha1Op::Sha256Rnds2),
+            (0xcc, Sha1Op::Sha256Msg1),
+            (0xcd, Sha1Op::Sha256Msg2),
+        ] {
+            let decoded = decode_sha1_ni(&[0x0f, 0x38, opcode, 0xd1]).expect("decodes");
+            assert_eq!(decoded.op, expected);
+            assert_eq!(decoded.dest, 2);
+            assert_eq!(decoded.src, 1);
+            assert_eq!(decoded.length, 4);
+        }
+        // REX.RB reaches the upper eight registers.
+        let decoded = decode_sha1_ni(&[0x45, 0x0f, 0x38, 0xcc, 0xc1]).expect("decodes");
+        assert_eq!(decoded.op, Sha1Op::Sha256Msg1);
+        assert_eq!(decoded.dest, 8);
+        assert_eq!(decoded.src, 9);
+        assert_eq!(decoded.length, 5);
+    }
+
+    #[test]
+    fn sha256_ni_primitives_hash_the_empty_string_correctly() {
+        // Drive a full SHA-256 compression of the one-block padded empty message using only the
+        // emulated instructions, and compare against the published digest. Any lane-order or
+        // rotation error changes the digest, so this pins the semantics rather than the shape.
+        let mut w = [0_u32; 64];
+        w[0] = 0x8000_0000;
+        for index in 16..64 {
+            // Build the schedule with the same primitives the instructions use.
+            let s0 = sha256_small_sigma0(w[index - 15]);
+            let s1 = sha256_small_sigma1(w[index - 2]);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let initial: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        // SHA256RNDS2 lane layout: dst = {H, G, D, C}, src = {F, E, B, A}.
+        let mut abef = [initial[5], initial[4], initial[1], initial[0]];
+        let mut cdgh = [initial[7], initial[6], initial[3], initial[2]];
+        for round in (0..64).step_by(2) {
+            let constants = [
+                w[round].wrapping_add(K[round]),
+                w[round + 1].wrapping_add(K[round + 1]),
+                0,
+                0,
+            ];
+            let previous_abef = abef;
+            sha256_rnds2(&mut cdgh, previous_abef, constants);
+            std::mem::swap(&mut abef, &mut cdgh);
+        }
+        let digest = [
+            abef[3].wrapping_add(initial[0]),
+            abef[2].wrapping_add(initial[1]),
+            cdgh[3].wrapping_add(initial[2]),
+            cdgh[2].wrapping_add(initial[3]),
+            abef[1].wrapping_add(initial[4]),
+            abef[0].wrapping_add(initial[5]),
+            cdgh[1].wrapping_add(initial[6]),
+            cdgh[0].wrapping_add(initial[7]),
+        ];
+        assert_eq!(
+            digest,
+            [
+                0xe3b0c442, 0x98fc1c14, 0x9afbf4c8, 0x996fb924, 0x27ae41e4, 0x649b934c, 0xa495991b,
+                0x7852b855
+            ],
+            "SHA-256 of the empty string"
+        );
+    }
 
     #[test]
     fn decodes_poppy_fault_site() {
