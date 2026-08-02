@@ -1177,14 +1177,13 @@ pub(crate) fn av_player_nv12_layout(
 ) -> Option<(usize, usize)> {
     let width = usize::try_from(width).ok()?;
     let height = usize::try_from(height).ok()?;
-    // The Gen5 extended ABI exposes a 256-byte-aligned pitch and the visible height, while the
-    // backing GPU texture still rounds its storage height to 16 lines. Legacy frame info has no
-    // explicit pitch and therefore exposes both aligned dimensions.
+    // The Gen5 extended ABI exposes a 256-byte-aligned pitch and the raw visible height.
+    // Disassembly of Poppy Playtime's FAVPlayerMovieStreamer and UE MediaPlayer consumers
+    // (ghidra-avplayer-abi.md) proves both derive the chroma plane as pData + pitch*height
+    // with height used unaligned — a tightly packed NV12 with no inter-plane padding. Legacy
+    // frame info has no explicit pitch and exposes both dimensions 16-aligned.
     let (row_pitch, storage_height) = if extended {
-        (
-            width.checked_add(255)? & !255,
-            height.checked_add(15)? & !15,
-        )
+        (width.checked_add(255)? & !255, height)
     } else {
         (width.checked_add(15)? & !15, height.checked_add(15)? & !15)
     };
@@ -1253,7 +1252,14 @@ fn av_player_write_video_frame(
     }
     let width = usize::try_from(player.width).unwrap_or(0);
     let height = usize::try_from(player.height).unwrap_or(0);
-    let storage_height = height.saturating_add(15) & !15;
+    // The chroma destination must sit exactly where the layout published it: at
+    // row_pitch*height on the extended path, and at the 16-aligned storage height on the
+    // legacy path.
+    let storage_height = if extended {
+        height
+    } else {
+        height.saturating_add(15) & !15
+    };
     // The decoder hands over a tightly packed frame whose UV plane starts at width*height.
     // The published layout promises UV at row_pitch*storage_height, so the packed frame can
     // only be forwarded untouched when both dimensions already match their aligned forms.

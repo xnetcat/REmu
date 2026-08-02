@@ -15,13 +15,15 @@ type TlsStoreHelper = unsafe extern "C" fn();
 
 #[test]
 fn av_player_nv12_layout_matches_linear_gpu_texture_storage_extent() {
+    // The extended-ABI consumers derive the chroma plane at pData + pitch*height with the
+    // height used raw (ghidra-avplayer-abi.md), so the layout is tightly packed.
     assert_eq!(
         super::av_player_nv12_layout(1_440, 1_080, true),
-        Some((1_536, 2_506_752))
+        Some((1_536, 2_488_320))
     );
     assert_eq!(
         super::av_player_nv12_layout(1_920, 1_080, true),
-        Some((2_048, 3_342_336))
+        Some((2_048, 3_317_760))
     );
 }
 
