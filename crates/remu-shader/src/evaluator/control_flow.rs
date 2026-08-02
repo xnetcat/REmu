@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+use smallvec::SmallVec;
+
 use crate::{Instruction, Opcode};
 
 use super::scalar_alu::low_u16;
@@ -17,6 +19,32 @@ pub(crate) struct ScalarPath {
     pub(crate) exec_mask: u64,
     pub(crate) scalar_condition: bool,
     pub(crate) supplemental: bool,
+    /// Backward-edge budget already spent by this lineage, keyed by branch pc. Forked paths
+    /// inherit these counts. A fork that started with an empty table would restart the loop
+    /// budget, and since a loop body advances live scalar registers no two iterations share a
+    /// memoization key, so the evaluator would unroll the loop once per fork without bound.
+    pub(crate) backward_branch_visits: SmallVec<[(u32, u32); 4]>,
+}
+
+impl ScalarPath {
+    pub(crate) fn backward_branch_visits(&self, pc: u32) -> u32 {
+        self.backward_branch_visits
+            .iter()
+            .find(|(branch, _)| *branch == pc)
+            .map_or(0, |(_, visits)| *visits)
+    }
+
+    pub(crate) fn record_backward_branch_visit(&mut self, pc: u32) {
+        if let Some((_, visits)) = self
+            .backward_branch_visits
+            .iter_mut()
+            .find(|(branch, _)| *branch == pc)
+        {
+            *visits = visits.saturating_add(1);
+        } else {
+            self.backward_branch_visits.push((pc, 1));
+        }
+    }
 }
 
 pub(crate) struct VisitedPaths {

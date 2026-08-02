@@ -83,10 +83,14 @@ pub enum EvaluationError {
     #[error("branch at pc 0x{pc:X} targets invalid pc 0x{target:X}")]
     InvalidBranchTarget { pc: u32, target: u32 },
     #[error(
-        "shader control flow exceeded {MAX_PATH_STEPS} evaluated instructions at pc 0x{pc:X} \
+        "shader control flow exceeded {limit} evaluated instructions at pc 0x{pc:X} \
          with {pending_paths} pending paths"
     )]
-    ControlFlowLimit { pc: u32, pending_paths: usize },
+    ControlFlowLimit {
+        pc: u32,
+        pending_paths: usize,
+        limit: usize,
+    },
     #[error("guest memory read failed at pc 0x{pc:X}: address {address:#x}, {length} bytes")]
     MemoryFault {
         pc: u32,
@@ -163,12 +167,22 @@ struct Evaluator<'a, M> {
     global_bindings: Vec<GlobalMemoryBinding>,
     vertex_inputs: Vec<VertexInputBinding>,
     evaluated_steps: usize,
+    maximum_steps: usize,
 }
 
 pub fn evaluate_shader(
     memory: &impl GuestMemoryReader,
     state: &ShaderState,
     options: EvaluationOptions,
+) -> Result<ShaderEvaluation, EvaluationError> {
+    evaluate_shader_within(memory, state, options, MAX_PATH_STEPS)
+}
+
+fn evaluate_shader_within(
+    memory: &impl GuestMemoryReader,
+    state: &ShaderState,
+    options: EvaluationOptions,
+    maximum_steps: usize,
 ) -> Result<ShaderEvaluation, EvaluationError> {
     let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
     let user_base =
@@ -207,6 +221,7 @@ pub fn evaluate_shader(
         global_bindings: Vec::with_capacity(state.program.global_binding_capacity_hint()),
         vertex_inputs: Vec::with_capacity(4),
         evaluated_steps: 0,
+        maximum_steps,
     };
     if !state.program.instructions.is_empty() {
         evaluator.queue_path(ScalarPath {
@@ -215,6 +230,7 @@ pub fn evaluate_shader(
             exec_mask,
             scalar_condition: false,
             supplemental: false,
+            backward_branch_visits: SmallVec::new(),
         });
     }
     while let Some(path) = evaluator.pending_paths.pop() {
@@ -270,7 +286,6 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
 
     #[allow(clippy::too_many_lines)]
     fn execute_path(&mut self, mut path: ScalarPath) -> Result<(), EvaluationError> {
-        let mut backward_branch_visits = Vec::<(u32, usize)>::with_capacity(4);
         while let Some(instruction_index) = self
             .state
             .program
@@ -279,10 +294,11 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             path.instruction_index = instruction_index;
             let instruction = &self.state.program.instructions[instruction_index];
             self.evaluated_steps = self.evaluated_steps.saturating_add(1);
-            if self.evaluated_steps > MAX_PATH_STEPS {
+            if self.evaluated_steps > self.maximum_steps {
                 return Err(EvaluationError::ControlFlowLimit {
                     pc: instruction.pc,
                     pending_paths: self.pending_paths.len(),
+                    limit: self.maximum_steps,
                 });
             }
             if instruction.opcode == Opcode::END_PROGRAM {
@@ -323,11 +339,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     path.scalar_condition,
                 )?;
                 let backward = target_pc <= instruction.pc;
-                let backward_visits = backward_branch_visits
-                    .iter()
-                    .find(|(pc, _)| *pc == instruction.pc)
-                    .map(|(_, visits)| *visits)
-                    .unwrap_or_default();
+                let backward_visits = path.backward_branch_visits(instruction.pc);
                 // SCC is produced entirely by scalar instructions that this evaluator executes,
                 // so its branch direction is exact. Exploring the opposite SCC edge on every
                 // scalar-loop iteration creates thousands of impossible paths and can exhaust the
@@ -342,6 +354,12 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     } else {
                         target_index
                     };
+                    if backward && !taken {
+                        // The alternate edge of a not-taken backward branch is the loop header, so
+                        // it re-enters the loop exactly as taking the edge would. Charge it to the
+                        // same budget before cloning so the fork inherits the charge.
+                        path.record_backward_branch_visit(instruction.pc);
+                    }
                     let mut alternate = path.clone();
                     alternate.instruction_index = alternate_index;
                     alternate.supplemental = true;
@@ -374,14 +392,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                             path.instruction_index = path.instruction_index.saturating_add(1);
                             continue;
                         }
-                        if let Some((_, visits)) = backward_branch_visits
-                            .iter_mut()
-                            .find(|(pc, _)| *pc == instruction.pc)
-                        {
-                            *visits = visits.saturating_add(1);
-                        } else {
-                            backward_branch_visits.push((instruction.pc, 1));
-                        }
+                        path.record_backward_branch_visit(instruction.pc);
                     }
                     path.instruction_index = target_index;
                 } else {
