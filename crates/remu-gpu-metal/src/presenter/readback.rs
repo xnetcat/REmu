@@ -8,7 +8,8 @@ use super::{
     RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
     RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidentGuestTexture, SpanQueryOrder,
     TextureReadbackLayout, capture_interval, diagnostic_dump_glyph_draw,
-    diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_minimum_draw,
+    diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_index_count,
+    diagnostic_dump_target_minimum_draw,
     diagnostic_scanout_writer, evaluation_samples_glyph_atlas,
     encode_mode27_mip_chain_into_raw, half_float_to_f32, half_float_to_srgb_unorm8,
     half_float_to_unorm8, linear_unorm8_to_srgb_unorm8, mode27_mip_chain_layout,
@@ -182,6 +183,7 @@ impl MetalPresenter {
                 .is_some_and(|evaluation| evaluation_samples_glyph_atlas(evaluation));
         if (!shader_selected && !glyph_selected)
             || draw.sequence < diagnostic_dump_target_minimum_draw()
+            || diagnostic_dump_target_index_count().is_some_and(|count| count != draw.index_count)
         {
             return Ok(());
         }

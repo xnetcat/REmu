@@ -970,6 +970,15 @@ pub(super) fn diagnostic_dump_target_minimum_draw() -> u64 {
     })
 }
 
+pub(super) fn diagnostic_dump_target_index_count() -> Option<u32> {
+    static COUNT: OnceLock<Option<u32>> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("REMU_DUMP_TARGET_INDEX_COUNT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    })
+}
+
 pub(super) fn diagnostic_dump_target_match_index() -> usize {
     static INDEX: OnceLock<usize> = OnceLock::new();
     *INDEX.get_or_init(|| {

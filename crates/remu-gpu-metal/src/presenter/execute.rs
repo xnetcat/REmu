@@ -29,7 +29,8 @@ use super::{
     diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
     diagnostic_dump_glyph_draw,
     diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
-    diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
+    diagnostic_dump_target_index_count, diagnostic_dump_target_match_index,
+    diagnostic_dump_target_minimum_draw,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
     diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
     diagnostic_dump_video_target_consumer, diagnostic_force_msaa_vertex_pattern,
@@ -1868,6 +1869,7 @@ impl MetalPresenter {
                 .flatten()
             });
         if draw.sequence >= diagnostic_dump_target_minimum_draw()
+            && diagnostic_dump_target_index_count().is_none_or(|count| count == draw.index_count)
             && let Some(target) = diagnostic_target
         {
             static TARGET_MATCHES: AtomicUsize = AtomicUsize::new(0);
