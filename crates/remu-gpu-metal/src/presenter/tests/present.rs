@@ -12,8 +12,9 @@ use remu_shader::PixelOutputKind;
 use std::time::{Duration, Instant};
 
 use super::{
-    DecodedRenderTarget, DisplayConfiguration, GuestTextureDescriptor, MetalPresenter,
-    OrderedEventPoll, OrderedEventSource, PendingFlip, PresentationResolution, QueueBlockReason,
+    DecodedRenderTarget, DisplayConfiguration, GuestCommandBatch, GuestTextureDescriptor,
+    MetalPresenter, OrderedEventPoll, OrderedEventSource, PendingFlip, PresentationResolution,
+    QueueBlockReason,
     VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
     appkit_persistent_state_is_ignored, clear_appkit_persistent_state_override,
     decode_scanout_target, disable_appkit_state_restoration, headless_metal_value_is_enabled,
@@ -466,6 +467,105 @@ fn a_superseded_flip_is_completed_when_the_next_flip_replaces_it() {
             }
         ],
         "the replaced flip is retired before the flip that replaced it"
+    );
+}
+
+#[test]
+fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.display = Some(DisplayConfiguration {
+        width: 640,
+        height: 360,
+        pitch: 640,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 0,
+    });
+    presenter.pending_flip = Some(PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0x11,
+        sequence: 1,
+    });
+    presenter.next_flip_sequence = 1;
+    presenter.finalized_flip_sequence = 1;
+    presenter.uploaded_flip_sequence = 1;
+    // Ordered guest work whose Metal batch has not reached a terminal state: an unenqueued
+    // command buffer never retires, so any flip completion published while it queues has
+    // overtaken the frame's effects.
+    let outstanding = queue.new_command_buffer().to_owned();
+    presenter
+        .committed_guest_batches
+        .push_back(GuestCommandBatch {
+            command_buffer: outstanding.clone(),
+            work: Vec::new(),
+            committed_at: None,
+            global_upload_chunks: Vec::new(),
+            global_writebacks: Vec::new(),
+            guest_write_ranges: Vec::new(),
+            memory_writes: Vec::new(),
+            render_pass: None,
+            compute_encoder: None,
+            completion_sequences: Vec::new(),
+            flip_completions: Vec::new(),
+        });
+
+    sender
+        .send(GpuEvent::Flip {
+            address: 0xefc2_0000_00,
+            buffer_index: 1,
+            flip_argument: 0x22,
+            width: 640,
+            height: 360,
+            pitch: 640,
+            pixel_format: 0x8000_0000_0000_0000,
+            tiling_mode: 0,
+        })
+        .expect("flip event reaches presenter");
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+
+    assert_eq!(
+        presenter.submitted_flip_sequence, 2,
+        "both flips consumed their pacing slot: the superseded one into the deferral, the \
+         replacement through the surface-less finalize"
+    );
+    assert!(
+        remu_gpu::take_gpu_completed_flips()
+            .iter()
+            .all(|completion| completion.flip_argument != 0x11),
+        "the superseded flip must not retire while ordered guest work is outstanding"
+    );
+    let deferred = presenter
+        .committed_guest_batches
+        .back()
+        .expect("the outstanding batch is still queued")
+        .flip_completions
+        .clone();
+    assert_eq!(
+        deferred
+            .iter()
+            .map(|completion| completion.flip_argument)
+            .collect::<Vec<_>>(),
+        [0x11],
+        "the superseded completion waits on the outstanding batch"
+    );
+
+    // Once the batch reaches a terminal state and retires, the deferred completion publishes.
+    outstanding.commit();
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("the empty batch settles");
+    assert!(
+        remu_gpu::take_gpu_completed_flips()
+            .iter()
+            .any(|completion| completion.flip_argument == 0x11),
+        "batch retirement publishes the deferred flip completion"
     );
 }
 
