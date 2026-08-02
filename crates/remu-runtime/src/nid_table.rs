@@ -478,8 +478,13 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "ZvwO9euwYzc" => "sceAgcDcbSetCxRegistersIndirect",
         "-HOOCn0JY48" => "sceAgcDcbSetShRegistersIndirect",
         "hvUfkUIQcOE" => "sceAgcDcbSetUcRegistersIndirect",
-        "D9sr1xGUriE" => "sceAgcCreatePrimitiveState",
-        "HV4j+E0MBHE" => "sceAgcCreateInterpolantMapping",
+        "D9sr1xGUriE" => "sceAgcCreatePrimState",
+        // Called by shipped titles, but this is NOT sceAgcCreateInterpolantMapping: that symbol
+        // is dbOlWdppb4o in libSceAgc's export table. The name was borrowed from SharpEmu, whose
+        // own comment records that it collides with a real catalog symbol of a different NID.
+        // REmu's handler was written against the borrowed name, so what this entry point actually
+        // does is an open question rather than a settled one.
+        "HV4j+E0MBHE" => "sceAgcUnknown_HV4j+E0MBHE",
         "l4fM9K-Lyks" => "sceAgcDcbSetIndexBuffer",
         "GIIW2J37e70" => "sceAgcDcbSetIndexSize",
         "B+aG9DUnTKA" => "sceAgcDcbDrawIndexOffset",
@@ -487,7 +492,17 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "Yw0jKSqop+E" => "sceAgcDcbDrawIndexAuto",
         "n2fD4A+pb+g" => "sceAgcCbSetShRegisterRangeDirect",
         "V++UgBtQhn0" => "sceAgcGetDataPacketPayloadAddress",
-        "qj7QZpgr9Uw" => "sceAgcUnknownQj7QZpgr9Uw",
+        "qj7QZpgr9Uw" => "sceAgcDcbContextStateOp",
+        "H6vHS5cidSA" => "sceAgcDcbContextStateOpGetSize",
+        "ca4KPvp0qLQ" => "sceAgcDcbSetIndexSizeGetSize",
+        // The genuine sceAgcCreateInterpolantMapping. No observed title calls it — they call
+        // HV4j+E0MBHE below, which is a different NID that REmu and SharpEmu both label with this
+        // name. Naming both keeps a future caller from being reported as unknown.
+        "dbOlWdppb4o" => "sceAgcCreateInterpolantMapping",
+        "vieBRwlh1Lw" => "sceAgcUpdateInterpolantMapping",
+        // Named from libSceAgc's SDK 10.00 export table rather than by hashing: this NID is not
+        // the SHA-1 of any symbol name. `GIIW2J37e70` above is the hashed NID for the same
+        // function from an older SDK generation, and both are imported by shipped titles.
         "-KRzWekV120" => "sceAgcDcbSetIndexSize",
         "X-Nm5KLREeg" => "sceAgcDriverRegisterOwner",
         "W5z4eZrjEas" => "sceAgcDriverRegisterResource",

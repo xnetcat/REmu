@@ -312,12 +312,15 @@ fn dispatch_draw_command(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 
         "ZvwO9euwYzc" => set_registers_indirect(arguments, IndirectRegisterKind::Context),
         "-HOOCn0JY48" => set_registers_indirect(arguments, IndirectRegisterKind::Shader),
         "hvUfkUIQcOE" => set_registers_indirect(arguments, IndirectRegisterKind::UserConfig),
-        // Two NIDs, one function. `-KRzWekV120` is the identifier libSceAgc's export table
-        // actually carries for sceAgcDcbSetIndexSize; it is one of a handful of AGC exports whose
-        // NID is NOT the SHA-1 of its own name, so every table built by hashing symbol names —
-        // including the one that produced `GIIW2J37e70` — invents an identifier no shipping title
-        // ever calls. Unreal calls the real one about 1139 times per run. The hashed alias is kept
-        // in case some SDK revision does emit it.
+        // One function, two NIDs, split cleanly by SDK generation. `GIIW2J37e70` is the SHA-1 of
+        // "sceAgcDcbSetIndexSize" and is what SDKs up to 5.00 exported; SDK 7.00 replaced it with
+        // `-KRzWekV120`, which is not the hash of any name and is what libSceAgc's stub archive
+        // carries. Across the seven shipped titles surveyed the correlation is exact and no title
+        // imports both: the <= 5.00 builds (Dreaming Sarah among them, which calls it) take the
+        // hashed NID, the >= 7.00 builds take the other. In both generations the thunk occupies
+        // the same declaration-order slot just before SetIndexBuffer/SetIndexCount and the
+        // arguments agree. Unreal calls it about 1139 times per run in Poppy Playtime, every one
+        // of which reached the unimplemented path until this arm existed.
         "GIIW2J37e70" | "-KRzWekV120" => set_index_size(arguments),
         // DcbSetIndexBuffer stays in the parent runtime because its four-argument ABI associates
         // a CPU index pointer with a GPU resource address.

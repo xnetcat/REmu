@@ -6876,9 +6876,23 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(combination)
         {
+            // The whole block, not just the leading pair: entry order is a property of the
+            // shader compiler, not of the ABI, so which hardware register actually sits at
+            // position 0 can only be read off a real title.
+            let block = (0..u64::from(register_count))
+                .map(|index| {
+                    let entry = registers + index * 8;
+                    format!(
+                        "{:#x}={:#x}",
+                        read_guest_u32(entry),
+                        read_guest_u32(entry + 4)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!(
                 "[REMu][AGC] accepted shader registration type={shader_type} \
-                 registers=({:#x}, {:#x}) count={register_count}",
+                 registers=({:#x}, {:#x}) count={register_count} block=[{block}]",
                 observed.0, observed.1
             );
         }
@@ -8529,9 +8543,7 @@ fn probe_entry(
     ) as i32;
     run_guest_thread_destructors();
     set_current_guest_thread_pointer(0);
-    // The SIGILL-recovery counters print inside the summary, which also covers the common case
-    // where the guest never returns here because it exits through terminate_probe.
-    report_abi_gap_summary();
+    report_end_of_run_diagnostics();
     DIAGNOSTIC_TIMEOUT_CANCELLED.store(true, Ordering::Release);
     DIAGNOSTIC_TIMEOUT_SECONDS.store(0, Ordering::Release);
     remu_gpu::set_progress_telemetry_enabled(false);
@@ -8585,6 +8597,21 @@ pub fn report_shader_opcode_coverage() {
 /// so this summary is the only place exact totals appear. It prints at most once per process and
 /// runs on every exit path via [`terminate_probe`], because the runs that need it most are the
 /// ones that die early.
+/// Prints every end-of-run report, from whichever path a run happens to wind down through.
+///
+/// The two reports used to be called separately, and drifted: the guest-return tail printed the
+/// ABI summary without the opcode histogram, so a clean exit silently lost the histogram even with
+/// `REMU_TRACE_SHADER_OPCODES=1` set correctly. Worse, the surviving summary made it look as
+/// though `terminate_probe` had run, which sent an investigation after the environment plumbing
+/// instead of this. One entry point is the fix for that class of drift.
+///
+/// Both reports are individually safe to call more than once — the summary is guarded by its own
+/// flag and the histogram is empty unless its trace variable is set.
+fn report_end_of_run_diagnostics() {
+    report_shader_opcode_coverage();
+    report_abi_gap_summary();
+}
+
 pub fn report_abi_gap_summary() {
     static REPORTED: AtomicBool = AtomicBool::new(false);
     if REPORTED.swap(true, Ordering::AcqRel) {
@@ -8649,6 +8676,15 @@ fn abi_gap_fingerprint() -> u64 {
 }
 
 fn write_abi_gap_summary() {
+    // One block at a time. The periodic reporter deliberately bypasses the once-only guard so it
+    // can re-emit, which means its tick can land inside the exit-path emission — and `eprintln!`
+    // locks per line, not per block. Interleaved blocks would splice two snapshots together, and
+    // run-game.sh copies the LAST header-delimited block into summary.txt, so a torn block becomes
+    // wrong totals in the run's own record.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _serialized = WRITING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     eprintln!("[REMu][REPORT] --- ABI gap summary ---");
     for (reason, count) in DECLINED_SHADER_REASONS
         .iter()
@@ -8983,8 +9019,7 @@ fn start_diagnostic_timeout(timeout_seconds: u32) {
 }
 
 fn terminate_probe(code: i32) -> ! {
-    report_shader_opcode_coverage();
-    report_abi_gap_summary();
+    report_end_of_run_diagnostics();
     stop_av_player_controller();
     #[cfg(unix)]
     // SAFETY: `_exit` terminates the isolated CLI probe without unwinding across guest frames.
