@@ -26,6 +26,7 @@ use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{GpuEvent, GpuMemoryAcquire};
 use std::sync::atomic::{AtomicUsize, Ordering};
 mod batch;
+mod draw_footprint;
 mod events;
 mod memory;
 mod waits;
@@ -37,6 +38,7 @@ pub(crate) use self::batch::{
     completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
     merge_guest_batch_result,
 };
+pub(crate) use self::draw_footprint::{SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject};
 #[cfg(test)]
 pub(crate) use self::memory::{
     apply_pending_guest_memory_writes, pin_guest_memory_write, release_value_for_wait,
@@ -180,6 +182,11 @@ impl MetalPresenter {
             let mut shared_event_gpu_ordered_registered_wait = false;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
                 let dependencies = self.unsignaled_host_dependencies(queue_id);
+                if !dependencies.is_empty()
+                    && let GpuEvent::IndexedDraw(draw) = &event
+                {
+                    self.observe_shared_event_direct_draw_preflight(queue_id, &dependencies, draw);
+                }
                 let gpu_orderable = dependencies.is_empty()
                     || self.event_is_shared_event_gpu_orderable(source, &event);
                 if !gpu_orderable {

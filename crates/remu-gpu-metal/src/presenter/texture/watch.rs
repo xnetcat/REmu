@@ -6,14 +6,13 @@ use super::{
     GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, ResourceSpan,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
-    TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+    StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, guest_texture_byte_count,
-    gpu_written_resident_serving_sampled_key,
-    mode5_mip_chain_layout, mode27_mip_chain_layout, record_texture_dirty_work_detail,
-    record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
-    StaleSource, texture_alias_trace_match, trace_alias_correlated_acquire,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, gpu_written_resident_serving_sampled_key,
+    guest_texture_byte_count, mode5_mip_chain_layout, mode27_mip_chain_layout,
+    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
+    retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
     trace_resident_texture_demotion, trace_resident_texture_removal,
 };
 use remu_gpu::GpuMemoryAcquire;
@@ -268,12 +267,9 @@ impl MetalPresenter {
             // GPU-authored resident still owns the pixels (Octopath 0x80f27e0000 snapshots).
             // Prefer the resident's sparse content validation over the sampled watch dirty bit:
             // pitch-mismatched SRDs and component-reordered views share the same GPU image.
-            if let Some(resident_descriptor) = gpu_written_resident_serving_sampled_key(
-                &self.resident_guest_textures,
-                key,
-            ) && let Some(resident) = self
-                .resident_guest_textures
-                .get_mut(&resident_descriptor)
+            if let Some(resident_descriptor) =
+                gpu_written_resident_serving_sampled_key(&self.resident_guest_textures, key)
+                && let Some(resident) = self.resident_guest_textures.get_mut(&resident_descriptor)
                 && !resident.write_watch.content_has_changed()?
             {
                 resident.note_gpu_write();
@@ -1046,33 +1042,47 @@ pub(crate) fn watch_resident_texture(
     layer_count: u32,
     mip_level_count: u32,
 ) -> Result<GuestTextureWriteWatch, String> {
+    let byte_count =
+        resident_texture_raw_byte_count(descriptor, texture_type, layer_count, mip_level_count)?;
+    GuestTextureWriteWatch::new(descriptor.address, byte_count)
+}
+
+/// Returns the complete guest allocation extent used by a resident texture.
+///
+/// Residency watches and shared-event draw preflight deliberately share this calculation. A
+/// second attachment-footprint formula could silently omit mip tails, array faces, or tiled
+/// padding and admit a draw against an in-flight producer write.
+pub(crate) fn resident_texture_raw_byte_count(
+    descriptor: GuestTextureDescriptor,
+    texture_type: u32,
+    layer_count: u32,
+    mip_level_count: u32,
+) -> Result<u64, String> {
     if texture_type == 9 && layer_count == 1 {
         if mip_level_count == 1 {
-            watch_guest_texture(descriptor)
-        } else {
-            let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
-            GuestTextureWriteWatch::new(
-                descriptor.address,
-                u64::try_from(layout.byte_count)
-                    .map_err(|_| "mip chain byte count does not fit u64")?,
-            )
+            return guest_texture_byte_count(descriptor)
+                .ok_or_else(|| "resident texture byte count overflows".to_owned());
         }
-    } else {
-        if mip_level_count != 1 {
-            return Err(format!(
-                "mipmapped resident texture type={texture_type} layers={layer_count} is unsupported"
-            ));
-        }
-        watch_sampled_texture(DecodedImageDescriptor {
-            guest: descriptor,
-            span: ResourceSpan::for_texture(descriptor),
-            destination_select: 0,
-            base_mip_level: 0,
-            mip_level_count: 1,
-            texture_type,
-            layer_count,
-        })
+        let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
+        return u64::try_from(layout.byte_count)
+            .map_err(|_| "mip chain byte count does not fit u64".to_owned());
     }
+    if mip_level_count != 1 {
+        return Err(format!(
+            "mipmapped resident texture type={texture_type} layers={layer_count} is unsupported"
+        ));
+    }
+    let descriptor = DecodedImageDescriptor {
+        guest: descriptor,
+        span: ResourceSpan::for_texture(descriptor),
+        destination_select: 0,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        texture_type,
+        layer_count,
+    };
+    let (_, byte_count) = sampled_texture_raw_range(descriptor)?;
+    u64::try_from(byte_count).map_err(|_| "resident texture byte count does not fit u64".to_owned())
 }
 
 pub(crate) fn refresh_sampled_texture_write_watch(

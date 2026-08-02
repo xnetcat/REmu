@@ -12,7 +12,7 @@ use super::super::{
     RESIDENT_WRITEBACK_PUBLISHED, RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState,
     SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
-    SHARED_HOST_KIND_WAIT, WRITEBACK_TRIGGERS,
+    SHARED_HOST_KIND_WAIT, SharedEventDrawReject, WRITEBACK_TRIGGERS,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -304,17 +304,35 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
             );
             eprintln!(
-                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s gpu-ordered-waits={:.0}/s gpu-ordered-compute={:.0}/s footprint-incomplete={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
+                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s gpu-ordered-waits={:.0}/s gpu-ordered-compute={:.0}/s gpu-ordered-draw={:.0}/s footprint-incomplete={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
                 f64::from(self.statistics.shared_event_signals) / seconds,
                 f64::from(self.statistics.shared_event_waits) / seconds,
                 f64::from(self.statistics.shared_event_host_blocks) / seconds,
                 f64::from(self.statistics.shared_event_host_wakes) / seconds,
                 f64::from(self.statistics.shared_event_gpu_ordered_registered_waits) / seconds,
                 f64::from(self.statistics.shared_event_gpu_ordered_compute_dispatches,) / seconds,
+                f64::from(self.statistics.shared_event_gpu_ordered_draws) / seconds,
                 f64::from(self.statistics.shared_event_incomplete_signal_footprints) / seconds,
                 self.statistics.shared_event_error_advances,
                 f64::from(self.statistics.shared_event_fallbacks_no_exact_producer) / seconds,
                 self.statistics.shared_event_fallbacks_timeline_overflow,
+            );
+            let draw_rejections = &self.statistics.shared_event_draw_rejections;
+            eprintln!(
+                "[REMu][PERF-SHARED-EVENT-DRAW] attempts={:.0}/s disjoint-candidates={:.0}/s internal-drains={:.0}/s admission=disabled reject=overlap:{:.0}/s,incomplete-producer:{:.0}/s,unresolved:{:.0}/s,indirect:{:.0}/s,shader-coverage:{:.0}/s,special-op:{:.0}/s,diagnostic:{:.0}/s,other:{:.0}/s",
+                f64::from(self.statistics.shared_event_draw_attempts) / seconds,
+                f64::from(self.statistics.shared_event_draw_disjoint_candidates) / seconds,
+                f64::from(self.statistics.shared_event_draw_internal_drains) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Overlap.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::IncompleteProducer.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Unresolved.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Indirect.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::ShaderCoverage.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::SpecialOperation.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Diagnostic.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Other.index()]) / seconds,
             );
             let host_kinds = &self.statistics.shared_event_host_block_kinds;
             eprintln!(

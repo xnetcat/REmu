@@ -35,6 +35,32 @@ pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT: usize = 1_080;
 
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX: u64 = 30;
 
+/// Whether draw execution is under an opt-in diagnostic which can alter the normal presenter
+/// path, inspect native resources, drain Metal work, or write an artifact.
+///
+/// Shared-event draw preflight treats the diagnostic namespaces as default-deny. Keeping that
+/// policy here means a new `REMU_DUMP_*`, `REMU_TRACE_*`, or `REMU_DIAGNOSTIC_*` switch cannot be
+/// accidentally GPU-ordered merely because the scheduler's allow-list was not updated.
+pub(super) fn draw_diagnostics_are_host_effectful() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::vars_os().any(|(name, value)| {
+            let name = name.to_string_lossy();
+            let selected_namespace = name.starts_with("REMU_DUMP_")
+                || name.starts_with("REMU_TRACE_")
+                || name.starts_with("REMU_DIAGNOSTIC_");
+            let selected_capture = matches!(
+                name.as_ref(),
+                "REMU_CAPTURE_FRAMES" | "REMU_CAPTURE_TARGET_SAMPLES"
+            );
+            let selected_shader_skip = matches!(name.as_ref(), "REMU_SKIP_ES" | "REMU_SKIP_PS");
+            (selected_namespace || selected_capture || selected_shader_skip)
+                && !value.is_empty()
+                && value != "0"
+        })
+    })
+}
+
 pub(super) fn trace_image_descriptors() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_IMAGES").is_some_and(|value| value == "1"))
@@ -46,15 +72,15 @@ pub(super) fn trace_image_descriptors() -> bool {
 /// lost channel swizzle.
 pub(super) fn trace_glyph_atlas() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var_os("REMU_TRACE_GLYPH_ATLAS").is_some_and(|value| value == "1"))
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_GLYPH_ATLAS").is_some_and(|value| value == "1")
+    })
 }
 
 pub(super) fn diagnostic_dump_glyph_draw() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_DUMP_GLYPH_DRAW").is_some_and(|value| value == "1")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var_os("REMU_DUMP_GLYPH_DRAW").is_some_and(|value| value == "1"))
 }
 
 pub(super) fn evaluation_samples_glyph_atlas(evaluation: &ShaderEvaluation) -> bool {
