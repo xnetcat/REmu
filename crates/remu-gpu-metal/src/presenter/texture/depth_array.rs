@@ -117,7 +117,10 @@ impl MetalPresenter {
             self.resident_guest_textures
                 .get(&face)
                 .is_some_and(|resident| {
-                    resident.gpu_written() && resident.texture_type == 9 && resident.layer_count == 1
+                    resident.gpu_written()
+                        && resident.serves_reads()
+                        && resident.texture_type == 9
+                        && resident.layer_count == 1
                 })
         })
     }
@@ -157,6 +160,7 @@ impl MetalPresenter {
                         let face = depth_array_face_descriptor(descriptor, layer)?;
                         let resident = self.resident_guest_textures.get(&face)?;
                         (resident.gpu_written()
+                            && resident.serves_reads()
                             && resident.texture_type == 9
                             && resident.layer_count == 1)
                             .then(|| (resident.texture.clone(), resident.content_version))

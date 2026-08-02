@@ -119,9 +119,10 @@ pub(crate) fn resident_texture_eviction_plan(
             let mapping_replaced =
                 resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced);
             (
-                // Replaced mappings carry no valid destination for writeback. Clean residents
-                // need no writeback. Retire both before GPU-owned live mappings.
-                !mapping_replaced,
+                // Replaced mappings carry no valid destination for writeback, and a demoted
+                // allocation answers for no byte at all. Clean residents need no writeback.
+                // Retire all three before GPU-owned live mappings.
+                !mapping_replaced && resident.is_live(),
                 resident.gpu_written(),
                 resident.last_use.flip,
                 resident.last_use.work,
@@ -132,9 +133,9 @@ pub(crate) fn resident_texture_eviction_plan(
         })
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(
-        |(live_mapping, gpu_written, flip, work, version, descriptor, _)| {
+        |(reclaim_last, gpu_written, flip, work, version, descriptor, _)| {
             (
-                *live_mapping,
+                *reclaim_last,
                 *gpu_written,
                 *flip,
                 *work,

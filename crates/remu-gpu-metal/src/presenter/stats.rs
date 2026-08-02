@@ -102,6 +102,18 @@ pub(super) static OWNED_UNRESOLVED_SPAN: AtomicU64 = AtomicU64::new(0);
 /// range the code claimed before the range algebra existed.
 pub(super) static OWNED_FALLBACK_FULL_RANGE: AtomicU64 = AtomicU64::new(0);
 
+/// Residents an intersecting write reached through the index but did not take a byte from.
+///
+/// This is the direct measure of pooled tenants surviving a neighbour's write: every count is a
+/// resident the descriptor-overlap rule would have destroyed.
+pub(super) static OWNED_SUBTRACT_TENANTS_SURVIVED: AtomicU64 = AtomicU64::new(0);
+
+/// Residents that lost their last owned byte and moved to `Stale` in place.
+pub(super) static OWNED_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Demoted residents re-taken by a bind that overwrites every texel, at no copy cost.
+pub(super) static OWNED_RECLAIM_DISCARD: AtomicU64 = AtomicU64::new(0);
+
 pub(super) static SAMPLED_ALIAS_WRITEBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static SAMPLED_ALIAS_WRITEBACK_BYTES: AtomicU64 = AtomicU64::new(0);

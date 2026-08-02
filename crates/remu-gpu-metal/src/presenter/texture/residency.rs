@@ -6,10 +6,10 @@ use super::super::{FlushPolicy, GuestBatchFlushReason};
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
-    MultisampleTextureKey, RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState,
-    ResidentGuestTexture, ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan,
-    ScanoutSnapshotTexture, SpanQueryOrder, TEXTURE_QUARANTINE_ADOPTED,
-    TEXTURE_QUARANTINE_REJECTED, WriteWatchRefresh, WrittenRegion,
+    MultisampleTextureKey, OWNED_SUBTRACT_TENANTS_SURVIVED, RESIDENT_WRITE_ATTRIBUTION_MISSES,
+    RangeSet, ResidencyState, ResidentGuestTexture, ResidentTextureActivityStamp,
+    ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture, SpanQueryOrder, StaleSource,
+    TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED, WriteWatchRefresh, WrittenRegion,
     create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
     decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
     guest_texture_byte_count, guest_texture_descriptors_share_gpu_sample_storage,
@@ -17,10 +17,10 @@ use super::{
     mode27_mip_chain_layout, promote_resident_mip_hierarchy, record_mode27_work_detail,
     refresh_resident_texture_write_watch, resident_texture_eviction_plan,
     resident_texture_for_sample, retire_multisample_textures_overlapping_writeback,
-    retire_overlapping_sampled_textures, retire_resident_textures_overlapping_writeback,
-    retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
-    snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw, spans_overlap,
-    texture_element_layout, trace_resident_texture_removal, trace_residency_churn,
+    retire_overlapping_sampled_textures, retire_sampled_textures_overlapping_writeback,
+    snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
+    snapshot_watched_sampled_texture_raw, spans_overlap, texture_element_layout,
+    trace_resident_texture_demotion, trace_resident_texture_removal, trace_residency_churn,
     watch_guest_texture, watch_resident_texture, watch_sampled_texture,
     write_resident_texture_contents_to_guest, written_byte_ranges,
 };
@@ -31,8 +31,16 @@ use metal::{
 use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+/// A/B lever for the range algebra: `REMU_RANGE_ALGEBRA=0` makes every write claim its writer's
+/// whole declared range, which supersedes exactly what the descriptor-overlap retirement did.
+fn range_algebra_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("REMU_RANGE_ALGEBRA").as_deref() != Ok("0"))
+}
 
 /// A Metal texture together with the residency-map key the ensure path served it from.
 ///
@@ -59,6 +67,9 @@ pub(crate) struct ResidentTextureOwnershipStats {
     pub(crate) gpu_owned_bytes: u64,
     pub(crate) cpu_owned_count: usize,
     pub(crate) cpu_owned_bytes: u64,
+    /// Demoted allocations, which answer for no byte but still pin their Metal storage.
+    pub(crate) stale_count: usize,
+    pub(crate) stale_bytes: u64,
     pub(crate) active_mapping_count: usize,
     pub(crate) active_mapping_bytes: u64,
     pub(crate) reprotected_mapping_count: usize,
@@ -89,6 +100,10 @@ pub(crate) fn resident_texture_ownership_stats(
         } else {
             stats.cpu_owned_count += 1;
             stats.cpu_owned_bytes = stats.cpu_owned_bytes.saturating_add(allocated_bytes);
+        }
+        if !resident.is_live() {
+            stats.stale_count += 1;
+            stats.stale_bytes = stats.stale_bytes.saturating_add(allocated_bytes);
         }
 
         let mapping_is_live = match resident.write_watch.retirement() {
@@ -212,32 +227,20 @@ impl MetalPresenter {
             }
 
             if gpu_written {
-                let (alias_ranges, content_version) = {
-                    let resident = self
-                        .resident_guest_textures
-                        .get(&descriptor)
-                        .expect("pressure candidate survived watch refresh");
-                    (
-                        resident.write_watch.alias_ranges(),
-                        resident.content_version,
-                    )
-                };
+                let alias_ranges = self
+                    .resident_guest_textures
+                    .get(&descriptor)
+                    .expect("pressure candidate survived watch refresh")
+                    .write_watch
+                    .alias_ranges();
                 // A sampled alias can retain a texture view of the same allocation. Retire every
                 // overlapping interpretation before publishing the authoritative pixels to RAM,
-                // and discard older resident/MSAA versions that the writeback supersedes.
+                // and hand this resident's authority to guest RAM for everyone it supersedes.
                 retire_sampled_textures_overlapping_writeback(
                     &mut self.sampled_texture_cache,
                     &alias_ranges,
                 );
-                // Pressure eviction reclaims memory; parking casualties in the quarantine the
-                // pass just cleared would keep their allocations alive, so discard them.
-                retire_resident_textures_overlapping_writeback(
-                    &mut self.resident_guest_textures,
-                    &mut HashMap::new(),
-                    &alias_ranges,
-                    descriptor,
-                    content_version,
-                );
+                self.note_resident_writeback_published(descriptor);
                 retire_multisample_textures_overlapping_writeback(
                     &mut self.multisample_textures,
                     &alias_ranges,
@@ -349,6 +352,7 @@ impl MetalPresenter {
             .get(&descriptor.guest)
             .is_some_and(|resident| {
                 !resident.gpu_written()
+                    && resident.is_live()
                     && resident.texture_type == 9
                     && resident.layer_count == 1
                     && resident.mip_level_count < underlying_mip_count
@@ -428,10 +432,15 @@ impl MetalPresenter {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
                 | WriteWatchRefresh::Renewed { .. } => {
-                    return Ok(SelectedResidentTexture {
-                        texture: resident.texture.clone(),
-                        descriptor,
-                    });
+                    // A demoted target the guest is about to overwrite costs one state flip: no
+                    // snapshot, no de-tile, no reprotect, no allocation. This is the path Unreal's
+                    // transient allocator takes every time it re-binds a pooled range.
+                    if resident.reclaim_for_bind(!upload_guest_contents) {
+                        return Ok(SelectedResidentTexture {
+                            texture: resident.texture.clone(),
+                            descriptor,
+                        });
+                    }
                 }
                 WriteWatchRefresh::Replaced => {}
             }
@@ -443,7 +452,8 @@ impl MetalPresenter {
             .resident_guest_textures
             .values()
             .find(|resident| {
-                resident.texture_type == 9
+                resident.serves_reads()
+                    && resident.texture_type == 9
                     && resident.layer_count == 1
                     && resident.mip_level_count >= 1
                     && guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
@@ -478,6 +488,7 @@ impl MetalPresenter {
             .values()
             .filter(|resident| {
                 resident.gpu_written()
+                    && resident.serves_reads()
                     && resident.texture_type == 9
                     && resident.layer_count == 1
                     && resident.mip_level_count >= 1
@@ -505,8 +516,11 @@ impl MetalPresenter {
                     .overlapping(span, SpanQueryOrder::ResidentFirst)
             })
             .filter_map(|alias| {
+                // A demoted alias owes no writeback; its watch is refreshed by the acquire scan
+                // and by the exact-key bind that reclaims or rebuilds it.
                 self.resident_guest_textures
                     .get(&alias)
+                    .filter(|resident| resident.is_live())
                     .map(|resident| (resident.content_version, resident.descriptor))
             })
             .collect::<Vec<_>>();
@@ -575,46 +589,42 @@ impl MetalPresenter {
                         trace_resident_texture_removal("alias-mapping-replaced", &resident);
                     }
                 } else if gpu_written {
-                    let resident = self
-                        .resident_guest_textures
-                        .remove(&alias)
-                        .expect("collected GPU-written resident alias exists");
                     if cpu_write_obsoletes_writeback {
                         // The guest reused this heap range after the last render. Publishing the
                         // old Metal image now would overwrite the new indirect-command bytes.
-                        trace_resident_texture_removal("cpu-reused-gpu-alias", &resident);
+                        if let Some(resident) = self.resident_guest_textures.remove(&alias) {
+                            trace_resident_texture_removal("cpu-reused-gpu-alias", &resident);
+                        }
                         continue;
                     }
-                    let alias_ranges = resident.write_watch.alias_ranges();
+                    let alias_ranges = self
+                        .resident_guest_textures
+                        .get(&alias)
+                        .expect("collected GPU-written resident alias exists")
+                        .write_watch
+                        .alias_ranges();
                     retire_sampled_textures_overlapping_writeback(
                         &mut self.sampled_texture_cache,
                         &alias_ranges,
                     );
-                    retire_resident_textures_overlapping_writeback(
-                        &mut self.resident_guest_textures,
-                        &mut self.retired_texture_quarantine,
-                        &alias_ranges,
-                        resident.descriptor,
-                        resident.content_version,
-                    );
+                    self.note_resident_writeback_published(alias);
                     retire_multisample_textures_overlapping_writeback(
                         &mut self.multisample_textures,
                         &alias_ranges,
                     );
-                    write_resident_texture_contents_to_guest(
-                        device,
-                        queue
-                            .as_ref()
-                            .expect("GPU-written aliases acquired the command queue"),
-                        &resident,
-                    )?;
+                    let queue = queue
+                        .as_ref()
+                        .expect("GPU-written aliases acquired the command queue");
+                    let resident = self
+                        .resident_guest_textures
+                        .get_mut(&alias)
+                        .expect("collected GPU-written resident alias exists");
+                    write_resident_texture_contents_to_guest(device, queue, resident)?;
                     // The writeback made guest RAM and the Metal allocation identical and
-                    // refreshed the watch's content baseline, so the resident is CPU-owned
-                    // again and adoptable. Re-adopting it also breaks the per-frame cycle:
-                    // the next bind sees no GPU-written alias and skips this whole path.
-                    let mut resident = resident;
+                    // refreshed the watch's content baseline, so the allocation stays in place,
+                    // still the authority for its bytes and owing none of them. That is what
+                    // breaks the per-frame cycle: the next bind sees no GPU-written alias.
                     resident.clear_gpu_authored();
-                    quarantine_retired_resident(&mut self.retired_texture_quarantine, resident);
                 }
             }
         }
@@ -635,6 +645,7 @@ impl MetalPresenter {
         &mut self,
         device: &Device,
         target: DecodedRenderTarget,
+        discard_guest_contents: bool,
     ) -> Result<SelectedResidentTexture, String> {
         if target.texture_type != 9
             || target.layer_count != 1
@@ -662,10 +673,12 @@ impl MetalPresenter {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
                 | WriteWatchRefresh::Renewed { .. } => {
-                    return Ok(SelectedResidentTexture {
-                        texture: resident.texture.clone(),
-                        descriptor: target.texture,
-                    });
+                    if resident.reclaim_for_bind(discard_guest_contents) {
+                        return Ok(SelectedResidentTexture {
+                            texture: resident.texture.clone(),
+                            descriptor: target.texture,
+                        });
+                    }
                 }
                 WriteWatchRefresh::Replaced => {}
             }
@@ -794,7 +807,7 @@ impl MetalPresenter {
                     !discard_guest_contents,
                 )
             } else {
-                self.ensure_mipmapped_render_target_texture(device, target)
+                self.ensure_mipmapped_render_target_texture(device, target, discard_guest_contents)
             };
         }
         if target.texture_type != 10 || target.layer_count <= 1 {
@@ -826,10 +839,12 @@ impl MetalPresenter {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
                 | WriteWatchRefresh::Renewed { .. } => {
-                    return Ok(SelectedResidentTexture {
-                        texture: resident.texture.clone(),
-                        descriptor: target.texture,
-                    });
+                    if resident.reclaim_for_bind(discard_guest_contents) {
+                        return Ok(SelectedResidentTexture {
+                            texture: resident.texture.clone(),
+                            descriptor: target.texture,
+                        });
+                    }
                 }
                 WriteWatchRefresh::Replaced => {}
             }
@@ -1031,10 +1046,13 @@ impl MetalPresenter {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
                 | WriteWatchRefresh::Renewed { .. } => {
-                    return Ok(SelectedResidentTexture {
-                        texture: resident.texture.clone(),
-                        descriptor: depth.texture,
-                    });
+                    // Depth is tested as well as written, so a superseded array must rebuild.
+                    if resident.reclaim_for_bind(false) {
+                        return Ok(SelectedResidentTexture {
+                            texture: resident.texture.clone(),
+                            descriptor: depth.texture,
+                        });
+                    }
                 }
                 WriteWatchRefresh::Replaced => {}
             }
@@ -1315,6 +1333,10 @@ impl MetalPresenter {
         activity_stamp: ResidentTextureActivityStamp,
     ) {
         self.resident_content_version = self.resident_content_version.saturating_add(1);
+        let version = self.resident_content_version;
+        // The first two arms name the exact allocation the write landed in, whatever state it is
+        // in: recording the write is what makes it the authority again. Only the scan may not
+        // reach a demoted resident, which answers for no byte and must not be handed any.
         let resident_descriptor = selected_resident
             .filter(|selected| self.resident_guest_textures.contains_key(selected))
             .or_else(|| {
@@ -1326,82 +1348,177 @@ impl MetalPresenter {
                 self.resident_guest_textures
                     .values()
                     .find(|resident| {
-                        guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
+                        resident.is_live()
+                            && guest_texture_descriptors_share_storage(
+                                resident.descriptor,
+                                descriptor,
+                            )
                     })
                     .map(|resident| resident.descriptor)
             });
         if resident_descriptor.is_none()
             && self.resident_guest_textures.values().any(|resident| {
-                guest_texture_descriptors_share_gpu_sample_storage(resident.descriptor, descriptor)
+                resident.is_live()
+                    && guest_texture_descriptors_share_gpu_sample_storage(
+                        resident.descriptor,
+                        descriptor,
+                    )
             })
         {
             // A resident that only the pitch-tolerant rule can reach served this write, and the
             // caller did not carry its key here. Ownership and content version are now lost.
             RESIDENT_WRITE_ATTRIBUTION_MISSES.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(resident_descriptor) = resident_descriptor {
-            // Multiple read-only interpretations of the same guest bytes may coexist. Creating a
-            // second clean view must not evict and immediately reconstruct the first one. Once a
-            // view is actually written, however, every other clean overlapping interpretation is
-            // stale and can be retired without a writeback.
-            let stale_aliases = span
-                .iter()
-                .flat_map(|span| {
-                self.resident_guest_textures
-                    .overlapping(span, SpanQueryOrder::ResidentFirst)
-            })
-                .filter(|candidate| {
-                    *candidate != resident_descriptor
-                        && self
-                            .resident_guest_textures
-                            .get(candidate)
-                            .is_some_and(|resident| !resident.gpu_written())
-                })
-                .collect::<Vec<_>>();
-            for stale_alias in stale_aliases {
-                if let Some(resident) = self.resident_guest_textures.remove(&stale_alias) {
-                    trace_resident_texture_removal("gpu-write-invalidates-clean-alias", &resident);
-                    // Unreal sub-allocates many live surfaces inside one pooled allocation, so
-                    // most "stale" aliases here are untouched neighbours of the written range.
-                    // Keep them adoptable while their watch can still prove the bytes unchanged.
-                    quarantine_retired_resident(&mut self.retired_texture_quarantine, resident);
+        if let Some(writer) = resident_descriptor {
+            let (written, writer_span) = {
+                let resident = self
+                    .resident_guest_textures
+                    .get(&writer)
+                    .expect("attributed writer exists");
+                match resident.span {
+                    Some(writer_span) if range_algebra_enabled() => (
+                        written_byte_ranges(
+                            writer_span,
+                            resident.descriptor,
+                            resident.texture_type,
+                            resident.layer_count,
+                            resident.mip_level_count,
+                            region,
+                        ),
+                        Some(writer_span),
+                    ),
+                    // No physical identity — or the kill switch off — claims the whole declared
+                    // range, which supersedes every overlapping resident exactly as the
+                    // descriptor-level retirement did.
+                    resident_span => (
+                        resident_span.as_ref().map(RangeSet::for_span).unwrap_or_default(),
+                        resident_span,
+                    ),
                 }
-            }
-            let resident = self
-                .resident_guest_textures
-                .get_mut(&resident_descriptor)
-                .expect("selected resident survived clean-alias retirement");
-            // The written ranges are recorded against the writer only. Subtracting them from the
-            // residents they supersede is what turns this into an algebra, and nothing reads
-            // `owned` for a decision yet.
-            //
-            // `gpu_written()` is `!gpu_authored.is_empty()`, so a resident outside the algebra
-            // must still claim something here or the GPU-ownership signal the whole residency
-            // path keys on would silently vanish.
-            let written = match resident.span {
-                Some(resident_span) => written_byte_ranges(
-                    resident_span,
-                    resident.descriptor,
-                    resident.texture_type,
-                    resident.layer_count,
-                    resident.mip_level_count,
-                    region,
-                ),
-                None => ResourceSpan::for_texture(resident.descriptor)
-                    .as_ref()
-                    .map(RangeSet::for_span)
-                    .unwrap_or_default(),
             };
-            resident.note_write(activity_stamp);
-            resident.note_gpu_authored(&written);
-            debug_assert!(
-                resident.gpu_written(),
-                "a GPU write must leave its resident owing the bytes it covered"
-            );
-            resident.content_version = self.resident_content_version;
-            resident.note_gpu_write();
+            {
+                let resident = self
+                    .resident_guest_textures
+                    .get_mut(&writer)
+                    .expect("attributed writer exists");
+                resident.note_write(activity_stamp);
+                resident.note_gpu_authored(&written);
+                debug_assert!(
+                    resident.gpu_written(),
+                    "a GPU write must leave its resident owing the bytes it covered"
+                );
+                resident.content_version = version;
+                resident.note_gpu_write();
+            }
+            if let Some(writer_span) = writer_span {
+                self.subtract_resident_authority(
+                    &writer_span,
+                    &written,
+                    Some(writer),
+                    StaleSource::Allocation {
+                        descriptor: writer,
+                        content_version: version,
+                    },
+                    "gpu-write-supersedes-alias",
+                );
+            }
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, span);
+    }
+
+    /// Guest RAM became authoritative for `published` of `span`'s storage.
+    ///
+    /// `writer` keeps its own authority: RAM merely agrees with it now. Everyone else loses those
+    /// bytes, and a resident that loses its last one is demoted rather than destroyed, so its
+    /// allocation, watch and fingerprint baseline survive to make the rebuild a validated no-op.
+    pub(crate) fn note_guest_memory_authoritative(
+        &mut self,
+        span: &ResourceSpan,
+        published: &RangeSet,
+        writer: Option<GuestTextureDescriptor>,
+        reason: &str,
+    ) {
+        self.subtract_resident_authority(
+            span,
+            published,
+            writer,
+            StaleSource::GuestMemory,
+            reason,
+        );
+    }
+
+    /// Hands `writer`'s authority to guest RAM after its contents were published there.
+    pub(crate) fn note_resident_writeback_published(&mut self, writer: GuestTextureDescriptor) {
+        let Some((span, published)) = self
+            .resident_guest_textures
+            .get(&writer)
+            .and_then(|resident| Some((resident.span?, resident.owned.clone())))
+        else {
+            return;
+        };
+        self.note_guest_memory_authoritative(
+            &span,
+            &published,
+            Some(writer),
+            "superseded-by-writeback",
+        );
+    }
+
+    /// Takes `taken` away from every resident but `keep` whose span the index query reaches.
+    ///
+    /// Candidates keep the operand order the linear scans they replace used. Only residents whose
+    /// runs live in the same offset space are subtracted byte for byte; an identity that cannot be
+    /// compared is superseded whole, which is what the descriptor-overlap rule did to every one.
+    fn subtract_resident_authority(
+        &mut self,
+        span: &ResourceSpan,
+        taken: &RangeSet,
+        keep: Option<GuestTextureDescriptor>,
+        source: StaleSource,
+        reason: &str,
+    ) {
+        let candidates = self
+            .resident_guest_textures
+            .overlapping(span, SpanQueryOrder::ResidentFirst);
+        for candidate in candidates {
+            if Some(candidate) == keep {
+                continue;
+            }
+            let Some(other) = self.resident_guest_textures.get(&candidate) else {
+                continue;
+            };
+            if !other.is_live() {
+                // An already demoted allocation holds nothing left to take.
+                continue;
+            }
+            let comparable = other
+                .span
+                .is_some_and(|other_span| other_span.shares_offset_space(span));
+            if comparable && !other.owned.intersects(taken) {
+                // A disjoint tenant of the same pooled allocation keeps every byte it holds.
+                OWNED_SUBTRACT_TENANTS_SURVIVED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if other.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced) {
+                // A replaced mapping proves nothing about any byte, so it cannot be demoted.
+                if let Some(resident) = self.resident_guest_textures.remove(&candidate) {
+                    trace_resident_texture_removal("superseded-mapping-replaced", &resident);
+                }
+                continue;
+            }
+            let other = self
+                .resident_guest_textures
+                .get_mut(&candidate)
+                .expect("inspected candidate is still resident");
+            if comparable {
+                other.subtract_authority(taken, source);
+            } else {
+                other.demote(source);
+            }
+            if !other.is_live() {
+                trace_resident_texture_demotion(reason, other);
+            }
+        }
     }
 
     pub(crate) fn note_resident_texture_read_at(
@@ -1417,7 +1534,11 @@ impl MetalPresenter {
                 self.resident_guest_textures
                     .values()
                     .find(|resident| {
-                        guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
+                        resident.is_live()
+                            && guest_texture_descriptors_share_storage(
+                                resident.descriptor,
+                                descriptor,
+                            )
                     })
                     .map(|resident| resident.descriptor)
             });
@@ -1438,10 +1559,9 @@ pub(crate) const RETIRED_TEXTURE_QUARANTINE_CAPACITY: usize = 64;
 
 /// Holds a retired clean resident for adoption while its write watch stays armed.
 ///
-/// Only residents the GPU never wrote enter the quarantine, so an adoption can never skip a
-/// writeback the guest is owed. A watch whose mapping was replaced can no longer prove
-/// anything about its bytes and is dropped instead, and the bounded map evicts its least
-/// recently used surface first.
+/// The range algebra demotes in place instead of retiring, so nothing produces entries any more
+/// and the adoption side below always no-ops. Both halves are deleted with the field itself.
+#[allow(dead_code)]
 pub(crate) fn quarantine_retired_resident(
     retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     resident: ResidentGuestTexture,
@@ -1537,7 +1657,11 @@ pub(crate) fn ensure_resident_texture_in_map(
         match refresh_resident_texture_write_watch(resident)? {
             WriteWatchRefresh::Active
             | WriteWatchRefresh::Reprotecting
-            | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
+            | WriteWatchRefresh::Renewed { .. } => {
+                if resident.reclaim_for_bind(!upload_guest_contents) {
+                    return Ok(resident.texture.clone());
+                }
+            }
             WriteWatchRefresh::Replaced => {}
         }
     }
@@ -1545,6 +1669,11 @@ pub(crate) fn ensure_resident_texture_in_map(
         let reason = if resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced)
         {
             "ensure-map-mapping-replaced"
+        } else if !resident.serves_reads() {
+            // The superseding allocation is authoritative for the overlapping bytes and has not
+            // published them yet, so this rebuild reads whatever guest RAM holds. That is the
+            // same answer the descriptor-level retirement gave; PR3 re-materialises on the GPU.
+            "ensure-map-superseded-rebuild"
         } else {
             "ensure-map-incompatible-resident"
         };

@@ -14,7 +14,7 @@ use super::{
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
     resident_is_depth_array_face, retire_multisample_textures_overlapping_writeback,
-    retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
+    retire_sampled_textures_overlapping_writeback,
     sampled_alias_descriptor, texture_element_layout, trace_image_descriptors,
     trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
     write_resident_texture_contents_to_guest,
@@ -226,27 +226,17 @@ impl MetalPresenter {
                 }
                 continue;
             }
-            let (alias_ranges, content_version) = {
-                let resident = self
-                    .resident_guest_textures
-                    .get(&descriptor)
-                    .expect("collected sampled alias exists");
-                (
-                    resident.write_watch.alias_ranges(),
-                    resident.content_version,
-                )
-            };
+            let alias_ranges = self
+                .resident_guest_textures
+                .get(&descriptor)
+                .expect("collected sampled alias exists")
+                .write_watch
+                .alias_ranges();
             retire_sampled_textures_overlapping_writeback(
                 &mut self.sampled_texture_cache,
                 &alias_ranges,
             );
-            retire_resident_textures_overlapping_writeback(
-                &mut self.resident_guest_textures,
-                &mut self.retired_texture_quarantine,
-                &alias_ranges,
-                descriptor,
-                content_version,
-            );
+            self.note_resident_writeback_published(descriptor);
             retire_multisample_textures_overlapping_writeback(
                 &mut self.multisample_textures,
                 &alias_ranges,
@@ -291,7 +281,7 @@ pub(crate) fn gpu_written_resident_serving_sampled_key(
     let sampled = decoded_image_for_sampled_key(key);
     residents
         .iter()
-        .filter(|(_, resident)| resident.gpu_written())
+        .filter(|(_, resident)| resident.gpu_written() && resident.serves_reads())
         .filter(|(descriptor, resident)| {
             let descriptor = **descriptor;
             guest_texture_descriptors_overlap(descriptor, key.descriptor)
@@ -512,6 +502,7 @@ pub(crate) fn resident_color_view_sample_is_eligible(
         .checked_add(sampled.mip_level_count.max(1));
     !comparison
         && resident.gpu_written()
+        && resident.serves_reads()
         && resident.texture_type == 9
         && resident.layer_count == 1
         && sampled.texture_type == 9
@@ -528,6 +519,7 @@ pub(crate) fn resident_depth_sample_is_eligible(
         .base_mip_level
         .checked_add(sampled.mip_level_count.max(1));
     resident.gpu_written()
+        && resident.serves_reads()
         && resident.texture_type == 9
         && resident.layer_count == 1
         && sampled.texture_type == 9

@@ -90,17 +90,12 @@ impl RangeSet {
     ///
     /// Never coarsens, in either direction: widening the removal would drop bytes this set still
     /// holds, and widening the result would keep bytes another writer has taken.
-    // Subtraction, intersection and coverage are the query side of the algebra. They are shipped
-    // and tested here, ahead of the demotion and writeback paths that call them, so that the range
-    // arithmetic can be reviewed on its own.
-    #[allow(dead_code)]
     pub(crate) fn subtract(&mut self, other: &Self) {
         for &(start, end) in &other.runs {
             self.subtract_run(start, end);
         }
     }
 
-    #[allow(dead_code)]
     fn subtract_run(&mut self, start: u64, end: u64) {
         if start >= end {
             return;
@@ -120,6 +115,7 @@ impl RangeSet {
         self.runs.splice(first..last, replacement);
     }
 
+    /// Intersection. PR3's publication debt transfer is its only non-test consumer.
     #[allow(dead_code)]
     pub(crate) fn intersect(&self, other: &Self) -> Self {
         let mut runs = Vec::new();
@@ -139,7 +135,6 @@ impl RangeSet {
         Self { runs }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn intersects(&self, other: &Self) -> bool {
         let (mut left, mut right) = (0_usize, 0_usize);
         while left < self.runs.len() && right < other.runs.len() {
@@ -168,7 +163,6 @@ impl RangeSet {
             .is_some_and(|(run_start, run_end)| *run_start <= start && end <= *run_end)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn covers(&self, span: &ResourceSpan) -> bool {
         self.contains_run(span.range_start(), span.range_end())
     }

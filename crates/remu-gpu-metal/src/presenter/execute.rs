@@ -450,7 +450,11 @@ impl MetalPresenter {
                 texture
             } else {
                 let has_resident_storage = self.resident_guest_textures.values().any(|resident| {
-                    guest_texture_descriptors_share_storage(resident.descriptor, target.texture)
+                    resident.serves_reads()
+                        && guest_texture_descriptors_share_storage(
+                            resident.descriptor,
+                            target.texture,
+                        )
                 });
                 let metadata_clear_pending = consume_color_metadata_clear(
                     &mut self.color_metadata_clears,
@@ -522,7 +526,8 @@ impl MetalPresenter {
         }
         let depth_had_resident_storage = depth.is_some_and(|depth| {
             self.resident_guest_textures.values().any(|resident| {
-                guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
+                resident.serves_reads()
+                    && guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
             })
         });
         let resolved_depth = depth
@@ -1854,7 +1859,11 @@ impl MetalPresenter {
                         .ok_or("diagnostic target has no direct scanout Metal texture")?
                         .texture
                         .clone()
-                } else if let Some(resident) = self.resident_guest_textures.get(&descriptor) {
+                } else if let Some(resident) = self
+                    .resident_guest_textures
+                    .get(&descriptor)
+                    .filter(|resident| resident.serves_reads())
+                {
                     resident.texture.clone()
                 } else if let Some(snapshot) =
                     self.scanout_snapshot_textures.get(&descriptor.address)
@@ -1864,7 +1873,11 @@ impl MetalPresenter {
                     self.resident_guest_textures
                         .values()
                         .find(|resident| {
-                            guest_texture_descriptors_share_storage(resident.descriptor, descriptor)
+                            resident.serves_reads()
+                                && guest_texture_descriptors_share_storage(
+                                    resident.descriptor,
+                                    descriptor,
+                                )
                         })
                         .ok_or("diagnostic target has no resident or scanout Metal texture")?
                         .texture
@@ -2540,6 +2553,7 @@ impl MetalPresenter {
             let texture = self
                 .resident_guest_textures
                 .get(&descriptor)
+                .filter(|resident| resident.serves_reads())
                 .ok_or("traced target has no resident Metal texture")?
                 .texture
                 .clone();
@@ -2666,6 +2680,7 @@ impl MetalPresenter {
             let texture = self
                 .resident_guest_textures
                 .get(&descriptor)
+                .filter(|resident| resident.serves_reads())
                 .ok_or("video render target has no resident Metal texture")?
                 .texture
                 .clone();

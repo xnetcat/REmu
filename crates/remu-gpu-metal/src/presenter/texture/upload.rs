@@ -328,7 +328,7 @@ pub(crate) fn upload_image_textures(
                         })
                         .filter_map(|(key, _)| {
                             let resident = resident_guest_textures.get(&key.descriptor)?;
-                            resident.gpu_written().then_some((
+                            (resident.gpu_written() && resident.serves_reads()).then_some((
                                 resident.content_version,
                                 key.descriptor,
                                 resident.texture.clone(),
@@ -344,7 +344,8 @@ pub(crate) fn upload_image_textures(
                             resident_guest_textures
                                 .get(&descriptor.guest)
                                 .filter(|resident| {
-                                    resident.texture_type == descriptor.texture_type
+                                    resident.serves_reads()
+                                        && resident.texture_type == descriptor.texture_type
                                         && resident.layer_count == descriptor.layer_count
                                         && resident.mip_level_count >= underlying_mip_count
                                 })
@@ -357,7 +358,8 @@ pub(crate) fn upload_image_textures(
                         resident_guest_textures
                             .values()
                             .filter(|resident| {
-                                resident.texture_type == 9
+                                resident.serves_reads()
+                                    && resident.texture_type == 9
                                     && resident.layer_count == 1
                                     && resident.mip_level_count >= underlying_mip_count
                                     && ((!comparison
