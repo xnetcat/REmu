@@ -242,6 +242,15 @@ use winit::keyboard::KeyCode;
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::window::Window;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const SHARED_HOST_KIND_ACQUIRE: usize = 0;
+const SHARED_HOST_KIND_DRAW: usize = 1;
+const SHARED_HOST_KIND_COMPUTE: usize = 2;
+const SHARED_HOST_KIND_DMA: usize = 3;
+const SHARED_HOST_KIND_WAIT: usize = 4;
+const SHARED_HOST_KIND_FLIP: usize = 5;
+const SHARED_HOST_KIND_UI: usize = 6;
+const SHARED_HOST_KIND_OTHER: usize = 7;
+const SHARED_HOST_KIND_COUNT: usize = 8;
 /// A late Superliminal frame contains roughly 700 draws. Draining only 16 events per AppKit
 /// callback imposed an artificial ~2k draw/s ceiling even when both the guest producer and Metal
 /// encoder had capacity. This bound covers most of a frame while still returning to AppKit often
@@ -1479,6 +1488,7 @@ struct PresenterStatistics {
     shared_event_signals: u32,
     shared_event_waits: u32,
     shared_event_host_blocks: u32,
+    shared_event_host_block_kinds: [u32; SHARED_HOST_KIND_COUNT],
     shared_event_host_wakes: u32,
     shared_event_error_advances: u32,
     shared_event_fallbacks_no_exact_producer: u32,

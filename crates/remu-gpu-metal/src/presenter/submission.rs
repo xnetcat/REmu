@@ -10,10 +10,12 @@ use super::{
     OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PendingFlip,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
     PipelineCompileCandidate, PresenterFlow, QueueBlockReason, RangeSet, ResourceSpan,
-    ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh,
-    compute_pipeline_key, diagnostic_skip_export_shader, diagnostic_skip_pixel_shader,
-    graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
-    guest_texture_byte_count, noop_placeholder_cover_draw, pixel_scalars,
+    SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
+    SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
+    SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer,
+    WriteWatchRefresh, compute_pipeline_key, diagnostic_skip_export_shader,
+    diagnostic_skip_pixel_shader, graphics_pipeline_key, guest_physical_ranges_overlap,
+    guest_ranges_overlap, guest_texture_byte_count, noop_placeholder_cover_draw, pixel_scalars,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_memory_copy,
     refresh_resident_texture_write_watch, register_value, retire_sampled_textures_matching,
     trace_resident_texture_removal, trace_video_target_compute_consumer,
@@ -198,6 +200,9 @@ impl MetalPresenter {
                     }
                     self.statistics.shared_event_host_blocks =
                         self.statistics.shared_event_host_blocks.saturating_add(1);
+                    let host_kind = shared_event_host_effect_kind(&event);
+                    self.statistics.shared_event_host_block_kinds[host_kind] =
+                        self.statistics.shared_event_host_block_kinds[host_kind].saturating_add(1);
                     self.receiver.block_event(
                         source,
                         event,
@@ -692,6 +697,28 @@ impl MetalPresenter {
             FlushPolicy::Required,
             GuestBatchFlushReason::CommandProcessorBarrier,
         )
+    }
+}
+
+fn shared_event_host_effect_kind(event: &GpuEvent) -> usize {
+    match event {
+        GpuEvent::MemoryAcquire(_) => SHARED_HOST_KIND_ACQUIRE,
+        GpuEvent::IndexedDraw(_) => SHARED_HOST_KIND_DRAW,
+        GpuEvent::ComputeDispatch(_) => SHARED_HOST_KIND_COMPUTE,
+        GpuEvent::MemoryCopy(_) | GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
+            SHARED_HOST_KIND_DMA
+        }
+        GpuEvent::MemoryWait(_)
+        | GpuEvent::RegisteredMemoryWait { .. }
+        | GpuEvent::WaitFlipDone(_) => SHARED_HOST_KIND_WAIT,
+        GpuEvent::Flip { .. } => SHARED_HOST_KIND_FLIP,
+        GpuEvent::DisplayRegistered { .. }
+        | GpuEvent::ShowHostSplash(_)
+        | GpuEvent::HideHostSplash
+        | GpuEvent::ShowHostDialog(_)
+        | GpuEvent::HideHostDialog { .. }
+        | GpuEvent::ShowHostToast(_) => SHARED_HOST_KIND_UI,
+        _ => SHARED_HOST_KIND_OTHER,
     }
 }
 

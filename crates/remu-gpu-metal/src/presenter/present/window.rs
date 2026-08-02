@@ -10,7 +10,9 @@ use super::super::{
     OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
     OWNED_UNRESOLVED_SPAN, RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_DISCARDED_BYTES,
     RESIDENT_WRITEBACK_PUBLISHED, RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState,
-    WRITEBACK_TRIGGERS,
+    SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
+    SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
+    SHARED_HOST_KIND_WAIT, WRITEBACK_TRIGGERS,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -310,6 +312,18 @@ impl MetalPresenter {
                 self.statistics.shared_event_error_advances,
                 f64::from(self.statistics.shared_event_fallbacks_no_exact_producer) / seconds,
                 self.statistics.shared_event_fallbacks_timeline_overflow,
+            );
+            let host_kinds = &self.statistics.shared_event_host_block_kinds;
+            eprintln!(
+                "[REMu][PERF-SHARED-EVENT-HOST] acquire={:.0}/s draw={:.0}/s compute={:.0}/s dma={:.0}/s wait={:.0}/s flip={:.0}/s ui={:.0}/s other={:.0}/s",
+                f64::from(host_kinds[SHARED_HOST_KIND_ACQUIRE]) / seconds,
+                f64::from(host_kinds[SHARED_HOST_KIND_DRAW]) / seconds,
+                f64::from(host_kinds[SHARED_HOST_KIND_COMPUTE]) / seconds,
+                f64::from(host_kinds[SHARED_HOST_KIND_DMA]) / seconds,
+                f64::from(host_kinds[SHARED_HOST_KIND_WAIT]) / seconds,
+                f64::from(host_kinds[SHARED_HOST_KIND_FLIP]) / seconds,
+                f64::from(host_kinds[SHARED_HOST_KIND_UI]) / seconds,
+                f64::from(host_kinds[SHARED_HOST_KIND_OTHER]) / seconds,
             );
             let head_join = self
                 .flip_completion_joins
@@ -958,6 +972,7 @@ impl MetalPresenter {
         self.statistics.shared_event_signals = 0;
         self.statistics.shared_event_waits = 0;
         self.statistics.shared_event_host_blocks = 0;
+        self.statistics.shared_event_host_block_kinds = [0; super::super::SHARED_HOST_KIND_COUNT];
         self.statistics.shared_event_host_wakes = 0;
         self.statistics.shared_event_error_advances = 0;
         self.statistics.shared_event_fallbacks_no_exact_producer = 0;

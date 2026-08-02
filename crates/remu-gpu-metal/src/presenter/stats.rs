@@ -399,6 +399,7 @@ impl PresenterStatistics {
             shared_event_signals: 0,
             shared_event_waits: 0,
             shared_event_host_blocks: 0,
+            shared_event_host_block_kinds: [0; super::SHARED_HOST_KIND_COUNT],
             shared_event_host_wakes: 0,
             shared_event_error_advances: 0,
             shared_event_fallbacks_no_exact_producer: 0,
