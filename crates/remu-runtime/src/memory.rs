@@ -892,7 +892,9 @@ pub(crate) fn kernel_munmap(arguments: [u64; 6], state: &mut ProbeDispatchState)
         return kernel_memory_error(&error);
     }
     refresh_kernel_memory_readable_ranges(memory);
-    if trace_guest_vm() {
+    // Always recorded, for the same reason releases are: an unmap that removes backing another
+    // consumer still uses turns into a SIGBUS far away, with nothing linking the two.
+    {
         eprintln!("[REMu][VM] unmapped address={address:#x} length={length:#x}");
     }
     0
@@ -949,9 +951,13 @@ fn kernel_release_direct_memory_core(
     if checked && !released {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
-    if trace_guest_vm() {
-        eprintln!("[REMu][VM] released direct start={start:#x} length={length:#x}");
-    }
+    // Releasing direct memory that still has live mappings leaves those mappings pointing at a
+    // backing object the kernel has dropped, and a later guest access faults SIGBUS rather than
+    // SIGSEGV. Releases are infrequent and semantically decisive, so they are always recorded:
+    // without this, a use-after-release is indistinguishable from memory that never existed.
+    eprintln!(
+        "[REMu][VM] released direct start={start:#x} length={length:#x} released={released}"
+    );
     0
 }
 
