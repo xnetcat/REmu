@@ -42,6 +42,15 @@ impl MetalPresenter {
     }
 
     fn scanout_snapshot_address(&self) -> Option<u64> {
+        // An accepted flip names the buffer to present. A recorded write only selects the snapshot
+        // when no flip is waiting for one, so a write to the other registered buffer cannot divert
+        // the pending flip's own snapshot to the frame the guest has not flipped yet.
+        if let Some(flip) = self
+            .pending_flip
+            .filter(|flip| flip.sequence != self.uploaded_flip_sequence)
+        {
+            return Some(flip.address);
+        }
         self.pending_scanout_write_address
             .or_else(|| self.pending_flip.map(|flip| flip.address))
     }
@@ -84,6 +93,14 @@ impl MetalPresenter {
         if let Some(flip) = flip {
             self.finalized_flip_sequence = flip.sequence;
             self.garbage_collect_resident_textures(flip.sequence);
+            // Without a surface the finalized snapshot is as guest-visible as the frame will ever
+            // become. Host windowing state must not gate guest flip pacing: leaving the flip
+            // outstanding here is what pins headless and occluded runs at the pacing backlog.
+            if self.layer.is_none()
+                && let Some(completion) = self.complete_flip(flip.sequence)
+            {
+                remu_gpu::record_gpu_flip_completed(completion);
+            }
         }
         self.pending_scanout_write_address = None;
         self.redraw_pending = true;
@@ -99,6 +116,67 @@ impl MetalPresenter {
                 self.pending_flip_target_written_since_boundary,
             );
         }
+    }
+
+    /// Retires the pending flip when it is `sequence`, yielding the completion to publish.
+    ///
+    /// Every accepted flip increments the guest's pacing counter and only a completion decrements
+    /// it, so exactly one caller may retire a given sequence: presentation, a surface-less
+    /// finalization, or replacement by a newer flip.
+    pub(crate) fn complete_flip(&mut self, sequence: u64) -> Option<remu_gpu::GpuFlipCompletion> {
+        let flip = self.pending_flip.filter(|flip| {
+            flip.sequence == sequence && flip.sequence > self.submitted_flip_sequence
+        })?;
+        self.submitted_flip_sequence = flip.sequence;
+        Some(remu_gpu::GpuFlipCompletion {
+            address: flip.address,
+            buffer_index: flip.buffer_index,
+            flip_argument: flip.flip_argument,
+        })
+    }
+
+    /// Flips this presenter still owns: accepted but neither presented nor already published.
+    fn outstanding_flip_count(&self) -> usize {
+        let unpresented = self
+            .next_flip_sequence
+            .saturating_sub(self.submitted_flip_sequence);
+        let awaiting_presentation = self
+            .pending_presentations
+            .iter()
+            .filter(|presentation| presentation.flip_completion.is_some())
+            .count();
+        usize::try_from(unpresented)
+            .unwrap_or(usize::MAX)
+            .saturating_add(awaiting_presentation)
+    }
+
+    /// Re-syncs the guest's flip pacing counter against this presenter's flip accounting.
+    ///
+    /// A lost flip is otherwise unrecoverable: the counter only falls on completion, and three
+    /// leaked flips put the guest into permanent multi-second pacing stalls. Reconciliation is
+    /// restricted to the point where no accepted event is still undelivered, because a flip in the
+    /// channel counts against the guest before this presenter has sequenced it.
+    pub(crate) fn reconcile_pending_flips(&mut self) {
+        const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        if self.statistics.last_flip_reconciliation.elapsed() < RECONCILE_INTERVAL {
+            return;
+        }
+        self.statistics.last_flip_reconciliation = std::time::Instant::now();
+        if remu_gpu::gpu_work_items_pending() != 0 {
+            return;
+        }
+        let outstanding = self.outstanding_flip_count();
+        let Some(observed) = remu_gpu::reconcile_gpu_flips_pending(outstanding) else {
+            return;
+        };
+        eprintln!(
+            "[REMu][METAL] flip accounting diverged: guest pending={observed} presenter outstanding={outstanding} next={} finalized={} uploaded={} submitted={} presentations={}; corrected to {outstanding}",
+            self.next_flip_sequence,
+            self.finalized_flip_sequence,
+            self.uploaded_flip_sequence,
+            self.submitted_flip_sequence,
+            self.pending_presentations.len(),
+        );
     }
 
     pub(crate) fn show_host_splash(&mut self, image: GpuHostImage) -> Result<(), String> {
@@ -157,7 +235,16 @@ impl MetalPresenter {
             (OrderedEventSource::GuestQueue(queue_id), Some(pending_queue))
                 if queue_id == pending_queue
         );
-        if !initial_flip_boundary && !self.pending_flip_target_written_since_boundary {
+        // Only a write to the pending flip's own target completes that flip's frame. A write to the
+        // other registered buffer, or another write once this flip is already snapshotted, is state
+        // for the next flip: presenting it publishes a mid-render frame and costs a second present
+        // per guest frame without ever retiring a flip.
+        let write_completes_pending_flip = self.pending_flip_target_written_since_boundary
+            && self.pending_flip.is_some_and(|flip| {
+                self.pending_scanout_write_address == Some(flip.address)
+                    && flip.sequence != self.uploaded_flip_sequence
+            });
+        if !initial_flip_boundary && !write_completes_pending_flip {
             return;
         }
         // A foreign queue's boundary orders a compute or copy producer that completed this frame.
@@ -177,6 +264,7 @@ impl MetalPresenter {
     }
 
     pub(crate) fn retire_completed_presentations(&mut self) {
+        self.reconcile_pending_flips();
         loop {
             let Some(presentation) = self.pending_presentations.front() else {
                 return;

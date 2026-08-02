@@ -1167,6 +1167,7 @@ enum GuestBatchFlushReason {
 struct PresenterStatistics {
     interval_started: Instant,
     last_logged: Instant,
+    last_flip_reconciliation: Instant,
     guest_flips: u32,
     completed_presents: u32,
     submitted_guest_batches: u32,
