@@ -378,6 +378,20 @@ impl MetalPresenter {
         descriptor: GuestTextureDescriptor,
         upload_guest_contents: bool,
     ) -> Result<Texture, String> {
+        // Adopt before walking the alias graph: a successful adoption means no rebuild, so no
+        // guest-RAM snapshot is needed and no GPU-written alias has to be flushed and written
+        // back first. This is what breaks the per-frame cycle on Unreal's pooled render-target
+        // heaps — the alias loop below only runs when a real rebuild is unavoidable.
+        adopt_quarantined_resident(
+            descriptor,
+            &mut self.resident_guest_textures,
+            &mut self.retired_texture_quarantine,
+            if upload_guest_contents {
+                QuarantineAdoption::CurrentContent
+            } else {
+                QuarantineAdoption::ShapeOnly
+            },
+        )?;
         if let Some(resident) =
             self.resident_guest_textures
                 .get_mut(&descriptor)
