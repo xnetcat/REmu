@@ -5,20 +5,25 @@ use std::os::unix::fs::FileExt;
 use std::os::windows::fs::FileExt;
 use std::sync::{Arc, Mutex, RwLock};
 
+use remu_shader::GuestMemoryReader;
+
 use crate::{
     AMPR_COMMAND_ORDER, AMPR_READ_STAGING_POOL, AmprAddressWrite, AmprCommandBufferState,
     AmprCompletion, AmprReadCommand, KERNEL_EVENT_FILTER_AMPR, KernelQueuedEvent, PROBE_DISPATCH,
+    ProcessGuestMemory,
     ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
     SCE_KERNEL_ERROR_NO_SPACE, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
     current_guest_thread_name, guest_memset, kernel_stat_payload_from_metadata,
     lock_probe_dispatch_for_write, low_u32, notify_kernel_equeue_waiters,
-    process_guest_range_has_read_access, queue_kernel_event, read_guest_cstring, read_guest_u64,
-    resolve_probe_guest_path, sce_kernel_error, trace_ampr_reads, write_guest_u32, write_guest_u64,
+    process_guest_range_has_read_access, queue_kernel_event, read_guest_u64,
+    resolve_probe_guest_path, sce_kernel_error, trace_ampr_reads, try_read_process_guest_u64,
+    write_guest_u32, write_guest_u64,
 };
 
 const AMPR_ORDER_LOCK_COUNT: usize = 64;
 const AMPR_STAGING_POOL_LIMIT: usize = 4;
 const AMPR_MAX_RETAINED_STAGING_BYTES: usize = 8 * 1024 * 1024;
+const AMPR_MAX_PATH_BYTES: usize = 1024;
 /// Published to a recorded completion word when the submission's transfers did not all run.
 ///
 /// Zero is the word's pre-submission state, so a failure cannot be reported by leaving it or by
@@ -392,6 +397,9 @@ pub(crate) struct AprResolveOutputs {
 }
 
 pub(crate) fn ampr_resolve_file_paths(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if arguments[3] == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
     ampr_resolve_paths_core(
         arguments[0],
         arguments[1],
@@ -431,21 +439,36 @@ pub(crate) fn ampr_resolve_paths_core(
         );
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    let Ok(count_usize) = usize::try_from(count) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let Some(path_list_bytes) = count_usize.checked_mul(std::mem::size_of::<u64>()) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if !process_guest_range_has_read_access(path_list, path_list_bytes)
+        || !apr_output_has_write_access(state, ids, count_usize, std::mem::size_of::<u32>())
+        || !apr_output_has_write_access(state, sizes, count_usize, std::mem::size_of::<u64>())
+        || !apr_output_has_write_access(state, results, count_usize, std::mem::size_of::<u32>())
+        || (error_index != 0 && !ampr_destination_has_write_access(state, error_index, 4))
+    {
+        return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+    }
+    let mut first_error = 0;
+    let mut resolved = 0_u32;
     for index in 0..count {
+        // Fail-fast resolvers leave entries after the first failure untouched. Initialize only
+        // the entry that is about to be attempted, so stale data cannot make that entry usable
+        // while later entries retain the caller's state exactly as the batch ABI requires.
         if ids != 0 {
             write_guest_u32(ids + index * 4, AMPR_INVALID_FILE_ID);
         }
         if sizes != 0 {
             write_guest_u64(sizes + index * 8, 0);
         }
-    }
-    let mut first_error = 0;
-    let mut resolved = 0_u32;
-    for index in 0..count {
-        let candidate = read_guest_u64(path_list + index * 8);
-        let path = read_guest_cstring(candidate).or_else(|| {
+        let candidate = try_read_process_guest_u64(path_list + index * 8).unwrap_or(0);
+        let path = ampr_read_guest_path(candidate).or_else(|| {
             (index == 0)
-                .then(|| read_guest_cstring(path_list))
+                .then(|| ampr_read_guest_path(path_list))
                 .flatten()
         });
         let entry_error = match path {
@@ -485,6 +508,56 @@ pub(crate) fn ampr_resolve_paths_core(
         return u64::from(resolved);
     }
     first_error
+}
+
+fn apr_output_has_write_access(
+    state: &ProbeDispatchState,
+    address: u64,
+    count: usize,
+    element_size: usize,
+) -> bool {
+    address == 0
+        || count
+            .checked_mul(element_size)
+            .is_some_and(|bytes| ampr_destination_has_write_access(state, address, bytes))
+}
+
+/// Reads one APR path without dereferencing an untrusted guest pointer.
+pub(crate) fn ampr_read_guest_path(address: u64) -> Option<String> {
+    if address == 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(64);
+    for offset in 0..AMPR_MAX_PATH_BYTES {
+        let offset = u64::try_from(offset).ok()?;
+        let mut byte = [0_u8];
+        if !ProcessGuestMemory.read(address.checked_add(offset)?, &mut byte) {
+            return None;
+        }
+        if byte[0] == 0 {
+            return String::from_utf8(bytes).ok();
+        }
+        bytes.push(byte[0]);
+    }
+    None
+}
+
+pub(crate) fn ampr_resolve_paths_with_prefix(
+    prefix_address: u64,
+    path_list: u64,
+    count: u64,
+    outputs: AprResolveOutputs,
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    let prefix = if prefix_address == 0 {
+        None
+    } else {
+        let Some(prefix) = ampr_read_guest_path(prefix_address) else {
+            return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
+        };
+        Some(prefix)
+    };
+    ampr_resolve_paths_core(path_list, count, prefix, outputs, state)
 }
 
 /// Joins a resolver prefix with one entry, keeping exactly one separator between them.

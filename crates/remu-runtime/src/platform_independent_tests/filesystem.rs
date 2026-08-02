@@ -563,6 +563,52 @@ fn unresolved_apr_paths_report_an_invalid_identifier() {
     assert_eq!(error_index, 0);
 }
 
+/// The error-index form is fail-fast: entries before the rejected path are committed, the
+/// rejected entry is invalidated, and entries after it retain the caller's values.
+#[cfg(target_os = "macos")]
+#[test]
+fn apr_resolution_stops_at_the_rejected_entry_without_touching_the_tail() {
+    let root = TemporaryTestDirectory::new("apr-fail-fast");
+    std::fs::write(root.path.join("asset.bin"), b"asset").unwrap();
+    let mut state = ProbeDispatchState {
+        game_root: root.path.clone(),
+        ..ProbeDispatchState::default()
+    };
+    let present = b"/app0/asset.bin\0";
+    let missing = b"/app0/missing.bin\0";
+    let list = [
+        present.as_ptr().addr() as u64,
+        missing.as_ptr().addr() as u64,
+        present.as_ptr().addr() as u64,
+    ];
+    let mut ids = [0x1111_1111_u32, 0x2222_2222, 0x3333_3333];
+    let mut sizes = [0x1111_u64, 0x2222, 0x3333];
+    let mut error_index = u32::MAX;
+
+    assert_eq!(
+        ampr_resolve_paths_core(
+            list.as_ptr().addr() as u64,
+            3,
+            None,
+            AprResolveOutputs {
+                ids: ids.as_mut_ptr().addr() as u64,
+                sizes: sizes.as_mut_ptr().addr() as u64,
+                error_index: (&raw mut error_index).addr() as u64,
+                ..AprResolveOutputs::default()
+            },
+            &mut state,
+        ),
+        sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+    );
+    assert_ne!(ids[0], AMPR_INVALID_FILE_ID);
+    assert_eq!(sizes[0], 5);
+    assert_eq!(ids[1], AMPR_INVALID_FILE_ID);
+    assert_eq!(sizes[1], 0);
+    assert_eq!(error_index, 1);
+    assert_eq!(ids[2], 0x3333_3333);
+    assert_eq!(sizes[2], 0x3333);
+}
+
 #[test]
 fn directory_records_pack_console_dirents_without_crossing_blocks() {
     let entries: Vec<(String, bool)> = (0..40)

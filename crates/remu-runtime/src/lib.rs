@@ -151,8 +151,8 @@ pub(crate) use ampr_api::{
     ampr_command_buffer_set_buffer, ampr_command_buffer_write_address_on_completion,
     ampr_command_buffer_write_kernel_event_queue, ampr_command_order, ampr_get_file_size,
     ampr_get_file_stat, ampr_measure_command_size, ampr_resolve_file_paths,
-    ampr_resolve_paths_core, ampr_submit_command_buffer, ampr_submit_command_buffer_ordered,
-    ampr_wait_command_buffer,
+    ampr_resolve_paths_core, ampr_resolve_paths_with_prefix, ampr_submit_command_buffer,
+    ampr_submit_command_buffer_ordered, ampr_wait_command_buffer,
 };
 #[cfg(test)]
 pub(crate) use ampr_api::{
@@ -4834,10 +4834,10 @@ fn dispatch_probe_import(
             },
             state,
         )),
-        "i3HWvW35jao" => guest_posix_file_result(ampr_resolve_paths_core(
+        "i3HWvW35jao" => guest_posix_file_result(ampr_resolve_paths_with_prefix(
+            arguments[0],
             arguments[1],
             arguments[2],
-            read_guest_cstring(arguments[0]),
             AprResolveOutputs {
                 ids: arguments[3],
                 error_index: arguments[4],
@@ -4845,10 +4845,10 @@ fn dispatch_probe_import(
             },
             state,
         )),
-        "w5fcCG+t31g" => guest_posix_file_result(ampr_resolve_paths_core(
+        "w5fcCG+t31g" => guest_posix_file_result(ampr_resolve_paths_with_prefix(
+            arguments[0],
             arguments[1],
             arguments[2],
-            read_guest_cstring(arguments[0]),
             AprResolveOutputs {
                 ids: arguments[3],
                 sizes: arguments[4],
@@ -4857,10 +4857,10 @@ fn dispatch_probe_import(
             },
             state,
         )),
-        "VB-BtuIW8Xc" => guest_posix_file_result(ampr_resolve_paths_core(
+        "VB-BtuIW8Xc" => guest_posix_file_result(ampr_resolve_paths_with_prefix(
+            arguments[0],
             arguments[1],
             arguments[2],
-            read_guest_cstring(arguments[0]),
             AprResolveOutputs {
                 ids: arguments[3],
                 results: arguments[4],
@@ -4868,10 +4868,10 @@ fn dispatch_probe_import(
             },
             state,
         )),
-        "C+Khtbbx2g8" => guest_posix_file_result(ampr_resolve_paths_core(
+        "C+Khtbbx2g8" => guest_posix_file_result(ampr_resolve_paths_with_prefix(
+            arguments[0],
             arguments[1],
             arguments[2],
-            read_guest_cstring(arguments[0]),
             AprResolveOutputs {
                 ids: arguments[3],
                 sizes: arguments[4],
