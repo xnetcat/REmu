@@ -746,6 +746,15 @@ impl MetalPresenter {
             // handler returns immediately, so no cache or guest-visible state can overtake the
             // producer. Invalidating acquires remain behind the host acknowledgement below.
             GpuEvent::MemoryAcquire(acquire) => !acquire.invalidates_guest_resources(),
+            // A registered wait can extend an already GPU-ordered consumer segment without
+            // making the presenter observe label RAM. Admission is generation-safe only when
+            // this exact submitted wait ticket is still bound to a retained producer checkpoint;
+            // the normal wait handler then encodes that Metal event and transfers its host and
+            // resource dependencies into the consumer batch. Missing or retired checkpoints
+            // remain behind the host gate and use the conservative wait path.
+            GpuEvent::RegisteredMemoryWait { id, .. } => {
+                self.registered_wait_has_exact_shared_event_checkpoint(source, *id)
+            }
             GpuEvent::ComputeDispatch(dispatch) => {
                 matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct)
                     && dispatch.shader.as_ref().is_some_and(|snapshot| {
@@ -783,6 +792,29 @@ impl MetalPresenter {
             // must observe the producer event first.
             _ => false,
         }
+    }
+
+    fn registered_wait_has_exact_shared_event_checkpoint(
+        &self,
+        source: OrderedEventSource,
+        wait_id: remu_gpu::GpuWaitId,
+    ) -> bool {
+        if !self.per_queue_guest_batches || !matches!(source, OrderedEventSource::GuestQueue(_)) {
+            return false;
+        }
+        let Some(fence) = self.gpu_wait_fences.get(wait_id) else {
+            return false;
+        };
+        self.guest_queue_batches
+            .get(&fence.producer().queue_id())
+            .is_some_and(|producer| {
+                producer
+                    .committed_batches
+                    .iter()
+                    .chain(producer.open_batch.iter())
+                    .flat_map(|batch| &batch.signal_checkpoints)
+                    .any(|checkpoint| checkpoint.fence == fence)
+            })
     }
 }
 

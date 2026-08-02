@@ -29,8 +29,8 @@ use super::super::submission::{
     collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, SharedEventSignalCheckpoint,
-    UploadedGlobalBuffer,
+    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, SHARED_HOST_KIND_ACQUIRE,
+    SHARED_HOST_KIND_WAIT, SharedEventSignalCheckpoint, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -4573,6 +4573,157 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
             .is_empty(),
         "retired fence ranges are pruned after the last wait/resource reference"
     );
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn exact_registered_waits_chain_without_intermediate_host_acknowledgements() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_label_space, first_label) = mapped_test_label();
+    let second_label = first_label + 8;
+    let wait = |address| GpuMemoryWait {
+        address,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![
+            GpuEvent::MemoryRelease(GpuMemoryRelease {
+                address: first_label,
+                value: GpuMemoryReleaseValue::Immediate32(1),
+            }),
+            GpuEvent::MemoryRelease(GpuMemoryRelease {
+                address: second_label,
+                value: GpuMemoryReleaseValue::Immediate32(1),
+            }),
+        ],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait(first_label)),
+            GpuEvent::MemoryWait(wait(second_label)),
+            GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+                engine: 0,
+                cb_db_control: 0,
+                base_address: first_label,
+                size_bytes: 12,
+                poll_interval: 0,
+                gcr_control: 1,
+            }),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_waits, 2);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_WAIT], 0,
+        "the second exact wait must extend the Metal-ordered segment instead of forcing a host ack"
+    );
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_ACQUIRE], 1,
+        "the first genuinely host-visible effect still terminates the ordered segment"
+    );
+    assert!(matches!(
+        presenter.receiver.blocked_queues.get(&0),
+        Some(QueueBlockReason::GuestSharedEventHostEffect { .. })
+    ));
+    assert!(
+        presenter.guest_queue_batches[&0].open_batch.is_none(),
+        "the consumer wait/ack batch commits before the producer queue is drained"
+    );
+    assert!(presenter.guest_queue_batches[&41].open_batch.is_some());
+    assert_eq!(
+        presenter.guest_queue_batches[&0]
+            .host_dependencies
+            .values()
+            .copied()
+            .collect::<Vec<_>>(),
+        [2],
+        "same-producer wait fences coalesce to the newest exact generation"
+    );
+
+    presenter.set_active_guest_queue(Some(41));
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("producer signals commit after the consumer waits");
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("both exact waits and the consumer acknowledgement settle");
+    assert_eq!(read_test_label(first_label), 1);
+    assert_eq!(read_test_label(second_label), 1);
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert!(!presenter.receiver.blocked_queues.contains_key(&0));
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn registered_wait_ordering_rejects_missing_checkpoint_and_recycled_label() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_label_space, label) = mapped_test_label();
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    let take_registered_wait = |presenter: &mut MetalPresenter| {
+        assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        }));
+        let (source, id, event) = match presenter.receiver.try_recv(|_| true) {
+            OrderedEventPoll::Event {
+                source,
+                event: GpuEvent::RegisteredMemoryWait { id, wait },
+            } => (source, id, GpuEvent::RegisteredMemoryWait { id, wait }),
+            other => panic!("expected a registered wait, got {other:?}"),
+        };
+        presenter.receiver.finish_event(source);
+        (source, id, event)
+    };
+
+    let (source, old_id, old_event) = take_registered_wait(&mut presenter);
+    open_per_queue_batch(&mut presenter, 41);
+    let fence = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists")
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("producer fence");
+    let _ = presenter.gpu_wait_fences.bind_if_unbound(old_id, fence);
+    assert!(
+        !presenter.event_is_shared_event_gpu_orderable(source, &old_event),
+        "a ticket-to-fence binding without its retained resource checkpoint is not enough"
+    );
+
+    remu_gpu::retire_gpu_wait(old_id);
+    let (new_source, new_id, new_event) = take_registered_wait(&mut presenter);
+    assert_ne!(
+        old_id, new_id,
+        "submitted wait generations never reuse identity"
+    );
+    assert!(
+        !presenter.event_is_shared_event_gpu_orderable(new_source, &new_event),
+        "an old exact fence must not authorize a new wait at the same recycled label address"
+    );
+
+    let _ = presenter.gpu_wait_fences.take(old_id);
+    remu_gpu::retire_gpu_wait(new_id);
     remu_gpu::clear_event_sink();
 }
 
