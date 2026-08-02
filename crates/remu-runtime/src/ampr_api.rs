@@ -19,6 +19,16 @@ use crate::{
 const AMPR_ORDER_LOCK_COUNT: usize = 64;
 const AMPR_STAGING_POOL_LIMIT: usize = 4;
 const AMPR_MAX_RETAINED_STAGING_BYTES: usize = 8 * 1024 * 1024;
+/// Published to a recorded completion word when the submission's transfers did not all run.
+///
+/// Zero is the word's pre-submission state, so a failure cannot be reported by leaving it or by
+/// clearing it: a guest polling the word would never observe the submission ending. The value is
+/// deliberately not the recorded success token, which means "the transfers this program records
+/// have happened".
+const AMPR_FAILED_COMPLETION_VALUE: u64 = u64::MAX;
+/// `EV_ERROR`. Set on a completion event whose transfers failed; `data` still carries the
+/// recorded token, so the guest can identify which request the error belongs to.
+const AMPR_EVENT_FLAG_ERROR: u16 = 0x4000;
 
 fn positional_file_read(
     file: &std::fs::File,
@@ -740,7 +750,7 @@ where
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let command_buffer = arguments[0];
-    let (reads, paths) = {
+    let (reads, paths, retained_handles) = {
         let state = dispatch
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -749,22 +759,21 @@ where
         };
         let mut paths = BTreeMap::new();
         for read in &command.pending_reads {
-            let Ok(capacity) = usize::try_from(read.size) else {
-                return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-            };
-            // A reusable APR program may outlive or reprotect its original destination. Validate
-            // the entire current mapping on every submission rather than trusting record time.
-            if !ampr_destination_has_write_access(&state, read.destination, capacity) {
-                return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
-            }
+            // Every per-read rejection is decided by the execution pass below, which revalidates
+            // after any intervening open anyway. This pass only collects the handles that pass
+            // may need, so one unresolvable record cannot cancel the whole program.
             let Some(path) = state.ampr_files.get(&read.file_id).cloned() else {
-                return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+                continue;
             };
             paths
                 .entry(read.file_id)
                 .or_insert_with(|| (path, state.ampr_file_handles.get(&read.file_id).cloned()));
         }
-        (command.pending_reads.clone(), paths)
+        (
+            command.pending_reads.clone(),
+            paths,
+            state.ampr_file_handles.len(),
+        )
     };
 
     let mut files = BTreeMap::<u32, Arc<std::fs::File>>::new();
@@ -774,11 +783,14 @@ where
             None => match std::fs::File::open(&path) {
                 Ok(file) => Arc::new(file),
                 Err(error) => {
+                    // The retained-handle count is part of the diagnostic: this cache holds one
+                    // descriptor per file the title has ever read, so it is the first suspect
+                    // when the host refuses an open.
                     eprintln!(
-                        "[REMu][AMPR] submit could not open id={file_id:#x} host={:?}: {error}",
+                        "[REMu][AMPR] submit could not open id={file_id:#x} host={:?} handles={retained_handles}: {error}",
                         path.display()
                     );
-                    return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+                    continue;
                 }
             },
         };
@@ -789,33 +801,17 @@ where
     // guest-memory faults retain the process dispatch lock, so unrelated guest services and APR
     // buffers continue making progress.
     let mut completed_reads = Vec::with_capacity(reads.len());
+    let mut failure = None;
     for read in reads {
-        let Ok(capacity) = usize::try_from(read.size) else {
-            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-        };
-        {
-            let state = dispatch
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Opening another file, or an earlier command, may have allowed the guest to change
-            // this reusable destination. Revalidate directly before this command's I/O.
-            if !ampr_destination_has_write_access(&state, read.destination, capacity) {
-                return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
-            }
-        }
-        let Some(file) = files.get(&read.file_id) else {
-            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-        };
-        let bytes_read = match read_file(
-            file,
-            read.file_id,
-            read.destination,
-            read.size,
-            read.file_offset,
-            capacity,
-        ) {
+        // A failed record is contained to itself: later records still run, and its result word
+        // still reports zero bytes, because a guest parses the destination on the strength of
+        // that word and would otherwise parse the previous submission's bytes.
+        let bytes_read = match ampr_execute_recorded_read(dispatch, &files, &read, &mut read_file) {
             Ok(bytes_read) => bytes_read,
-            Err(error) => return error,
+            Err(error) => {
+                failure.get_or_insert(error);
+                0
+            }
         };
         completed_reads.push((read.record_offset, bytes_read));
     }
@@ -831,22 +827,82 @@ where
     };
     for (record_offset, bytes_read) in completed_reads {
         let Some(result_offset) = record_offset.checked_add(0x20) else {
-            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            failure.get_or_insert(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+            continue;
         };
         if result_offset > command.size || 8 > command.size - result_offset {
-            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+            failure.get_or_insert(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+            continue;
         }
         write_guest_u64(
             command.buffer + result_offset,
             u64::try_from(bytes_read).unwrap_or(u64::MAX),
         );
     }
-    ampr_submit_command_buffer(arguments, &mut state)
+    ampr_publish_command_buffer_completion(arguments, &mut state, failure)
+}
+
+/// Runs one recorded transfer, reporting the error the guest should see when it cannot run.
+///
+/// Errors are per record. The caller owns the program's outcome, so nothing here may abandon the
+/// remaining records or the buffer's completion publication.
+fn ampr_execute_recorded_read<F>(
+    dispatch: &RwLock<ProbeDispatchState>,
+    files: &BTreeMap<u32, Arc<std::fs::File>>,
+    read: &AmprReadCommand,
+    read_file: &mut F,
+) -> Result<usize, u64>
+where
+    F: FnMut(&std::fs::File, u32, u64, u64, u64, usize) -> Result<usize, u64>,
+{
+    let Ok(capacity) = usize::try_from(read.size) else {
+        return Err(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+    };
+    {
+        let state = dispatch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A reusable APR program may outlive or reprotect its original destination, and opening
+        // another file or running an earlier command gives the guest the chance to. Validate the
+        // entire current mapping directly before this command's I/O.
+        if !ampr_destination_has_write_access(&state, read.destination, capacity) {
+            eprintln!(
+                "[REMu][AMPR] submit rejected unmapped destination={:#x} size={:#x} id={:#x}",
+                read.destination, read.size, read.file_id
+            );
+            return Err(sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT));
+        }
+    }
+    let Some(file) = files.get(&read.file_id) else {
+        return Err(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
+    };
+    read_file(
+        file,
+        read.file_id,
+        read.destination,
+        read.size,
+        read.file_offset,
+        capacity,
+    )
 }
 
 pub(crate) fn ampr_submit_command_buffer(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
+) -> u64 {
+    ampr_publish_command_buffer_completion(arguments, state, None)
+}
+
+/// Publishes a submission's recorded completions, reporting `failure` to the guest when the
+/// transfers did not all run.
+///
+/// A failed submission publishes exactly what a successful one does. The completion word and the
+/// queued event are the only channels a guest has for learning that a submission ended, so
+/// withholding them turns a recoverable I/O error into a wait that never returns.
+fn ampr_publish_command_buffer_completion(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+    failure: Option<u64>,
 ) -> u64 {
     if arguments[0] == 0 || !state.ampr_command_buffers.contains_key(&arguments[0]) {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
@@ -881,7 +937,14 @@ pub(crate) fn ampr_submit_command_buffer(
         if !ampr_destination_has_write_access(state, write.address, 8) {
             return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
         }
-        write_guest_u64(write.address, write.value);
+        write_guest_u64(
+            write.address,
+            if failure.is_some() {
+                AMPR_FAILED_COMPLETION_VALUE
+            } else {
+                write.value
+            },
+        );
     }
     // The value recorded with the queue-write command is the event's `data`, which the guest
     // reads back through `sceKernelGetEventData` to identify which request completed. `udata`
@@ -902,7 +965,11 @@ pub(crate) fn ampr_submit_command_buffer(
                 equeue: completion.equeue,
                 ident: completion.ident,
                 filter: KERNEL_EVENT_FILTER_AMPR,
-                flags: 0,
+                flags: if failure.is_some() {
+                    AMPR_EVENT_FLAG_ERROR
+                } else {
+                    0
+                },
                 fflags: 1,
                 data: completion.user_data,
                 user_data,
@@ -915,12 +982,12 @@ pub(crate) fn ampr_submit_command_buffer(
         notify_kernel_equeue_waiters();
     }
     if arguments[2] != 0 {
-        write_guest_u64(arguments[2], 0);
+        write_guest_u64(arguments[2], failure.unwrap_or(0));
     }
     if arguments[3] != 0 {
         write_guest_u32(arguments[3], id);
     }
-    0
+    failure.unwrap_or(0)
 }
 
 pub(crate) fn ampr_wait_command_buffer(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {

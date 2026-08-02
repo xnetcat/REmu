@@ -640,3 +640,243 @@ fn ampr_address_completion_rejects_a_missing_buffer_or_address() {
         sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
     );
 }
+
+fn ampr_record_result(records: &[u8], record_offset: usize) -> u64 {
+    let result = record_offset + 0x20;
+    u64::from_le_bytes(records[result..result + 8].try_into().unwrap())
+}
+
+const AMPR_TEST_COMPLETION_VALUE: u64 = 0xa5;
+const AMPR_TEST_EVENT_IDENT: u64 = 0x7601;
+const AMPR_TEST_EVENT_DATA: u64 = 0xdef;
+
+/// Records one 4-byte read per `(file id, destination)`, each continuing where the previous one
+/// left off in the file, followed by the completion word and, given an equeue, the completion
+/// event.
+fn ampr_record_read_program(
+    command_buffer: u64,
+    reads: &[(u32, u64)],
+    completion_word: u64,
+    equeue: Option<u64>,
+    records: &mut [u8],
+    state: &mut ProbeDispatchState,
+) {
+    state.ampr_command_buffers.insert(
+        command_buffer,
+        AmprCommandBufferState {
+            buffer: records.as_mut_ptr().addr() as u64,
+            size: records.len() as u64,
+            ..AmprCommandBufferState::default()
+        },
+    );
+    for (index, (file_id, destination)) in reads.iter().enumerate() {
+        assert_eq!(
+            crate::ampr_command_buffer_record_read(
+                [command_buffer, 0, 0, u64::from(*file_id), *destination, 4],
+                [index as u64 * 4, 0, 0, 0, 0, 0],
+                state,
+            ),
+            0
+        );
+    }
+    assert_eq!(
+        ampr_command_buffer_write_address_on_completion(
+            [
+                command_buffer,
+                completion_word,
+                AMPR_TEST_COMPLETION_VALUE,
+                0,
+                0,
+                0,
+            ],
+            state,
+        ),
+        0
+    );
+    if let Some(equeue) = equeue {
+        assert_eq!(
+            ampr_command_buffer_write_kernel_event_queue(
+                [
+                    command_buffer,
+                    equeue,
+                    AMPR_TEST_EVENT_IDENT,
+                    AMPR_TEST_EVENT_DATA,
+                    0,
+                    0,
+                ],
+                state,
+            ),
+            0
+        );
+    }
+}
+
+/// A failed transfer is contained to its own record: the records after it still run, its result
+/// word reports zero bytes rather than the previous submission's count, and the completion the
+/// guest polls or waits on is still published — carrying a failure, because a submission that
+/// publishes nothing leaves the guest waiting on an error it can never observe.
+#[test]
+fn ampr_submit_contains_a_failed_read_and_still_publishes_its_completion() {
+    let path = create_ampr_test_file(b"0123456789ab");
+    let file_id = 0x1357_2468;
+    let command_buffer = 0x6c00;
+    let equeue = 0x4100;
+    let mut command_records = [0_u8; 0x180];
+    let mut first = [0_u8; 4];
+    let mut second = [0_u8; 4];
+    let mut third = [0_u8; 4];
+    let mut flag = 0_u64;
+    let mut state = ProbeDispatchState::default();
+    state.kernel_equeues.insert(equeue);
+    state.ampr_files.insert(file_id, path.clone());
+    ampr_record_read_program(
+        command_buffer,
+        &[
+            (file_id, first.as_mut_ptr().addr() as u64),
+            (file_id, second.as_mut_ptr().addr() as u64),
+            (file_id, third.as_mut_ptr().addr() as u64),
+        ],
+        (&raw mut flag).addr() as u64,
+        Some(equeue),
+        &mut command_records,
+        &mut state,
+    );
+
+    let dispatch = RwLock::new(state);
+    let order = Mutex::new(());
+    assert_eq!(
+        crate::ampr_submit_command_buffer_two_phase_with(
+            &order,
+            &dispatch,
+            [command_buffer, 0, 0, 0, 0, 0],
+            crate::ampr_read_file_to_guest,
+        ),
+        0
+    );
+    assert_eq!(ampr_record_result(&command_records, 0x30), 4);
+    assert_eq!(flag, AMPR_TEST_COMPLETION_VALUE);
+
+    // The same program over new contents, with the middle transfer failing. A reusable program's
+    // records and destinations still hold what the previous submission left there.
+    std::fs::write(&path, b"ABCDEFGHIJKL").unwrap();
+    flag = 0;
+    dispatch.write().unwrap().pending_events.clear();
+    let mut submission_result = u64::MAX;
+    let mut submission_id = 0_u32;
+    let mut observed_offsets = Vec::new();
+    let read_error = sce_kernel_error(crate::SCE_KERNEL_ERROR_IO);
+    assert_eq!(
+        crate::ampr_submit_command_buffer_two_phase_with(
+            &order,
+            &dispatch,
+            [
+                command_buffer,
+                0,
+                (&raw mut submission_result).addr() as u64,
+                (&raw mut submission_id).addr() as u64,
+                0,
+                0,
+            ],
+            |file, id, destination, size, offset, capacity| {
+                observed_offsets.push(offset);
+                if offset == 4 {
+                    return Err(read_error);
+                }
+                crate::ampr_read_file_to_guest(file, id, destination, size, offset, capacity)
+            },
+        ),
+        read_error
+    );
+
+    assert_eq!(
+        observed_offsets,
+        [0, 4, 8],
+        "a failed read cancelled the rest of the program"
+    );
+    assert_eq!(&first, b"ABCD");
+    assert_eq!(&second, b"4567", "the failed read wrote its destination");
+    assert_eq!(&third, b"IJKL", "a read after a failure did not run");
+    assert_eq!(ampr_record_result(&command_records, 0), 4);
+    assert_eq!(
+        ampr_record_result(&command_records, 0x30),
+        0,
+        "the failed record kept the previous submission's byte count"
+    );
+    assert_eq!(ampr_record_result(&command_records, 0x60), 4);
+    assert_eq!(flag, u64::MAX, "the completion word did not report failure");
+    assert_eq!(submission_result, read_error);
+    assert_eq!(submission_id, 2);
+    let state = dispatch.read().unwrap();
+    let event = state
+        .pending_events
+        .front()
+        .expect("the failed submission announced no completion event");
+    assert_eq!(event.equeue, equeue);
+    assert_eq!(
+        event.data, AMPR_TEST_EVENT_DATA,
+        "the event lost its request identity"
+    );
+    assert_eq!(event.flags, 0x4000, "the event did not report the failure");
+    drop(state);
+    std::fs::remove_file(path).ok();
+}
+
+/// The exhausted-descriptor shape: one file of a program cannot be opened. The records that read
+/// other files still run, and the program still completes.
+#[test]
+fn ampr_submit_reports_an_unopenable_read_without_cancelling_the_program() {
+    let readable = create_ampr_test_file(b"abcdefghijkl");
+    let unopenable = create_ampr_test_file(b"unreadable");
+    let readable_id = 0x2222_1111;
+    let unopenable_id = 0x3333_4444;
+    let command_buffer = 0x6e00;
+    let mut command_records = [0_u8; 0x120];
+    let mut first = [0_u8; 4];
+    let mut second = [0_u8; 4];
+    let mut third = [0_u8; 4];
+    let mut flag = 0_u64;
+    let mut state = ProbeDispatchState::default();
+    state.ampr_files.insert(readable_id, readable.clone());
+    state.ampr_files.insert(unopenable_id, unopenable.clone());
+    ampr_record_read_program(
+        command_buffer,
+        &[
+            (readable_id, first.as_mut_ptr().addr() as u64),
+            (unopenable_id, second.as_mut_ptr().addr() as u64),
+            (readable_id, third.as_mut_ptr().addr() as u64),
+        ],
+        (&raw mut flag).addr() as u64,
+        None,
+        &mut command_records,
+        &mut state,
+    );
+    std::fs::remove_file(&unopenable).unwrap();
+
+    let dispatch = RwLock::new(state);
+    let order = Mutex::new(());
+    assert_eq!(
+        crate::ampr_submit_command_buffer_two_phase_with(
+            &order,
+            &dispatch,
+            [command_buffer, 0, 0, 0, 0, 0],
+            crate::ampr_read_file_to_guest,
+        ),
+        sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+    );
+
+    assert_eq!(&first, b"abcd");
+    assert_eq!(second, [0; 4], "the unopenable read wrote its destination");
+    assert_eq!(&third, b"ijkl", "a read after an unopenable file failed");
+    assert_eq!(ampr_record_result(&command_records, 0), 4);
+    assert_eq!(ampr_record_result(&command_records, 0x30), 0);
+    assert_eq!(ampr_record_result(&command_records, 0x60), 4);
+    assert_eq!(flag, u64::MAX, "the completion word did not report failure");
+    assert!(
+        !dispatch
+            .read()
+            .unwrap()
+            .ampr_file_handles
+            .contains_key(&unopenable_id)
+    );
+    std::fs::remove_file(readable).ok();
+}
