@@ -175,40 +175,223 @@ fn rwlock_tracks_recursive_read_ownership_and_excludes_writers() {
     assert_eq!(crate::guest_rwlock_destroy(address), 0);
 }
 
+/// Every console-named reader/writer-lock NID, in dispatch order.
+const CONSOLE_RWLOCK_NIDS: [&str; 8] = [
+    "6ULAa0fq4jA",
+    "BB+kb08Tl9A",
+    "Ox9i0c7L5w0",
+    "mqdNorrB+gI",
+    "XD3mDeybCnk",
+    "bIHoZCTomsI",
+    "+L98PIbGttk",
+    "12wOHk8ywb0",
+];
+
+fn probe_dispatch() -> &'static std::sync::RwLock<ProbeDispatchState> {
+    crate::PROBE_DISPATCH.get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()))
+}
+
+/// Selects a dispatch tier the way `import_dispatch` does.
+///
+/// A NID that can park must be served before the process-wide dispatch lock is taken; routing one
+/// through the lock-holding tier is the deadlock this file guards against, so the tier choice has
+/// to be part of the call under test rather than assumed by it.
+fn dispatch_import_by_tier(nid: &str, arguments: [u64; 6]) -> u64 {
+    if crate::is_guest_sync_import(nid) {
+        return crate::dispatch_guest_sync_import(nid, arguments, None);
+    }
+    let mut state = crate::lock_probe_dispatch_for_write(probe_dispatch());
+    crate::kernel_api::dispatch(nid, arguments, &mut state)
+        .expect("the test names a NID some dispatch table owns")
+}
+
 #[test]
 fn console_named_rwlock_entry_points_reach_the_same_lock() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut state = ProbeDispatchState::default();
     let address = 0x7fff_0000_00c0;
-    let call = |nid: &str, state: &mut ProbeDispatchState| {
-        crate::kernel_api::dispatch(nid, [address, 0, 0, 0, 0, 0], state)
-            .unwrap_or_else(|| panic!("{nid} is not served by the kernel ABI"))
-    };
-    assert_eq!(call("6ULAa0fq4jA", &mut state), 0);
+    let call = |nid: &str| dispatch_import_by_tier(nid, [address, 0, 0, 0, 0, 0]);
+    assert_eq!(call("6ULAa0fq4jA"), 0);
     // The blocking acquires are the pair Dantelion2 uses; a missing one is an unimplemented
     // return that its DLReadWriteLock treats as a fatal error rather than as contention.
-    assert_eq!(call("mqdNorrB+gI", &mut state), 0);
+    assert_eq!(call("mqdNorrB+gI"), 0);
     // A console-named writer must exclude a POSIX-named reader: both spellings are one object.
     assert_eq!(
         crate::guest_rwlock_lock(address, false, true),
         u64::from(libc::EBUSY.cast_unsigned())
     );
-    assert_eq!(call("+L98PIbGttk", &mut state), 0);
-    assert_eq!(call("Ox9i0c7L5w0", &mut state), 0);
-    assert_eq!(call("Ox9i0c7L5w0", &mut state), 0);
+    assert_eq!(call("+L98PIbGttk"), 0);
+    assert_eq!(call("Ox9i0c7L5w0"), 0);
+    assert_eq!(call("Ox9i0c7L5w0"), 0);
     assert_eq!(
-        call("bIHoZCTomsI", &mut state),
-        u64::from(libc::EBUSY.cast_unsigned())
+        call("bIHoZCTomsI"),
+        u64::from(libc::EBUSY.cast_unsigned()),
+        "the console try-lock reports the pthread errno, as its POSIX twin does"
     );
-    assert_eq!(call("+L98PIbGttk", &mut state), 0);
-    assert_eq!(call("+L98PIbGttk", &mut state), 0);
-    assert_eq!(call("BB+kb08Tl9A", &mut state), 0);
+    assert_eq!(call("+L98PIbGttk"), 0);
+    assert_eq!(call("+L98PIbGttk"), 0);
+    assert_eq!(call("BB+kb08Tl9A"), 0);
     assert_eq!(
         crate::known_nid_name("mqdNorrB+gI"),
         Some("scePthreadRwlockWrlock")
     );
+}
+
+#[test]
+fn console_named_rwlock_entry_points_are_owned_by_the_pre_lock_tier() {
+    let mut state = ProbeDispatchState::default();
+    for nid in CONSOLE_RWLOCK_NIDS {
+        assert!(
+            crate::is_guest_sync_import(nid),
+            "{nid} may park, so it must be served before the dispatch lock is taken"
+        );
+        assert!(
+            crate::kernel_api::dispatch(nid, [0; 6], &mut state).is_none(),
+            "{nid} must not also be claimed by a table that runs under the dispatch lock"
+        );
+    }
+}
+
+#[test]
+fn a_guest_sync_wait_under_the_dispatch_write_lock_is_a_test_failure() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let held = crate::lock_probe_dispatch_for_write(probe_dispatch());
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let rejected = std::panic::catch_unwind(|| {
+        crate::assert_wait_is_off_the_dispatch_lock("scePthreadRwlockWrlock");
+    })
+    .is_err();
+    std::panic::set_hook(previous_hook);
+    drop(held);
+
+    assert!(
+        rejected,
+        "a park under the process-wide dispatch write lock must be rejected, not deadlock"
+    );
+    // The marker is scoped to the guard, so the same wait is legal once it is released.
+    crate::assert_wait_is_off_the_dispatch_lock("scePthreadRwlockWrlock");
+}
+
+#[test]
+fn a_contended_console_named_write_lock_does_not_hold_the_dispatch_lock() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let address = 0x7fff_0000_01c0;
+    assert_eq!(
+        dispatch_import_by_tier("6ULAa0fq4jA", [address, 0, 0, 0, 0, 0]),
+        0
+    );
+    assert_eq!(crate::guest_rwlock_lock(address, false, false), 0);
+
+    let (acquired, writer_result) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let result = dispatch_import_by_tier("mqdNorrB+gI", [address, 0, 0, 0, 0, 0]);
+        acquired.send(result).expect("test receiver remains live");
+        if result == 0 {
+            assert_eq!(
+                dispatch_import_by_tier("+L98PIbGttk", [address, 0, 0, 0, 0, 0]),
+                0
+            );
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let waiting = crate::guest_sync()
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rwlocks
+            .get(&address)
+            .map_or(0, |lock| lock.waiting_writers);
+        if waiting == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the console-named writer did not park"
+        );
+        std::thread::yield_now();
+    }
+
+    // The parked writer must not be holding the process-wide dispatch lock: if it were, no other
+    // guest thread could reach the unlock that releases it.
+    let held = loop {
+        match probe_dispatch().try_write() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a parked console-named writer is holding the process-wide dispatch lock"
+                );
+                std::thread::yield_now();
+            }
+        }
+    };
+    assert_eq!(crate::guest_rwlock_unlock(address), 0);
+    assert_eq!(
+        writer_result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the contended writer acquires while the dispatch lock is held elsewhere"),
+        0
+    );
+    drop(held);
+    writer.join().expect("guest writer thread");
+    assert_eq!(
+        dispatch_import_by_tier("BB+kb08Tl9A", [address, 0, 0, 0, 0, 0]),
+        0
+    );
+}
+
+#[test]
+fn polling_a_semaphore_takes_a_count_only_when_one_is_already_available() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let handle = {
+        let sync = crate::guest_sync();
+        let mut state = sync
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.next_semaphore_handle = state.next_semaphore_handle.wrapping_add(1).max(1);
+        let handle = state.next_semaphore_handle;
+        state.semaphores.insert(
+            handle,
+            crate::GuestSemaphoreState {
+                count: 2,
+                maximum: 4,
+            },
+        );
+        handle
+    };
+    let poll = |needed: u64| {
+        dispatch_import_by_tier("12wOHk8ywb0", [u64::from(handle), needed, 0, 0, 0, 0])
+    };
+
+    assert_eq!(poll(2), 0);
+    assert_eq!(poll(1), sce_kernel_error(crate::SCE_KERNEL_ERROR_BUSY));
+    assert_eq!(
+        poll(0),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        dispatch_import_by_tier("12wOHk8ywb0", [0, 1, 0, 0, 0, 0]),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_NOT_FOUND)
+    );
+
+    crate::guest_sync()
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .semaphores
+        .remove(&handle);
 }
 
 #[test]

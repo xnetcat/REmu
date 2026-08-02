@@ -3,10 +3,9 @@
 
 use crate::{
     DEFAULT_THREAD_AFFINITY_MASK, DEFAULT_THREAD_PRIORITY, ProbeDispatchState,
-    SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND,
-    current_guest_thread_handle, guest_sync, low_i32, low_u32, pthread_attr_state,
-    sce_kernel_error, signed_i32_return, update_pthread_attr, write_guest_bytes, write_guest_u32,
-    write_guest_u64,
+    SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND, current_guest_thread_handle,
+    pthread_attr_state, sce_kernel_error, signed_i32_return, update_pthread_attr,
+    write_guest_bytes, write_guest_u32, write_guest_u64,
 };
 
 use super::set_guest_errno;
@@ -105,28 +104,6 @@ pub(super) fn pthread_attr_set_solo_schedule(
     state: &mut ProbeDispatchState,
 ) -> u64 {
     update_pthread_attr(arguments[0], state, |_| {})
-}
-
-/// Takes a count from a semaphore when one is already available, and never waits.
-pub(super) fn kernel_poll_semaphore(arguments: [u64; 6]) -> u64 {
-    let handle = low_u32(arguments[0]);
-    let needed = low_i32(arguments[1]);
-    if needed <= 0 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
-    let sync = guest_sync();
-    let mut state = sync
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(semaphore) = state.semaphores.get_mut(&handle) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    };
-    if semaphore.count < needed {
-        return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
-    }
-    semaphore.count -= needed;
-    0
 }
 
 /// Reports one end of the priority range a scheduling policy accepts.

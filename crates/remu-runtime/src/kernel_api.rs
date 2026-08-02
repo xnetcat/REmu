@@ -25,7 +25,6 @@ use crate::{
     KERNEL_EVENT_FILTER_USER, KERNEL_FILES, KernelFileState, ProbeDispatchState,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NOT_FOUND,
     current_guest_thread_handle, guest_errno_address, guest_kernel_rmdir, guest_posix_file_result,
-    guest_rwlock_destroy, guest_rwlock_init, guest_rwlock_lock, guest_rwlock_unlock,
     kernel_process_time, kernel_register_event, low_i32, posix_pthread_result,
     process_guest_range_is_readable, pthread_attr_set_inherit_schedule,
     pthread_attr_set_schedule_param, pthread_get_schedule_param, pthread_rename, read_guest_u16,
@@ -49,7 +48,7 @@ use self::filesystem::{
 use self::net::{AF_INET, AF_INET6};
 use self::net::{inet_ntop, inet_pton};
 use self::thread::{
-    KERNEL_PRIORITY_HIGHEST, KERNEL_PRIORITY_LOWEST, kernel_current_cpu, kernel_poll_semaphore,
+    KERNEL_PRIORITY_HIGHEST, KERNEL_PRIORITY_LOWEST, kernel_current_cpu,
     pthread_attr_get_detach_state, pthread_attr_set_solo_schedule, pthread_get_affinity,
     pthread_get_name, pthread_get_priority, scheduler_priority_bound,
 };
@@ -161,7 +160,10 @@ fn dispatch_event(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchState
     })
 }
 
-/// Handles the thread, thread-attribute, and reader/writer-lock entry points.
+/// Handles the thread and thread-attribute entry points.
+///
+/// The reader/writer-lock family is deliberately absent: its blocking acquires park, so it is
+/// served by [`crate::dispatch_guest_sync_import_at_import`] before the dispatch lock is taken.
 fn dispatch_thread(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchState) -> Option<u64> {
     Some(match nid {
         "3PtV6p3QNX4" => u64::from(arguments[0] == arguments[1] && arguments[0] != 0),
@@ -176,16 +178,6 @@ fn dispatch_thread(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchStat
         "euKRgm0Vn2M" => posix_pthread_result(pthread_attr_set_schedule_param(arguments, state)),
         "9vyP6Z7bqzc" => posix_pthread_result(pthread_rename(arguments, state)),
         "2+pVfgiEd7A" => posix_pthread_result(pthread_attr_set_solo_schedule(arguments, state)),
-        // The console's reader/writer lock is the POSIX object under another name, so these share
-        // the guest-synchronisation table with the entry points already exported for it.
-        "6ULAa0fq4jA" => guest_rwlock_init(arguments[0]),
-        "BB+kb08Tl9A" => guest_rwlock_destroy(arguments[0]),
-        "Ox9i0c7L5w0" => guest_rwlock_lock(arguments[0], false, false),
-        "mqdNorrB+gI" => guest_rwlock_lock(arguments[0], true, false),
-        "XD3mDeybCnk" => guest_rwlock_lock(arguments[0], false, true),
-        "bIHoZCTomsI" => guest_rwlock_lock(arguments[0], true, true),
-        "+L98PIbGttk" => guest_rwlock_unlock(arguments[0]),
-        "12wOHk8ywb0" => kernel_poll_semaphore(arguments),
         _ => return None,
     })
 }

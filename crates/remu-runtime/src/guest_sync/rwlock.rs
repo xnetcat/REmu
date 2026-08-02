@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{GuestRwlockState, guest_sync};
+use crate::assert_wait_is_off_the_dispatch_lock;
 
 pub(crate) fn guest_rwlock_init(address: u64) -> u64 {
     if address == 0 {
@@ -96,6 +97,7 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
                 lock.writer = Some(current);
                 return 0;
             }
+            assert_wait_is_off_the_dispatch_lock("scePthreadRwlockWrlock");
             state = sync
                 .1
                 .wait(state)
@@ -122,6 +124,7 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
         if try_only {
             return u64::from(libc::EBUSY.cast_unsigned());
         }
+        assert_wait_is_off_the_dispatch_lock("scePthreadRwlockRdlock");
         state = sync
             .1
             .wait(state)
