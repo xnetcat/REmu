@@ -159,8 +159,9 @@ use self::stats::process_resident_bytes;
 use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
     MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE,
-    OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD, OWNED_SUBTRACT_TENANTS_SURVIVED,
-    OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED,
+    OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD, OWNED_REMATERIALISE_BLIT,
+    OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_VIEW,
+    OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WRITE_ATTRIBUTION_MISSES,
@@ -209,7 +210,8 @@ use self::texture::{
     guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
     prepare_sampled_texture_upload, resident_texture_eviction_plan, sampled_texture_cache_accepts,
-    sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
+    rematerialisation_blit_source_origin_y, sampled_texture_cache_needs_reload,
+    sampled_texture_cache_requires_eviction,
     sampled_texture_key, sampled_texture_raw_range, snapshot_guest_texture_linear,
     snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
 };

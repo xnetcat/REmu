@@ -8,6 +8,8 @@ use super::{
     GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
     MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
     OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_SUBTRACT_TENANTS_SURVIVED,
+    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED,
+    OWNED_REMATERIALISE_VIEW,
     RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
     RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidencyState, ResidentGuestTexture,
     ResourceSpan,
@@ -77,17 +79,19 @@ pub(crate) use self::resident_map::{ResidentTextureMap, SpanQueryOrder};
 #[cfg(test)]
 pub(crate) use self::resident_map::ResidentSpanIndex;
 pub(crate) use self::residency::{ensure_resident_texture_in_map, resident_texture_ownership_stats};
+#[cfg(test)]
+pub(crate) use self::residency::rematerialisation_blit_source_origin_y;
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_sampled_texture, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, trace_resident_texture_demotion,
     trace_resident_texture_removal,
 };
+pub(crate) use self::sampled::new_color_alias_texture_view;
 #[cfg(test)]
 pub(crate) use self::sampled::{
     apply_image_destination_select, image_destination_select_is_native,
-    new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
-    prepare_sampled_texture_upload,
+    new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
 };
 pub(crate) use self::sampled::{
     create_sampled_guest_texture, decode_sampled_texture_linear_from_raw,

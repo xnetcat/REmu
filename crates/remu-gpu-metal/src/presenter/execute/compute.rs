@@ -4,7 +4,8 @@
 use super::WrittenRegion;
 use super::{
     FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
-    ResidentTextureActivityStamp, SpanQueryOrder, append_unique_global_writebacks,
+    ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
+    append_unique_global_writebacks,
     append_unique_guest_write_ranges, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, compute_pipeline_key, compute_program_can_split_wave64,
     create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
@@ -99,6 +100,28 @@ impl MetalPresenter {
                 error
             }
         })?;
+
+        // Read-only sampled descriptors also participate in render-graph aliasing. Resolve an
+        // exact stale tenant before sampled-cache upload can decode obsolete guest RAM.
+        for binding in evaluation
+            .image_bindings
+            .iter()
+            .filter(|binding| !image_resource_descriptor_is_null(&binding.resource_descriptor))
+        {
+            if let Ok(descriptor) = decode_image_descriptor(&binding.resource_descriptor)
+                && self
+                    .resident_guest_textures
+                    .get(&descriptor.guest)
+                    .is_some_and(|resident| {
+                        matches!(
+                            resident.state,
+                            ResidencyState::Stale(StaleSource::Allocation { .. })
+                        )
+                    })
+            {
+                self.rematerialise_stale_resident_for_read(descriptor.guest)?;
+            }
+        }
 
         for binding in evaluation
             .image_bindings

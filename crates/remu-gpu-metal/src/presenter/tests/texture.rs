@@ -13,6 +13,8 @@ use super::super::texture::{
     ResidentSpanIndex, ResidentTextureMap, SpanQueryOrder, ensure_resident_texture_in_map,
 };
 use super::super::{
+    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED,
+    OWNED_REMATERIALISE_VIEW,
     RESIDENT_WRITE_ATTRIBUTION_MISSES, RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_PUBLISHED,
     ResidencyState, StaleSource, TEXTURE_SNAPSHOT_COUNT, WritebackTrigger,
 };
@@ -20,7 +22,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use super::super::WrittenRegion;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, ResourceSpan,
-    ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
+    RangeSet, ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
     apply_image_destination_select, comparison_depth32_upload, create_sampled_guest_texture,
     decode_guest_texture_linear_from_raw, decode_image_descriptor, depth_array_face_descriptor,
     depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
@@ -32,6 +34,7 @@ use super::{
     guest_texture_raw_matches, guest_texture_raw_range,
     image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
     mode27_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
+    read_texture_linear, rematerialisation_blit_source_origin_y,
     render_resolve_candidate_matches, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_eviction_plan,
     resident_texture_ownership_stats, sampled_alias_descriptor, sampled_texture_cache_accepts,
@@ -2545,7 +2548,8 @@ fn a_disjoint_tenant_survives_an_overlapping_neighbours_write() {
 }
 
 #[test]
-fn a_contained_tenant_is_demoted_and_rebuilds_from_guest_memory() {
+#[allow(clippy::too_many_lines)]
+fn a_contained_tenant_is_rematerialised_by_an_ordered_blit() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -2574,16 +2578,22 @@ fn a_contained_tenant_is_demoted_and_rebuilds_from_guest_memory() {
         bytes_per_pixel: 4,
     };
     let tenant = GuestTextureDescriptor {
-        address: address + 1024,
+        // Two complete source rows preserve mode-27's equivalent parity invariant too.
+        address: address + 2 * 32 * 4,
         width: 16,
         height: 16,
-        pitch: 16,
+        pitch: 32,
         ..parent
     };
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
     let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
     presenter
         .ensure_resident_texture(&device, parent)
         .expect("pooled parent");
@@ -2591,6 +2601,28 @@ fn a_contained_tenant_is_demoted_and_rebuilds_from_guest_memory() {
         .ensure_resident_texture(&device, tenant)
         .expect("contained tenant")
         .texture;
+
+    // Make the Metal source observably newer than RAM before attributing the guest GPU write.
+    let mut source_pixels = vec![0_u8; 32 * 32 * 4];
+    for y in 0..32_usize {
+        for x in 0..32_usize {
+            let offset = (y * 32 + x) * 4;
+            source_pixels[offset..offset + 4].copy_from_slice(&[
+                u8::try_from(x).unwrap(),
+                u8::try_from(y).unwrap(),
+                u8::try_from(x ^ y).unwrap(),
+                0xff,
+            ]);
+        }
+    }
+    presenter.resident_guest_textures[&parent]
+        .texture
+        .replace_region(
+            MTLRegion::new_2d(0, 0, 32, 32),
+            0,
+            source_pixels.as_ptr().cast::<std::ffi::c_void>(),
+            32 * 4,
+        );
 
     presenter.mark_resident_texture_written(parent);
 
@@ -2605,17 +2637,304 @@ fn a_contained_tenant_is_demoted_and_rebuilds_from_guest_memory() {
         "demotion keeps the Metal allocation in place"
     );
 
-    // A read bind of a demoted resident rebuilds it from guest RAM: the superseding allocation is
-    // authoritative for the overlapping bytes and has not published them, so RAM is the only
-    // answer available until PR3 re-materialises on the GPU.
     let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
-    let rebuilt = presenter
+    let blits_before = OWNED_REMATERIALISE_BLIT.load(AtomicOrdering::Relaxed);
+    let rematerialised = presenter
         .ensure_resident_texture(&device, tenant)
-        .expect("demoted tenant rebuilds")
+        .expect("demoted tenant rematerialises")
         .texture;
-    assert!(!std::ptr::eq(tenant_texture.as_ref(), rebuilt.as_ref()));
-    assert!(TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed) > snapshots_before);
+    assert!(
+        std::ptr::eq(tenant_texture.as_ref(), rematerialised.as_ref()),
+        "the blit rung preserves the tenant's existing Metal allocation"
+    );
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before,
+        "GPU rematerialisation must not snapshot guest RAM"
+    );
+    assert_eq!(
+        OWNED_REMATERIALISE_BLIT.load(AtomicOrdering::Relaxed),
+        blits_before + 1
+    );
+    let batch = presenter
+        .open_guest_batch
+        .take()
+        .expect("the blit is appended to the open guest batch");
+    assert_eq!(
+        batch.command_buffer.status(),
+        MTLCommandBufferStatus::NotEnqueued,
+        "rematerialisation must not flush, commit, or wait"
+    );
+    batch.command_buffer.commit();
+    batch.command_buffer.wait_until_completed();
+
+    let pixels = read_texture_linear(&device, &queue, &rematerialised, tenant)
+        .expect("rematerialised tenant readback");
+    let mut expected = Vec::with_capacity(16 * 16 * 4);
+    for y in 2..18_usize {
+        for x in 0..16_usize {
+            let offset = (y * 32 + x) * 4;
+            expected.extend_from_slice(&source_pixels[offset..offset + 4]);
+        }
+    }
+    assert_eq!(pixels, expected, "the blit must preserve every logical texel");
     assert!(presenter.resident_guest_textures[&tenant].serves_reads());
+    assert!(presenter.resident_guest_textures[&tenant].gpu_written());
+}
+
+#[test]
+fn a_typed_alias_is_rematerialised_as_a_zero_copy_view() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("alias mapping")
+        .get();
+    let source = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::R32Float,
+        bytes_per_pixel: 4,
+    };
+    let target = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::R32Uint,
+        ..source
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let source_texture = presenter
+        .ensure_resident_texture(&device, source)
+        .expect("float source")
+        .texture;
+    let old_target = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("integer alias")
+        .texture;
+    presenter.mark_resident_texture_written(source);
+    assert!(matches!(
+        presenter.resident_guest_textures[&target].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+    ));
+
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let views_before = OWNED_REMATERIALISE_VIEW.load(AtomicOrdering::Relaxed);
+    let view = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("typed alias rematerialises")
+        .texture;
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before
+    );
+    assert_eq!(
+        OWNED_REMATERIALISE_VIEW.load(AtomicOrdering::Relaxed),
+        views_before + 1
+    );
+    assert!(view.parent_texture().is_some());
+    assert_eq!(view.pixel_format(), MTLPixelFormat::R32Uint);
+    assert!(!std::ptr::eq(old_target.as_ref(), view.as_ref()));
+    assert!(
+        presenter.open_guest_batch.is_none(),
+        "a view does not need a command buffer"
+    );
+    assert!(matches!(
+        presenter.resident_guest_textures[&source].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == target
+    ));
+    assert!(presenter.resident_guest_textures[&target].serves_reads());
+    assert!(presenter.resident_guest_textures[&target].gpu_written());
+    assert!(std::ptr::eq(
+        source_texture.as_ref(),
+        view.parent_texture().expect("view parent")
+    ));
+}
+
+#[test]
+fn guest_memory_stale_state_takes_the_counted_snapshot_fallback() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let target = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let old_texture = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("resident target")
+        .texture;
+    let span = ResourceSpan::for_texture(target).expect("target span");
+    let published = RangeSet::for_span(&span);
+    presenter.note_guest_memory_authoritative(&span, &published, None, "test-cpu-authority");
+    assert_eq!(
+        presenter.resident_guest_textures[&target].state,
+        ResidencyState::Stale(StaleSource::GuestMemory)
+    );
+
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let cpu_before = OWNED_REMATERIALISE_CPU.load(AtomicOrdering::Relaxed);
+    let rebuilt = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("guest-memory fallback rebuilds")
+        .texture;
+    assert_eq!(
+        OWNED_REMATERIALISE_CPU.load(AtomicOrdering::Relaxed),
+        cpu_before + 1
+    );
+    assert!(TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed) > snapshots_before);
+    assert!(!std::ptr::eq(old_texture.as_ref(), rebuilt.as_ref()));
+    assert!(presenter.open_guest_batch.is_none());
+    assert!(presenter.resident_guest_textures[&target].serves_reads());
+}
+
+#[test]
+fn gpu_current_stale_state_never_fabricates_a_guest_memory_fallback() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let source = GuestTextureDescriptor {
+        address,
+        width: 32,
+        height: 32,
+        pitch: 32,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let incompatible = GuestTextureDescriptor {
+        address: address + 1024,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        ..source
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, source)
+        .expect("source resident");
+    presenter
+        .ensure_resident_texture(&device, incompatible)
+        .expect("incompatible tenant");
+    presenter.mark_resident_texture_written(source);
+
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let failures_before = OWNED_REMATERIALISE_FAILED.load(AtomicOrdering::Relaxed);
+    let error = presenter
+        .ensure_resident_texture(&device, incompatible)
+        .expect_err("GPU-only bytes cannot fall back to stale RAM");
+    assert!(error.contains("cannot be viewed or blitted"), "{error}");
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before
+    );
+    assert_eq!(
+        OWNED_REMATERIALISE_FAILED.load(AtomicOrdering::Relaxed),
+        failures_before + 1
+    );
+    assert!(matches!(
+        presenter.resident_guest_textures[&incompatible].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+    ));
+    assert!(presenter.open_guest_batch.is_none());
+}
+
+#[test]
+fn mode27_rematerialisation_requires_even_block_row_parity() {
+    let source = GuestTextureDescriptor {
+        address: 0x10_0000,
+        width: 128,
+        height: 512,
+        pitch: 128,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let even = GuestTextureDescriptor {
+        address: source.address + 2 * 65_536,
+        width: 128,
+        height: 128,
+        ..source
+    };
+    let odd = GuestTextureDescriptor {
+        address: source.address + 65_536,
+        ..even
+    };
+    assert_eq!(
+        rematerialisation_blit_source_origin_y(
+            source,
+            even,
+            ResourceSpan::new(source.address, 4 * 65_536),
+            ResourceSpan::new(even.address, 65_536),
+        ),
+        Some(256)
+    );
+    assert_eq!(
+        rematerialisation_blit_source_origin_y(
+            source,
+            odd,
+            ResourceSpan::new(source.address, 4 * 65_536),
+            ResourceSpan::new(odd.address, 65_536),
+        ),
+        None
+    );
 }
 
 #[test]

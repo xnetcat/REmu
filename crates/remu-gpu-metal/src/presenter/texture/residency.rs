@@ -7,19 +7,22 @@ use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
     MultisampleTextureKey, OWNED_SUBTRACT_TENANTS_SURVIVED, RESIDENT_WRITE_ATTRIBUTION_MISSES,
-    RangeSet, ResidencyState, ResidentGuestTexture, ResidentTextureActivityStamp,
+    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED,
+    OWNED_REMATERIALISE_VIEW, RangeSet, ResidencyState, ResidentGuestTexture,
+    ResidentTextureActivityStamp,
     ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture, SpanQueryOrder, StaleSource,
     WriteWatchRefresh, WrittenRegion,
     create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
     decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
     guest_texture_byte_count, guest_texture_descriptors_share_gpu_sample_storage,
-    guest_texture_descriptors_share_storage, initial_depth_clear_for_target,
-    mode27_mip_chain_layout, promote_resident_mip_hierarchy, record_mode27_work_detail,
-    refresh_resident_texture_write_watch, resident_texture_eviction_plan,
-    resident_texture_for_sample,
+    guest_texture_descriptors_share_color_view_storage, guest_texture_descriptors_share_storage,
+    initial_depth_clear_for_target, mode27_mip_chain_layout, new_color_alias_texture_view,
+    promote_resident_mip_hierarchy, record_mode27_work_detail,
+    refresh_resident_texture_write_watch, resident_texture_eviction_plan, resident_texture_for_sample,
     retire_overlapping_sampled_textures, retire_sampled_textures_overlapping_writeback,
     snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
-    snapshot_watched_sampled_texture_raw, spans_overlap, texture_element_layout,
+    snapshot_watched_sampled_texture_raw, spans_overlap, texture_element_layout, tiled_block_bytes,
+    tiled_block_dimensions,
     trace_resident_texture_demotion, trace_resident_texture_removal, trace_residency_churn,
     watch_guest_texture, watch_resident_texture, watch_sampled_texture, written_byte_ranges,
 };
@@ -52,6 +55,66 @@ fn range_algebra_enabled() -> bool {
 pub(crate) struct SelectedResidentTexture {
     pub(crate) texture: Texture,
     pub(crate) descriptor: GuestTextureDescriptor,
+}
+
+enum StaleReadRematerialisation {
+    View(Texture),
+    Blit {
+        source: Texture,
+        destination: Texture,
+        source_origin_y: u64,
+    },
+}
+
+/// Source-row offset for the byte-exact rematerialisation blit rung.
+///
+/// A linear surface may move by whole pitch rows. Mode 27 may move by whole block rows only when
+/// the shift preserves the block-row parity that selects the within-block swizzle table. Other
+/// tilings stay on the explicit fallback until their address transform has an equivalent proof.
+pub(crate) fn rematerialisation_blit_source_origin_y(
+    source: GuestTextureDescriptor,
+    target: GuestTextureDescriptor,
+    source_span: ResourceSpan,
+    target_span: ResourceSpan,
+) -> Option<u64> {
+    if source.tile_mode != target.tile_mode
+        || source.bytes_per_pixel != target.bytes_per_pixel
+        || source.pitch != target.pitch
+        || source.pixel_format != target.pixel_format
+        || !source_span.shares_offset_space(&target_span)
+    {
+        return None;
+    }
+    let delta_bytes = target_span
+        .range_start()
+        .checked_sub(source_span.range_start())?;
+    match source.tile_mode {
+        0 => {
+            let row_bytes = u64::from(source.pitch)
+                .checked_mul(u64::from(source.bytes_per_pixel))?;
+            (row_bytes != 0 && delta_bytes % row_bytes == 0)
+                .then_some(delta_bytes / row_bytes)
+        }
+        27 => {
+            let block_bytes = tiled_block_bytes(27)?;
+            let bytes_per_pixel = usize::try_from(source.bytes_per_pixel).ok()?;
+            let (block_width, block_height) =
+                tiled_block_dimensions(block_bytes, bytes_per_pixel)?;
+            let pitch = usize::try_from(source.pitch).ok()?;
+            let blocks_per_row = pitch.div_ceil(block_width);
+            let block_row_bytes = blocks_per_row.checked_mul(block_bytes)?;
+            let block_row_bytes = u64::try_from(block_row_bytes).ok()?;
+            if block_row_bytes == 0 || delta_bytes % block_row_bytes != 0 {
+                return None;
+            }
+            let block_rows = delta_bytes / block_row_bytes;
+            if block_rows % 2 != 0 {
+                return None;
+            }
+            block_rows.checked_mul(u64::try_from(block_height).ok()?)
+        }
+        _ => None,
+    }
 }
 
 /// Read-only attribution for persistent Metal render/storage targets.
@@ -157,6 +220,375 @@ pub(crate) fn resident_texture_ownership_stats(
 }
 
 impl MetalPresenter {
+    /// Restores a demoted read target from the allocation that currently owns its bytes.
+    ///
+    /// View reuse is immediate. A copy is appended to the existing guest command buffer after
+    /// closing its active encoders, which orders it after the producer and before the consumer
+    /// without committing, flushing, or waiting. Returning `false` is permitted only when guest
+    /// RAM is provably authoritative; GPU-current failures stay stale and are reported loudly.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn rematerialise_stale_resident_for_read(
+        &mut self,
+        target_descriptor: GuestTextureDescriptor,
+    ) -> Result<bool, String> {
+        let failure = |reason: String| {
+            OWNED_REMATERIALISE_FAILED.fetch_add(1, Ordering::Relaxed);
+            Err(reason)
+        };
+
+        let Some(target_state) = self
+            .resident_guest_textures
+            .get(&target_descriptor)
+            .map(|resident| resident.state)
+        else {
+            return Ok(false);
+        };
+        let ResidencyState::Stale(stale_source) = target_state else {
+            return Ok(false);
+        };
+
+        let target_refresh = refresh_resident_texture_write_watch(
+            self.resident_guest_textures
+                .get_mut(&target_descriptor)
+                .expect("stale target still exists"),
+        )?;
+        if target_refresh == WriteWatchRefresh::Replaced {
+            // The descriptor now names a different mapping. The ordinary ensure path creates a
+            // fresh resident from that mapping; the old allocation relation is no longer valid.
+            OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        if target_refresh == WriteWatchRefresh::Reprotecting {
+            return failure(format!(
+                "cannot rematerialise stale texture {:#x} while its mapping is being reprotected",
+                target_descriptor.address
+            ));
+        }
+
+        let target_cpu_may_have_changed = self
+            .resident_guest_textures
+            .get(&target_descriptor)
+            .is_some_and(|resident| {
+                matches!(target_refresh, WriteWatchRefresh::Renewed { was_dirty: true })
+                    || resident.write_watch.content_validation_pending()
+                    || resident.write_watch.is_dirty()
+            });
+        let target_cpu_changed = target_cpu_may_have_changed
+            && self
+                .resident_guest_textures
+                .get(&target_descriptor)
+                .expect("stale target still exists")
+                .write_watch
+                .content_has_changed()?;
+
+        let StaleSource::Allocation {
+            descriptor: source_descriptor,
+            content_version: expected_source_version,
+        } = stale_source
+        else {
+            OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        };
+        if source_descriptor == target_descriptor {
+            return failure(format!(
+                "stale texture {:#x} names itself as its allocation source",
+                target_descriptor.address
+            ));
+        }
+
+        let source_refresh = match self.resident_guest_textures.get_mut(&source_descriptor) {
+            Some(source) => refresh_resident_texture_write_watch(source)?,
+            None => {
+                return failure(format!(
+                    "stale texture {:#x} lost allocation source {:#x} version {}",
+                    target_descriptor.address,
+                    source_descriptor.address,
+                    expected_source_version
+                ));
+            }
+        };
+        if source_refresh == WriteWatchRefresh::Replaced {
+            return failure(format!(
+                "stale texture {:#x} allocation source {:#x} was remapped",
+                target_descriptor.address, source_descriptor.address
+            ));
+        }
+        if source_refresh == WriteWatchRefresh::Reprotecting {
+            return failure(format!(
+                "stale texture {:#x} allocation source {:#x} is being reprotected",
+                target_descriptor.address, source_descriptor.address
+            ));
+        }
+
+        let Some((target_span, target_texture_type, target_layers, target_mips)) = self
+            .resident_guest_textures
+            .get(&target_descriptor)
+            .and_then(|target| {
+                Some((
+                    target.span?,
+                    target.texture_type,
+                    target.layer_count,
+                    target.mip_level_count,
+                ))
+            })
+        else {
+            return failure(format!(
+                "stale texture {:#x} has no resolved allocation span",
+                target_descriptor.address
+            ));
+        };
+        let moved = RangeSet::for_span(&target_span);
+
+        let Some(source) = self.resident_guest_textures.get(&source_descriptor) else {
+            unreachable!("source was refreshed above")
+        };
+        let Some(source_span) = source.span else {
+            return failure(format!(
+                "allocation source {:#x} has no resolved span for stale texture {:#x}",
+                source_descriptor.address, target_descriptor.address
+            ));
+        };
+        if !source.is_live()
+            || source.content_version != expected_source_version
+            || !source_span.shares_offset_space(&target_span)
+            || !source.owned.contains_all(&moved)
+        {
+            return failure(format!(
+                "allocation source {:#x} no longer owns stale texture {:#x} at version {}",
+                source_descriptor.address,
+                target_descriptor.address,
+                expected_source_version
+            ));
+        }
+        let debt = source.gpu_authored.intersect(&moved);
+        if target_cpu_changed {
+            if debt.is_empty() {
+                self.note_guest_memory_authoritative(
+                    &target_span,
+                    &moved,
+                    None,
+                    "rematerialise-clean-cpu-write",
+                );
+                self.resident_guest_textures
+                    .get_mut(&target_descriptor)
+                    .expect("stale target still exists")
+                    .state = ResidencyState::Stale(StaleSource::GuestMemory);
+                OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+            return failure(format!(
+                "stale texture {:#x} has both CPU-modified bytes and GPU-only allocation debt",
+                target_descriptor.address
+            ));
+        }
+
+        let same_host_shape = source.texture_type == target_texture_type
+            && source.layer_count == target_layers
+            && source.mip_level_count == target_mips;
+        let view = if same_host_shape
+            && guest_texture_descriptors_share_storage(source_descriptor, target_descriptor)
+        {
+            Some(source.texture.clone())
+        } else if same_host_shape
+            && guest_texture_descriptors_share_color_view_storage(
+                source_descriptor,
+                target_descriptor,
+            )
+        {
+            new_color_alias_texture_view(
+                &source.texture,
+                target_descriptor.pixel_format,
+                0,
+                target_mips,
+            )
+        } else {
+            None
+        };
+
+        let rematerialisation = if let Some(view) = view {
+            StaleReadRematerialisation::View(view)
+        } else {
+            let source_origin_y = (target_texture_type == 9
+                && target_layers == 1
+                && target_mips == 1
+                && source.texture_type == 9
+                && source.layer_count == 1
+                && source.mip_level_count == 1)
+                .then(|| {
+                    rematerialisation_blit_source_origin_y(
+                        source_descriptor,
+                        target_descriptor,
+                        source_span,
+                        target_span,
+                    )
+                })
+                .flatten();
+            let source_origin_y = source_origin_y.filter(|source_origin_y| {
+                source.texture.width() >= u64::from(target_descriptor.width)
+                    && source
+                        .texture
+                        .height()
+                        .checked_sub(*source_origin_y)
+                        .is_some_and(|height| height >= u64::from(target_descriptor.height))
+            });
+            if let Some(source_origin_y) = source_origin_y {
+                let destination = self
+                    .resident_guest_textures
+                    .get(&target_descriptor)
+                    .expect("stale target still exists")
+                    .texture
+                    .clone();
+                if destination.width() < u64::from(target_descriptor.width)
+                    || destination.height() < u64::from(target_descriptor.height)
+                    || destination.pixel_format() != target_descriptor.pixel_format
+                    || source.texture.pixel_format() != target_descriptor.pixel_format
+                {
+                    if debt.is_empty() {
+                        self.note_guest_memory_authoritative(
+                            &target_span,
+                            &moved,
+                            None,
+                            "rematerialise-clean-guest-fallback",
+                        );
+                        self.resident_guest_textures
+                            .get_mut(&target_descriptor)
+                            .expect("stale target still exists")
+                            .state = ResidencyState::Stale(StaleSource::GuestMemory);
+                        OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
+                        return Ok(false);
+                    }
+                    return failure(format!(
+                        "stale texture {:#x} has no byte-exact Metal destination",
+                        target_descriptor.address
+                    ));
+                }
+                StaleReadRematerialisation::Blit {
+                    source: source.texture.clone(),
+                    destination,
+                    source_origin_y,
+                }
+            } else {
+                // RAM is an honest fallback only when none of the requested bytes exist solely
+                // in Metal. Publishing here would be emulator bookkeeping, not guest behaviour.
+                if debt.is_empty() {
+                    self.note_guest_memory_authoritative(
+                        &target_span,
+                        &moved,
+                        None,
+                        "rematerialise-clean-guest-fallback",
+                    );
+                    self.resident_guest_textures
+                        .get_mut(&target_descriptor)
+                        .expect("stale target still exists")
+                        .state = ResidencyState::Stale(StaleSource::GuestMemory);
+                    OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
+                    return Ok(false);
+                }
+                return failure(format!(
+                    "GPU-current stale texture {:#x} cannot be viewed or blitted from {:#x} (mode={} pitch={} format={:?})",
+                    target_descriptor.address,
+                    source_descriptor.address,
+                    target_descriptor.tile_mode,
+                    target_descriptor.pitch,
+                    target_descriptor.pixel_format
+                ));
+            }
+        };
+
+        if let StaleReadRematerialisation::Blit {
+            source,
+            destination,
+            source_origin_y,
+        } = &rematerialisation
+        {
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable")?
+                .clone();
+            self.ensure_open_guest_batch(&queue);
+            let command_buffer = {
+                let batch = self
+                    .open_guest_batch
+                    .as_mut()
+                    .expect("guest batch was opened for texture rematerialisation");
+                batch.close_active_pass_encoders();
+                batch.command_buffer.clone()
+            };
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.set_label("REMu rematerialise stale guest texture");
+            blit.copy_from_texture(
+                source,
+                0,
+                0,
+                MTLOrigin {
+                    x: 0,
+                    y: *source_origin_y,
+                    z: 0,
+                },
+                MTLSize::new(
+                    u64::from(target_descriptor.width),
+                    u64::from(target_descriptor.height),
+                    1,
+                ),
+                destination,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+            blit.end_encoding();
+        }
+
+        // The transfer becomes visible to the residency algebra only after view creation or blit
+        // encoding succeeds. Publication debt follows the same exact byte range.
+        let source_version = self
+            .resident_guest_textures
+            .get(&source_descriptor)
+            .expect("validated source still exists")
+            .content_version;
+        let mut target = self
+            .resident_guest_textures
+            .remove(&target_descriptor)
+            .expect("validated stale target still exists");
+        {
+            let source = self
+                .resident_guest_textures
+                .get_mut(&source_descriptor)
+                .expect("validated source still exists");
+            source.subtract_authority(
+                &moved,
+                StaleSource::Allocation {
+                    descriptor: target_descriptor,
+                    content_version: source_version,
+                },
+            );
+            if !source.is_live() {
+                trace_resident_texture_demotion("rematerialised-into-alias", source);
+            }
+        }
+        target.texture = match rematerialisation {
+            StaleReadRematerialisation::View(view) => {
+                OWNED_REMATERIALISE_VIEW.fetch_add(1, Ordering::Relaxed);
+                view
+            }
+            StaleReadRematerialisation::Blit { destination, .. } => {
+                OWNED_REMATERIALISE_BLIT.fetch_add(1, Ordering::Relaxed);
+                destination
+            }
+        };
+        target.component_reorder_view = None;
+        target.owned = moved;
+        target.gpu_authored = debt;
+        target.state = ResidencyState::Live;
+        target.content_version = source_version;
+        if target.gpu_written() {
+            target.note_gpu_write();
+        }
+        self.resident_guest_textures
+            .insert(target_descriptor, target);
+        Ok(true)
+    }
+
     pub(crate) fn garbage_collect_resident_textures_to_budget(
         &mut self,
         byte_capacity: u64,
@@ -254,6 +686,7 @@ impl MetalPresenter {
         device: &Device,
         descriptor: DecodedImageDescriptor,
     ) -> Result<Texture, String> {
+        self.rematerialise_stale_resident_for_read(descriptor.guest)?;
         let underlying_mip_count = descriptor
             .base_mip_level
             .checked_add(descriptor.mip_level_count)
@@ -370,6 +803,17 @@ impl MetalPresenter {
         span: Option<ResourceSpan>,
         upload_guest_contents: bool,
     ) -> Result<SelectedResidentTexture, String> {
+        if upload_guest_contents && self.rematerialise_stale_resident_for_read(descriptor)? {
+            return Ok(SelectedResidentTexture {
+                texture: self
+                    .resident_guest_textures
+                    .get(&descriptor)
+                    .expect("rematerialised resident exists")
+                    .texture
+                    .clone(),
+                descriptor,
+            });
+        }
         if let Some(resident) =
             self.resident_guest_textures
                 .get_mut(&descriptor)
@@ -579,6 +1023,19 @@ impl MetalPresenter {
                 target.sample_count
             ));
         }
+        if !discard_guest_contents
+            && self.rematerialise_stale_resident_for_read(target.texture)?
+        {
+            return Ok(SelectedResidentTexture {
+                texture: self
+                    .resident_guest_textures
+                    .get(&target.texture)
+                    .expect("rematerialised mip target exists")
+                    .texture
+                    .clone(),
+                descriptor: target.texture,
+            });
+        }
         if let Some(resident) = self
             .resident_guest_textures
             .get_mut(&target.texture)
@@ -743,6 +1200,19 @@ impl MetalPresenter {
                 target.mip_level,
                 target.mip_level_count - 1
             ));
+        }
+        if !discard_guest_contents
+            && self.rematerialise_stale_resident_for_read(target.texture)?
+        {
+            return Ok(SelectedResidentTexture {
+                texture: self
+                    .resident_guest_textures
+                    .get(&target.texture)
+                    .expect("rematerialised layered target exists")
+                    .texture
+                    .clone(),
+                descriptor: target.texture,
+            });
         }
         if let Some(resident) = self
             .resident_guest_textures
@@ -950,6 +1420,17 @@ impl MetalPresenter {
             ));
         }
         const DEPTH_ARRAY_TEXTURE_TYPE: u32 = 13;
+        if self.rematerialise_stale_resident_for_read(depth.texture)? {
+            return Ok(SelectedResidentTexture {
+                texture: self
+                    .resident_guest_textures
+                    .get(&depth.texture)
+                    .expect("rematerialised depth array exists")
+                    .texture
+                    .clone(),
+                descriptor: depth.texture,
+            });
+        }
         if let Some(resident) =
             self.resident_guest_textures
                 .get_mut(&depth.texture)

@@ -109,6 +109,18 @@ pub(super) static OWNED_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
 /// Demoted residents re-taken by a bind that overwrites every texel, at no copy cost.
 pub(super) static OWNED_RECLAIM_DISCARD: AtomicU64 = AtomicU64::new(0);
 
+/// Demoted allocations restored by reusing a compatible Metal texture view.
+pub(super) static OWNED_REMATERIALISE_VIEW: AtomicU64 = AtomicU64::new(0);
+
+/// Demoted allocations restored by an ordered texture-to-texture copy.
+pub(super) static OWNED_REMATERIALISE_BLIT: AtomicU64 = AtomicU64::new(0);
+
+/// Demoted allocations rebuilt from guest memory after proving RAM is authoritative.
+pub(super) static OWNED_REMATERIALISE_CPU: AtomicU64 = AtomicU64::new(0);
+
+/// GPU-current stale reads for which no lossless rematerialisation rung was available.
+pub(super) static OWNED_REMATERIALISE_FAILED: AtomicU64 = AtomicU64::new(0);
+
 /// Resident writebacks that reached guest memory, indexed by `WritebackTrigger`.
 pub(super) static RESIDENT_WRITEBACK_PUBLISHED: [AtomicU64; WRITEBACK_TRIGGER_COUNT] =
     [const { AtomicU64::new(0) }; WRITEBACK_TRIGGER_COUNT];

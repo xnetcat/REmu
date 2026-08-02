@@ -14,7 +14,8 @@ use super::{
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
     NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    ResidentTextureActivityStamp, SpanQueryOrder, append_unique_global_writebacks,
+    ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
+    append_unique_global_writebacks,
     append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, color_operation_is_raster_noop, compute_pipeline_key,
@@ -565,6 +566,33 @@ impl MetalPresenter {
             } else {
                 (None, None, false)
             };
+
+        // A sampled SRD can name a demoted render-graph tenant even when it is not a storage
+        // opcode. Restore that exact tenant on the GPU before cache selection gets a chance to
+        // decode stale RAM. Malformed SRDs retain the ordinary fallback-image path below.
+        for evaluation in [export_evaluation, pixel_evaluation] {
+            for binding in evaluation
+                .image_bindings
+                .iter()
+                .filter(|binding| {
+                    !image_resource_descriptor_is_null(&binding.resource_descriptor)
+                })
+            {
+                if let Ok(descriptor) = decode_image_descriptor(&binding.resource_descriptor)
+                    && self
+                        .resident_guest_textures
+                        .get(&descriptor.guest)
+                        .is_some_and(|resident| {
+                            matches!(
+                                resident.state,
+                                ResidencyState::Stale(StaleSource::Allocation { .. })
+                            )
+                        })
+                {
+                    self.rematerialise_stale_resident_for_read(descriptor.guest)?;
+                }
+            }
+        }
 
         for evaluation in [export_evaluation, pixel_evaluation] {
             for binding in evaluation
