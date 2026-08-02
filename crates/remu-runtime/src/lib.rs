@@ -1241,27 +1241,37 @@ thread_local! {
     static DISPATCH_WRITE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Write access to [`PROBE_DISPATCH`], recorded for the guard's lifetime in test builds.
-pub(crate) struct DispatchWriteGuard<'a>(std::sync::RwLockWriteGuard<'a, ProbeDispatchState>);
+/// Write access to [`PROBE_DISPATCH`], timed for the guard's complete lifetime.
+pub(crate) struct DispatchWriteGuard<'a> {
+    guard: Option<std::sync::RwLockWriteGuard<'a, ProbeDispatchState>>,
+    acquire_wait: Duration,
+    acquired_at: Instant,
+}
 
 impl std::ops::Deref for DispatchWriteGuard<'_> {
     type Target = ProbeDispatchState;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.guard.as_deref().expect("dispatch write guard is live")
     }
 }
 
 impl std::ops::DerefMut for DispatchWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        self.guard
+            .as_deref_mut()
+            .expect("dispatch write guard is live")
     }
 }
 
-#[cfg(test)]
 impl Drop for DispatchWriteGuard<'_> {
     fn drop(&mut self) {
+        let held = self.acquired_at.elapsed();
+        drop(self.guard.take());
+        #[cfg(test)]
         DISPATCH_WRITE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        remu_gpu::record_dispatch_lock_acquire_wait(self.acquire_wait);
+        remu_gpu::record_dispatch_lock_hold(held);
     }
 }
 
@@ -1269,12 +1279,18 @@ impl Drop for DispatchWriteGuard<'_> {
 pub(crate) fn lock_probe_dispatch_for_write(
     lock: &RwLock<ProbeDispatchState>,
 ) -> DispatchWriteGuard<'_> {
+    let started = Instant::now();
     let guard = lock
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let acquire_wait = started.elapsed();
     #[cfg(test)]
     DISPATCH_WRITE_DEPTH.with(|depth| depth.set(depth.get() + 1));
-    DispatchWriteGuard(guard)
+    DispatchWriteGuard {
+        guard: Some(guard),
+        acquire_wait,
+        acquired_at: Instant::now(),
+    }
 }
 
 /// Rejects a guest-synchronization park attempted under the process-wide dispatch write lock.
@@ -1315,8 +1331,6 @@ static NEXT_NET_POOL_HANDLE: AtomicUsize = AtomicUsize::new(1);
 static NEXT_SSL_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static NEXT_HTTP_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static NEXT_NP_WEB_API2_CONTEXT: AtomicUsize = AtomicUsize::new(1);
-static DISPATCH_LOCK_STALL_LOGS: AtomicUsize = AtomicUsize::new(0);
-static DISPATCH_LOCK_HOLD_LOGS: AtomicUsize = AtomicUsize::new(0);
 static GUEST_EXCEPTION_DELIVERY: OnceLock<Mutex<GuestExceptionDeliveryState>> = OnceLock::new();
 
 static GUEST_EXCEPTION_PENDING: AtomicBool = AtomicBool::new(false);
@@ -2655,13 +2669,6 @@ fn trace_import_errors() -> bool {
     })
 }
 
-fn trace_dispatch_stalls() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_TRACE_DISPATCH_STALLS").is_some_and(|value| value == "1")
-    })
-}
-
 /// Everything the end-of-run report needs about one failing import: how often it failed and
 /// which error codes it produced. Distinct results are capped so a pathological import cannot
 /// grow the map without bound; overflow counts collapse into the reserved key `0`, which no
@@ -3002,6 +3009,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         terminate_probe(86);
     }
     if matches!(nid, "uMei1W9uyNo" | "6Z83sYWFlA8") {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Leaf);
         let status = low_i32(call_args[0]);
         let run_callbacks = nid == "uMei1W9uyNo";
         if run_callbacks {
@@ -3014,6 +3022,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         terminate_probe(status);
     }
     if nid == "T72hz6ffq08" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Leaf);
         static RENDER_THREAD_YIELD_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
         const BLOCKING_RENDER_QUERY_YIELD_RETURN: u64 = 0x8011_42b17;
         // Naming the guest thread allocates, and this is the hottest spin-wait import in an
@@ -3065,6 +3074,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         return ProbeImportReturn::integer(0);
     }
     if matches!(nid, "4J2sUJmuHZQ" | "fgxnMeTNUtY" | "BNowx2l588E") {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Leaf);
         // Process timers are called by FMOD's mixer and streaming workers. They must not queue
         // behind graphics submission on the process-wide dispatch lock or audio production can
         // stall for an entire frame even though reading the monotonic clock is independent.
@@ -3077,6 +3087,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         return ProbeImportReturn::integer(result);
     }
     if is_guest_sync_import(nid) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::GuestSync);
         let is_mutex_init = matches!(nid, "cmo1RIYva9o" | "ttHNfU+qDBU");
         let mutex_attributes = if is_mutex_init {
             let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
@@ -3104,9 +3115,11 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         nid,
         "5OqszGpy7Mg" | "zlfEH8FmyUA" | "VOBg+iNwB-4" | "2vDqwBlpF-o"
     ) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Leaf);
         return dispatch_guest_numeric_parser(nid, call_args);
     }
     if nid == "pztV4AF18iI" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Leaf);
         return ProbeImportReturn::integer(guest_sincosf(
             low_f32(float_argument0),
             call_args[0],
@@ -3114,15 +3127,18 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         ));
     }
     if nid == "AEJdIVZTEmo" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Leaf);
         return ProbeImportReturn::integer(guest_qsort(call_args));
     }
     if nid == "DYhhWbJSeRg" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Leaf);
         return ProbeImportReturn::integer(platform_services::video_out_color_settings_set_gamma(
             call_args[0],
             low_f32(float_argument0),
         ));
     }
     if nid == "dhK16CKwhQg" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Leaf);
         return ProbeImportReturn::integer(u64::from(float_argument0.is_finite()));
     }
     if matches!(
@@ -3151,9 +3167,11 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             | "XHl38ZNknbs"
             | "v8iOE+j8a5o"
     ) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Audio);
         return ProbeImportReturn::integer(dispatch_audio_out_import(nid, call_args));
     }
     if let Some(result) = dispatch_pad_import(nid, call_args) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Pad);
         // Controller lifecycle and polling belong to one small service-local lock. In particular,
         // the per-frame read path must not queue behind command-buffer translation, which owns no
         // pad state and can take tens of milliseconds under shader-heavy workloads.
@@ -3164,12 +3182,15 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     // preserving the complete ABI frame for the less common dispatch paths below.
     let stack_args = read_import_stack_arguments(frame);
     if let Some(result) = dispatch_stateless_import(nid, call_args, stack_args) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Stateless);
         return ProbeImportReturn::integer(result);
     }
     if let Some(result) = dispatch_kernel_fd_import(nid, call_args) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::KernelFd);
         return ProbeImportReturn::integer(result);
     }
     if nid == "fzyMKs9kim0" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Equeue);
         // An untimed equeue wait must park without retaining the process-wide dispatch lock.
         // Graphics submission, flip, and completion producers all need that lock briefly to
         // publish their events; holding it here would create the exact producer/consumer
@@ -3179,6 +3200,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         return ProbeImportReturn::integer(result);
     }
     if nid == "wzvqT4UqKX8" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Loader);
         // Module initialization can itself call guest imports. Resolve and mark the object while
         // holding the process lock, then invoke its DT_INIT entries after releasing that lock.
         return ProbeImportReturn::integer(kernel_load_start_module(call_args));
@@ -3187,36 +3209,28 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         prepare_av_player_video_buffers(call_args[0], nid == "JdksQu8pNdQ");
     }
     if nid == "mQ16-QdKv7k" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Ampr);
         return ProbeImportReturn::integer(ampr_command_buffer_read_file_ordered(
             call_args, stack_args,
         ));
     }
     if is_ordered_ampr_submit_import(nid) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Ampr);
         return ProbeImportReturn::integer(ampr_submit_command_buffer_ordered(call_args));
     }
-    let _ampr_order = is_serialized_ampr_import(nid).then(|| {
+    let serialized_ampr = is_serialized_ampr_import(nid);
+    remu_gpu::record_dispatch_import(if serialized_ampr {
+        remu_gpu::DispatchImportFamily::Ampr
+    } else {
+        remu_gpu::DispatchImportFamily::Stateful
+    });
+    let _ampr_order = serialized_ampr.then(|| {
         ampr_command_order(call_args[0])
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-    let trace_lock_stall = trace_dispatch_stalls();
-    let lock_started = trace_lock_stall.then(Instant::now);
     let mut state = lock_probe_dispatch_for_write(state);
-    if let Some(lock_started) = lock_started {
-        let waited = lock_started.elapsed();
-        if waited >= Duration::from_millis(2)
-            && DISPATCH_LOCK_STALL_LOGS.fetch_add(1, Ordering::Relaxed) < 64
-        {
-            eprintln!(
-                "[REMu][IMPORT][LOCK] waited={:.3}ms nid={nid} name={} thread={:?} guest={:#x}",
-                waited.as_secs_f64() * 1_000.0,
-                nid_display_name(nid).unwrap_or("unknown"),
-                std::thread::current().name().unwrap_or("unnamed"),
-                current_guest_thread_handle(),
-            );
-        }
-    }
     // Flip completions are produced asynchronously by Metal. Refresh them at every stateful import
     // boundary instead of only when the guest happens to poll an equeue; VideoOut pending queries
     // and AVPlayer's completed-vblank clock otherwise observe arbitrarily stale state and can hold
@@ -3389,27 +3403,12 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     // emits Play/Pause/Stop synchronously from their initiating game-thread calls. Keeping those in
     // a process-wide deferred queue would let an unrelated renderer or audio worker steal the
     // callback and mutate its thread-local media state, so they are taken back below by delivery.
-    let dispatch_started = trace_lock_stall.then(Instant::now);
     begin_deferred_gpu_publication();
     let result = dispatch_probe_import(nid, call_args, stack_args, &mut state);
     let av_player_calling_thread_callbacks = take_av_player_calling_thread_callbacks(&mut state);
     let av_player_texture_deallocations =
         std::mem::take(&mut state.av_player.pending_texture_deallocations);
     let gpu_publication = take_deferred_gpu_publication();
-    if let Some(dispatch_started) = dispatch_started {
-        let held = dispatch_started.elapsed();
-        if held >= Duration::from_millis(2)
-            && DISPATCH_LOCK_HOLD_LOGS.fetch_add(1, Ordering::Relaxed) < 64
-        {
-            eprintln!(
-                "[REMu][IMPORT][HOLD] held={:.3}ms nid={nid} name={} thread={:?} guest={:#x}",
-                held.as_secs_f64() * 1_000.0,
-                nid_display_name(nid).unwrap_or("unknown"),
-                std::thread::current().name().unwrap_or("unnamed"),
-                current_guest_thread_handle(),
-            );
-        }
-    }
     drop(state);
     let publication_succeeded = {
         let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::GpuPublication);
@@ -5785,6 +5784,55 @@ fn kernel_wait_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u6
     kernel_poll_equeue(arguments, state).map_or_else(std::convert::identity, |_| 0)
 }
 
+fn report_kernel_equeue_wait_stall(equeue: u64, guest_thread: u64, report_after: Duration) {
+    let Some(state) = PROBE_DISPATCH.get() else {
+        return;
+    };
+    let Ok(state) = state.try_read() else {
+        eprintln!(
+            "[REMu][STALL] equeue wait exceeded {}s thread={:?} handle={guest_thread:#x} equeue={equeue:#x} dispatch=busy",
+            report_after.as_secs(),
+            current_guest_thread_name(),
+        );
+        return;
+    };
+    let registration_count = state
+        .kernel_event_registrations
+        .keys()
+        .filter(|(registered_equeue, _, _)| *registered_equeue == equeue)
+        .count();
+    let pending_count = state
+        .pending_events
+        .iter()
+        .filter(|event| event.equeue == equeue)
+        .count();
+    eprintln!(
+        "[REMu][STALL] equeue wait exceeded {}s thread={:?} handle={guest_thread:#x} equeue={equeue:#x} exists={} registrations={registration_count} pending={pending_count}",
+        report_after.as_secs(),
+        current_guest_thread_name(),
+        state.kernel_equeues.contains(&equeue),
+    );
+    for (&(_, filter, ident), &user_data) in state
+        .kernel_event_registrations
+        .iter()
+        .filter(|((registered_equeue, _, _), _)| *registered_equeue == equeue)
+    {
+        eprintln!(
+            "[REMu][STALL] equeue registration equeue={equeue:#x} filter={filter} ident={ident:#x} user_data={user_data:#x}"
+        );
+    }
+    for event in state
+        .pending_events
+        .iter()
+        .filter(|event| event.equeue == equeue)
+    {
+        eprintln!(
+            "[REMu][STALL] equeue pending equeue={equeue:#x} filter={} ident={:#x} flags={:#x} fflags={:#x} data={:#x} user_data={:#x}",
+            event.filter, event.ident, event.flags, event.fflags, event.data, event.user_data,
+        );
+    }
+}
+
 fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
     static WAIT_COUNT: AtomicUsize = AtomicUsize::new(0);
     let wait_sequence = WAIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5797,6 +5845,7 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
     let deadline = timeout_microseconds
         .and_then(|microseconds| Instant::now().checked_add(Duration::from_micros(microseconds)));
     let guest_thread = current_guest_thread_handle();
+    let mut stall_reported = false;
     if wait_sequence <= 64 || wait_sequence.is_power_of_two() {
         let thread_name = current_guest_thread_name();
         eprintln!(
@@ -5868,6 +5917,16 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
                 .1
                 .wait_timeout(wake_state, wait_for)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+        } else if let Some(report_after) = stall_report_interval() {
+            let (wake_state, wait_result) = wake
+                .1
+                .wait_timeout(wake_state, report_after)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(wake_state);
+            if wait_result.timed_out() && !stall_reported {
+                stall_reported = true;
+                report_kernel_equeue_wait_stall(arguments[0], guest_thread, report_after);
+            }
         } else {
             drop(
                 wake.1
@@ -7146,6 +7205,7 @@ fn flush_deferred_gpu_publication_with_admission(
         admitted();
         return true;
     };
+    let publication_started = Instant::now();
     let traced = trace_gpu_publication();
     let summary = traced.then(|| publication.summary());
     let started = traced.then(Instant::now);
@@ -7227,6 +7287,7 @@ fn flush_deferred_gpu_publication_with_admission(
             summary.queue_work_items,
         );
     }
+    remu_gpu::record_gpu_publication_wait(publication_started.elapsed());
     all_sent
 }
 

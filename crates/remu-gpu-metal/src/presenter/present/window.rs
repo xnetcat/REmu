@@ -37,9 +37,10 @@ use metal::{MTLCommandBufferStatus, MTLPixelFormat, MetalLayer};
 use objc::runtime::{NO, Object, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use remu_gpu::{
-    GpuEvent, HostPadState, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
-    PAD_BUTTON_L2, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2,
-    PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
+    DispatchImportFamily as ImportFamily, GpuEvent, HostPadState, PAD_BUTTON_CIRCLE,
+    PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1, PAD_BUTTON_L2, PAD_BUTTON_LEFT,
+    PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE,
+    PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
 };
 use std::ffi::OsStr;
 use std::sync::atomic::Ordering;
@@ -225,6 +226,47 @@ impl MetalPresenter {
         }
         if self.statistics.last_logged.elapsed() >= Duration::from_secs(5) {
             eprintln!("[REMu][PERF] {title}");
+            let dispatch_window_ms = self.statistics.last_logged.elapsed().as_millis();
+            let dispatch = remu_gpu::take_dispatch_telemetry_sample();
+            let calls = |family| dispatch.import_calls_for(family);
+            let average_ns = |histogram: &remu_gpu::DispatchLatencyHistogram| {
+                if histogram.count == 0 {
+                    0
+                } else {
+                    histogram.total_ns / histogram.count
+                }
+            };
+            eprintln!(
+                "[REMu][PERF-DISPATCH] window_ms={dispatch_window_ms} calls={} direct={} leaf={} sync={} audio={} pad={} stateless={} fd={} equeue={} loader={} ampr={} stateful={} | lock-wait count={} total_ns={} mean_ns={} max_ns={} buckets={:?} | lock-hold count={} total_ns={} mean_ns={} max_ns={} buckets={:?} | gpu-publication count={} total_ns={} mean_ns={} max_ns={} buckets={:?} bucket_upper_ns={:?}",
+                dispatch.total_import_calls(),
+                calls(ImportFamily::Direct),
+                calls(ImportFamily::Leaf),
+                calls(ImportFamily::GuestSync),
+                calls(ImportFamily::Audio),
+                calls(ImportFamily::Pad),
+                calls(ImportFamily::Stateless),
+                calls(ImportFamily::KernelFd),
+                calls(ImportFamily::Equeue),
+                calls(ImportFamily::Loader),
+                calls(ImportFamily::Ampr),
+                calls(ImportFamily::Stateful),
+                dispatch.dispatch_lock_acquire_wait.count,
+                dispatch.dispatch_lock_acquire_wait.total_ns,
+                average_ns(&dispatch.dispatch_lock_acquire_wait),
+                dispatch.dispatch_lock_acquire_wait.maximum_ns,
+                dispatch.dispatch_lock_acquire_wait.buckets,
+                dispatch.dispatch_lock_hold.count,
+                dispatch.dispatch_lock_hold.total_ns,
+                average_ns(&dispatch.dispatch_lock_hold),
+                dispatch.dispatch_lock_hold.maximum_ns,
+                dispatch.dispatch_lock_hold.buckets,
+                dispatch.gpu_publication_wait.count,
+                dispatch.gpu_publication_wait.total_ns,
+                average_ns(&dispatch.gpu_publication_wait),
+                dispatch.gpu_publication_wait.maximum_ns,
+                dispatch.gpu_publication_wait.buckets,
+                remu_gpu::DISPATCH_LATENCY_BUCKET_UPPER_NS,
+            );
             eprintln!(
                 "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s color-op={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
                 f64::from(self.statistics.render_pass_ends_for_compute) / seconds,

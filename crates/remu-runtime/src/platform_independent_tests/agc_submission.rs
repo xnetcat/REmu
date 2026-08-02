@@ -19,6 +19,7 @@ fn gpu_publication_waits_until_the_dispatch_state_can_be_released() {
     remu_gpu::clear_event_sink();
     let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_event_sink(sender);
+    let _ = remu_gpu::take_dispatch_telemetry_sample();
 
     crate::begin_deferred_gpu_publication();
     assert!(crate::publish_gpu_event(remu_gpu::GpuEvent::Shutdown));
@@ -29,6 +30,8 @@ fn gpu_publication_waits_until_the_dispatch_state_can_be_released() {
 
     let publication = crate::take_deferred_gpu_publication();
     assert!(crate::flush_deferred_gpu_publication(publication));
+    let telemetry = remu_gpu::take_dispatch_telemetry_sample();
+    assert_eq!(telemetry.gpu_publication_wait.count, 1);
     assert!(matches!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown)));
     remu_gpu::record_gpu_event_consumed();
     remu_gpu::clear_event_sink();

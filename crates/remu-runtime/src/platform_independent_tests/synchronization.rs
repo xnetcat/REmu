@@ -258,6 +258,7 @@ fn a_guest_sync_wait_under_the_dispatch_write_lock_is_a_test_failure() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = remu_gpu::take_dispatch_telemetry_sample();
     let held = crate::lock_probe_dispatch_for_write(probe_dispatch());
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -267,6 +268,10 @@ fn a_guest_sync_wait_under_the_dispatch_write_lock_is_a_test_failure() {
     .is_err();
     std::panic::set_hook(previous_hook);
     drop(held);
+
+    let telemetry = remu_gpu::take_dispatch_telemetry_sample();
+    assert_eq!(telemetry.dispatch_lock_acquire_wait.count, 1);
+    assert_eq!(telemetry.dispatch_lock_hold.count, 1);
 
     assert!(
         rejected,

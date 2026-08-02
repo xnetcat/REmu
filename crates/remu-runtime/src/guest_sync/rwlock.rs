@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{GuestRwlockState, guest_sync};
-use crate::assert_wait_is_off_the_dispatch_lock;
+use crate::{
+    assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle, current_guest_thread_name,
+    stall_report_interval,
+};
 
 pub(crate) fn guest_rwlock_init(address: u64) -> u64 {
     if address == 0 {
@@ -83,6 +86,7 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
             .get_mut(&address)
             .expect("rwlock was initialized")
             .waiting_writers += 1;
+        let mut stall_reported = false;
         loop {
             let acquired = state
                 .rwlocks
@@ -98,13 +102,39 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
                 return 0;
             }
             assert_wait_is_off_the_dispatch_lock("scePthreadRwlockWrlock");
-            state = sync
-                .1
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(report_after) = stall_report_interval() {
+                let (next_state, wait_result) = sync
+                    .1
+                    .wait_timeout(state, report_after)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next_state;
+                if wait_result.timed_out() && !stall_reported {
+                    let lock = state
+                        .rwlocks
+                        .get(&address)
+                        .expect("a waiting writer prevents rwlock destruction");
+                    stall_reported = true;
+                    eprintln!(
+                        "[REMu][STALL] rwlock write wait exceeded {}s thread={:?} handle={:#x} rwlock={address:#x} writer={:?} readers={} reader_threads={} waiting_writers={}",
+                        report_after.as_secs(),
+                        current_guest_thread_name(),
+                        current_guest_thread_handle(),
+                        lock.writer,
+                        lock.reader_total,
+                        lock.readers.len(),
+                        lock.waiting_writers,
+                    );
+                }
+            } else {
+                state = sync
+                    .1
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
         }
     }
 
+    let mut stall_reported = false;
     loop {
         // Gen5 rwlocks are reader-first: only an active writer excludes a reader. Making queued
         // writers exclusive here can deadlock a reader that recursively acquires the same lock.
@@ -125,10 +155,35 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
             return u64::from(libc::EBUSY.cast_unsigned());
         }
         assert_wait_is_off_the_dispatch_lock("scePthreadRwlockRdlock");
-        state = sync
-            .1
-            .wait(state)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(report_after) = stall_report_interval() {
+            let (next_state, wait_result) = sync
+                .1
+                .wait_timeout(state, report_after)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if wait_result.timed_out() && !stall_reported {
+                let lock = state
+                    .rwlocks
+                    .get(&address)
+                    .expect("an active writer prevents rwlock destruction");
+                stall_reported = true;
+                eprintln!(
+                    "[REMu][STALL] rwlock read wait exceeded {}s thread={:?} handle={:#x} rwlock={address:#x} writer={:?} readers={} reader_threads={} waiting_writers={}",
+                    report_after.as_secs(),
+                    current_guest_thread_name(),
+                    current_guest_thread_handle(),
+                    lock.writer,
+                    lock.reader_total,
+                    lock.readers.len(),
+                    lock.waiting_writers,
+                );
+            }
+        } else {
+            state = sync
+                .1
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 

@@ -214,47 +214,61 @@ pub(super) fn native_libc_symbol_name(nid: &str) -> Option<&'static std::ffi::CS
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn record_direct_runtime_import() {
+    remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Direct);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_pthread_self() -> u64 {
+    record_direct_runtime_import();
     current_guest_thread_handle()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_pthread_get_specific(key: u64) -> u64 {
+    record_direct_runtime_import();
     pthread_get_specific(low_u32(key))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_posix_pthread_set_specific(key: u64, value: u64) -> u64 {
+    record_direct_runtime_import();
     posix_pthread_result(pthread_set_specific([key, value, 0, 0, 0, 0]))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_sce_pthread_set_specific(key: u64, value: u64) -> u64 {
+    record_direct_runtime_import();
     pthread_set_specific([key, value, 0, 0, 0, 0])
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_guest_mutex_lock(address: u64) -> u64 {
+    record_direct_runtime_import();
     guest_mutex_lock(address, false)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_guest_mutex_unlock(address: u64) -> u64 {
+    record_direct_runtime_import();
     guest_mutex_unlock(address)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_guest_rwlock_write_lock(address: u64) -> u64 {
+    record_direct_runtime_import();
     guest_rwlock_lock(address, true, false)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_guest_rwlock_unlock(address: u64) -> u64 {
+    record_direct_runtime_import();
     guest_rwlock_unlock(address)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 extern "C" fn direct_process_time_counter() -> u64 {
+    record_direct_runtime_import();
     kernel_process_time(true)
 }
 
