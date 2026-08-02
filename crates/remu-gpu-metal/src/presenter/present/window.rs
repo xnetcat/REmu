@@ -42,7 +42,7 @@ use remu_gpu::{
     PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, set_host_pad_state,
 };
 use std::ffi::OsStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -1023,6 +1023,12 @@ impl MetalPresenter {
         // queued redraw ever ran. Render here, on the same AppKit event-loop thread, before any
         // later callback can drain another GPU event. RedrawRequested remains the retry path when
         // CAMetalLayer has no drawable; `render` leaves `redraw_pending` set in that case.
+        if self.redraw_pending {
+            static REPORTED_SYNCHRONOUS_REDRAW: AtomicBool = AtomicBool::new(false);
+            if !REPORTED_SYNCHRONOUS_REDRAW.swap(true, Ordering::Relaxed) {
+                eprintln!("[REMu][METAL] servicing finalized redraw before further GPU ingress");
+            }
+        }
         self.render();
         flow
     }
