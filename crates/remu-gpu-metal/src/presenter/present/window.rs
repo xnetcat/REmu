@@ -5,7 +5,10 @@ use super::super::completion::{command_buffer_native_state_summary, trace_metal_
 use super::super::{
     OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD,
     OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED,
-    OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN,
+    OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED_CPU_GPU,
+    OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
+    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW,
+    OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN,
     RESIDENT_WRITEBACK_DISCARDED,
     RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
     RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState, WRITEBACK_TRIGGERS,
@@ -512,7 +515,7 @@ impl MetalPresenter {
                 owned_runs += resident.owned.runs().len();
             }
             eprintln!(
-                "[REMu][PERF-TEXTURE-OWNED] live={live} stale={stale} owned={:.1}MiB/{owned_runs} runs debt={:.1}MiB survived={} demoted={} reclaim_discard={} rematerialise={}/{}/{} failed={} coarsened={} unresolved={} fallback={}",
+                "[REMu][PERF-TEXTURE-OWNED] live={live} stale={stale} owned={:.1}MiB/{owned_runs} runs debt={:.1}MiB survived={} demoted={} reclaim_discard={} rematerialise={}/{}/{}/{} failed={}({}/{}/{}/{}) coarsened={} unresolved={} fallback={}",
                 owned_bytes as f64 / (1024.0 * 1024.0),
                 debt_bytes as f64 / (1024.0 * 1024.0),
                 OWNED_SUBTRACT_TENANTS_SURVIVED.swap(0, Ordering::Relaxed),
@@ -520,8 +523,13 @@ impl MetalPresenter {
                 OWNED_RECLAIM_DISCARD.swap(0, Ordering::Relaxed),
                 OWNED_REMATERIALISE_VIEW.swap(0, Ordering::Relaxed),
                 OWNED_REMATERIALISE_BLIT.swap(0, Ordering::Relaxed),
+                OWNED_REMATERIALISE_DETILE.swap(0, Ordering::Relaxed),
                 OWNED_REMATERIALISE_CPU.swap(0, Ordering::Relaxed),
                 OWNED_REMATERIALISE_FAILED.swap(0, Ordering::Relaxed),
+                OWNED_REMATERIALISE_FAILED_MAPPING.swap(0, Ordering::Relaxed),
+                OWNED_REMATERIALISE_FAILED_CPU_GPU.swap(0, Ordering::Relaxed),
+                OWNED_REMATERIALISE_FAILED_LAYOUT.swap(0, Ordering::Relaxed),
+                OWNED_REMATERIALISE_FAILED_METAL.swap(0, Ordering::Relaxed),
                 OWNED_RANGE_SET_COARSENED.swap(0, Ordering::Relaxed),
                 OWNED_UNRESOLVED_SPAN.swap(0, Ordering::Relaxed),
                 OWNED_FALLBACK_FULL_RANGE.swap(0, Ordering::Relaxed),

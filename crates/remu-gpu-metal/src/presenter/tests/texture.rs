@@ -13,18 +13,21 @@ use super::super::texture::{
     ResidentSpanIndex, ResidentTextureMap, SpanQueryOrder, ensure_resident_texture_in_map,
 };
 use super::super::{
-    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED,
-    OWNED_REMATERIALISE_VIEW,
+    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
+    OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_VIEW,
     RESIDENT_WRITE_ATTRIBUTION_MISSES, RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_PUBLISHED,
     ResidencyState, StaleSource, TEXTURE_SNAPSHOT_COUNT, WritebackTrigger,
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
 use super::super::WrittenRegion;
 use super::{
-    DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, ResourceSpan,
+    DecodedImageDescriptor, DecodedRenderTarget, GuestTextureDescriptor, MetalPresenter,
+    ResourceSpan,
     RangeSet, ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
-    apply_image_destination_select, comparison_depth32_upload, create_sampled_guest_texture,
-    decode_guest_texture_linear_from_raw, decode_image_descriptor, depth_array_face_descriptor,
+    apply_image_destination_select, comparison_depth32_upload, copy_linear_to_tiled_at_z,
+    create_sampled_guest_texture,
+    decode_guest_texture_linear_from_raw, decode_image_descriptor,
+    decode_mode27_mip_chain_from_raw, depth_array_face_descriptor,
     depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
     guest_texture_byte_count, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_color_view_storage,
@@ -2877,10 +2880,12 @@ fn gpu_current_stale_state_never_fabricates_a_guest_memory_fallback() {
 
     let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
     let failures_before = OWNED_REMATERIALISE_FAILED.load(AtomicOrdering::Relaxed);
+    let layout_failures_before =
+        OWNED_REMATERIALISE_FAILED_LAYOUT.load(AtomicOrdering::Relaxed);
     let error = presenter
         .ensure_resident_texture(&device, incompatible)
         .expect_err("GPU-only bytes cannot fall back to stale RAM");
-    assert!(error.contains("cannot be viewed or blitted"), "{error}");
+    assert!(error.contains("cannot be rematerialised"), "{error}");
     assert_eq!(
         TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
         snapshots_before
@@ -2888,6 +2893,10 @@ fn gpu_current_stale_state_never_fabricates_a_guest_memory_fallback() {
     assert_eq!(
         OWNED_REMATERIALISE_FAILED.load(AtomicOrdering::Relaxed),
         failures_before + 1
+    );
+    assert_eq!(
+        OWNED_REMATERIALISE_FAILED_LAYOUT.load(AtomicOrdering::Relaxed),
+        layout_failures_before + 1
     );
     assert!(matches!(
         presenter.resident_guest_textures[&incompatible].state,
@@ -2935,6 +2944,501 @@ fn mode27_rematerialisation_requires_even_block_row_parity() {
         ),
         None
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mode27_gpu_retile_preserves_cross_format_alias_bytes_without_a_batch_boundary() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    const SOURCE_BYTES: u64 = 4 * 65_536;
+    let mut memory = GuestAddressSpace::new(4 * SOURCE_BYTES).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(SOURCE_BYTES).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            SOURCE_BYTES,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let source = GuestTextureDescriptor {
+        address,
+        width: 256,
+        height: 256,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let target = GuestTextureDescriptor {
+        address: address + 65_536,
+        width: 256,
+        height: 128,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::R16Uint,
+        bytes_per_pixel: 2,
+    };
+    assert_eq!(guest_texture_byte_count(source), Some(SOURCE_BYTES));
+    assert_eq!(guest_texture_byte_count(target), Some(65_536));
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    presenter
+        .ensure_resident_texture(&device, source)
+        .expect("source resident");
+    let old_target = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("target resident")
+        .texture;
+
+    let mut source_linear = vec![0_u8; 256 * 256 * 4];
+    for (index, byte) in source_linear.iter_mut().enumerate() {
+        *byte = u8::try_from((index * 37 + index / 251) & 0xff).expect("byte pattern");
+    }
+    presenter.resident_guest_textures[&source]
+        .texture
+        .replace_region(
+            MTLRegion::new_2d(0, 0, 256, 256),
+            0,
+            source_linear.as_ptr().cast::<std::ffi::c_void>(),
+            256 * 4,
+        );
+    presenter.mark_resident_texture_written(source);
+    assert!(matches!(
+        presenter.resident_guest_textures[&target].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+    ));
+
+    let detiles_before = OWNED_REMATERIALISE_DETILE.load(AtomicOrdering::Relaxed);
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let rematerialised = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("cross-format mode-27 alias rematerialises")
+        .texture;
+    assert!(
+        std::ptr::eq(old_target.as_ref(), rematerialised.as_ref()),
+        "the detile rung preserves the target allocation"
+    );
+    assert_eq!(
+        OWNED_REMATERIALISE_DETILE.load(AtomicOrdering::Relaxed),
+        detiles_before + 1
+    );
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before,
+        "GPU rematerialisation never snapshots or publishes guest RAM"
+    );
+    let batch = presenter
+        .open_guest_batch
+        .take()
+        .expect("retile/de-tile work remains in the open guest batch");
+    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    batch.command_buffer.commit();
+    batch.command_buffer.wait_until_completed();
+
+    let actual = read_texture_linear(&device, &queue, &rematerialised, target)
+        .expect("rematerialised target readback");
+    let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
+    copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
+        .expect("CPU retile oracle");
+    let expected = decode_guest_texture_linear_from_raw(
+        target,
+        &source_raw[65_536..2 * 65_536],
+    )
+    .expect("CPU detile oracle");
+    assert_eq!(actual, expected, "GPU retile/de-tile must be byte exact");
+    assert!(presenter.resident_guest_textures[&target].serves_reads());
+    assert!(presenter.resident_guest_textures[&target].gpu_written());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mode27_gpu_retile_merges_disjoint_current_owners_in_physical_byte_order() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    const BLOCK_BYTES: u64 = 65_536;
+    const TARGET_BYTES: u64 = 4 * BLOCK_BYTES;
+    let mut memory = GuestAddressSpace::new(4 * TARGET_BYTES).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(TARGET_BYTES).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            TARGET_BYTES,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let target = GuestTextureDescriptor {
+        address,
+        width: 256,
+        height: 256,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let owners = std::array::from_fn::<_, 4, _>(|index| GuestTextureDescriptor {
+        address: address + u64::try_from(index).unwrap() * BLOCK_BYTES,
+        width: 128,
+        height: 128,
+        pitch: 128,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    });
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    presenter
+        .ensure_resident_texture(&device, target)
+        .expect("composite target");
+    for owner in owners {
+        presenter
+            .ensure_resident_texture(&device, owner)
+            .expect("block owner");
+    }
+
+    let mut owner_linear = Vec::new();
+    for (owner_index, owner) in owners.into_iter().enumerate() {
+        let mut linear = vec![0_u8; 128 * 128 * 4];
+        for (byte_index, byte) in linear.iter_mut().enumerate() {
+            *byte = u8::try_from(
+                (owner_index * 53 + byte_index * 29 + byte_index / 127) & 0xff,
+            )
+            .expect("owner byte pattern");
+        }
+        presenter.resident_guest_textures[&owner]
+            .texture
+            .replace_region(
+                MTLRegion::new_2d(0, 0, 128, 128),
+                0,
+                linear.as_ptr().cast::<std::ffi::c_void>(),
+                128 * 4,
+            );
+        presenter.mark_resident_texture_written(owner);
+        owner_linear.push(linear);
+    }
+    assert!(matches!(
+        presenter.resident_guest_textures[&target].state,
+        ResidencyState::Stale(StaleSource::Allocation { .. })
+    ));
+
+    let detiles_before = OWNED_REMATERIALISE_DETILE.load(AtomicOrdering::Relaxed);
+    let rematerialised = presenter
+        .ensure_resident_texture(&device, target)
+        .expect("four-owner target rematerialises")
+        .texture;
+    assert_eq!(
+        OWNED_REMATERIALISE_DETILE.load(AtomicOrdering::Relaxed),
+        detiles_before + 1
+    );
+    let batch = presenter
+        .open_guest_batch
+        .take()
+        .expect("owner merge remains ordered in the open batch");
+    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    batch.command_buffer.commit();
+    batch.command_buffer.wait_until_completed();
+
+    let actual = read_texture_linear(&device, &queue, &rematerialised, target)
+        .expect("merged target readback");
+    let mut expected_raw = vec![0_u8; usize::try_from(TARGET_BYTES).unwrap()];
+    for (index, (owner, linear)) in owners.into_iter().zip(&owner_linear).enumerate() {
+        let start = index * usize::try_from(BLOCK_BYTES).unwrap();
+        copy_linear_to_tiled_at_z(
+            linear,
+            owner,
+            &mut expected_raw[start..start + usize::try_from(BLOCK_BYTES).unwrap()],
+            0,
+        )
+        .expect("CPU owner retile oracle");
+    }
+    let expected = decode_guest_texture_linear_from_raw(target, &expected_raw)
+        .expect("CPU composite detile oracle");
+    assert_eq!(actual, expected, "every current owner must contribute its exact bytes");
+    assert!(presenter.resident_guest_textures[&target].serves_reads());
+    for owner in owners {
+        assert!(matches!(
+            presenter.resident_guest_textures[&owner].state,
+            ResidencyState::Stale(StaleSource::Allocation { descriptor, .. })
+                if descriptor == target
+        ));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mode27_gpu_detile_reconstructs_every_volume_slice_with_surface_xor() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    const SOURCE_BYTES: u64 = 4 * 65_536;
+    let mut memory = GuestAddressSpace::new(4 * SOURCE_BYTES).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(SOURCE_BYTES).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            SOURCE_BYTES,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let source = GuestTextureDescriptor {
+        address,
+        width: 256,
+        height: 256,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let volume = GuestTextureDescriptor {
+        address,
+        width: 32,
+        height: 32,
+        pitch: 32,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA16Uint,
+        bytes_per_pixel: 8,
+    };
+    let volume_target = DecodedRenderTarget {
+        guest_slot: 0,
+        texture: volume,
+        span: ResourceSpan::for_texture(volume),
+        output_kind: remu_shader::PixelOutputKind::Uint,
+        write_mask: 0xf,
+        direct_scanout: false,
+        sample_count: 1,
+        texture_type: 10,
+        layer_count: 4,
+        base_layer: 0,
+        mip_level: 0,
+        mip_level_count: 1,
+        dcc_enabled: false,
+        fast_clear_enabled: false,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    presenter
+        .ensure_resident_texture(&device, source)
+        .expect("source resident");
+    presenter
+        .ensure_layered_render_target_texture(&device, volume_target, false)
+        .expect("volume resident");
+
+    let mut source_linear = vec![0_u8; 256 * 256 * 4];
+    for (index, byte) in source_linear.iter_mut().enumerate() {
+        *byte = u8::try_from((index * 43 + index / 193) & 0xff).expect("byte pattern");
+    }
+    presenter.resident_guest_textures[&source]
+        .texture
+        .replace_region(
+            MTLRegion::new_2d(0, 0, 256, 256),
+            0,
+            source_linear.as_ptr().cast::<std::ffi::c_void>(),
+            256 * 4,
+        );
+    presenter.mark_resident_texture_written(source);
+    assert!(matches!(
+        presenter.resident_guest_textures[&volume].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+    ));
+
+    let rematerialised = presenter
+        .ensure_layered_render_target_texture(&device, volume_target, false)
+        .expect("volume rematerialises")
+        .texture;
+    let batch = presenter
+        .open_guest_batch
+        .take()
+        .expect("volume detile remains in the open batch");
+    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    batch.command_buffer.commit();
+    batch.command_buffer.wait_until_completed();
+
+    let actual = super::super::read_texture_volume_linear(
+        &device,
+        &queue,
+        &rematerialised,
+        volume,
+    )
+    .expect("volume readback");
+    let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
+    copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
+        .expect("CPU source retile oracle");
+    let mut expected = Vec::with_capacity(actual.len());
+    for z in 0..4_usize {
+        expected.extend_from_slice(
+            &super::super::texture::decode_guest_texture_linear_from_raw_at_z(
+                volume,
+                &source_raw[z * 65_536..(z + 1) * 65_536],
+                z,
+            )
+            .expect("CPU volume detile oracle"),
+        );
+    }
+    assert_eq!(actual, expected, "surface-Z XOR must be preserved per slice");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mode27_gpu_detile_reconstructs_nontail_and_mip_tail_levels() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    const SOURCE_BYTES: u64 = 4 * 65_536;
+    let mut memory = GuestAddressSpace::new(4 * SOURCE_BYTES).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(SOURCE_BYTES).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            SOURCE_BYTES,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let source = GuestTextureDescriptor {
+        address,
+        width: 256,
+        height: 256,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let mipped = GuestTextureDescriptor {
+        address,
+        width: 256,
+        height: 128,
+        pitch: 256,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::R16Uint,
+        bytes_per_pixel: 2,
+    };
+    let mipped_image = DecodedImageDescriptor {
+        guest: mipped,
+        span: ResourceSpan::for_texture(mipped),
+        destination_select: 0,
+        base_mip_level: 0,
+        mip_level_count: 6,
+        texture_type: 9,
+        layer_count: 1,
+    };
+    let mip_layout = mode27_mip_chain_layout(mipped, 6).expect("target mip layout");
+    assert!(mip_layout.levels.iter().any(|level| level.in_tail));
+    assert!(mip_layout.levels.iter().any(|level| !level.in_tail));
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    presenter
+        .ensure_resident_texture(&device, source)
+        .expect("source resident");
+    presenter
+        .ensure_mipmapped_storage_texture(&device, mipped_image)
+        .expect("mip-chain resident");
+    if let Some(batch) = presenter.open_guest_batch.take() {
+        batch.command_buffer.commit();
+        batch.command_buffer.wait_until_completed();
+    }
+
+    let mut source_linear = vec![0_u8; 256 * 256 * 4];
+    for (index, byte) in source_linear.iter_mut().enumerate() {
+        *byte = u8::try_from((index * 47 + index / 181) & 0xff).expect("byte pattern");
+    }
+    presenter.resident_guest_textures[&source]
+        .texture
+        .replace_region(
+            MTLRegion::new_2d(0, 0, 256, 256),
+            0,
+            source_linear.as_ptr().cast::<std::ffi::c_void>(),
+            256 * 4,
+        );
+    presenter.mark_resident_texture_written(source);
+    assert!(matches!(
+        presenter.resident_guest_textures[&mipped].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+    ));
+
+    let rematerialised = presenter
+        .ensure_mipmapped_storage_texture(&device, mipped_image)
+        .expect("mip chain rematerialises");
+    let batch = presenter
+        .open_guest_batch
+        .take()
+        .expect("mip detile remains in the open batch");
+    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    batch.command_buffer.commit();
+    batch.command_buffer.wait_until_completed();
+
+    let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
+    copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
+        .expect("CPU source retile oracle");
+    let (_, expected_levels) = decode_mode27_mip_chain_from_raw(
+        mipped,
+        6,
+        &source_raw[..mip_layout.byte_count],
+    )
+    .expect("CPU mip detile oracle");
+    for (level, expected) in expected_levels.iter().enumerate() {
+        let actual = super::super::readback::read_texture_mip_linear(
+            &device,
+            &queue,
+            &rematerialised,
+            mipped,
+            u32::try_from(level).expect("mip index"),
+        )
+        .expect("mip readback");
+        assert_eq!(&actual, expected, "mip {level} differs from CPU oracle");
+    }
 }
 
 #[test]
