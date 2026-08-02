@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use block::ConcreteBlock;
 use metal::{
     CompileOptions, Device, MTLBlendFactor, MTLBlendOperation, MTLClearColor, MTLLoadAction,
     MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLSamplerAddressMode,
@@ -9,6 +10,8 @@ use metal::{
     SamplerDescriptor, TextureDescriptor,
 };
 use remu_gpu::{SYSTEM_UI_HEIGHT, SYSTEM_UI_WIDTH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::{
@@ -237,6 +240,13 @@ impl MetalPresenter {
             encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
         }
         encoder.end_encoding();
+        let drawable_presented = Arc::new(AtomicBool::new(false));
+        let presented_latch = Arc::clone(&drawable_presented);
+        let presented_handler = ConcreteBlock::new(move |_: &metal::DrawableRef| {
+            presented_latch.store(true, Ordering::Release);
+        })
+        .copy();
+        drawable.add_presented_handler(&presented_handler);
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
         if trace_scanout_writes() {
@@ -259,6 +269,8 @@ impl MetalPresenter {
             submitted_at: Instant::now(),
             flip_sequence,
             flip_terminal_source: FlipTerminalSource::Presentation,
+            drawable_presented: Some(drawable_presented),
+            await_presented_reported: false,
         });
         self.redraw_pending = false;
     }

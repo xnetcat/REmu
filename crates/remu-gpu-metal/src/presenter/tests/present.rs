@@ -22,7 +22,7 @@ use super::{
     process_memory_statistics, process_resident_bytes, raw_video_out_layout_is_linear,
     raw_video_out_texture_descriptor, read_texture_linear,
 };
-use super::super::FlipTerminalSource;
+use super::super::{FlipTerminalSource, PendingPresentation};
 
 #[test]
 fn presenter_shows_and_hides_a_host_splash_without_guest_video_out() {
@@ -430,6 +430,61 @@ fn a_flip_without_a_presentable_surface_still_completes() {
         remu_gpu::take_gpu_completed_flips().is_empty(),
         "a flip is retired exactly once"
     );
+}
+
+#[test]
+fn a_completed_presentation_waits_until_the_drawable_is_presented() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    let flip = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0x44,
+        submission_sequence: None,
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+    assert_eq!(presenter.claim_flip_terminal(1), Some(1));
+
+    let command_buffer = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .new_command_buffer()
+        .to_owned();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let drawable_presented = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    presenter
+        .pending_presentations
+        .push_back(PendingPresentation {
+            command_buffer,
+            submitted_at: std::time::Instant::now(),
+            flip_sequence: Some(1),
+            flip_terminal_source: FlipTerminalSource::Presentation,
+            drawable_presented: Some(std::sync::Arc::clone(&drawable_presented)),
+            await_presented_reported: false,
+        });
+
+    presenter.retire_completed_presentations();
+    assert!(
+        remu_gpu::take_gpu_completed_flips().is_empty(),
+        "render completion must not stand in for display presentation"
+    );
+    assert_eq!(presenter.pending_presentations.len(), 1);
+
+    drawable_presented.store(true, std::sync::atomic::Ordering::Release);
+    presenter.retire_completed_presentations();
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips(),
+        [GpuFlipCompletion {
+            address: 0xefc0_0000_00,
+            buffer_index: 0,
+            flip_argument: 0x44,
+        }]
+    );
+    assert!(presenter.pending_presentations.is_empty());
 }
 
 #[test]

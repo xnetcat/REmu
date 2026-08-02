@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -1372,6 +1372,11 @@ struct PendingPresentation {
     submitted_at: Instant,
     flip_sequence: Option<u64>,
     flip_terminal_source: FlipTerminalSource,
+    /// Windowed flips become guest-visible when Core Animation presents the drawable, not when
+    /// Metal merely finishes rendering it. Surface-less retirement tails have no drawable and
+    /// therefore leave this unset.
+    drawable_presented: Option<Arc<AtomicBool>>,
+    await_presented_reported: bool,
 }
 
 /// Whether a flush may decline to commit the open guest batch.

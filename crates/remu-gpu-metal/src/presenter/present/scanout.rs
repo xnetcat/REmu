@@ -106,6 +106,8 @@ impl MetalPresenter {
                             submitted_at: std::time::Instant::now(),
                             flip_sequence: Some(sequence),
                             flip_terminal_source: super::super::FlipTerminalSource::SurfaceLess,
+                            drawable_presented: None,
+                            await_presented_reported: false,
                         });
                     }
                 } else {
@@ -396,11 +398,38 @@ impl MetalPresenter {
         self.retire_completed_guest_batches();
         self.reconcile_pending_flips();
         loop {
-            let Some(presentation) = self.pending_presentations.front() else {
+            let Some(presentation) = self.pending_presentations.front_mut() else {
                 return;
             };
             match presentation.command_buffer.status() {
                 MTLCommandBufferStatus::Completed => {
+                    if presentation.flip_terminal_source
+                        == super::super::FlipTerminalSource::Presentation
+                        && !presentation
+                            .drawable_presented
+                            .as_ref()
+                            .is_some_and(|presented| {
+                                presented.load(std::sync::atomic::Ordering::Acquire)
+                            })
+                    {
+                        if !presentation.await_presented_reported {
+                            if presentation
+                                .flip_sequence
+                                .is_some_and(completion_order_trace_sequence)
+                            {
+                                eprintln!(
+                                    "[REMu][COMPLETION-ORDER] phase=await-presented flip={:?} command_buffer=completed age_ms={:.3}",
+                                    presentation.flip_sequence,
+                                    presentation.submitted_at.elapsed().as_secs_f64() * 1000.0,
+                                );
+                            }
+                            presentation.await_presented_reported = true;
+                        }
+                        // Command-buffer completion only proves the drawable's pixels are ready.
+                        // The guest may recycle the frame only after Core Animation reports the
+                        // drawable actually presented at a display edge.
+                        return;
+                    }
                     let presentation = self
                         .pending_presentations
                         .pop_front()
