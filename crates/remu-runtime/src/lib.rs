@@ -4534,6 +4534,11 @@ fn dispatch_stateless_import(
         "MmpF1XsQiHw" => ajm_batch_initialize(arguments),
         "cK6bYHf-Q5E" | "-hJRce8wn1U" => guest_zeroed_constructor(arguments[0], 8),
         "WSOuge5IsCg" => guest_zeroed_constructor(arguments[0], 0x28),
+        // A libSceAgc driver entry point whose catalog name has never been recovered — SharpEmu
+        // carries the same NID as sceAgcDriverUnknown_KRzWekV120 and acknowledges it, and titles
+        // run there. Unreal's RHIThread calls it over a thousand times per run in Poppy Playtime,
+        // so an error return only feeds a retry loop the console never exercises.
+        "-KRzWekV120" => 0,
         "TRO721eVt4g" => agc_dcb_reset_queue(arguments),
         "ZvwO9euwYzc" => agc_dcb_set_registers_indirect(arguments, AGC_R_CX_REGS_INDIRECT),
         "-HOOCn0JY48" => agc_dcb_set_registers_indirect(arguments, AGC_R_SH_REGS_INDIRECT),
