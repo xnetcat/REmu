@@ -8485,6 +8485,7 @@ fn probe_entry(
         eprintln!("[REMu] warning: SHA-NI SIGILL recovery unavailable: {error}");
     }
     trace_linked_guest_code(image);
+    start_abi_gap_reporter();
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     invoke_guest_module_initializers(&image.module_initializers, 0, 0);
     if timeout_seconds != 0 {
@@ -8558,6 +8559,66 @@ pub fn report_abi_gap_summary() {
     if REPORTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    write_abi_gap_summary();
+}
+
+/// Repeats the summary while the run is alive, so a process killed by a forwarded fault still
+/// leaves a near-final one in its log.
+///
+/// A crash never reaches [`terminate_probe`]: the write-watch handler declines the fault, the
+/// instruction refaults under the default disposition, and the process dies in signal context
+/// where this summary — which allocates and takes locks — must not run. Since the counts are
+/// cumulative, a snapshot from a few seconds earlier answers the same questions, and crashing
+/// runs are exactly the ones whose gaps matter most.
+fn start_abi_gap_reporter() {
+    /// Long enough to stay out of the way of a run's own output, short enough that the last
+    /// snapshot before a crash is still representative.
+    const REPORT_INTERVAL: Duration = Duration::from_secs(15);
+
+    std::thread::Builder::new()
+        .name("remu-abi-report".to_owned())
+        .spawn(|| {
+            let mut previous = 0_u64;
+            loop {
+                std::thread::sleep(REPORT_INTERVAL);
+                // Reprinting an unchanged summary would bury the run's other output, and the
+                // fingerprint is exactly what a reader would compare the snapshots by anyway.
+                let fingerprint = abi_gap_fingerprint();
+                if fingerprint != previous {
+                    previous = fingerprint;
+                    write_abi_gap_summary();
+                }
+            }
+        })
+        .ok();
+}
+
+/// Sums the reportable gap counts, so an unchanged run reprints nothing.
+fn abi_gap_fingerprint() -> u64 {
+    let declines: u64 = DECLINED_SHADER_REGISTRATIONS
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .sum();
+    let unimplemented = UNIMPLEMENTED_IMPORTS.get().map_or(0, |imports| {
+        imports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len() as u64
+    });
+    let failures = IMPORT_FAILURE_COUNTS.get().map_or(0, |failures| {
+        failures.try_lock().map_or(0, |failures| {
+            failures.values().map(|record| record.total).sum()
+        })
+    });
+    declines
+        .wrapping_add(unimplemented)
+        .wrapping_add(failures)
+        .wrapping_add(sha_ni::recovered_sse4a_count())
+        .wrapping_add(sha_ni::recovered_sha_ni_count())
+}
+
+fn write_abi_gap_summary() {
+    eprintln!("[REMu][REPORT] --- ABI gap summary ---");
     for (reason, count) in DECLINED_SHADER_REASONS
         .iter()
         .zip(&DECLINED_SHADER_REGISTRATIONS)

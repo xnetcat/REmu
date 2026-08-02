@@ -325,9 +325,12 @@ unimplemented_count=$(grep -c '\[REMu\]\[IMPORT\] unimplemented' "$run_dir/guest
     echo "captured_frames=$frame_count"
     echo "unimplemented_nids=$unimplemented_count"
 } > "$run_dir/summary.txt"
-# The runtime prints exact ABI-gap totals ([REMu][REPORT] lines) on every exit path; copying
-# them here makes each run summary self-auditing without re-parsing the full log.
-grep '\[REMu\]\[REPORT\]' "$run_dir/guest.log" >> "$run_dir/summary.txt" || true
+# The runtime prints exact ABI-gap totals ([REMu][REPORT] lines) periodically and on every exit
+# path, so a run killed by a forwarded fault still leaves one. Keep only the final block: the
+# earlier snapshots are prefixes of it, and copying them all would bury the totals that matter.
+awk '/\[REMu\]\[REPORT\] --- ABI gap summary/ { block = "" }
+     /\[REMu\]\[REPORT\]/ { block = block $0 "\n" }
+     END { printf "%s", block }' "$run_dir/guest.log" >> "$run_dir/summary.txt" || true
 
 tail -n 30 "$run_dir/guest.log" || true
 cat "$run_dir/summary.txt"
