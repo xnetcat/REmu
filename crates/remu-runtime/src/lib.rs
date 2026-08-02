@@ -6852,6 +6852,27 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
             format!("observed={observed:#x?} expected={expected:#x?}"),
         );
     }
+    // Which shader types a title actually registers, and the program-register pair each one
+    // carries, is otherwise only observable when the pair MISMATCHES — and no title has ever
+    // produced a mismatch, so the expected values above have never been confirmed against a
+    // guest. One line per distinct combination makes the accepted set readable too, which is
+    // what settles whether an expected pair is right or merely never exercised.
+    {
+        static ACCEPTED: OnceLock<Mutex<BTreeSet<(u8, u32, u32)>>> = OnceLock::new();
+        let combination = (shader_type, observed.0, observed.1);
+        if ACCEPTED
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(combination)
+        {
+            eprintln!(
+                "[REMu][AGC] accepted shader registration type={shader_type} \
+                 registers=({:#x}, {:#x}) count={register_count}",
+                observed.0, observed.1
+            );
+        }
+    }
     write_guest_u32(registers + 4, ((code >> 8) & 0xffff_ffff) as u32);
     write_guest_u32(registers + 12, ((code >> 40) & 0xff) as u32);
     // `registers` is derived from a just-relocated header field; if the relocation was wrong,
