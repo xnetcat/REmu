@@ -415,6 +415,64 @@ fn agc_completion_tracking_requires_a_published_queue_submission() {
 }
 
 #[test]
+fn containing_submission_sequence_is_attached_only_to_captured_flips() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let address = 0x0070_1234_5600;
+    let mut state = ProbeDispatchState {
+        agc_submission_count: 73,
+        ..ProbeDispatchState::default()
+    };
+    let flip = remu_gpu::GpuEvent::Flip {
+        address,
+        buffer_index: 1,
+        flip_argument: 0x1234,
+        submission_sequence: None,
+        width: 1_280,
+        height: 720,
+        pitch: 1_280,
+        pixel_format: 0x8000_0000_2200_0000,
+        tiling_mode: 0,
+    };
+
+    assert!(crate::request_agc_submission_completion(
+        &mut state,
+        7,
+        vec![flip],
+    ));
+    let remu_gpu::GpuEvent::QueueSubmission { queue_id, events } =
+        receiver.recv().expect("captured submission reaches presenter")
+    else {
+        panic!("captured work must retain its queue envelope");
+    };
+    assert_eq!(queue_id, 7);
+    assert!(matches!(
+        events.as_slice(),
+        [
+            remu_gpu::GpuEvent::Flip {
+                submission_sequence: Some(73),
+                ..
+            },
+            remu_gpu::GpuEvent::SubmissionBoundary(73),
+        ]
+    ));
+    remu_gpu::record_gpu_event_consumed();
+    remu_gpu::record_gpu_work_item_processed();
+    remu_gpu::record_gpu_work_item_processed();
+    remu_gpu::record_gpu_flip_completed(remu_gpu::GpuFlipCompletion {
+        address,
+        buffer_index: 1,
+        flip_argument: 0x1234,
+    });
+    let _ = remu_gpu::take_gpu_completed_flips();
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
 fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
     let _serial = GPU_EVENT_SINK_TEST
         .lock()
@@ -607,6 +665,7 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         address: flipped_address,
         buffer_index,
         flip_argument,
+        submission_sequence,
         width,
         height,
         ..
@@ -617,6 +676,7 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
     assert_eq!(flipped_address, address);
     assert_eq!(buffer_index, 0);
     assert_eq!(flip_argument, 0x1234);
+    assert_eq!(submission_sequence, None);
     assert_eq!((width, height), (1_280, 720));
     assert_eq!(
         crate::video_out_is_flip_pending([1, 0, 0, 0, 0, 0], &mut state),

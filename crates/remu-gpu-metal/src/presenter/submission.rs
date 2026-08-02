@@ -4,8 +4,9 @@
 use super::{
     ActiveGuestMemoryWait, DisplayConfiguration, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT,
     GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk, GuestBatchFlushReason,
-    GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery,
-    GuestMemoryWaitStatus, GuestMemoryWaitTracker, GuestMemoryWriteOperation,
+    FlipTerminalSource, GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
+    GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
+    GuestMemoryWriteOperation,
     MetalPresenter, OrderedEventPoll, OrderedEventSource,
     OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PendingFlip,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
@@ -164,6 +165,7 @@ impl MetalPresenter {
                     address,
                     buffer_index,
                     flip_argument,
+                    submission_sequence,
                     width,
                     height,
                     pitch,
@@ -188,25 +190,20 @@ impl MetalPresenter {
                     // still writing through pointers into it. Defer the completion behind the
                     // ordered work exactly as SubmissionBoundary defers empty submissions.
                     if let Some(superseded) = self.pending_flip
-                        && let Some(completion) = self.complete_flip(superseded.sequence)
+                        && let Some(sequence) = self.claim_flip_terminal(superseded.sequence)
                     {
-                        if let Some(batch) = self.open_guest_batch.as_mut() {
-                            batch.flip_completions.push(completion);
-                        } else if let Some(batch) = self.committed_guest_batches.back_mut() {
-                            batch.flip_completions.push(completion);
-                        } else {
-                            // Nothing queued or in flight: the superseded frame's work has
-                            // already retired and the completion is safe to publish now.
-                            remu_gpu::record_gpu_flip_completed(completion);
-                        }
+                        self.mark_flip_terminal(sequence, FlipTerminalSource::Superseded);
                     }
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
-                    self.pending_flip = Some(PendingFlip {
+                    let flip = PendingFlip {
                         address,
                         buffer_index,
                         flip_argument,
+                        submission_sequence,
                         sequence: self.next_flip_sequence,
-                    });
+                    };
+                    self.register_flip_completion_join(flip);
+                    self.pending_flip = Some(flip);
                     self.pending_flip_target_written_since_boundary = false;
                     self.pending_scanout_write_address = None;
                     self.active_translated_scanout = None;
@@ -482,7 +479,7 @@ impl MetalPresenter {
                     } else {
                         // No open or committed work remains, so this submission is genuinely
                         // empty and can complete immediately.
-                        remu_gpu::record_gpu_submission_completed(sequence);
+                        self.publish_guest_submission_completion(sequence);
                     }
                     self.finalize_pending_flip_at_submission_boundary(source);
                 }

@@ -18,7 +18,7 @@ use remu_shader::{GlobalMemoryBinding, Program, ShaderEvaluation};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::super::UploadedGlobalBuffer;
+use super::super::{FlipTerminalSource, UploadedGlobalBuffer};
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
@@ -29,7 +29,7 @@ use super::{
     GuestCommandBatch,
     GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
     GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor,
-    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter,
+    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, PendingFlip,
     OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PipelineCompileCandidate, ProgramIdentity,
     QueueBlockReason, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
@@ -361,7 +361,6 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
         }),
         compute_encoder: None,
         completion_sequences: vec![40],
-        flip_completions: Vec::new(),
     });
     sender
         .send(GpuEvent::QueueSubmission {
@@ -467,6 +466,62 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
 }
 
 #[test]
+fn post_flip_release_mem_precedes_the_exact_flip_completion() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    let submission_sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
+    let flip = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0x301,
+        submission_sequence: Some(submission_sequence),
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+    assert_eq!(presenter.claim_flip_terminal(1), Some(1));
+    presenter.mark_flip_terminal(1, FlipTerminalSource::Superseded);
+
+    let (_release_space, release_address) = mapped_test_label();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+    presenter
+        .execute_guest_memory_release(GpuMemoryRelease {
+            address: release_address,
+            value: GpuMemoryReleaseValue::Immediate32(0xfeed_beef),
+        })
+        .expect("post-flip release enters the same guest batch");
+    presenter
+        .open_guest_batch
+        .as_mut()
+        .expect("release opened a guest batch")
+        .completion_sequences
+        .push(submission_sequence);
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
+        .expect("post-flip release batch commits");
+
+    assert_eq!(read_test_label(release_address), 0);
+    assert!(remu_gpu::take_gpu_completed_flips().is_empty());
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("post-flip release batch reaches a terminal state");
+    assert_eq!(read_test_label(release_address), 0xfeed_beef);
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips()
+            .iter()
+            .map(|completion| completion.flip_argument)
+            .collect::<Vec<_>>(),
+        [0x301],
+        "the flip publishes only after finish_terminal_guest_batch applies RELEASE_MEM"
+    );
+}
+
+#[test]
 fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
@@ -515,7 +570,6 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
         }),
         compute_encoder: None,
         completion_sequences: Vec::new(),
-        flip_completions: Vec::new(),
     });
 
     presenter
@@ -569,7 +623,6 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         render_pass: None,
         compute_encoder: None,
         completion_sequences: vec![40],
-        flip_completions: Vec::new(),
     });
     sender
         .send(GpuEvent::QueueSubmission {
@@ -1418,7 +1471,6 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
         render_pass: None,
         compute_encoder: None,
         completion_sequences: Vec::new(),
-        flip_completions: Vec::new(),
     });
 
     let (_label_space, address) = mapped_test_label();
@@ -1506,6 +1558,18 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
 fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    let submission_sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
+    let flip = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0x401,
+        submission_sequence: Some(submission_sequence),
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+    assert_eq!(presenter.claim_flip_terminal(1), Some(1));
+    presenter.mark_flip_terminal(1, FlipTerminalSource::Presentation);
     let (_label_space, address) = mapped_test_label();
     let wait = GpuMemoryWait {
         address,
@@ -1548,6 +1612,15 @@ fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
         GuestMemoryWaitRecovery::ProducerLatched(7),
         "the ordered producer must wake a suspended WAIT_REG_MEM"
     );
+    presenter.publish_guest_submission_completion(submission_sequence);
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips()
+            .iter()
+            .map(|completion| completion.flip_argument)
+            .collect::<Vec<_>>(),
+        [0x401],
+        "a terminal GPU error still satisfies the exact submission half of the flip join"
+    );
 }
 
 #[test]
@@ -1589,7 +1662,6 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
                 render_pass: None,
         compute_encoder: None,
                 completion_sequences: Vec::new(),
-                flip_completions: Vec::new(),
             });
     }
 
@@ -1645,7 +1717,6 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
             render_pass: None,
         compute_encoder: None,
             completion_sequences: Vec::new(),
-            flip_completions: Vec::new(),
         });
 
     let error = presenter
@@ -1705,7 +1776,6 @@ fn fill_committed_guest_batch_budget(
                 render_pass: None,
                 compute_encoder: None,
                 completion_sequences: Vec::new(),
-                flip_completions: Vec::new(),
             });
     }
 }
@@ -1826,7 +1896,6 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         render_pass: None,
         compute_encoder: None,
         completion_sequences: Vec::new(),
-        flip_completions: Vec::new(),
     };
     let (first_buffer, first_offset) = batch
         .upload_global_bytes(&device, &[1, 2, 3])
@@ -1979,7 +2048,6 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             render_pass: None,
         compute_encoder: None,
             completion_sequences: Vec::new(),
-            flip_completions: Vec::new(),
         });
 
     let (_completion_space, completion_address) = mapped_test_label();
@@ -2004,7 +2072,6 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             render_pass: None,
         compute_encoder: None,
             completion_sequences: Vec::new(),
-            flip_completions: Vec::new(),
         });
 
     presenter
@@ -2417,6 +2484,7 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
             address: 0x7000_0000,
             buffer_index: 1,
             flip_argument: 9,
+            submission_sequence: None,
             width: 1_280,
             height: 720,
             pitch: 1_280,
@@ -3237,6 +3305,7 @@ fn blocked_guest_wait_does_not_stall_independent_video_out_flip() {
             address: 0x7000_0000,
             buffer_index: 2,
             flip_argument: 11,
+            submission_sequence: None,
             width: 1_920,
             height: 1_080,
             pitch: 1_920,
@@ -3340,6 +3409,7 @@ fn video_out_flip_retains_ingress_order_against_runnable_guest_work() {
             address: 0x7100_0000,
             buffer_index: 3,
             flip_argument: 12,
+            submission_sequence: None,
             width: 1_920,
             height: 1_080,
             pitch: 1_920,
