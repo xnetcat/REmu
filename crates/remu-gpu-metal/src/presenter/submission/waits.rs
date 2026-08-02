@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    ActiveGuestMemoryWait, GuestBatchFlushReason, GuestMemoryWaitKey, GuestMemoryWaitRecovery,
+    ActiveGuestMemoryWait, FlushPolicy, GuestBatchFlushReason, GuestMemoryWaitKey,
+    GuestMemoryWaitRecovery,
     GuestMemoryWaitStatus, GuestMemoryWaitTracker, MetalPresenter, OrderedEventSource,
 };
 use remu_gpu::{GpuMemoryWait, GpuWaitId};
@@ -106,7 +107,7 @@ impl MetalPresenter {
         // scheduler retains this packet at the submission front and runs another guest queue;
         // later commands from this queue are never allowed to overtake the unsatisfied condition.
         if let Err(error) =
-            self.flush_guest_command_batch(false, GuestBatchFlushReason::BlockedWait)
+            self.flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::BlockedWait)
         {
             if let Some(ticket_id) = ticket_id {
                 remu_gpu::retire_gpu_wait(ticket_id);

@@ -5,6 +5,7 @@ use super::super::completion::{
     COMMAND_BUFFER_SETTLE_TIMEOUT, command_buffer_failure_message, settle_timeout_message,
     wait_until_settled_within,
 };
+use super::super::FlushPolicy;
 use crate::presenter::diagnostics::trace_diagnostic_guest_write;
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
@@ -31,6 +32,14 @@ static DISCARDED_STALE_GLOBAL_WRITEBACKS: AtomicUsize = AtomicUsize::new(0);
 enum GuestBatchSettlement {
     Completed,
     Failed(String),
+    Pending(String),
+}
+
+/// Outcome of settling the oldest committed batch. `Retired` carries that batch's own completion
+/// result; `Pending` means it is still queued and no slot was reclaimed.
+enum FrontBatchSettlement {
+    Empty,
+    Retired(Result<(), String>),
     Pending(String),
 }
 
@@ -152,16 +161,41 @@ impl MetalPresenter {
 
     pub(crate) fn flush_guest_command_batch(
         &mut self,
-        wait: bool,
+        policy: FlushPolicy,
         reason: GuestBatchFlushReason,
+    ) -> Result<(), String> {
+        self.flush_guest_command_batch_by(
+            policy,
+            reason,
+            Instant::now() + COMMAND_BUFFER_SETTLE_TIMEOUT,
+        )
+    }
+
+    /// Flushes the open batch, bounding any budget-reclaiming settle by `settle_deadline`.
+    fn flush_guest_command_batch_by(
+        &mut self,
+        policy: FlushPolicy,
+        reason: GuestBatchFlushReason,
+        settle_deadline: Instant,
     ) -> Result<(), String> {
         if self.open_guest_batch.is_none() {
             return Ok(());
         }
-        if !wait
-            && self.committed_guest_batches.len() >= super::super::MAX_COMMITTED_GUEST_BATCHES
-        {
-            return Ok(());
+        // A batch that outlives the settle budget stays queued, so the in-flight count can still be
+        // at the cap below. Committing one batch past it is bounded and temporary; declining to
+        // commit would hand a `Required` caller the uncommitted results it is about to read.
+        let mut settlement = Ok(());
+        if self.committed_guest_batches.len() >= super::super::MAX_COMMITTED_GUEST_BATCHES {
+            match policy {
+                FlushPolicy::Opportunistic => return Ok(()),
+                FlushPolicy::Required => {
+                    settlement = match self.settle_front_guest_batch(settle_deadline) {
+                        FrontBatchSettlement::Empty => Ok(()),
+                        FrontBatchSettlement::Retired(result) => result,
+                        FrontBatchSettlement::Pending(error) => Err(error),
+                    };
+                }
+            }
         }
         let Some(mut batch) = self.open_guest_batch.take() else {
             return Ok(());
@@ -219,34 +253,31 @@ impl MetalPresenter {
         batch.command_buffer.commit();
         self.statistics.submitted_guest_batches =
             self.statistics.submitted_guest_batches.saturating_add(1);
-        if wait {
-            match settle_guest_batch_by(&batch, Instant::now() + COMMAND_BUFFER_SETTLE_TIMEOUT) {
-                GuestBatchSettlement::Completed => {
-                    let result = self.finish_terminal_guest_batch(&batch, None);
-                    self.statistics.gpu_execution_time +=
-                        completed_command_buffer_gpu_duration(&batch.command_buffer);
-                    publish_guest_batch_completion(&batch);
-                    result?;
-                }
-                GuestBatchSettlement::Failed(error) => {
-                    let result = self.finish_terminal_guest_batch(&batch, Some(error));
-                    self.statistics.gpu_execution_time +=
-                        completed_command_buffer_gpu_duration(&batch.command_buffer);
-                    publish_guest_batch_completion(&batch);
-                    result?;
-                }
-                GuestBatchSettlement::Pending(error) => {
-                    // A timeout is an observation about the host wait, not a terminal Metal
-                    // status. Keep the command buffer and every resource/completion effect alive;
-                    // the normal retirement path will finish it once the driver does.
-                    self.committed_guest_batches.push_back(batch);
-                    return Err(error);
-                }
+        self.committed_guest_batches.push_back(batch);
+        settlement
+    }
+
+    /// Settles the oldest committed batch and publishes its completion effects.
+    ///
+    /// A batch that outlives `deadline` is put back at the front: later buffers from the same queue
+    /// cannot complete before it, so none of their CPU-side completion effects may overtake it.
+    fn settle_front_guest_batch(&mut self, deadline: Instant) -> FrontBatchSettlement {
+        let Some(batch) = self.committed_guest_batches.pop_front() else {
+            return FrontBatchSettlement::Empty;
+        };
+        let execution_error = match settle_guest_batch_by(&batch, deadline) {
+            GuestBatchSettlement::Completed => None,
+            GuestBatchSettlement::Failed(error) => Some(error),
+            GuestBatchSettlement::Pending(error) => {
+                self.committed_guest_batches.push_front(batch);
+                return FrontBatchSettlement::Pending(error);
             }
-        } else {
-            self.committed_guest_batches.push_back(batch);
-        }
-        Ok(())
+        };
+        let result = self.finish_terminal_guest_batch(&batch, execution_error);
+        self.statistics.gpu_execution_time +=
+            completed_command_buffer_gpu_duration(&batch.command_buffer);
+        publish_guest_batch_completion(&batch);
+        FrontBatchSettlement::Retired(result)
     }
 
     pub(crate) fn wait_for_guest_command_batches(&mut self) -> Result<(), String> {
@@ -257,38 +288,38 @@ impl MetalPresenter {
         &mut self,
         timeout: Duration,
     ) -> Result<(), String> {
-        self.flush_guest_command_batch(false, GuestBatchFlushReason::CpuSynchronization)?;
-        let mut result = Ok(());
-        // One budget covers the whole drain. Charging every queued batch its own timeout would sum
-        // to far past the host watchdog window this bound exists to stay inside, and a device that
-        // stalled on the first batch will not retire the rest either.
+        // One budget covers the whole drain, including the flush's own slot reclaim. Charging every
+        // queued batch its own timeout would sum to far past the host watchdog window this bound
+        // exists to stay inside, and a device that stalled on the first batch will not retire the
+        // rest either.
         let deadline = Instant::now() + timeout;
-        while let Some(batch) = self.committed_guest_batches.pop_front() {
-            let execution_error = match settle_guest_batch_by(&batch, deadline) {
-                GuestBatchSettlement::Completed => None,
-                GuestBatchSettlement::Failed(error) => Some(error),
-                GuestBatchSettlement::Pending(error) => {
-                    // Preserve ordering: later buffers from the same queue cannot complete before
-                    // this one, and none of their CPU-side completion effects may overtake it.
-                    self.committed_guest_batches.push_front(batch);
+        self.flush_guest_command_batch_by(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CpuSynchronization,
+            deadline,
+        )?;
+        debug_assert!(self.open_guest_batch.is_none());
+        let mut result = Ok(());
+        loop {
+            match self.settle_front_guest_batch(deadline) {
+                FrontBatchSettlement::Empty => return result,
+                // Drain every already-committed batch even after one fails. Returning early here
+                // used to abandon later RELEASE_MEM labels and completion IDs during shutdown or a
+                // synchronous readback, converting a preserved Metal error into an unrelated guest
+                // RenderThread timeout.
+                FrontBatchSettlement::Retired(batch_result) => {
+                    result =
+                        merge_guest_batch_result(result, "later ordered guest batch", batch_result);
+                }
+                FrontBatchSettlement::Pending(error) => {
                     return merge_guest_batch_result(
                         result,
                         "pending ordered guest batch",
                         Err(error),
                     );
                 }
-            };
-            let batch_result = self.finish_terminal_guest_batch(&batch, execution_error);
-            self.statistics.gpu_execution_time +=
-                completed_command_buffer_gpu_duration(&batch.command_buffer);
-            publish_guest_batch_completion(&batch);
-            // Drain every already-committed batch even after one fails. Returning early here used
-            // to abandon later RELEASE_MEM labels and completion IDs during shutdown or a
-            // synchronous readback, converting a preserved Metal error into an unrelated guest
-            // RenderThread timeout.
-            result = merge_guest_batch_result(result, "later ordered guest batch", batch_result);
+            }
         }
-        result
     }
 }
 

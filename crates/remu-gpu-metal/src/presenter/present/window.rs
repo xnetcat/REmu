@@ -5,7 +5,7 @@ use super::super::completion::{command_buffer_native_state_summary, trace_metal_
 use super::super::texture::RETIRED_TEXTURE_QUARANTINE_CAPACITY;
 use super::super::{TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED};
 use super::{
-    EVENT_POLL_INTERVAL, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
+    EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS,
     MetalPresenter, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED,
     PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PresenterFlow,
@@ -950,7 +950,8 @@ impl ApplicationHandler for MetalPresenter {
             event_loop.exit();
             return;
         }
-        if let Err(error) = self.flush_guest_command_batch(false, GuestBatchFlushReason::EventLoop)
+        if let Err(error) = self
+            .flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
         {
             eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
         }
@@ -991,7 +992,10 @@ pub(crate) fn run_headless_presenter(receiver: Receiver<GpuEvent>) -> Result<(),
         let (flow, submission) = objc::rc::autoreleasepool(|| {
             let flow = presenter.receive_events();
             let submission = if flow == PresenterFlow::Continue {
-                presenter.flush_guest_command_batch(false, GuestBatchFlushReason::EventLoop)
+                presenter.flush_guest_command_batch(
+                    FlushPolicy::Opportunistic,
+                    GuestBatchFlushReason::EventLoop,
+                )
             } else {
                 Ok(())
             };

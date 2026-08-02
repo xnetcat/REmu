@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::commit_and_settle;
-use super::super::GuestBatchFlushReason;
+use super::super::{FlushPolicy, GuestBatchFlushReason};
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
@@ -516,7 +516,12 @@ impl MetalPresenter {
                     .is_some_and(|resident| resident.gpu_written)
             });
             let queue = if has_gpu_written_alias {
-                self.flush_guest_command_batch(false, GuestBatchFlushReason::CpuSynchronization)?;
+                // The loop below downloads each GPU-written alias into guest memory; the download
+                // is ordered behind its producer only once that producer is committed.
+                self.flush_guest_command_batch(
+                    FlushPolicy::Required,
+                    GuestBatchFlushReason::CpuSynchronization,
+                )?;
                 self.multisample_textures.retain(|key, _| {
                     !guest_texture_descriptors_overlap(key.descriptor, descriptor)
                 });
