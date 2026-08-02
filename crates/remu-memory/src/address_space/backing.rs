@@ -156,6 +156,7 @@ impl ReadMappingCache {
 pub(super) struct BackingInner {
     pub(super) id: u64,
     size: u64,
+    virtually_keyed: bool,
     pub(super) descriptor: i32,
     read_mappings: Mutex<ReadMappingCache>,
 }
@@ -207,7 +208,21 @@ impl Drop for GuestSharedBackingView {
 }
 
 impl GuestPhysicalBacking {
+    /// Creates a physically keyed backing: its offsets name stable guest physical bytes.
     pub fn new(size: u64) -> Result<Self, AddressSpaceError> {
+        Self::create(size, false)
+    }
+
+    /// Creates a virtually keyed backing, whose offsets are guest virtual placements.
+    ///
+    /// Only an address space's committed-memory object may use this: byte `offset` of the object
+    /// is guest address `base + offset`, so a recorded `(backing, offset)` pair names a *virtual*
+    /// address whose contents the allocator may already have handed to another object.
+    pub(super) fn new_virtually_keyed(size: u64) -> Result<Self, AddressSpaceError> {
+        Self::create(size, true)
+    }
+
+    fn create(size: u64, virtually_keyed: bool) -> Result<Self, AddressSpaceError> {
         if size == 0 {
             return Err(AddressSpaceError::ZeroBackingSize);
         }
@@ -258,6 +273,7 @@ impl GuestPhysicalBacking {
             inner: Arc::new(BackingInner {
                 id,
                 size,
+                virtually_keyed,
                 descriptor,
                 read_mappings: Mutex::new(ReadMappingCache::default()),
             }),
@@ -272,6 +288,15 @@ impl GuestPhysicalBacking {
     #[must_use]
     pub fn size(&self) -> u64 {
         self.inner.size
+    }
+
+    /// Reports whether this object is keyed by guest virtual placement rather than physical bytes.
+    ///
+    /// A recorded offset into such an object is not a durable physical identity, so no writer may
+    /// republish captured bytes there once the naming mapping is gone.
+    #[must_use]
+    pub fn is_virtually_keyed(&self) -> bool {
+        self.inner.virtually_keyed
     }
 
     pub(super) fn map_shared_view(

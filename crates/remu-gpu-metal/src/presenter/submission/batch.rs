@@ -5,6 +5,7 @@ use super::super::completion::{
     COMMAND_BUFFER_SETTLE_TIMEOUT, command_buffer_failure_message, settle_timeout_message,
     wait_until_settled_within,
 };
+use crate::presenter::diagnostics::trace_diagnostic_guest_write;
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter,
@@ -976,6 +977,8 @@ fn write_changed_global_ranges_with(
             backing_id: expected.backing_id,
             backing_offset,
         };
+        let byte_count = u64::try_from(cursor - start)
+            .map_err(|_| "writable global buffer changed byte count does not fit u64")?;
         let published = match mode {
             GlobalWritePublishMode::RequireLiveVa => {
                 write_guest_shared_backing_if_identity(
@@ -985,16 +988,16 @@ fn write_changed_global_ranges_with(
                 )
             }
             GlobalWritePublishMode::ProducerIdentity => {
+                trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
                 write_guest_shared_backing_at_identity(range_identity, &current_bytes[start..cursor])
             }
         };
         if !published {
-            let byte_count = u64::try_from(cursor - start)
-                .map_err(|_| "writable global buffer changed byte count does not fit u64")?;
             let current = guest_shared_backing_identity(address, byte_count);
             if matches!(mode, GlobalWritePublishMode::RequireLiveVa) && current != Some(range_identity)
             {
                 // VA moved mid-publish; fall back to the captured producer pages.
+                trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
                 if write_guest_shared_backing_at_identity(
                     range_identity,
                     &current_bytes[start..cursor],

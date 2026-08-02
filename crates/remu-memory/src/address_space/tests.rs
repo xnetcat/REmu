@@ -413,6 +413,75 @@ fn identity_targeted_backing_write_survives_same_heap_va_recycle() {
 }
 
 #[test]
+fn identity_targeted_backing_write_is_refused_for_a_virtually_keyed_backing() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let committed = memory
+        .map_committed(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .unwrap();
+    let identity = guest_shared_backing_identity(committed.get(), GUEST_PAGE_SIZE)
+        .expect("committed mapping identity");
+
+    assert!(!write_guest_shared_backing_at_identity(identity, b"glyph"));
+    let mut observed = [0_u8; 5];
+    memory.read(committed, &mut observed).unwrap();
+    assert_eq!(observed, [0; 5]);
+}
+
+#[test]
+fn identity_targeted_backing_write_is_refused_when_live_records_cover_only_part_of_the_range() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let identity = guest_shared_backing_identity(mapped.get(), 2 * GUEST_PAGE_SIZE)
+        .expect("two-page mapping identity");
+
+    memory.unmap(page(mapped, 1), GUEST_PAGE_SIZE).unwrap();
+
+    let source = vec![0xab_u8; usize::try_from(GUEST_PAGE_SIZE).unwrap() + 16];
+    assert!(!write_guest_shared_backing_at_identity(identity, &source));
+    let mut observed = [0_u8; 5];
+    memory.read(mapped, &mut observed).unwrap();
+    assert_eq!(observed, [0; 5]);
+}
+
+#[test]
+fn identity_targeted_backing_write_publishes_a_fully_covered_physical_range() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let identity = guest_shared_backing_identity(page(mapped, 1).get(), GUEST_PAGE_SIZE)
+        .expect("second page identity");
+
+    assert!(write_guest_shared_backing_at_identity(identity, b"glyph"));
+    let mut observed = [0_u8; 5];
+    memory.read(page(mapped, 1), &mut observed).unwrap();
+    assert_eq!(&observed, b"glyph");
+}
+
+#[test]
 fn replacing_shared_pages_removes_their_backing_identity() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();

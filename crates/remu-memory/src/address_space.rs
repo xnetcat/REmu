@@ -107,7 +107,7 @@ impl GuestAddressSpace {
         if let Some(backing) = &self.commit_backing {
             return Ok(backing.clone());
         }
-        let backing = GuestPhysicalBacking::new(self.size())?;
+        let backing = GuestPhysicalBacking::new_virtually_keyed(self.size())?;
         self.commit_backing = Some(backing.clone());
         Ok(backing)
     }

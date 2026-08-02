@@ -571,8 +571,17 @@ pub fn write_guest_shared_backing_if_identity(
 ///
 /// Prospero recycles direct-memory VAs while GPU work is still in flight. Metal writebacks that
 /// recorded the producer identity must still land on those physical pages so any remaining alias
-/// (and later remaps back onto that interval) observe the GPU results. The backing object is
-/// resolved through any live shared mapping that still names `identity.backing_id`.
+/// (and later remaps back onto that interval) observe the GPU results.
+///
+/// Two conditions bound that licence, because a recorded identity is not by itself a claim on
+/// memory. The backing must be physically keyed: in a virtually keyed object, `backing_offset` is
+/// just `guest_va - base`, so publishing "by producer identity" would rewrite the very address
+/// whose liveness check has already failed, straight into whatever the guest allocator has since
+/// put there. And live mappings must cover the whole of `[backing_offset, backing_offset + len)`;
+/// naming the backing id somewhere else in the object proves nothing about these bytes. Coverage
+/// and the transfer share the registry lock so an unmap cannot intervene between them.
+///
+/// Refusals are reported: a silently dropped writeback is indistinguishable from a correct one.
 pub fn write_guest_shared_backing_at_identity(
     identity: GuestSharedMappingIdentity,
     source: &[u8],
@@ -580,6 +589,11 @@ pub fn write_guest_shared_backing_at_identity(
     let Ok(byte_count) = u64::try_from(source.len()) else {
         return false;
     };
+    // An empty range proves no coverage, so it cannot be published; `write_guest_shared_backing`
+    // rejects zero-length writes for the same reason.
+    if byte_count == 0 {
+        return false;
+    }
     let Some(end) = identity.backing_offset.checked_add(byte_count) else {
         return false;
     };
@@ -591,13 +605,83 @@ pub fn write_guest_shared_backing_at_identity(
         .find(|record| record.backing.id() == identity.backing_id)
         .map(|record| record.backing.clone())
     else {
+        trace_refused_identity_write(&mappings, identity, byte_count, "backing has no live mapping");
         return false;
     };
-    if end > backing.size() {
+    if backing.is_virtually_keyed() {
+        trace_refused_identity_write(&mappings, identity, byte_count, "virtually keyed backing");
         return false;
     }
-    drop(mappings);
+    if end > backing.size() {
+        trace_refused_identity_write(&mappings, identity, byte_count, "range exceeds backing");
+        return false;
+    }
+    if !identity_range_is_live(&mappings, identity.backing_id, identity.backing_offset, end) {
+        trace_refused_identity_write(
+            &mappings,
+            identity,
+            byte_count,
+            "no live mapping covers the range",
+        );
+        return false;
+    }
     backing.write_all_at(identity.backing_offset, source)
+}
+
+/// Reports whether live records cover every byte of a physical interval in one backing.
+fn identity_range_is_live(
+    mappings: &BTreeMap<u64, SharedMappingRecord>,
+    backing_id: u64,
+    start: u64,
+    end: u64,
+) -> bool {
+    let mut cursor = start;
+    while cursor < end {
+        let covered_end = mappings
+            .iter()
+            .filter(|(_, record)| record.backing.id() == backing_id)
+            .filter_map(|(&mapping_start, record)| {
+                let mapping_length = record.end.checked_sub(mapping_start)?;
+                let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
+                (record.backing_offset <= cursor && cursor < mapping_backing_end)
+                    .then_some(mapping_backing_end)
+            })
+            .max();
+        let Some(covered_end) = covered_end.filter(|covered_end| *covered_end > cursor) else {
+            return false;
+        };
+        cursor = covered_end.min(end);
+    }
+    true
+}
+
+static REFUSED_IDENTITY_WRITES: AtomicU64 = AtomicU64::new(0);
+
+fn trace_refused_identity_write(
+    mappings: &BTreeMap<u64, SharedMappingRecord>,
+    identity: GuestSharedMappingIdentity,
+    byte_count: u64,
+    reason: &str,
+) {
+    let sequence = REFUSED_IDENTITY_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence > 16 && !sequence.is_power_of_two() {
+        return;
+    }
+    let alias = mappings
+        .iter()
+        .filter(|(_, record)| record.backing.id() == identity.backing_id)
+        .find_map(|(&mapping_start, record)| {
+            let mapping_length = record.end.checked_sub(mapping_start)?;
+            let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
+            (record.backing_offset <= identity.backing_offset
+                && identity.backing_offset < mapping_backing_end)
+                .then(|| mapping_start + (identity.backing_offset - record.backing_offset))
+        })
+        .map_or_else(|| "none".to_owned(), |address| format!("{address:#x}"));
+    eprintln!(
+        "[REMu][VM] refused producer-identity writeback sequence={sequence} reason={reason} address={alias} bytes={byte_count:#x} backing={} offset={:#x}",
+        identity.backing_id, identity.backing_offset,
+    );
 }
 
 fn unregister_shared_mapping_range_locked(
