@@ -384,10 +384,21 @@ pub(crate) fn decode_render_target_state(
     }
     let resource_type = (attrib3 >> 24) & 0x3;
     let resource_level = (attrib3 >> 27) & 0x7;
-    let non_block_compressed_view = (attrib3 >> 31) & 1;
-    if resource_level != 0 || non_block_compressed_view != 0 {
+    // RESOURCE_LEVEL is a GFX10 descriptor-generation selector, not the mip being rendered.
+    // The public AMD GFX10 register description assigns it bits 27..29 and Mesa programs one
+    // for every GFX10 color surface. Prospero streams exercise both zero and one; in either form
+    // CB_COLOR_VIEW.MIP_LEVEL and CB_COLOR_ATTRIB2.MAX_MIP remain the complete subresource view.
+    if resource_level > 1 {
         return Err(format!(
-            "color target {guest_slot} requires unsupported resource state type={resource_type} level={resource_level} nbc={non_block_compressed_view} extent={width}x{height}"
+            "color target {guest_slot} has invalid GFX10 resource level {resource_level} in CB_COLOR_ATTRIB3={attrib3:#010x}"
+        ));
+    }
+    // Bit 31 is not a non-block-compressed-view selector in CB_COLOR_ATTRIB3. SDK 10 names it
+    // as the Trinity-only control for writing VRS rate hints into CMASK. Base Prospero cannot
+    // enable it, and emulating it as an ordinary color attachment would discard guest state.
+    if attrib3 >> 31 != 0 {
+        return Err(format!(
+            "color target {guest_slot} requires unsupported Trinity VRS CMASK hints in CB_COLOR_ATTRIB3={attrib3:#010x}"
         ));
     }
     let (texture_type, layer_count, base_layer) = match resource_type {

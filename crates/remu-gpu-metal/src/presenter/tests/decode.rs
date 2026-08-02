@@ -11,6 +11,7 @@ use remu_shader::{PixelOutputKind, Program, ShaderEvaluation, decode_program};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::super::decode::decode_render_target_state;
 use super::{
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
@@ -924,6 +925,31 @@ fn silent_hill_render_target_accepts_absolute_max_mip_hierarchy() {
 }
 
 #[test]
+fn gfx10_resource_level_one_is_not_a_render_target_mip() {
+    let target = decode_render_target_state(
+        0,
+        0x00ef_c200_0000,
+        0,
+        0x0000_8024,
+        0,
+        ((3_840 - 1) << 14) | (2_160 - 1),
+        0x4dc6_c000,
+        0xf,
+    )
+    .expect("Poppy's GFX10 scanout resource state is representable");
+
+    assert_eq!(target.texture.address, 0x00ef_c200_0000);
+    assert_eq!(
+        (target.texture.width, target.texture.height),
+        (3_840, 2_160)
+    );
+    assert_eq!(target.texture.pixel_format, MTLPixelFormat::RGB10A2Unorm);
+    assert_eq!(target.texture.tile_mode, 27);
+    assert_eq!((target.mip_level, target.mip_level_count), (0, 1));
+    assert_eq!((target.texture_type, target.layer_count), (9, 1));
+}
+
+#[test]
 fn render_target_decode_rejects_incomplete_or_lossy_state() {
     assert!(
         decode_render_target_format(7, 7, 0)
@@ -999,6 +1025,32 @@ fn render_target_decode_rejects_incomplete_or_lossy_state() {
         .expect("color attrib3 exists")
         .value = (27 << 14) | (1 << 24);
 
+    registers
+        .iter_mut()
+        .find(|register| register.offset == CB_COLOR0_ATTRIB3)
+        .expect("color attrib3 exists")
+        .value |= 2 << 27;
+    assert!(
+        decode_render_targets_from_registers(&registers, 0xf)
+            .expect_err("undefined resource levels cannot be flattened")
+            .contains("invalid GFX10 resource level 2")
+    );
+    registers
+        .iter_mut()
+        .find(|register| register.offset == CB_COLOR0_ATTRIB3)
+        .expect("color attrib3 exists")
+        .value = (27 << 14) | (1 << 24) | (1 << 31);
+    assert!(
+        decode_render_targets_from_registers(&registers, 0xf)
+            .expect_err("Trinity VRS CMASK behavior cannot be silently dropped")
+            .contains("Trinity VRS CMASK hints")
+    );
+    registers
+        .iter_mut()
+        .find(|register| register.offset == CB_COLOR0_ATTRIB3)
+        .expect("color attrib3 exists")
+        .value = (27 << 14) | (1 << 24);
+
     registers.retain(|register| register.offset != CB_COLOR0_ATTRIB2);
     assert!(
         decode_render_targets_from_registers(&registers, 0xf)
@@ -1024,7 +1076,7 @@ fn decodes_silent_hill_volume_render_target() {
         .iter_mut()
         .find(|register| register.offset == CB_COLOR0_ATTRIB3)
         .expect("color attrib3 exists")
-        .value = 63 | (27 << 14) | (2 << 24);
+        .value = 63 | (27 << 14) | (2 << 24) | (1 << 27);
     registers.sort_by_key(|register| register.offset);
 
     let target = decode_render_targets_from_registers(&registers, 0xf)

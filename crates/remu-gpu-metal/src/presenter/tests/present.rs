@@ -217,6 +217,37 @@ fn decodes_explicit_scanout_target_without_fabricating_context_registers() {
 }
 
 #[test]
+fn decodes_poppy_resource_level_scanout_as_a_translated_ten_bit_target() {
+    let surface = GpuColorTarget {
+        slot: 0,
+        address: 0x00ef_c200_0000,
+        view: 0,
+        info: 0x0000_8024,
+        attrib: 0,
+        attrib2: ((3_840 - 1) << 14) | (2_160 - 1),
+        attrib3: 0x4dc6_c000,
+    };
+    let target = GpuScanoutTarget {
+        address: surface.address,
+        width: 3_840,
+        height: 2_160,
+        pitch: 3_840,
+        pixel_format: 0x8100_0000_2200_0000,
+        tiling_mode: 0,
+        export_slot: 0,
+        write_mask: 0xf,
+        color_surface: Some(surface),
+    };
+
+    let decoded = decode_scanout_target(target).expect("Poppy scanout target");
+
+    assert_eq!(decoded.texture.pixel_format, MTLPixelFormat::RGB10A2Unorm);
+    assert_eq!(decoded.texture.tile_mode, 27);
+    assert_eq!((decoded.mip_level, decoded.mip_level_count), (0, 1));
+    assert!(!decoded.direct_scanout);
+}
+
+#[test]
 fn decodes_video_out_only_scanout_as_a_host_target() {
     let target = GpuScanoutTarget {
         address: 0x0070_1234_5600,
