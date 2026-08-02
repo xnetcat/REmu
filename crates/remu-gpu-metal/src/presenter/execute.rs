@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::WrittenRegion;
 use super::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_CONTROL,
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, ColorOperationMode,
@@ -1585,12 +1586,14 @@ impl MetalPresenter {
             if target.direct_scanout {
                 self.mark_direct_scanout_initialized(target.texture.address);
             } else {
+                let region = WrittenRegion::render_target(*target, scissor);
                 if target.sample_count > 1 {
                     self.mark_multisample_texture_initialized(target.texture, target.sample_count);
                     self.mark_resident_texture_written_preserving_multisample_at(
                         target.texture,
                         target.span,
                         *resident_descriptor,
+                        region,
                         activity_stamp,
                     );
                 } else {
@@ -1598,6 +1601,7 @@ impl MetalPresenter {
                         target.texture,
                         target.span,
                         *resident_descriptor,
+                        region,
                         activity_stamp,
                     );
                 }
@@ -1640,11 +1644,14 @@ impl MetalPresenter {
             // while an earlier R32Float sample SRD shadowed them and forced CPU snapshots
             // (Octopath 0x8063d50000: depth_native=0 forever).
             if depth.write_enabled || depth_clear_value.is_some() {
+                let region =
+                    WrittenRegion::depth_target(scissor, depth_clear_value.is_some());
                 if depth.sample_count > 1 {
                     self.mark_resident_texture_written_preserving_multisample_at(
                         depth.texture,
                         depth.span,
                         depth_resident_descriptor,
+                        region,
                         activity_stamp,
                     );
                 } else {
@@ -1652,6 +1659,7 @@ impl MetalPresenter {
                         depth.texture,
                         depth.span,
                         depth_resident_descriptor,
+                        region,
                         activity_stamp,
                     );
                 }
@@ -1689,6 +1697,7 @@ impl MetalPresenter {
                     texture.descriptor.guest,
                     texture.descriptor.span,
                     texture.selected_resident,
+                    WrittenRegion::storage_image(texture.descriptor),
                     activity_stamp,
                 );
                 self.note_pending_flip_target_write(texture.descriptor.guest);
@@ -2096,7 +2105,7 @@ impl MetalPresenter {
                         let resident = self
                             .resident_guest_textures
                             .get(&uploaded.descriptor.guest)
-                            .map(|resident| (resident.gpu_written, resident.content_version));
+                            .map(|resident| (resident.gpu_written(), resident.content_version));
                         let aliases = self
                             .resident_guest_textures
                             .values()
@@ -2116,7 +2125,7 @@ impl MetalPresenter {
                                 .ok();
                                 (
                                     resident.descriptor,
-                                    resident.gpu_written,
+                                    resident.gpu_written(),
                                     resident.content_version,
                                     contents.as_ref().map(|contents| {
                                         contents.iter().filter(|&&value| value != 0).count()
@@ -2169,7 +2178,7 @@ impl MetalPresenter {
                                                     )
                                                     .ok();
                                                     (
-                                                        resident.gpu_written,
+                                                        resident.gpu_written(),
                                                         resident.content_version,
                                                         contents.as_ref().map(|contents| {
                                                             contents
@@ -2215,7 +2224,7 @@ impl MetalPresenter {
                                                 .map(|resident| {
                                                     (
                                                         resident.descriptor,
-                                                        resident.gpu_written,
+                                                        resident.gpu_written(),
                                                         resident.content_version,
                                                     )
                                                 })
@@ -2856,6 +2865,8 @@ impl MetalPresenter {
             destination.texture,
             destination.span,
             Some(destination_resident.descriptor),
+            // The resolve draw covers the whole base-level destination surface.
+            WrittenRegion::whole_resource(),
             activity_stamp,
         );
         self.note_pending_flip_target_write(destination.texture);
@@ -2963,12 +2974,15 @@ impl MetalPresenter {
             export_dispatcher: false,
             pixel_dispatcher: false,
         });
+        // Materializing fast-clear metadata rewrites every texel of the base-level target.
+        let region = WrittenRegion::whole_resource();
         if target.sample_count > 1 {
             self.mark_multisample_texture_initialized(target.texture, target.sample_count);
             self.mark_resident_texture_written_preserving_multisample_at(
                 target.texture,
                 target.span,
                 Some(selected.descriptor),
+                region,
                 activity_stamp,
             );
         } else {
@@ -2976,6 +2990,7 @@ impl MetalPresenter {
                 target.texture,
                 target.span,
                 Some(selected.descriptor),
+                region,
                 activity_stamp,
             );
         }

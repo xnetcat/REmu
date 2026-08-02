@@ -4,11 +4,12 @@
 use super::{
     CachedSampledTexture, DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget,
     DepthArrayKey, DepthArrayResidentTexture, DirectScanoutTexture, GuestTextureContentState,
-    GuestTextureDescriptor, GuestTextureWatchRange,
+    GuestScissor, GuestTextureDescriptor, GuestTextureWatchRange,
     GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
     MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
+    OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED,
     RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
-    RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidentGuestTexture,
+    RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidencyState, ResidentGuestTexture,
     ResourceSpan,
     ResidentTextureActivityStamp, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
@@ -33,7 +34,7 @@ use super::{
     record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, render_resolve_candidate_matches,
     sampled_alias_descriptor, sampler_uses_normalized_coordinates, spans_overlap,
-    texture_element_layout,
+    texture_element_layout, tiled_block_bytes, tiled_block_dimensions,
     trace_glyph_atlas, trace_image_descriptors, trace_target_sampling,
     trace_video_target_consumers,
     write_resident_texture_contents_to_guest,
@@ -43,8 +44,10 @@ use remu_memory::guest_shared_mapping_identity;
 use remu_memory::{CpuWriteWatchRetirement, read_guest_shared_backing, write_guest_shared_backing};
 mod correlation;
 mod depth_array;
+mod extent;
 mod lifetime;
 mod mips;
+mod ranges;
 mod resident_map;
 mod residency;
 mod retire;
@@ -56,6 +59,8 @@ pub(crate) use self::correlation::{
     trace_alias_correlated_image_bindings, trace_residency_churn,
 };
 pub(crate) use self::depth_array::resident_is_depth_array_face;
+pub(crate) use self::extent::{WrittenRegion, resident_declared_span, written_byte_ranges};
+pub(crate) use self::ranges::RangeSet;
 #[cfg(test)]
 pub(crate) use self::depth_array::{depth_array_face_descriptor, depth_array_face_set_is_complete};
 pub(crate) use self::lifetime::{

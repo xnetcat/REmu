@@ -54,6 +54,21 @@ impl ResourceSpan {
         self.backing
     }
 
+    /// First offset of this span in the space `RangeSet` keeps its runs in.
+    ///
+    /// A resolved backing gives a physical offset, which is what makes two virtual aliases of one
+    /// resource comparable byte for byte. A span with no complete live backing has no physical
+    /// identity to share, so it stays in virtual-address space and the range algebra only ever
+    /// compares it against itself.
+    pub(crate) fn range_start(&self) -> u64 {
+        self.backing
+            .map_or(self.address, |backing| backing.backing_offset)
+    }
+
+    pub(crate) fn range_end(&self) -> u64 {
+        self.range_start().saturating_add(self.len)
+    }
+
     #[cfg(test)]
     pub(crate) fn overlaps_texture(&self, other: GuestTextureDescriptor) -> bool {
         Self::for_texture(other).is_some_and(|other| self.overlaps(&other))

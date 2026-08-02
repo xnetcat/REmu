@@ -83,6 +83,25 @@ pub(super) static RESIDENT_WRITE_ATTRIBUTION_MISSES: AtomicU64 = AtomicU64::new(
 
 pub(super) static RESIDENT_DEPTH_SAMPLE_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Times a range set widened its claim instead of tracking every run exactly.
+///
+/// Widening an authority claim can only cost an extra re-materialisation, never stale pixels, so
+/// this is a throughput signal rather than a correctness one. Counted for the `RANGE_SET_MAX_RUNS`
+/// collapse and for the layout cases whose rect refinement is deliberately not attempted.
+pub(super) static OWNED_RANGE_SET_COARSENED: AtomicU64 = AtomicU64::new(0);
+
+/// Residents admitted with no complete live shared backing for their declared range.
+///
+/// Their ranges stay in virtual-address space and are never compared against a resident that did
+/// resolve, so they are excluded from the cross-resident algebra entirely.
+pub(super) static OWNED_UNRESOLVED_SPAN: AtomicU64 = AtomicU64::new(0);
+
+/// Written-region computations that fell back to the writer's whole declared span.
+///
+/// Every failure inside `written_byte_ranges` lands here, which is exactly the descriptor-level
+/// range the code claimed before the range algebra existed.
+pub(super) static OWNED_FALLBACK_FULL_RANGE: AtomicU64 = AtomicU64::new(0);
+
 pub(super) static SAMPLED_ALIAS_WRITEBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static SAMPLED_ALIAS_WRITEBACK_BYTES: AtomicU64 = AtomicU64::new(0);

@@ -153,7 +153,8 @@ use self::shader::{
 use self::stats::process_resident_bytes;
 use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
-    MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, PIPELINE_COMPILE_COMPLETED,
+    MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, OWNED_FALLBACK_FULL_RANGE,
+    OWNED_RANGE_SET_COARSENED, OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WRITE_ATTRIBUTION_MISSES,
@@ -180,9 +181,10 @@ use self::submission::{
     apply_pending_guest_memory_writes, pin_guest_memory_write, write_back_pending_globals,
 };
 use self::texture::{
-    RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, decode_guest_texture_linear_from_raw,
+    RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, WrittenRegion,
+    decode_guest_texture_linear_from_raw,
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
-    resident_depth_sample_is_eligible, resident_texture_activity_stats,
+    resident_declared_span, resident_depth_sample_is_eligible, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
     retire_multisample_textures_overlapping_writeback,
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
@@ -214,7 +216,7 @@ use self::tiling::{
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     mode5_mip_chain_layout, mode27_mip_chain_layout, render_resolve_candidate_matches,
-    spans_overlap, tiled_block_dimensions,
+    spans_overlap, tiled_block_bytes, tiled_block_dimensions,
 };
 #[cfg(test)]
 use self::tiling::{
@@ -977,7 +979,21 @@ struct ResidentGuestTexture {
     layer_count: u32,
     mip_level_count: u32,
     write_watch: GuestTextureWriteWatch,
-    gpu_written: bool,
+    /// The guest bytes this allocation declares, resolved once at creation.
+    ///
+    /// `None` disables the range algebra for this resident and leaves it on the descriptor-overlap
+    /// behaviour. Note this is the resident's *whole* range — mip chain, array faces and all —
+    /// while the interval index keys residents by their level-0 span, so the index answers "which
+    /// residents might be involved" and `owned` answers "which bytes are actually theirs".
+    span: Option<ResourceSpan>,
+    /// Guest bytes this allocation is the authority for.
+    owned: RangeSet,
+    /// Subset of `owned` whose current value exists only in Metal.
+    ///
+    /// This is the publication debt the guest is owed, and it is what `gpu_written()` reports.
+    gpu_authored: RangeSet,
+    /// `Live` unless every owned byte was taken by another writer or by the CPU.
+    state: ResidencyState,
     content_version: u64,
     /// CPU-write generations observed when Metal most recently became authoritative.
     ///
@@ -997,6 +1013,34 @@ struct ResidentGuestTexture {
     /// Ordinary runs retain no counters and take only the predictable `Option::None` branch at
     /// resident sample/write sites.
     activity: Option<ResidentTextureActivity>,
+}
+
+/// Whether an allocation still answers for any of its guest bytes, and where they went if not.
+///
+/// The field has no `Default` on purpose: every construction site must name it.
+// `Stale` is only reachable once the subtraction that empties an `owned` set is live; until then
+// every resident is constructed `Live` and nothing demotes.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidencyState {
+    Live,
+    Stale(StaleSource),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaleSource {
+    /// Another resident wrote every byte, and its texels are recoverable on the GPU.
+    Allocation {
+        descriptor: GuestTextureDescriptor,
+        /// The superseder's `content_version` at demotion time. A superseder that is gone or has
+        /// moved on cannot be trusted as an identity, and recovery falls back to `GuestMemory`.
+        content_version: u64,
+    },
+    /// Guest RAM became authoritative: a validated CPU write, an ACQUIRE_MEM invalidation, a DMA
+    /// destination write, or REmu's own publish. Recovery is a rebuild from RAM, which is free
+    /// whenever the watch proves the bytes are unchanged.
+    GuestMemory,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1032,6 +1076,54 @@ impl ResidentTextureActivity {
 }
 
 impl ResidentGuestTexture {
+    /// A watch's span together with authority over every byte of it.
+    ///
+    /// A newly created allocation owns everything it declares: it either uploaded guest RAM or is
+    /// about to be fully overwritten, and either way no other resident may answer for those bytes.
+    fn declared_authority(write_watch: &GuestTextureWriteWatch) -> (Option<ResourceSpan>, RangeSet) {
+        let span = resident_declared_span(write_watch);
+        if span.is_none_or(|span| span.backing().is_none()) {
+            OWNED_UNRESOLVED_SPAN.fetch_add(1, Ordering::Relaxed);
+        }
+        let owned = span.as_ref().map(RangeSet::for_span).unwrap_or_default();
+        (span, owned)
+    }
+
+    /// True while any guest byte's current value exists only in Metal.
+    fn gpu_written(&self) -> bool {
+        !self.gpu_authored.is_empty()
+    }
+
+    #[cfg(test)]
+    fn note_gpu_authored_whole_span(&mut self) {
+        let written = self.span.as_ref().map(RangeSet::for_span).unwrap_or_default();
+        self.note_gpu_authored(&written);
+    }
+
+    /// Records a GPU write of `written` bytes: authority is claimed and the debt grows with it.
+    fn note_gpu_authored(&mut self, written: &RangeSet) {
+        self.owned.insert(written);
+        self.gpu_authored.insert(written);
+        self.state = ResidencyState::Live;
+        debug_assert!(
+            self.owned.contains_all(&self.gpu_authored),
+            "a resident may only owe bytes it is the authority for"
+        );
+        debug_assert!(
+            self.span
+                .is_none_or(|span| RangeSet::for_span(&span).contains_all(&self.owned)),
+            "a resident may only claim bytes inside its own declared span"
+        );
+    }
+
+    /// Drops the publication debt after guest RAM was made to agree with Metal.
+    ///
+    /// Authority is unchanged: the allocation still defines what these bytes mean, RAM merely
+    /// holds the same value now.
+    fn clear_gpu_authored(&mut self) {
+        self.gpu_authored = RangeSet::default();
+    }
+
     fn note_gpu_write(&mut self) {
         self.gpu_write_watch_generations = self.write_watch.generations();
     }
