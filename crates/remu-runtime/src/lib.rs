@@ -6750,8 +6750,25 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
     let registers = read_guest_u64(header + AGC_SHADER_SH_REGISTERS_OFFSET);
     let shader_type = read_guest_u8(header + AGC_SHADER_TYPE_OFFSET);
     let register_count = read_guest_u8(header + AGC_SHADER_SH_REGISTER_COUNT_OFFSET);
+    // Every rejection here fails sceAgcCreateShader, and the guest treats that as a shader it
+    // cannot use. Reporting the reason is the difference between "REmu declined 388 shaders" and
+    // a silent rendering gap: the counts below are how a missing draw becomes attributable.
+    let reject = |reason: &str, detail: String| {
+        static REJECTED: AtomicU64 = AtomicU64::new(0);
+        let sequence = REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence <= 16 || sequence.is_power_of_two() {
+            eprintln!(
+                "[REMu][AGC] declined shader registration sequence={sequence} header={header:#x} \
+                 type={shader_type} reason={reason} {detail}"
+            );
+        }
+        false
+    };
     if registers == 0 || register_count < 2 {
-        return false;
+        return reject(
+            "unusable-sh-register-block",
+            format!("registers={registers:#x} count={register_count}"),
+        );
     }
     let expected = match shader_type {
         0 => (0x20c, 0x20d),
@@ -6759,10 +6776,16 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
         2 | 6 => (0x0c8, 0x0c9),
         4 => (0x08a, 0x08b),
         7 => (0x148, 0x149),
-        _ => return false,
+        // Gen5 defines shader stages REmu has no register mapping for yet; a title using one
+        // loses those draws entirely, so name the stage rather than dropping it quietly.
+        _ => return reject("unmapped-shader-stage", String::new()),
     };
-    if (read_guest_u32(registers), read_guest_u32(registers + 8)) != expected {
-        return false;
+    let observed = (read_guest_u32(registers), read_guest_u32(registers + 8));
+    if observed != expected {
+        return reject(
+            "unexpected-program-registers",
+            format!("observed={observed:#x?} expected={expected:#x?}"),
+        );
     }
     write_guest_u32(registers + 4, ((code >> 8) & 0xffff_ffff) as u32);
     write_guest_u32(registers + 12, ((code >> 40) & 0xff) as u32);
