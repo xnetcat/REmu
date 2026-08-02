@@ -998,6 +998,70 @@ fn records_the_accepted_writer_of_each_context_blend_register() {
 }
 
 #[test]
+fn routes_blend_controls_from_unified_uc_tables_into_context_state() {
+    let registers = [
+        0x4000_01e0,
+        0x6501_0501,
+        0x4000_01e7,
+        0x6504_0504,
+        0x4000_0243,
+        2,
+    ];
+    let registers_address = registers.as_ptr().addr() as u64;
+    let packet = [
+        agc_pm4(5, AGC_IT_SET_UCONFIG_REG_INDIRECT, 0),
+        low_u32(registers_address),
+        (registers_address >> 32) as u32,
+        0x8000_0000,
+        3,
+    ];
+    let packet_address = packet.as_ptr().addr() as u64;
+    let mut graphics = AgcGraphicsState::default();
+
+    crate::agc_apply_submission_registers(
+        packet_address,
+        5,
+        AGC_IT_SET_UCONFIG_REG_INDIRECT,
+        0,
+        &mut graphics,
+    )
+    .expect("unified UC indirect table");
+
+    assert_eq!(graphics.context_registers.get(&0x1e0), Some(&0x6501_0501));
+    assert_eq!(graphics.context_registers.get(&0x1e7), Some(&0x6504_0504));
+    assert!(!graphics.user_config_registers.contains_key(&0x1e0));
+    assert!(!graphics.user_config_registers.contains_key(&0x1e7));
+    assert_eq!(graphics.user_config_registers.get(&0x243), Some(&2));
+    assert_eq!(graphics.index_size, 2);
+    assert_eq!(
+        graphics.blend_register_provenance[0],
+        Some(crate::AgcBlendRegisterProvenance {
+            sequence: 1,
+            source: "indirect-uc-routed-cx",
+            packet_address,
+            table_address: registers_address,
+            table_index: Some(0),
+            raw_offset: 0x4000_01e0,
+            normalized_offset: 0x1e0,
+            value: 0x6501_0501,
+        })
+    );
+    assert_eq!(
+        graphics.blend_register_provenance[7],
+        Some(crate::AgcBlendRegisterProvenance {
+            sequence: 2,
+            source: "indirect-uc-routed-cx",
+            packet_address,
+            table_address: registers_address,
+            table_index: Some(1),
+            raw_offset: 0x4000_01e7,
+            normalized_offset: 0x1e7,
+            value: 0x6504_0504,
+        })
+    );
+}
+
+#[test]
 fn skips_predicated_packets_when_boolean_predication_is_false() {
     let predicate = 1_u64;
     let predicate_address = std::ptr::from_ref(&predicate).addr() as u64;
