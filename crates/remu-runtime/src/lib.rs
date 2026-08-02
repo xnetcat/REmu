@@ -6797,6 +6797,20 @@ const DECLINED_SHADER_REASONS: [&str; 3] = [
     "unexpected-program-registers",
 ];
 
+/// The console error each decline reason corresponds to, for readers comparing REmu's behaviour
+/// against hardware. An incomplete SH register block is `SCE_AGC_ERROR_SHADER_INCOMPLETE_SH` and
+/// a program-register disagreement is `SCE_AGC_ERROR_SHADER_MISMATCH`; the unmapped-stage arm has
+/// no console equivalent, because the console maps every stage its own enum defines.
+///
+/// REmu returns -1 from `sceAgcCreateShader` rather than these codes. Aligning the return value is
+/// a guest-visible change and therefore needs the n>=15 crash protocol, so it is deliberately not
+/// done here — naming the code in the log costs nothing and is what a reader actually needs.
+const DECLINED_SHADER_CONSOLE_ERRORS: [&str; 3] = [
+    "SCE_AGC_ERROR_SHADER_INCOMPLETE_SH(0x8a6c0005)",
+    "none(REmu-specific)",
+    "SCE_AGC_ERROR_SHADER_MISMATCH(0x8a6c0008)",
+];
+
 /// Declined shader registrations by reason, reported at exit.
 static DECLINED_SHADER_REGISTRATIONS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -6816,7 +6830,8 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
         if trace_logarithmic_sequence(sequence, 16) {
             eprintln!(
                 "[REMu][AGC] declined shader registration sequence={sequence} header={header:#x} \
-                 type={shader_type} reason={reason} {detail}"
+                 type={shader_type} reason={reason} console_error={} {detail}",
+                DECLINED_SHADER_CONSOLE_ERRORS[reason_index]
             );
         }
         false
