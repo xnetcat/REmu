@@ -457,8 +457,8 @@ struct ProbeDispatchState {
     json_runtime: JsonRuntimeState,
     av_player: AvPlayerRuntimeState,
     services: RuntimeServiceState,
-    agc_primary_register_defaults: u64,
-    agc_internal_register_defaults: u64,
+    agc_primary_register_defaults: [u64; 3],
+    agc_internal_register_defaults: [u64; 3],
     ctype_table: u64,
     tolower_table: u64,
     toupper_table: u64,
@@ -1963,8 +1963,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .get_or_init(|| Mutex::new(AudioOut2State::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = AudioOut2State::default();
-    state.agc_primary_register_defaults = 0;
-    state.agc_internal_register_defaults = 0;
+    state.agc_primary_register_defaults.fill(0);
+    state.agc_internal_register_defaults.fill(0);
     state.ctype_table = 0;
     state.tolower_table = 0;
     state.toupper_table = 0;
