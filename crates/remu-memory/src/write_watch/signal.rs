@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::diagnostic::{
     DiagnosticBuffer, FaultReason, FaultRegister, FaultReport, FaultSpace, format_fault_registers,
-    format_fault_report,
+    format_fault_report, format_fault_stack_words,
 };
 use super::guest_space::contains_guest_address;
 use super::page::{align_down, host_page_size_infallible};
@@ -254,6 +254,9 @@ fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) 
         format_fault_registers(registers, &mut buffer);
     }
     write_signal_diagnostic_bytes(buffer.as_slice());
+    if let Some(registers) = registers.as_ref() {
+        write_interrupted_stack_diagnostic(registers);
+    }
     // A declined fault is normally the crash itself. When the journal is armed, name every
     // emulator publication that covers the faulting bytes before the process dies. The register
     // values anchor the dump: a poisoned dereference faults on the derived garbage pointer, while
@@ -272,6 +275,46 @@ fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) 
         }
     }
     crate::dump_guest_write_journal(report.address, &anchors[..anchor_count]);
+}
+
+/// Emits the mapped remainder of the interrupted stack page for offline symbolication.
+///
+/// The signal frame itself proves that bytes below the interrupted stack pointer are mapped, but
+/// a pointer exactly at a page boundary may legally name an unmapped next page. Requiring a
+/// nonzero in-page offset and never crossing that page keeps this last-chance read bounded. The
+/// handler deliberately uses unaligned volatile reads because the corrupted frame may no longer
+/// satisfy the ABI alignment rule.
+fn write_interrupted_stack_diagnostic(registers: &[FaultRegister]) {
+    const MAX_STACK_WORDS: usize = 48;
+    let Some(stack_pointer) = registers
+        .iter()
+        .find(|register| register.name == b"rsp" || register.name == b"sp")
+        .map(|register| register.value)
+    else {
+        return;
+    };
+    let Ok(stack_pointer_usize) = usize::try_from(stack_pointer) else {
+        return;
+    };
+    let page_size = host_page_size_infallible() as usize;
+    let in_page_offset = stack_pointer_usize & (page_size - 1);
+    if in_page_offset == 0 {
+        return;
+    }
+    let available_words = (page_size - in_page_offset) / std::mem::size_of::<u64>();
+    let word_count = available_words.min(MAX_STACK_WORDS);
+    if word_count == 0 {
+        return;
+    }
+    let mut words = [0_u64; MAX_STACK_WORDS];
+    for (index, word) in words[..word_count].iter_mut().enumerate() {
+        // SAFETY: the interrupted stack pointer lies in the mapped stack page used to enter this
+        // handler, and `word_count` is bounded to the remainder of that same page.
+        *word = unsafe { std::ptr::read_volatile((stack_pointer_usize + index * 8) as *const u64) };
+    }
+    let mut buffer = DiagnosticBuffer::new();
+    format_fault_stack_words(stack_pointer, &words[..word_count], &mut buffer);
+    write_signal_diagnostic_bytes(buffer.as_slice());
 }
 
 /// Reads the interrupted instruction pointer and integer registers out of the machine context.
