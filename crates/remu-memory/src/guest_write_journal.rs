@@ -15,8 +15,16 @@ use crate::signal_text::DiagnosticBuffer;
 /// Set to `1` to record and dump the journal.
 pub const GUEST_WRITE_JOURNAL_VARIABLE: &str = "REMU_GUEST_WRITE_JOURNAL";
 
-/// Ring capacity in entries; a power of two so slot selection is a mask. Sized so a scattered
-/// per-row texture publication cannot evict a whole frame of DMA fills.
+/// Ring capacity in entries; a power of two so slot selection is a mask.
+///
+/// Corruption sits latent: MallocBinned3 only trips over a poisoned free-list entry when it next
+/// pops it, which the first soak measured at more than the ~5 seconds a 64k ring held (all 15
+/// crashes dumped `matched=0` against ~480k recorded publications). Four million entries hold
+/// minutes of publication traffic — the whole run — at ~200 MiB, allocated only when the journal
+/// is armed.
+#[cfg(not(test))]
+const CAPACITY: usize = 1 << 22;
+#[cfg(test)]
 const CAPACITY: usize = 64 * 1024;
 
 /// Entries printed after the covering set, newest last.
@@ -44,6 +52,28 @@ pub enum GuestWriteSite {
     GlobalWriteback,
     GlobalWritebackIdentity,
     GlobalWritebackDirect,
+    /// AMPR file read replayed at submit time into a destination recorded earlier.
+    AmprReadReplay,
+    /// AMPR completion/result word written on every submission of a reusable command buffer.
+    AmprCompletion,
+    /// AvPlayer video/audio frame staged into guest-allocated buffers off the decoder timeline.
+    AvPlayerFrame,
+    /// HLE'd guest `memset`.
+    GuestMemset,
+    /// HLE'd guest `memcpy`/`memmove`.
+    GuestMemcpy,
+    /// Runtime bulk byte publication (save data and similar guest-named outputs).
+    RuntimeBytes,
+    /// REmu's mspace suballocator zero-filling a `calloc` block inside a guest region.
+    MspaceZero,
+    /// REmu's mspace suballocator migrating bytes for `realloc`.
+    MspaceCopy,
+    /// In-place mutation of guest AGC shader headers (pointer relocation, register patches).
+    ShaderPatch,
+    /// `MAP_FIXED` anonymous mapping: the whole range becomes zeros without any byte store.
+    MapZero,
+    /// Commit-on-protect remap: the range's contents are replaced by the committed backing's.
+    MapCommit,
 }
 
 impl GuestWriteSite {
@@ -59,6 +89,17 @@ impl GuestWriteSite {
             Self::GlobalWriteback => b"global-writeback",
             Self::GlobalWritebackIdentity => b"global-writeback-identity",
             Self::GlobalWritebackDirect => b"global-writeback-direct",
+            Self::AmprReadReplay => b"ampr-read-replay",
+            Self::AmprCompletion => b"ampr-completion",
+            Self::AvPlayerFrame => b"avplayer-frame",
+            Self::GuestMemset => b"guest-memset",
+            Self::GuestMemcpy => b"guest-memcpy",
+            Self::RuntimeBytes => b"runtime-bytes",
+            Self::MspaceZero => b"mspace-zero",
+            Self::MspaceCopy => b"mspace-copy",
+            Self::ShaderPatch => b"shader-patch",
+            Self::MapZero => b"map-zero",
+            Self::MapCommit => b"map-commit",
         }
     }
 
@@ -73,7 +114,18 @@ impl GuestWriteSite {
             6 => Self::ReleaseMem,
             7 => Self::GlobalWriteback,
             8 => Self::GlobalWritebackIdentity,
-            _ => Self::GlobalWritebackDirect,
+            9 => Self::GlobalWritebackDirect,
+            10 => Self::AmprReadReplay,
+            11 => Self::AmprCompletion,
+            12 => Self::AvPlayerFrame,
+            13 => Self::GuestMemset,
+            14 => Self::GuestMemcpy,
+            15 => Self::RuntimeBytes,
+            16 => Self::MspaceZero,
+            17 => Self::MspaceCopy,
+            18 => Self::ShaderPatch,
+            19 => Self::MapZero,
+            _ => Self::MapCommit,
         }
     }
 
@@ -89,6 +141,17 @@ impl GuestWriteSite {
             Self::GlobalWriteback => 7,
             Self::GlobalWritebackIdentity => 8,
             Self::GlobalWritebackDirect => 9,
+            Self::AmprReadReplay => 10,
+            Self::AmprCompletion => 11,
+            Self::AvPlayerFrame => 12,
+            Self::GuestMemset => 13,
+            Self::GuestMemcpy => 14,
+            Self::RuntimeBytes => 15,
+            Self::MspaceZero => 16,
+            Self::MspaceCopy => 17,
+            Self::ShaderPatch => 18,
+            Self::MapZero => 19,
+            Self::MapCommit => 20,
         }
     }
 }
@@ -119,13 +182,14 @@ impl JournalSlot {
     }
 }
 
-#[expect(
-    clippy::declare_interior_mutable_const,
-    reason = "array initialiser for a static of interior-mutable slots"
-)]
-const EMPTY_SLOT: JournalSlot = JournalSlot::new();
+/// The ring is ~200 MiB at production capacity, so it exists only when the journal is armed.
+/// Recording paths allocate it on first use (never in signal context); the fault-time dump only
+/// ever observes it through [`std::sync::OnceLock::get`], which is a plain atomic load.
+static SLOTS: std::sync::OnceLock<Box<[JournalSlot]>> = std::sync::OnceLock::new();
 
-static SLOTS: [JournalSlot; CAPACITY] = [EMPTY_SLOT; CAPACITY];
+fn slots_for_recording() -> &'static [JournalSlot] {
+    SLOTS.get_or_init(|| (0..CAPACITY).map(|_| JournalSlot::new()).collect())
+}
 
 static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -145,6 +209,11 @@ pub fn guest_write_journal_enabled() -> bool {
         _ => {
             let enabled = std::env::var_os(GUEST_WRITE_JOURNAL_VARIABLE)
                 .is_some_and(|value| value == "1" || value == "true");
+            if enabled {
+                // Pay the ~200 MiB ring allocation at resolution time (process start) rather
+                // than as a hitch inside the first recorded publication.
+                let _ = slots_for_recording();
+            }
             ENABLED.store(
                 if enabled { ENABLED_YES } else { ENABLED_NO },
                 Ordering::Relaxed,
@@ -174,7 +243,7 @@ pub fn record_guest_write(
         uniform |= SAMPLED_PAYLOAD;
     }
     let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let slot = &SLOTS[(sequence as usize) & (CAPACITY - 1)];
+    let slot = &slots_for_recording()[(sequence as usize) & (CAPACITY - 1)];
     slot.stamp.store(0, Ordering::Release);
     slot.address.store(address, Ordering::Relaxed);
     slot.byte_count.store(byte_count, Ordering::Relaxed);
@@ -297,6 +366,29 @@ pub fn dump_guest_write_journal(fault_address: u64, anchors: &[u64]) {
     write_diagnostic(&buffer);
 }
 
+/// Reports a signal no recovery claimed, from signal context, then dumps the journal.
+///
+/// The SHA-NI SIGILL recovery re-raises unrecognised illegal instructions with the default
+/// disposition, which previously killed the process with no pc, no address and no journal — three
+/// of the first fifteen soak runs died that way and yielded nothing. `anchors` should carry the
+/// interrupted registers when the caller has them; the pc is always used as one.
+pub fn report_unrecovered_signal(name: &[u8], pc: u64, fault_address: u64, anchors: &[u64]) {
+    let mut buffer = DiagnosticBuffer::new();
+    buffer.push_bytes(b"[REMu][WATCH] unrecovered ");
+    buffer.push_bytes(name);
+    buffer.push_bytes(b" pc=");
+    buffer.push_hexadecimal(pc);
+    buffer.push_bytes(b" addr=");
+    buffer.push_hexadecimal(fault_address);
+    buffer.push_bytes(b"; forwarding\n");
+    write_diagnostic(&buffer);
+    let mut all = [0_u64; 33];
+    let count = anchors.len().min(32);
+    all[..count].copy_from_slice(&anchors[..count]);
+    all[count] = pc;
+    dump_guest_write_journal(fault_address, &all[..=count]);
+}
+
 struct JournalEntry {
     sequence: u64,
     site: GuestWriteSite,
@@ -319,8 +411,12 @@ impl JournalEntry {
 }
 
 /// Reads the slot holding `sequence`, or `None` if it was recycled or is mid-write.
+///
+/// Runs in signal context: it must not allocate, so an unallocated ring reads as empty.
 fn read_slot(sequence: u64) -> Option<JournalEntry> {
-    let slot = &SLOTS[(sequence as usize) & (CAPACITY - 1)];
+    let slot = SLOTS
+        .get()?
+        .get((sequence as usize) & (CAPACITY - 1))?;
     let stamp = slot.stamp.load(Ordering::Acquire);
     if stamp != sequence.wrapping_add(1) {
         return None;

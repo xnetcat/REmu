@@ -717,6 +717,16 @@ remaining={:#x} destination={:#x}: {error}",
     unsafe {
         std::ptr::copy_nonoverlapping(staging.as_ptr(), destination as *mut u8, total);
     }
+    // This destination was recorded at record time and is replayed on EVERY submission of the
+    // command buffer; a destination the guest has since freed is exactly the corruption class the
+    // journal exists to catch.
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::AmprReadReplay,
+        destination,
+        total as u64,
+        &staging[..total.min(4096)],
+        0,
+    );
     if staging.capacity() <= AMPR_MAX_RETAINED_STAGING_BYTES {
         staging.clear();
         let mut pool = AMPR_READ_STAGING_POOL
@@ -830,9 +840,14 @@ where
             failure.get_or_insert(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
             continue;
         }
-        write_guest_u64(
+        let result_value = u64::try_from(bytes_read).unwrap_or(u64::MAX);
+        write_guest_u64(command.buffer + result_offset, result_value);
+        remu_memory::record_guest_write(
+            remu_memory::GuestWriteSite::AmprCompletion,
             command.buffer + result_offset,
-            u64::try_from(bytes_read).unwrap_or(u64::MAX),
+            8,
+            &result_value.to_le_bytes(),
+            0,
         );
     }
     ampr_publish_command_buffer_completion(arguments, &mut state, failure)
@@ -933,13 +948,18 @@ fn ampr_publish_command_buffer_completion(
         if !ampr_destination_has_write_access(state, write.address, 8) {
             return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
         }
-        write_guest_u64(
+        let value = if failure.is_some() {
+            AMPR_FAILED_COMPLETION_VALUE
+        } else {
+            write.value
+        };
+        write_guest_u64(write.address, value);
+        remu_memory::record_guest_write(
+            remu_memory::GuestWriteSite::AmprCompletion,
             write.address,
-            if failure.is_some() {
-                AMPR_FAILED_COMPLETION_VALUE
-            } else {
-                write.value
-            },
+            8,
+            &value.to_le_bytes(),
+            0,
         );
     }
     // The value recorded with the queue-write command is the event's `data`, which the guest

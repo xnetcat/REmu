@@ -767,12 +767,21 @@ impl GuestMspace {
             return Some(address);
         }
         let replacement = self.allocate(new_size, Self::ALLOCATION_ALIGNMENT)?;
+        let copied = usize::try_from(old_size).ok()?;
         // SAFETY: Both ranges are disjoint, live allocations within the caller-provided mspace.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                address as *const u8,
-                replacement as *mut u8,
-                usize::try_from(old_size).ok()?,
+            std::ptr::copy_nonoverlapping(address as *const u8, replacement as *mut u8, copied);
+        }
+        if remu_memory::guest_write_journal_enabled() {
+            // SAFETY: the copy above just wrote exactly these bytes.
+            let sample =
+                unsafe { std::slice::from_raw_parts(replacement as *const u8, copied.min(4096)) };
+            remu_memory::record_guest_write(
+                remu_memory::GuestWriteSite::MspaceCopy,
+                replacement,
+                old_size,
+                sample,
+                0,
             );
         }
         self.free(address);
@@ -6723,7 +6732,17 @@ fn ime_keyboard_get_info(output: u64) -> u64 {
 fn relocate_guest_pointer(field: u64) {
     let relative = read_guest_u64(field);
     if relative != 0 {
-        write_guest_u64(field, field.wrapping_add(relative));
+        let absolute = field.wrapping_add(relative);
+        write_guest_u64(field, absolute);
+        // Not idempotent: a second sceAgcCreateShader over a reused header re-relocates every
+        // pointer through heap garbage, so each mutation earns a journal entry.
+        remu_memory::record_guest_write(
+            remu_memory::GuestWriteSite::ShaderPatch,
+            field,
+            8,
+            &absolute.to_le_bytes(),
+            0,
+        );
     }
 }
 
@@ -6747,6 +6766,22 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
     }
     write_guest_u32(registers + 4, ((code >> 8) & 0xffff_ffff) as u32);
     write_guest_u32(registers + 12, ((code >> 40) & 0xff) as u32);
+    // `registers` is derived from a just-relocated header field; if the relocation was wrong,
+    // these two stores land at an arbitrary heap address, so both are journaled.
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::ShaderPatch,
+        registers + 4,
+        4,
+        &(((code >> 8) & 0xffff_ffff) as u32).to_le_bytes(),
+        0,
+    );
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::ShaderPatch,
+        registers + 12,
+        4,
+        &(((code >> 40) & 0xff) as u32).to_le_bytes(),
+        0,
+    );
     true
 }
 

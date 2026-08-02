@@ -246,6 +246,9 @@ impl GuestAddressSpace {
             ));
         }
         debug_assert_eq!(result, pointer);
+        // The fixed anonymous mapping just replaced every byte in the range with zeros without a
+        // single byte store; record it so a zero-poisoned crash can name it.
+        crate::record_guest_write(crate::GuestWriteSite::MapZero, start, size, &[0], 0);
         unregister_shared_mapping_range(start, size);
         Ok(())
     }

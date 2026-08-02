@@ -26,6 +26,10 @@ use super::{FiberContext, FiberData};
 /// it. Resuming a context whose stack frame has returned jumps into freed stack.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
+// A stable export prevents ThinLTO from internalizing the naked body into a different codegen
+// unit than its callers, which intermittently left the mangled symbol undefined at link time as
+// unrelated code in this crate shifted partitioning.
+#[unsafe(export_name = "remu_fiber_set_jmp")]
 pub(super) unsafe extern "C" fn fiber_set_jmp(_context: *mut FiberContext) -> u32 {
     core::arch::naked_asm!(
         "mov [rdi + 0x00], rax",
@@ -59,6 +63,7 @@ pub(super) unsafe extern "C" fn fiber_set_jmp(_context: *mut FiberContext) -> u3
 /// `context` must hold state saved by [`fiber_set_jmp`] on a stack that is still live.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
+#[unsafe(export_name = "remu_fiber_long_jmp")]
 pub(super) unsafe extern "C" fn fiber_long_jmp(_context: *mut FiberContext) -> ! {
     core::arch::naked_asm!(
         // Restore the saved rounding and masking bits while keeping the live exception flags,
@@ -104,6 +109,7 @@ pub(super) unsafe extern "C" fn fiber_long_jmp(_context: *mut FiberContext) -> !
 /// `force_quit` must not return.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
+#[unsafe(export_name = "remu_fiber_switch_entry")]
 pub(super) unsafe extern "C" fn fiber_switch_entry(
     _data: *const FiberData,
     _set_floating_point: u32,

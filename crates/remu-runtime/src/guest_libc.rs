@@ -269,10 +269,18 @@ pub(crate) fn guest_memset(destination: u64, value: u64, length: u64) -> u64 {
     let Ok(length) = usize::try_from(length) else {
         return 0;
     };
+    let fill = value.to_le_bytes()[0];
     // SAFETY: The call originates in guest code and supplies a live destination mapping.
     unsafe {
-        std::ptr::write_bytes(destination as *mut u8, value.to_le_bytes()[0], length);
+        std::ptr::write_bytes(destination as *mut u8, fill, length);
     }
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::GuestMemset,
+        destination,
+        length as u64,
+        &[fill; 8][..length.min(8)],
+        0,
+    );
     destination
 }
 
@@ -290,7 +298,26 @@ pub(crate) fn guest_memcpy(destination: u64, source: u64, length: u64) -> u64 {
     unsafe {
         std::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, length);
     }
+    journal_guest_copy(destination, length);
     destination
+}
+
+/// Journals one HLE'd copy into guest memory. Sub-16-byte copies are the emulator's hottest
+/// call and cannot carry a bulk fill, so they stay out of the ring; the uniformity verdict is
+/// drawn from the leading page.
+fn journal_guest_copy(destination: u64, length: usize) {
+    if length >= 16 && remu_memory::guest_write_journal_enabled() {
+        // SAFETY: the copy that just completed wrote exactly these destination bytes.
+        let sample =
+            unsafe { std::slice::from_raw_parts(destination as *const u8, length.min(4096)) };
+        remu_memory::record_guest_write(
+            remu_memory::GuestWriteSite::GuestMemcpy,
+            destination,
+            length as u64,
+            sample,
+            0,
+        );
+    }
 }
 
 pub(crate) fn guest_memmove(destination: u64, source: u64, length: u64) -> u64 {
@@ -307,6 +334,7 @@ pub(crate) fn guest_memmove(destination: u64, source: u64, length: u64) -> u64 {
     unsafe {
         std::ptr::copy(source as *const u8, destination as *mut u8, length);
     }
+    journal_guest_copy(destination, length);
     destination
 }
 
@@ -374,6 +402,13 @@ pub(crate) fn guest_mspace_calloc(arguments: [u64; 6], state: &mut ProbeDispatch
         };
         // SAFETY: The mspace allocator returned a live block of at least `size` bytes.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0, size) };
+        remu_memory::record_guest_write(
+            remu_memory::GuestWriteSite::MspaceZero,
+            address,
+            size as u64,
+            &[0; 8][..size.min(8)],
+            0,
+        );
     }
     address
 }

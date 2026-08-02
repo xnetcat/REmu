@@ -374,6 +374,16 @@ impl GuestAddressSpace {
                 let backing = self.committed_backing()?;
                 let backing_offset = sub_start - self.base().get();
                 self.map_host_shared(sub_start, sub_size, protection, &backing, backing_offset)?;
+                // Committing a Reserved range replaces whatever the VA showed with the backing's
+                // pages. If a VMA-kind desync ever marks a populated range Reserved, this is the
+                // silent bulk zero that destroys it — record it so a crash can say so.
+                crate::record_guest_write(
+                    crate::GuestWriteSite::MapCommit,
+                    sub_start,
+                    sub_size,
+                    &[0],
+                    0,
+                );
                 if let Some(vma) = self.vmas.get_mut(&sub_start) {
                     vma.kind = VmaKind::Committed(backing);
                     vma.backing_offset = backing_offset;

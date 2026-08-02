@@ -1320,6 +1320,13 @@ fn av_player_write_video_frame(
     player.next_video_buffer = (player.next_video_buffer + 1) % 3;
     // SAFETY: the destination is one complete slice of the dedicated three-frame allocation.
     unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), address as *mut u8, frame.len()) };
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::AvPlayerFrame,
+        address,
+        frame.len() as u64,
+        &frame[..frame.len().min(4096)],
+        0,
+    );
     let _ = notify_guest_memory_written(address, u64::try_from(frame.len()).unwrap_or(u64::MAX));
     av_player_write_video_frame_info(
         output,
@@ -2151,6 +2158,13 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
             FRAME_BYTES,
         )
     };
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::AvPlayerFrame,
+        address,
+        FRAME_BYTES as u64,
+        &player.raw_audio_frame[..FRAME_BYTES.min(4096)],
+        0,
+    );
     let timestamp = player
         .next_audio_frame
         .saturating_mul(SAMPLES_PER_FRAME as u64)

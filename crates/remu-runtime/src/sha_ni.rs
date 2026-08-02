@@ -85,8 +85,46 @@ extern "C" fn sha_ni_sigill_handler(
         RECOVERED.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    report_unrecovered_sigill(information, context);
     unsafe { chain_previous_sigill(signal, information, context) };
 }
+
+/// A SIGILL nobody recovers is a crash that previously died with no pc, no registers and no
+/// journal (exit 132, three of fifteen soak runs). Report it through the same signal-safe path
+/// as the protection faults before the default disposition kills the process.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn report_unrecovered_sigill(information: *mut libc::siginfo_t, context: *mut std::ffi::c_void) {
+    let fault_address = if information.is_null() {
+        0
+    } else {
+        // SAFETY: SA_SIGINFO delivers a live siginfo_t for the duration of the handler.
+        unsafe { (*information).si_addr as u64 }
+    };
+    let mut pc = 0_u64;
+    let mut anchors = [0_u64; 16];
+    let mut anchor_count = 0;
+    if !context.is_null() {
+        // SAFETY: SA_SIGINFO delivers a live ucontext_t for the duration of the handler.
+        let ucontext = unsafe { &*context.cast::<libc::ucontext_t>() };
+        if !ucontext.uc_mcontext.is_null() {
+            // SAFETY: uc_mcontext points at the faulting thread's Darwin mcontext.
+            let state = unsafe { &(*ucontext.uc_mcontext).__ss };
+            pc = state.__rip;
+            for value in [
+                state.__rax, state.__rbx, state.__rcx, state.__rdx, state.__rdi, state.__rsi,
+                state.__rbp, state.__rsp, state.__r8, state.__r9, state.__r10, state.__r11,
+                state.__r12, state.__r13, state.__r14, state.__r15,
+            ] {
+                anchors[anchor_count] = value;
+                anchor_count += 1;
+            }
+        }
+    }
+    remu_memory::report_unrecovered_signal(b"SIGILL", pc, fault_address, &anchors[..anchor_count]);
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn report_unrecovered_sigill(_information: *mut libc::siginfo_t, _context: *mut std::ffi::c_void) {}
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 fn try_recover_sha_ni(context: *mut std::ffi::c_void) -> bool {

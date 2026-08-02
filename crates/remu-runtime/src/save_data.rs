@@ -747,6 +747,13 @@ pub(crate) fn write_guest_bytes(address: u64, source: &[u8]) {
     unsafe {
         std::ptr::copy_nonoverlapping(source.as_ptr(), address as *mut u8, source.len());
     }
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::RuntimeBytes,
+        address,
+        source.len() as u64,
+        &source[..source.len().min(4096)],
+        0,
+    );
 }
 
 fn save_data_directory_stats(root: &Path) -> std::io::Result<(u64, i64)> {
