@@ -111,6 +111,64 @@ fn vector_only_scalar_sources_do_not_become_evaluation_inputs() {
 }
 
 #[test]
+fn recurrence_liveness_tracks_only_observable_scalar_load_offsets() {
+    let scalar_load = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Smem,
+        opcode: Opcode::from_static("SLoadDwordx2"),
+        words: vec![0, 0],
+        sources: vec![Operand::scalar(4)],
+        destinations: vec![Operand::scalar(16), Operand::scalar(17)],
+        control: Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+            destination_count: 2,
+            immediate_offset_bytes: 0,
+            dynamic_offset_register: Some(12),
+        })),
+    };
+    let end = Instruction {
+        pc: 16,
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::END_PROGRAM,
+        words: vec![0],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    };
+
+    let dead = Program::new(0x1000, vec![scalar_load.clone(), end.clone()]);
+    let dead_live = dead.evaluation_live_scalar_register_indices(0);
+    assert!(dead_live.contains(&4) && dead_live.contains(&5));
+    assert!(!dead_live.contains(&12));
+
+    let global = Instruction {
+        pc: 8,
+        encoding: ShaderEncoding::Flat,
+        opcode: Opcode::from_static("GlobalLoadDword"),
+        words: vec![0, 0],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+            dword_count: 1,
+            vector_address: 0,
+            vector_data: 0,
+            vector_destination: 0,
+            scalar_address: Some(16),
+            offset_bytes: 0,
+            dlc: false,
+            lds: false,
+            glc: false,
+            slc: false,
+        })),
+    };
+    let live = Program::new(0x1000, vec![scalar_load, global, end]);
+    assert!(
+        live.evaluation_live_scalar_register_indices(0)
+            .contains(&12),
+        "offset is observable when the loaded pointer selects a later binding"
+    );
+}
+
+#[test]
 fn branched_programs_keep_conservative_shader_inputs() {
     let program = Program::new(
         0x1000,

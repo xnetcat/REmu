@@ -30,15 +30,130 @@ const SCALAR_LIVE_WORDS: usize = 4;
 
 type ScalarLiveSet = [u64; SCALAR_LIVE_WORDS];
 
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct EvaluationLiveSet {
+    registers: ScalarLiveSet,
+    scalar_condition: bool,
+}
+
+fn scalar_operand_width(instruction: &Instruction) -> u32 {
+    if instruction
+        .opcode
+        .known_name()
+        .is_some_and(|name| name.ends_with("B64") || name.ends_with("I64") || name.ends_with("U64"))
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn scalar_instruction_defines_condition(instruction: &Instruction) -> bool {
+    if instruction.encoding == ShaderEncoding::Sopc
+        || (instruction.encoding == ShaderEncoding::Sopk && instruction.opcode.starts_with("SCmpk"))
+    {
+        return true;
+    }
+    matches!(
+        instruction.opcode.known_name(),
+        Some(
+            "SNotB32"
+                | "SBrevB32"
+                | "SBcnt1I32B32"
+                | "SFF1I32B32"
+                | "SBcnt1I32B64"
+                | "SNotB64"
+                | "SWqmB64"
+                | "SLshlB64"
+                | "SLshrB64"
+                | "SAshrI64"
+                | "SBfeU64"
+                | "SBfeI64"
+                | "SCselectB64"
+                | "SAndB64"
+                | "SOrB64"
+                | "SXorB64"
+                | "SAndn2B64"
+                | "SOrn2B64"
+                | "SNandB64"
+                | "SNorB64"
+                | "SXnorB64"
+                | "SAddU32"
+                | "SSubU32"
+                | "SAddI32"
+                | "SSubI32"
+                | "SAddcU32"
+                | "SSubbU32"
+                | "SMinI32"
+                | "SMinU32"
+                | "SMaxI32"
+                | "SMaxU32"
+                | "SAndB32"
+                | "SOrB32"
+                | "SXorB32"
+                | "SAndn2B32"
+                | "SOrn2B32"
+                | "SNandB32"
+                | "SNorB32"
+                | "SXnorB32"
+                | "SLshlB32"
+                | "SLshrB32"
+                | "SAshrI32"
+                | "SBfeU32"
+                | "SBfeI32"
+                | "SAbsdiffI32"
+                | "SLshl1AddU32"
+                | "SLshl2AddU32"
+                | "SLshl3AddU32"
+                | "SLshl4AddU32"
+                | "SAndSaveexecB32"
+                | "SOrSaveexecB32"
+                | "SXorSaveexecB32"
+                | "SAndn1SaveexecB32"
+                | "SAndn2SaveexecB32"
+                | "SOrn1SaveexecB32"
+                | "SOrn2SaveexecB32"
+                | "SNandSaveexecB32"
+                | "SNorSaveexecB32"
+                | "SXnorSaveexecB32"
+                | "SAndSaveexecB64"
+                | "SOrSaveexecB64"
+                | "SXorSaveexecB64"
+                | "SAndn1SaveexecB64"
+                | "SAndn2SaveexecB64"
+                | "SOrn1SaveexecB64"
+                | "SOrn2SaveexecB64"
+                | "SNandSaveexecB64"
+                | "SNorSaveexecB64"
+                | "SXnorSaveexecB64"
+        )
+    )
+}
+
+fn scalar_instruction_reads_condition(instruction: &Instruction) -> bool {
+    matches!(
+        instruction.opcode.known_name(),
+        Some("SCselectB32" | "SCselectB64" | "SAddcU32" | "SSubbU32")
+    ) || instruction
+        .sources
+        .iter()
+        .any(|operand| operand.kind == OperandKind::EncodedConstant && operand.value == 253)
+}
+
+fn scalar_destination_is_also_source(instruction: &Instruction) -> bool {
+    matches!(
+        instruction.opcode.known_name(),
+        Some("SAddkI32" | "SMulkI32" | "SBitset1B32")
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn evaluation_scalar_liveness(
     instructions: &[Instruction],
     next_evaluation_instruction_indices: &[u32],
     linked_transfer_targets: &BTreeMap<u32, u32>,
-) -> Vec<Vec<u8>> {
+) -> (Vec<Vec<u8>>, Vec<bool>) {
     let instruction_count = instructions.len();
-    let mut uses = vec![[0_u64; SCALAR_LIVE_WORDS]; instruction_count];
-    let mut definitions = vec![[0_u64; SCALAR_LIVE_WORDS]; instruction_count];
     let mut successors = vec![Vec::<usize>::with_capacity(2); instruction_count];
 
     let next_evaluation = |index: usize| {
@@ -53,54 +168,6 @@ pub(crate) fn evaluation_scalar_liveness(
         if !instruction_requires_evaluation(instruction) {
             continue;
         }
-        for operand in &instruction.sources {
-            if operand.kind == OperandKind::ScalarRegister {
-                scalar_live_insert_range(&mut uses[index], operand.value, 2);
-            }
-        }
-        match instruction.control.as_ref() {
-            Some(InstructionControl::Image(image)) => {
-                scalar_live_insert_range(&mut uses[index], image.scalar_resource, 8);
-                scalar_live_insert_range(&mut uses[index], image.scalar_sampler, 4);
-            }
-            Some(InstructionControl::GlobalMemory(global)) => {
-                if let Some(register) = global.scalar_address {
-                    scalar_live_insert_range(&mut uses[index], register, 2);
-                }
-            }
-            Some(InstructionControl::BufferMemory(buffer)) => {
-                scalar_live_insert_range(&mut uses[index], buffer.scalar_resource, 4);
-            }
-            Some(InstructionControl::ScalarMemory(scalar)) => {
-                if matches!(
-                    instruction.encoding,
-                    ShaderEncoding::Smem | ShaderEncoding::Smrd
-                ) && let Some(base) = instruction.sources.first()
-                    && base.kind == OperandKind::ScalarRegister
-                {
-                    scalar_live_insert_range(&mut uses[index], base.value, 4);
-                }
-                if let Some(register) = scalar.dynamic_offset_register {
-                    scalar_live_insert_range(&mut uses[index], register, 2);
-                }
-            }
-            _ => {}
-        }
-        match instruction.opcode.known_name() {
-            Some("SCbranchVccz" | "SCbranchVccnz") => {
-                scalar_live_insert_range(&mut uses[index], 106, 2);
-            }
-            Some("SCbranchExecz" | "SCbranchExecnz") => {
-                scalar_live_insert_range(&mut uses[index], 126, 2);
-            }
-            _ => {}
-        }
-        for operand in &instruction.destinations {
-            if operand.kind == OperandKind::ScalarRegister {
-                scalar_live_insert_range(&mut definitions[index], operand.value, 1);
-            }
-        }
-
         let name = instruction.opcode.known_name();
         if instruction.opcode == Opcode::END_PROGRAM || matches!(name, Some("SSwappcB64")) {
             continue;
@@ -143,23 +210,134 @@ pub(crate) fn evaluation_scalar_liveness(
         }
     }
 
-    let mut live_in = vec![[0_u64; SCALAR_LIVE_WORDS]; instruction_count];
+    let mut live_in = vec![EvaluationLiveSet::default(); instruction_count];
     loop {
         let mut changed = false;
         for index in (0..instruction_count).rev() {
             if !instruction_requires_evaluation(&instructions[index]) {
                 continue;
             }
-            let mut live_out = [0_u64; SCALAR_LIVE_WORDS];
+            let instruction = &instructions[index];
+            let mut live_out = EvaluationLiveSet::default();
             for &successor in &successors[index] {
                 for word in 0..SCALAR_LIVE_WORDS {
-                    live_out[word] |= live_in[successor][word];
+                    live_out.registers[word] |= live_in[successor].registers[word];
+                }
+                live_out.scalar_condition |= live_in[successor].scalar_condition;
+            }
+
+            let compare_k = instruction.encoding == ShaderEncoding::Sopk
+                && instruction.opcode.starts_with("SCmpk");
+            let destination_live = instruction.destinations.iter().any(|operand| {
+                operand.kind == OperandKind::ScalarRegister
+                    && scalar_live_contains(&live_out.registers, operand.value)
+            });
+            let condition_live =
+                scalar_instruction_defines_condition(instruction) && live_out.scalar_condition;
+            let result_live = destination_live || condition_live;
+            let mut updated = live_out;
+
+            if !compare_k {
+                let destination_width = scalar_operand_width(instruction);
+                for operand in &instruction.destinations {
+                    if operand.kind == OperandKind::ScalarRegister {
+                        scalar_live_remove_range(
+                            &mut updated.registers,
+                            operand.value,
+                            destination_width,
+                        );
+                    }
                 }
             }
-            let mut updated = uses[index];
-            for word in 0..SCALAR_LIVE_WORDS {
-                updated[word] |= live_out[word] & !definitions[index][word];
+            if scalar_instruction_defines_condition(instruction) {
+                updated.scalar_condition = false;
             }
+
+            match instruction.control.as_ref() {
+                Some(InstructionControl::Image(image)) => {
+                    scalar_live_insert_range(&mut updated.registers, image.scalar_resource, 8);
+                    if instruction.opcode.starts_with("ImageSample")
+                        || instruction.opcode.starts_with("ImageGather")
+                    {
+                        scalar_live_insert_range(&mut updated.registers, image.scalar_sampler, 4);
+                    }
+                }
+                Some(InstructionControl::GlobalMemory(global)) => {
+                    if let Some(register) = global.scalar_address {
+                        scalar_live_insert_range(&mut updated.registers, register, 2);
+                    }
+                }
+                Some(InstructionControl::BufferMemory(buffer)) => {
+                    scalar_live_insert_range(&mut updated.registers, buffer.scalar_resource, 4);
+                }
+                Some(InstructionControl::ScalarMemory(scalar)) => {
+                    if let Some(base) = instruction.sources.first()
+                        && base.kind == OperandKind::ScalarRegister
+                    {
+                        let base_width = if instruction.opcode.starts_with("SBufferLoad") {
+                            4
+                        } else {
+                            2
+                        };
+                        scalar_live_insert_range(&mut updated.registers, base.value, base_width);
+                    }
+                    // The offset selects loaded scalar values, but not the Metal buffer identity.
+                    // It only participates in recurrence when a loaded destination can affect a
+                    // later binding or scalar branch.
+                    if destination_live && let Some(register) = scalar.dynamic_offset_register {
+                        scalar_live_insert_range(&mut updated.registers, register, 1);
+                    }
+                }
+                _ => {}
+            }
+
+            match instruction.opcode.known_name() {
+                Some("SCbranchScc0" | "SCbranchScc1") => {
+                    updated.scalar_condition = true;
+                }
+                Some("SCbranchVccz" | "SCbranchVccnz") => {
+                    scalar_live_insert_range(&mut updated.registers, 106, 2);
+                }
+                Some("SCbranchExecz" | "SCbranchExecnz") => {
+                    scalar_live_insert_range(&mut updated.registers, 126, 2);
+                }
+                _ => {}
+            }
+
+            let scalar_operation = matches!(
+                instruction.encoding,
+                ShaderEncoding::Sop1
+                    | ShaderEncoding::Sop2
+                    | ShaderEncoding::Sopc
+                    | ShaderEncoding::Sopk
+            );
+            if scalar_operation && result_live {
+                let source_width = scalar_operand_width(instruction);
+                for operand in &instruction.sources {
+                    if operand.kind == OperandKind::ScalarRegister {
+                        scalar_live_insert_range(
+                            &mut updated.registers,
+                            operand.value,
+                            source_width,
+                        );
+                    }
+                }
+                if compare_k || scalar_destination_is_also_source(instruction) {
+                    for operand in &instruction.destinations {
+                        if operand.kind == OperandKind::ScalarRegister {
+                            scalar_live_insert_range(
+                                &mut updated.registers,
+                                operand.value,
+                                source_width,
+                            );
+                        }
+                    }
+                }
+                if scalar_instruction_reads_condition(instruction) {
+                    updated.scalar_condition = true;
+                }
+            }
+
             if updated != live_in[index] {
                 live_in[index] = updated;
                 changed = true;
@@ -170,15 +348,20 @@ pub(crate) fn evaluation_scalar_liveness(
         }
     }
 
-    live_in
-        .into_iter()
+    let registers = live_in
+        .iter()
         .map(|set| {
             (0_u32..256)
-                .filter(|register| scalar_live_contains(&set, *register))
+                .filter(|register| scalar_live_contains(&set.registers, *register))
                 .filter_map(|register| u8::try_from(register).ok())
                 .collect()
         })
-        .collect()
+        .collect();
+    let scalar_conditions = live_in
+        .into_iter()
+        .map(|set| set.scalar_condition)
+        .collect();
+    (registers, scalar_conditions)
 }
 
 pub(crate) fn evaluation_branch_target(instruction: &Instruction) -> Option<u32> {
@@ -203,6 +386,14 @@ pub(crate) fn scalar_live_contains(set: &ScalarLiveSet, register: u32) -> bool {
     let word = usize::try_from(register / 64).expect("scalar register word fits usize");
     let bit = register % 64;
     (set[word] & (1_u64 << bit)) != 0
+}
+
+pub(crate) fn scalar_live_remove_range(set: &mut ScalarLiveSet, first: u32, count: u32) {
+    for register in first..first.saturating_add(count).min(256) {
+        let word = usize::try_from(register / 64).expect("scalar register word fits usize");
+        let bit = register % 64;
+        set[word] &= !(1_u64 << bit);
+    }
 }
 
 pub(crate) fn insert_scalar_range(registers: &mut BTreeSet<u32>, first: u32, count: u32) {

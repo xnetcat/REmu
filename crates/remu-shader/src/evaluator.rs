@@ -189,10 +189,9 @@ fn record_truncated_evaluation(reason: &'static str, address: u64) {
 
 /// Renders abandoned evaluation paths as report lines, one per reason, without a log prefix.
 ///
-/// Vector-controlled loops whose evaluation-live scalar state reaches an exact recurrence are
-/// complete for resource discovery and are not listed. `vector-loop-scalar-state-changed` means
-/// the loop changed state that can affect a later descriptor or scalar branch, so stopping remains
-/// a real semantic gap. The other reasons abandon a path outright.
+/// Vector-controlled loops execute until their evaluation-observable scalar state reaches an exact
+/// recurrence, so they are complete for resource discovery and are not listed. Other reasons
+/// abandon a path outright.
 #[must_use]
 pub fn truncated_evaluation_report() -> Vec<String> {
     let truncations = TRUNCATED_EVALUATIONS
@@ -334,7 +333,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         );
     }
 
-    fn trace_vector_loop_fixed_point(&self, instruction: &Instruction, header_pc: u32) {
+    fn trace_vector_loop_recurrence(&self, instruction: &Instruction, header_pc: u32, period: u64) {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         static SITES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
         if !*ENABLED.get_or_init(|| {
@@ -351,7 +350,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             return;
         }
         eprintln!(
-            "[REMu][SHADER][VECTOR-LOOP-FIXED-POINT] program={:#x} latch={address:#x} pc={:#x} header={header_pc:#x}",
+            "[REMu][SHADER][VECTOR-LOOP-RECURRENCE] program={:#x} latch={address:#x} pc={:#x} header={header_pc:#x} period={period}",
             self.state.program.address, instruction.pc
         );
     }
@@ -403,6 +402,9 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     .evaluation_live_scalar_register_indices(instruction_index),
                 path.exec_mask,
                 path.scalar_condition,
+                self.state
+                    .program
+                    .evaluation_live_scalar_condition(instruction_index),
             ),
         );
         if self.visited_paths.insert(key) {
@@ -506,29 +508,27 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                         // exit path. Scalar SCC loops have an exact direction and run until that
                         // direction exits; the evaluator-wide instruction budget remains the
                         // safety bound for malformed or genuinely non-terminating scalar code.
-                        let unconditional_latch_is_vector_controlled = if instruction
-                            .opcode
-                            .is("SBranch")
-                        {
-                            if let Some(vector_controlled) = self
-                                .backward_branch_vector_control
-                                .get(&instruction.pc)
-                                .copied()
-                            {
-                                vector_controlled
+                        let unconditional_latch_is_vector_controlled =
+                            if instruction.opcode.is("SBranch") {
+                                if let Some(vector_controlled) = self
+                                    .backward_branch_vector_control
+                                    .get(&instruction.pc)
+                                    .copied()
+                                {
+                                    vector_controlled
+                                } else {
+                                    let vector_controlled = self
+                                        .unconditional_latch_is_vector_controlled(
+                                            target_index,
+                                            instruction_index,
+                                        )?;
+                                    self.backward_branch_vector_control
+                                        .insert(instruction.pc, vector_controlled);
+                                    vector_controlled
+                                }
                             } else {
-                                let vector_controlled = self
-                                    .unconditional_latch_is_vector_controlled(
-                                        target_index,
-                                        instruction_index,
-                                    )?;
-                                self.backward_branch_vector_control
-                                    .insert(instruction.pc, vector_controlled);
-                                vector_controlled
-                            }
-                        } else {
-                            false
-                        };
+                                false
+                            };
                         let vector_controlled =
                             branch_condition_depends_on_vector_state(instruction.opcode)
                                 || unconditional_latch_is_vector_controlled;
@@ -545,23 +545,17 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                                     .evaluation_live_scalar_register_indices(target_index),
                                 path.exec_mask,
                                 path.scalar_condition,
+                                self.state
+                                    .program
+                                    .evaluation_live_scalar_condition(target_index),
                             );
-                            if let Some(previous) =
-                                path.backward_branch_recurrence(instruction.pc)
+                            if let Some(period) =
+                                path.observe_backward_branch_recurrence(instruction.pc, recurrence)
                             {
-                                if previous == &recurrence {
-                                    self.trace_vector_loop_fixed_point(instruction, target_pc);
-                                } else {
-                                    record_truncated_evaluation(
-                                        "vector-loop-scalar-state-changed",
-                                        self.state.program.instruction_address(instruction.pc),
-                                    );
-                                }
-                                path.instruction_index =
-                                    path.instruction_index.saturating_add(1);
+                                self.trace_vector_loop_recurrence(instruction, target_pc, period);
+                                path.instruction_index = path.instruction_index.saturating_add(1);
                                 continue;
                             }
-                            path.record_backward_branch_recurrence(instruction.pc, recurrence);
                             path.record_backward_branch_visit(instruction.pc);
                         }
                     }

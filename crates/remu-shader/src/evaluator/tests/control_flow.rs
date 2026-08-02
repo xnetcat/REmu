@@ -165,7 +165,7 @@ fn conversion_only_vector_alu_is_skipped_by_scalar_resource_evaluation() {
 }
 
 #[test]
-fn exits_an_unconditional_back_edge_after_discovering_the_vector_loop_once() {
+fn exits_an_unconditional_back_edge_after_reaching_an_observable_recurrence() {
     let mut exit = instruction(
         4,
         ShaderEncoding::Sopp,
@@ -215,6 +215,41 @@ fn exits_an_unconditional_back_edge_after_discovering_the_vector_loop_once() {
         EvaluationOptions::default(),
     )
     .expect("unconditional vector loop back edge must remain bounded");
+}
+
+#[test]
+fn detects_a_non_unit_scalar_recurrence_in_constant_space() {
+    let mut path = ScalarPath {
+        instruction_index: 0,
+        registers: [0; SCALAR_REGISTER_COUNT],
+        exec_mask: RDNA_WAVE_MASK,
+        scalar_condition: false,
+        supplemental: false,
+        backward_branch_visits: SmallVec::new(),
+        backward_branch_recurrences: SmallVec::new(),
+    };
+    let recurrence = |value| {
+        let mut registers = [0; SCALAR_REGISTER_COUNT];
+        registers[20] = value;
+        scalar_recurrence_state(&registers, &[20], RDNA_WAVE_MASK, false, false)
+    };
+
+    assert_eq!(
+        path.observe_backward_branch_recurrence(0x40, recurrence(1)),
+        None
+    );
+    assert_eq!(
+        path.observe_backward_branch_recurrence(0x40, recurrence(2)),
+        None
+    );
+    assert_eq!(
+        path.observe_backward_branch_recurrence(0x40, recurrence(1)),
+        None
+    );
+    assert_eq!(
+        path.observe_backward_branch_recurrence(0x40, recurrence(2)),
+        Some(2)
+    );
 }
 
 #[test]
@@ -549,6 +584,22 @@ fn nested_vector_branches_around_a_loop_stay_within_the_evaluation_budget() {
     user_data[8] = 0x4000;
     user_data[13] = 1;
     let shader = state(nested_vector_loop_program(), user_data);
+    let loop_header = shader
+        .program
+        .instructions
+        .binary_search_by_key(&0xcc, |instruction| instruction.pc)
+        .expect("Poppy-derived vector loop header");
+    let recurrence_registers = shader
+        .program
+        .evaluation_live_scalar_register_indices(loop_header);
+    assert!(
+        recurrence_registers.contains(&4),
+        "SMEM base identity must remain observable"
+    );
+    assert!(
+        !recurrence_registers.contains(&12),
+        "dead SMEM induction offset must not prevent convergence"
+    );
 
     let evaluation = evaluate_shader_within(&memory, &shader, EvaluationOptions::default(), 4096)
         .expect("nested vector control flow must terminate within a small step budget");
