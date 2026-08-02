@@ -192,9 +192,11 @@ fn explicit_host_write_notification_reaches_every_physical_alias() {
         first.get() + GUEST_PAGE_SIZE + 32,
         64
     ));
+    // Dirty tracking is host-page granular: 16 KiB natively, 4 KiB under Rosetta. The 64-byte
+    // write lands in the first host page after the guest-page boundary on either size.
     assert_eq!(
         watched_second.dirty_page_ranges(),
-        vec![(second.get() + GUEST_PAGE_SIZE, GUEST_PAGE_SIZE)]
+        vec![(second.get() + GUEST_PAGE_SIZE, page_size() as u64)]
     );
     assert_eq!(watched_second.generation(), 1);
     drop(watched_second);
