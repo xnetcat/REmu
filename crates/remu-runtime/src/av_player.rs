@@ -1254,7 +1254,10 @@ fn av_player_write_video_frame(
     let width = usize::try_from(player.width).unwrap_or(0);
     let height = usize::try_from(player.height).unwrap_or(0);
     let storage_height = height.saturating_add(15) & !15;
-    let frame = if row_pitch == width {
+    // The decoder hands over a tightly packed frame whose UV plane starts at width*height.
+    // The published layout promises UV at row_pitch*storage_height, so the packed frame can
+    // only be forwarded untouched when both dimensions already match their aligned forms.
+    let frame = if row_pitch == width && storage_height == height {
         &player.raw_video_frame
     } else {
         player.padded_video_frame.resize(frame_bytes, 0);
@@ -1305,8 +1308,12 @@ pub(crate) fn av_player_write_video_frame_info(
 ) {
     let visible_width = usize::try_from(width).unwrap_or(0);
     let visible_height = usize::try_from(height).unwrap_or(0);
+    // The width field carries the displayable extent; the storage stride lives in the pitch
+    // field at +60. Poppy Playtime scales the reported width onto the screen without reading
+    // any crop field, so reporting the pitch here squeezed the picture by pitch/width and
+    // showed the zero pad as a dead band on the right.
     let output_width = if extended {
-        row_pitch
+        visible_width
     } else {
         visible_width.saturating_add(15) & !15
     };
@@ -1326,16 +1333,9 @@ pub(crate) fn av_player_write_video_frame_info(
         write_guest_u8(output + 64, 8);
         write_guest_u8(output + 65, 8);
         // Silent Hill consumes the PS4-compatible 104-byte Gen5 VideoFrameInfoEx prefix. Crop
-        // fields are left, right, top, bottom at +44/+48/+52/+56 respectively; writing padding
-        // into left/top shifts the visible image even though its final extent happens to match.
-        write_guest_u32(
-            output + 48,
-            u32::try_from(row_pitch.saturating_sub(visible_width)).unwrap_or(0),
-        );
-        write_guest_u32(
-            output + 56,
-            u32::try_from(output_height.saturating_sub(visible_height)).unwrap_or(0),
-        );
+        // fields are left, right, top, bottom at +44/+48/+52/+56 respectively. With the width
+        // field carrying the displayable extent there is nothing left to crop, and the memset
+        // above already published zeros for every crop field.
         // Gen5 replaces the legacy integer frame-rate field with a double in the extended tail.
         write_guest_u64(output + 0x48, frames_per_second.to_bits());
     }

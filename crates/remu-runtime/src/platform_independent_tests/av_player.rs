@@ -384,7 +384,8 @@ fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[24..28].try_into().unwrap()),
-        512
+        378,
+        "the width field carries the displayable extent, not the storage pitch"
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[28..32].try_into().unwrap()),
@@ -396,7 +397,8 @@ fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[48..52].try_into().unwrap()),
-        134
+        0,
+        "a displayable width leaves nothing for the crop fields to trim"
     );
     assert_eq!(
         u32::from_ne_bytes(frame_info[52..56].try_into().unwrap()),
