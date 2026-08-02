@@ -536,6 +536,51 @@ fn np_web_api2_push_event_create_handle_allocates_offline_handles() {
 }
 
 #[test]
+fn np_web_api2_check_timeout_expires_pending_work_once() {
+    let mut state = ProbeDispatchState::default();
+    let handle = crate::np_web_api2_push_event_create_handle([1, 0, 0, 0, 0, 0], &mut state);
+    assert_eq!(handle, 1);
+    state
+        .services
+        .np_web_api2_push_event_handles
+        .get_mut(&1)
+        .unwrap()
+        .timeout
+        .deadline_microseconds = Some(1_500);
+    state.services.np_web_api2_requests.insert(
+        7,
+        crate::NpWebApi2TimeoutState {
+            deadline_microseconds: Some(1_500),
+            ..Default::default()
+        },
+    );
+
+    crate::np_web_api2_check_timeout_at(1_000, &mut state);
+    assert!(!state.services.np_web_api2_requests[&7].timed_out);
+    crate::np_web_api2_check_timeout_at(1_501, &mut state);
+    assert!(!state.services.np_web_api2_requests[&7].timed_out);
+    crate::np_web_api2_check_timeout_at(2_001, &mut state);
+
+    let request = state.services.np_web_api2_requests[&7];
+    assert!(request.timed_out);
+    assert!(request.aborted);
+    let handle = state.services.np_web_api2_push_event_handles[&1];
+    assert!(handle.timeout.timed_out);
+    assert!(handle.timeout.aborted);
+    assert_eq!(
+        dispatch_probe_import("3Tt9zL3tkoc", [0; 6], [0; 6], &mut state),
+        0
+    );
+    assert_eq!(state.services.np_web_api2_requests[&7], request);
+    assert_eq!(state.services.np_web_api2_push_event_handles[&1], handle);
+    assert_eq!(
+        crate::known_nid_name("3Tt9zL3tkoc"),
+        Some("sceNpWebApi2CheckTimeout")
+    );
+    assert!(state.unimplemented_nids.is_empty());
+}
+
+#[test]
 fn np_get_online_id_writes_a_fixed_offline_id() {
     let mut online_id = [0xff_u8; 16];
     assert_eq!(
