@@ -188,7 +188,7 @@ use self::texture::{
     retire_resident_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
     snapshot_watched_guest_range, storage_image_requires_mip_hierarchy,
-    trace_resident_texture_removal, upload_image_textures,
+    ResidentTextureMap, SpanQueryOrder, trace_resident_texture_removal, upload_image_textures,
     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
     write_watched_guest_texture_linear,
 };
@@ -206,7 +206,7 @@ use self::texture::{
     snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
 };
 use self::tiling::{
-    GuestTextureOverlapQuery, copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear,
+    ResourceSpan, copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear,
     copy_tiled_to_linear_at_z, decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
     effective_linear_pitch, encode_mode27_mip_chain_into_raw, guest_physical_ranges_overlap,
     guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
@@ -214,7 +214,7 @@ use self::tiling::{
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     mode5_mip_chain_layout, mode27_mip_chain_layout, render_resolve_candidate_matches,
-    tiled_block_dimensions,
+    spans_overlap, tiled_block_dimensions,
 };
 #[cfg(test)]
 use self::tiling::{
@@ -594,6 +594,9 @@ struct GraphicsShaderResourceKey {
 struct DecodedRenderTarget {
     guest_slot: u32,
     texture: GuestTextureDescriptor,
+    /// `texture`'s guest bytes, resolved once here so no per-draw path resolves them per
+    /// candidate. `None` when the descriptor's byte count overflows.
+    span: Option<ResourceSpan>,
     output_kind: PixelOutputKind,
     write_mask: u32,
     direct_scanout: bool,
@@ -617,6 +620,7 @@ struct DiagnosticScanoutWriter {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DecodedDepthTarget {
     texture: GuestTextureDescriptor,
+    span: Option<ResourceSpan>,
     layer_count: u32,
     htile_address: Option<u64>,
     compare: MTLCompareFunction,
@@ -1094,7 +1098,7 @@ struct DepthArrayResidentTexture {
 struct CachedSampledTexture {
     texture: Texture,
     write_watch: Arc<GuestTextureWriteWatch>,
-    overlap: GuestTextureOverlapQuery,
+    overlap: Option<ResourceSpan>,
     /// Actual Metal allocation charged to the sampled-image cache budget.
     ///
     /// Guest bytes can be block-compressed while the host texture is expanded, and generated mip
@@ -1583,6 +1587,7 @@ struct CachedNggMeshlets {
 #[derive(Clone, Copy, Debug)]
 struct DecodedImageDescriptor {
     guest: GuestTextureDescriptor,
+    span: Option<ResourceSpan>,
     destination_select: u32,
     base_mip_level: u32,
     mip_level_count: u32,
@@ -1644,7 +1649,7 @@ struct MetalPresenter {
     /// Compute dispatches whose execution failed, keyed by shader address; same contract as
     /// `dropped_draw_executions`.
     dropped_compute_executions: HashMap<u64, u64>,
-    resident_guest_textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    resident_guest_textures: ResidentTextureMap,
     /// Clean residents retired by an overlapping GPU write, kept adoptable while their write
     /// watch stays armed. Unreal sub-allocates many live surfaces inside one pooled guest
     /// allocation, so byte-overlap retirement constantly destroys clean neighbours; re-adopting
@@ -1829,7 +1834,7 @@ impl MetalPresenter {
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),
             dropped_compute_executions: HashMap::new(),
-            resident_guest_textures: HashMap::new(),
+            resident_guest_textures: ResidentTextureMap::new(),
             retired_texture_quarantine: HashMap::new(),
             depth_array_textures: HashMap::new(),
             direct_scanout_textures: HashMap::new(),

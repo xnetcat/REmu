@@ -12,7 +12,7 @@ use super::{
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
     NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    ResidentTextureActivityStamp, append_unique_global_writebacks,
+    ResidentTextureActivityStamp, SpanQueryOrder, append_unique_global_writebacks,
     append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, color_operation_is_raster_noop, compute_pipeline_key,
@@ -46,7 +46,7 @@ use super::{
     native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
     prepare_indexed_primitive, prepare_nonindexed_ngg_indices, read_draw_indices,
     read_texture_array_linear,
-    read_texture_linear, read_texture_volume_linear, rearm_color_metadata_clear,
+    read_texture_linear, read_texture_volume_linear, rearm_color_metadata_clear, spans_overlap,
     rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_scanout_writer,
     record_diagnostic_texture_writer, register_value, render_target_cmask_address,
     render_target_fast_clear_color, resident_color_view_sample_is_eligible,
@@ -576,7 +576,7 @@ impl MetalPresenter {
                 if !has_read_compatible_resident {
                     for target in &targets {
                         if descriptor.guest != target.texture
-                            && guest_texture_descriptors_overlap(descriptor.guest, target.texture)
+                            && spans_overlap(descriptor.span, target.span)
                         {
                             return Err(format!(
                                 "{} image at PC {:#x} aliases render target {} through an incompatible view",
@@ -592,7 +592,7 @@ impl MetalPresenter {
                     }
                     if let Some(depth) = depth
                         && descriptor.guest != depth.texture
-                        && guest_texture_descriptors_overlap(descriptor.guest, depth.texture)
+                        && spans_overlap(descriptor.span, depth.span)
                     {
                         return Err(format!(
                             "{} image at PC {:#x} aliases the depth target through an incompatible view",
@@ -609,7 +609,12 @@ impl MetalPresenter {
                     if storage_image_requires_mip_hierarchy(binding, descriptor) {
                         self.ensure_mipmapped_storage_texture(&device, descriptor)?;
                     } else if writable || !has_read_compatible_resident {
-                        self.ensure_resident_texture(&device, descriptor.guest)?;
+                        self.ensure_resident_texture_with_initial_contents(
+                            &device,
+                            descriptor.guest,
+                            descriptor.span,
+                            true,
+                        )?;
                     }
                 }
             }
@@ -1583,12 +1588,14 @@ impl MetalPresenter {
                     self.mark_multisample_texture_initialized(target.texture, target.sample_count);
                     self.mark_resident_texture_written_preserving_multisample_at(
                         target.texture,
+                        target.span,
                         *resident_descriptor,
                         activity_stamp,
                     );
                 } else {
                     self.mark_resident_texture_written_at(
                         target.texture,
+                        target.span,
                         *resident_descriptor,
                         activity_stamp,
                     );
@@ -1635,12 +1642,14 @@ impl MetalPresenter {
                 if depth.sample_count > 1 {
                     self.mark_resident_texture_written_preserving_multisample_at(
                         depth.texture,
+                        depth.span,
                         depth_resident_descriptor,
                         activity_stamp,
                     );
                 } else {
                     self.mark_resident_texture_written_at(
                         depth.texture,
+                        depth.span,
                         depth_resident_descriptor,
                         activity_stamp,
                     );
@@ -1677,6 +1686,7 @@ impl MetalPresenter {
                 }
                 self.mark_resident_texture_written_at(
                     texture.descriptor.guest,
+                    texture.descriptor.span,
                     texture.selected_resident,
                     activity_stamp,
                 );
@@ -2840,6 +2850,7 @@ impl MetalPresenter {
         });
         self.mark_resident_texture_written_at(
             destination.texture,
+            destination.span,
             Some(destination_resident.descriptor),
             activity_stamp,
         );
@@ -2952,12 +2963,14 @@ impl MetalPresenter {
             self.mark_multisample_texture_initialized(target.texture, target.sample_count);
             self.mark_resident_texture_written_preserving_multisample_at(
                 target.texture,
+                target.span,
                 Some(selected.descriptor),
                 activity_stamp,
             );
         } else {
             self.mark_resident_texture_written_at(
                 target.texture,
+                target.span,
                 Some(selected.descriptor),
                 activity_stamp,
             );

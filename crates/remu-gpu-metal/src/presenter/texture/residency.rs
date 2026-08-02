@@ -7,21 +7,21 @@ use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
     MultisampleTextureKey, RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidentGuestTexture,
-    ResidentTextureActivityStamp, ScanoutSnapshotTexture, TEXTURE_QUARANTINE_ADOPTED,
-    TEXTURE_QUARANTINE_REJECTED, WriteWatchRefresh,
+    ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
+    SpanQueryOrder, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED, WriteWatchRefresh,
     create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
     decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
-    guest_texture_byte_count, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    initial_depth_clear_for_target, mode27_mip_chain_layout, promote_resident_mip_hierarchy,
-    record_mode27_work_detail, refresh_resident_texture_write_watch,
-    resident_texture_eviction_plan, resident_texture_for_sample,
-    retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
-    retire_resident_textures_overlapping_writeback, retire_sampled_textures_overlapping_writeback,
-    snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
-    snapshot_watched_sampled_texture_raw, texture_element_layout, trace_residency_churn,
-    trace_resident_texture_removal, watch_guest_texture, watch_resident_texture,
-    watch_sampled_texture, write_resident_texture_contents_to_guest,
+    guest_texture_byte_count, guest_texture_descriptors_share_gpu_sample_storage,
+    guest_texture_descriptors_share_storage, initial_depth_clear_for_target,
+    mode27_mip_chain_layout, promote_resident_mip_hierarchy, record_mode27_work_detail,
+    refresh_resident_texture_write_watch, resident_texture_eviction_plan,
+    resident_texture_for_sample, retire_multisample_textures_overlapping_writeback,
+    retire_overlapping_sampled_textures, retire_resident_textures_overlapping_writeback,
+    retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
+    snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw, spans_overlap,
+    texture_element_layout, trace_resident_texture_removal, trace_residency_churn,
+    watch_guest_texture, watch_resident_texture, watch_sampled_texture,
+    write_resident_texture_contents_to_guest,
 };
 use metal::{
     Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
@@ -75,7 +75,7 @@ pub(crate) struct ResidentTextureOwnershipStats {
 }
 
 pub(crate) fn resident_texture_ownership_stats(
-    residents: &HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    residents: &ResidentTextureMap,
 ) -> ResidentTextureOwnershipStats {
     let mut stats = ResidentTextureOwnershipStats::default();
     let mut backing_bases = HashSet::new();
@@ -379,18 +379,25 @@ impl MetalPresenter {
         )
     }
 
+    /// Ensures a resident for a descriptor no decoded structure carries a span for.
+    ///
+    /// Every guest-driven path reaches residency through a decoded descriptor and passes the span
+    /// decode already resolved, so this is a test entry point.
+    #[cfg(test)]
     pub(crate) fn ensure_resident_texture(
         &mut self,
         device: &Device,
         descriptor: GuestTextureDescriptor,
     ) -> Result<SelectedResidentTexture, String> {
-        self.ensure_resident_texture_with_initial_contents(device, descriptor, true)
+        let span = ResourceSpan::for_texture(descriptor);
+        self.ensure_resident_texture_with_initial_contents(device, descriptor, span, true)
     }
 
     pub(crate) fn ensure_resident_texture_with_initial_contents(
         &mut self,
         device: &Device,
         descriptor: GuestTextureDescriptor,
+        span: Option<ResourceSpan>,
         upload_guest_contents: bool,
     ) -> Result<SelectedResidentTexture, String> {
         // Adopt before walking the alias graph: a successful adoption means no rebuild, so no
@@ -490,11 +497,17 @@ impl MetalPresenter {
                 descriptor: gpu_sample_resident,
             });
         }
-        let mut aliases = self
-            .resident_guest_textures
-            .values()
-            .filter(|resident| guest_texture_descriptors_overlap(resident.descriptor, descriptor))
-            .map(|resident| (resident.content_version, resident.descriptor))
+        let mut aliases = span
+            .iter()
+            .flat_map(|span| {
+                self.resident_guest_textures
+                    .overlapping(span, SpanQueryOrder::ResidentFirst)
+            })
+            .filter_map(|alias| {
+                self.resident_guest_textures
+                    .get(&alias)
+                    .map(|resident| (resident.content_version, resident.descriptor))
+            })
             .collect::<Vec<_>>();
         if !aliases.is_empty() {
             trace_residency_churn(
@@ -518,7 +531,7 @@ impl MetalPresenter {
             let queue = if has_gpu_written_alias {
                 self.flush_guest_command_batch(false, GuestBatchFlushReason::CpuSynchronization)?;
                 self.multisample_textures.retain(|key, _| {
-                    !guest_texture_descriptors_overlap(key.descriptor, descriptor)
+                    !spans_overlap(ResourceSpan::for_texture(key.descriptor), span)
                 });
                 Some(
                     self.command_queue
@@ -670,13 +683,14 @@ impl MetalPresenter {
                 batch.close_active_pass_encoders();
                 batch.command_buffer.clone()
             };
-            retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
+            retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.span);
             let resident = self
                 .resident_guest_textures
                 .remove(&target.texture)
                 .expect("selected GPU-written target exists");
             let descriptor = DecodedImageDescriptor {
                 guest: target.texture,
+                span: target.span,
                 destination_select: 0,
                 base_mip_level: 0,
                 mip_level_count: target.mip_level_count,
@@ -701,7 +715,7 @@ impl MetalPresenter {
         if let Some(resident) = self.resident_guest_textures.remove(&target.texture) {
             trace_resident_texture_removal("mipmapped-target-resident-replaced", &resident);
         }
-        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
+        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.span);
         let started = Instant::now();
         let layout = mode27_mip_chain_layout(target.texture, target.mip_level_count)?;
         let write_watch = watch_resident_texture(
@@ -766,6 +780,7 @@ impl MetalPresenter {
                 self.ensure_resident_texture_with_initial_contents(
                     device,
                     target.texture,
+                    target.span,
                     !discard_guest_contents,
                 )
             } else {
@@ -822,9 +837,10 @@ impl MetalPresenter {
         if let Some(resident) = self.resident_guest_textures.remove(&target.texture) {
             trace_resident_texture_removal("layered-target-resident-replaced", &resident);
         }
-        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.texture);
+        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.span);
         let descriptor = DecodedImageDescriptor {
             guest: target.texture,
+            span: target.span,
             destination_select: 0,
             base_mip_level: 0,
             mip_level_count: 1,
@@ -871,7 +887,12 @@ impl MetalPresenter {
         minimum_height: u32,
     ) -> Result<SelectedResidentTexture, String> {
         let selected = if depth.layer_count == 1 {
-            self.ensure_resident_texture(device, depth.texture)?
+            self.ensure_resident_texture_with_initial_contents(
+                device,
+                depth.texture,
+                depth.span,
+                true,
+            )?
         } else {
             self.ensure_layered_depth_render_target_texture(device, depth)?
         };
@@ -1063,6 +1084,7 @@ impl MetalPresenter {
 
         let descriptor = DecodedImageDescriptor {
             guest: depth.texture,
+            span: depth.span,
             destination_select: 0,
             base_mip_level: 0,
             mip_level_count: 1,
@@ -1233,6 +1255,7 @@ impl MetalPresenter {
     pub(crate) fn mark_resident_texture_written(&mut self, descriptor: GuestTextureDescriptor) {
         self.mark_resident_texture_written_at(
             descriptor,
+            ResourceSpan::for_texture(descriptor),
             None,
             ResidentTextureActivityStamp::default(),
         );
@@ -1240,27 +1263,31 @@ impl MetalPresenter {
 
     /// Records a GPU write against `descriptor`'s resident and retires its stale interpretations.
     ///
-    /// `selected_resident` is the residency key the ensure path actually served this write's
-    /// texture from. Only attribution follows it; sampled and multisample retirement stay keyed
-    /// on `descriptor`, because the written bytes are the ones the guest descriptor names.
+    /// `span` is `descriptor`'s span as the decode path resolved it. `selected_resident` is the
+    /// residency key the ensure path actually served this write's texture from. Only attribution
+    /// follows it; sampled and multisample retirement stay keyed on `descriptor`, because the
+    /// written bytes are the ones the guest descriptor names.
     pub(crate) fn mark_resident_texture_written_at(
         &mut self,
         descriptor: GuestTextureDescriptor,
+        span: Option<ResourceSpan>,
         selected_resident: Option<GuestTextureDescriptor>,
         activity_stamp: ResidentTextureActivityStamp,
     ) {
         self.mark_resident_texture_written_preserving_multisample_at(
             descriptor,
+            span,
             selected_resident,
             activity_stamp,
         );
         self.multisample_textures
-            .retain(|key, _| !guest_texture_descriptors_overlap(key.descriptor, descriptor));
+            .retain(|key, _| !spans_overlap(ResourceSpan::for_texture(key.descriptor), span));
     }
 
     pub(crate) fn mark_resident_texture_written_preserving_multisample_at(
         &mut self,
         descriptor: GuestTextureDescriptor,
+        span: Option<ResourceSpan>,
         selected_resident: Option<GuestTextureDescriptor>,
         activity_stamp: ResidentTextureActivityStamp,
     ) {
@@ -1294,14 +1321,18 @@ impl MetalPresenter {
             // second clean view must not evict and immediately reconstruct the first one. Once a
             // view is actually written, however, every other clean overlapping interpretation is
             // stale and can be retired without a writeback.
-            let stale_aliases = self
-                .resident_guest_textures
+            let stale_aliases = span
                 .iter()
-                .filter_map(|(candidate, resident)| {
-                    (*candidate != resident_descriptor
-                        && !resident.gpu_written
-                        && guest_texture_descriptors_overlap(*candidate, descriptor))
-                    .then_some(*candidate)
+                .flat_map(|span| {
+                self.resident_guest_textures
+                    .overlapping(span, SpanQueryOrder::ResidentFirst)
+            })
+                .filter(|candidate| {
+                    *candidate != resident_descriptor
+                        && self
+                            .resident_guest_textures
+                            .get(candidate)
+                            .is_some_and(|resident| !resident.gpu_written)
                 })
                 .collect::<Vec<_>>();
             for stale_alias in stale_aliases {
@@ -1322,7 +1353,7 @@ impl MetalPresenter {
             resident.content_version = self.resident_content_version;
             resident.note_gpu_write();
         }
-        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, descriptor);
+        retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, span);
     }
 
     pub(crate) fn note_resident_texture_read_at(
@@ -1405,7 +1436,7 @@ pub(crate) enum QuarantineAdoption {
 
 pub(crate) fn adopt_quarantined_resident(
     descriptor: GuestTextureDescriptor,
-    resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    resident_guest_textures: &mut ResidentTextureMap,
     retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     adoption: QuarantineAdoption,
 ) -> Result<(), String> {
@@ -1435,7 +1466,7 @@ pub(crate) fn adopt_quarantined_resident(
 pub(crate) fn ensure_resident_texture_in_map(
     device: &Device,
     descriptor: GuestTextureDescriptor,
-    resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    resident_guest_textures: &mut ResidentTextureMap,
     retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     upload_guest_contents: bool,
 ) -> Result<Texture, String> {

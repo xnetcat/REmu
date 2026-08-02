@@ -463,6 +463,7 @@ fn pre_pixel_shader_diagnostic_can_capture_an_exact_resident_mode27_target() {
     let target = DecodedRenderTarget {
         guest_slot: 0,
         texture: descriptor,
+        span: super::ResourceSpan::for_texture(descriptor),
         output_kind: PixelOutputKind::Float,
         write_mask: 0xf,
         direct_scanout: false,

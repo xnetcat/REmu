@@ -3,13 +3,13 @@
 
 use super::{
     GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
-    ResidentTextureActivityStamp, append_unique_global_writebacks,
+    ResidentTextureActivityStamp, SpanQueryOrder, append_unique_global_writebacks,
     append_unique_guest_write_ranges, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, compute_pipeline_key, compute_program_can_split_wave64,
     create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
-    dump_msl_compute_filter_matches, guest_texture_descriptors_overlap,
-    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    read_texture_linear, rearm_color_metadata_clear, rearm_depth_metadata_clear,
+    dump_msl_compute_filter_matches, image_resource_descriptor_is_null, is_storage_image_opcode,
+    is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
+    rearm_depth_metadata_clear,
     record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     sampled_image_bindings, shader_scalar_metadata_for_registers,
@@ -122,16 +122,15 @@ impl MetalPresenter {
                 && !has_read_compatible_resident
                 && trace_target_sampling()
             {
-                let overlapping = self
-                    .resident_guest_textures
-                    .values()
-                    .filter(|resident| {
-                        resident.gpu_written
-                            && guest_texture_descriptors_overlap(
-                                resident.descriptor,
-                                descriptor.guest,
-                            )
+                let overlapping = descriptor
+                    .span
+                    .iter()
+                    .flat_map(|span| {
+                        self.resident_guest_textures
+                            .overlapping(span, SpanQueryOrder::ResidentFirst)
                     })
+                    .filter_map(|alias| self.resident_guest_textures.get(&alias))
+                    .filter(|resident| resident.gpu_written)
                     .map(|resident| {
                         (
                             resident.descriptor.address,
@@ -172,7 +171,12 @@ impl MetalPresenter {
                     binding.opcode,
                     has_read_compatible_resident,
                 ) {
-                    self.ensure_resident_texture(&device, descriptor.guest)?;
+                    self.ensure_resident_texture_with_initial_contents(
+                        &device,
+                        descriptor.guest,
+                        descriptor.span,
+                        true,
+                    )?;
                 }
             }
         }
@@ -379,6 +383,7 @@ impl MetalPresenter {
                 }
                 self.mark_resident_texture_written_at(
                     texture.descriptor.guest,
+                    texture.descriptor.span,
                     texture.selected_resident,
                     activity_stamp,
                 );

@@ -12,14 +12,15 @@ use std::collections::HashMap;
 
 use super::super::refresh_resident_texture_write_watch;
 use super::super::texture::{
-    QuarantineAdoption, adopt_quarantined_resident, ensure_resident_texture_in_map,
+    QuarantineAdoption, ResidentSpanIndex, ResidentTextureMap, SpanQueryOrder,
+    adopt_quarantined_resident, ensure_resident_texture_in_map,
 };
 use super::super::{
     RESIDENT_WRITE_ATTRIBUTION_MISSES, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
 use super::{
-    DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter,
+    DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, ResourceSpan,
     ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
     apply_image_destination_select, comparison_depth32_upload, create_sampled_guest_texture,
     decode_guest_texture_linear_from_raw, decode_image_descriptor, depth_array_face_descriptor,
@@ -356,16 +357,18 @@ fn layered_depth_sample_faces_resolve_to_per_face_depth_targets() {
     // six-layer R16Unorm array SRD. Each layer must resolve to the matching per-face depth
     // descriptor so the faces can be served on the GPU instead of round-tripping through guest
     // memory every frame.
+    let sampled_guest = GuestTextureDescriptor {
+        address: 0x70_6969_0000,
+        width: 1024,
+        height: 1024,
+        pitch: 1024,
+        tile_mode: 24,
+        pixel_format: MTLPixelFormat::R16Unorm,
+        bytes_per_pixel: 2,
+    };
     let sampled = DecodedImageDescriptor {
-        guest: GuestTextureDescriptor {
-            address: 0x70_6969_0000,
-            width: 1024,
-            height: 1024,
-            pitch: 1024,
-            tile_mode: 24,
-            pixel_format: MTLPixelFormat::R16Unorm,
-            bytes_per_pixel: 2,
-        },
+        guest: sampled_guest,
+        span: ResourceSpan::for_texture(sampled_guest),
         destination_select: 0x924,
         base_mip_level: 0,
         mip_level_count: 1,
@@ -410,16 +413,18 @@ fn layered_depth_sample_faces_resolve_to_per_face_depth_targets() {
 
 #[test]
 fn layered_depth_sample_requires_every_face_before_skipping_alias_writeback() {
+    let sampled_guest = GuestTextureDescriptor {
+        address: 0x70_6969_0000,
+        width: 1024,
+        height: 1024,
+        pitch: 1024,
+        tile_mode: 24,
+        pixel_format: MTLPixelFormat::R16Unorm,
+        bytes_per_pixel: 2,
+    };
     let sampled = DecodedImageDescriptor {
-        guest: GuestTextureDescriptor {
-            address: 0x70_6969_0000,
-            width: 1024,
-            height: 1024,
-            pitch: 1024,
-            tile_mode: 24,
-            pixel_format: MTLPixelFormat::R16Unorm,
-            bytes_per_pixel: 2,
-        },
+        guest: sampled_guest,
+        span: ResourceSpan::for_texture(sampled_guest),
         destination_select: 0x924,
         base_mip_level: 0,
         mip_level_count: 1,
@@ -772,7 +777,7 @@ fn a_clean_retired_resident_is_adopted_from_quarantine_without_a_rebuild() {
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         bytes_per_pixel: 4,
     };
-    let mut residents = HashMap::new();
+    let mut residents = ResidentTextureMap::new();
     let mut quarantine = HashMap::new();
     let original =
         ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut quarantine, true)
@@ -830,7 +835,7 @@ fn a_guest_write_makes_a_quarantined_resident_rebuild_instead_of_adopt() {
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         bytes_per_pixel: 4,
     };
-    let mut residents = HashMap::new();
+    let mut residents = ResidentTextureMap::new();
     let mut quarantine = HashMap::new();
     let original =
         ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut quarantine, true)
@@ -900,7 +905,7 @@ fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         bytes_per_pixel: 4,
     };
-    let mut residents = HashMap::new();
+    let mut residents = ResidentTextureMap::new();
     ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut HashMap::new(), true)
         .expect("resident with initialized content baseline");
     {
@@ -978,7 +983,7 @@ fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         bytes_per_pixel: 4,
     };
-    let mut residents = HashMap::new();
+    let mut residents = ResidentTextureMap::new();
     ensure_resident_texture_in_map(&device, descriptor, &mut residents, &mut HashMap::new(), false)
         .expect("discarded render target with a CPU baseline");
     {
@@ -1651,16 +1656,18 @@ fn accepts_a_nonzero_sampled_mip_view() {
 
 #[test]
 fn mode5_sampled_mip_range_covers_the_packed_prefix_and_deferred_base_image() {
+    const MODE5_HIERARCHY: GuestTextureDescriptor = GuestTextureDescriptor {
+        address: 0x70_2754_1000,
+        width: 512,
+        height: 512,
+        pitch: 512,
+        tile_mode: 5,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
     let descriptor = DecodedImageDescriptor {
-        guest: GuestTextureDescriptor {
-            address: 0x70_2754_1000,
-            width: 512,
-            height: 512,
-            pitch: 512,
-            tile_mode: 5,
-            pixel_format: MTLPixelFormat::RGBA8Unorm,
-            bytes_per_pixel: 4,
-        },
+        guest: MODE5_HIERARCHY,
+        span: ResourceSpan::for_texture(MODE5_HIERARCHY),
         destination_select: 0xfac,
         base_mip_level: 0,
         mip_level_count: 10,
@@ -1688,16 +1695,18 @@ fn mode5_sampled_mip_range_covers_the_packed_prefix_and_deferred_base_image() {
 
 #[test]
 fn mode5_cube_mip_range_uses_one_complete_chain_per_face() {
+    const CUBE_FACE: GuestTextureDescriptor = GuestTextureDescriptor {
+        address: 0x70_3000_0000,
+        width: 256,
+        height: 256,
+        pitch: 256,
+        tile_mode: 5,
+        pixel_format: MTLPixelFormat::RGBA16Float,
+        bytes_per_pixel: 8,
+    };
     let descriptor = DecodedImageDescriptor {
-        guest: GuestTextureDescriptor {
-            address: 0x70_3000_0000,
-            width: 256,
-            height: 256,
-            pitch: 256,
-            tile_mode: 5,
-            pixel_format: MTLPixelFormat::RGBA16Float,
-            bytes_per_pixel: 8,
-        },
+        guest: CUBE_FACE,
+        span: ResourceSpan::for_texture(CUBE_FACE),
         destination_select: 0xfac,
         base_mip_level: 0,
         mip_level_count: 9,
@@ -2122,6 +2131,7 @@ fn resident_pressure_eviction_retiles_gpu_pixels_before_removal() {
     );
     presenter.mark_resident_texture_written_at(
         descriptor,
+        ResourceSpan::for_texture(descriptor),
         None,
         ResidentTextureActivityStamp { work: 10, flip: 1 },
     );
@@ -2175,6 +2185,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
     };
     let descriptor = DecodedImageDescriptor {
         guest,
+        span: ResourceSpan::for_texture(guest),
         destination_select: 0x22c,
         base_mip_level: 2,
         mip_level_count: 1,
@@ -2340,6 +2351,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let complete = super::DecodedImageDescriptor {
         guest,
+        span: ResourceSpan::for_texture(guest),
         destination_select: 0x22c,
         base_mip_level: 0,
         mip_level_count: 6,
@@ -2380,6 +2392,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
 
     let sampled = super::DecodedImageDescriptor {
         guest,
+        span: ResourceSpan::for_texture(guest),
         destination_select: 0x22c,
         base_mip_level: 2,
         mip_level_count: 2,
@@ -2412,17 +2425,19 @@ fn creates_exact_initial_mode27_base_three_and_seven_views() {
     let Some(device) = Device::system_default() else {
         return;
     };
+    const EXACT_VIEW: GuestTextureDescriptor = GuestTextureDescriptor {
+        address: 0x80c0_0000_00,
+        width: 1_024,
+        height: 1_024,
+        pitch: 1_024,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
     for base_mip_level in [3, 7] {
         let descriptor = super::DecodedImageDescriptor {
-            guest: GuestTextureDescriptor {
-                address: 0x80c0_0000_00,
-                width: 1_024,
-                height: 1_024,
-                pitch: 1_024,
-                tile_mode: 27,
-                pixel_format: MTLPixelFormat::RGBA8Unorm,
-                bytes_per_pixel: 4,
-            },
+            guest: EXACT_VIEW,
+            span: ResourceSpan::for_texture(EXACT_VIEW),
             destination_select: 0xfac,
             base_mip_level,
             mip_level_count: 1,
@@ -3048,9 +3063,9 @@ fn shared_backing_aliases_reuse_identical_metal_storage() {
 
     assert!(guest_texture_descriptors_overlap(first, second));
     assert!(guest_texture_descriptors_share_storage(first, second));
-    let overlap = GuestTextureOverlapQuery::new(first);
-    assert!(overlap.overlaps(second));
-    assert!(!overlap.overlaps(GuestTextureDescriptor {
+    let overlap = ResourceSpan::for_texture(first).expect("first span");
+    assert!(overlap.overlaps_texture(second));
+    assert!(!overlap.overlaps_texture(GuestTextureDescriptor {
         address: second.address + GUEST_PAGE_SIZE,
         ..second
     }));
@@ -3099,7 +3114,7 @@ fn cached_overlap_identity_survives_original_virtual_address_rebinding() {
         address: alias.get(),
         ..original_descriptor
     };
-    let cached = GuestTextureOverlapQuery::new(original_descriptor);
+    let cached = ResourceSpan::for_texture(original_descriptor).expect("cached span");
 
     memory.unmap(original, GUEST_PAGE_SIZE).unwrap();
     memory
@@ -3113,13 +3128,13 @@ fn cached_overlap_identity_survives_original_virtual_address_rebinding() {
         )
         .unwrap();
 
-    let written_alias = GuestTextureOverlapQuery::new(alias_descriptor);
+    let written_alias = ResourceSpan::for_texture(alias_descriptor).expect("alias span");
     assert!(
-        !written_alias.overlaps(original_descriptor),
+        !written_alias.overlaps_texture(original_descriptor),
         "resolving the cached descriptor again observes the replacement backing",
     );
     assert!(
-        written_alias.overlaps_query(&cached),
+        written_alias.overlaps(&cached),
         "the admission-time identity continues to name the cached physical storage",
     );
 }
@@ -3175,6 +3190,7 @@ fn gpu_written_resident_serving_sampled_key_prefers_the_newest_gpu_written_resid
     let key = sampled_texture_key(
         DecodedImageDescriptor {
             guest: sampled,
+            span: ResourceSpan::for_texture(sampled),
             destination_select: 0,
             base_mip_level: 0,
             mip_level_count: 1,
@@ -3269,6 +3285,7 @@ fn writing_a_pitch_tolerant_selection_attributes_to_the_resident_that_was_served
     let misses_before = RESIDENT_WRITE_ATTRIBUTION_MISSES.load(AtomicOrdering::Relaxed);
     presenter.mark_resident_texture_written_at(
         sampled,
+        ResourceSpan::for_texture(sampled),
         Some(selected.descriptor),
         ResidentTextureActivityStamp { work: 42, flip: 7 },
     );
@@ -3324,6 +3341,7 @@ fn writing_without_the_selected_key_counts_a_pitch_tolerant_attribution_miss() {
     let misses_before = RESIDENT_WRITE_ATTRIBUTION_MISSES.load(AtomicOrdering::Relaxed);
     presenter.mark_resident_texture_written_at(
         sampled,
+        ResourceSpan::for_texture(sampled),
         None,
         ResidentTextureActivityStamp { work: 42, flip: 7 },
     );
@@ -3339,4 +3357,192 @@ fn writing_without_the_selected_key_counts_a_pitch_tolerant_attribution_miss() {
             .content_version,
         version_after_first_write
     );
+}
+
+/// Deterministic pseudo-random source for the residency-index property tests.
+///
+/// A fixed sequence keeps any failure reproducible; the suite must not depend on entropy.
+struct IndexTestRandom(u64);
+
+impl IndexTestRandom {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % bound
+    }
+}
+
+/// Builds a linear descriptor at a random offset and height inside one of `bases`.
+///
+/// Every generated range stays inside its mapping so its physical identity resolves; the
+/// mappings the caller supplies decide whether two descriptors can alias.
+fn index_test_descriptor(
+    random: &mut IndexTestRandom,
+    bases: &[u64],
+    mapping_bytes: u64,
+) -> GuestTextureDescriptor {
+    const ROW_BYTES: u64 = 256;
+    let maximum_rows = mapping_bytes / ROW_BYTES;
+    let height = 1 + random.below(maximum_rows / 4);
+    let row = random.below(maximum_rows - height);
+    GuestTextureDescriptor {
+        address: bases[usize::try_from(random.below(u64::try_from(bases.len()).unwrap())).unwrap()]
+            + row * ROW_BYTES,
+        width: 64,
+        height: u32::try_from(height).unwrap(),
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    }
+}
+
+fn index_test_sort_key(descriptor: GuestTextureDescriptor) -> (u64, u32, u32) {
+    (descriptor.address, descriptor.height, descriptor.pitch)
+}
+
+fn index_test_sorted(descriptors: Vec<GuestTextureDescriptor>) -> Vec<(u64, u32, u32)> {
+    let mut keys = descriptors
+        .into_iter()
+        .map(index_test_sort_key)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys
+}
+
+/// The linear scan the index replaces, in the requested operand order.
+fn index_test_linear_overlapping(
+    residents: &[GuestTextureDescriptor],
+    query: GuestTextureDescriptor,
+    order: SpanQueryOrder,
+) -> Vec<GuestTextureDescriptor> {
+    residents
+        .iter()
+        .copied()
+        .filter(|resident| match order {
+            SpanQueryOrder::ResidentFirst => guest_texture_descriptors_overlap(*resident, query),
+            SpanQueryOrder::QueryFirst => guest_texture_descriptors_overlap(query, *resident),
+        })
+        .collect()
+}
+
+/// Maps one backing at two virtual addresses plus an unrelated backing at a third.
+///
+/// The alias pair makes the predicate's physical branch reachable: two descriptors there can be
+/// virtually disjoint and still name the same bytes. The unrelated mapping supplies pairs that
+/// must stay disjoint even when their physical offsets collide.
+fn index_test_mappings() -> (remu_memory::GuestAddressSpace, Vec<u64>, u64) {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mapping_bytes = 8 * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(64 * GUEST_PAGE_SIZE).expect("guest address space");
+    let shared = GuestPhysicalBacking::new(mapping_bytes).expect("shared backing");
+    let unrelated = GuestPhysicalBacking::new(mapping_bytes).expect("unrelated backing");
+    let mut bases = Vec::new();
+    for backing in [&shared, &shared, &unrelated] {
+        bases.push(
+            memory
+                .map_shared(
+                    GuestMapPlacement::Anywhere,
+                    mapping_bytes,
+                    GUEST_PAGE_SIZE,
+                    GuestProtection::READ_WRITE,
+                    backing,
+                    0,
+                )
+                .expect("index test mapping")
+                .get(),
+        );
+    }
+    (memory, bases, mapping_bytes)
+}
+
+#[test]
+fn resident_span_index_answers_exactly_what_the_linear_overlap_scan_does() {
+    let (_memory, bases, mapping_bytes) = index_test_mappings();
+    let mut random = IndexTestRandom::new(0x5eed_0001);
+    let mut residents = Vec::new();
+    let mut index = ResidentSpanIndex::new();
+    for _ in 0..64 {
+        let descriptor = index_test_descriptor(&mut random, &bases, mapping_bytes);
+        if residents.contains(&descriptor) {
+            continue;
+        }
+        residents.push(descriptor);
+        index.insert(descriptor);
+    }
+    assert_eq!(index.len(), residents.len());
+
+    // Matches that only the physical branch can produce: the two virtual ranges are disjoint.
+    let mut physical_only_matches = 0_usize;
+    for _ in 0..256 {
+        let query = index_test_descriptor(&mut random, &bases, mapping_bytes);
+        let span = ResourceSpan::for_texture(query).expect("query span");
+        for order in [SpanQueryOrder::ResidentFirst, SpanQueryOrder::QueryFirst] {
+            let indexed = index_test_sorted(index.overlapping(&span, order));
+            let linear = index_test_linear_overlapping(&residents, query, order);
+            physical_only_matches += linear
+                .iter()
+                .filter(|resident| {
+                    !super::super::guest_ranges_overlap(
+                        resident.address,
+                        guest_texture_byte_count(**resident).expect("resident bytes"),
+                        query.address,
+                        guest_texture_byte_count(query).expect("query bytes"),
+                    )
+                })
+                .count();
+            assert_eq!(
+                indexed,
+                index_test_sorted(linear),
+                "index disagrees with the linear scan for {query:?}"
+            );
+        }
+    }
+    assert!(
+        physical_only_matches > 0,
+        "no query aliased a resident through the shared backing; the physical index went untested"
+    );
+}
+
+#[test]
+fn resident_span_index_matches_the_linear_scan_after_random_inserts_and_removes() {
+    let (_memory, bases, mapping_bytes) = index_test_mappings();
+    let mut random = IndexTestRandom::new(0x5eed_0002);
+    let population = (0..48)
+        .map(|_| index_test_descriptor(&mut random, &bases, mapping_bytes))
+        .collect::<Vec<_>>();
+
+    let mut live: Vec<GuestTextureDescriptor> = Vec::new();
+    let mut index = ResidentSpanIndex::new();
+    for step in 0..512 {
+        let candidate = population[usize::try_from(random.below(48)).unwrap()];
+        if live.contains(&candidate) && random.below(2) == 0 {
+            live.retain(|resident| *resident != candidate);
+            index.remove(&candidate);
+        } else if !live.contains(&candidate) {
+            live.push(candidate);
+            index.insert(candidate);
+        }
+        assert_eq!(index.len(), live.len(), "index population drifted at step {step}");
+
+        let query = index_test_descriptor(&mut random, &bases, mapping_bytes);
+        let span = ResourceSpan::for_texture(query).expect("query span");
+        for order in [SpanQueryOrder::ResidentFirst, SpanQueryOrder::QueryFirst] {
+            assert_eq!(
+                index_test_sorted(index.overlapping(&span, order)),
+                index_test_sorted(index_test_linear_overlapping(&live, query, order)),
+                "index disagrees with the linear scan at step {step}"
+            );
+        }
+    }
 }

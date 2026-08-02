@@ -5,7 +5,8 @@ use super::super::sampled_texture_cache_byte_capacity;
 use super::{
     CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
     GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    ResidentGuestTexture, ResidentTextureActivityStamp, SAMPLED_TEXTURE_CACHE_CAPACITY,
+    ResidentGuestTexture, ResidentTextureActivityStamp, ResidentTextureMap,
+    SAMPLED_TEXTURE_CACHE_CAPACITY, SpanQueryOrder,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
     SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey,
     UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
@@ -116,7 +117,7 @@ pub(crate) fn upload_image_textures(
     device: &Device,
     queue: &metal::CommandQueue,
     evaluation: &ShaderEvaluation,
-    resident_guest_textures: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    resident_guest_textures: &mut ResidentTextureMap,
     retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     depth_array_textures: &HashMap<DepthArrayKey, DepthArrayResidentTexture>,
     multisample_textures: &HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
@@ -225,16 +226,16 @@ pub(crate) fn upload_image_textures(
                     let exact = resident_guest_textures
                         .get(&descriptor.guest)
                         .map(|resident| (resident.gpu_written, resident.content_version));
-                    let aliases = resident_guest_textures
-                        .values()
-                        .filter(|resident| {
-                            guest_texture_descriptors_overlap(
-                                resident.descriptor,
-                                descriptor.guest,
-                            )
+                    let aliases = descriptor
+                        .span
+                        .iter()
+                        .flat_map(|span| {
+                            resident_guest_textures
+                                .overlapping(span, SpanQueryOrder::ResidentFirst)
                         })
-                        .map(|resident| {
-                            (
+                        .filter_map(|alias| {
+                            let resident = resident_guest_textures.get(&alias)?;
+                            Some((
                                 resident.descriptor.address,
                                 resident.descriptor.width,
                                 resident.descriptor.height,
@@ -242,7 +243,7 @@ pub(crate) fn upload_image_textures(
                                 resident.descriptor.tile_mode,
                                 resident.gpu_written,
                                 resident.content_version,
-                            )
+                            ))
                         })
                         .collect::<Vec<_>>();
                     let multisample_candidates = multisample_textures
@@ -731,7 +732,7 @@ pub(crate) fn upload_image_textures(
                             CachedSampledTexture {
                                 texture: texture.clone(),
                                 write_watch,
-                                overlap: super::GuestTextureOverlapQuery::new(descriptor.guest),
+                                overlap: descriptor.span,
                                 resident_bytes: incoming_bytes,
                                 last_use: *next_sampled_texture_use,
                             },

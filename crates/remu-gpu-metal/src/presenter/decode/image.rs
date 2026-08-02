@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    DecodedImageDescriptor, GuestTextureDescriptor, decode_sampled_texture_format,
+    DecodedImageDescriptor, GuestTextureDescriptor, ResourceSpan, decode_sampled_texture_format,
     effective_linear_pitch, is_storage_image_opcode, trace_image_descriptors,
 };
 use metal::MTLPixelFormat;
@@ -129,16 +129,20 @@ pub(crate) fn decode_image_descriptor(words: &[u32]) -> Result<DecodedImageDescr
             "Metal image upload does not yet implement tile mode {tile_mode}"
         ));
     }
+    let guest = GuestTextureDescriptor {
+        address,
+        width,
+        height,
+        pitch,
+        tile_mode,
+        pixel_format,
+        bytes_per_pixel: bytes_per_element,
+    };
     Ok(DecodedImageDescriptor {
-        guest: GuestTextureDescriptor {
-            address,
-            width,
-            height,
-            pitch,
-            tile_mode,
-            pixel_format,
-            bytes_per_pixel: bytes_per_element,
-        },
+        guest,
+        // The one place a bound image's physical span is resolved. Every later overlap query
+        // against this binding reuses it instead of re-entering the shared-mapping registry.
+        span: ResourceSpan::for_texture(guest),
         destination_select,
         base_mip_level: base_level,
         mip_level_count: last_level - base_level + 1,
@@ -188,16 +192,18 @@ pub(crate) fn fallback_image_descriptor(
         }
     };
     let layer_count = if texture_type == 11 { 6 } else { 1 };
+    let guest = GuestTextureDescriptor {
+        address: 0,
+        width: 1,
+        height: 1,
+        pitch: 1,
+        tile_mode: 0,
+        pixel_format,
+        bytes_per_pixel,
+    };
     Ok(DecodedImageDescriptor {
-        guest: GuestTextureDescriptor {
-            address: 0,
-            width: 1,
-            height: 1,
-            pitch: 1,
-            tile_mode: 0,
-            pixel_format,
-            bytes_per_pixel,
-        },
+        guest,
+        span: ResourceSpan::for_texture(guest),
         destination_select: 0,
         base_mip_level: 0,
         mip_level_count: 1,

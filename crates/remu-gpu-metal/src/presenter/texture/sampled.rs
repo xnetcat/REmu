@@ -3,7 +3,8 @@
 
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, MetalTextureSwizzleChannels,
-    RESIDENT_DEPTH_SAMPLE_HITS, ResidentGuestTexture, SAMPLED_ALIAS_WRITEBACK_BYTES,
+    RESIDENT_DEPTH_SAMPLE_HITS, ResidentGuestTexture, ResidentTextureMap, ResourceSpan,
+    SAMPLED_ALIAS_WRITEBACK_BYTES,
     SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey,
     WriteWatchRefresh, comparison_depth32_upload, compressed_texture_block_extent,
     decode_guest_texture_linear_from_raw_at_z, guest_frame_fingerprint, guest_texture_byte_count,
@@ -269,6 +270,7 @@ impl MetalPresenter {
 pub(crate) fn decoded_image_for_sampled_key(key: SampledTextureKey) -> DecodedImageDescriptor {
     DecodedImageDescriptor {
         guest: key.descriptor,
+        span: ResourceSpan::for_texture(key.descriptor),
         destination_select: 0,
         base_mip_level: key.base_mip_level,
         mip_level_count: key.mip_level_count,
@@ -279,7 +281,7 @@ pub(crate) fn decoded_image_for_sampled_key(key: SampledTextureKey) -> DecodedIm
 
 /// Returns the GPU-authored resident that can still serve a cached sampled texture after ACQUIRE.
 pub(crate) fn gpu_written_resident_serving_sampled_key(
-    residents: &std::collections::HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    residents: &ResidentTextureMap,
     key: SampledTextureKey,
 ) -> Option<GuestTextureDescriptor> {
     let sampled = decoded_image_for_sampled_key(key);
