@@ -19,11 +19,20 @@ pub(crate) struct ScalarPath {
     pub(crate) exec_mask: u64,
     pub(crate) scalar_condition: bool,
     pub(crate) supplemental: bool,
-    /// Backward-edge budget already spent by this lineage, keyed by branch pc. Forked paths
-    /// inherit these counts. A fork that started with an empty table would restart the loop
-    /// budget, and since a loop body advances live scalar registers no two iterations share a
-    /// memoization key, so the evaluator would unroll the loop once per fork without bound.
+    /// Backward edges already traversed by this lineage, keyed by branch pc. Forked paths inherit
+    /// these counts so static alternate-edge discovery is performed once per loop lineage.
     pub(crate) backward_branch_visits: SmallVec<[(u32, u32); 4]>,
+    /// Exact evaluation-live scalar state observed at a vector-controlled back edge. If the same
+    /// state recurs, resource discovery has reached a fixed point even though lane execution will
+    /// continue on hardware.
+    pub(crate) backward_branch_recurrences: SmallVec<[(u32, ScalarRecurrenceState); 4]>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ScalarRecurrenceState {
+    registers: SmallVec<[(u8, u32); 16]>,
+    exec_mask: u64,
+    scalar_condition: bool,
 }
 
 impl ScalarPath {
@@ -43,6 +52,32 @@ impl ScalarPath {
             *visits = visits.saturating_add(1);
         } else {
             self.backward_branch_visits.push((pc, 1));
+        }
+    }
+
+    pub(crate) fn backward_branch_recurrence(
+        &self,
+        pc: u32,
+    ) -> Option<&ScalarRecurrenceState> {
+        self.backward_branch_recurrences
+            .iter()
+            .find(|(branch, _)| *branch == pc)
+            .map(|(_, state)| state)
+    }
+
+    pub(crate) fn record_backward_branch_recurrence(
+        &mut self,
+        pc: u32,
+        state: ScalarRecurrenceState,
+    ) {
+        if let Some((_, previous)) = self
+            .backward_branch_recurrences
+            .iter_mut()
+            .find(|(branch, _)| *branch == pc)
+        {
+            *previous = state;
+        } else {
+            self.backward_branch_recurrences.push((pc, state));
         }
     }
 }
@@ -66,6 +101,22 @@ pub(crate) fn scalar_state_hash(
     }
     hash = (hash ^ exec_mask).wrapping_mul(PRIME);
     (hash ^ u64::from(scalar_condition)).wrapping_mul(PRIME)
+}
+
+pub(crate) fn scalar_recurrence_state(
+    registers: &[u32],
+    register_indices: &[u8],
+    exec_mask: u64,
+    scalar_condition: bool,
+) -> ScalarRecurrenceState {
+    ScalarRecurrenceState {
+        registers: register_indices
+            .iter()
+            .map(|&index| (index, registers[usize::from(index)]))
+            .collect(),
+        exec_mask,
+        scalar_condition,
+    }
 }
 
 pub(crate) fn branch_target(instruction: &Instruction) -> Result<u32, EvaluationError> {
