@@ -26,6 +26,7 @@ use super::{
     diagnostic_context_register_snapshot, diagnostic_disable_culling, diagnostic_disable_depth,
     guest_viewport_y_scale_is_negative,
     diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
+    diagnostic_dump_glyph_draw,
     diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
@@ -39,10 +40,11 @@ use super::{
     diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
     diagnostic_trace_target_stride, diagnostic_uploaded_global_binding_head,
     diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
-    dump_msl_compute_filter_matches, dump_shader_pair_msl, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison, fragmentless_pixel_evaluation, guest_frame_fingerprint,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage, half_float_to_f32,
-    image_resource_descriptor_is_null, initial_depth_clear_for_target,
+    dump_msl_compute_filter_matches, dump_shader_pair_msl, evaluation_samples_glyph_atlas,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
+    fragmentless_pixel_evaluation, guest_frame_fingerprint, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_storage, half_float_to_f32, image_resource_descriptor_is_null,
+    initial_depth_clear_for_target,
     initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
     metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
     native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
@@ -1815,8 +1817,14 @@ impl MetalPresenter {
                 (diagnostic_dump_video_chain_consumer()
                     && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed)
                         == draw.sequence)
-                    .then(|| targets.first())
-                    .flatten()
+                .then(|| targets.first())
+                .flatten()
+            })
+            .or_else(|| {
+                (diagnostic_dump_glyph_draw()
+                    && evaluation_samples_glyph_atlas(&pixel_evaluation))
+                .then(|| targets.first())
+                .flatten()
             });
         if draw.sequence >= diagnostic_dump_target_minimum_draw()
             && let Some(target) = diagnostic_target

@@ -10,12 +10,14 @@ use super::{
     VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
-    diagnostic_dump_shadow_consumer, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer,
+    diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
     diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
     diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
     diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
-    diagnostic_video_chain_selected_draw, evaluation_samples_large_linear_video,
+    diagnostic_video_chain_selected_draw, evaluation_samples_glyph_atlas,
+    evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count, image_component_class,
     is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
@@ -782,7 +784,8 @@ fn graphics_diagnostic_pipeline_state(
         || (diagnostic_dump_video_chain_consumer()
             && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence)
         || (diagnostic_dump_shadow_consumer()
-            && evaluation_samples_layered_comparison(pixel_evaluation));
+            && evaluation_samples_layered_comparison(pixel_evaluation))
+        || (diagnostic_dump_glyph_draw() && evaluation_samples_glyph_atlas(pixel_evaluation));
     let samples_large_video =
         diagnostic_dump_video_draw() && evaluation_samples_large_linear_video(pixel_evaluation);
 
