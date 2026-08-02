@@ -2,13 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::commit_and_settle;
-use super::super::{FlushPolicy, GuestBatchFlushReason, WritebackTrigger};
+use super::super::cache::metal_buffer_with_guest_backing_range;
+use super::super::{
+    FlushPolicy, GuestBatchFlushReason, WritebackTrigger, compile_metal_compute_library,
+};
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
     MultisampleTextureKey, OWNED_SUBTRACT_TENANTS_SURVIVED, RESIDENT_WRITE_ATTRIBUTION_MISSES,
-    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED,
-    OWNED_REMATERIALISE_VIEW, RangeSet, ResidencyState, ResidentGuestTexture,
+    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
+    OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
+    OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
+    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, RangeSet, ResidencyState,
+    ResidentGuestTexture,
     ResidentTextureActivityStamp,
     ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture, SpanQueryOrder, StaleSource,
     WriteWatchRefresh, WrittenRegion,
@@ -27,10 +33,13 @@ use super::{
     watch_guest_texture, watch_resident_texture, watch_sampled_texture, written_byte_ranges,
 };
 use metal::{
-    Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
-    MTLTextureType, MTLTextureUsage, RenderPassDescriptor, Texture, TextureDescriptor,
+    Buffer, ComputePipelineState, Device, MTLBlitOption, MTLLoadAction, MTLOrigin, MTLRegion,
+    MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
+    RenderPassDescriptor, Texture, TextureDescriptor,
 };
-use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
+use remu_memory::{
+    CpuWriteWatchRetirement, guest_shared_backing_identity, guest_shared_backing_range,
+};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -64,6 +73,671 @@ enum StaleReadRematerialisation {
         destination: Texture,
         source_origin_y: u64,
     },
+    Detile {
+        destination: Texture,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RematerialisationFailureKind {
+    Mapping,
+    CpuGpuConflict,
+    Layout,
+    Metal,
+}
+
+fn record_rematerialisation_failure(kind: RematerialisationFailureKind) {
+    OWNED_REMATERIALISE_FAILED.fetch_add(1, Ordering::Relaxed);
+    match kind {
+        RematerialisationFailureKind::Mapping => {
+            OWNED_REMATERIALISE_FAILED_MAPPING.fetch_add(1, Ordering::Relaxed);
+        }
+        RematerialisationFailureKind::CpuGpuConflict => {
+            OWNED_REMATERIALISE_FAILED_CPU_GPU.fetch_add(1, Ordering::Relaxed);
+        }
+        RematerialisationFailureKind::Layout => {
+            OWNED_REMATERIALISE_FAILED_LAYOUT.fetch_add(1, Ordering::Relaxed);
+        }
+        RematerialisationFailureKind::Metal => {
+            OWNED_REMATERIALISE_FAILED_METAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+const MODE27_REMATERIALISATION_SOURCE: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+
+// All fields are ulong so the host ABI is an unambiguous array of 64-bit words.
+enum RemuMode27Parameter {
+    kWidth = 0, kHeight = 1, kLinearRowBytes = 2, kLinearOffset = 3,
+    kResourceBase = 4, kTargetBase = 5, kLevelOffset = 6, kPitch = 7,
+    kBytesPerElement = 8, kBlockWidth = 9, kBlockHeight = 10,
+    kTailX = 11, kTailY = 12, kSurfaceZXor = 13, kInTail = 14,
+    kTargetLength = 15, kRunCount = 16
+};
+
+static uint remu_mode27_within_block(uint x, uint y, uint log2_bytes) {
+    switch (log2_bytes) {
+        case 0:
+            return ((y << 2) & 0x0008u) ^ ((y << 4) & 0x0010u)
+                ^ ((y << 3) & 0x00a0u) ^ ((y << 5) & 0x0f00u)
+                ^ ((y << 6) & 0x1000u) ^ ((y << 7) & 0x4000u)
+                ^ (x & 0x0007u) ^ ((x << 3) & 0x0040u)
+                ^ ((x << 5) & 0x0300u) ^ ((x << 4) & 0x0400u)
+                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
+                ^ ((x << 8) & 0x8000u);
+        case 1:
+            return ((y << 4) & 0x0070u) ^ ((y << 5) & 0x0f00u)
+                ^ ((y << 8) & 0x5000u) ^ ((x << 1) & 0x000eu)
+                ^ ((x << 4) & 0x0480u) ^ ((x << 5) & 0x0300u)
+                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
+                ^ ((x << 8) & 0x8000u);
+        case 2:
+            return ((y << 4) & 0x0070u) ^ ((y << 5) & 0x0f00u)
+                ^ ((y << 9) & 0x1000u) ^ ((y << 8) & 0x4000u)
+                ^ ((x << 2) & 0x000cu) ^ ((x << 5) & 0x0380u)
+                ^ ((x << 4) & 0x0400u) ^ ((x << 6) & 0x0800u)
+                ^ ((x << 9) & 0xa000u);
+        case 3:
+            return ((y << 4) & 0x0010u) ^ ((y << 6) & 0x0080u)
+                ^ ((y << 5) & 0x0f00u) ^ ((y << 10) & 0x5000u)
+                ^ ((x << 3) & 0x0008u) ^ ((x << 4) & 0x0460u)
+                ^ ((x << 5) & 0x0300u) ^ ((x << 6) & 0x0800u)
+                ^ ((x << 10) & 0x2000u) ^ ((x << 9) & 0x8000u);
+        default:
+            return ((x << 4) & 0x0410u) ^ ((x << 5) & 0x0340u)
+                ^ ((x << 6) & 0x0800u) ^ ((x << 11) & 0xa000u)
+                ^ ((y << 5) & 0x0f20u) ^ ((y << 6) & 0x0080u)
+                ^ ((y << 10) & 0x1000u) ^ ((y << 11) & 0x4000u);
+    }
+}
+
+static ulong remu_mode27_physical(constant ulong* p, uint2 gid) {
+    const uint block_width = uint(p[kBlockWidth]);
+    const uint block_height = uint(p[kBlockHeight]);
+    const bool tail = p[kInTail] != 0;
+    const uint x = tail ? uint(p[kTailX]) + gid.x : gid.x;
+    const uint y = tail ? uint(p[kTailY]) + gid.y : gid.y;
+    const uint block_x = tail ? 0u : gid.x / block_width;
+    const uint block_y = tail ? 0u : gid.y / block_height;
+    const ulong blocks_per_row = (p[kPitch] + block_width - 1u) / block_width;
+    const ulong block = tail ? 0ul : ulong(block_y) * blocks_per_row + block_x;
+    const uint log2_bytes = ctz(uint(p[kBytesPerElement]));
+    const uint within = remu_mode27_within_block(x, y, log2_bytes)
+        ^ uint(p[kSurfaceZXor]);
+    return p[kResourceBase] + p[kLevelOffset] + block * 65536ul + within;
+}
+
+static bool remu_in_debt(device const ulong2* runs, ulong count, ulong address) {
+    for (ulong index = 0; index < count; ++index) {
+        if (runs[index].x <= address && address < runs[index].y) return true;
+    }
+    return false;
+}
+
+kernel void remu_mode27_scatter(
+    device const uchar* linear [[buffer(0)]], device uchar* tiled [[buffer(1)]],
+    device const ulong2* debt [[buffer(2)]], constant ulong* p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
+    const ulong physical = remu_mode27_physical(p, gid);
+    const ulong source = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
+        + ulong(gid.x) * p[kBytesPerElement];
+    for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
+        const ulong address = physical + byte;
+        if (address >= p[kTargetBase]
+            && address - p[kTargetBase] < p[kTargetLength]
+            && remu_in_debt(debt, p[kRunCount], address)) {
+            tiled[address - p[kTargetBase]] = linear[source + byte];
+        }
+    }
+}
+
+kernel void remu_mode27_gather(
+    device const uchar* tiled [[buffer(0)]], device uchar* linear [[buffer(1)]],
+    constant ulong* p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
+    const ulong physical = remu_mode27_physical(p, gid);
+    const ulong destination = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
+        + ulong(gid.x) * p[kBytesPerElement];
+    if (physical < p[kTargetBase]
+        || physical - p[kTargetBase] + p[kBytesPerElement] > p[kTargetLength]) return;
+    for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
+        linear[destination + byte] = tiled[physical - p[kTargetBase] + byte];
+    }
+}
+";
+
+#[derive(Clone, Copy, Debug)]
+struct Mode27RematerialisationSubresource {
+    width: u64,
+    height: u64,
+    linear_offset: u64,
+    linear_row_bytes: u64,
+    linear_image_bytes: u64,
+    level_offset: u64,
+    pitch: u64,
+    bytes_per_element: u64,
+    block_width: u64,
+    block_height: u64,
+    tail_x: u64,
+    tail_y: u64,
+    surface_z_xor: u64,
+    in_tail: bool,
+    metal_slice: u64,
+    metal_level: u64,
+    metal_z: u64,
+}
+
+fn align_256(value: u64) -> Option<u64> {
+    value.checked_add(255).map(|value| value & !255)
+}
+
+#[allow(clippy::too_many_lines)]
+fn mode27_rematerialisation_subresources(
+    resident: &ResidentGuestTexture,
+) -> Result<(Vec<Mode27RematerialisationSubresource>, u64), String> {
+    if resident.descriptor.tile_mode != 27
+        || resident.layer_count == 0
+        || resident.mip_level_count == 0
+        || !matches!(resident.descriptor.bytes_per_pixel, 1 | 2 | 4 | 8 | 16)
+    {
+        return Err(format!(
+            "GPU retile requires mode-27 1/2/4/8/16-byte storage, got mode={} bpe={} layers={} mips={}",
+            resident.descriptor.tile_mode,
+            resident.descriptor.bytes_per_pixel,
+            resident.layer_count,
+            resident.mip_level_count,
+        ));
+    }
+    if resident.mip_level_count > 1
+        && (resident.texture_type != 9 || resident.layer_count != 1)
+    {
+        return Err(format!(
+            "GPU retile cannot represent mipmapped type={} layers={}",
+            resident.texture_type, resident.layer_count
+        ));
+    }
+    if !matches!(resident.texture_type, 9 | 10 | 11 | 13) {
+        return Err(format!(
+            "GPU retile cannot represent texture type {}",
+            resident.texture_type
+        ));
+    }
+    if super::super::metal_uncompressed_bytes_per_pixel(resident.descriptor.pixel_format)
+        != Some(resident.descriptor.bytes_per_pixel)
+    {
+        return Err(format!(
+            "GPU retile requires an exact uncompressed Metal layout for {:?}/{} bytes",
+            resident.descriptor.pixel_format, resident.descriptor.bytes_per_pixel
+        ));
+    }
+    let expected_type = match resident.texture_type {
+        9 => MTLTextureType::D2,
+        10 => MTLTextureType::D3,
+        11 | 13 => MTLTextureType::D2Array,
+        _ => unreachable!("texture type was validated"),
+    };
+    if resident.texture.texture_type() != expected_type
+        || resident.texture.pixel_format() != resident.descriptor.pixel_format
+        || resident.texture.sample_count() != 1
+        || resident.texture.framebuffer_only()
+        || resident.texture.storage_mode() == MTLStorageMode::Memoryless
+        || resident.texture.width() < u64::from(resident.descriptor.width)
+        || resident.texture.height() < u64::from(resident.descriptor.height)
+        || resident.texture.mipmap_level_count() < u64::from(resident.mip_level_count)
+        || (expected_type == MTLTextureType::D3
+            && resident.texture.depth() < u64::from(resident.layer_count))
+        || (expected_type == MTLTextureType::D2Array
+            && resident.texture.array_length() < u64::from(resident.layer_count))
+    {
+        return Err(format!(
+            "GPU retile Metal storage does not match type={} {}x{} layers={} mips={} {:?}",
+            resident.texture_type,
+            resident.descriptor.width,
+            resident.descriptor.height,
+            resident.layer_count,
+            resident.mip_level_count,
+            resident.descriptor.pixel_format,
+        ));
+    }
+    let bytes_per_element = u64::from(resident.descriptor.bytes_per_pixel);
+    let block_bytes = tiled_block_bytes(27).ok_or("mode-27 block size is unavailable")?;
+    let (base_block_width, base_block_height) = tiled_block_dimensions(
+        block_bytes,
+        usize::try_from(bytes_per_element).map_err(|_| "element size does not fit usize")?,
+    )
+    .ok_or("mode-27 block dimensions are unavailable")?;
+    let mut linear_offset = 0_u64;
+    let mut result = Vec::new();
+    let mut push = |width: u64,
+                    height: u64,
+                    level_offset: u64,
+                    pitch: u64,
+                    block_width: u64,
+                    block_height: u64,
+                    tail_x: u64,
+                    tail_y: u64,
+                    in_tail: bool,
+                    surface_z: u32,
+                    metal_level: u64|
+     -> Result<(), String> {
+        let packed_row = width
+            .checked_mul(bytes_per_element)
+            .ok_or("GPU retile packed row overflows")?;
+        let linear_row_bytes = align_256(packed_row).ok_or("GPU retile row alignment overflows")?;
+        let linear_image_bytes = linear_row_bytes
+            .checked_mul(height)
+            .ok_or("GPU retile image size overflows")?;
+        linear_offset = align_256(linear_offset).ok_or("GPU retile offset overflows")?;
+        let metal_slice = if matches!(resident.texture_type, 11 | 13) {
+            u64::from(surface_z)
+        } else {
+            0
+        };
+        let metal_z = if resident.texture_type == 10 {
+            u64::from(surface_z)
+        } else {
+            0
+        };
+        result.push(Mode27RematerialisationSubresource {
+            width,
+            height,
+            linear_offset,
+            linear_row_bytes,
+            linear_image_bytes,
+            level_offset,
+            pitch,
+            bytes_per_element,
+            block_width,
+            block_height,
+            tail_x,
+            tail_y,
+            surface_z_xor: u64::try_from(super::mode27_surface_z_xor(
+                usize::try_from(surface_z).expect("surface index fits usize"),
+            ))
+            .expect("surface xor fits u64"),
+            in_tail,
+            metal_slice,
+            metal_level,
+            metal_z,
+        });
+        linear_offset = linear_offset
+            .checked_add(linear_image_bytes)
+            .ok_or("GPU retile linear buffer size overflows")?;
+        Ok(())
+    };
+    if resident.mip_level_count > 1 {
+        let layout = mode27_mip_chain_layout(
+            resident.descriptor,
+            resident.mip_level_count,
+        )?;
+        for (level_index, level) in layout.levels.iter().enumerate() {
+            push(
+                u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?,
+                u64::try_from(level.height).map_err(|_| "mip height does not fit u64")?,
+                u64::try_from(level.offset).map_err(|_| "mip offset does not fit u64")?,
+                u64::try_from(level.padded_width)
+                    .map_err(|_| "mip pitch does not fit u64")?,
+                u64::try_from(layout.block_width)
+                    .map_err(|_| "mip block width does not fit u64")?,
+                u64::try_from(layout.block_height)
+                    .map_err(|_| "mip block height does not fit u64")?,
+                u64::try_from(level.tail_x).map_err(|_| "mip tail X does not fit u64")?,
+                u64::try_from(level.tail_y).map_err(|_| "mip tail Y does not fit u64")?,
+                level.in_tail,
+                0,
+                u64::try_from(level_index).map_err(|_| "mip index does not fit u64")?,
+            )?;
+        }
+    } else {
+        let face_bytes = guest_texture_byte_count(resident.descriptor)
+            .ok_or("GPU retile face size overflows")?;
+        for surface_z in 0..resident.layer_count {
+            push(
+                u64::from(resident.descriptor.width),
+                u64::from(resident.descriptor.height),
+                face_bytes
+                    .checked_mul(u64::from(surface_z))
+                    .ok_or("GPU retile layer offset overflows")?,
+                u64::from(resident.descriptor.pitch),
+                u64::try_from(base_block_width)
+                    .map_err(|_| "block width does not fit u64")?,
+                u64::try_from(base_block_height)
+                    .map_err(|_| "block height does not fit u64")?,
+                0,
+                0,
+                false,
+                surface_z,
+                0,
+            )?;
+        }
+    }
+    Ok((result, linear_offset))
+}
+
+struct Mode27RematerialisationInput {
+    texture: Texture,
+    span: ResourceSpan,
+    debt: RangeSet,
+    subresources: Vec<Mode27RematerialisationSubresource>,
+    linear_length: u64,
+}
+
+fn mode27_rematerialisation_parameters(
+    subresource: Mode27RematerialisationSubresource,
+    resource_base: u64,
+    target_span: ResourceSpan,
+    run_count: usize,
+) -> Result<[u64; 17], String> {
+    Ok([
+        subresource.width,
+        subresource.height,
+        subresource.linear_row_bytes,
+        subresource.linear_offset,
+        resource_base,
+        target_span.range_start(),
+        subresource.level_offset,
+        subresource.pitch,
+        subresource.bytes_per_element,
+        subresource.block_width,
+        subresource.block_height,
+        subresource.tail_x,
+        subresource.tail_y,
+        subresource.surface_z_xor,
+        u64::from(subresource.in_tail),
+        target_span.len(),
+        u64::try_from(run_count).map_err(|_| "GPU retile run count does not fit u64")?,
+    ])
+}
+
+fn compile_mode27_rematerialisation_pipelines(
+    device: &Device,
+) -> Result<(ComputePipelineState, ComputePipelineState), String> {
+    let library = compile_metal_compute_library(device, MODE27_REMATERIALISATION_SOURCE)?;
+    let scatter = library
+        .get_function("remu_mode27_scatter", None)
+        .map_err(|error| format!("Metal mode-27 scatter function: {error}"))?;
+    let gather = library
+        .get_function("remu_mode27_gather", None)
+        .map_err(|error| format!("Metal mode-27 gather function: {error}"))?;
+    Ok((
+        device
+            .new_compute_pipeline_state_with_function(&scatter)
+            .map_err(|error| format!("Metal mode-27 scatter pipeline: {error}"))?,
+        device
+            .new_compute_pipeline_state_with_function(&gather)
+            .map_err(|error| format!("Metal mode-27 gather pipeline: {error}"))?,
+    ))
+}
+
+fn encode_texture_to_linear_buffer(
+    blit: &metal::BlitCommandEncoderRef,
+    texture: &Texture,
+    linear: &Buffer,
+    subresources: &[Mode27RematerialisationSubresource],
+) {
+    for subresource in subresources {
+        blit.copy_from_texture_to_buffer(
+            texture,
+            subresource.metal_slice,
+            subresource.metal_level,
+            MTLOrigin {
+                x: 0,
+                y: 0,
+                z: subresource.metal_z,
+            },
+            MTLSize::new(subresource.width, subresource.height, 1),
+            linear,
+            subresource.linear_offset,
+            subresource.linear_row_bytes,
+            subresource.linear_image_bytes,
+            MTLBlitOption::None,
+        );
+    }
+}
+
+fn encode_linear_buffer_to_texture(
+    blit: &metal::BlitCommandEncoderRef,
+    linear: &Buffer,
+    texture: &Texture,
+    subresources: &[Mode27RematerialisationSubresource],
+) {
+    for subresource in subresources {
+        blit.copy_from_buffer_to_texture(
+            linear,
+            subresource.linear_offset,
+            subresource.linear_row_bytes,
+            subresource.linear_image_bytes,
+            MTLSize::new(subresource.width, subresource.height, 1),
+            texture,
+            subresource.metal_slice,
+            subresource.metal_level,
+            MTLOrigin {
+                x: 0,
+                y: 0,
+                z: subresource.metal_z,
+            },
+            MTLBlitOption::None,
+        );
+    }
+}
+
+impl MetalPresenter {
+    /// Reconstructs `target_descriptor` from RAM overlaid with every current GPU publication
+    /// debt owner. All work stays in the open guest batch: the shared backing is read, never
+    /// written, and no completion boundary is introduced.
+    #[allow(clippy::too_many_lines)]
+    fn encode_mode27_stale_rematerialisation(
+        &mut self,
+        target_descriptor: GuestTextureDescriptor,
+        target_span: ResourceSpan,
+        source_descriptors: &[GuestTextureDescriptor],
+    ) -> Result<Texture, String> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+        if self.mode27_rematerialisation_scatter_pipeline.is_none()
+            || self.mode27_rematerialisation_gather_pipeline.is_none()
+        {
+            let (scatter, gather) = compile_mode27_rematerialisation_pipelines(&device)?;
+            self.mode27_rematerialisation_scatter_pipeline = Some(scatter);
+            self.mode27_rematerialisation_gather_pipeline = Some(gather);
+        }
+        let scatter_pipeline = self
+            .mode27_rematerialisation_scatter_pipeline
+            .as_ref()
+            .expect("mode-27 scatter pipeline was initialized")
+            .clone();
+        let gather_pipeline = self
+            .mode27_rematerialisation_gather_pipeline
+            .as_ref()
+            .expect("mode-27 gather pipeline was initialized")
+            .clone();
+
+        let target = self
+            .resident_guest_textures
+            .get(&target_descriptor)
+            .ok_or("stale rematerialisation target disappeared")?;
+        let destination = target.texture.clone();
+        let (target_subresources, target_linear_length) =
+            mode27_rematerialisation_subresources(target)?;
+        let mut sources = Vec::with_capacity(source_descriptors.len());
+        for descriptor in source_descriptors {
+            let source = self
+                .resident_guest_textures
+                .get(descriptor)
+                .ok_or("stale rematerialisation source disappeared")?;
+            let span = source
+                .span
+                .ok_or("stale rematerialisation source has no allocation span")?;
+            let debt = source
+                .gpu_authored
+                .intersect(&RangeSet::for_span(&target_span));
+            if debt.is_empty() {
+                continue;
+            }
+            let (subresources, linear_length) =
+                mode27_rematerialisation_subresources(source)?;
+            sources.push(Mode27RematerialisationInput {
+                texture: source.texture.clone(),
+                span,
+                debt,
+                subresources,
+                linear_length,
+            });
+        }
+        if sources.is_empty() {
+            return Err("GPU retile was requested without a current debt owner".to_owned());
+        }
+
+        let backing_range = guest_shared_backing_range(target_span.address(), target_span.len())
+            .ok_or("stale target has no contiguous guest backing view")?;
+        let identity = backing_range.view_identity();
+        if target_span.backing().is_none_or(|target| {
+            target.backing_id != identity.backing_id
+                || target.backing_offset
+                    != identity
+                        .backing_offset
+                        .saturating_add(backing_range.resource_offset())
+        }) {
+            return Err("stale target backing view changed after residency admission".to_owned());
+        }
+        let guest = metal_buffer_with_guest_backing_range(&device, &backing_range)
+            .ok_or("stale target guest backing cannot be exposed to Metal")?;
+        let scratch = device.new_buffer(
+            target_span.len(),
+            MTLResourceOptions::StorageModePrivate,
+        );
+        scratch.set_label("REMu mode-27 rematerialisation tiled scratch");
+        let target_linear = device.new_buffer(
+            target_linear_length,
+            MTLResourceOptions::StorageModePrivate,
+        );
+        target_linear.set_label("REMu mode-27 rematerialisation target linear");
+
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
+        self.ensure_open_guest_batch(&queue);
+        let command_buffer = {
+            let batch = self
+                .open_guest_batch
+                .as_mut()
+                .expect("guest batch was opened for texture rematerialisation");
+            batch.close_active_pass_encoders();
+            batch.command_buffer.clone()
+        };
+
+        let initialize = command_buffer.new_blit_command_encoder();
+        initialize.set_label("REMu initialize rematerialisation from guest bytes");
+        initialize.copy_from_buffer(
+            &guest,
+            backing_range.resource_offset(),
+            &scratch,
+            0,
+            target_span.len(),
+        );
+        initialize.end_encoding();
+
+        for source in &sources {
+            let linear = device.new_buffer(
+                source.linear_length,
+                MTLResourceOptions::StorageModePrivate,
+            );
+            linear.set_label("REMu mode-27 rematerialisation source linear");
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.set_label("REMu linearize current texture owner");
+            encode_texture_to_linear_buffer(
+                blit,
+                &source.texture,
+                &linear,
+                &source.subresources,
+            );
+            blit.end_encoding();
+
+            let mut run_words = Vec::with_capacity(source.debt.runs().len() * 2);
+            for &(start, end) in source.debt.runs() {
+                run_words.extend_from_slice(&[start, end]);
+            }
+            let run_bytes = u64::try_from(run_words.len())
+                .ok()
+                .and_then(|words| words.checked_mul(8))
+                .ok_or("GPU retile run buffer size overflows")?;
+            let runs = device.new_buffer_with_data(
+                run_words.as_ptr().cast::<c_void>(),
+                run_bytes,
+                MTLResourceOptions::StorageModeShared,
+            );
+            runs.set_label("REMu mode-27 rematerialisation debt runs");
+            let compute = command_buffer.new_compute_command_encoder();
+            compute.set_label("REMu retile current texture owner");
+            compute.set_compute_pipeline_state(&scatter_pipeline);
+            compute.set_buffer(0, Some(&linear), 0);
+            compute.set_buffer(1, Some(&scratch), 0);
+            compute.set_buffer(2, Some(&runs), 0);
+            for subresource in &source.subresources {
+                let parameters = mode27_rematerialisation_parameters(
+                    *subresource,
+                    source.span.range_start(),
+                    target_span,
+                    source.debt.runs().len(),
+                )?;
+                compute.set_bytes(
+                    3,
+                    u64::try_from(std::mem::size_of_val(&parameters))
+                        .expect("parameter byte count fits u64"),
+                    parameters.as_ptr().cast::<c_void>(),
+                );
+                compute.dispatch_threads(
+                    MTLSize::new(subresource.width, subresource.height, 1),
+                    MTLSize::new(16, 16, 1),
+                );
+            }
+            compute.end_encoding();
+        }
+
+        let gather = command_buffer.new_compute_command_encoder();
+        gather.set_label("REMu detile stale target");
+        gather.set_compute_pipeline_state(&gather_pipeline);
+        gather.set_buffer(0, Some(&scratch), 0);
+        gather.set_buffer(1, Some(&target_linear), 0);
+        for subresource in &target_subresources {
+            let parameters = mode27_rematerialisation_parameters(
+                *subresource,
+                target_span.range_start(),
+                target_span,
+                0,
+            )?;
+            gather.set_bytes(
+                3,
+                u64::try_from(std::mem::size_of_val(&parameters))
+                    .expect("parameter byte count fits u64"),
+                parameters.as_ptr().cast::<c_void>(),
+            );
+            gather.dispatch_threads(
+                MTLSize::new(subresource.width, subresource.height, 1),
+                MTLSize::new(16, 16, 1),
+            );
+        }
+        gather.end_encoding();
+
+        let upload = command_buffer.new_blit_command_encoder();
+        upload.set_label("REMu upload detiled stale target");
+        encode_linear_buffer_to_texture(
+            upload,
+            &target_linear,
+            &destination,
+            &target_subresources,
+        );
+        upload.end_encoding();
+        Ok(destination)
+    }
 }
 
 /// Source-row offset for the byte-exact rematerialisation blit rung.
@@ -231,8 +905,8 @@ impl MetalPresenter {
         &mut self,
         target_descriptor: GuestTextureDescriptor,
     ) -> Result<bool, String> {
-        let failure = |reason: String| {
-            OWNED_REMATERIALISE_FAILED.fetch_add(1, Ordering::Relaxed);
+        let failure = |kind: RematerialisationFailureKind, reason: String| {
+            record_rematerialisation_failure(kind);
             Err(reason)
         };
 
@@ -259,10 +933,13 @@ impl MetalPresenter {
             return Ok(false);
         }
         if target_refresh == WriteWatchRefresh::Reprotecting {
-            return failure(format!(
-                "cannot rematerialise stale texture {:#x} while its mapping is being reprotected",
-                target_descriptor.address
-            ));
+            return failure(
+                RematerialisationFailureKind::Mapping,
+                format!(
+                    "cannot rematerialise stale texture {:#x} while its mapping is being reprotected",
+                    target_descriptor.address
+                ),
+            );
         }
 
         let target_cpu_may_have_changed = self
@@ -281,44 +958,11 @@ impl MetalPresenter {
                 .write_watch
                 .content_has_changed()?;
 
-        let StaleSource::Allocation {
-            descriptor: source_descriptor,
-            content_version: expected_source_version,
-        } = stale_source
+        let StaleSource::Allocation { .. } = stale_source
         else {
             OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         };
-        if source_descriptor == target_descriptor {
-            return failure(format!(
-                "stale texture {:#x} names itself as its allocation source",
-                target_descriptor.address
-            ));
-        }
-
-        let source_refresh = match self.resident_guest_textures.get_mut(&source_descriptor) {
-            Some(source) => refresh_resident_texture_write_watch(source)?,
-            None => {
-                return failure(format!(
-                    "stale texture {:#x} lost allocation source {:#x} version {}",
-                    target_descriptor.address,
-                    source_descriptor.address,
-                    expected_source_version
-                ));
-            }
-        };
-        if source_refresh == WriteWatchRefresh::Replaced {
-            return failure(format!(
-                "stale texture {:#x} allocation source {:#x} was remapped",
-                target_descriptor.address, source_descriptor.address
-            ));
-        }
-        if source_refresh == WriteWatchRefresh::Reprotecting {
-            return failure(format!(
-                "stale texture {:#x} allocation source {:#x} is being reprotected",
-                target_descriptor.address, source_descriptor.address
-            ));
-        }
 
         let Some((target_span, target_texture_type, target_layers, target_mips)) = self
             .resident_guest_textures
@@ -332,35 +976,81 @@ impl MetalPresenter {
                 ))
             })
         else {
-            return failure(format!(
-                "stale texture {:#x} has no resolved allocation span",
-                target_descriptor.address
-            ));
+            return failure(
+                RematerialisationFailureKind::Mapping,
+                format!(
+                    "stale texture {:#x} has no resolved allocation span",
+                    target_descriptor.address
+                ),
+            );
         };
         let moved = RangeSet::for_span(&target_span);
 
-        let Some(source) = self.resident_guest_textures.get(&source_descriptor) else {
-            unreachable!("source was refreshed above")
-        };
-        let Some(source_span) = source.span else {
-            return failure(format!(
-                "allocation source {:#x} has no resolved span for stale texture {:#x}",
-                source_descriptor.address, target_descriptor.address
-            ));
-        };
-        if !source.is_live()
-            || source.content_version != expected_source_version
-            || !source_span.shares_offset_space(&target_span)
-            || !source.owned.contains_all(&moved)
-        {
-            return failure(format!(
-                "allocation source {:#x} no longer owns stale texture {:#x} at version {}",
-                source_descriptor.address,
-                target_descriptor.address,
-                expected_source_version
-            ));
+        // A stale link records the owner at demotion time, but authority can subsequently move
+        // through several pooled tenants. Resolve the current disjoint owners from `owned`
+        // instead of following an obsolete descriptor/version chain.
+        let candidates = self
+            .resident_guest_textures
+            .overlapping(&target_span, SpanQueryOrder::ResidentFirst);
+        for candidate in &candidates {
+            if *candidate == target_descriptor {
+                continue;
+            }
+            let refresh = refresh_resident_texture_write_watch(
+                self.resident_guest_textures
+                    .get_mut(candidate)
+                    .expect("indexed rematerialisation candidate exists"),
+            )?;
+            if matches!(refresh, WriteWatchRefresh::Replaced | WriteWatchRefresh::Reprotecting) {
+                return failure(
+                    RematerialisationFailureKind::Mapping,
+                    format!(
+                        "current texture owner {:#x} changed mapping while restoring stale texture {:#x}",
+                        candidate.address, target_descriptor.address
+                    ),
+                );
+            }
         }
-        let debt = source.gpu_authored.intersect(&moved);
+        let mut owners = Vec::new();
+        let mut authority = RangeSet::default();
+        let mut debt = RangeSet::default();
+        let mut full_owner = None;
+        for candidate in candidates {
+            if candidate == target_descriptor {
+                continue;
+            }
+            let Some(owner) = self.resident_guest_textures.get(&candidate) else {
+                continue;
+            };
+            let Some(owner_span) = owner.span else {
+                continue;
+            };
+            if !owner.is_live() || !owner_span.shares_offset_space(&target_span) {
+                continue;
+            }
+            let held = owner.owned.intersect(&moved);
+            if held.is_empty() {
+                continue;
+            }
+            if authority.intersects(&held) {
+                return failure(
+                    RematerialisationFailureKind::Mapping,
+                    format!(
+                        "overlapping current owners reached stale texture {:#x}",
+                        target_descriptor.address
+                    ),
+                );
+            }
+            authority.insert(&held);
+            let owner_debt = owner.gpu_authored.intersect(&moved);
+            if !owner_debt.is_empty() {
+                debt.insert(&owner_debt);
+                owners.push(candidate);
+            }
+            if owner.owned.contains_all(&moved) {
+                full_owner = Some(candidate);
+            }
+        }
         if target_cpu_changed {
             if debt.is_empty() {
                 self.note_guest_memory_authoritative(
@@ -376,123 +1066,143 @@ impl MetalPresenter {
                 OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
                 return Ok(false);
             }
-            return failure(format!(
-                "stale texture {:#x} has both CPU-modified bytes and GPU-only allocation debt",
-                target_descriptor.address
-            ));
+            return failure(
+                RematerialisationFailureKind::CpuGpuConflict,
+                format!(
+                    "stale texture {:#x} has both CPU-modified bytes and GPU-only allocation debt",
+                    target_descriptor.address
+                ),
+            );
+        }
+        // RAM is authoritative for every requested byte not present in this union. If no byte
+        // exists solely in Metal, the ordinary validated rebuild remains the cheapest rung.
+        if debt.is_empty() {
+            self.note_guest_memory_authoritative(
+                &target_span,
+                &moved,
+                None,
+                "rematerialise-clean-guest-fallback",
+            );
+            self.resident_guest_textures
+                .get_mut(&target_descriptor)
+                .expect("stale target still exists")
+                .state = ResidencyState::Stale(StaleSource::GuestMemory);
+            OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
         }
 
-        let same_host_shape = source.texture_type == target_texture_type
-            && source.layer_count == target_layers
-            && source.mip_level_count == target_mips;
-        let view = if same_host_shape
-            && guest_texture_descriptors_share_storage(source_descriptor, target_descriptor)
-        {
-            Some(source.texture.clone())
-        } else if same_host_shape
-            && guest_texture_descriptors_share_color_view_storage(
-                source_descriptor,
-                target_descriptor,
-            )
-        {
-            new_color_alias_texture_view(
-                &source.texture,
-                target_descriptor.pixel_format,
-                0,
-                target_mips,
-            )
-        } else {
-            None
-        };
-
-        let rematerialisation = if let Some(view) = view {
-            StaleReadRematerialisation::View(view)
-        } else {
-            let source_origin_y = (target_texture_type == 9
-                && target_layers == 1
-                && target_mips == 1
-                && source.texture_type == 9
-                && source.layer_count == 1
-                && source.mip_level_count == 1)
-                .then(|| {
-                    rematerialisation_blit_source_origin_y(
-                        source_descriptor,
-                        target_descriptor,
-                        source_span,
-                        target_span,
-                    )
-                })
-                .flatten();
-            let source_origin_y = source_origin_y.filter(|source_origin_y| {
-                source.texture.width() >= u64::from(target_descriptor.width)
-                    && source
-                        .texture
-                        .height()
-                        .checked_sub(*source_origin_y)
-                        .is_some_and(|height| height >= u64::from(target_descriptor.height))
-            });
-            if let Some(source_origin_y) = source_origin_y {
-                let destination = self
-                    .resident_guest_textures
-                    .get(&target_descriptor)
-                    .expect("stale target still exists")
-                    .texture
-                    .clone();
-                if destination.width() < u64::from(target_descriptor.width)
-                    || destination.height() < u64::from(target_descriptor.height)
-                    || destination.pixel_format() != target_descriptor.pixel_format
-                    || source.texture.pixel_format() != target_descriptor.pixel_format
-                {
-                    if debt.is_empty() {
-                        self.note_guest_memory_authoritative(
-                            &target_span,
-                            &moved,
-                            None,
-                            "rematerialise-clean-guest-fallback",
-                        );
-                        self.resident_guest_textures
-                            .get_mut(&target_descriptor)
-                            .expect("stale target still exists")
-                            .state = ResidencyState::Stale(StaleSource::GuestMemory);
-                        OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
-                        return Ok(false);
-                    }
-                    return failure(format!(
-                        "stale texture {:#x} has no byte-exact Metal destination",
-                        target_descriptor.address
-                    ));
-                }
-                StaleReadRematerialisation::Blit {
-                    source: source.texture.clone(),
-                    destination,
-                    source_origin_y,
-                }
+        let mut rematerialisation = None;
+        let mut source_version = None;
+        if let Some(source_descriptor) = full_owner {
+            let source = self
+                .resident_guest_textures
+                .get(&source_descriptor)
+                .expect("resolved full owner exists");
+            let source_span = source.span.expect("resolved full owner has a span");
+            let same_host_shape = source.texture_type == target_texture_type
+                && source.layer_count == target_layers
+                && source.mip_level_count == target_mips;
+            let view = if same_host_shape
+                && guest_texture_descriptors_share_storage(source_descriptor, target_descriptor)
+            {
+                Some(source.texture.clone())
+            } else if same_host_shape
+                && guest_texture_descriptors_share_color_view_storage(
+                    source_descriptor,
+                    target_descriptor,
+                )
+            {
+                new_color_alias_texture_view(
+                    &source.texture,
+                    target_descriptor.pixel_format,
+                    0,
+                    target_mips,
+                )
             } else {
-                // RAM is an honest fallback only when none of the requested bytes exist solely
-                // in Metal. Publishing here would be emulator bookkeeping, not guest behaviour.
-                if debt.is_empty() {
-                    self.note_guest_memory_authoritative(
-                        &target_span,
-                        &moved,
-                        None,
-                        "rematerialise-clean-guest-fallback",
-                    );
-                    self.resident_guest_textures
-                        .get_mut(&target_descriptor)
+                None
+            };
+            if let Some(view) = view {
+                rematerialisation = Some(StaleReadRematerialisation::View(view));
+                source_version = Some(source.content_version);
+            } else {
+                let source_origin_y = (target_texture_type == 9
+                    && target_layers == 1
+                    && target_mips == 1
+                    && source.texture_type == 9
+                    && source.layer_count == 1
+                    && source.mip_level_count == 1)
+                    .then(|| {
+                        rematerialisation_blit_source_origin_y(
+                            source_descriptor,
+                            target_descriptor,
+                            source_span,
+                            target_span,
+                        )
+                    })
+                    .flatten()
+                    .filter(|source_origin_y| {
+                        source.texture.width() >= u64::from(target_descriptor.width)
+                            && source
+                                .texture
+                                .height()
+                                .checked_sub(*source_origin_y)
+                                .is_some_and(|height| {
+                                    height >= u64::from(target_descriptor.height)
+                                })
+                    });
+                if let Some(source_origin_y) = source_origin_y {
+                    let destination = self
+                        .resident_guest_textures
+                        .get(&target_descriptor)
                         .expect("stale target still exists")
-                        .state = ResidencyState::Stale(StaleSource::GuestMemory);
-                    OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
-                    return Ok(false);
+                        .texture
+                        .clone();
+                    if destination.width() >= u64::from(target_descriptor.width)
+                        && destination.height() >= u64::from(target_descriptor.height)
+                        && destination.pixel_format() == target_descriptor.pixel_format
+                        && source.texture.pixel_format() == target_descriptor.pixel_format
+                    {
+                        rematerialisation = Some(StaleReadRematerialisation::Blit {
+                            source: source.texture.clone(),
+                            destination,
+                            source_origin_y,
+                        });
+                        source_version = Some(source.content_version);
+                    }
                 }
-                return failure(format!(
-                    "GPU-current stale texture {:#x} cannot be viewed or blitted from {:#x} (mode={} pitch={} format={:?})",
-                    target_descriptor.address,
-                    source_descriptor.address,
-                    target_descriptor.tile_mode,
-                    target_descriptor.pitch,
-                    target_descriptor.pixel_format
-                ));
             }
+        }
+
+        let rematerialisation = if let Some(rematerialisation) = rematerialisation {
+            rematerialisation
+        } else {
+            let destination = match self.encode_mode27_stale_rematerialisation(
+                target_descriptor,
+                target_span,
+                &owners,
+            ) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    let kind = if error.contains("backing") || error.contains("mapping") {
+                        RematerialisationFailureKind::Mapping
+                    } else if error.contains("Metal") {
+                        RematerialisationFailureKind::Metal
+                    } else {
+                        RematerialisationFailureKind::Layout
+                    };
+                    return failure(
+                        kind,
+                        format!(
+                            "GPU-current stale texture {:#x} cannot be rematerialised from {} current owners: {error}",
+                            target_descriptor.address,
+                            owners.len()
+                        ),
+                    );
+                }
+            };
+            self.resident_content_version = self.resident_content_version.saturating_add(1);
+            source_version = Some(self.resident_content_version);
+            StaleReadRematerialisation::Detile { destination }
         };
 
         if let StaleReadRematerialisation::Blit {
@@ -541,31 +1251,21 @@ impl MetalPresenter {
 
         // The transfer becomes visible to the residency algebra only after view creation or blit
         // encoding succeeds. Publication debt follows the same exact byte range.
-        let source_version = self
-            .resident_guest_textures
-            .get(&source_descriptor)
-            .expect("validated source still exists")
-            .content_version;
+        let source_version = source_version.expect("every rematerialisation has a content version");
+        self.subtract_resident_authority(
+            &target_span,
+            &moved,
+            Some(target_descriptor),
+            StaleSource::Allocation {
+                descriptor: target_descriptor,
+                content_version: source_version,
+            },
+            "rematerialised-into-alias",
+        );
         let mut target = self
             .resident_guest_textures
             .remove(&target_descriptor)
             .expect("validated stale target still exists");
-        {
-            let source = self
-                .resident_guest_textures
-                .get_mut(&source_descriptor)
-                .expect("validated source still exists");
-            source.subtract_authority(
-                &moved,
-                StaleSource::Allocation {
-                    descriptor: target_descriptor,
-                    content_version: source_version,
-                },
-            );
-            if !source.is_live() {
-                trace_resident_texture_demotion("rematerialised-into-alias", source);
-            }
-        }
         target.texture = match rematerialisation {
             StaleReadRematerialisation::View(view) => {
                 OWNED_REMATERIALISE_VIEW.fetch_add(1, Ordering::Relaxed);
@@ -573,6 +1273,10 @@ impl MetalPresenter {
             }
             StaleReadRematerialisation::Blit { destination, .. } => {
                 OWNED_REMATERIALISE_BLIT.fetch_add(1, Ordering::Relaxed);
+                destination
+            }
+            StaleReadRematerialisation::Detile { destination } => {
+                OWNED_REMATERIALISE_DETILE.fetch_add(1, Ordering::Relaxed);
                 destination
             }
         };

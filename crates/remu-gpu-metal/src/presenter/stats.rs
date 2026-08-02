@@ -115,11 +115,20 @@ pub(super) static OWNED_REMATERIALISE_VIEW: AtomicU64 = AtomicU64::new(0);
 /// Demoted allocations restored by an ordered texture-to-texture copy.
 pub(super) static OWNED_REMATERIALISE_BLIT: AtomicU64 = AtomicU64::new(0);
 
+/// Demoted allocations reconstructed by ordered GPU retile/de-tile work.
+pub(super) static OWNED_REMATERIALISE_DETILE: AtomicU64 = AtomicU64::new(0);
+
 /// Demoted allocations rebuilt from guest memory after proving RAM is authoritative.
 pub(super) static OWNED_REMATERIALISE_CPU: AtomicU64 = AtomicU64::new(0);
 
 /// GPU-current stale reads for which no lossless rematerialisation rung was available.
 pub(super) static OWNED_REMATERIALISE_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Failure reasons are deliberately separate from the total so a run says which rung to build.
+pub(super) static OWNED_REMATERIALISE_FAILED_MAPPING: AtomicU64 = AtomicU64::new(0);
+pub(super) static OWNED_REMATERIALISE_FAILED_CPU_GPU: AtomicU64 = AtomicU64::new(0);
+pub(super) static OWNED_REMATERIALISE_FAILED_LAYOUT: AtomicU64 = AtomicU64::new(0);
+pub(super) static OWNED_REMATERIALISE_FAILED_METAL: AtomicU64 = AtomicU64::new(0);
 
 /// Resident writebacks that reached guest memory, indexed by `WritebackTrigger`.
 pub(super) static RESIDENT_WRITEBACK_PUBLISHED: [AtomicU64; WRITEBACK_TRIGGER_COUNT] =

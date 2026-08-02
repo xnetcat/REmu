@@ -160,7 +160,10 @@ use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
     MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE,
     OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD, OWNED_REMATERIALISE_BLIT,
-    OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_VIEW,
+    OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED,
+    OWNED_REMATERIALISE_FAILED_CPU_GPU, OWNED_REMATERIALISE_FAILED_LAYOUT,
+    OWNED_REMATERIALISE_FAILED_MAPPING, OWNED_REMATERIALISE_FAILED_METAL,
+    OWNED_REMATERIALISE_VIEW,
     OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
@@ -223,15 +226,15 @@ use self::tiling::{
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    mode5_mip_chain_layout, mode27_mip_chain_layout, render_resolve_candidate_matches,
-    spans_overlap, tiled_block_bytes, tiled_block_dimensions,
+    mode5_mip_chain_layout, mode27_mip_chain_layout, mode27_surface_z_xor,
+    render_resolve_candidate_matches, spans_overlap, tiled_block_bytes, tiled_block_dimensions,
 };
 #[cfg(test)]
 use self::tiling::{
     encode_mode5_mip_chain_into_raw, guest_texture_descriptors_share_component_reordered_storage,
     mode5_within_block_byte_offset, mode9_within_block_byte_offset,
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_source_byte_offset,
-    mode27_surface_z_xor, mode27_within_block_byte_offset,
+    mode27_within_block_byte_offset,
     mode27_within_block_byte_offset_for_format,
 };
 
@@ -1893,6 +1896,8 @@ struct MetalPresenter {
     compiled_compute_pipelines: HashMap<ComputePipelineKey, CompiledComputePipeline>,
     compiling_compute_pipelines: HashSet<ComputePipelineKey>,
     rectangle_indirect_pipeline: Option<ComputePipelineState>,
+    mode27_rematerialisation_scatter_pipeline: Option<ComputePipelineState>,
+    mode27_rematerialisation_gather_pipeline: Option<ComputePipelineState>,
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
     /// Compute dispatches whose execution failed, keyed by shader address; same contract as
@@ -2079,6 +2084,8 @@ impl MetalPresenter {
             compiled_compute_pipelines: HashMap::new(),
             compiling_compute_pipelines: HashSet::new(),
             rectangle_indirect_pipeline: None,
+            mode27_rematerialisation_scatter_pipeline: None,
+            mode27_rematerialisation_gather_pipeline: None,
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),
             dropped_compute_executions: HashMap::new(),
