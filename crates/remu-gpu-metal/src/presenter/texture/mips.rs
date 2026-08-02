@@ -4,9 +4,8 @@
 use super::super::GuestMipChainLayout;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
-    MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, QuarantineAdoption, RangeSet, ResidencyState,
-    ResidentGuestTexture, ResidentTextureMap, WriteWatchRefresh, adopt_quarantined_resident,
-    compressed_texture_block_extent,
+    MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, RangeSet, ResidencyState, ResidentGuestTexture,
+    ResidentTextureMap, WriteWatchRefresh, compressed_texture_block_extent,
     copy_mode27_mip_level_to_linear,
     decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
     record_mode27_work_detail, record_texture_work, refresh_resident_texture_write_watch,
@@ -18,7 +17,6 @@ use metal::{
     MTLTextureUsage, NSRange, Texture, TextureDescriptor,
 };
 use remu_shader::ImageBinding;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -27,17 +25,8 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     promotion_command_buffer: Option<&CommandBufferRef>,
     descriptor: DecodedImageDescriptor,
     resident_guest_textures: &mut ResidentTextureMap,
-    retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     origin: Mode27WorkOrigin,
 ) -> Result<Texture, String> {
-    // A clean hierarchy retired by a pooled neighbour's write short-circuits the whole
-    // level-by-level rebuild ladder when its watch proves the bytes unchanged.
-    adopt_quarantined_resident(
-        descriptor.guest,
-        resident_guest_textures,
-        retired_texture_quarantine,
-        QuarantineAdoption::CurrentContent,
-    )?;
     if descriptor.texture_type != 9
         || descriptor.layer_count != 1
         || descriptor.guest.tile_mode != 27
@@ -107,9 +96,6 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             .expect("selected clean mip resident exists");
         let promoted =
             promote_resident_mip_hierarchy(device, command_buffer, descriptor, resident, origin)?;
-        // A fresh insert supersedes any quarantined duplicate; adopting one later would
-        // resurrect older pixels out of order.
-        retired_texture_quarantine.remove(&descriptor.guest);
         resident_guest_textures.insert(descriptor.guest, promoted);
         return resident_texture_for_sample(
             resident_guest_textures
@@ -151,7 +137,6 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
         "REMu {}-level storage image {:#x}",
         underlying_mip_count, descriptor.guest.address
     ));
-    retired_texture_quarantine.remove(&descriptor.guest);
     let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
     resident_guest_textures.insert(
         descriptor.guest,

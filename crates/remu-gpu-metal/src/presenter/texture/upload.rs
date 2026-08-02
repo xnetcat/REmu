@@ -3,9 +3,9 @@
 
 use super::super::sampled_texture_cache_byte_capacity;
 use super::{
-    CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
-    GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    ResidentGuestTexture, ResidentTextureActivityStamp, ResidentTextureMap,
+    CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureWriteWatch,
+    Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
+    ResidentTextureActivityStamp, ResidentTextureMap,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SpanQueryOrder,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
     SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey,
@@ -118,7 +118,6 @@ pub(crate) fn upload_image_textures(
     queue: &metal::CommandQueue,
     evaluation: &ShaderEvaluation,
     resident_guest_textures: &mut ResidentTextureMap,
-    retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     depth_array_textures: &HashMap<DepthArrayKey, DepthArrayResidentTexture>,
     multisample_textures: &HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
     sampled_texture_cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
@@ -591,7 +590,6 @@ pub(crate) fn upload_image_textures(
                         None,
                         descriptor,
                         resident_guest_textures,
-                        retired_texture_quarantine,
                         Mode27WorkOrigin::StorageCreate,
                     )?
                 } else {
@@ -600,7 +598,6 @@ pub(crate) fn upload_image_textures(
                         device,
                         descriptor.guest,
                         resident_guest_textures,
-                        retired_texture_quarantine,
                         true,
                     )?
                 }

@@ -213,7 +213,6 @@ impl MetalPresenter {
             &queue,
             evaluation,
             &mut self.resident_guest_textures,
-            &mut self.retired_texture_quarantine,
             &self.depth_array_textures,
             &self.multisample_textures,
             &mut self.sampled_texture_cache,

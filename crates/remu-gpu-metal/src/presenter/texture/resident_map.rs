@@ -7,8 +7,7 @@ use std::collections::HashMap;
 /// `resident_guest_textures` together with an interval index over the residents' spans.
 ///
 /// The map is private: the index is only correct while it mirrors the map exactly, so every
-/// insertion and removal — including the moves in and out of `retired_texture_quarantine` —
-/// has to pass through this type rather than touching a `HashMap` directly.
+/// insertion and removal has to pass through this type rather than touching a `HashMap` directly.
 pub(crate) struct ResidentTextureMap {
     textures: HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     index: ResidentSpanIndex,

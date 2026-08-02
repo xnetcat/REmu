@@ -17,7 +17,7 @@ use super::{
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     SampledTextureKey, ScanoutSnapshotTexture, StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES,
     TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
-    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
+    TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT, UploadedImageTexture,
     WriteWatchRefresh,
@@ -76,10 +76,7 @@ pub(crate) use self::mips::{
 pub(crate) use self::resident_map::{ResidentTextureMap, SpanQueryOrder};
 #[cfg(test)]
 pub(crate) use self::resident_map::ResidentSpanIndex;
-pub(crate) use self::residency::{
-    QuarantineAdoption, RETIRED_TEXTURE_QUARANTINE_CAPACITY, adopt_quarantined_resident,
-    ensure_resident_texture_in_map, resident_texture_ownership_stats,
-};
+pub(crate) use self::residency::{ensure_resident_texture_in_map, resident_texture_ownership_stats};
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_sampled_texture, retire_sampled_textures_matching,

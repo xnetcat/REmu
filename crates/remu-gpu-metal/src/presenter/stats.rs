@@ -45,12 +45,6 @@ pub(super) static TEXTURE_DIRTY_VALIDATION_NANOSECONDS: AtomicU64 = AtomicU64::n
 
 pub(super) static TEXTURE_DIRTY_VALIDATION_UNCHANGED: AtomicU64 = AtomicU64::new(0);
 
-/// Clean retired residents re-adopted from the quarantine instead of rebuilt from guest RAM.
-pub(super) static TEXTURE_QUARANTINE_ADOPTED: AtomicU64 = AtomicU64::new(0);
-
-/// Quarantined residents whose watch or content check refused adoption.
-pub(super) static TEXTURE_QUARANTINE_REJECTED: AtomicU64 = AtomicU64::new(0);
-
 pub(super) static MODE27_DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static MODE27_DECODE_BYTES: AtomicU64 = AtomicU64::new(0);

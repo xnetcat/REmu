@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::{command_buffer_native_state_summary, trace_metal_command_stalls};
-use super::super::texture::RETIRED_TEXTURE_QUARANTINE_CAPACITY;
 use super::super::{
     OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD,
     OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN, RESIDENT_WRITEBACK_DISCARDED,
     RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
-    RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState, TEXTURE_QUARANTINE_ADOPTED,
-    TEXTURE_QUARANTINE_REJECTED, WRITEBACK_TRIGGERS,
+    RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState, WRITEBACK_TRIGGERS,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -444,13 +442,11 @@ impl MetalPresenter {
             let alias_writeback_bytes = SAMPLED_ALIAS_WRITEBACK_BYTES.swap(0, Ordering::Relaxed);
             let alias_writeback_nanoseconds =
                 SAMPLED_ALIAS_WRITEBACK_NANOSECONDS.swap(0, Ordering::Relaxed);
-            let quarantine_adopted = TEXTURE_QUARANTINE_ADOPTED.swap(0, Ordering::Relaxed);
-            let quarantine_rejected = TEXTURE_QUARANTINE_REJECTED.swap(0, Ordering::Relaxed);
             // Expected to stay zero: any count is a GPU write that reached no resident at all.
             let write_attribution_misses =
                 RESIDENT_WRITE_ATTRIBUTION_MISSES.swap(0, Ordering::Relaxed);
             eprintln!(
-                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB guest={}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms quarantine={}/{} adopt={} stale={} write_attribution_miss={}",
+                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB guest={}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms write_attribution_miss={}",
                 self.sampled_texture_cache.len(),
                 sampled_texture_cache_mib,
                 sampled_texture_cache_guest_mib,
@@ -467,10 +463,6 @@ impl MetalPresenter {
                 alias_writeback_count,
                 alias_writeback_bytes as f64 / (1024.0 * 1024.0),
                 alias_writeback_nanoseconds as f64 / 1_000_000.0,
-                self.retired_texture_quarantine.len(),
-                RETIRED_TEXTURE_QUARANTINE_CAPACITY,
-                quarantine_adopted,
-                quarantine_rejected,
                 write_attribution_misses,
             );
             // Host→guest publication of rendered pixels, by what asked for it. `drop` is the
