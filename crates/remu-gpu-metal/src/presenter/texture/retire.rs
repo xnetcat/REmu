@@ -48,7 +48,7 @@ pub(crate) fn trace_resident_texture_removal(reason: &str, resident: &ResidentGu
         resident.texture_type,
         resident.layer_count,
         resident.mip_level_count,
-        resident.gpu_written,
+        resident.gpu_written(),
         resident.content_version,
         resident.write_watch.is_dirty(),
         last_read,
@@ -156,7 +156,7 @@ pub(crate) fn retire_resident_textures_overlapping_writeback(
             // writeback notifies every intersecting watch, so a content-consuming adoption
             // revalidates and a stale entry can never serve pixels; a discarded-render-target
             // adoption reuses the allocation without reading them.
-            resident.gpu_written = false;
+            resident.clear_gpu_authored();
             quarantine_retired_resident(retired_texture_quarantine, resident);
         }
     }

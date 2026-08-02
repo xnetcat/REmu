@@ -225,7 +225,7 @@ pub(crate) fn upload_image_textures(
                         .and_then(|address| guest_shared_mapping_identity(address, 1));
                     let exact = resident_guest_textures
                         .get(&descriptor.guest)
-                        .map(|resident| (resident.gpu_written, resident.content_version));
+                        .map(|resident| (resident.gpu_written(), resident.content_version));
                     let aliases = descriptor
                         .span
                         .iter()
@@ -241,7 +241,7 @@ pub(crate) fn upload_image_textures(
                                 resident.descriptor.height,
                                 resident.descriptor.pixel_format,
                                 resident.descriptor.tile_mode,
-                                resident.gpu_written,
+                                resident.gpu_written(),
                                 resident.content_version,
                             ))
                         })
@@ -266,7 +266,7 @@ pub(crate) fn upload_image_textures(
                                 resident_guest_textures
                                     .get(&key.descriptor)
                                     .map(|resident| {
-                                        (resident.gpu_written, resident.content_version)
+                                        (resident.gpu_written(), resident.content_version)
                                     }),
                             )
                         })
@@ -328,7 +328,7 @@ pub(crate) fn upload_image_textures(
                         })
                         .filter_map(|(key, _)| {
                             let resident = resident_guest_textures.get(&key.descriptor)?;
-                            resident.gpu_written.then_some((
+                            resident.gpu_written().then_some((
                                 resident.content_version,
                                 key.descriptor,
                                 resident.texture.clone(),
@@ -349,7 +349,7 @@ pub(crate) fn upload_image_textures(
                                         && resident.mip_level_count >= underlying_mip_count
                                 })
                                 .map(|resident| {
-                                    (resident.descriptor, resident.gpu_written, resident.content_version)
+                                    (resident.descriptor, resident.gpu_written(), resident.content_version)
                                 })
                         })
                         .flatten();
@@ -375,10 +375,10 @@ pub(crate) fn upload_image_textures(
                                         || resident_depth_sample_is_eligible(resident, descriptor))
                             })
                             .max_by_key(|resident| {
-                                (resident.gpu_written, resident.content_version)
+                                (resident.gpu_written(), resident.content_version)
                             })
                             .map(|resident| {
-                                (resident.descriptor, resident.gpu_written, resident.content_version)
+                                (resident.descriptor, resident.gpu_written(), resident.content_version)
                             })
                     })
                     .flatten();

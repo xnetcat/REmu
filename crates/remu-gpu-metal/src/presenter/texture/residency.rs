@@ -6,9 +6,10 @@ use super::super::{FlushPolicy, GuestBatchFlushReason};
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
-    MultisampleTextureKey, RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidentGuestTexture,
-    ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
-    SpanQueryOrder, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED, WriteWatchRefresh,
+    MultisampleTextureKey, RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState,
+    ResidentGuestTexture, ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan,
+    ScanoutSnapshotTexture, SpanQueryOrder, TEXTURE_QUARANTINE_ADOPTED,
+    TEXTURE_QUARANTINE_REJECTED, WriteWatchRefresh, WrittenRegion,
     create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
     decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
     guest_texture_byte_count, guest_texture_descriptors_share_gpu_sample_storage,
@@ -21,7 +22,7 @@ use super::{
     snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw, spans_overlap,
     texture_element_layout, trace_resident_texture_removal, trace_residency_churn,
     watch_guest_texture, watch_resident_texture, watch_sampled_texture,
-    write_resident_texture_contents_to_guest,
+    write_resident_texture_contents_to_guest, written_byte_ranges,
 };
 use metal::{
     Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
@@ -82,7 +83,7 @@ pub(crate) fn resident_texture_ownership_stats(
     let mut backing_spans = HashSet::new();
     for resident in residents.values() {
         let allocated_bytes = u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
-        if resident.gpu_written {
+        if resident.gpu_written() {
             stats.gpu_owned_count += 1;
             stats.gpu_owned_bytes = stats.gpu_owned_bytes.saturating_add(allocated_bytes);
         } else {
@@ -200,7 +201,7 @@ impl MetalPresenter {
                 continue;
             }
 
-            let gpu_written = resident.gpu_written;
+            let gpu_written = resident.gpu_written();
             if gpu_written && resident.cpu_write_obsoletes_gpu_writeback(refresh)? {
                 if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
                     trace_resident_texture_removal("pressure-cpu-reused", &resident);
@@ -291,7 +292,7 @@ impl MetalPresenter {
             .resident_guest_textures
             .get(&descriptor.guest)
             .is_some_and(|resident| {
-                resident.gpu_written
+                resident.gpu_written()
                     && resident.texture_type == 9
                     && resident.layer_count == 1
                     && resident.mip_level_count < underlying_mip_count
@@ -347,7 +348,7 @@ impl MetalPresenter {
             .resident_guest_textures
             .get(&descriptor.guest)
             .is_some_and(|resident| {
-                !resident.gpu_written
+                !resident.gpu_written()
                     && resident.texture_type == 9
                     && resident.layer_count == 1
                     && resident.mip_level_count < underlying_mip_count
@@ -476,7 +477,7 @@ impl MetalPresenter {
             .resident_guest_textures
             .values()
             .filter(|resident| {
-                resident.gpu_written
+                resident.gpu_written()
                     && resident.texture_type == 9
                     && resident.layer_count == 1
                     && resident.mip_level_count >= 1
@@ -517,7 +518,7 @@ impl MetalPresenter {
                     self.resident_guest_textures.get(alias).map(|resident| {
                         (
                             resident.descriptor,
-                            resident.gpu_written,
+                            resident.gpu_written(),
                             resident.content_version,
                         )
                     })
@@ -526,7 +527,7 @@ impl MetalPresenter {
             let has_gpu_written_alias = aliases.iter().any(|(_, alias)| {
                 self.resident_guest_textures
                     .get(alias)
-                    .is_some_and(|resident| resident.gpu_written)
+                    .is_some_and(|resident| resident.gpu_written())
             });
             let queue = if has_gpu_written_alias {
                 // The loop below downloads each GPU-written alias into guest memory; the download
@@ -557,7 +558,7 @@ impl MetalPresenter {
                 let gpu_written = self
                     .resident_guest_textures
                     .get(&alias)
-                    .is_some_and(|resident| resident.gpu_written);
+                    .is_some_and(|resident| resident.gpu_written());
                 let cpu_write_obsoletes_writeback = self
                     .resident_guest_textures
                     .get_mut(&alias)
@@ -612,7 +613,7 @@ impl MetalPresenter {
                     // again and adoptable. Re-adopting it also breaks the per-frame cycle:
                     // the next bind sees no GPU-written alias and skips this whole path.
                     let mut resident = resident;
-                    resident.gpu_written = false;
+                    resident.clear_gpu_authored();
                     quarantine_retired_resident(&mut self.retired_texture_quarantine, resident);
                 }
             }
@@ -672,7 +673,7 @@ impl MetalPresenter {
         if self
             .resident_guest_textures
             .get(&target.texture)
-            .is_some_and(|resident| resident.gpu_written)
+            .is_some_and(|resident| resident.gpu_written())
         {
             let queue = self
                 .command_queue
@@ -751,6 +752,7 @@ impl MetalPresenter {
             target.mip_level_count, target.texture.address
         ));
         self.retired_texture_quarantine.remove(&target.texture);
+        let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
         self.resident_guest_textures.insert(
             target.texture,
             ResidentGuestTexture {
@@ -761,7 +763,10 @@ impl MetalPresenter {
                 layer_count: target.layer_count,
                 mip_level_count: target.mip_level_count,
                 write_watch,
-                gpu_written: false,
+                span,
+                owned,
+                gpu_authored: RangeSet::default(),
+                state: ResidencyState::Live,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
                 last_use: ResidentTextureActivityStamp::default(),
@@ -832,7 +837,7 @@ impl MetalPresenter {
         if self
             .resident_guest_textures
             .get(&target.texture)
-            .is_some_and(|resident| resident.gpu_written)
+            .is_some_and(|resident| resident.gpu_written())
         {
             return Err(format!(
                 "cannot replace GPU-written target {:#x} with a {}-layer 3D view",
@@ -861,6 +866,7 @@ impl MetalPresenter {
             target.layer_count, target.texture.address
         ));
         self.retired_texture_quarantine.remove(&target.texture);
+        let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
         self.resident_guest_textures.insert(
             target.texture,
             ResidentGuestTexture {
@@ -871,7 +877,10 @@ impl MetalPresenter {
                 layer_count: target.layer_count,
                 mip_level_count: 1,
                 write_watch,
-                gpu_written: false,
+                span,
+                owned,
+                gpu_authored: RangeSet::default(),
+                state: ResidencyState::Live,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
                 last_use: ResidentTextureActivityStamp::default(),
@@ -1040,7 +1049,7 @@ impl MetalPresenter {
             .resident_guest_textures
             .values()
             .filter(|resident| {
-                resident.gpu_written
+                resident.gpu_written()
                     && resident
                         .write_watch
                         .overlaps_alias_range(depth.texture.address, array_bytes)
@@ -1109,6 +1118,7 @@ impl MetalPresenter {
             depth.layer_count, depth.texture.address
         ));
         self.retired_texture_quarantine.remove(&depth.texture);
+        let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
         self.resident_guest_textures.insert(
             depth.texture,
             ResidentGuestTexture {
@@ -1119,7 +1129,10 @@ impl MetalPresenter {
                 layer_count: depth.layer_count,
                 mip_level_count: 1,
                 write_watch,
-                gpu_written: false,
+                span,
+                owned,
+                gpu_authored: RangeSet::default(),
+                state: ResidencyState::Live,
                 content_version: 0,
                 gpu_write_watch_generations: Vec::new(),
                 last_use: ResidentTextureActivityStamp::default(),
@@ -1262,6 +1275,7 @@ impl MetalPresenter {
             descriptor,
             ResourceSpan::for_texture(descriptor),
             None,
+            WrittenRegion::whole_resource(),
             ResidentTextureActivityStamp::default(),
         );
     }
@@ -1271,18 +1285,21 @@ impl MetalPresenter {
     /// `span` is `descriptor`'s span as the decode path resolved it. `selected_resident` is the
     /// residency key the ensure path actually served this write's texture from. Only attribution
     /// follows it; sampled and multisample retirement stay keyed on `descriptor`, because the
-    /// written bytes are the ones the guest descriptor names.
+    /// written bytes are the ones the guest descriptor names. `region` bounds the write inside the
+    /// resident it is attributed to.
     pub(crate) fn mark_resident_texture_written_at(
         &mut self,
         descriptor: GuestTextureDescriptor,
         span: Option<ResourceSpan>,
         selected_resident: Option<GuestTextureDescriptor>,
+        region: WrittenRegion,
         activity_stamp: ResidentTextureActivityStamp,
     ) {
         self.mark_resident_texture_written_preserving_multisample_at(
             descriptor,
             span,
             selected_resident,
+            region,
             activity_stamp,
         );
         self.multisample_textures
@@ -1294,6 +1311,7 @@ impl MetalPresenter {
         descriptor: GuestTextureDescriptor,
         span: Option<ResourceSpan>,
         selected_resident: Option<GuestTextureDescriptor>,
+        region: WrittenRegion,
         activity_stamp: ResidentTextureActivityStamp,
     ) {
         self.resident_content_version = self.resident_content_version.saturating_add(1);
@@ -1337,7 +1355,7 @@ impl MetalPresenter {
                         && self
                             .resident_guest_textures
                             .get(candidate)
-                            .is_some_and(|resident| !resident.gpu_written)
+                            .is_some_and(|resident| !resident.gpu_written())
                 })
                 .collect::<Vec<_>>();
             for stale_alias in stale_aliases {
@@ -1353,8 +1371,33 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .get_mut(&resident_descriptor)
                 .expect("selected resident survived clean-alias retirement");
+            // The written ranges are recorded against the writer only. Subtracting them from the
+            // residents they supersede is what turns this into an algebra, and nothing reads
+            // `owned` for a decision yet.
+            //
+            // `gpu_written()` is `!gpu_authored.is_empty()`, so a resident outside the algebra
+            // must still claim something here or the GPU-ownership signal the whole residency
+            // path keys on would silently vanish.
+            let written = match resident.span {
+                Some(resident_span) => written_byte_ranges(
+                    resident_span,
+                    resident.descriptor,
+                    resident.texture_type,
+                    resident.layer_count,
+                    resident.mip_level_count,
+                    region,
+                ),
+                None => ResourceSpan::for_texture(resident.descriptor)
+                    .as_ref()
+                    .map(RangeSet::for_span)
+                    .unwrap_or_default(),
+            };
             resident.note_write(activity_stamp);
-            resident.gpu_written = true;
+            resident.note_gpu_authored(&written);
+            debug_assert!(
+                resident.gpu_written(),
+                "a GPU write must leave its resident owing the bytes it covered"
+            );
             resident.content_version = self.resident_content_version;
             resident.note_gpu_write();
         }
@@ -1403,7 +1446,7 @@ pub(crate) fn quarantine_retired_resident(
     retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     resident: ResidentGuestTexture,
 ) {
-    if resident.gpu_written
+    if resident.gpu_written()
         || resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced)
     {
         return;
@@ -1526,6 +1569,7 @@ pub(crate) fn ensure_resident_texture_in_map(
     };
     texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));
     retired_texture_quarantine.remove(&descriptor);
+    let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
     resident_guest_textures.insert(
         descriptor,
         ResidentGuestTexture {
@@ -1536,7 +1580,10 @@ pub(crate) fn ensure_resident_texture_in_map(
             layer_count: 1,
             mip_level_count: 1,
             write_watch,
-            gpu_written: false,
+            span,
+            owned,
+            gpu_authored: RangeSet::default(),
+            state: ResidencyState::Live,
             content_version: 0,
             gpu_write_watch_generations: Vec::new(),
             last_use: ResidentTextureActivityStamp::default(),

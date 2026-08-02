@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::WrittenRegion;
 use super::{
     FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
     ResidentTextureActivityStamp, SpanQueryOrder, append_unique_global_writebacks,
@@ -130,7 +131,7 @@ impl MetalPresenter {
                             .overlapping(span, SpanQueryOrder::ResidentFirst)
                     })
                     .filter_map(|alias| self.resident_guest_textures.get(&alias))
-                    .filter(|resident| resident.gpu_written)
+                    .filter(|resident| resident.gpu_written())
                     .map(|resident| {
                         (
                             resident.descriptor.address,
@@ -385,6 +386,7 @@ impl MetalPresenter {
                     texture.descriptor.guest,
                     texture.descriptor.span,
                     texture.selected_resident,
+                    WrittenRegion::storage_image(texture.descriptor),
                     activity_stamp,
                 );
                 // Gen5 presentation targets are ordinary guest images and may be completed by a

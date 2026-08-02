@@ -116,7 +116,7 @@ impl MetalPresenter {
             let mut source_descriptors = self
                 .resident_guest_textures
                 .values()
-                .filter(|resident| resident.gpu_written)
+                .filter(|resident| resident.gpu_written())
                 .filter(|resident| {
                     resident
                         .write_watch
@@ -215,7 +215,7 @@ impl MetalPresenter {
                         .get_mut(&descriptor)
                         .expect("collected DMA source texture exists");
                     write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-                    resident.gpu_written = false;
+                    resident.clear_gpu_authored();
                 }
             }
 

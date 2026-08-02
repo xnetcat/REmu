@@ -80,7 +80,7 @@ impl MetalPresenter {
                     .get(&descriptor)
                     .expect("collected resident texture exists");
                 (
-                    resident.gpu_written,
+                    resident.gpu_written(),
                     resident.write_watch.is_dirty(),
                     resident.write_watch.precise_tracking(),
                     resident.write_watch.dirty_page_ranges(),
@@ -153,7 +153,7 @@ impl MetalPresenter {
                     trace_acquire(
                         resident,
                         refresh,
-                        if resident.gpu_written { "gpu" } else { "cpu" },
+                        if resident.gpu_written() { "gpu" } else { "cpu" },
                         None,
                         "retained-reprotecting",
                     );
@@ -165,10 +165,10 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .get_mut(&descriptor)
                 .expect("overlapping resident survived write-watch refresh");
-            let gpu_written = resident.gpu_written;
+            let gpu_written = resident.gpu_written();
             let content_changed = resident.write_watch.content_has_changed()?;
             if !content_changed {
-                if resident.gpu_written {
+                if resident.gpu_written() {
                     // A permission-only renewal resets watch generations. Once sparse content
                     // validation proves that guest bytes did not change, move the GPU ownership
                     // boundary into the new generation domain instead of retiring it later.
@@ -177,9 +177,9 @@ impl MetalPresenter {
                 trace_acquire(
                     resident,
                     refresh,
-                    if resident.gpu_written { "gpu" } else { "cpu" },
+                    if resident.gpu_written() { "gpu" } else { "cpu" },
                     Some(false),
-                    if resident.gpu_written {
+                    if resident.gpu_written() {
                         "retained-gpu"
                     } else {
                         "retained-cpu"
@@ -1028,7 +1028,7 @@ pub(crate) fn refresh_resident_texture_write_watch(
             )?;
             renewed.inherit_content_state_from(&resident.write_watch)?;
             resident.write_watch = renewed;
-            if resident.gpu_written && !was_dirty {
+            if resident.gpu_written() && !was_dirty {
                 // Reprotection replaced the watch objects but not the shared backing. Preserve
                 // the ownership boundary in the new generation domain when no CPU store was
                 // observed during the transition.

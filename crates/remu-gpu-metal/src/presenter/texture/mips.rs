@@ -4,8 +4,8 @@
 use super::super::GuestMipChainLayout;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
-    MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, QuarantineAdoption, ResidentGuestTexture,
-    ResidentTextureMap, WriteWatchRefresh, adopt_quarantined_resident,
+    MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, QuarantineAdoption, RangeSet, ResidencyState,
+    ResidentGuestTexture, ResidentTextureMap, WriteWatchRefresh, adopt_quarantined_resident,
     compressed_texture_block_extent,
     copy_mode27_mip_level_to_linear,
     decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
@@ -77,7 +77,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     }
     if resident_guest_textures
         .get(&descriptor.guest)
-        .is_some_and(|resident| resident.gpu_written)
+        .is_some_and(|resident| resident.gpu_written())
     {
         return Err(format!(
             "cannot reinterpret GPU-written image {:#x} as a {underlying_mip_count}-level hierarchy",
@@ -148,6 +148,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
         underlying_mip_count, descriptor.guest.address
     ));
     retired_texture_quarantine.remove(&descriptor.guest);
+    let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
     resident_guest_textures.insert(
         descriptor.guest,
         ResidentGuestTexture {
@@ -158,7 +159,10 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             layer_count: descriptor.layer_count,
             mip_level_count: underlying_mip_count,
             write_watch,
-            gpu_written: false,
+            span,
+            owned,
+            gpu_authored: RangeSet::default(),
+            state: ResidencyState::Live,
             content_version: 0,
             gpu_write_watch_generations: Vec::new(),
             last_use: super::super::ResidentTextureActivityStamp::default(),
@@ -312,10 +316,21 @@ pub(crate) fn promote_resident_mip_hierarchy(
         "REMu promoted {}-level image {:#x}",
         underlying_mip_count, descriptor.guest.address
     ));
-    let gpu_write_watch_generations = if resident.gpu_written {
+    let gpu_write_watch_generations = if resident.gpu_written() {
         write_watch.generations()
     } else {
         Vec::new()
+    };
+    // Adding a level moves every other level's offset inside the chain, so the previous runs name
+    // the wrong bytes. The promotion preserves every level's pixels, so a live allocation stays the
+    // authority for its whole grown range and owes exactly what it owed before, widened to that
+    // range — which is the range the pre-B15 code published anyway. A demoted one answers for
+    // nothing, and growing its shape does not give it any bytes back.
+    let (span, declared) = ResidentGuestTexture::declared_authority(&write_watch);
+    let (owned, gpu_authored) = match (resident.state, resident.gpu_written()) {
+        (ResidencyState::Stale(_), _) => (RangeSet::default(), RangeSet::default()),
+        (ResidencyState::Live, true) => (declared.clone(), declared),
+        (ResidencyState::Live, false) => (declared, RangeSet::default()),
     };
     eprintln!(
         "[REMu][METAL] encoded ordered mip promotion image={:#x} {}x{} {:?} levels={}->{} gpu_current={}",
@@ -325,7 +340,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
         descriptor.guest.pixel_format,
         resident.mip_level_count,
         underlying_mip_count,
-        resident.gpu_written,
+        resident.gpu_written(),
     );
     Ok(ResidentGuestTexture {
         texture,
@@ -335,7 +350,10 @@ pub(crate) fn promote_resident_mip_hierarchy(
         layer_count: descriptor.layer_count,
         mip_level_count: underlying_mip_count,
         write_watch,
-        gpu_written: resident.gpu_written,
+        span,
+        owned,
+        gpu_authored,
+        state: resident.state,
         content_version: resident.content_version,
         gpu_write_watch_generations,
         last_use: resident.last_use,

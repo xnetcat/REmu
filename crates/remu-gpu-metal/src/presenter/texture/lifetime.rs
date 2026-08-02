@@ -32,7 +32,7 @@ impl ResidentTextureAgeBucket {
         let bytes = u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
         self.resident_count += 1;
         self.resident_bytes = self.resident_bytes.saturating_add(bytes);
-        if resident.gpu_written {
+        if resident.gpu_written() {
             self.gpu_owned_count += 1;
             self.gpu_owned_bytes = self.gpu_owned_bytes.saturating_add(bytes);
         } else {
@@ -102,7 +102,7 @@ pub(crate) fn resident_texture_eviction_plan(
         .filter(|resident| {
             // The pairwise scan this replaces was quadratic in the resident count and took the
             // shared-mapping lock once per pair.
-            !resident.gpu_written
+            !resident.gpu_written()
                 || !ResourceSpan::for_texture(resident.descriptor).is_some_and(|span| {
                     residents
                         .overlapping(&span, SpanQueryOrder::QueryFirst)
@@ -111,7 +111,7 @@ pub(crate) fn resident_texture_eviction_plan(
                             other != resident.descriptor
                                 && residents
                                     .get(&other)
-                                    .is_some_and(|other| other.gpu_written)
+                                    .is_some_and(|other| other.gpu_written())
                         })
                 })
         })
@@ -122,7 +122,7 @@ pub(crate) fn resident_texture_eviction_plan(
                 // Replaced mappings carry no valid destination for writeback. Clean residents
                 // need no writeback. Retire both before GPU-owned live mappings.
                 !mapping_replaced,
-                resident.gpu_written,
+                resident.gpu_written(),
                 resident.last_use.flip,
                 resident.last_use.work,
                 resident.content_version,
@@ -259,7 +259,7 @@ pub(crate) fn resident_texture_backing_overlap_stats(
         let bytes = u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
         stats.resident_count += 1;
         stats.resident_bytes = stats.resident_bytes.saturating_add(bytes);
-        if resident.gpu_written {
+        if resident.gpu_written() {
             stats.gpu_owned_count += 1;
             stats.gpu_owned_bytes = stats.gpu_owned_bytes.saturating_add(bytes);
         } else {

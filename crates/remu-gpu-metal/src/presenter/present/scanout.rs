@@ -315,7 +315,7 @@ impl MetalPresenter {
         let descriptor = self
             .resident_guest_textures
             .values()
-            .filter(|resident| resident.descriptor.address == address && resident.gpu_written)
+            .filter(|resident| resident.descriptor.address == address && resident.gpu_written())
             .filter(|resident| {
                 display.is_none_or(|display| {
                     resident.descriptor.width == display.width
@@ -394,7 +394,7 @@ impl MetalPresenter {
             .get_mut(&descriptor)
             .expect("refreshed resident texture exists");
         write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-        resident.gpu_written = false;
+        resident.clear_gpu_authored();
         Ok(())
     }
 
@@ -452,7 +452,7 @@ impl MetalPresenter {
                 (
                     resident.descriptor,
                     resident.content_version,
-                    resident.gpu_written,
+                    resident.gpu_written(),
                 )
             })
             .collect::<Vec<_>>();
@@ -531,7 +531,7 @@ impl MetalPresenter {
             let selected_state = self
                 .resident_guest_textures
                 .get(&descriptor)
-                .map(|resident| (resident.content_version, resident.gpu_written));
+                .map(|resident| (resident.content_version, resident.gpu_written()));
             eprintln!(
                 "[REMu][METAL][SCANOUT-SNAPSHOT] sequence={sequence} address={address:#x} source={source} descriptor={descriptor:?} selected_state={selected_state:?} source_format={:?} snapshot_format={:?} pending={} finalized={} uploaded={} submitted={}",
                 source_texture.pixel_format(),

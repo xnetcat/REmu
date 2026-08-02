@@ -649,7 +649,7 @@ fn translated_scanout_resolution_prefers_the_current_resident_object() {
     // A synchronization can write Metal's current contents back to guest memory and clear
     // this dirty bit without invalidating the Metal texture. Presentation validity must not
     // be tied to whether another writeback is presently required.
-    resident.gpu_written = false;
+    resident.clear_gpu_authored();
 
     let (_, selected, source) = presenter
         .translated_scanout_source(address.get(), descriptor.width, descriptor.height)

@@ -3,7 +3,10 @@
 
 use super::super::completion::{command_buffer_native_state_summary, trace_metal_command_stalls};
 use super::super::texture::RETIRED_TEXTURE_QUARANTINE_CAPACITY;
-use super::super::{TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED};
+use super::super::{
+    OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_UNRESOLVED_SPAN, ResidencyState,
+    TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
+};
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS,
@@ -418,6 +421,29 @@ impl MetalPresenter {
                 quarantine_rejected,
                 write_attribution_misses,
             );
+            // The range algebra's own accounting. `owned` is the authority the residents hold and
+            // `debt` the part of it that exists only in Metal; the counters are the ways a claim
+            // stopped being exact. The demotion, re-materialisation and publish figures arrive
+            // with the paths that produce them rather than as standing zeros.
+            let (mut live, mut stale) = (0_usize, 0_usize);
+            let (mut owned_bytes, mut debt_bytes, mut owned_runs) = (0_u64, 0_u64, 0_usize);
+            for resident in self.resident_guest_textures.values() {
+                match resident.state {
+                    ResidencyState::Live => live += 1,
+                    ResidencyState::Stale(_) => stale += 1,
+                }
+                owned_bytes = owned_bytes.saturating_add(resident.owned.byte_count());
+                debt_bytes = debt_bytes.saturating_add(resident.gpu_authored.byte_count());
+                owned_runs += resident.owned.runs().len();
+            }
+            eprintln!(
+                "[REMu][PERF-TEXTURE-OWNED] live={live} stale={stale} owned={:.1}MiB/{owned_runs} runs debt={:.1}MiB coarsened={} unresolved={} fallback={}",
+                owned_bytes as f64 / (1024.0 * 1024.0),
+                debt_bytes as f64 / (1024.0 * 1024.0),
+                OWNED_RANGE_SET_COARSENED.swap(0, Ordering::Relaxed),
+                OWNED_UNRESOLVED_SPAN.swap(0, Ordering::Relaxed),
+                OWNED_FALLBACK_FULL_RANGE.swap(0, Ordering::Relaxed),
+            );
             let texture_allocated_bytes = |texture: &metal::Texture| {
                 u64::try_from(texture.allocated_size()).unwrap_or(u64::MAX)
             };
@@ -496,7 +522,7 @@ impl MetalPresenter {
                     (
                         texture_allocated_bytes(&resident.texture),
                         resident.descriptor,
-                        resident.gpu_written,
+                        resident.gpu_written(),
                         resident.content_version,
                         resident.write_watch.retirement(),
                     )
@@ -627,7 +653,7 @@ impl MetalPresenter {
                             resident.descriptor.pixel_format,
                             resident.descriptor.tile_mode,
                             texture_allocated_bytes(&resident.texture) as f64 / (1024.0 * 1024.0),
-                            resident.gpu_written,
+                            resident.gpu_written(),
                             resident.content_version,
                             display_stamp(activity.last_read_work, activity.last_read_flip),
                             display_stamp(activity.last_write_work, activity.last_write_flip),

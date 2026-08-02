@@ -76,7 +76,7 @@ impl MetalPresenter {
                 aliases.extend(
                     self.resident_guest_textures
                         .values()
-                        .filter(|resident| resident.gpu_written)
+                        .filter(|resident| resident.gpu_written())
                         .filter(|resident| {
                             let overlaps_resident = resident
                                 .write_watch
@@ -256,7 +256,7 @@ impl MetalPresenter {
                 .get_mut(&descriptor)
                 .expect("collected sampled alias exists");
             write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-            resident.gpu_written = false;
+            resident.clear_gpu_authored();
         }
         SAMPLED_ALIAS_WRITEBACK_COUNT.fetch_add(
             u64::try_from(alias_count).unwrap_or(u64::MAX),
@@ -291,7 +291,7 @@ pub(crate) fn gpu_written_resident_serving_sampled_key(
     let sampled = decoded_image_for_sampled_key(key);
     residents
         .iter()
-        .filter(|(_, resident)| resident.gpu_written)
+        .filter(|(_, resident)| resident.gpu_written())
         .filter(|(descriptor, resident)| {
             let descriptor = **descriptor;
             guest_texture_descriptors_overlap(descriptor, key.descriptor)
@@ -511,7 +511,7 @@ pub(crate) fn resident_color_view_sample_is_eligible(
         .base_mip_level
         .checked_add(sampled.mip_level_count.max(1));
     !comparison
-        && resident.gpu_written
+        && resident.gpu_written()
         && resident.texture_type == 9
         && resident.layer_count == 1
         && sampled.texture_type == 9
@@ -527,7 +527,7 @@ pub(crate) fn resident_depth_sample_is_eligible(
     let underlying_mip_count = sampled
         .base_mip_level
         .checked_add(sampled.mip_level_count.max(1));
-    resident.gpu_written
+    resident.gpu_written()
         && resident.texture_type == 9
         && resident.layer_count == 1
         && sampled.texture_type == 9

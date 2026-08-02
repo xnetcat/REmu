@@ -19,6 +19,7 @@ use super::super::{
     RESIDENT_WRITE_ATTRIBUTION_MISSES, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
+use super::super::WrittenRegion;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, ResourceSpan,
     ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
@@ -273,7 +274,7 @@ fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
         presenter
             .resident_guest_textures
             .get(&rendered)
-            .is_some_and(|resident| resident.gpu_written),
+            .is_some_and(|resident| resident.gpu_written()),
         "depth target must be GPU-authored"
     );
 
@@ -785,7 +786,7 @@ fn a_clean_retired_resident_is_adopted_from_quarantine_without_a_rebuild() {
 
     // Retire the clean resident the way a pooled neighbour's GPU write does, then re-ensure.
     let retired = residents.remove(&descriptor).expect("resident exists");
-    assert!(!retired.gpu_written, "the retired resident must be clean");
+    assert!(!retired.gpu_written(), "the retired resident must be clean");
     quarantine.insert(descriptor, retired);
     let adopted_before = TEXTURE_QUARANTINE_ADOPTED.load(AtomicOrdering::Relaxed);
     let adopted =
@@ -910,7 +911,7 @@ fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
         .expect("resident with initialized content baseline");
     {
         let resident = residents.get_mut(&descriptor).expect("resident exists");
-        resident.gpu_written = true;
+        resident.note_gpu_authored_whole_span();
         resident.note_gpu_write();
     }
 
@@ -988,7 +989,7 @@ fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
         .expect("discarded render target with a CPU baseline");
     {
         let resident = residents.get_mut(&descriptor).expect("resident exists");
-        resident.gpu_written = true;
+        resident.note_gpu_authored_whole_span();
         resident.note_gpu_write();
     }
 
@@ -1901,7 +1902,7 @@ fn resident_lifetime_stats_attribute_physical_aliases_and_activity_age() {
         .resident_guest_textures
         .get_mut(&first)
         .expect("first resident");
-    first_resident.gpu_written = true;
+    first_resident.note_gpu_authored_whole_span();
     first_resident.activity = Some(ResidentTextureActivity {
         last_read_work: Some(100),
         last_read_flip: Some(10),
@@ -1985,7 +1986,7 @@ fn resident_pressure_plan_prefers_clean_old_images_and_excludes_the_current_flip
             .resident_guest_textures
             .get_mut(&old_gpu)
             .expect("old GPU resident");
-        resident.gpu_written = true;
+        resident.note_gpu_authored_whole_span();
         resident.last_use = ResidentTextureActivityStamp { work: 10, flip: 1 };
     }
     presenter
@@ -1998,7 +1999,7 @@ fn resident_pressure_plan_prefers_clean_old_images_and_excludes_the_current_flip
             .resident_guest_textures
             .get_mut(&current_gpu)
             .expect("current GPU resident");
-        resident.gpu_written = true;
+        resident.note_gpu_authored_whole_span();
         resident.last_use = ResidentTextureActivityStamp { work: 30, flip: 2 };
     }
     let total_bytes = presenter
@@ -2070,7 +2071,7 @@ fn resident_pressure_plan_keeps_overlapping_gpu_versions_indivisible() {
             .resident_guest_textures
             .get_mut(&descriptor)
             .expect("overlap resident");
-        resident.gpu_written = true;
+        resident.note_gpu_authored_whole_span();
         resident.content_version = work;
         resident.last_use = ResidentTextureActivityStamp { work, flip: 1 };
     }
@@ -2133,6 +2134,7 @@ fn resident_pressure_eviction_retiles_gpu_pixels_before_removal() {
         descriptor,
         ResourceSpan::for_texture(descriptor),
         None,
+        WrittenRegion::whole_resource(),
         ResidentTextureActivityStamp { work: 10, flip: 1 },
     );
 
@@ -2243,7 +2245,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
         .expect("promoted resident");
     assert_eq!(resident.mip_level_count, 3);
     assert!(
-        !resident.gpu_written,
+        !resident.gpu_written(),
         "copying clean guest-derived levels must not invent GPU ownership"
     );
     assert!(resident.gpu_write_watch_generations.is_empty());
@@ -2306,7 +2308,7 @@ fn clean_overlapping_render_views_coexist_until_one_is_written() {
         presenter
             .resident_guest_textures
             .get(&second)
-            .is_some_and(|resident| resident.gpu_written)
+            .is_some_and(|resident| resident.gpu_written())
     );
 }
 
@@ -3287,13 +3289,14 @@ fn writing_a_pitch_tolerant_selection_attributes_to_the_resident_that_was_served
         sampled,
         ResourceSpan::for_texture(sampled),
         Some(selected.descriptor),
+        WrittenRegion::whole_resource(),
         ResidentTextureActivityStamp { work: 42, flip: 7 },
     );
     let resident = presenter
         .resident_guest_textures
         .get(&rendered)
         .expect("selected resident survives its own write");
-    assert!(resident.gpu_written);
+    assert!(resident.gpu_written());
     assert!(resident.content_version > version_after_first_write);
     assert_eq!(
         resident.last_use,
@@ -3343,6 +3346,7 @@ fn writing_without_the_selected_key_counts_a_pitch_tolerant_attribution_miss() {
         sampled,
         ResourceSpan::for_texture(sampled),
         None,
+        WrittenRegion::whole_resource(),
         ResidentTextureActivityStamp { work: 42, flip: 7 },
     );
     assert_eq!(
