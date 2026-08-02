@@ -49,30 +49,36 @@ impl MetalPresenter {
                 wait.address
             ));
         }
-        // A release/write queued after the preceding Metal batch is the value the ordered GPU
-        // wait will observe. When it already satisfies the comparison, the serial Metal queue
-        // provides the required ordering without a CPU round trip. The actual guest-memory write
-        // is published as that batch retires, before its completion sequence becomes visible.
-        // A WAIT whose condition is already true is only an ordering point. Later Metal command
-        // buffers are submitted to the same serial queue, so completing every earlier batch on
-        // the CPU before reading the label adds no ordering that the queue does not already
-        // provide. This is the overwhelmingly common Unity fence pattern (for example 0 < a
-        // monotonically increasing reference) and synchronously draining the queue here turns
-        // hundreds of otherwise asynchronous draws into one CPU/GPU round trip per frame.
+        // A queued write to this label is the value the GPU will eventually observe, but it is
+        // not completion evidence yet. The old fast path returned `Satisfied` from that future
+        // value and let the presenter execute following host-side commands immediately. Metal
+        // encodes happened to remain ordered on the one serial command queue, but CP DMA copies,
+        // cache mutations, and other CPU-emulated effects could overtake the producer. A later
+        // submission boundary would still join the producer batch, hiding the lie from the
+        // completion counters while those early effects touched allocations the guest considered
+        // fenced.
         //
-        // A queued write to this exact label takes precedence over the current memory contents:
-        // the guest WAIT is ordered after that write. If no such write exists, the live value can
-        // be tested immediately. If the queued value does not satisfy the comparison, retirement
-        // below publishes it before the next live-memory test.
-        match self.pending_guest_memory_value(wait.address, wait.is_64_bit) {
-            Some(value) if wait.is_satisfied_by(value) => {
-                self.guest_memory_waits.complete(key);
-                if let Some(ticket_id) = ticket_id {
-                    remu_gpu::retire_gpu_wait(ticket_id);
+        // Park only this logical guest queue until the producer batch reaches a terminal state
+        // and publishes the real label. Other queues remain runnable and no host thread waits.
+        // The producer publication also latches registered waits, so the normal ticket path above
+        // resumes without polling a recycled label generation.
+        let pending_value = self.pending_guest_memory_value(wait.address, wait.is_64_bit);
+        match pending_value {
+            Some(value) => {
+                if wait.is_satisfied_by(value) {
+                    static DEFERRED_FUTURE_VALUE_WAITS: AtomicUsize = AtomicUsize::new(0);
+                    let sequence =
+                        DEFERRED_FUTURE_VALUE_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sequence <= 16 || sequence.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][LIFETIME-ORDER] phase=defer-future-wait sequence={sequence} address={:#x} value={value:#x} open_batch={} committed_batches={}",
+                            wait.address,
+                            self.open_guest_batch.is_some(),
+                            self.committed_guest_batches.len()
+                        );
+                    }
                 }
-                return Ok(GuestMemoryWaitStatus::Satisfied);
             }
-            Some(_) => {}
             None if wait.is_satisfied_by(read_guest_memory_wait_value(wait)) => {
                 self.guest_memory_waits.complete(key);
                 if let Some(ticket_id) = ticket_id {
@@ -84,13 +90,6 @@ impl MetalPresenter {
         }
         self.retire_completed_guest_batches();
         match self.pending_guest_memory_value(wait.address, wait.is_64_bit) {
-            Some(value) if wait.is_satisfied_by(value) => {
-                self.guest_memory_waits.complete(key);
-                if let Some(ticket_id) = ticket_id {
-                    remu_gpu::retire_gpu_wait(ticket_id);
-                }
-                return Ok(GuestMemoryWaitStatus::Satisfied);
-            }
             Some(_) => {}
             None if wait.is_satisfied_by(read_guest_memory_wait_value(wait)) => {
                 self.guest_memory_waits.complete(key);
