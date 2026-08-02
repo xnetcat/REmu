@@ -256,9 +256,13 @@ mod tests {
             sce_kernel_error(SCE_NET_CTL_ERROR_INVALID_ADDRESS)
         );
         assert_eq!(dispatch("not-a-nid-11", [0; 6]), None);
+        // This NID is the hash of `sceUserServiceGetPlatformPrivacyWs1`. It was previously named
+        // `sceUserServiceGetPlatformPrivacySetting`, which is a real symbol but hashes to
+        // `Yd+E-89ZPl4` — a different import wearing this one's name, pinned here by this
+        // assertion. Recovering a name by hashing the candidate is the check that settles it.
         assert_eq!(
             crate::known_nid_name("D-CzAxQL0XI"),
-            Some("sceUserServiceGetPlatformPrivacySetting")
+            Some("sceUserServiceGetPlatformPrivacyWs1")
         );
     }
 }

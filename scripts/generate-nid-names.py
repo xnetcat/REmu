@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """Generate the NID-to-symbol-name table used to label imports in diagnostics.
 
-A PS5 import is identified only by an 11-character NID: the first eight bytes of
-`SHA-1(symbol || suffix)`, little-endian, base64 encoded with `/` rewritten to `-`.  The
-mapping is one-way, so a name can only be recovered by hashing a candidate symbol and
-comparing.  This script hashes every symbol exported by a set of ELF modules and emits the
-matches as a sorted Rust table.
+A PS5 import is identified only by an 11-character NID.  For almost every export that NID is
+the first eight bytes of `SHA-1(symbol || suffix)`, little-endian, base64 encoded with `/`
+rewritten to `-`, and since the mapping is one-way a name is recovered by hashing a candidate
+symbol and comparing.  This script hashes every symbol exported by a set of ELF modules and
+emits the matches as a sorted Rust table.
+
+CAUTION — the hash relation is not universal, and this script assumes it is.  A small number of
+exports carry hand-assigned ("pinned") NIDs that are not the hash of their own symbol name: 16
+of them in SDK 10.00, 15 in libSceAgc alone, including `sceAgcInit`, `sceAgcDcbSetIndexSize`,
+`sceAgcDcbContextStateOp`, `sceAgcGetDataPacketPayloadAddress`, `sceAgcFuseShaderHalves` and
+`sceAgcGetFusedShaderSize`.  For those, `nid_of(name)` returns an identifier no binary ever
+uses, so this script emits a phantom entry and silently omits the real one.  Hashing therefore
+cannot recover them and must not be used to "verify" them either: applied naively to the
+hand-maintained table it flags correct pinned entries as wrong.
+
+The authoritative pairing is in the stub library itself — a `.scenid` section holding one
+8-byte NID per `.dynsym` entry — which is the only source that can name a pinned export.  Until
+this script reads that section, treat its output as covering hashed exports only, and keep the
+pinned entries in the hand-maintained table where they can be sourced deliberately.
 
 The table carries names only.  It records no signature, layout, or behaviour, and it never
 makes a NID dispatch anywhere -- an unimplemented import stays unimplemented, it just gets
