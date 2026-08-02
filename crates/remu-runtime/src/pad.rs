@@ -242,7 +242,7 @@ pub(crate) fn pad_read_state(arguments: [u64; 6]) -> u64 {
     }
     guest_memset(output, 0, 0x78);
     let host = remu_gpu::host_pad_state();
-    let buttons = host.buttons | auto_cross_buttons();
+    let buttons = host.buttons | auto_cross_buttons() | auto_options_buttons();
     let previous_buttons = LAST_LOGGED_BUTTONS.swap(buttons, Ordering::Relaxed);
     if previous_buttons != buttons {
         eprintln!("[REMu][PAD] buttons={buttons:#010x}");
@@ -394,9 +394,77 @@ fn auto_cross_buttons() -> u32 {
     pulse.buttons_at(now, start, times, hold, repeat)
 }
 
+#[derive(Default)]
+struct AutoScheduledButtonPulseState {
+    next_scheduled_pulse: usize,
+    active_until: Option<Instant>,
+}
+
+impl AutoScheduledButtonPulseState {
+    fn buttons_at(
+        &mut self,
+        now: Instant,
+        start: Instant,
+        times: &[Duration],
+        hold: Duration,
+        button: u32,
+    ) -> u32 {
+        if self
+            .active_until
+            .is_some_and(|active_until| now < active_until)
+        {
+            return button;
+        }
+        self.active_until = None;
+
+        let elapsed = now.saturating_duration_since(start);
+        if times
+            .get(self.next_scheduled_pulse)
+            .is_some_and(|scheduled| elapsed >= *scheduled)
+        {
+            self.next_scheduled_pulse += 1;
+            self.active_until = Some(now + hold);
+            return button;
+        }
+        0
+    }
+}
+
+fn auto_options_buttons() -> u32 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    static TIMES: OnceLock<Vec<Duration>> = OnceLock::new();
+    static HOLD: OnceLock<Duration> = OnceLock::new();
+    static PULSE: OnceLock<Mutex<AutoScheduledButtonPulseState>> = OnceLock::new();
+    let times = TIMES.get_or_init(|| {
+        std::env::var("REMU_AUTO_OPTIONS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.trim().parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(Duration::from_secs_f64)
+            .collect()
+    });
+    if times.is_empty() {
+        return 0;
+    }
+    let hold = *HOLD.get_or_init(|| {
+        std::env::var("REMU_AUTO_OPTIONS_HOLD_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Duration::from_millis(400), Duration::from_millis)
+    });
+    let start = *START.get_or_init(Instant::now);
+    let now = Instant::now();
+    let mut pulse = PULSE
+        .get_or_init(|| Mutex::new(AutoScheduledButtonPulseState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pulse.buttons_at(now, start, times, hold, remu_gpu::PAD_BUTTON_OPTIONS)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AutoCrossPulseState;
+    use super::{AutoCrossPulseState, AutoScheduledButtonPulseState};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -511,6 +579,65 @@ mod tests {
                 None
             ),
             remu_gpu::PAD_BUTTON_CROSS
+        );
+    }
+
+    #[test]
+    fn scheduled_button_pulses_have_release_edges() {
+        let start = Instant::now();
+        let hold = Duration::from_millis(100);
+        let times = [Duration::from_secs(1), Duration::from_secs(2)];
+        let mut state = AutoScheduledButtonPulseState::default();
+
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(999),
+                start,
+                &times,
+                hold,
+                remu_gpu::PAD_BUTTON_OPTIONS,
+            ),
+            0
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_secs(1),
+                start,
+                &times,
+                hold,
+                remu_gpu::PAD_BUTTON_OPTIONS,
+            ),
+            remu_gpu::PAD_BUTTON_OPTIONS
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(1_100),
+                start,
+                &times,
+                hold,
+                remu_gpu::PAD_BUTTON_OPTIONS,
+            ),
+            0
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_secs(2),
+                start,
+                &times,
+                hold,
+                remu_gpu::PAD_BUTTON_OPTIONS,
+            ),
+            remu_gpu::PAD_BUTTON_OPTIONS
+        );
+        assert_eq!(
+            state.buttons_at(
+                start + Duration::from_millis(2_100),
+                start,
+                &times,
+                hold,
+                remu_gpu::PAD_BUTTON_OPTIONS,
+            ),
+            0
         );
     }
 }

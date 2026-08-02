@@ -304,6 +304,10 @@ fi
 # Separate button edges keep title UIs from rejecting the two-button chord. Set
 # REMU_AUTO_CROSS_REPEAT_MS=0 to keep an explicit schedule one-shot.
 auto_cross=${REMU_AUTO_CROSS:-}
+# Some first-boot and system-style title screens bind their explicit confirmation action to the
+# controller's Options button. Keep this as a separate one-shot schedule so it never forms a
+# chord with the existing Cross/Square repeat automation.
+auto_options=${REMU_AUTO_OPTIONS:-}
 # Scripted runs must never gate on a guest dialog waiting for a human. The runtime
 # auto-completes dialogs when this is set; pass an explicit 0 to restore interactive dialogs.
 REMU_AUTO_DISMISS_DIALOGS=${REMU_AUTO_DISMISS_DIALOGS:-1}
@@ -379,7 +383,8 @@ if [ "$capture_frames" = 1 ]; then
         "$script_dir/run-with-watchdog.sh" \
             "$watchdog_timeout_seconds" "$watchdog_termination_grace_seconds" -- \
             env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME \
-                REMU_AUTO_CROSS="$auto_cross" REMU_CAPTURE_DIR="$frame_dir" \
+                REMU_AUTO_CROSS="$auto_cross" REMU_AUTO_OPTIONS="$auto_options" \
+                REMU_CAPTURE_DIR="$frame_dir" \
                 arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
     ) > "$run_dir/guest.log" 2>&1 &
 else
@@ -388,7 +393,7 @@ else
         "$script_dir/run-with-watchdog.sh" \
             "$watchdog_timeout_seconds" "$watchdog_termination_grace_seconds" -- \
             env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME -u REMU_CAPTURE_DIR \
-                REMU_AUTO_CROSS="$auto_cross" \
+                REMU_AUTO_CROSS="$auto_cross" REMU_AUTO_OPTIONS="$auto_options" \
                 arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
     ) > "$run_dir/guest.log" 2>&1 &
 fi
