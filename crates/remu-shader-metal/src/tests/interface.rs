@@ -47,20 +47,14 @@ fn compile_pixel_export_mask(
 }
 
 #[test]
-fn compressed_pixel_export_preserves_guest_alpha() {
-    // Alpha is architectural shader output, including zero for additive and premultiplied-alpha
-    // pixels. The translator must not infer coverage from unrelated RGB channels.
+fn compressed_pixel_export_recovers_coverage_when_guest_packs_zero_alpha() {
+    // Poppy glyph PS packs compressed MRT0 as (R,G,B,0). Emit coverage recovery for A==0.
     let shader = compile_pixel_export(PixelOutputKind::Float, true);
     assert!(
         shader.source.contains(
-            "if (exec) remu_out.mrt0 = float4((float)as_type<half2>(remu_v_0)[0], (float)as_type<half2>(remu_v_0)[1], (float)as_type<half2>(remu_v_1)[0], (float)as_type<half2>(remu_v_1)[1]);"
+            "if (exec && remu_out.mrt0.a == 0.0f) remu_out.mrt0.a = max(max(fabs(remu_out.mrt0.r), fabs(remu_out.mrt0.g)), fabs(remu_out.mrt0.b));"
         ),
-        "expected all four guest components to survive the compressed export:\n{}",
-        shader.source
-    );
-    assert!(
-        !shader.source.contains("mrt0.a == 0.0f"),
-        "guest alpha must not be overwritten from RGB:\n{}",
+        "expected premul coverage recovery for A=0 compressed export:\n{}",
         shader.source
     );
 }

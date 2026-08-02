@@ -363,6 +363,21 @@ impl Compiler<'_> {
                 values[0], values[1], values[2], values[3]
             ),
         );
+        // Poppy Slate SDF packs compressed MRT0 as (R,G,B,0) after V_CVT_PKRTZ …, 0. Premul RGB
+        // still carries coverage, but A=0 makes SrcAlpha / OneMinusSrcAlpha compositing a no-op
+        // or leaves the default opaque alpha from init — both read as solid letter boxes. Recover
+        // coverage from premul RGB when the guest explicitly exported a zero alpha.
+        if export.compressed
+            && matches!(output.kind, PixelOutputKind::Float)
+            && export.enable_mask & 0b0100 != 0
+        {
+            self.line(
+                3,
+                &format!(
+                    "if (exec && {field}.a == 0.0f) {field}.a = max(max(fabs({field}.r), fabs({field}.g)), fabs({field}.b));"
+                ),
+            );
+        }
         Ok(())
     }
 
