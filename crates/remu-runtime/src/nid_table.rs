@@ -487,6 +487,18 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         // older SDK's hand-assigned NID: not derived from its name, so unguessable by
         // construction. The function identity is inferred rather than read: Kyty and KytyPS5 both
         // catalog it as the interpolant-mapping entry point from behavioural reverse engineering.
+        //
+        // Sharing a display name here does NOT license sharing an implementation. The evidence
+        // bar is lower than for the sceAgcDcbSetIndexSize pair above, where GIIW2J37e70 IS the
+        // SHA-1 of the name and the identity is proven; here it rests on behavioural RE alone.
+        // Nobody knows why Sony pins a NID, and one live hypothesis is that pinning accompanies a
+        // signature change under an unchanged name — which would make a shared name precisely the
+        // case where two entry points take DIFFERENT arguments. Only HV4j+E0MBHE is dispatched
+        // today. Before wiring dbOlWdppb4o to the same body, diff its argument profile against
+        // this one's, which is already heterogeneous: the common shape repeats a pointer
+        // (dst, ptr, srcA, srcB, srcA, 4) while a second family arrives as (dst, ptr, 0, n, 1,
+        // 0x10). One NID reaching a body by two shapes is the thing to understand before a second
+        // NID is pointed at it.
         "dbOlWdppb4o" | "HV4j+E0MBHE" => "sceAgcCreateInterpolantMapping",
         "l4fM9K-Lyks" => "sceAgcDcbSetIndexBuffer",
         "GIIW2J37e70" => "sceAgcDcbSetIndexSize",
