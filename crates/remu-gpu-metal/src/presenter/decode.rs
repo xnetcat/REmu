@@ -18,9 +18,9 @@ use super::{
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
-    is_storage_image_opcode, ngg_export_uses_general_lds, ngg_memoryless_cover_export_stage,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
-    procedural_rectangle_stage_for_draw, program_embeds_global_base, tiled_block_dimensions,
+    is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    tiled_block_dimensions,
     trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
     video_target_binding_summary,
 };

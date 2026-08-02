@@ -36,17 +36,18 @@ pub(crate) use self::program::{
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
-    ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
+    ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
     pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
     program_uses_lds, rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
 #[cfg(test)]
 pub(crate) use self::program::{
-    lift_expanded_vertex_buffer_num_records, ngg_mesh_draw_supported,
-    procedural_rectangle_export_stage, rectangle_draw_has_incomplete_interface,
-    shader_scalar_metadata, truncated_memoryless_ngg_rectangle_cover,
+    lift_expanded_vertex_buffer_num_records, ngg_export_uses_general_lds,
+    ngg_mesh_draw_supported, procedural_rectangle_export_stage,
+    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
+    truncated_memoryless_ngg_rectangle_cover,
 };
 
 impl MetalPresenter {

@@ -449,7 +449,7 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
     draw.index_count = 4;
     assert!(
         ngg_fullscreen_cover_draw(&program, &draw),
-        "LDS-free NGG strip covers keep the synthesized path even when the guest ES still touches Flat/Global vertex seeds"
+        "memoryless NGG strip covers keep the synthesized path"
     );
     draw.indexed = true;
     draw.primitive_type = 4;
@@ -606,6 +606,18 @@ fn keeps_lds_free_vertex_fetching_ngg_quads_off_the_mesh_path() {
         ngg_mesh_stage_for_draw(&program, &draw),
         Ok(false),
         "LDS-free buffer-fetching NGG quads keep the ordinary VS path"
+    );
+    draw.indexed = false;
+    draw.primitive_type = 6;
+    draw.index_count = 4;
+    assert!(
+        !ngg_fullscreen_cover_draw(&program, &draw),
+        "a four-vertex YUV-style strip must retain the guest shader's resource-loaded UV extent"
+    );
+    assert_eq!(
+        ngg_mesh_stage_for_draw(&program, &draw),
+        Ok(false),
+        "LDS-free buffer-fetching strips execute as ordinary vertex shaders"
     );
 }
 
