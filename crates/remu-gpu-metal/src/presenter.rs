@@ -156,7 +156,8 @@ use self::stats::{
     MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
-    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, SAMPLED_ALIAS_WRITEBACK_BYTES,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WRITE_ATTRIBUTION_MISSES,
+    SAMPLED_ALIAS_WRITEBACK_BYTES,
     SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
@@ -957,6 +958,11 @@ struct UploadedImageTexture {
     texture: Texture,
     descriptor: DecodedImageDescriptor,
     writable: bool,
+    /// The key the residency map filed the served texture under, when it came from a resident.
+    ///
+    /// A storage image can be served by a resident whose pitch differs from the binding's, so
+    /// attributing a later write to `descriptor.guest` would find no resident at all.
+    selected_resident: Option<GuestTextureDescriptor>,
 }
 
 struct ResidentGuestTexture {

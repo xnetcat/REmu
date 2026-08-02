@@ -704,7 +704,8 @@ fn promotes_small_depth_target_to_the_color_framebuffer_extent() {
 
     let promoted = presenter
         .ensure_depth_render_target_texture(&device, depth, 128, 96)
-        .expect("promote depth target");
+        .expect("promote depth target")
+        .texture;
     assert_eq!((promoted.width(), promoted.height()), (128, 96));
 
     let promoted_descriptor = GuestTextureDescriptor {
@@ -774,7 +775,8 @@ fn promotes_layered_depth_target_without_collapsing_its_slices() {
 
     let promoted = presenter
         .ensure_depth_render_target_texture(&device, depth, 128, 96)
-        .expect("promote layered depth target");
+        .expect("promote layered depth target")
+        .texture;
     assert_eq!(promoted.texture_type(), MTLTextureType::D2Array);
     assert_eq!(promoted.array_length(), 3);
     assert_eq!((promoted.width(), promoted.height()), (128, 96));

@@ -434,6 +434,9 @@ impl MetalPresenter {
         let mut target_textures = Vec::with_capacity(targets.len());
         let mut target_resolve_textures = Vec::with_capacity(targets.len());
         let mut initial_target_clear_colors = Vec::with_capacity(targets.len());
+        // Residency may serve a target through a pitch-mismatched alias of the decoded
+        // descriptor. Keep the key it chose so the post-draw write reaches that resident.
+        let mut target_resident_descriptors = Vec::with_capacity(targets.len());
         for target in &targets {
             let resolved_texture = if target.direct_scanout {
                 let texture = self.ensure_direct_scanout_texture(&device, target.texture);
@@ -441,6 +444,7 @@ impl MetalPresenter {
                     self.direct_scanout_needs_initial_clear(target.texture.address)
                         .then_some(MTLClearColor::new(0.0, 0.0, 0.0, 1.0)),
                 );
+                target_resident_descriptors.push(None);
                 texture
             } else {
                 let has_resident_storage = self.resident_guest_textures.values().any(|resident| {
@@ -472,17 +476,20 @@ impl MetalPresenter {
                         );
                     }
                 }
-                self.ensure_layered_render_target_texture(
-                    &device,
-                    *target,
-                    initial_clear_color.is_some(),
-                )
-                .map_err(|error| {
-                    format!(
-                        "render target {} guest memory is unreadable: {error}",
-                        target.guest_slot
+                let selected = self
+                    .ensure_layered_render_target_texture(
+                        &device,
+                        *target,
+                        initial_clear_color.is_some(),
                     )
-                })?
+                    .map_err(|error| {
+                        format!(
+                            "render target {} guest memory is unreadable: {error}",
+                            target.guest_slot
+                        )
+                    })?;
+                target_resident_descriptors.push(Some(selected.descriptor));
+                selected.texture
             };
             if target.sample_count > 1 {
                 let (multisample, clear_multisample) = self.ensure_multisample_texture(
@@ -516,12 +523,14 @@ impl MetalPresenter {
                 guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
             })
         });
-        let resolved_depth_texture = depth
+        let resolved_depth = depth
             .map(|depth| {
                 self.ensure_depth_render_target_texture(&device, depth, render_width, render_height)
                     .map_err(|error| format!("depth target guest memory is unreadable: {error}"))
             })
             .transpose()?;
+        let depth_resident_descriptor = resolved_depth.as_ref().map(|resolved| resolved.descriptor);
+        let resolved_depth_texture = resolved_depth.map(|resolved| resolved.texture);
         let (depth_texture, depth_resolve_texture, clear_uninitialized_depth) =
             if let (Some(depth), Some(resolved)) = (depth, resolved_depth_texture) {
                 if depth.sample_count > 1 {
@@ -1566,7 +1575,7 @@ impl MetalPresenter {
             }
         }
 
-        for target in &targets {
+        for (target, resident_descriptor) in targets.iter().zip(&target_resident_descriptors) {
             if target.direct_scanout {
                 self.mark_direct_scanout_initialized(target.texture.address);
             } else {
@@ -1574,10 +1583,15 @@ impl MetalPresenter {
                     self.mark_multisample_texture_initialized(target.texture, target.sample_count);
                     self.mark_resident_texture_written_preserving_multisample_at(
                         target.texture,
+                        *resident_descriptor,
                         activity_stamp,
                     );
                 } else {
-                    self.mark_resident_texture_written_at(target.texture, activity_stamp);
+                    self.mark_resident_texture_written_at(
+                        target.texture,
+                        *resident_descriptor,
+                        activity_stamp,
+                    );
                 }
             }
             // A flip can arrive before the presenter has translated its render target. Remember
@@ -1621,10 +1635,15 @@ impl MetalPresenter {
                 if depth.sample_count > 1 {
                     self.mark_resident_texture_written_preserving_multisample_at(
                         depth.texture,
+                        depth_resident_descriptor,
                         activity_stamp,
                     );
                 } else {
-                    self.mark_resident_texture_written_at(depth.texture, activity_stamp);
+                    self.mark_resident_texture_written_at(
+                        depth.texture,
+                        depth_resident_descriptor,
+                        activity_stamp,
+                    );
                 }
             }
         }
@@ -1656,7 +1675,11 @@ impl MetalPresenter {
                         sampled.clone(),
                     );
                 }
-                self.mark_resident_texture_written_at(texture.descriptor.guest, activity_stamp);
+                self.mark_resident_texture_written_at(
+                    texture.descriptor.guest,
+                    texture.selected_resident,
+                    activity_stamp,
+                );
                 self.note_pending_flip_target_write(texture.descriptor.guest);
             }
         }
@@ -2764,9 +2787,12 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal command queue is unavailable")?
             .clone();
-        let source_texture = self.ensure_layered_render_target_texture(&device, source, false)?;
-        let destination_texture =
+        let source_texture = self
+            .ensure_layered_render_target_texture(&device, source, false)?
+            .texture;
+        let destination_resident =
             self.ensure_layered_render_target_texture(&device, destination, true)?;
+        let destination_texture = destination_resident.texture.clone();
         let activity_stamp = ResidentTextureActivityStamp {
             work: draw.sequence,
             flip: self.next_flip_sequence,
@@ -2812,7 +2838,11 @@ impl MetalPresenter {
             export_dispatcher: false,
             pixel_dispatcher: false,
         });
-        self.mark_resident_texture_written_at(destination.texture, activity_stamp);
+        self.mark_resident_texture_written_at(
+            destination.texture,
+            Some(destination_resident.descriptor),
+            activity_stamp,
+        );
         self.note_pending_flip_target_write(destination.texture);
         Ok((source.texture, destination.texture))
     }
@@ -2862,7 +2892,8 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal command queue is unavailable")?
             .clone();
-        let resolved = self.ensure_layered_render_target_texture(&device, target, true)?;
+        let selected = self.ensure_layered_render_target_texture(&device, target, true)?;
+        let resolved = selected.texture.clone();
         let (attachment_texture, resolve_texture) = if target.sample_count > 1 {
             let (multisample, _) = self.ensure_multisample_texture(
                 &device,
@@ -2921,10 +2952,15 @@ impl MetalPresenter {
             self.mark_multisample_texture_initialized(target.texture, target.sample_count);
             self.mark_resident_texture_written_preserving_multisample_at(
                 target.texture,
+                Some(selected.descriptor),
                 activity_stamp,
             );
         } else {
-            self.mark_resident_texture_written_at(target.texture, activity_stamp);
+            self.mark_resident_texture_written_at(
+                target.texture,
+                Some(selected.descriptor),
+                activity_stamp,
+            );
         }
         self.note_pending_flip_target_write(target.texture);
         Ok(Some(target.texture))

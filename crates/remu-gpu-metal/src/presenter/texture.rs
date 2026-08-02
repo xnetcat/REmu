@@ -7,7 +7,8 @@ use super::{
     GuestTextureDescriptor, GuestTextureOverlapQuery, GuestTextureWatchRange,
     GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
     MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
+    RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
+    RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidentGuestTexture,
     ResidentTextureActivityStamp, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
@@ -65,8 +66,7 @@ pub(crate) use self::mips::{
 };
 pub(crate) use self::residency::{
     QuarantineAdoption, RETIRED_TEXTURE_QUARANTINE_CAPACITY, adopt_quarantined_resident,
-    ensure_resident_texture_in_map, quarantine_retired_resident,
-    resident_texture_ownership_stats,
+    ensure_resident_texture_in_map, quarantine_retired_resident, resident_texture_ownership_stats,
 };
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,

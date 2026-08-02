@@ -10,7 +10,8 @@ use super::{
     MetalPresenter, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED,
     PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PresenterFlow,
     RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_FLIP_AGE_LABELS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
-    RESIDENT_WORK_AGE_LABELS, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    RESIDENT_WORK_AGE_LABELS, RESIDENT_WRITE_ATTRIBUTION_MISSES, SAMPLED_ALIAS_WRITEBACK_BYTES,
+    SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
     SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, TEXTURE_DIRTY_VALIDATION_BYTES,
@@ -390,8 +391,11 @@ impl MetalPresenter {
                 SAMPLED_ALIAS_WRITEBACK_NANOSECONDS.swap(0, Ordering::Relaxed);
             let quarantine_adopted = TEXTURE_QUARANTINE_ADOPTED.swap(0, Ordering::Relaxed);
             let quarantine_rejected = TEXTURE_QUARANTINE_REJECTED.swap(0, Ordering::Relaxed);
+            // Expected to stay zero: any count is a GPU write that reached no resident at all.
+            let write_attribution_misses =
+                RESIDENT_WRITE_ATTRIBUTION_MISSES.swap(0, Ordering::Relaxed);
             eprintln!(
-                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB guest={}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms quarantine={}/{} adopt={} stale={}",
+                "[REMu][PERF-TEXTURE-CACHE] resident={}/{}MiB guest={}MiB metal={}/{}MiB watches={} hit={} miss={} dirty_reload={} acquire_invalidate={} resident_acquire_invalidate={} capacity_evict={} depth_native={} alias_writeback={}/{:.1}MiB/{:.1}ms quarantine={}/{} adopt={} stale={} write_attribution_miss={}",
                 self.sampled_texture_cache.len(),
                 sampled_texture_cache_mib,
                 sampled_texture_cache_guest_mib,
@@ -412,6 +416,7 @@ impl MetalPresenter {
                 RETIRED_TEXTURE_QUARANTINE_CAPACITY,
                 quarantine_adopted,
                 quarantine_rejected,
+                write_attribution_misses,
             );
             let texture_allocated_bytes = |texture: &metal::Texture| {
                 u64::try_from(texture.allocated_size()).unwrap_or(u64::MAX)

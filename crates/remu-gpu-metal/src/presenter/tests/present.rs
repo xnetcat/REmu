@@ -457,7 +457,8 @@ fn translated_scanout_resolution_prefers_the_current_resident_object() {
     };
     let original = presenter
         .ensure_resident_texture(&device, descriptor)
-        .expect("resident scanout");
+        .expect("resident scanout")
+        .texture;
     presenter.mark_resident_texture_written(descriptor);
     presenter.ensure_direct_scanout_texture(&device, descriptor);
     presenter.mark_direct_scanout_initialized(address.get());

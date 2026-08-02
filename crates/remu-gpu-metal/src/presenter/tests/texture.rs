@@ -14,7 +14,9 @@ use super::super::refresh_resident_texture_write_watch;
 use super::super::texture::{
     QuarantineAdoption, adopt_quarantined_resident, ensure_resident_texture_in_map,
 };
-use super::super::{TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED};
+use super::super::{
+    RESIDENT_WRITE_ATTRIBUTION_MISSES, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
+};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, GuestTextureOverlapQuery, MetalPresenter,
@@ -1751,7 +1753,8 @@ fn a_single_level_descriptor_does_not_gain_an_inferred_mip_hierarchy() {
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let resident = presenter
         .ensure_resident_texture(&device, guest)
-        .expect("single-level residency");
+        .expect("single-level residency")
+        .texture;
     assert_eq!(resident.mipmap_level_count(), 1);
     assert_eq!(
         presenter
@@ -2106,7 +2109,8 @@ fn resident_pressure_eviction_retiles_gpu_pixels_before_removal() {
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let texture = presenter
         .ensure_resident_texture(&device, descriptor)
-        .expect("resident texture");
+        .expect("resident texture")
+        .texture;
     let rendered = (0..64 * 64 * 4)
         .map(|index| ((index * 37 + index / 11) & 0xff) as u8)
         .collect::<Vec<_>>();
@@ -2118,6 +2122,7 @@ fn resident_pressure_eviction_retiles_gpu_pixels_before_removal() {
     );
     presenter.mark_resident_texture_written_at(
         descriptor,
+        None,
         ResidentTextureActivityStamp { work: 10, flip: 1 },
     );
 
@@ -3188,5 +3193,150 @@ fn gpu_written_resident_serving_sampled_key_prefers_the_newest_gpu_written_resid
     assert_eq!(
         gpu_written_resident_serving_sampled_key(&presenter.resident_guest_textures, key),
         Some(rendered)
+    );
+}
+
+/// Builds a GPU-written resident that only the pitch-tolerant rule can serve to `sampled`.
+#[cfg(test)]
+fn pitch_tolerant_gpu_resident(
+    presenter: &mut MetalPresenter,
+    device: &Device,
+    address: u64,
+) -> (GuestTextureDescriptor, GuestTextureDescriptor) {
+    let rendered = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let sampled = GuestTextureDescriptor {
+        pitch: 32,
+        ..rendered
+    };
+    assert!(guest_texture_descriptors_share_gpu_sample_storage(
+        rendered, sampled
+    ));
+    assert!(!guest_texture_descriptors_share_storage(rendered, sampled));
+    presenter
+        .ensure_resident_texture(device, rendered)
+        .expect("render target resident");
+    presenter.mark_resident_texture_written(rendered);
+    (rendered, sampled)
+}
+
+#[test]
+fn writing_a_pitch_tolerant_selection_attributes_to_the_resident_that_was_served() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("target mapping")
+        .get();
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let (rendered, sampled) = pitch_tolerant_gpu_resident(&mut presenter, &device, address);
+    let version_after_first_write = presenter
+        .resident_guest_textures
+        .get(&rendered)
+        .expect("rendered resident")
+        .content_version;
+
+    // The mismatched pitch is served by the existing GPU-written resident, so no second
+    // resident is created and the write has to be attributed through the selected key.
+    let selected = presenter
+        .ensure_resident_texture(&device, sampled)
+        .expect("pitch-tolerant selection");
+    assert_eq!(selected.descriptor, rendered);
+    assert!(!presenter.resident_guest_textures.contains_key(&sampled));
+
+    let misses_before = RESIDENT_WRITE_ATTRIBUTION_MISSES.load(AtomicOrdering::Relaxed);
+    presenter.mark_resident_texture_written_at(
+        sampled,
+        Some(selected.descriptor),
+        ResidentTextureActivityStamp { work: 42, flip: 7 },
+    );
+    let resident = presenter
+        .resident_guest_textures
+        .get(&rendered)
+        .expect("selected resident survives its own write");
+    assert!(resident.gpu_written);
+    assert!(resident.content_version > version_after_first_write);
+    assert_eq!(
+        resident.last_use,
+        ResidentTextureActivityStamp { work: 42, flip: 7 }
+    );
+    assert_eq!(
+        RESIDENT_WRITE_ATTRIBUTION_MISSES.load(AtomicOrdering::Relaxed),
+        misses_before
+    );
+}
+
+#[test]
+fn writing_without_the_selected_key_counts_a_pitch_tolerant_attribution_miss() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("target mapping")
+        .get();
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let (rendered, sampled) = pitch_tolerant_gpu_resident(&mut presenter, &device, address);
+    let version_after_first_write = presenter
+        .resident_guest_textures
+        .get(&rendered)
+        .expect("rendered resident")
+        .content_version;
+
+    // This is the defect the counter watches for: the raw written descriptor reaches neither
+    // the exact key nor a shared-storage resident, so the write lands nowhere.
+    let misses_before = RESIDENT_WRITE_ATTRIBUTION_MISSES.load(AtomicOrdering::Relaxed);
+    presenter.mark_resident_texture_written_at(
+        sampled,
+        None,
+        ResidentTextureActivityStamp { work: 42, flip: 7 },
+    );
+    assert_eq!(
+        RESIDENT_WRITE_ATTRIBUTION_MISSES.load(AtomicOrdering::Relaxed),
+        misses_before + 1
+    );
+    assert_eq!(
+        presenter
+            .resident_guest_textures
+            .get(&rendered)
+            .expect("rendered resident")
+            .content_version,
+        version_after_first_write
     );
 }

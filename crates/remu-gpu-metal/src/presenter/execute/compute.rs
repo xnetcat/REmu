@@ -377,7 +377,11 @@ impl MetalPresenter {
                         sampled.clone(),
                     );
                 }
-                self.mark_resident_texture_written_at(texture.descriptor.guest, activity_stamp);
+                self.mark_resident_texture_written_at(
+                    texture.descriptor.guest,
+                    texture.selected_resident,
+                    activity_stamp,
+                );
                 // Gen5 presentation targets are ordinary guest images and may be completed by a
                 // storage-image compute pass (upscaling, tone mapping, or format conversion)
                 // rather than a color attachment. Treat that write exactly like a render-target

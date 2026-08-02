@@ -5,7 +5,8 @@ use super::super::completion::commit_and_settle;
 use super::super::GuestBatchFlushReason;
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
-    GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture,
+    GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
+    MultisampleTextureKey, RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidentGuestTexture,
     ResidentTextureActivityStamp, ScanoutSnapshotTexture, TEXTURE_QUARANTINE_ADOPTED,
     TEXTURE_QUARANTINE_REJECTED, WriteWatchRefresh,
     create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
@@ -31,6 +32,19 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+/// A Metal texture together with the residency-map key the ensure path served it from.
+///
+/// The selected key is not always the requested descriptor: a GPU-written resident whose row
+/// pitch differs is still allowed to serve the request. Marking that write against the requested
+/// descriptor resolves no resident, so ownership, content version and activity are lost while
+/// the sampled caches are retired anyway. Callers that later mark the target written must carry
+/// `descriptor` back into the mark path.
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedResidentTexture {
+    pub(crate) texture: Texture,
+    pub(crate) descriptor: GuestTextureDescriptor,
+}
 
 /// Read-only attribution for persistent Metal render/storage targets.
 ///
@@ -369,7 +383,7 @@ impl MetalPresenter {
         &mut self,
         device: &Device,
         descriptor: GuestTextureDescriptor,
-    ) -> Result<Texture, String> {
+    ) -> Result<SelectedResidentTexture, String> {
         self.ensure_resident_texture_with_initial_contents(device, descriptor, true)
     }
 
@@ -378,7 +392,7 @@ impl MetalPresenter {
         device: &Device,
         descriptor: GuestTextureDescriptor,
         upload_guest_contents: bool,
-    ) -> Result<Texture, String> {
+    ) -> Result<SelectedResidentTexture, String> {
         // Adopt before walking the alias graph: a successful adoption means no rebuild, so no
         // guest-RAM snapshot is needed and no GPU-written alias has to be flushed and written
         // back first. This is what breaks the per-frame cycle on Unreal's pooled render-target
@@ -405,7 +419,12 @@ impl MetalPresenter {
             match refresh_resident_texture_write_watch(resident)? {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
-                | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
+                | WriteWatchRefresh::Renewed { .. } => {
+                    return Ok(SelectedResidentTexture {
+                        texture: resident.texture.clone(),
+                        descriptor,
+                    });
+                }
                 WriteWatchRefresh::Replaced => {}
             }
         }
@@ -430,7 +449,12 @@ impl MetalPresenter {
             match refresh_resident_texture_write_watch(resident)? {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
-                | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
+                | WriteWatchRefresh::Renewed { .. } => {
+                    return Ok(SelectedResidentTexture {
+                        texture: resident.texture.clone(),
+                        descriptor: shared_resident,
+                    });
+                }
                 WriteWatchRefresh::Replaced => {
                     if let Some(resident) = self.resident_guest_textures.remove(&shared_resident) {
                         trace_resident_texture_removal(
@@ -461,7 +485,10 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .get(&gpu_sample_resident)
                 .expect("selected GPU sample resident exists");
-            return Ok(resident.texture.clone());
+            return Ok(SelectedResidentTexture {
+                texture: resident.texture.clone(),
+                descriptor: gpu_sample_resident,
+            });
         }
         let mut aliases = self
             .resident_guest_textures
@@ -572,20 +599,24 @@ impl MetalPresenter {
                 }
             }
         }
-        ensure_resident_texture_in_map(
-            device,
+        // The map path only ever adopts, reuses or creates under the exact key.
+        Ok(SelectedResidentTexture {
+            texture: ensure_resident_texture_in_map(
+                device,
+                descriptor,
+                &mut self.resident_guest_textures,
+                &mut self.retired_texture_quarantine,
+                upload_guest_contents,
+            )?,
             descriptor,
-            &mut self.resident_guest_textures,
-            &mut self.retired_texture_quarantine,
-            upload_guest_contents,
-        )
+        })
     }
 
     pub(crate) fn ensure_mipmapped_render_target_texture(
         &mut self,
         device: &Device,
         target: DecodedRenderTarget,
-    ) -> Result<Texture, String> {
+    ) -> Result<SelectedResidentTexture, String> {
         if target.texture_type != 9
             || target.layer_count != 1
             || target.mip_level_count <= 1
@@ -611,7 +642,12 @@ impl MetalPresenter {
             match refresh_resident_texture_write_watch(resident)? {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
-                | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
+                | WriteWatchRefresh::Renewed { .. } => {
+                    return Ok(SelectedResidentTexture {
+                        texture: resident.texture.clone(),
+                        descriptor: target.texture,
+                    });
+                }
                 WriteWatchRefresh::Replaced => {}
             }
         }
@@ -657,7 +693,10 @@ impl MetalPresenter {
             let texture = promoted.texture.clone();
             self.resident_guest_textures
                 .insert(target.texture, promoted);
-            return Ok(texture);
+            return Ok(SelectedResidentTexture {
+                texture,
+                descriptor: target.texture,
+            });
         }
         if let Some(resident) = self.resident_guest_textures.remove(&target.texture) {
             trace_resident_texture_removal("mipmapped-target-resident-replaced", &resident);
@@ -710,7 +749,10 @@ impl MetalPresenter {
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
-        Ok(texture)
+        Ok(SelectedResidentTexture {
+            texture,
+            descriptor: target.texture,
+        })
     }
 
     pub(crate) fn ensure_layered_render_target_texture(
@@ -718,7 +760,7 @@ impl MetalPresenter {
         device: &Device,
         target: DecodedRenderTarget,
         discard_guest_contents: bool,
-    ) -> Result<Texture, String> {
+    ) -> Result<SelectedResidentTexture, String> {
         if target.texture_type == 9 && target.layer_count == 1 {
             return if target.mip_level_count == 1 {
                 self.ensure_resident_texture_with_initial_contents(
@@ -758,7 +800,12 @@ impl MetalPresenter {
             match refresh_resident_texture_write_watch(resident)? {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
-                | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
+                | WriteWatchRefresh::Renewed { .. } => {
+                    return Ok(SelectedResidentTexture {
+                        texture: resident.texture.clone(),
+                        descriptor: target.texture,
+                    });
+                }
                 WriteWatchRefresh::Replaced => {}
             }
         }
@@ -810,7 +857,10 @@ impl MetalPresenter {
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
-        Ok(texture)
+        Ok(SelectedResidentTexture {
+            texture,
+            descriptor: target.texture,
+        })
     }
 
     pub(crate) fn ensure_depth_render_target_texture(
@@ -819,16 +869,18 @@ impl MetalPresenter {
         depth: DecodedDepthTarget,
         minimum_width: u32,
         minimum_height: u32,
-    ) -> Result<Texture, String> {
-        let texture = if depth.layer_count == 1 {
+    ) -> Result<SelectedResidentTexture, String> {
+        let selected = if depth.layer_count == 1 {
             self.ensure_resident_texture(device, depth.texture)?
         } else {
             self.ensure_layered_depth_render_target_texture(device, depth)?
         };
         let host_width = depth.texture.width.max(minimum_width);
         let host_height = depth.texture.height.max(minimum_height);
-        if texture.width() >= u64::from(host_width) && texture.height() >= u64::from(host_height) {
-            return Ok(texture);
+        if selected.texture.width() >= u64::from(host_width)
+            && selected.texture.height() >= u64::from(host_height)
+        {
+            return Ok(selected);
         }
 
         // Unreal can bind a hierarchically sized DB surface beside a larger color target. The
@@ -889,13 +941,13 @@ impl MetalPresenter {
         let blit = command_buffer.new_blit_command_encoder();
         for layer in 0..depth.layer_count {
             blit.copy_from_texture(
-                &texture,
+                &selected.texture,
                 u64::from(layer),
                 0,
                 MTLOrigin { x: 0, y: 0, z: 0 },
                 MTLSize::new(
-                    texture.width().min(u64::from(host_width)),
-                    texture.height().min(u64::from(host_height)),
+                    selected.texture.width().min(u64::from(host_width)),
+                    selected.texture.height().min(u64::from(host_height)),
                     1,
                 ),
                 &promoted,
@@ -907,33 +959,23 @@ impl MetalPresenter {
         blit.end_encoding();
         commit_and_settle(&command_buffer, "depth-target promotion")?;
 
-        let resident_descriptor = self
-            .resident_guest_textures
-            .contains_key(&depth.texture)
-            .then_some(depth.texture)
-            .or_else(|| {
-                self.resident_guest_textures
-                    .values()
-                    .find(|resident| {
-                        guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
-                    })
-                    .map(|resident| resident.descriptor)
-            })
-            .ok_or("promoted depth target lost its resident identity")?;
         let resident = self
             .resident_guest_textures
-            .get_mut(&resident_descriptor)
-            .expect("selected depth resident exists");
+            .get_mut(&selected.descriptor)
+            .ok_or("promoted depth target lost its resident identity")?;
         resident.texture = promoted.clone();
         resident.component_reorder_view = None;
-        Ok(promoted)
+        Ok(SelectedResidentTexture {
+            texture: promoted,
+            descriptor: selected.descriptor,
+        })
     }
 
     fn ensure_layered_depth_render_target_texture(
         &mut self,
         device: &Device,
         depth: DecodedDepthTarget,
-    ) -> Result<Texture, String> {
+    ) -> Result<SelectedResidentTexture, String> {
         if depth.layer_count <= 1 || depth.sample_count != 1 {
             return Err(format!(
                 "layered depth target requires multiple single-sample slices, got layers={} samples={}",
@@ -953,7 +995,12 @@ impl MetalPresenter {
             match refresh_resident_texture_write_watch(resident)? {
                 WriteWatchRefresh::Active
                 | WriteWatchRefresh::Reprotecting
-                | WriteWatchRefresh::Renewed { .. } => return Ok(resident.texture.clone()),
+                | WriteWatchRefresh::Renewed { .. } => {
+                    return Ok(SelectedResidentTexture {
+                        texture: resident.texture.clone(),
+                        descriptor: depth.texture,
+                    });
+                }
                 WriteWatchRefresh::Replaced => {}
             }
         }
@@ -1052,7 +1099,10 @@ impl MetalPresenter {
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
         );
-        Ok(texture)
+        Ok(SelectedResidentTexture {
+            texture,
+            descriptor: depth.texture,
+        })
     }
 
     pub(crate) fn ensure_direct_scanout_texture(
@@ -1181,15 +1231,29 @@ impl MetalPresenter {
 
     #[cfg(test)]
     pub(crate) fn mark_resident_texture_written(&mut self, descriptor: GuestTextureDescriptor) {
-        self.mark_resident_texture_written_at(descriptor, ResidentTextureActivityStamp::default());
+        self.mark_resident_texture_written_at(
+            descriptor,
+            None,
+            ResidentTextureActivityStamp::default(),
+        );
     }
 
+    /// Records a GPU write against `descriptor`'s resident and retires its stale interpretations.
+    ///
+    /// `selected_resident` is the residency key the ensure path actually served this write's
+    /// texture from. Only attribution follows it; sampled and multisample retirement stay keyed
+    /// on `descriptor`, because the written bytes are the ones the guest descriptor names.
     pub(crate) fn mark_resident_texture_written_at(
         &mut self,
         descriptor: GuestTextureDescriptor,
+        selected_resident: Option<GuestTextureDescriptor>,
         activity_stamp: ResidentTextureActivityStamp,
     ) {
-        self.mark_resident_texture_written_preserving_multisample_at(descriptor, activity_stamp);
+        self.mark_resident_texture_written_preserving_multisample_at(
+            descriptor,
+            selected_resident,
+            activity_stamp,
+        );
         self.multisample_textures
             .retain(|key, _| !guest_texture_descriptors_overlap(key.descriptor, descriptor));
     }
@@ -1197,13 +1261,17 @@ impl MetalPresenter {
     pub(crate) fn mark_resident_texture_written_preserving_multisample_at(
         &mut self,
         descriptor: GuestTextureDescriptor,
+        selected_resident: Option<GuestTextureDescriptor>,
         activity_stamp: ResidentTextureActivityStamp,
     ) {
         self.resident_content_version = self.resident_content_version.saturating_add(1);
-        let resident_descriptor = self
-            .resident_guest_textures
-            .contains_key(&descriptor)
-            .then_some(descriptor)
+        let resident_descriptor = selected_resident
+            .filter(|selected| self.resident_guest_textures.contains_key(selected))
+            .or_else(|| {
+                self.resident_guest_textures
+                    .contains_key(&descriptor)
+                    .then_some(descriptor)
+            })
             .or_else(|| {
                 self.resident_guest_textures
                     .values()
@@ -1212,6 +1280,15 @@ impl MetalPresenter {
                     })
                     .map(|resident| resident.descriptor)
             });
+        if resident_descriptor.is_none()
+            && self.resident_guest_textures.values().any(|resident| {
+                guest_texture_descriptors_share_gpu_sample_storage(resident.descriptor, descriptor)
+            })
+        {
+            // A resident that only the pitch-tolerant rule can reach served this write, and the
+            // caller did not carry its key here. Ownership and content version are now lost.
+            RESIDENT_WRITE_ATTRIBUTION_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(resident_descriptor) = resident_descriptor {
             // Multiple read-only interpretations of the same guest bytes may coexist. Creating a
             // second clean view must not evict and immediately reconstruct the first one. Once a

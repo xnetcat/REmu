@@ -74,6 +74,13 @@ pub(super) static SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS: AtomicU64 = AtomicU6
 
 pub(super) static RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// GPU writes that reached the mark path without the resident the ensure path served.
+///
+/// Resolving a written target by exact key or shared storage requires an identical pitch, while
+/// the ensure path also accepts a pitch-mismatched GPU-sample alias. Any count here is a write
+/// whose `gpu_written`, `content_version` and activity never reached a resident that exists.
+pub(super) static RESIDENT_WRITE_ATTRIBUTION_MISSES: AtomicU64 = AtomicU64::new(0);
+
 pub(super) static RESIDENT_DEPTH_SAMPLE_HITS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static SAMPLED_ALIAS_WRITEBACK_COUNT: AtomicU64 = AtomicU64::new(0);

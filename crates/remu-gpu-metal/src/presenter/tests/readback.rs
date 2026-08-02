@@ -458,7 +458,8 @@ fn pre_pixel_shader_diagnostic_can_capture_an_exact_resident_mode27_target() {
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let resident = presenter
         .ensure_resident_texture(&device, descriptor)
-        .expect("mode-27 target becomes resident");
+        .expect("mode-27 target becomes resident")
+        .texture;
     let target = DecodedRenderTarget {
         guest_slot: 0,
         texture: descriptor,

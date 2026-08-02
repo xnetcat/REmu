@@ -455,6 +455,16 @@ pub(crate) fn upload_image_textures(
                     .as_ref()
                     .map(|(_, _, texture)| texture.clone())
             };
+            let render_resolve_descriptor = if select_multisample {
+                multisample_resolve
+                    .as_ref()
+                    .map(|(_, descriptor, _)| *descriptor)
+            } else {
+                resident_resolve
+                    .as_ref()
+                    .map(|(descriptor, _, _)| *descriptor)
+            };
+            let mut selected_resident = None;
             // A layered depth-sample SRD assembled from resident depth faces is served directly:
             // the assembly ran before this upload pass, inside the guest command batch, so the
             // array already orders after the face render passes.
@@ -569,8 +579,10 @@ pub(crate) fn upload_image_textures(
                 // until an alias really requires a CPU-visible writeback. Metal encoder order
                 // supplies the attachment/storage dependency for this same texture.
                 if let Some(texture) = render_resolve {
+                    selected_resident = render_resolve_descriptor;
                     texture
                 } else if storage_image_requires_mip_hierarchy(binding, descriptor) {
+                    selected_resident = Some(descriptor.guest);
                     ensure_mipmapped_resident_texture_in_map(
                         device,
                         None,
@@ -580,6 +592,7 @@ pub(crate) fn upload_image_textures(
                         Mode27WorkOrigin::StorageCreate,
                     )?
                 } else {
+                    selected_resident = Some(descriptor.guest);
                     ensure_resident_texture_in_map(
                         device,
                         descriptor.guest,
@@ -740,6 +753,7 @@ pub(crate) fn upload_image_textures(
                 // resident in the shared sampled-image cache so later GPU reads see its contents;
                 // it must not invalidate that cache through the 2D writeback path.
                 writable: !fallback && writable && descriptor.texture_type == 9,
+                selected_resident,
             })
         })
         .collect()
