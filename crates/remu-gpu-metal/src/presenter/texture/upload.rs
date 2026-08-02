@@ -3,8 +3,8 @@
 
 use super::super::sampled_texture_cache_byte_capacity;
 use super::{
-    CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureWriteWatch,
-    Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
+    CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
+    GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
     ResidentTextureActivityStamp, ResidentTextureMap,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SpanQueryOrder,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
