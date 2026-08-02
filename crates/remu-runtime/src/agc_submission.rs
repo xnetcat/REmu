@@ -9,14 +9,13 @@ use crate::{
     AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_INDEX_TYPE, AGC_IT_NOP,
     AGC_IT_NUM_INSTANCES, AGC_IT_PFP_SYNC_ME, AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE,
     AGC_IT_WAIT_REG_MEM, AGC_IT_WRITE_DATA, AGC_R_ACB_RESET, AGC_R_ACQUIRE_MEM, AGC_R_DMA_DATA,
-    AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM,
-    AGC_R_WAIT_FLIP_DONE, AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA,
-    AgcComputeDispatchError, AgcGraphicsState,
-    AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory, VideoOutState,
-    agc_apply_set_base, agc_apply_submission_registers, agc_decode_compute_dispatch, agc_emit_draw,
-    agc_emit_draw_with_indirect_arguments, agc_emit_indexed_draw, agc_image_binding_address,
-    agc_submit_ordered_video_out_flip, agc_video_out_target, emit_agc_gpu_event, read_guest_u32,
-    read_guest_u64,
+    AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_WAIT_FLIP_DONE,
+    AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA, AgcComputeDispatchError,
+    AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory,
+    VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_decode_compute_dispatch,
+    agc_emit_draw, agc_emit_draw_with_indirect_arguments, agc_emit_indexed_draw,
+    agc_image_binding_address, agc_submit_ordered_video_out_flip, agc_video_out_target,
+    emit_agc_gpu_event, read_guest_u32, read_guest_u64, trace_agc_blend_provenance,
     trace_agc_programs, trace_agc_registers, trace_agc_shaders, trace_guest_sync,
     trace_logarithmic_sequence,
 };
@@ -281,6 +280,20 @@ fn agc_apply_clear_state(
     // processor validates that selector and resets the complete context, shader, user-config,
     // index, instance and indirect-argument state regardless of its admitted value. Resource
     // residency and telemetry are host bookkeeping, not register state.
+    if trace_agc_blend_provenance() {
+        let values = std::array::from_fn::<_, 8, _>(|slot| {
+            graphics
+                .context_registers
+                .get(&(0x1e0 + u32::try_from(slot).expect("blend slot fits u32")))
+                .copied()
+        });
+        eprintln!(
+            "[REMu][AGC][BLEND-PROVENANCE] phase=reset source=clear-state \
+             packet={packet_address:#x} control={control:#x} values={values:#010x?} \
+             provenance={:#x?}",
+            graphics.blend_register_provenance,
+        );
+    }
     if trace_agc_registers() {
         eprintln!(
             "[REMu][AGC][REG] clear state packet={packet_address:#x} control={control:#x} cx={} sh={} uc={}",
@@ -314,6 +327,20 @@ pub(crate) fn agc_handle_submission_packet(
     }
     if opcode == AGC_IT_NOP && matches!(register, AGC_R_DRAW_RESET | AGC_R_ACB_RESET) && length >= 2
     {
+        if trace_agc_blend_provenance() {
+            let values = std::array::from_fn::<_, 8, _>(|slot| {
+                graphics
+                    .context_registers
+                    .get(&(0x1e0 + u32::try_from(slot).expect("blend slot fits u32")))
+                    .copied()
+            });
+            eprintln!(
+                "[REMu][AGC][BLEND-PROVENANCE] phase=reset source=queue-reset \
+                 packet={packet_address:#x} register={register:#x} values={values:#010x?} \
+                 provenance={:#x?}",
+                graphics.blend_register_provenance,
+            );
+        }
         if trace_agc_registers() {
             eprintln!(
                 "[REMu][AGC][REG] queue reset packet={packet_address:#x} register={register:#x} cx={} sh={} uc={}",

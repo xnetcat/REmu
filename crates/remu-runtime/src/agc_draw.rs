@@ -15,9 +15,9 @@ use crate::{
     emit_agc_gpu_event, evaluate_draw_shader_requests_parallel,
     evaluate_shader_register_snapshot_cached, export_user_data_register, read_guest_u32,
     shader_control_flow_summary, shader_evaluation_worker_request, snapshot_draw_indices,
-    snapshot_small_readonly_global_bindings, trace_agc_draws, trace_agc_programs,
-    trace_agc_registers, trace_agc_shader_draw, trace_agc_shaders, trace_agc_target_address,
-    trace_logarithmic_sequence,
+    snapshot_small_readonly_global_bindings, trace_agc_blend_provenance, trace_agc_draws,
+    trace_agc_programs, trace_agc_registers, trace_agc_shader_draw, trace_agc_shaders,
+    trace_agc_target_address, trace_logarithmic_sequence,
 };
 
 fn agc_packet_words(packet_address: u64, length: u32) -> Vec<u32> {
@@ -417,6 +417,19 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
     }
     graphics.draw_index_offset = element_offset;
     graphics.emitted_draws = graphics.emitted_draws.saturating_add(1);
+    if trace_agc_blend_provenance() {
+        let values = std::array::from_fn::<_, 8, _>(|slot| {
+            graphics
+                .context_registers
+                .get(&(0x1e0 + u32::try_from(slot).expect("blend slot fits u32")))
+                .copied()
+        });
+        eprintln!(
+            "[REMu][AGC][BLEND-PROVENANCE] phase=draw draw={} packet={packet_address:#x} \
+             values={values:#010x?} provenance={:#x?}",
+            graphics.emitted_draws, graphics.blend_register_provenance,
+        );
+    }
 
     let export_shader_address = agc_program_address(
         &graphics.shader_registers,

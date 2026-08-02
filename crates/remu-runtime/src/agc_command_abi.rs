@@ -112,7 +112,7 @@ const MAX_PACKET_DWORDS: u32 = 0x4001;
 
 type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndirectRegisterKind {
     Context,
     Shader,
@@ -140,6 +140,54 @@ impl IndirectRegisterKind {
             Self::UserConfig => IT_SET_UCONFIG_REG_INDIRECT,
         }
     }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Context => "cx",
+            Self::Shader => "sh",
+            Self::UserConfig => "uc",
+        }
+    }
+}
+
+fn trace_indirect_register_packet(phase: &'static str, kind: IndirectRegisterKind, command: u64) {
+    const CB_BLEND0_CONTROL: u32 = 0x1e0;
+    const CB_BLEND_CONTROL_COUNT: u32 = 8;
+
+    if !crate::trace_agc_blend_provenance() || kind == IndirectRegisterKind::Shader {
+        return;
+    }
+    let registers_address =
+        u64::from(read_u32(command + 4) & !3) | (u64::from(read_u32(command + 8)) << 32);
+    let register_count = read_u32(command + 16) & 0x3fff;
+    let byte_count = usize::try_from(register_count)
+        .ok()
+        .and_then(|count| count.checked_mul(8));
+    let table_readable = register_count == 0
+        || byte_count.is_some_and(|byte_count| {
+            registers_address != 0
+                && crate::process_guest_range_has_read_access(registers_address, byte_count)
+        });
+    let entries = if table_readable && register_count != 0 {
+        (0..register_count)
+            .filter_map(|index| {
+                let entry = registers_address.checked_add(u64::from(index) * 8)?;
+                let raw_offset = read_u32(entry);
+                let normalized_offset = raw_offset & !0x7000_0000;
+                (CB_BLEND0_CONTROL..CB_BLEND0_CONTROL + CB_BLEND_CONTROL_COUNT)
+                    .contains(&normalized_offset)
+                    .then(|| (index, raw_offset, normalized_offset, read_u32(entry + 4)))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    eprintln!(
+        "[REMu][AGC][BLEND-PROVENANCE] phase={phase} kind={} command={command:#x} \
+         table={registers_address:#x} count={register_count} table_readable={table_readable} \
+         entries={entries:#x?}",
+        kind.name(),
+    );
 }
 
 /// Dispatch one stateless Gen5 AGC command-construction import.

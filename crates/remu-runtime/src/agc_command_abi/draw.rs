@@ -78,6 +78,7 @@ pub(super) fn set_registers_indirect(arguments: [u64; 6], kind: IndirectRegister
             register_count,
         ],
     );
+    super::trace_indirect_register_packet("build", kind, command);
     command
 }
 

@@ -44,6 +44,7 @@ pub(super) fn patch_indirect_address(arguments: [u64; 6], kind: IndirectRegister
         (read_u32(command + 4) & 3) | (low_u32(address) & !3),
     );
     write_u32(command + 8, low_u32(address >> 32));
+    super::trace_indirect_register_packet("patch-address", kind, command);
     0
 }
 
@@ -67,6 +68,15 @@ pub(super) fn patch_indirect_count(
         count
     };
     write_u32(command + 16, (previous & !0x3fff) | next);
+    super::trace_indirect_register_packet(
+        if add {
+            "patch-add-count"
+        } else {
+            "patch-set-count"
+        },
+        kind,
+        command,
+    );
     0
 }
 
