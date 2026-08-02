@@ -37,7 +37,6 @@ use super::{
     texture_element_layout, tiled_block_bytes, tiled_block_dimensions,
     trace_glyph_atlas, trace_image_descriptors, trace_target_sampling,
     trace_video_target_consumers,
-    write_resident_texture_contents_to_guest,
 };
 #[cfg(test)]
 use remu_memory::{guest_shared_mapping_identity, write_guest_shared_backing};

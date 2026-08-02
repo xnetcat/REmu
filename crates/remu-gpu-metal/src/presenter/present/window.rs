@@ -5,8 +5,10 @@ use super::super::completion::{command_buffer_native_state_summary, trace_metal_
 use super::super::texture::RETIRED_TEXTURE_QUARANTINE_CAPACITY;
 use super::super::{
     OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD,
-    OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN, ResidencyState,
-    TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
+    OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN, RESIDENT_WRITEBACK_DISCARDED,
+    RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
+    RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState, TEXTURE_QUARANTINE_ADOPTED,
+    TEXTURE_QUARANTINE_REJECTED, WRITEBACK_TRIGGERS,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -421,6 +423,29 @@ impl MetalPresenter {
                 quarantine_adopted,
                 quarantine_rejected,
                 write_attribution_misses,
+            );
+            // Host→guest publication of rendered pixels, by what asked for it. `drop` is the
+            // traffic REmu refused to stage into a range no guest read named; `pub` is the
+            // remaining exposure, and every one of those destinations was named by the guest.
+            let writeback_published_bytes =
+                RESIDENT_WRITEBACK_PUBLISHED_BYTES.swap(0, Ordering::Relaxed);
+            let writeback_discarded_bytes =
+                RESIDENT_WRITEBACK_DISCARDED_BYTES.swap(0, Ordering::Relaxed);
+            let writeback_detail = WRITEBACK_TRIGGERS
+                .iter()
+                .map(|trigger| {
+                    format!(
+                        " {}={}/{}",
+                        trigger.label(),
+                        RESIDENT_WRITEBACK_PUBLISHED[trigger.index()].swap(0, Ordering::Relaxed),
+                        RESIDENT_WRITEBACK_DISCARDED[trigger.index()].swap(0, Ordering::Relaxed),
+                    )
+                })
+                .collect::<String>();
+            eprintln!(
+                "[REMu][PERF-TEXTURE-WRITEBACK] published={:.1}MiB dropped={:.1}MiB pub/drop:{writeback_detail}",
+                writeback_published_bytes as f64 / (1024.0 * 1024.0),
+                writeback_discarded_bytes as f64 / (1024.0 * 1024.0),
             );
             // The range algebra's own accounting. `owned` is the authority the residents hold and
             // `debt` the part of it that exists only in Metal; the counters are the ways a claim

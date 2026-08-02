@@ -1,14 +1,14 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::WritebackTrigger;
 use super::{
     GuestMemoryWriteOperation, MetalPresenter, PendingGlobalWriteback, PendingGuestMemoryWrite,
     RangeSet, ResourceSpan, WriteWatchRefresh, guest_batch_writes_overlap, guest_ranges_overlap,
     guest_texture_byte_count, merge_guest_batch_result, read_guest_memory_wait_value,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_memory_copy,
-    refresh_resident_texture_write_watch, retire_multisample_textures_overlapping_writeback,
-    retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
-    trace_resident_texture_removal, write_resident_texture_contents_to_guest,
+    refresh_resident_texture_write_watch, retire_sampled_textures_matching,
+    trace_resident_texture_removal,
 };
 use crate::presenter::diagnostics::trace_diagnostic_guest_write;
 use remu_gpu::{
@@ -141,16 +141,6 @@ impl MetalPresenter {
                 self.wait_for_guest_command_batches()?;
             }
             if !source_descriptors.is_empty() {
-                let device = self
-                    .device
-                    .as_ref()
-                    .ok_or("Metal device is unavailable")?
-                    .clone();
-                let queue = self
-                    .command_queue
-                    .as_ref()
-                    .ok_or("Metal command queue is unavailable")?
-                    .clone();
                 for descriptor in source_descriptors {
                     let refresh = refresh_resident_texture_write_watch(
                         self.resident_guest_textures
@@ -184,27 +174,12 @@ impl MetalPresenter {
                         continue;
                     }
                     authoritative_gpu_source = true;
-                    let alias_ranges = self
-                        .resident_guest_textures
-                        .get(&descriptor)
-                        .expect("collected DMA source texture exists")
-                        .write_watch
-                        .alias_ranges();
-                    retire_sampled_textures_overlapping_writeback(
-                        &mut self.sampled_texture_cache,
-                        &alias_ranges,
-                    );
-                    self.note_resident_writeback_published(descriptor);
-                    retire_multisample_textures_overlapping_writeback(
-                        &mut self.multisample_textures,
-                        &alias_ranges,
-                    );
-                    let resident = self
-                        .resident_guest_textures
-                        .get_mut(&descriptor)
-                        .expect("collected DMA source texture exists");
-                    write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-                    resident.clear_gpu_authored();
+                    // The packet names this source range, so the guest is reading these exact
+                    // bytes now and the allocation is provably still its own.
+                    self.settle_resident_texture_writeback(
+                        descriptor,
+                        WritebackTrigger::DmaSource,
+                    )?;
                 }
             }
 
