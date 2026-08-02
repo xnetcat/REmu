@@ -6,7 +6,8 @@ use super::super::completion::{
     wait_until_settled_within,
 };
 use super::super::shared_event::{
-    SharedEventBatchTerminalState, SharedEventProducerId, terminal_shared_event_advance,
+    SharedEventBatchTerminalState, SharedEventFence, SharedEventProducerId,
+    terminal_shared_event_advance,
 };
 use super::super::{FlushPolicy, GuestQueueBatchState, PresenterStatistics};
 use super::{
@@ -16,6 +17,9 @@ use super::{
     guest_physical_ranges_overlap, guest_ranges_overlap,
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
+use crate::presenter::{
+    SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint, SharedEventUnresolvedWriteRange,
+};
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -56,6 +60,67 @@ enum GlobalWritebackOutcome {
     DiscardedStale,
 }
 
+impl SharedEventSignalCheckpoint {
+    pub(crate) fn capture(batch: &GuestCommandBatch, fence: SharedEventFence) -> Self {
+        let global_writeback_count = batch.global_writebacks.len();
+        let guest_write_range_count = batch.guest_write_ranges.len();
+        let memory_write_count = batch.memory_writes.len();
+        let mut global_versions: Vec<SharedEventGlobalBufferVersion> = Vec::new();
+        for writeback in &batch.global_writebacks {
+            let Ok(byte_count) = u64::try_from(writeback.byte_count) else {
+                continue;
+            };
+            let version = SharedEventGlobalBufferVersion {
+                buffer: writeback.buffer.clone(),
+                offset: writeback.offset,
+                guest_address: writeback.guest_address,
+                byte_count,
+                mapping_identity: writeback.mapping_identity,
+            };
+            // Each writable copied binding gets fresh Metal storage. Replacing only the same
+            // exact guest-physical interval materializes the latest version as of this signal;
+            // partially overlapping intervals remain separate so consumers reject ambiguity.
+            if let Some(existing) = global_versions.iter_mut().find(|existing| {
+                existing.byte_count == version.byte_count
+                    && match (existing.mapping_identity, version.mapping_identity) {
+                        (Some(existing), Some(version)) => existing == version,
+                        (None, None) => existing.guest_address == version.guest_address,
+                        _ => false,
+                    }
+            }) {
+                *existing = version;
+            } else {
+                global_versions.push(version);
+            }
+        }
+        let mut unresolved_write_ranges = batch
+            .guest_write_ranges
+            .iter()
+            .map(|range| SharedEventUnresolvedWriteRange {
+                guest_address: range.address,
+                byte_count: range.byte_count,
+                mapping_identity: Some(range.physical_identity),
+            })
+            .collect::<Vec<_>>();
+        unresolved_write_ranges.extend(batch.memory_writes.iter().map(|write| {
+            let (guest_address, byte_count) = write.range();
+            SharedEventUnresolvedWriteRange {
+                guest_address,
+                byte_count,
+                mapping_identity: write.mapping_identity,
+            }
+        }));
+        Self {
+            fence,
+            global_writeback_count,
+            guest_write_range_count,
+            memory_write_count,
+            global_versions,
+            unresolved_write_ranges,
+        }
+    }
+}
+
 impl MetalPresenter {
     pub(crate) fn encode_active_guest_queue_host_ack(
         &mut self,
@@ -87,14 +152,8 @@ impl MetalPresenter {
             .command_buffer
             .encode_signal_event(state.shared_event_timeline.event(), fence.value());
         batch.max_encoded_signal = Some(fence);
-        batch
-            .signal_checkpoints
-            .push(super::super::SharedEventSignalCheckpoint {
-                fence,
-                global_writeback_count: batch.global_writebacks.len(),
-                guest_write_range_count: batch.guest_write_ranges.len(),
-                memory_write_count: batch.memory_writes.len(),
-            });
+        let checkpoint = SharedEventSignalCheckpoint::capture(batch, fence);
+        batch.signal_checkpoints.push(checkpoint);
         self.statistics.shared_event_signals =
             self.statistics.shared_event_signals.saturating_add(1);
         Ok(Some(fence))
@@ -121,9 +180,11 @@ impl MetalPresenter {
         consumer.host_dependencies.retain(|producer, value| {
             host_retired.get(producer).copied().unwrap_or_default() < *value
         });
-        consumer.resource_dependencies.retain(|producer, value| {
-            host_retired.get(producer).copied().unwrap_or_default() < *value
-        });
+        consumer
+            .resource_dependencies
+            .retain(|producer, checkpoint| {
+                host_retired.get(producer).copied().unwrap_or_default() < checkpoint.fence.value()
+            });
         if consumer.host_dependencies.len() < before {
             self.statistics.shared_event_host_wakes =
                 self.statistics.shared_event_host_wakes.saturating_add(1);
@@ -148,7 +209,7 @@ impl MetalPresenter {
                 state
                     .resource_dependencies
                     .iter()
-                    .map(|(&producer, &value)| (producer, value)),
+                    .map(|(&producer, checkpoint)| (producer, checkpoint.fence.value())),
             );
         }
         for (&queue_id, state) in &mut self.guest_queue_batches {

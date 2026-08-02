@@ -65,7 +65,7 @@ impl MetalPresenter {
                 remu_gpu::retire_gpu_wait(ticket_id);
                 return Err("registered guest wait has no logical queue identity".to_owned());
             };
-            let producer_event = self
+            let producer = self
                 .guest_queue_batches
                 .get(&fence.producer().queue_id())
                 .ok_or_else(|| {
@@ -73,9 +73,22 @@ impl MetalPresenter {
                         "registered wait references missing producer queue {}",
                         fence.producer().queue_id()
                     )
-                })?
-                .shared_event_timeline
-                .event_owned();
+                })?;
+            let producer_event = producer.shared_event_timeline.event_owned();
+            let resource_checkpoint = producer
+                .committed_batches
+                .iter()
+                .chain(producer.open_batch.iter())
+                .flat_map(|batch| &batch.signal_checkpoints)
+                .find(|checkpoint| checkpoint.fence == fence)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "registered wait references missing resource checkpoint queue={} fence={}",
+                        fence.producer().queue_id(),
+                        fence.value()
+                    )
+                })?;
             self.ensure_active_open_guest_batch()?;
             let consumer = self
                 .guest_queue_batches
@@ -97,8 +110,12 @@ impl MetalPresenter {
             consumer
                 .resource_dependencies
                 .entry(fence.producer())
-                .and_modify(|value| *value = (*value).max(fence.value()))
-                .or_insert(fence.value());
+                .and_modify(|checkpoint| {
+                    if checkpoint.fence.value() < resource_checkpoint.fence.value() {
+                        *checkpoint = resource_checkpoint.clone();
+                    }
+                })
+                .or_insert(resource_checkpoint);
             let taken = self.gpu_wait_fences.take(ticket_id);
             debug_assert_eq!(taken, Some(fence));
             remu_gpu::retire_gpu_wait(ticket_id);

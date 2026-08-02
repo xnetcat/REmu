@@ -176,11 +176,12 @@ impl MetalPresenter {
                 OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
                 OrderedEventSource::Host { .. } => None,
             });
+            let mut shared_event_gpu_ordered_compute = false;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
                 let dependencies = self.unsignaled_host_dependencies(queue_id);
-                if !dependencies.is_empty()
-                    && !self.event_is_shared_event_gpu_orderable(source, &event)
-                {
+                let gpu_orderable = dependencies.is_empty()
+                    || self.event_is_shared_event_gpu_orderable(source, &event);
+                if !gpu_orderable {
                     let acknowledgement = match self.encode_active_guest_queue_host_ack() {
                         Ok(acknowledgement) => acknowledgement,
                         Err(error) => {
@@ -213,6 +214,9 @@ impl MetalPresenter {
                         },
                     );
                     continue;
+                }
+                if !dependencies.is_empty() && matches!(&event, GpuEvent::ComputeDispatch(_)) {
+                    shared_event_gpu_ordered_compute = true;
                 }
             }
             match event {
@@ -502,6 +506,12 @@ impl MetalPresenter {
                         Ok(()) => {
                             self.statistics.encoded_compute_dispatches =
                                 self.statistics.encoded_compute_dispatches.saturating_add(1);
+                            if shared_event_gpu_ordered_compute {
+                                self.statistics.shared_event_gpu_ordered_compute_dispatches = self
+                                    .statistics
+                                    .shared_event_gpu_ordered_compute_dispatches
+                                    .saturating_add(1);
+                            }
                         }
                         Err(error) => {
                             // Every dropped dispatch is counted so a pass failing each frame
@@ -736,6 +746,16 @@ impl MetalPresenter {
             // handler returns immediately, so no cache or guest-visible state can overtake the
             // producer. Invalidating acquires remain behind the host acknowledgement below.
             GpuEvent::MemoryAcquire(acquire) => !acquire.invalidates_guest_resources(),
+            GpuEvent::ComputeDispatch(dispatch) => {
+                matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct)
+                    && dispatch
+                        .shader_evaluation
+                        .as_ref()
+                        .is_some_and(|evaluation| {
+                            evaluation.image_bindings.is_empty()
+                                && self.shared_event_dependencies_supply_compute_globals(evaluation)
+                        })
+            }
             GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
                 self.active_open_guest_batch().is_some()
                     || !self.active_committed_guest_batches().is_empty()
@@ -753,9 +773,10 @@ impl MetalPresenter {
                     });
                 !initial_flip_boundary && !write_completes_pending_flip
             }
-            // Draw/compute preparation snapshots guest bytes and mutates shared residency/cache
-            // state on the presenter thread. DMA, invalidating acquires, waits, flips and host UI have still
-            // more direct CPU-visible effects. They must observe the producer event first.
+            // Draw and image-backed/indirect/writable compute preparation snapshots guest bytes
+            // and mutates shared residency/cache state on the presenter thread. DMA, invalidating
+            // acquires, waits, flips and host UI have still more direct CPU-visible effects. They
+            // must observe the producer event first.
             _ => false,
         }
     }

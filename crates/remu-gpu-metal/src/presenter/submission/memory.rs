@@ -392,14 +392,8 @@ impl MetalPresenter {
             .command_buffer
             .encode_signal_event(state.shared_event_timeline.event(), fence.value());
         batch.max_encoded_signal = Some(fence);
-        batch
-            .signal_checkpoints
-            .push(super::super::SharedEventSignalCheckpoint {
-                fence,
-                global_writeback_count: batch.global_writebacks.len(),
-                guest_write_range_count: batch.guest_write_ranges.len(),
-                memory_write_count: batch.memory_writes.len(),
-            });
+        let checkpoint = super::super::SharedEventSignalCheckpoint::capture(batch, fence);
+        batch.signal_checkpoints.push(checkpoint);
         for &wait_id in matching_waits {
             let _ = self.gpu_wait_fences.bind_if_unbound(wait_id, fence);
         }

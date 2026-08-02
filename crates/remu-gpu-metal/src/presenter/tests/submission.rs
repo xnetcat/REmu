@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use metal::foreign_types::ForeignType;
 use metal::{
     Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLResourceOptions, MTLStorageMode,
     MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
@@ -25,7 +26,8 @@ use super::super::submission::{
     collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, UploadedGlobalBuffer,
+    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, SharedEventSignalCheckpoint,
+    UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -4290,6 +4292,145 @@ fn per_queue_flush_clears_only_its_transient_bindings() {
     presenter
         .wait_for_guest_command_batches()
         .expect("test queues drain");
+}
+
+#[test]
+fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let guest_address = 0x8004_2000_00;
+    let byte_count = 64_usize;
+    let before_signal = device.new_buffer(
+        u64::try_from(byte_count).unwrap(),
+        MTLResourceOptions::StorageModeShared,
+    );
+    let after_signal = device.new_buffer(
+        u64::try_from(byte_count).unwrap(),
+        MTLResourceOptions::StorageModeShared,
+    );
+    open_per_queue_batch(&mut presenter, 41);
+    let producer = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists");
+    producer
+        .open_batch
+        .as_mut()
+        .expect("producer batch is open")
+        .global_writebacks
+        .push(PendingGlobalWriteback {
+            buffer: before_signal.clone(),
+            offset: 0,
+            guest_address,
+            byte_count,
+            mapping_identity: None,
+            write_watch: None,
+            original_bytes: vec![0; byte_count],
+        });
+    let fence = producer
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("producer fence");
+    let checkpoint = SharedEventSignalCheckpoint::capture(
+        producer
+            .open_batch
+            .as_ref()
+            .expect("producer batch remains open"),
+        fence,
+    );
+    producer
+        .open_batch
+        .as_mut()
+        .expect("producer batch remains open")
+        .global_writebacks
+        .push(PendingGlobalWriteback {
+            buffer: after_signal.clone(),
+            offset: 0,
+            guest_address,
+            byte_count,
+            mapping_identity: None,
+            write_watch: None,
+            original_bytes: vec![0; byte_count],
+        });
+
+    open_per_queue_batch(&mut presenter, 0);
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .resource_dependencies
+        .insert(fence.producer(), checkpoint);
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: guest_address,
+        instruction_pcs: Default::default(),
+        byte_count,
+        data: vec![0x11; byte_count],
+        writable: false,
+        write_back_to_guest: false,
+    };
+    let evaluation = evaluation_with_global(binding.clone());
+    assert!(
+        presenter.shared_event_dependencies_supply_compute_globals(&evaluation),
+        "an exact copied producer version is sufficient for direct buffer-only compute"
+    );
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("consumer forwards the retained checkpoint version");
+    assert_eq!(uploaded.buffer.as_ptr(), before_signal.as_ptr());
+    assert_ne!(uploaded.buffer.as_ptr(), after_signal.as_ptr());
+
+    let dispatch = ComputeDispatch {
+        sequence: 1,
+        source: ComputeDispatchSource::Direct,
+        launch: ComputeLaunch {
+            grid: ComputeGrid::Threadgroups([1, 1, 1]),
+            group_count: [1, 1, 1],
+            base_group: [0, 0, 0],
+            threads_per_group: [1, 1, 1],
+            wave_lane_count: 32,
+            lds_size_bytes: 0,
+            initiator: 1,
+        },
+        shader_address: 0x5000,
+        shader_prefix: [0; 4],
+        shader: None,
+        shader_evaluation: Some(Arc::new(evaluation)),
+        shader_registers: Vec::new(),
+    };
+    assert!(presenter.event_is_shared_event_gpu_orderable(
+        OrderedEventSource::GuestQueue(0),
+        &GpuEvent::ComputeDispatch(Box::new(dispatch.clone())),
+    ));
+    let mut indirect = dispatch;
+    indirect.source = ComputeDispatchSource::Indirect {
+        dimensions_address: guest_address + 0x100,
+    };
+    assert!(!presenter.event_is_shared_event_gpu_orderable(
+        OrderedEventSource::GuestQueue(0),
+        &GpuEvent::ComputeDispatch(Box::new(indirect)),
+    ));
+
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .resource_dependencies
+        .get_mut(&fence.producer())
+        .expect("checkpoint remains retained")
+        .unresolved_write_ranges
+        .push(super::super::SharedEventUnresolvedWriteRange {
+            guest_address,
+            byte_count: u64::try_from(byte_count).unwrap(),
+            mapping_identity: None,
+        });
+    let unresolved = evaluation_with_global(binding);
+    assert!(
+        !presenter.shared_event_dependencies_supply_compute_globals(&unresolved),
+        "zero-copy or CPU-published overlap must remain behind the host gate"
+    );
 }
 
 #[test]

@@ -1402,7 +1402,7 @@ struct GuestQueueBatchState {
     shared_event_timeline: SharedEventTimeline,
     host_retired_fence_value: u64,
     host_dependencies: HashMap<SharedEventProducerId, u64>,
-    resource_dependencies: HashMap<SharedEventProducerId, u64>,
+    resource_dependencies: HashMap<SharedEventProducerId, SharedEventSignalCheckpoint>,
     retired_fence_write_ranges: BTreeMap<u64, Vec<(u64, u64)>>,
     open_batch: Option<GuestCommandBatch>,
     committed_batches: VecDeque<GuestCommandBatch>,
@@ -1490,6 +1490,7 @@ struct PresenterStatistics {
     shared_event_host_blocks: u32,
     shared_event_host_block_kinds: [u32; SHARED_HOST_KIND_COUNT],
     shared_event_host_wakes: u32,
+    shared_event_gpu_ordered_compute_dispatches: u32,
     shared_event_error_advances: u32,
     shared_event_fallbacks_no_exact_producer: u32,
     shared_event_fallbacks_timeline_overflow: u32,
@@ -1548,12 +1549,36 @@ struct GuestCommandBatch {
     completion_sequences: Vec<u64>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SharedEventSignalCheckpoint {
     fence: SharedEventFence,
     global_writeback_count: usize,
     guest_write_range_count: usize,
     memory_write_count: usize,
+    /// Immutable copied-buffer versions produced before `fence` was encoded.
+    ///
+    /// A checkpoint owns Metal references rather than vector indices alone. Later producer work
+    /// can append or replace bookkeeping entries without changing the exact bytes visible at the
+    /// signal. Zero-copy guest buffers and CPU-published writes are deliberately excluded: their
+    /// storage remains mutable and therefore cannot cross a queue on a GPU wait alone.
+    global_versions: Vec<SharedEventGlobalBufferVersion>,
+    unresolved_write_ranges: Vec<SharedEventUnresolvedWriteRange>,
+}
+
+#[derive(Clone, Debug)]
+struct SharedEventGlobalBufferVersion {
+    buffer: Buffer,
+    offset: u64,
+    guest_address: u64,
+    byte_count: u64,
+    mapping_identity: Option<GuestSharedMappingIdentity>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SharedEventUnresolvedWriteRange {
+    guest_address: u64,
+    byte_count: u64,
+    mapping_identity: Option<GuestSharedMappingIdentity>,
 }
 
 struct GlobalUploadChunk {
