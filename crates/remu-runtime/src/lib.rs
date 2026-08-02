@@ -1095,6 +1095,14 @@ struct AgcGraphicsState {
     context_registers: BTreeMap<u32, u32>,
     shader_registers: BTreeMap<u32, u32>,
     user_config_registers: BTreeMap<u32, u32>,
+    /// Last accepted command-processor write for each `CB_BLENDn_CONTROL` context register.
+    ///
+    /// This is diagnostic provenance only; draw semantics continue to come from
+    /// `context_registers`. Keeping the packet/table identity beside the final value lets an
+    /// accepted-path trace distinguish a guest-authored disabled value from a later routing or
+    /// reset loss.
+    blend_register_provenance: [Option<AgcBlendRegisterProvenance>; 8],
+    register_write_sequence: u64,
     predicate_skip: bool,
     index_buffer_address: u64,
     index_resource_address: u64,
@@ -1157,6 +1165,7 @@ impl AgcGraphicsState {
         self.context_registers.clear();
         self.shader_registers.clear();
         self.user_config_registers.clear();
+        self.blend_register_provenance = [None; 8];
         self.predicate_skip = false;
         self.index_buffer_address = 0;
         self.index_resource_address = 0;
@@ -1166,6 +1175,18 @@ impl AgcGraphicsState {
         self.draw_index_offset = 0;
         self.indirect_args_address = 0;
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AgcBlendRegisterProvenance {
+    sequence: u64,
+    source: &'static str,
+    packet_address: u64,
+    table_address: u64,
+    table_index: Option<u32>,
+    raw_offset: u32,
+    normalized_offset: u32,
+    value: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7648,6 +7669,13 @@ fn trace_agc_registers() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("REMU_TRACE_AGC_REGISTERS").is_some_and(|value| value == "1")
+    })
+}
+
+fn trace_agc_blend_provenance() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_AGC_BLEND_PROVENANCE").is_some_and(|value| value == "1")
     })
 }
 

@@ -17,10 +17,89 @@ use crate::{
     AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_CX_REGS_INDIRECT, AGC_R_SH_REGS_INDIRECT,
     AGC_R_UC_REGS_INDIRECT, AGC_SHADER_SPECIALS_OFFSET, AGC_SPI_PS_INPUT_CNTL_0,
     AGC_SPI_SHADER_PGM_HI_ES, AGC_SPI_SHADER_PGM_HI_PS, AGC_SPI_SHADER_PGM_LO_ES,
-    AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_INDEX_TYPE, AGC_VGT_PRIMITIVE_TYPE, AgcGraphicsState,
-    AgcShaderRegistry, ProcessGuestMemory, agc_read_mapped_u64, read_guest_u32, read_guest_u64,
+    AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_INDEX_TYPE, AGC_VGT_PRIMITIVE_TYPE,
+    AgcBlendRegisterProvenance, AgcGraphicsState, AgcShaderRegistry, ProcessGuestMemory,
+    agc_read_mapped_u64, read_guest_u32, read_guest_u64, trace_agc_blend_provenance,
     trace_agc_programs, trace_agc_registers, try_read_process_guest_u32,
 };
+
+const AGC_CB_BLEND0_CONTROL: u32 = 0x1e0;
+const AGC_CB_BLEND_CONTROL_COUNT: u32 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgcRegisterFile {
+    Context,
+    Shader,
+    UserConfig,
+}
+
+impl AgcRegisterFile {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Context => "cx",
+            Self::Shader => "sh",
+            Self::UserConfig => "uc",
+        }
+    }
+
+    const fn normalize_selector(self) -> bool {
+        !matches!(self, Self::Context)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agc_apply_register_value(
+    graphics: &mut AgcGraphicsState,
+    destination: AgcRegisterFile,
+    source: &'static str,
+    packet_address: u64,
+    table_address: u64,
+    table_index: Option<u32>,
+    raw_offset: u32,
+    normalized_offset: u32,
+    value: u32,
+) {
+    let previous = match destination {
+        AgcRegisterFile::Context => graphics.context_registers.insert(normalized_offset, value),
+        AgcRegisterFile::Shader => graphics.shader_registers.insert(normalized_offset, value),
+        AgcRegisterFile::UserConfig => graphics
+            .user_config_registers
+            .insert(normalized_offset, value),
+    };
+    let blend_slot = normalized_offset
+        .checked_sub(AGC_CB_BLEND0_CONTROL)
+        .filter(|slot| *slot < AGC_CB_BLEND_CONTROL_COUNT);
+    let Some(blend_slot) = blend_slot else {
+        return;
+    };
+    graphics.register_write_sequence = graphics.register_write_sequence.saturating_add(1);
+    let sequence = graphics.register_write_sequence;
+    if destination == AgcRegisterFile::Context {
+        graphics.blend_register_provenance
+            [usize::try_from(blend_slot).expect("blend slot fits usize")] =
+            Some(AgcBlendRegisterProvenance {
+                sequence,
+                source,
+                packet_address,
+                table_address,
+                table_index,
+                raw_offset,
+                normalized_offset,
+                value,
+            });
+    }
+    if trace_agc_blend_provenance() {
+        let context_value = graphics.context_registers.get(&normalized_offset).copied();
+        eprintln!(
+            "[REMu][AGC][BLEND-PROVENANCE] phase=apply sequence={sequence} source={source} \
+             packet={packet_address:#x} table={table_address:#x} index={table_index:?} \
+             raw={raw_offset:#010x} normalized={normalized_offset:#05x} \
+             destination={} previous={previous:#010x?} value={value:#010x} \
+             context_value={context_value:#010x?}",
+            destination.name(),
+        );
+    }
+}
 
 pub(crate) fn agc_apply_submission_registers(
     packet_address: u64,
@@ -33,14 +112,25 @@ pub(crate) fn agc_apply_submission_registers(
         if length != 3 {
             return Err(AgcSubmissionError::IndexedUconfigRegisterPacketLength { actual: length });
         }
-        let register = read_guest_u32(packet_address + 4) & !0x7000_0000;
+        let raw_register = read_guest_u32(packet_address + 4);
+        let register = raw_register & !0x7000_0000;
         let value = read_guest_u32(packet_address + 8);
         if trace_agc_registers() && register == AGC_VGT_PRIMITIVE_TYPE {
             eprintln!(
                 "[REMu][AGC][REG] primitive={value:#x} source=indexed packet={packet_address:#x}"
             );
         }
-        graphics.user_config_registers.insert(register, value);
+        agc_apply_register_value(
+            graphics,
+            AgcRegisterFile::UserConfig,
+            "indexed-direct",
+            packet_address,
+            0,
+            None,
+            raw_register,
+            register,
+            value,
+        );
         if register == AGC_VGT_INDEX_TYPE {
             graphics.index_size = value & 0x3;
         }
@@ -60,15 +150,16 @@ pub(crate) fn agc_apply_submission_registers(
         // Without masking, index_size stays on the 16-bit CLEAR_STATE default while the
         // buffer is 32-bit (`[0,1,2]` → `[0,0,1,0,2,0]`), and compute threadgroup size
         // silently falls back to `[1,1,1]` via `.max(1)` when NUM_THREAD is missing.
+        let raw_first_register = read_guest_u32(packet_address + 4);
         let first_register = if matches!(opcode, AGC_IT_SET_UCONFIG_REG | AGC_IT_SET_SH_REG) {
-            read_guest_u32(packet_address + 4) & !0x7000_0000
+            raw_first_register & !0x7000_0000
         } else {
-            read_guest_u32(packet_address + 4)
+            raw_first_register
         };
         let destination = match opcode {
-            AGC_IT_SET_CONTEXT_REG => &mut graphics.context_registers,
-            AGC_IT_SET_SH_REG => &mut graphics.shader_registers,
-            _ => &mut graphics.user_config_registers,
+            AGC_IT_SET_CONTEXT_REG => AgcRegisterFile::Context,
+            AGC_IT_SET_SH_REG => AgcRegisterFile::Shader,
+            _ => AgcRegisterFile::UserConfig,
         };
         let mut index_type_value = None;
         for index in 0..length - 2 {
@@ -82,7 +173,17 @@ pub(crate) fn agc_apply_submission_registers(
                     "[REMu][AGC][REG] primitive={value:#x} source=direct packet={packet_address:#x}"
                 );
             }
-            destination.insert(register, value);
+            agc_apply_register_value(
+                graphics,
+                destination,
+                "direct",
+                packet_address,
+                0,
+                None,
+                raw_first_register.saturating_add(index),
+                register,
+                value,
+            );
             if opcode == AGC_IT_SET_UCONFIG_REG && register == AGC_VGT_INDEX_TYPE {
                 index_type_value = Some(value);
             }
@@ -101,7 +202,8 @@ pub(crate) fn agc_apply_submission_registers(
                 .min(AGC_SPI_PS_INPUT_CNTL_0 + 32);
             let entries = (first..last)
                 .filter_map(|offset| {
-                    destination
+                    graphics
+                        .context_registers
                         .get(&offset)
                         .copied()
                         .map(|value| (offset, value))
@@ -184,17 +286,18 @@ pub(crate) fn agc_apply_submission_registers(
         let registers_address = u64::from(read_guest_u32(packet_address + 4) & !0x3)
             | (u64::from(read_guest_u32(packet_address + 8)) << 32);
         let register_count = read_guest_u32(packet_address + 16) & 0x3fff;
-        let (destination, normalize_selector) = match opcode {
-            AGC_IT_SET_CONTEXT_REG_INDIRECT => (&mut graphics.context_registers, false),
-            AGC_IT_SET_SH_REG_INDIRECT => (&mut graphics.shader_registers, true),
-            _ => (&mut graphics.user_config_registers, true),
+        let destination = match opcode {
+            AGC_IT_SET_CONTEXT_REG_INDIRECT => AgcRegisterFile::Context,
+            AGC_IT_SET_SH_REG_INDIRECT => AgcRegisterFile::Shader,
+            _ => AgcRegisterFile::UserConfig,
         };
         if let Some(value) = agc_apply_indirect_register_table(
             opcode,
+            packet_address,
             registers_address,
             register_count,
-            normalize_selector,
             destination,
+            graphics,
         )? {
             graphics.index_size = value & 0x3;
         }
@@ -212,19 +315,20 @@ pub(crate) fn agc_apply_submission_registers(
     }
     let register_count = read_guest_u32(packet_address + 4).min(4_096);
     let registers_address = read_guest_u64(packet_address + 8);
-    let (destination, normalize_selector) = match register {
-        AGC_R_CX_REGS_INDIRECT => (&mut graphics.context_registers, false),
+    let destination = match register {
+        AGC_R_CX_REGS_INDIRECT => AgcRegisterFile::Context,
         // HLE SH/UC tables use the same 0x2000_/0x4000_ selector high bits as the native
         // indirect packets; context tables keep bare Gen5 offsets.
-        AGC_R_SH_REGS_INDIRECT => (&mut graphics.shader_registers, true),
-        _ => (&mut graphics.user_config_registers, true),
+        AGC_R_SH_REGS_INDIRECT => AgcRegisterFile::Shader,
+        _ => AgcRegisterFile::UserConfig,
     };
     if let Some(value) = agc_apply_indirect_register_table(
         opcode,
+        packet_address,
         registers_address,
         register_count,
-        normalize_selector,
         destination,
+        graphics,
     )? {
         graphics.index_size = value & 0x3;
     }
@@ -235,10 +339,11 @@ pub(crate) fn agc_apply_submission_registers(
 /// that raw register value so callers can mirror it into `graphics.index_size`.
 fn agc_apply_indirect_register_table(
     opcode: u32,
+    packet_address: u64,
     registers_address: u64,
     register_count: u32,
-    normalize_selector: bool,
-    destination: &mut BTreeMap<u32, u32>,
+    destination: AgcRegisterFile,
+    graphics: &mut AgcGraphicsState,
 ) -> Result<Option<u32>, AgcSubmissionError> {
     if register_count == 0 {
         return Ok(None);
@@ -265,12 +370,12 @@ fn agc_apply_indirect_register_table(
     let mut traced_raw_registers = Vec::new();
     let mut traced_pixel_inputs = Vec::new();
     let mut index_type_value = None;
-    for pair in bytes.chunks_exact(8) {
+    for (table_index, pair) in (0_u32..).zip(bytes.chunks_exact(8)) {
         let raw_offset = u32::from_le_bytes(pair[..4].try_into().expect("register offset dword"));
         if raw_offset == u32::MAX {
             continue;
         }
-        let offset = if normalize_selector {
+        let offset = if destination.normalize_selector() {
             raw_offset & !0x7000_0000
         } else {
             raw_offset
@@ -302,8 +407,18 @@ fn agc_apply_indirect_register_table(
         {
             traced_pixel_inputs.push((raw_offset, offset, value));
         }
-        destination.insert(offset, value);
-        if offset == AGC_VGT_INDEX_TYPE {
+        agc_apply_register_value(
+            graphics,
+            destination,
+            "indirect",
+            packet_address,
+            registers_address,
+            Some(table_index),
+            raw_offset,
+            offset,
+            value,
+        );
+        if destination == AgcRegisterFile::UserConfig && offset == AGC_VGT_INDEX_TYPE {
             index_type_value = Some(value);
         }
     }
