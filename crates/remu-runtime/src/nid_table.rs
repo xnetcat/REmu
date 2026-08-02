@@ -508,6 +508,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "0fWWK5uG9rQ" => "sceAgcQueueEndOfPipeActionPatchAddress",
         "57labkp+rSQ" => "sceAgcDcbAcquireMem",
         "HXzjK9yI30k" => "sceVideoOutAddFlipEvent",
+        "SbU3dwp80lQ" => "sceVideoOutGetFlipStatus",
         "Xru92wHJRmg" => "sceVideoOutAddVblankEvent",
         "Up36PTk687E" => "sceVideoOutOpen",
         "utPrVdxio-8" => "sceVideoOutGetOutputStatus",

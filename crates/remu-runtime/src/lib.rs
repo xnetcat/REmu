@@ -1012,6 +1012,23 @@ struct VideoOutState {
     /// Equeues registered with `sceVideoOutAddVblankEvent`, keyed by queue handle.
     vblank_events: BTreeMap<u64, u64>,
     completed_flip_count: u64,
+    /// Most recently completed flip, which `sceVideoOutGetFlipStatus` reports until the next one.
+    last_completed_flip: Option<CompletedVideoOutFlip>,
+}
+
+/// Completion record `sceVideoOutGetFlipStatus` reads back to a title pacing its frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletedVideoOutFlip {
+    /// Process time, in microseconds, when the flip completed.
+    process_time: u64,
+    /// Process time counter, in nanoseconds, when the flip completed.
+    process_time_counter: u64,
+    /// Argument the title attached to the flip request.
+    flip_argument: u64,
+    /// Display-buffer index the flip scanned out.
+    buffer_index: u32,
+    /// Process time counter, in nanoseconds, when the flip was submitted.
+    submit_process_time_counter: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1027,6 +1044,8 @@ struct VideoOutBufferAttributes {
 struct PendingVideoOutFlip {
     completion: remu_gpu::GpuFlipCompletion,
     handle: u32,
+    /// Process time counter, in nanoseconds, when the flip was queued for the GPU.
+    submit_process_time_counter: u64,
 }
 
 // Shader evaluation keys are entirely emulator-owned integers. SipHash's collision resistance is

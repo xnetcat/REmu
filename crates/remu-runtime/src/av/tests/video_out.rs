@@ -170,6 +170,82 @@ fn the_vblank_status_reports_a_free_running_counter_in_its_documented_layout() {
 }
 
 #[test]
+fn the_flip_status_reports_pending_depth_and_the_last_completed_flip() {
+    let mut state = open_display();
+    let mut status = [0xff_u8; 0x80];
+    let status_address = address_mut(&mut status);
+    assert_eq!(
+        dispatch(
+            "SbU3dwp80lQ",
+            args(&[VIDEO_OUT_HANDLE, status_address]),
+            &mut state
+        ),
+        Some(SUCCESS)
+    );
+    assert_eq!(
+        status, [0_u8; 0x80],
+        "before any flip every field must read zero"
+    );
+
+    state.pending_video_out_flips.push_back(PendingVideoOutFlip {
+        completion: remu_gpu::GpuFlipCompletion {
+            address: 0x2000,
+            buffer_index: 1,
+            flip_argument: 7,
+        },
+        handle: 1,
+        submit_process_time_counter: 210_000,
+    });
+    state.video_out.completed_flip_count = 3;
+    state.video_out.last_completed_flip = Some(CompletedVideoOutFlip {
+        process_time: 111,
+        process_time_counter: 222_000,
+        flip_argument: 0x4242,
+        buffer_index: 1,
+        submit_process_time_counter: 210_000,
+    });
+    assert_eq!(
+        dispatch(
+            "SbU3dwp80lQ",
+            args(&[VIDEO_OUT_HANDLE, status_address]),
+            &mut state
+        ),
+        Some(SUCCESS)
+    );
+    let field_u64 = |offset: usize| {
+        u64::from_le_bytes(
+            status[offset..offset + 8]
+                .try_into()
+                .expect("an eight-byte field"),
+        )
+    };
+    let field_u32 = |offset: usize| {
+        u32::from_le_bytes(
+            status[offset..offset + 4]
+                .try_into()
+                .expect("a four-byte field"),
+        )
+    };
+    assert_eq!(field_u64(0x00), 3, "count");
+    assert_eq!(field_u64(0x08), 111, "processTime");
+    assert_eq!(field_u64(0x18), 0x4242, "flipArg");
+    assert_eq!(field_u64(0x28), 222_000, "processTimeCounter");
+    assert_eq!(field_u32(0x30), 0, "gcQueueNum");
+    assert_eq!(field_u32(0x34), 1, "flipPendingNum");
+    assert_eq!(field_u32(0x38), 1, "currentBuffer");
+    assert_eq!(field_u64(0x40), 210_000, "submitProcessTimeCounter");
+
+    assert_eq!(
+        dispatch("SbU3dwp80lQ", args(&[VIDEO_OUT_HANDLE, 0]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_ADDRESS))
+    );
+    assert_eq!(
+        dispatch("SbU3dwp80lQ", args(&[2, status_address]), &mut state),
+        Some(error(VIDEO_OUT_ERROR_INVALID_HANDLE))
+    );
+}
+
+#[test]
 fn a_delivered_event_reports_the_display_event_it_carries() {
     let mut state = open_display();
     let mut event = [0_u8; KERNEL_EVENT_SIZE];

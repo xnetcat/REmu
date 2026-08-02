@@ -8,10 +8,10 @@ mod video_out;
 use super::*;
 use crate::AjmContextState;
 use crate::{
-    SCE_AJM_ERROR_INVALID_CONTEXT, SCE_AJM_ERROR_INVALID_PARAMETER,
-    VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE, VIDEO_OUT_ERROR_INVALID_INDEX,
-    VIDEO_OUT_ERROR_INVALID_VALUE, VideoOutBufferAttributes, audio, audio_out_error,
-    kernel_process_time, sce_kernel_error,
+    CompletedVideoOutFlip, PendingVideoOutFlip, SCE_AJM_ERROR_INVALID_CONTEXT,
+    SCE_AJM_ERROR_INVALID_PARAMETER, VIDEO_OUT_ERROR_INVALID_ADDRESS,
+    VIDEO_OUT_ERROR_INVALID_HANDLE, VIDEO_OUT_ERROR_INVALID_INDEX, VIDEO_OUT_ERROR_INVALID_VALUE,
+    VideoOutBufferAttributes, audio, audio_out_error, kernel_process_time, sce_kernel_error,
 };
 
 const SUCCESS: u64 = 0;

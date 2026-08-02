@@ -1,11 +1,11 @@
 use crate::{
     AGC_IT_DRAW_INDEX_OFFSET, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_INDEX_TYPE,
-    AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_R_DRAW_INDEX_AUTO, AGC_R_FLIP,
+    AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_R_DRAW_INDEX_AUTO, AGC_R_FLIP, CompletedVideoOutFlip,
     KERNEL_EVENT_FILTER_GRAPHICS, KernelQueuedEvent, PendingVideoOutFlip, ProbeDispatchState,
     QUEUED_FLIPS, VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE,
     VIDEO_OUT_ERROR_INVALID_INDEX, VideoOutBufferAttributes, VideoOutState,
-    agc_allocate_command_dwords, agc_pm4, emit_agc_gpu_event, low_i32, low_u32,
-    notify_kernel_equeue_waiters, publish_gpu_event, queue_kernel_event, read_guest_u32,
+    agc_allocate_command_dwords, agc_pm4, emit_agc_gpu_event, kernel_process_time, low_i32,
+    low_u32, notify_kernel_equeue_waiters, publish_gpu_event, queue_kernel_event, read_guest_u32,
     read_guest_u64, sce_kernel_error, trace_logarithmic_sequence, write_guest_u32,
 };
 
@@ -209,6 +209,7 @@ pub(crate) fn queue_video_out_flip(
                 flip_argument,
             },
             handle,
+            submit_process_time_counter: kernel_process_time(true),
         });
 }
 
@@ -236,6 +237,13 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .expect("completed flip index was just found");
         state.video_out.completed_flip_count =
             state.video_out.completed_flip_count.saturating_add(1);
+        state.video_out.last_completed_flip = Some(CompletedVideoOutFlip {
+            process_time: kernel_process_time(false),
+            process_time_counter: kernel_process_time(true),
+            flip_argument: pending.completion.flip_argument,
+            buffer_index: pending.completion.buffer_index,
+            submit_process_time_counter: pending.submit_process_time_counter,
+        });
         let event_data = 6 | ((pending.completion.flip_argument & 0x0000_ffff_ffff_ffff) << 16);
         let registrations = state
             .video_out

@@ -6,7 +6,7 @@ use crate::{
     VIDEO_OUT_ERROR_INVALID_INDEX, VIDEO_OUT_ERROR_INVALID_VALUE, VideoOutBufferAttributes,
     guest_memset, kernel_process_time, low_i32, low_u32, process_guest_range_is_readable,
     publish_gpu_event, read_guest_u32, read_guest_u64, sce_kernel_error, signed_i32_return,
-    write_guest_u64,
+    write_guest_u32, write_guest_u64,
 };
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -26,6 +26,24 @@ pub(super) const VIDEO_OUT_VBLANK_STATUS_SIZE: u64 = 0x28;
 pub(super) const VIDEO_OUT_VBLANK_PROCESS_TIME_OFFSET: u64 = 0x08;
 
 pub(super) const VIDEO_OUT_VBLANK_PROCESS_TIME_COUNTER_OFFSET: u64 = 0x18;
+
+/// Bytes one `SceVideoOutFlipStatus` occupies.
+pub(super) const VIDEO_OUT_FLIP_STATUS_SIZE: u64 = 0x80;
+
+/// Byte offsets within that block.
+pub(super) const VIDEO_OUT_FLIP_PROCESS_TIME_OFFSET: u64 = 0x08;
+
+pub(super) const VIDEO_OUT_FLIP_ARGUMENT_OFFSET: u64 = 0x18;
+
+pub(super) const VIDEO_OUT_FLIP_PROCESS_TIME_COUNTER_OFFSET: u64 = 0x28;
+
+pub(super) const VIDEO_OUT_FLIP_GC_QUEUE_NUM_OFFSET: u64 = 0x30;
+
+pub(super) const VIDEO_OUT_FLIP_PENDING_NUM_OFFSET: u64 = 0x34;
+
+pub(super) const VIDEO_OUT_FLIP_CURRENT_BUFFER_OFFSET: u64 = 0x38;
+
+pub(super) const VIDEO_OUT_FLIP_SUBMIT_PROCESS_TIME_COUNTER_OFFSET: u64 = 0x40;
 
 /// Bytes one `SceVideoOutOutputOptions` occupies.
 pub(super) const VIDEO_OUT_OUTPUT_OPTIONS_SIZE: u64 = 0x40;
@@ -252,6 +270,52 @@ pub(super) fn video_out_get_vblank_status(arguments: [u64; 6], state: &ProbeDisp
         status + VIDEO_OUT_VBLANK_PROCESS_TIME_COUNTER_OFFSET,
         kernel_process_time(true)
             .saturating_sub(since_vblank_microseconds.saturating_mul(NANOSECONDS_PER_MICROSECOND)),
+    );
+    0
+}
+
+/// Reports the display's flip counter, pending depth, and the most recent completed flip.
+///
+/// Unreal's `RHIFrameFlipThread` paces frame submission on this call: it reads `flipPendingNum`
+/// plus `gcQueueNum` to decide whether another frame may be queued, and `flipArg`/`count` to
+/// retire completed frames. Flips here enter `pending_video_out_flips` when their command
+/// stream is submitted, so no flip ever sits in a separate GPU-only queue and `gcQueueNum`
+/// is always zero.
+pub(super) fn video_out_get_flip_status(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    if !video_out_port_is_open(arguments[0], state) {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+    }
+    let status = arguments[1];
+    if !guest_object_is_reachable(status, VIDEO_OUT_FLIP_STATUS_SIZE) {
+        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
+    }
+    let pending = u32::try_from(state.pending_video_out_flips.len()).unwrap_or(u32::MAX);
+    guest_memset(status, 0, VIDEO_OUT_FLIP_STATUS_SIZE);
+    write_guest_u64(status, state.video_out.completed_flip_count);
+    write_guest_u32(status + VIDEO_OUT_FLIP_GC_QUEUE_NUM_OFFSET, 0);
+    write_guest_u32(status + VIDEO_OUT_FLIP_PENDING_NUM_OFFSET, pending);
+    let Some(completed) = state.video_out.last_completed_flip else {
+        return 0;
+    };
+    write_guest_u64(
+        status + VIDEO_OUT_FLIP_PROCESS_TIME_OFFSET,
+        completed.process_time,
+    );
+    write_guest_u64(
+        status + VIDEO_OUT_FLIP_ARGUMENT_OFFSET,
+        completed.flip_argument,
+    );
+    write_guest_u64(
+        status + VIDEO_OUT_FLIP_PROCESS_TIME_COUNTER_OFFSET,
+        completed.process_time_counter,
+    );
+    write_guest_u32(
+        status + VIDEO_OUT_FLIP_CURRENT_BUFFER_OFFSET,
+        completed.buffer_index,
+    );
+    write_guest_u64(
+        status + VIDEO_OUT_FLIP_SUBMIT_PROCESS_TIME_COUNTER_OFFSET,
+        completed.submit_process_time_counter,
     );
     0
 }

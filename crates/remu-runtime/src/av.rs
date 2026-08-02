@@ -81,7 +81,8 @@ use self::video_out::{
     VIDEO_OUT_TILING_MODE_TILE, VIDEO_OUT_TRUE,
 };
 use self::video_out::{
-    video_out_adjust_color, video_out_close, video_out_get_event_id, video_out_get_vblank_status,
+    video_out_adjust_color, video_out_close, video_out_get_event_id, video_out_get_flip_status,
+    video_out_get_vblank_status,
     video_out_initialize_output_options, video_out_is_output_supported,
     video_out_submit_change_buffer_attribute2, video_out_unregister_buffers,
     video_out_vrr_unpeg_from_fixed_rate, video_out_wait_vblank,
@@ -116,6 +117,7 @@ fn dispatch_video_out(
         "N5KDtkIjjJ4" => video_out_unregister_buffers(arguments, state),
         "HuViW4HnrOw" => video_out_submit_change_buffer_attribute2(arguments, state),
         "1FZBKy8HeNU" => video_out_get_vblank_status(arguments, state),
+        "SbU3dwp80lQ" => video_out_get_flip_status(arguments, state),
         "j6RaAUlaLv0" => video_out_wait_vblank(arguments, state),
         "U2JJtSqNKZI" => video_out_get_event_id(arguments[0]),
         "+I4K03i3EL0" => video_out_initialize_output_options(arguments[0]),
