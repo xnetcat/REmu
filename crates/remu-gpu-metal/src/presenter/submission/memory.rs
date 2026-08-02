@@ -16,7 +16,7 @@ use remu_gpu::{
 };
 use remu_memory::{
     CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_shared_mapping_identity,
-    guest_write_journal_enabled, notify_guest_memory_written, read_guest_shared_backing,
+    notify_guest_memory_written, read_guest_shared_backing,
     write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
@@ -185,43 +185,81 @@ impl MetalPresenter {
                 }
             }
 
-            if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref() {
-                // SAFETY: snapshot validation above proves a complete immutable packet-time
-                // source, and the runtime validated the destination guest mapping.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        snapshot.as_ptr(),
-                        copy.destination_address as *mut u8,
-                        byte_count,
-                    );
+            // A fence-shaped copy must not become guest-visible at event-dequeue time: Unreal
+            // writes GPU fences through DMA_DATA as well as RELEASE_MEM (the runtime traces the
+            // pattern as fence_label_dma), and an immediately-applied fence signals frame
+            // completion ahead of the frame's in-flight Metal work — the guest then recycles
+            // frame memory its own threads are still writing, which is the MallocBinned3
+            // corruption. Bulk copies stay immediate: they stage upload pages that later
+            // dequeue-time decode legitimately reads back out of guest RAM.
+            let fence_shaped = copy.byte_count <= 32
+                || (0x7e00_0000_0000..0x8000_0000_0000).contains(&copy.destination_address);
+            if fence_shaped {
+                // Resolve the source bytes now — every ordered producer that could feed this
+                // source was drained above, exactly as the immediate path required — and queue
+                // the destination write behind the batch like every other ordered CP effect.
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(byte_count)
+                    .map_err(|error| format!("could not stage DMA copy source: {error}"))?;
+                if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref()
+                {
+                    bytes.extend_from_slice(snapshot);
+                } else {
+                    // SAFETY: the runtime decodes DMA only for bounded non-null guest virtual
+                    // addresses, and the guest owns the source mapping for the ordered stream.
+                    let source = unsafe {
+                        std::slice::from_raw_parts(copy.source_address as *const u8, byte_count)
+                    };
+                    bytes.extend_from_slice(source);
                 }
+                self.queue_pending_guest_memory_write(GuestMemoryWriteOperation::Copy {
+                    address: copy.destination_address,
+                    bytes,
+                })?;
             } else {
-                // SAFETY: the runtime decodes DMA only for bounded non-null guest virtual
-                // addresses. The guest owns these mappings for the ordered event stream. The live
-                // path intentionally provides memmove semantics for legal overlapping packets.
-                unsafe {
-                    std::ptr::copy(
-                        copy.source_address as *const u8,
-                        copy.destination_address as *mut u8,
-                        byte_count,
+                if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref()
+                {
+                    // SAFETY: snapshot validation above proves a complete immutable packet-time
+                    // source, and the runtime validated the destination guest mapping.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            snapshot.as_ptr(),
+                            copy.destination_address as *mut u8,
+                            byte_count,
+                        );
+                    }
+                } else {
+                    // SAFETY: the runtime decodes DMA only for bounded non-null guest virtual
+                    // addresses. The guest owns these mappings for the ordered event stream. The
+                    // live path intentionally provides memmove semantics for overlapping packets.
+                    unsafe {
+                        std::ptr::copy(
+                            copy.source_address as *const u8,
+                            copy.destination_address as *mut u8,
+                            byte_count,
+                        );
+                    }
+                }
+                if remu_memory::guest_write_journal_enabled() {
+                    // SAFETY: the copy above just wrote exactly these bytes, so the destination
+                    // is readable for the journal's uniformity scan.
+                    let written = unsafe {
+                        std::slice::from_raw_parts(
+                            copy.destination_address as *const u8,
+                            byte_count,
+                        )
+                    };
+                    journal_guest_write(
+                        GuestWriteSite::DmaCopy,
+                        copy.destination_address,
+                        copy.byte_count,
+                        written,
                     );
                 }
+                let _ = notify_guest_memory_written(copy.destination_address, copy.byte_count);
+                self.record_submitted_gpu_waits_in_range(copy.destination_address, copy.byte_count);
             }
-            if guest_write_journal_enabled() {
-                // SAFETY: the copy above just wrote exactly these bytes, so the destination is
-                // readable for the journal's uniformity scan.
-                let written = unsafe {
-                    std::slice::from_raw_parts(copy.destination_address as *const u8, byte_count)
-                };
-                journal_guest_write(
-                    GuestWriteSite::DmaCopy,
-                    copy.destination_address,
-                    copy.byte_count,
-                    written,
-                );
-            }
-            let _ = notify_guest_memory_written(copy.destination_address, copy.byte_count);
-            self.record_submitted_gpu_waits_in_range(copy.destination_address, copy.byte_count);
         }
 
         // The copy made guest RAM authoritative for its destination. Resolving that range
@@ -405,6 +443,28 @@ impl MetalPresenter {
                         );
                     }
                 }
+                GuestMemoryWriteOperation::Copy { address, bytes } => {
+                    // Fence labels written through DMA_DATA are dword or qword sized; larger
+                    // copies rely on the active-wait latch below, like large fills.
+                    if bytes.len() >= 4 {
+                        let mut value = [0_u8; 4];
+                        value.copy_from_slice(&bytes[..4]);
+                        self.record_guest_memory_producer(
+                            *address,
+                            false,
+                            u64::from(u32::from_le_bytes(value)),
+                        );
+                    }
+                    if bytes.len() >= 8 {
+                        let mut value = [0_u8; 8];
+                        value.copy_from_slice(&bytes[..8]);
+                        self.record_guest_memory_producer(
+                            *address,
+                            true,
+                            u64::from_le_bytes(value),
+                        );
+                    }
+                }
             }
         }
 
@@ -454,6 +514,10 @@ impl GuestMemoryWriteOperation {
                     4
                 },
             ),
+            Self::Copy { address, bytes } => (
+                *address,
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            ),
             Self::Fill {
                 address,
                 dword_count,
@@ -500,6 +564,20 @@ impl GuestMemoryWriteOperation {
                     u64::from(*value)
                 })
             }
+            Self::Copy {
+                address: copy_address,
+                bytes,
+            } => {
+                let offset = usize::try_from(address.checked_sub(*copy_address)?).ok()?;
+                let width = if is_64_bit { 8 } else { 4 };
+                let end = offset.checked_add(width)?;
+                if end > bytes.len() {
+                    return None;
+                }
+                let mut value = [0_u8; 8];
+                value[..width].copy_from_slice(&bytes[offset..end]);
+                Some(u64::from_le_bytes(value))
+            }
             Self::Write(_) | Self::Release(_) => None,
         }
     }
@@ -514,6 +592,7 @@ impl GuestMemoryWriteOperation {
             Self::Release(_) => GuestWriteSite::ReleaseMem,
             Self::Write(_) => GuestWriteSite::WriteData,
             Self::Fill { .. } => GuestWriteSite::DmaFill,
+            Self::Copy { .. } => GuestWriteSite::DmaCopy,
         }
     }
 
@@ -549,6 +628,11 @@ impl GuestMemoryWriteOperation {
                 payload[..4].copy_from_slice(&value.to_le_bytes());
                 payload[4..].copy_from_slice(&value.to_le_bytes());
                 (payload, 8)
+            }
+            Self::Copy { bytes, .. } => {
+                let length = bytes.len().min(8);
+                payload[..length].copy_from_slice(&bytes[..length]);
+                (payload, length)
             }
         }
     }
@@ -626,6 +710,18 @@ fn validate_guest_memory_operation(write: &GuestMemoryWriteOperation) -> Result<
             address
                 .checked_add(byte_count)
                 .ok_or("DMA fill destination range overflowed")?;
+            Ok(())
+        }
+        GuestMemoryWriteOperation::Copy { address, bytes } => {
+            if *address == 0 || bytes.is_empty() {
+                return Err(format!(
+                    "DMA copy destination {address:#x} bytes={} is invalid",
+                    bytes.len()
+                ));
+            }
+            address
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| "DMA copy length overflow")?)
+                .ok_or("DMA copy destination range overflowed")?;
             Ok(())
         }
     }
@@ -746,6 +842,13 @@ fn apply_guest_memory_operation_direct(
                 }
             }
         }
+        GuestMemoryWriteOperation::Copy { address, bytes } => {
+            // SAFETY: the caller pins the original mapping against replacement for the duration
+            // of this operation, and validation bounded the destination range.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), *address as *mut u8, bytes.len());
+            }
+        }
     }
     Ok(())
 }
@@ -832,6 +935,9 @@ fn apply_guest_memory_operation_shared(
             }
             Ok(())
         }
+        GuestMemoryWriteOperation::Copy { bytes, .. } => {
+            write_shared_identity_bytes(address, identity, 0, bytes)
+        }
     }
 }
 
@@ -845,9 +951,9 @@ pub(crate) fn apply_pending_guest_memory_writes(
                 remu_gpu::take_pixel_pipe_stat_release_trace(release),
                 remu_gpu::take_pixel_pipe_query_completion_release_trace(release),
             ),
-            GuestMemoryWriteOperation::Write(_) | GuestMemoryWriteOperation::Fill { .. } => {
-                (None, None)
-            }
+            GuestMemoryWriteOperation::Write(_)
+            | GuestMemoryWriteOperation::Fill { .. }
+            | GuestMemoryWriteOperation::Copy { .. } => (None, None),
         };
         let observed_before = (pixel_pipe_trace.is_some() || query_completion_trace.is_some())
             .then(|| observe_pending_guest_memory_release(pending_write))
@@ -881,6 +987,11 @@ pub(crate) fn apply_pending_guest_memory_writes(
                 byte_count,
                 &payload[..payload_length],
             );
+            if matches!(pending_write.operation, GuestMemoryWriteOperation::Copy { .. }) {
+                // The immediate copy path notified the watch layer as it wrote; the deferred
+                // application owes the same dirtying so armed views of the destination revalidate.
+                let _ = notify_guest_memory_written(address, byte_count);
+            }
         }
         if let Some(trace) = pixel_pipe_trace {
             let GuestMemoryWriteOperation::Release(release) = pending_write.operation else {

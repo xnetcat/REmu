@@ -1463,6 +1463,13 @@ enum GuestMemoryWriteOperation {
         value: u32,
         dword_count: u64,
     },
+    /// A DMA_DATA copy's destination bytes, resolved at decode time and applied in order.
+    ///
+    /// Unreal writes its GPU fences through DMA_DATA as well as RELEASE_MEM (the runtime traces
+    /// them as `fence_label_dma`). Applying the copy at event-dequeue time made those fences
+    /// visible ahead of the frame's in-flight Metal work, and the guest recycled frame memory
+    /// its own threads were still writing.
+    Copy { address: u64, bytes: Vec<u8> },
 }
 
 #[derive(Debug)]
