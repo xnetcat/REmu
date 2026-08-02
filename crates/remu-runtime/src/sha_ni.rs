@@ -13,6 +13,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Number of SHA-NI instructions recovered by the SIGILL handler.
 static RECOVERED: AtomicU64 = AtomicU64::new(0);
 
+/// Wall-clock nanoseconds spent inside the SIGILL handler, summed over every recovered fault.
+///
+/// A title that compiles SHA-1 with SHA-NI takes one signal per instruction here — half a million
+/// in a 49-second Poppy Playtime run — and each is a full kernel round trip rather than the few
+/// cycles the hardware instruction would have cost. Whether that is a rounding error or a
+/// first-rank frame-time cost is not something to guess at, so the handler times itself.
+/// `clock_gettime` is async-signal-safe, which most timing sources are not.
+static RECOVERED_NANOSECONDS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn recovered_sigill_nanoseconds() -> u64 {
+    RECOVERED_NANOSECONDS.load(Ordering::Relaxed)
+}
+
+/// Reads the monotonic clock from signal context, or `None` where that is unavailable.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn signal_safe_now_nanoseconds() -> Option<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` is async-signal-safe and writes only the supplied timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut time) } != 0 {
+        return None;
+    }
+    u64::try_from(time.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(time.tv_nsec).ok()?)
+}
+
 static INSTALL: OnceLock<Result<(), i32>> = OnceLock::new();
 
 /// Installs the process-wide SIGILL recovery for SHA-NI opcodes. Safe to call repeatedly.
@@ -81,12 +111,23 @@ extern "C" fn sha_ni_sigill_handler(
     information: *mut libc::siginfo_t,
     context: *mut std::ffi::c_void,
 ) {
+    // The handler entry is the earliest point this code runs, so the span measured here is the
+    // decode-and-emulate work only. The kernel's delivery and sigreturn cost sits outside it and
+    // is typically the larger half, which makes this total a LOWER BOUND on what the traps cost.
+    let entered = signal_safe_now_nanoseconds();
+    let account = |entered: Option<u64>| {
+        if let (Some(entered), Some(left)) = (entered, signal_safe_now_nanoseconds()) {
+            RECOVERED_NANOSECONDS.fetch_add(left.saturating_sub(entered), Ordering::Relaxed);
+        }
+    };
     if try_recover_sha_ni(context) {
         RECOVERED.fetch_add(1, Ordering::Relaxed);
+        account(entered);
         return;
     }
     if try_recover_sse4a(context) {
         RECOVERED_SSE4A.fetch_add(1, Ordering::Relaxed);
+        account(entered);
         return;
     }
     report_unrecovered_sigill(information, context);

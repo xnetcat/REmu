@@ -8723,8 +8723,15 @@ fn write_abi_gap_summary() {
     let recovered_sha_ni = sha_ni::recovered_sha_ni_count();
     let recovered_sse4a = sha_ni::recovered_sse4a_count();
     if recovered_sha_ni != 0 || recovered_sse4a != 0 {
+        // The nanoseconds are handler-body only and therefore a lower bound: kernel signal
+        // delivery and sigreturn bracket this span and are not counted.
+        let nanoseconds = sha_ni::recovered_sigill_nanoseconds();
+        let total = recovered_sha_ni.saturating_add(recovered_sse4a);
         eprintln!(
-            "[REMu][REPORT] recovered instructions via SIGILL emulation sha_ni={recovered_sha_ni} sse4a={recovered_sse4a}"
+            "[REMu][REPORT] recovered instructions via SIGILL emulation sha_ni={recovered_sha_ni} \
+             sse4a={recovered_sse4a} handler_ms={} mean_ns={}",
+            nanoseconds / 1_000_000,
+            nanoseconds.checked_div(total).unwrap_or(0)
         );
     }
     for line in remu_shader::truncated_evaluation_report() {
