@@ -65,14 +65,12 @@ impl MetalPresenter {
             let OrderedEventSource::GuestQueue(queue_id) = source else {
                 return Err("guest memory release has no logical queue identity".to_owned());
             };
-            if self.active_open_guest_batch().is_some() {
-                self.encode_guest_release_shared_event(queue_id, &matching_waits)?;
-            } else {
-                self.statistics.shared_event_fallbacks_no_exact_producer = self
-                    .statistics
-                    .shared_event_fallbacks_no_exact_producer
-                    .saturating_add(1);
-            }
+            // A release-only producer is still an exact GPU queue point. Declining the binding
+            // merely because preceding work already committed forced every matching consumer back
+            // through host polling. Open a queue-local batch for the signal; Metal FIFO order keeps
+            // it behind earlier committed work, and host retirement remains FIFO as well.
+            self.ensure_active_open_guest_batch()?;
+            self.encode_guest_release_shared_event(queue_id, &matching_waits)?;
         }
         self.queue_pinned_guest_memory_write(pending)
     }
@@ -405,6 +403,8 @@ impl MetalPresenter {
         for &wait_id in matching_waits {
             let _ = self.gpu_wait_fences.bind_if_unbound(wait_id, fence);
         }
+        self.receiver
+            .retry_registered_guest_memory_waits(matching_waits);
         self.statistics.shared_event_signals =
             self.statistics.shared_event_signals.saturating_add(1);
         Ok(())

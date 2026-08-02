@@ -9,7 +9,7 @@ use super::{
     OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PipelineCompileCandidate,
     QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
 };
-use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait};
+use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, GpuWaitId};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -507,6 +507,29 @@ impl OrderedGpuEventReceiver {
         }) {
             self.host_block = None;
         }
+    }
+
+    /// Wakes only registered waits which just received an exact SharedEvent producer binding.
+    ///
+    /// The retained queue-front event carries the process-unique ticket generation. Matching that
+    /// identity avoids both the periodic-poll delay and the stale-address bug an address-only wake
+    /// would introduce when Unreal recycles its label pool.
+    pub(crate) fn retry_registered_guest_memory_waits(&mut self, wait_ids: &[GpuWaitId]) {
+        self.blocked_queues.retain(|queue_id, reason| {
+            if !matches!(reason, QueueBlockReason::GuestMemoryWait(_)) {
+                return true;
+            }
+            let registered_id = self
+                .submissions
+                .get(queue_id)
+                .and_then(|queue| queue.front())
+                .and_then(|submission| submission.events.front())
+                .and_then(|event| match event {
+                    GpuEvent::RegisteredMemoryWait { id, .. } => Some(*id),
+                    _ => None,
+                });
+            !registered_id.is_some_and(|id| wait_ids.contains(&id))
+        });
     }
 
     pub(crate) fn prefetch_pipeline_work(
