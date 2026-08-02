@@ -4625,6 +4625,13 @@ fn exact_registered_waits_chain_without_intermediate_host_acknowledgements() {
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
     assert_eq!(presenter.statistics.shared_event_waits, 2);
     assert_eq!(
+        presenter
+            .statistics
+            .shared_event_gpu_ordered_registered_waits,
+        1,
+        "the second exact wait is counted as a chained GPU-ordered wait"
+    );
+    assert_eq!(
         presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_WAIT], 0,
         "the second exact wait must extend the Metal-ordered segment instead of forcing a host ack"
     );

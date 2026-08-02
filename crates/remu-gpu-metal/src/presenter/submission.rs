@@ -177,6 +177,7 @@ impl MetalPresenter {
                 OrderedEventSource::Host { .. } => None,
             });
             let mut shared_event_gpu_ordered_compute = false;
+            let mut shared_event_gpu_ordered_registered_wait = false;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
                 let dependencies = self.unsignaled_host_dependencies(queue_id);
                 let gpu_orderable = dependencies.is_empty()
@@ -217,6 +218,11 @@ impl MetalPresenter {
                 }
                 if !dependencies.is_empty() && matches!(&event, GpuEvent::ComputeDispatch(_)) {
                     shared_event_gpu_ordered_compute = true;
+                }
+                if !dependencies.is_empty()
+                    && matches!(&event, GpuEvent::RegisteredMemoryWait { .. })
+                {
+                    shared_event_gpu_ordered_registered_wait = true;
                 }
             }
             match event {
@@ -451,7 +457,14 @@ impl MetalPresenter {
                 }
                 GpuEvent::RegisteredMemoryWait { id, wait } => {
                     match self.execute_guest_memory_wait(source, Some(id), wait) {
-                        Ok(GuestMemoryWaitStatus::Satisfied) => {}
+                        Ok(GuestMemoryWaitStatus::Satisfied) => {
+                            if shared_event_gpu_ordered_registered_wait {
+                                self.statistics.shared_event_gpu_ordered_registered_waits = self
+                                    .statistics
+                                    .shared_event_gpu_ordered_registered_waits
+                                    .saturating_add(1);
+                            }
+                        }
                         Ok(GuestMemoryWaitStatus::Blocked) => {
                             self.receiver.block_event(
                                 source,
