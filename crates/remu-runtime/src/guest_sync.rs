@@ -43,7 +43,9 @@ use self::event_flag::{
     guest_event_flag_cancel, guest_event_flag_clear, guest_event_flag_create,
     guest_event_flag_delete, guest_event_flag_poll, guest_event_flag_set,
 };
-use self::semaphore::{guest_semaphore_create, guest_semaphore_delete, guest_semaphore_signal};
+use self::semaphore::{
+    guest_semaphore_create, guest_semaphore_delete, guest_semaphore_poll, guest_semaphore_signal,
+};
 use self::state::{
     EVENT_FLAG_SET_SEQUENCE, EVENT_FLAG_WAIT_SEQUENCE, GuestMutexEntry, GuestMutexState,
     GuestRwlockState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard, guest_mutex_shards,
@@ -1160,6 +1162,11 @@ fn finish_main_timed_condition_trace(trace: Option<TimedConditionTrace>, result:
     );
 }
 
+/// Reports whether a NID is served before the process-wide dispatch lock is taken.
+///
+/// Membership is what makes a handler allowed to park. Every entry point that can wait for another
+/// guest thread must be listed here, because the thread that would release it needs the dispatch
+/// lock to reach its own release call.
 pub(crate) fn is_guest_sync_import(nid: &str) -> bool {
     matches!(
         nid,
@@ -1205,6 +1212,14 @@ pub(crate) fn is_guest_sync_import(nid: &str) -> bool {
             | "9lvj5DjHZiA"
             | "JTvBflhYazQ"
             | "PZku4ZrXJqg"
+            | "6ULAa0fq4jA"
+            | "BB+kb08Tl9A"
+            | "Ox9i0c7L5w0"
+            | "mqdNorrB+gI"
+            | "XD3mDeybCnk"
+            | "bIHoZCTomsI"
+            | "+L98PIbGttk"
+            | "12wOHk8ywb0"
     )
 }
 
@@ -1238,6 +1253,18 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         "SFxTMOfuCkE" => guest_rwlock_lock(arguments[0], false, true),
         "XhWHn6P5R7U" => guest_rwlock_lock(arguments[0], true, true),
         "EgmLo6EWgso" => guest_rwlock_unlock(arguments[0]),
+        // The console reader/writer lock is the POSIX object under another name, so both spellings
+        // share one implementation and one convention: the pthread errno as the reported value, no
+        // wrapper. The blocking acquires belong on this side of the dispatch lock, not in
+        // `kernel_api`, whose entry points run with that lock held.
+        "6ULAa0fq4jA" => guest_rwlock_init(arguments[0]),
+        "BB+kb08Tl9A" => guest_rwlock_destroy(arguments[0]),
+        "Ox9i0c7L5w0" => guest_rwlock_lock(arguments[0], false, false),
+        "mqdNorrB+gI" => guest_rwlock_lock(arguments[0], true, false),
+        "XD3mDeybCnk" => guest_rwlock_lock(arguments[0], false, true),
+        "bIHoZCTomsI" => guest_rwlock_lock(arguments[0], true, true),
+        "+L98PIbGttk" => guest_rwlock_unlock(arguments[0]),
+        "12wOHk8ywb0" => guest_semaphore_poll(arguments),
         "2Tb92quprl0" => guest_condition_init(arguments[0]),
         "0TyVk4MSLt0" => posix_pthread_result(guest_condition_init(arguments[0])),
         "g+PZd2hiacg" => guest_condition_destroy(arguments[0]),

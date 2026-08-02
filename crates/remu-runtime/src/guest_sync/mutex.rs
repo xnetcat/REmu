@@ -9,9 +9,10 @@ use remu_shader::GuestMemoryReader;
 use crate::{
     ProcessGuestMemory, PthreadMutexAttrState, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
     SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED,
-    SCE_KERNEL_ERROR_TRY_AGAIN, current_guest_thread_handle, current_guest_thread_name,
-    guest_calloc, guest_free, read_guest_u32, sce_kernel_error, stall_report_interval,
-    trace_guest_sync, trace_logarithmic_sequence, write_guest_u32, write_guest_u64,
+    SCE_KERNEL_ERROR_TRY_AGAIN, assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle,
+    current_guest_thread_name, guest_calloc, guest_free, read_guest_u32, sce_kernel_error,
+    stall_report_interval, trace_guest_sync, trace_logarithmic_sequence, write_guest_u32,
+    write_guest_u64,
 };
 
 use super::{
@@ -81,6 +82,7 @@ pub(crate) fn guest_pthread_once(control: u64, routine: u64) -> u64 {
             }
             IN_PROGRESS | WAIT => {
                 write_guest_u32(control, WAIT);
+                assert_wait_is_off_the_dispatch_lock("scePthreadOnce");
                 state = sync
                     .1
                     .wait(state)
@@ -258,6 +260,7 @@ pub(crate) fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
             }
             Some(_) if try_only => return u64::from(libc::EBUSY as u32),
             Some(_) => {
+                assert_wait_is_off_the_dispatch_lock("scePthreadMutexLock");
                 mutex.waiters = mutex.waiters.saturating_add(1);
                 let contention_sequence =
                     MUTEX_CONTENTION_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;

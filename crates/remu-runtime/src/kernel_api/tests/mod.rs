@@ -9,8 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::*;
 use crate::{
-    DEFAULT_THREAD_AFFINITY_MASK, DEFAULT_THREAD_PRIORITY, GuestSemaphoreState, KernelQueuedEvent,
-    PthreadAttrState, PthreadThreadObject, SaveDataMount, guest_sync,
+    DEFAULT_THREAD_AFFINITY_MASK, DEFAULT_THREAD_PRIORITY, KernelQueuedEvent, PthreadAttrState,
+    PthreadThreadObject, SaveDataMount,
 };
 
 const SUCCESS: u64 = 0;
@@ -18,7 +18,6 @@ const KERNEL_NOT_FOUND: u64 = 0xffff_ffff_8002_0002;
 const KERNEL_BAD_FILE_DESCRIPTOR: u64 = 0xffff_ffff_8002_0009;
 const KERNEL_PERMISSION_DENIED: u64 = 0xffff_ffff_8002_000d;
 const KERNEL_MEMORY_FAULT: u64 = 0xffff_ffff_8002_000e;
-const KERNEL_BUSY: u64 = 0xffff_ffff_8002_0010;
 const KERNEL_IS_DIRECTORY: u64 = 0xffff_ffff_8002_0015;
 const KERNEL_INVALID_ARGUMENT: u64 = 0xffff_ffff_8002_0016;
 const POSIX_FAILURE: u64 = u64::MAX;

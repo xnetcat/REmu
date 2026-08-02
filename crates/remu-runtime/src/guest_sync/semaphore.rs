@@ -4,10 +4,11 @@
 use std::time::{Duration, Instant};
 
 use crate::{
-    SCE_KERNEL_ERROR_INTERRUPTED, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND,
-    SCE_KERNEL_ERROR_TIMED_OUT, current_guest_thread_handle, guest_exception_is_pending, low_i32,
-    low_u32, read_guest_cstring, read_guest_u32, sce_kernel_error, trace_guest_sync,
-    trace_logarithmic_sequence, write_guest_u32,
+    SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INTERRUPTED, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+    SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TIMED_OUT, assert_wait_is_off_the_dispatch_lock,
+    current_guest_thread_handle, guest_exception_is_pending, low_i32, low_u32, read_guest_cstring,
+    read_guest_u32, sce_kernel_error, trace_guest_sync, trace_logarithmic_sequence,
+    write_guest_u32,
 };
 
 use super::{GuestSemaphoreState, guest_sync};
@@ -40,6 +41,28 @@ pub(super) fn guest_semaphore_create(arguments: [u64; 6]) -> u64 {
             read_guest_cstring(arguments[1]).unwrap_or_default()
         );
     }
+    0
+}
+
+/// Takes a count from a semaphore when one is already available, and never waits.
+pub(crate) fn guest_semaphore_poll(arguments: [u64; 6]) -> u64 {
+    let handle = low_u32(arguments[0]);
+    let needed = low_i32(arguments[1]);
+    if needed <= 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let sync = guest_sync();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(semaphore) = state.semaphores.get_mut(&handle) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    if semaphore.count < needed {
+        return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
+    }
+    semaphore.count -= needed;
     0
 }
 
@@ -92,6 +115,7 @@ pub(crate) fn guest_semaphore_wait(arguments: [u64; 6]) -> u64 {
             );
             logged_block = true;
         }
+        assert_wait_is_off_the_dispatch_lock("sceKernelWaitSema");
         if let Some(deadline) = deadline {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 write_guest_u32(timeout_pointer, 0);

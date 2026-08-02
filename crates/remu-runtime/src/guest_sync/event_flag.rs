@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use crate::{
     SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INTERRUPTED, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
     SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TIMED_OUT,
-    current_guest_thread_handle, current_guest_thread_name, guest_exception_is_pending, low_u32,
-    read_guest_cstring, read_guest_u32, sce_kernel_error, stall_report_interval, trace_guest_sync,
-    write_guest_u32, write_guest_u64,
+    assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle, current_guest_thread_name,
+    guest_exception_is_pending, low_u32, read_guest_cstring, read_guest_u32, sce_kernel_error,
+    stall_report_interval, trace_guest_sync, write_guest_u32, write_guest_u64,
 };
 
 use super::{EVENT_FLAG_SET_SEQUENCE, EVENT_FLAG_WAIT_SEQUENCE, GuestEventFlagState, guest_sync};
@@ -269,6 +269,7 @@ pub(crate) fn guest_event_flag_wait(arguments: [u64; 6]) -> u64 {
             }
             return 0;
         }
+        assert_wait_is_off_the_dispatch_lock("sceKernelWaitEventFlag");
         if let Some(deadline) = deadline {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 if arguments[3] != 0 {

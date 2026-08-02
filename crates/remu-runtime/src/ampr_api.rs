@@ -10,10 +10,10 @@ use crate::{
     AmprCompletion, AmprReadCommand, KERNEL_EVENT_FILTER_AMPR, KernelQueuedEvent, PROBE_DISPATCH,
     ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
     SCE_KERNEL_ERROR_NO_SPACE, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
-    current_guest_thread_name, guest_memset, kernel_stat_payload_from_metadata, low_u32,
-    notify_kernel_equeue_waiters, process_guest_range_has_read_access, queue_kernel_event,
-    read_guest_cstring, read_guest_u64, resolve_probe_guest_path, sce_kernel_error,
-    trace_ampr_reads, write_guest_u32, write_guest_u64,
+    current_guest_thread_name, guest_memset, kernel_stat_payload_from_metadata,
+    lock_probe_dispatch_for_write, low_u32, notify_kernel_equeue_waiters,
+    process_guest_range_has_read_access, queue_kernel_event, read_guest_cstring, read_guest_u64,
+    resolve_probe_guest_path, sce_kernel_error, trace_ampr_reads, write_guest_u32, write_guest_u64,
 };
 
 const AMPR_ORDER_LOCK_COUNT: usize = 64;
@@ -576,9 +576,7 @@ pub(crate) fn ampr_command_buffer_read_file_ordered(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dispatch = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-    let mut state = dispatch
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = lock_probe_dispatch_for_write(dispatch);
     ampr_command_buffer_record_read(arguments, stack_arguments, &mut state)
 }
 
@@ -816,9 +814,7 @@ where
         completed_reads.push((read.record_offset, bytes_read));
     }
 
-    let mut state = dispatch
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = lock_probe_dispatch_for_write(dispatch);
     for (file_id, file) in files {
         state.ampr_file_handles.entry(file_id).or_insert(file);
     }

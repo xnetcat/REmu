@@ -237,14 +237,14 @@ pub(crate) use guest_sync::{
     dispatch_guest_sync_import, guest_condition_destroy, guest_condition_init,
     guest_condition_notify, guest_condition_wait, guest_condition_wait_with_interrupt,
     guest_event_flag_wait, guest_mutex_destroy, guest_mutex_entry, guest_mutex_init,
-    guest_pthread_once, guest_semaphore_wait,
+    guest_pthread_once, guest_rwlock_destroy, guest_rwlock_init, guest_semaphore_wait,
 };
 #[cfg(any(test, target_arch = "x86_64"))]
-pub(crate) use guest_sync::{GUEST_SYNC, GuestSyncState, guest_mutex_lock, guest_mutex_unlock};
 pub(crate) use guest_sync::{
-    dispatch_guest_sync_import_at_import, guest_rwlock_destroy, guest_rwlock_init,
-    guest_rwlock_lock, guest_rwlock_unlock, guest_sync, is_guest_sync_import,
+    GUEST_SYNC, GuestSyncState, guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock,
+    guest_rwlock_unlock,
 };
+pub(crate) use guest_sync::{dispatch_guest_sync_import_at_import, guest_sync, is_guest_sync_import};
 #[cfg(test)]
 pub(crate) use memory::BATCH_MAP_OPERATION_MAP_DIRECT;
 pub(crate) use memory::{
@@ -1172,6 +1172,69 @@ const KERNEL_EVENT_FILTER_AMPR: i16 = -16;
 const KERNEL_EVENT_FILTER_VIDEO_OUT: i16 = -13;
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
+
+// Counts the `PROBE_DISPATCH` write guards this thread holds. Nothing reachable while one is alive
+// may park on a guest synchronization object: the guest thread that would release it cannot reach
+// its own release call without this same lock, so the whole process wedges. Test builds turn that
+// class into a failed assertion instead of a hang.
+#[cfg(test)]
+thread_local! {
+    static DISPATCH_WRITE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Write access to [`PROBE_DISPATCH`], recorded for the guard's lifetime in test builds.
+pub(crate) struct DispatchWriteGuard<'a>(std::sync::RwLockWriteGuard<'a, ProbeDispatchState>);
+
+impl std::ops::Deref for DispatchWriteGuard<'_> {
+    type Target = ProbeDispatchState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DispatchWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for DispatchWriteGuard<'_> {
+    fn drop(&mut self) {
+        DISPATCH_WRITE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Takes the process-wide dispatch lock for write, poisoning ignored.
+pub(crate) fn lock_probe_dispatch_for_write(
+    lock: &RwLock<ProbeDispatchState>,
+) -> DispatchWriteGuard<'_> {
+    let guard = lock
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(test)]
+    DISPATCH_WRITE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    DispatchWriteGuard(guard)
+}
+
+/// Rejects a guest-synchronization park attempted under the process-wide dispatch write lock.
+///
+/// Compiled away outside test builds; the constraint it names is structural, not diagnostic.
+#[inline]
+pub(crate) fn assert_wait_is_off_the_dispatch_lock(operation: &str) {
+    let _ = operation;
+    #[cfg(test)]
+    DISPATCH_WRITE_DEPTH.with(|depth| {
+        assert_eq!(
+            depth.get(),
+            0,
+            "{operation} would park while this thread holds the process-wide dispatch write lock, \
+             which the thread that must release it also needs"
+        );
+    });
+}
+
 /// Serializes APR/AMPR file and command-buffer operations in guest-observable order.
 ///
 /// A file read deliberately releases `PROBE_DISPATCH` while the host blocks in `pread` and while
@@ -1496,9 +1559,7 @@ fn retire_detached_guest_thread(handle: u64) {
         return;
     };
     let object = {
-        let mut state = dispatch
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock_probe_dispatch_for_write(dispatch);
         if !state.detached_threads.remove(&handle) {
             return;
         }
@@ -1519,9 +1580,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     let system_splash = load_system_splash(game_root);
     remu_gpu::install_gpu_completion_notifier(notify_kernel_equeue_waiters);
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-    let mut state = state
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = lock_probe_dispatch_for_write(state);
     let nids = image
         .import_stubs
         .iter()
@@ -2807,9 +2866,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let trace_lock_stall = trace_dispatch_stalls();
     let lock_started = trace_lock_stall.then(Instant::now);
-    let mut state = state
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = lock_probe_dispatch_for_write(state);
     if let Some(lock_started) = lock_started {
         let waited = lock_started.elapsed();
         if waited >= Duration::from_millis(2)
@@ -3420,9 +3477,7 @@ fn kernel_load_start_module(arguments: [u64; 6]) -> u64 {
         .and_then(|name| name.to_str())
         .unwrap_or(&requested_path);
     let dispatch = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-    let mut state = dispatch
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = lock_probe_dispatch_for_write(dispatch);
     let module = state.bundled_modules.iter_mut().find(|module| {
         module.name.eq_ignore_ascii_case(&requested_path)
             || Path::new(&module.name)
@@ -5429,9 +5484,7 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = {
             let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-            let mut state = state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = lock_probe_dispatch_for_write(state);
             kernel_poll_equeue(arguments, &mut state)
         };
         match result {

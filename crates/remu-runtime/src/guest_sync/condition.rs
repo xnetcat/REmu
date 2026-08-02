@@ -8,9 +8,9 @@ use std::time::Duration;
 use crate::{
     SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
     SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED, SCE_KERNEL_ERROR_TIMED_OUT, STALL_SNAPSHOT_EMITTED,
-    current_guest_thread_handle, current_guest_thread_name, guest_exception_is_pending,
-    report_kernel_event_registrations, sce_kernel_error, stall_break_enabled,
-    stall_report_interval, trace_guest_sync, trace_logarithmic_sequence,
+    assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle, current_guest_thread_name,
+    guest_exception_is_pending, report_kernel_event_registrations, sce_kernel_error,
+    stall_break_enabled, stall_report_interval, trace_guest_sync, trace_logarithmic_sequence,
 };
 
 use super::{guest_mutex_entry, guest_sync};
@@ -105,6 +105,7 @@ where
 
     // Set when a diagnostic spurious wake retires an otherwise unbounded wait.
     let mut released_spuriously = false;
+    assert_wait_is_off_the_dispatch_lock("scePthreadCondWait");
     let (timed_out, interrupted) = if let Some(timeout) = timeout_usec {
         let duration = Duration::from_micros(timeout);
         let (next_state, wait_result) = sync
@@ -251,6 +252,7 @@ where
                 0
             };
         }
+        assert_wait_is_off_the_dispatch_lock("scePthreadCondWait mutex reacquire");
         mutex.waiters = mutex.waiters.saturating_add(1);
         mutex = mutex_entry
             .wake
