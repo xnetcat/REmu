@@ -4,6 +4,7 @@
 use super::{
     GuestTextureDescriptor, Mode27WorkAggregate, Mode27WorkKey, Mode27WorkOrigin,
     PresenterStatistics, TextureDirtyWorkAggregate, TextureSnapshotWorkKey,
+    WRITEBACK_TRIGGER_COUNT,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -113,6 +114,21 @@ pub(super) static OWNED_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Demoted residents re-taken by a bind that overwrites every texel, at no copy cost.
 pub(super) static OWNED_RECLAIM_DISCARD: AtomicU64 = AtomicU64::new(0);
+
+/// Resident writebacks that reached guest memory, indexed by `WritebackTrigger`.
+pub(super) static RESIDENT_WRITEBACK_PUBLISHED: [AtomicU64; WRITEBACK_TRIGGER_COUNT] =
+    [const { AtomicU64::new(0) }; WRITEBACK_TRIGGER_COUNT];
+
+/// Resident writebacks refused admission, indexed by `WritebackTrigger`.
+///
+/// Every count is a host→guest copy REmu declined to make into a range it could not prove still
+/// belongs to the texture. The published counters above are the remaining exposure.
+pub(super) static RESIDENT_WRITEBACK_DISCARDED: [AtomicU64; WRITEBACK_TRIGGER_COUNT] =
+    [const { AtomicU64::new(0) }; WRITEBACK_TRIGGER_COUNT];
+
+pub(super) static RESIDENT_WRITEBACK_PUBLISHED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(super) static RESIDENT_WRITEBACK_DISCARDED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub(super) static SAMPLED_ALIAS_WRITEBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 

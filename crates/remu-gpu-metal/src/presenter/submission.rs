@@ -18,11 +18,8 @@ use super::{
     rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_memory_copy,
     refresh_resident_texture_write_watch, register_value,
-    retire_multisample_textures_overlapping_writeback,
-    retire_sampled_textures_matching,
-    retire_sampled_textures_overlapping_writeback, trace_resident_texture_removal,
+    retire_sampled_textures_matching, trace_resident_texture_removal,
     trace_video_target_compute_consumer, trace_video_target_draw_consumer,
-    write_resident_texture_contents_to_guest,
 };
 use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};

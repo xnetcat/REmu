@@ -16,8 +16,9 @@ use super::super::texture::{
     adopt_quarantined_resident, ensure_resident_texture_in_map,
 };
 use super::super::{
-    RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidencyState, StaleSource, TEXTURE_QUARANTINE_ADOPTED,
-    TEXTURE_QUARANTINE_REJECTED, TEXTURE_SNAPSHOT_COUNT,
+    RESIDENT_WRITE_ATTRIBUTION_MISSES, RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_PUBLISHED,
+    ResidencyState, StaleSource, TEXTURE_QUARANTINE_ADOPTED, TEXTURE_QUARANTINE_REJECTED,
+    TEXTURE_SNAPSHOT_COUNT, WritebackTrigger,
 };
 use std::sync::atomic::Ordering as AtomicOrdering;
 use super::super::WrittenRegion;
@@ -2085,7 +2086,7 @@ fn resident_pressure_plan_keeps_overlapping_gpu_versions_indivisible() {
 }
 
 #[test]
-fn resident_pressure_eviction_retiles_gpu_pixels_before_removal() {
+fn guest_observable_writeback_retiles_gpu_pixels_and_pressure_eviction_drops_them() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -2145,16 +2146,60 @@ fn resident_pressure_eviction_retiles_gpu_pixels_before_removal() {
     assert_eq!((count, bytes), (0, 0));
     assert!(presenter.resident_guest_textures.contains_key(&descriptor));
 
+    // Host memory pressure is REmu's own event, so the pixels are dropped rather than staged in
+    // a guest range no guest read named. The debt survives for a trigger that does name one.
+    let discarded_before =
+        RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
+            .load(AtomicOrdering::Relaxed);
+    let untouched = snapshot_guest_texture_raw(descriptor).expect("pre-eviction guest bytes");
     let (count, bytes) = presenter
         .garbage_collect_resident_textures_to_budget(0, 2, 8)
         .expect("completed-flip pressure pass");
     assert_eq!(count, 1);
     assert!(bytes >= rendered.len() as u64);
     assert!(!presenter.resident_guest_textures.contains_key(&descriptor));
+    assert_eq!(
+        RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
+            .load(AtomicOrdering::Relaxed),
+        discarded_before + 1
+    );
+    assert_eq!(
+        snapshot_guest_texture_raw(descriptor).expect("post-eviction guest bytes"),
+        untouched,
+        "an eviction the guest never asked for must not write guest memory"
+    );
+
+    // The same pixels, published for a trigger that names a guest read of exactly these bytes.
+    let texture = presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("rebuilt resident texture")
+        .texture;
+    texture.replace_region(
+        MTLRegion::new_2d(0, 0, 64, 64),
+        0,
+        rendered.as_ptr().cast::<c_void>(),
+        64 * 4,
+    );
+    presenter.mark_resident_texture_written_at(
+        descriptor,
+        ResourceSpan::for_texture(descriptor),
+        None,
+        WrittenRegion::whole_resource(),
+        ResidentTextureActivityStamp { work: 11, flip: 3 },
+    );
+    assert!(
+        presenter
+            .settle_resident_texture_writeback(descriptor, WritebackTrigger::DmaSource)
+            .expect("guest-observable writeback")
+    );
     let guest_raw = snapshot_guest_texture_raw(descriptor).expect("snapshotted tiled writeback");
     let guest_linear =
         decode_guest_texture_linear_from_raw(descriptor, &guest_raw).expect("detiled writeback");
     assert_eq!(guest_linear, rendered);
+    assert!(
+        !presenter.resident_guest_textures[&descriptor].gpu_written(),
+        "a published writeback settles the debt"
+    );
 }
 
 #[test]
@@ -2233,10 +2278,11 @@ fn resident_writeback_publishes_only_the_bytes_the_gpu_authored() {
         AUTHORED_BYTES as u64
     );
 
-    let (count, _) = presenter
-        .garbage_collect_resident_textures_to_budget(0, 2, 8)
-        .expect("pressure writeback");
-    assert_eq!(count, 1);
+    assert!(
+        presenter
+            .settle_resident_texture_writeback(descriptor, WritebackTrigger::FlipTarget)
+            .expect("guest-observable writeback")
+    );
 
     let published = snapshot_guest_texture_raw(descriptor).expect("published guest bytes");
     assert_eq!(
@@ -2249,6 +2295,134 @@ fn resident_writeback_publishes_only_the_bytes_the_gpu_authored() {
             && published[..AUTHORED_BYTES].iter().all(|&byte| byte == 0xa5),
         "the written region must carry the rendered pixels"
     );
+}
+
+#[test]
+fn writeback_triggers_admit_only_guest_observable_reads() {
+    for trigger in [WritebackTrigger::DmaSource, WritebackTrigger::FlipTarget] {
+        assert!(
+            trigger.publishes_to_guest(),
+            "{} names guest bytes the guest itself is about to read",
+            trigger.label()
+        );
+    }
+    for trigger in [
+        WritebackTrigger::PressureEviction,
+        WritebackTrigger::AliasRebuild,
+        WritebackTrigger::LayeredDepthAlias,
+        WritebackTrigger::SampledAlias,
+    ] {
+        assert!(
+            !trigger.publishes_to_guest(),
+            "{} is residency bookkeeping and may not stage pixels in guest memory",
+            trigger.label()
+        );
+    }
+}
+
+#[test]
+fn residency_trigger_keeps_the_debt_until_a_guest_read_asks_for_the_pixels() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+    use std::ffi::c_void;
+
+    let allocation_size = 8 * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            allocation_size,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("resident mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let guest_pattern = (0..64 * 64 * 4).map(|index| (index % 253) as u8).collect::<Vec<_>>();
+    memory
+        .write(address, &guest_pattern)
+        .expect("seed the guest allocation");
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let texture = presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("resident texture")
+        .texture;
+    let rendered = (0..64 * 64 * 4)
+        .map(|index| ((index * 17 + 3) & 0xff) as u8)
+        .collect::<Vec<_>>();
+    texture.replace_region(
+        MTLRegion::new_2d(0, 0, 64, 64),
+        0,
+        rendered.as_ptr().cast::<c_void>(),
+        64 * 4,
+    );
+    presenter.mark_resident_texture_written_at(
+        descriptor,
+        ResourceSpan::for_texture(descriptor),
+        None,
+        WrittenRegion::whole_resource(),
+        ResidentTextureActivityStamp { work: 10, flip: 1 },
+    );
+
+    let discarded_before = RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::SampledAlias.index()]
+        .load(AtomicOrdering::Relaxed);
+    let untouched = snapshot_guest_texture_raw(descriptor).expect("guest bytes before the refusal");
+    assert!(
+        !presenter
+            .settle_resident_texture_writeback(descriptor, WritebackTrigger::SampledAlias)
+            .expect("refused sampled-alias writeback")
+    );
+    assert_eq!(
+        RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::SampledAlias.index()]
+            .load(AtomicOrdering::Relaxed),
+        discarded_before + 1
+    );
+    assert_eq!(
+        snapshot_guest_texture_raw(descriptor).expect("guest bytes after the refusal"),
+        untouched,
+        "a refused writeback must leave guest memory exactly as the guest left it"
+    );
+    let resident = &presenter.resident_guest_textures[&descriptor];
+    assert!(
+        resident.gpu_written() && resident.is_live(),
+        "a refused writeback keeps the debt: those bytes still exist only in Metal"
+    );
+
+    let published_before = RESIDENT_WRITEBACK_PUBLISHED[WritebackTrigger::FlipTarget.index()]
+        .load(AtomicOrdering::Relaxed);
+    assert!(
+        presenter
+            .settle_resident_texture_writeback(descriptor, WritebackTrigger::FlipTarget)
+            .expect("guest-observable writeback")
+    );
+    assert_eq!(
+        RESIDENT_WRITEBACK_PUBLISHED[WritebackTrigger::FlipTarget.index()]
+            .load(AtomicOrdering::Relaxed),
+        published_before + 1
+    );
+    let guest_raw = snapshot_guest_texture_raw(descriptor).expect("published guest bytes");
+    let guest_linear =
+        decode_guest_texture_linear_from_raw(descriptor, &guest_raw).expect("detiled writeback");
+    assert_eq!(
+        guest_linear, rendered,
+        "the debt the refusal preserved must publish byte-exactly for a guest read"
+    );
+    assert!(!presenter.resident_guest_textures[&descriptor].gpu_written());
 }
 
 #[test]

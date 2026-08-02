@@ -121,9 +121,10 @@ use self::present::{
     run_headless_presenter,
 };
 use self::readback::{
-    capture_guest_frame, diagnostic_texture_depth_plane_summaries, guest_frame_fingerprint,
+    WRITEBACK_TRIGGER_COUNT, WRITEBACK_TRIGGERS, WritebackTrigger, capture_guest_frame,
+    diagnostic_texture_depth_plane_summaries, guest_frame_fingerprint,
     metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, read_texture_array_linear,
-    read_texture_linear, read_texture_volume_linear, write_resident_texture_contents_to_guest,
+    read_texture_linear, read_texture_volume_linear,
 };
 #[cfg(test)]
 use self::sampler::sampler_lod_bias;
@@ -159,6 +160,8 @@ use self::stats::{
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WRITE_ATTRIBUTION_MISSES,
+    RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_DISCARDED_BYTES,
+    RESIDENT_WRITEBACK_PUBLISHED, RESIDENT_WRITEBACK_PUBLISHED_BYTES,
     SAMPLED_ALIAS_WRITEBACK_BYTES,
     SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,

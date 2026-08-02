@@ -35,11 +35,9 @@ use super::{
     read_texture_linear, refresh_resident_texture_write_watch,
     resident_texture_activity_latest_work, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_lifetime_diagnostics_enabled,
-    resident_texture_ownership_stats, retire_multisample_textures_overlapping_writeback,
-    retire_sampled_textures_overlapping_writeback,
+    resident_texture_ownership_stats,
     snapshot_guest_texture_raw, take_mode27_work_details, take_texture_dirty_work_details,
     take_texture_snapshot_work_details, trace_resident_texture_removal, trace_scanout_writes,
-    write_resident_texture_contents_to_guest,
 };
 mod scanout;
 mod window;

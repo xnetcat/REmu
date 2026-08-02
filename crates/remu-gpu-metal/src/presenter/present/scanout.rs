@@ -1,17 +1,14 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::WritebackTrigger;
 use super::{
     ActiveTranslatedScanout, FlushPolicy, GuestBatchFlushReason, GuestTextureDescriptor,
-    HostSplashTexture,
-    MetalPresenter, OrderedEventSource, WriteWatchRefresh, capture_interval,
+    HostSplashTexture, MetalPresenter, OrderedEventSource, WriteWatchRefresh, capture_interval,
     completed_command_buffer_gpu_duration, decode_guest_texture_linear_from_raw,
     diagnostic_scanout_writer, diagnostic_texture_writer, raw_video_out_texture_descriptor,
-    read_texture_linear, refresh_resident_texture_write_watch,
-    retire_multisample_textures_overlapping_writeback,
-    retire_sampled_textures_overlapping_writeback,
-    snapshot_guest_texture_raw, trace_resident_texture_removal, trace_scanout_writes,
-    write_resident_texture_contents_to_guest,
+    read_texture_linear, refresh_resident_texture_write_watch, snapshot_guest_texture_raw,
+    trace_resident_texture_removal, trace_scanout_writes,
 };
 use crate::presenter::completion::command_buffer_failure_message;
 use metal::{
@@ -332,16 +329,6 @@ impl MetalPresenter {
             return Ok(());
         };
         self.wait_for_guest_command_batches()?;
-        let device = self
-            .device
-            .as_ref()
-            .ok_or("Metal device is unavailable")?
-            .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
         let resident = self
             .resident_guest_textures
             .get_mut(&descriptor)
@@ -368,27 +355,9 @@ impl MetalPresenter {
             }
             return Ok(());
         }
-        let alias_ranges = self
-            .resident_guest_textures
-            .get(&descriptor)
-            .expect("refreshed resident texture exists")
-            .write_watch
-            .alias_ranges();
-        retire_sampled_textures_overlapping_writeback(
-            &mut self.sampled_texture_cache,
-            &alias_ranges,
-        );
-        self.note_resident_writeback_published(descriptor);
-        retire_multisample_textures_overlapping_writeback(
-            &mut self.multisample_textures,
-            &alias_ranges,
-        );
-        let resident = self
-            .resident_guest_textures
-            .get_mut(&descriptor)
-            .expect("refreshed resident texture exists");
-        write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-        resident.clear_gpu_authored();
+        // The flip buffer is read out of guest memory by presentation and by anything the guest
+        // points at the same address, so this range is one the guest itself is about to observe.
+        self.settle_resident_texture_writeback(descriptor, WritebackTrigger::FlipTarget)?;
         Ok(())
     }
 

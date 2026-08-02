@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::commit_and_settle;
-use super::super::{FlushPolicy, GuestBatchFlushReason};
+use super::super::{FlushPolicy, GuestBatchFlushReason, WritebackTrigger};
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
@@ -16,13 +16,12 @@ use super::{
     guest_texture_descriptors_share_storage, initial_depth_clear_for_target,
     mode27_mip_chain_layout, promote_resident_mip_hierarchy, record_mode27_work_detail,
     refresh_resident_texture_write_watch, resident_texture_eviction_plan,
-    resident_texture_for_sample, retire_multisample_textures_overlapping_writeback,
+    resident_texture_for_sample,
     retire_overlapping_sampled_textures, retire_sampled_textures_overlapping_writeback,
     snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
     snapshot_watched_sampled_texture_raw, spans_overlap, texture_element_layout,
     trace_resident_texture_demotion, trace_resident_texture_removal, trace_residency_churn,
-    watch_guest_texture, watch_resident_texture, watch_sampled_texture,
-    write_resident_texture_contents_to_guest, written_byte_ranges,
+    watch_guest_texture, watch_resident_texture, watch_sampled_texture, written_byte_ranges,
 };
 use metal::{
     Device, MTLLoadAction, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLStoreAction,
@@ -181,16 +180,6 @@ impl MetalPresenter {
         // retain their bound textures until completion, and the single Metal queue orders the
         // following readbacks after all producer work.
         self.wait_for_guest_command_batches()?;
-        let device = self
-            .device
-            .as_ref()
-            .ok_or("Metal device is unavailable")?
-            .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
 
         let mut eviction_count = 0_usize;
         let mut eviction_bytes = 0_u64;
@@ -227,29 +216,10 @@ impl MetalPresenter {
             }
 
             if gpu_written {
-                let alias_ranges = self
-                    .resident_guest_textures
-                    .get(&descriptor)
-                    .expect("pressure candidate survived watch refresh")
-                    .write_watch
-                    .alias_ranges();
-                // A sampled alias can retain a texture view of the same allocation. Retire every
-                // overlapping interpretation before publishing the authoritative pixels to RAM,
-                // and hand this resident's authority to guest RAM for everyone it supersedes.
-                retire_sampled_textures_overlapping_writeback(
-                    &mut self.sampled_texture_cache,
-                    &alias_ranges,
-                );
-                self.note_resident_writeback_published(descriptor);
-                retire_multisample_textures_overlapping_writeback(
-                    &mut self.multisample_textures,
-                    &alias_ranges,
-                );
-                let resident = self
-                    .resident_guest_textures
-                    .get(&descriptor)
-                    .expect("pressure source survives overlapping-version retirement");
-                write_resident_texture_contents_to_guest(&device, &queue, resident)?;
+                self.settle_resident_texture_writeback(
+                    descriptor,
+                    WritebackTrigger::PressureEviction,
+                )?;
             }
 
             if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
@@ -543,9 +513,10 @@ impl MetalPresenter {
                     .get(alias)
                     .is_some_and(|resident| resident.gpu_written())
             });
-            let queue = if has_gpu_written_alias {
+            if has_gpu_written_alias && WritebackTrigger::AliasRebuild.publishes_to_guest() {
                 // The loop below downloads each GPU-written alias into guest memory; the download
-                // is ordered behind its producer only once that producer is committed.
+                // is ordered behind its producer only once that producer is committed. A rebuild
+                // that publishes nothing needs neither the drain nor the resolve invalidation.
                 self.flush_guest_command_batch(
                     FlushPolicy::Required,
                     GuestBatchFlushReason::CpuSynchronization,
@@ -553,15 +524,7 @@ impl MetalPresenter {
                 self.multisample_textures.retain(|key, _| {
                     !spans_overlap(ResourceSpan::for_texture(key.descriptor), span)
                 });
-                Some(
-                    self.command_queue
-                        .as_ref()
-                        .ok_or("Metal command queue is unavailable")?
-                        .clone(),
-                )
-            } else {
-                None
-            };
+            }
             aliases.sort_by_key(|(version, _)| *version);
             for (_, alias) in aliases {
                 let refresh = refresh_resident_texture_write_watch(
@@ -597,34 +560,10 @@ impl MetalPresenter {
                         }
                         continue;
                     }
-                    let alias_ranges = self
-                        .resident_guest_textures
-                        .get(&alias)
-                        .expect("collected GPU-written resident alias exists")
-                        .write_watch
-                        .alias_ranges();
-                    retire_sampled_textures_overlapping_writeback(
-                        &mut self.sampled_texture_cache,
-                        &alias_ranges,
-                    );
-                    self.note_resident_writeback_published(alias);
-                    retire_multisample_textures_overlapping_writeback(
-                        &mut self.multisample_textures,
-                        &alias_ranges,
-                    );
-                    let queue = queue
-                        .as_ref()
-                        .expect("GPU-written aliases acquired the command queue");
-                    let resident = self
-                        .resident_guest_textures
-                        .get_mut(&alias)
-                        .expect("collected GPU-written resident alias exists");
-                    write_resident_texture_contents_to_guest(device, queue, resident)?;
-                    // The writeback made guest RAM and the Metal allocation identical and
-                    // refreshed the watch's content baseline, so the allocation stays in place,
-                    // still the authority for its bytes and owing none of them. That is what
-                    // breaks the per-frame cycle: the next bind sees no GPU-written alias.
-                    resident.clear_gpu_authored();
+                    // A rebuild of an overlapping resource is REmu's own decision, not a guest
+                    // read of these bytes: the guest never asked for this allocation's pixels to
+                    // appear in RAM, and on hardware they were never staged there separately.
+                    self.settle_resident_texture_writeback(alias, WritebackTrigger::AliasRebuild)?;
                 }
             }
         }
@@ -1076,37 +1015,34 @@ impl MetalPresenter {
             .collect::<Vec<_>>();
         if !aliases.is_empty() {
             self.wait_for_guest_command_batches()?;
-            let queue = self
-                .command_queue
-                .as_ref()
-                .ok_or("Metal command queue is unavailable")?
-                .clone();
             for alias in aliases {
                 let refresh = refresh_resident_texture_write_watch(
                     self.resident_guest_textures
                         .get_mut(&alias)
                         .expect("collected layered-depth alias exists"),
                 )?;
-                let mut resident = self
-                    .resident_guest_textures
-                    .remove(&alias)
-                    .expect("collected layered-depth alias exists");
-                if refresh != WriteWatchRefresh::Replaced
-                    && !resident.cpu_write_obsoletes_gpu_writeback(refresh)?
-                {
-                    let alias_ranges = resident.write_watch.alias_ranges();
-                    retire_sampled_textures_overlapping_writeback(
-                        &mut self.sampled_texture_cache,
-                        &alias_ranges,
-                    );
-                    write_resident_texture_contents_to_guest(device, &queue, &resident)?;
-                } else if refresh != WriteWatchRefresh::Replaced {
-                    trace_resident_texture_removal("cpu-reused-layered-depth-alias", &resident);
-                } else {
+                let cpu_reused = refresh != WriteWatchRefresh::Replaced
+                    && self
+                        .resident_guest_textures
+                        .get_mut(&alias)
+                        .expect("refreshed layered-depth alias exists")
+                        .cpu_write_obsoletes_gpu_writeback(refresh)?;
+                if refresh != WriteWatchRefresh::Replaced && !cpu_reused {
+                    self.settle_resident_texture_writeback(
+                        alias,
+                        WritebackTrigger::LayeredDepthAlias,
+                    )?;
+                }
+                let Some(resident) = self.resident_guest_textures.remove(&alias) else {
+                    continue;
+                };
+                if refresh == WriteWatchRefresh::Replaced {
                     trace_resident_texture_removal(
                         "layered-depth-alias-mapping-replaced",
                         &resident,
                     );
+                } else if cpu_reused {
+                    trace_resident_texture_removal("cpu-reused-layered-depth-alias", &resident);
                 }
             }
         }

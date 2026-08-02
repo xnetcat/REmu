@@ -13,13 +13,11 @@ use super::{
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
-    resident_is_depth_array_face, retire_multisample_textures_overlapping_writeback,
-    retire_sampled_textures_overlapping_writeback,
+    resident_is_depth_array_face,
     sampled_alias_descriptor, texture_element_layout, trace_image_descriptors,
     trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
-    write_resident_texture_contents_to_guest,
 };
-use super::super::{FlushPolicy, GuestBatchFlushReason};
+use super::super::{FlushPolicy, GuestBatchFlushReason, WritebackTrigger};
 use metal::foreign_types::ForeignType;
 use metal::{
     Device, MTLPixelFormat, MTLRegion, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange,
@@ -179,21 +177,14 @@ impl MetalPresenter {
         // guest batch on the CPU. The following texture readbacks are encoded on the same Metal
         // queue and `PendingTextureReadback::finish` waits only for that blit, which implicitly
         // orders after the producer work already queued ahead of it. That ordering holds only if
-        // the producer really was committed, so the flush may not defer.
-        self.flush_guest_command_batch(
-            FlushPolicy::Required,
-            GuestBatchFlushReason::CpuSynchronization,
-        )?;
-        let device = self
-            .device
-            .as_ref()
-            .ok_or("Metal device is unavailable")?
-            .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
+        // the producer really was committed, so the flush may not defer. A synchronization that
+        // publishes nothing has no readback to order and skips the drain.
+        if WritebackTrigger::SampledAlias.publishes_to_guest() {
+            self.flush_guest_command_batch(
+                FlushPolicy::Required,
+                GuestBatchFlushReason::CpuSynchronization,
+            )?;
+        }
         for descriptor in aliases {
             let refresh = refresh_resident_texture_write_watch(
                 self.resident_guest_textures
@@ -226,27 +217,10 @@ impl MetalPresenter {
                 }
                 continue;
             }
-            let alias_ranges = self
-                .resident_guest_textures
-                .get(&descriptor)
-                .expect("collected sampled alias exists")
-                .write_watch
-                .alias_ranges();
-            retire_sampled_textures_overlapping_writeback(
-                &mut self.sampled_texture_cache,
-                &alias_ranges,
-            );
-            self.note_resident_writeback_published(descriptor);
-            retire_multisample_textures_overlapping_writeback(
-                &mut self.multisample_textures,
-                &alias_ranges,
-            );
-            let resident = self
-                .resident_guest_textures
-                .get_mut(&descriptor)
-                .expect("collected sampled alias exists");
-            write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-            resident.clear_gpu_authored();
+            // Reinterpreting a rendered range through a sampled SRD is a read REmu itself serves.
+            // It can bind the resident's own texels, so the guest never needs these bytes staged
+            // in RAM, and staging them is what can land pixels in a recycled heap block.
+            self.settle_resident_texture_writeback(descriptor, WritebackTrigger::SampledAlias)?;
         }
         SAMPLED_ALIAS_WRITEBACK_COUNT.fetch_add(
             u64::try_from(alias_count).unwrap_or(u64::MAX),
