@@ -1378,9 +1378,14 @@ pub(crate) fn av_player_write_video_frame_info(
         write_guest_u8(output + 64, 8);
         write_guest_u8(output + 65, 8);
         // Silent Hill consumes the PS4-compatible 104-byte Gen5 VideoFrameInfoEx prefix. Crop
-        // fields are left, right, top, bottom at +44/+48/+52/+56 respectively. With the width
-        // field carrying the displayable extent there is nothing left to crop, and the memset
-        // above already published zeros for every crop field.
+        // fields are left, right, top, bottom at +44/+48/+52/+56 respectively. Poppy's movie
+        // streamer reads width/pitch directly, while its MediaPlayer path ignores width and
+        // derives the visible extent as pitch-cropLeft-cropRight. Publish both contracts: true
+        // visible width plus a right crop that excludes storage-stride padding.
+        write_guest_u32(
+            output + 48,
+            u32::try_from(row_pitch.saturating_sub(visible_width)).unwrap_or_default(),
+        );
         // Gen5 replaces the legacy integer frame-rate field with a double in the extended tail.
         write_guest_u64(output + 0x48, frames_per_second.to_bits());
     }
