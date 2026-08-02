@@ -115,10 +115,125 @@ guest_code_dir="$run_dir/guest-code"
 msl_dir="$run_dir/msl"
 graphics_lds_ir_dir="$run_dir/graphics-lds-ir"
 scanout_msl_dir="$run_dir/scanout-msl"
+generated_overlay_dir="$run_dir/generated-overlay"
 raw_binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
 app_bundle=${REMU_APP_BUNDLE:-"$repo_dir/target/x86_64-apple-darwin/release/REMu.app"}
 launch_working_directory=${REMU_LAUNCH_WORKING_DIRECTORY:-"$repo_dir"}
 mkdir -p "$frame_dir"
+
+# Ask the guest engine to build its render graph at the selected resolution. This is deliberately
+# separate from REMU_PRESENTATION_SIZE: changing only the CAMetalLayer drawable leaves all guest
+# render targets, post-processing and synchronization traffic at the title's original resolution.
+# `native` preserves the title's request. Unreal titles read /app0/ue4commandline.txt before RHI
+# initialization, so an isolated per-run overlay can select their real back-buffer and scene size
+# without modifying the game dump. Other engines keep their native size until they receive an
+# equivalent guest-facing mode implementation.
+render_size=${REMU_RENDER_SIZE:-1920x1080}
+render_policy=native
+case "$(printf '%s' "$render_size" | tr '[:upper:]' '[:lower:]')" in
+    native)
+        ;;
+    *x*)
+        render_width=${render_size%%x*}
+        render_height=${render_size#*x}
+        case "$render_width" in
+            '' | *[!0-9]*)
+                echo "error: REMU_RENDER_SIZE must be native or WIDTHxHEIGHT, got '$render_size'" >&2
+                exit 64
+                ;;
+        esac
+        case "$render_height" in
+            '' | *[!0-9]*)
+                echo "error: REMU_RENDER_SIZE must be native or WIDTHxHEIGHT, got '$render_size'" >&2
+                exit 64
+                ;;
+        esac
+        if [ "$render_width" -eq 0 ] || [ "$render_height" -eq 0 ]; then
+            echo "error: REMU_RENDER_SIZE dimensions must be positive" >&2
+            exit 64
+        fi
+        if [ "$render_width" -gt 16384 ] || [ "$render_height" -gt 16384 ]; then
+            echo "error: REMU_RENDER_SIZE dimensions must each be in 1..=16384" >&2
+            exit 64
+        fi
+        render_size="${render_width}x${render_height}"
+        if [ -z "${REMU_PRESENTATION_SIZE:-}" ]; then
+            REMU_PRESENTATION_SIZE=$render_size
+            export REMU_PRESENTATION_SIZE
+        fi
+        # A user overlay may carry more than a command line, so never hide it behind the generated
+        # one. Users who supply REMU_OVERLAY_DIR retain complete control over UE configuration.
+        if [ -z "${REMU_OVERLAY_DIR:-}" ]; then
+            # Packaged UE executables do not necessarily retain their synthesized .uproject token.
+            # The command-line file path itself is the reliable capability marker. Resolve the
+            # project from the unique top-level Content/Paks directory, while allowing an explicit
+            # token for unusual or ambiguous package layouts.
+            ue_project=${REMU_UE_PROJECT:-}
+            ue_commandline_marker=$(strings -a "$game_path" 2>/dev/null | awk '
+                $0 == "/app0/ue4commandline.txt" {
+                    print "yes"
+                    exit
+                }')
+            if [ -z "$ue_project" ] && [ "$ue_commandline_marker" = yes ]; then
+                game_root=$(dirname -- "$game_path")
+                ue_project_count=0
+                for candidate in "$game_root"/*; do
+                    [ -d "$candidate" ] || continue
+                    candidate_has_paks=0
+                    for content_dir in "$candidate/content" "$candidate/Content"; do
+                        if [ -d "$content_dir/paks" ] || [ -d "$content_dir/Paks" ]; then
+                            candidate_has_paks=1
+                            break
+                        fi
+                    done
+                    [ "$candidate_has_paks" -eq 1 ] || continue
+                    project_name=$(basename -- "$candidate")
+                    ue_project="../../../$project_name/$project_name.uproject"
+                    ue_project_count=$((ue_project_count + 1))
+                done
+                if [ "$ue_project_count" -ne 1 ]; then
+                    ue_project=
+                    render_policy=ue4-project-ambiguous
+                fi
+            fi
+            if [ -n "$ue_project" ]; then
+                ue_project_file=${ue_project##*/}
+                ue_project_name=${ue_project_file%.uproject}
+                if [ -z "$ue_project_name" ] || [ "$ue_project_name" = "$ue_project_file" ]; then
+                    echo "error: REMU_UE_PROJECT must end in ProjectName.uproject, got '$ue_project'" >&2
+                    exit 64
+                fi
+                ue_platform_config_dir="$generated_overlay_dir/app0/$ue_project_name/platforms/ps5/config"
+                mkdir -p "$generated_overlay_dir/app0" "$ue_platform_config_dir"
+                printf '%s -ResX=%s -ResY=%s -ForceRes -ExecCmds="r.SetRes %sx%sf"\n' \
+                    "$ue_project" "$render_width" "$render_height" \
+                    "$render_width" "$render_height" \
+                    > "$generated_overlay_dir/app0/ue4commandline.txt"
+                # UE4's PS5 display object consumes platform-specific back-buffer CVars before
+                # the generic resolution command can resize it. The project/platform hierarchy is
+                # the first loose layer loaded after the packaged Engine/Platforms/PS5 defaults,
+                # so this changes the guest's real VideoOut buffer and render graph rather than
+                # scaling a completed 4K frame in the presenter.
+                printf '[SystemSettings]\nPS5.DefaultBackBufferWidth=%s\nPS5.DefaultBackBufferHeight=%s\n' \
+                    "$render_width" "$render_height" \
+                    > "$ue_platform_config_dir/ps5engine.ini"
+                REMU_OVERLAY_DIR=$generated_overlay_dir
+                export REMU_OVERLAY_DIR
+                render_policy=ue4-ps5-backbuffer
+            elif [ "$ue_commandline_marker" = yes ] && [ "$render_policy" != ue4-project-ambiguous ]; then
+                render_policy=ue4-project-missing
+            else
+                render_policy=presentation-only
+            fi
+        else
+            render_policy=user-overlay
+        fi
+        ;;
+    *)
+        echo "error: REMU_RENDER_SIZE must be native or WIDTHxHEIGHT, got '$render_size'" >&2
+        exit 64
+        ;;
+esac
 if [ "${REMU_DEEP_TRACE:-0}" = 1 ]; then
     # Keep one reproducible, self-contained view of the path from guest command construction
     # through shader translation and host presentation. These traces are intentionally opt-in:
@@ -231,6 +346,10 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 echo "[REMu] launching $game_name; artifacts: $run_dir"
+echo "[REMu] render resolution: $render_size ($render_policy)"
+if [ "$render_policy" = presentation-only ]; then
+    echo "[REMu] warning: no guest-native resolution hook was found; only presentation is ${render_size}" >&2
+fi
 if [ "${REMU_DEEP_TRACE:-0}" = 1 ]; then
     echo "[REMu] unified deep trace enabled"
 fi
@@ -324,6 +443,8 @@ unimplemented_count=$(grep -c '\[REMu\]\[IMPORT\] unimplemented' "$run_dir/guest
     echo "exit_status=$status"
     echo "captured_frames=$frame_count"
     echo "unimplemented_nids=$unimplemented_count"
+    echo "render_size=$render_size"
+    echo "render_policy=$render_policy"
 } > "$run_dir/summary.txt"
 # The runtime prints exact ABI-gap totals ([REMu][REPORT] lines) periodically and on every exit
 # path, so a run killed by a forwarded fault still leaves one. Keep only the final block: the

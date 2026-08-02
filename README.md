@@ -60,6 +60,16 @@ host drawable at logical window resolution, `native` uses Retina backing resolut
 such as `1920x1080` selects a fixed drawable size. These options scale only presentation: the guest
 keeps the display-buffer dimensions it requested.
 
+`REMU_RENDER_SIZE` selects the guest render resolution and defaults to `1920x1080`; set it to
+`native` to preserve the title's choice. For Unreal Engine titles, `run-game.sh` identifies the
+packaged project and supplies isolated per-run command-line and
+`Project/Platforms/PS5/Config/PS5Engine.ini` overlays before RHI initialization. The PS5 platform
+therefore creates its real VideoOut buffer and render graph at the selected size instead of REmu
+merely shrinking a completed frame. The host presentation size follows the render size unless
+`REMU_PRESENTATION_SIZE` is set explicitly. A caller-provided `REMU_OVERLAY_DIR` always wins, and
+`REMU_UE_PROJECT=../../../Project/Project.uproject` resolves unusual packaged-project layouts.
+Non-Unreal titles currently log `presentation-only` until their guest-facing mode path is implemented.
+
 For one self-contained rendering investigation, set `REMU_DEEP_TRACE=1`. The run directory then
 retains periodic frames, decoded AGC draw/register/program state, shader opcode coverage,
 translated MSL and graphics LDS IR, plus VM, VFS, synchronization, timing, AVPlayer gate, stale
