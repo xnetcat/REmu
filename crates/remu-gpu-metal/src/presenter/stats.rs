@@ -301,6 +301,7 @@ impl PresenterStatistics {
         Self {
             interval_started: Instant::now(),
             last_logged: Instant::now(),
+            last_flip_reconciliation: Instant::now(),
             guest_flips: 0,
             completed_presents: 0,
             submitted_guest_batches: 0,

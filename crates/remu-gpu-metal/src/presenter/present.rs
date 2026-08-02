@@ -253,20 +253,9 @@ impl MetalPresenter {
                 self.submitted_flip_sequence,
             );
         }
-        let flip_completion = self
-            .pending_flip
-            .filter(|flip| {
-                flip.sequence == self.finalized_flip_sequence
-                    && flip.sequence > self.submitted_flip_sequence
-            })
-            .map(|flip| {
-                self.submitted_flip_sequence = flip.sequence;
-                remu_gpu::GpuFlipCompletion {
-                    address: flip.address,
-                    buffer_index: flip.buffer_index,
-                    flip_argument: flip.flip_argument,
-                }
-            });
+        // Presentation is where a finalized flip becomes guest-visible; an unfinalized flip has no
+        // snapshot in this drawable and stays pending.
+        let flip_completion = self.complete_flip(self.finalized_flip_sequence);
         self.pending_presentations.push_back(PendingPresentation {
             command_buffer,
             submitted_at: Instant::now(),

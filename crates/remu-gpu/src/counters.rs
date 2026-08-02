@@ -137,6 +137,22 @@ pub(crate) fn cancel_pending_gpu_flips(count: usize) {
     });
 }
 
+/// Lowers the accepted-flip counter to a backend's own count of outstanding flips.
+///
+/// The counter gates guest flip pacing and is otherwise only decremented by presentation, so a flip
+/// the backend can never present would stall the guest permanently. Reconciliation is the recovery
+/// path. It only ever lowers the counter: raising it could mask a flip still travelling through the
+/// channel, which the backend has not counted yet.
+///
+/// Returns the previous value when it differed from `outstanding`.
+pub fn reconcile_gpu_flips_pending(outstanding: usize) -> Option<usize> {
+    GPU_FLIPS_PENDING
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            (value > outstanding).then_some(outstanding)
+        })
+        .ok()
+}
+
 /// Adds one host audio callback's output and underrun frame counts.
 pub fn report_audio_frames(output_frames: u64, underrun_frames: u64) {
     AUDIO_OUTPUT_FRAMES.fetch_add(output_frames, Ordering::Relaxed);

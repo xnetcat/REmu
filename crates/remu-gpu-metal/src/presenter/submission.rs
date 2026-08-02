@@ -181,6 +181,14 @@ impl MetalPresenter {
                         pixel_format,
                         tiling_mode,
                     });
+                    // A flip the guest replaces before presentation is never shown, but it was
+                    // counted against flip pacing on acceptance and the guest still holds it in its
+                    // own pending queue. Retiring it here is the only decrement it can ever get.
+                    if let Some(superseded) = self.pending_flip
+                        && let Some(completion) = self.complete_flip(superseded.sequence)
+                    {
+                        remu_gpu::record_gpu_flip_completed(completion);
+                    }
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
                     self.pending_flip = Some(PendingFlip {
                         address,

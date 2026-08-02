@@ -5,8 +5,11 @@ use metal::{
     MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLStorageMode, MTLStoreAction, MTLTextureType,
     MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
 };
-use remu_gpu::{GpuColorTarget, GpuEvent, GpuHostImage, GpuScanoutTarget, gpu_event_channel};
+use remu_gpu::{
+    GpuColorTarget, GpuEvent, GpuFlipCompletion, GpuHostImage, GpuScanoutTarget, gpu_event_channel,
+};
 use remu_shader::PixelOutputKind;
+use std::time::{Duration, Instant};
 
 use super::{
     DecodedRenderTarget, DisplayConfiguration, GuestTextureDescriptor, MetalPresenter,
@@ -293,7 +296,7 @@ fn pending_flip_without_a_source_retries_at_the_submission_boundary() {
 }
 
 #[test]
-fn alternate_registered_video_out_buffer_triggers_scanout_without_a_flip() {
+fn a_write_to_the_other_registered_buffer_waits_for_its_own_flip() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
     let device = presenter.device.as_ref().expect("Metal device").clone();
@@ -329,16 +332,176 @@ fn alternate_registered_video_out_buffer_triggers_scanout_without_a_flip() {
     presenter.ensure_direct_scanout_texture(&device, back);
     presenter.mark_direct_scanout_initialized(back.address);
 
+    // The guest composites the next frame into the buffer it has not flipped yet.
     presenter.note_pending_flip_target_write(back);
     assert!(presenter.pending_flip_target_written_since_boundary);
     assert_eq!(presenter.pending_scanout_write_address, Some(back.address));
 
+    presenter.redraw_pending = false;
     presenter.finalize_pending_flip_at_submission_boundary(OrderedEventSource::GuestQueue(7));
-    assert!(presenter.redraw_pending);
+    assert!(
+        !presenter.redraw_pending,
+        "a write to the buffer the guest has not flipped must not present a second frame"
+    );
+    assert!(presenter.active_translated_scanout.is_none());
+    assert_eq!(presenter.uploaded_flip_sequence, 1);
     assert_eq!(
-        presenter.active_translated_scanout.map(|scanout| scanout.address),
+        presenter.pending_scanout_write_address,
+        Some(back.address),
+        "the recorded write stays available to the flip that claims it"
+    );
+
+    // The flip for that buffer is what publishes it.
+    presenter.pending_flip = Some(PendingFlip {
+        address: back.address,
+        buffer_index: 1,
+        flip_argument: 0,
+        sequence: 2,
+    });
+    presenter.next_flip_sequence = 2;
+    presenter.pending_scanout_write_address = None;
+    presenter.finalize_pending_flip();
+    assert!(presenter.redraw_pending);
+    assert_eq!(presenter.uploaded_flip_sequence, 2);
+    assert_eq!(
+        presenter
+            .active_translated_scanout
+            .map(|scanout| scanout.address),
         Some(back.address)
     );
+}
+
+#[test]
+fn a_flip_without_a_presentable_surface_still_completes() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    presenter.display = Some(DisplayConfiguration {
+        width: 640,
+        height: 360,
+        pitch: 640,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 0,
+    });
+    presenter.pending_flip = Some(PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 1,
+        flip_argument: 0x42,
+        sequence: 1,
+    });
+    presenter.next_flip_sequence = 1;
+    assert!(
+        presenter.layer.is_none(),
+        "this presenter stands in for a headless or occluded run"
+    );
+
+    presenter.finalize_pending_flip();
+    assert_eq!(presenter.submitted_flip_sequence, 1);
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips(),
+        [GpuFlipCompletion {
+            address: 0xefc0_0000_00,
+            buffer_index: 1,
+            flip_argument: 0x42,
+        }]
+    );
+
+    presenter.finalize_pending_flip();
+    assert!(
+        remu_gpu::take_gpu_completed_flips().is_empty(),
+        "a flip is retired exactly once"
+    );
+}
+
+#[test]
+fn a_superseded_flip_is_completed_when_the_next_flip_replaces_it() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    // A flip the presenter accepted but could never present: no drawable was available for it.
+    presenter.display = Some(DisplayConfiguration {
+        width: 640,
+        height: 360,
+        pitch: 640,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 0,
+    });
+    presenter.pending_flip = Some(PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0x11,
+        sequence: 1,
+    });
+    presenter.next_flip_sequence = 1;
+    presenter.finalized_flip_sequence = 1;
+    presenter.uploaded_flip_sequence = 1;
+
+    sender
+        .send(GpuEvent::Flip {
+            address: 0xefc2_0000_00,
+            buffer_index: 1,
+            flip_argument: 0x22,
+            width: 640,
+            height: 360,
+            pitch: 640,
+            pixel_format: 0x8000_0000_0000_0000,
+            tiling_mode: 0,
+        })
+        .expect("flip event reaches presenter");
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+
+    assert_eq!(presenter.submitted_flip_sequence, 2);
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips(),
+        [
+            GpuFlipCompletion {
+                address: 0xefc0_0000_00,
+                buffer_index: 0,
+                flip_argument: 0x11,
+            },
+            GpuFlipCompletion {
+                address: 0xefc2_0000_00,
+                buffer_index: 1,
+                flip_argument: 0x22,
+            }
+        ],
+        "the replaced flip is retired before the flip that replaced it"
+    );
+}
+
+#[test]
+fn leaked_flip_pacing_is_reconciled_against_the_presenter_sequences() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    remu_gpu::install_event_sink(sender);
+    // A flip counted against guest pacing which this presenter never sequences is the permanent
+    // backpressure reconciliation exists to clear.
+    assert!(remu_gpu::emit_event(GpuEvent::Flip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0,
+        width: 640,
+        height: 360,
+        pitch: 640,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 0,
+    }));
+    remu_gpu::record_gpu_work_item_processed();
+    assert_eq!(remu_gpu::gpu_flips_pending(), 1);
+
+    presenter.reconcile_pending_flips();
+    assert_eq!(
+        remu_gpu::gpu_flips_pending(),
+        1,
+        "reconciliation runs at most once per second"
+    );
+
+    presenter.statistics.last_flip_reconciliation = Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .expect("the monotonic clock predates this test");
+    presenter.reconcile_pending_flips();
+    assert_eq!(remu_gpu::gpu_flips_pending(), 0);
+    remu_gpu::clear_event_sink();
 }
 
 #[test]
