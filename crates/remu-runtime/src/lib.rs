@@ -8413,6 +8413,12 @@ fn probe_entry(
     if recovered != 0 {
         eprintln!("[REMu][CPU] recovered {recovered} SHA-NI instructions via SIGILL emulation");
     }
+    let recovered_sse4a = sha_ni::recovered_sse4a_count();
+    if recovered_sse4a != 0 {
+        eprintln!(
+            "[REMu][CPU] recovered {recovered_sse4a} SSE4a instructions via SIGILL emulation"
+        );
+    }
     DIAGNOSTIC_TIMEOUT_CANCELLED.store(true, Ordering::Release);
     DIAGNOSTIC_TIMEOUT_SECONDS.store(0, Ordering::Release);
     remu_gpu::set_progress_telemetry_enabled(false);

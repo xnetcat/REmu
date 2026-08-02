@@ -85,8 +85,176 @@ extern "C" fn sha_ni_sigill_handler(
         RECOVERED.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    if try_recover_sse4a(context) {
+        RECOVERED_SSE4A.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     report_unrecovered_sigill(information, context);
     unsafe { chain_previous_sigill(signal, information, context) };
+}
+
+/// Number of SSE4a instructions recovered by the SIGILL handler.
+static RECOVERED_SSE4A: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn recovered_sse4a_count() -> u64 {
+    RECOVERED_SSE4A.load(Ordering::Relaxed)
+}
+
+/// Emulates AMD SSE4a EXTRQ/INSERTQ, which Prospero's Zen 2 executes natively and Rosetta
+/// refuses with SIGILL. Poppy Playtime executes `INSERTQ xmm0, xmm1, 0x20, 0x10` at a fixed pc
+/// (0x8035f86f0) on a recurring path, which previously killed roughly a third of all runs.
+///
+/// Register forms only: EXTRQ/INSERTQ have no memory operands, so a register-direct ModRM is a
+/// structural property of the instruction, not an implementation shortcut.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn try_recover_sse4a(context: *mut std::ffi::c_void) -> bool {
+    if context.is_null() {
+        return false;
+    }
+    // SAFETY: SA_SIGINFO delivers a live ucontext_t for the duration of the handler.
+    let ucontext = unsafe { &mut *context.cast::<libc::ucontext_t>() };
+    if ucontext.uc_mcontext.is_null() {
+        return false;
+    }
+    // SAFETY: uc_mcontext points at the faulting thread's Darwin mcontext for this signal.
+    let mcontext = unsafe { &mut *ucontext.uc_mcontext };
+    let rip = mcontext.__ss.__rip;
+    if rip == 0 {
+        return false;
+    }
+    // SAFETY: guest code is mapped into the process address space; RIP points at the faulting
+    // instruction, and the longest accepted encoding is prefix + REX + 0F 78 modrm ib ib.
+    let bytes = unsafe { std::slice::from_raw_parts(rip as *const u8, 8) };
+    let mut cursor = 0;
+    let mut has_66 = false;
+    let mut has_f2 = false;
+    let mut rex = 0_u8;
+    while cursor < 3 {
+        match bytes[cursor] {
+            0x66 => has_66 = true,
+            0xf2 => has_f2 = true,
+            byte @ 0x40..=0x4f => rex = byte,
+            _ => break,
+        }
+        cursor += 1;
+    }
+    if bytes[cursor] != 0x0f || has_66 == has_f2 {
+        return false;
+    }
+    let opcode = bytes[cursor + 1];
+    let modrm = bytes[cursor + 2];
+    if !matches!(opcode, 0x78 | 0x79) || modrm >> 6 != 0b11 {
+        return false;
+    }
+    let reg = (modrm >> 3) & 7 | ((rex >> 2) & 1) << 3;
+    let rm = modrm & 7 | (rex & 1) << 3;
+    let mut length = u64::from(cursor as u8) + 3;
+    let applied = match (has_66, opcode) {
+        (true, 0x78) => {
+            // EXTRQ xmm(rm), imm-length, imm-index; /0 is part of the encoding.
+            if (modrm >> 3) & 7 != 0 {
+                return false;
+            }
+            length += 2;
+            let mut value = read_xmm_u64(mcontext, rm);
+            value[0] = sse4a_extract(value[0], bytes[cursor + 3], bytes[cursor + 4]);
+            write_xmm_u64(mcontext, rm, value);
+            true
+        }
+        (true, 0x79) => {
+            // EXTRQ xmm(reg), xmm(rm): length in rm[5:0], index in rm[13:8].
+            let descriptor = read_xmm_u64(mcontext, rm)[0];
+            let mut value = read_xmm_u64(mcontext, reg);
+            value[0] = sse4a_extract(value[0], descriptor as u8, (descriptor >> 8) as u8);
+            write_xmm_u64(mcontext, reg, value);
+            true
+        }
+        (false, 0x78) => {
+            // INSERTQ xmm(reg), xmm(rm), imm-length, imm-index.
+            length += 2;
+            let source = read_xmm_u64(mcontext, rm)[0];
+            let mut value = read_xmm_u64(mcontext, reg);
+            value[0] = sse4a_insert(value[0], source, bytes[cursor + 3], bytes[cursor + 4]);
+            write_xmm_u64(mcontext, reg, value);
+            true
+        }
+        (false, 0x79) => {
+            // INSERTQ xmm(reg), xmm(rm): field in rm[63:0], length in rm[69:64], index in
+            // rm[77:72].
+            let source = read_xmm_u64(mcontext, rm);
+            let mut value = read_xmm_u64(mcontext, reg);
+            value[0] = sse4a_insert(
+                value[0],
+                source[0],
+                source[1] as u8,
+                (source[1] >> 8) as u8,
+            );
+            write_xmm_u64(mcontext, reg, value);
+            true
+        }
+        _ => false,
+    };
+    if !applied {
+        return false;
+    }
+    mcontext.__ss.__rip = rip.wrapping_add(length);
+    true
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn try_recover_sse4a(_context: *mut std::ffi::c_void) -> bool {
+    false
+}
+
+/// A six-bit SSE4a field descriptor where zero selects the full 64 bits.
+fn sse4a_field(length: u8, index: u8) -> (u32, u32, u64) {
+    let bits = match u32::from(length & 0x3f) {
+        0 => 64,
+        bits => bits,
+    };
+    let index = u32::from(index & 0x3f);
+    let mask = if bits == 64 { u64::MAX } else { (1 << bits) - 1 };
+    (bits, index, mask)
+}
+
+/// EXTRQ: the selected field, shifted down and zero-extended. AMD hardware shifts zeros in for
+/// out-of-range selections, which the wrapping arithmetic reproduces.
+fn sse4a_extract(value: u64, length: u8, index: u8) -> u64 {
+    let (_, index, mask) = sse4a_field(length, index);
+    value.checked_shr(index).unwrap_or(0) & mask
+}
+
+/// INSERTQ: the source field replaces the destination bits at the selected position; bits
+/// outside the field keep their destination values, which is what AMD hardware preserves and
+/// what field-packing loops rely on.
+fn sse4a_insert(destination: u64, source: u64, length: u8, index: u8) -> u64 {
+    let (_, index, mask) = sse4a_field(length, index);
+    let positioned_mask = mask.checked_shl(index).unwrap_or(0);
+    let field = (source & mask).checked_shl(index).unwrap_or(0);
+    (destination & !positioned_mask) | field
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn read_xmm_u64(mcontext: &libc::__darwin_mcontext64, index: u8) -> [u64; 2] {
+    let words = read_xmm(mcontext, index);
+    [
+        u64::from(words[0]) | u64::from(words[1]) << 32,
+        u64::from(words[2]) | u64::from(words[3]) << 32,
+    ]
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn write_xmm_u64(mcontext: &mut libc::__darwin_mcontext64, index: u8, value: [u64; 2]) {
+    write_xmm(
+        mcontext,
+        index,
+        [
+            value[0] as u32,
+            (value[0] >> 32) as u32,
+            value[1] as u32,
+            (value[1] >> 32) as u32,
+        ],
+    );
 }
 
 /// A SIGILL nobody recovers is a crash that previously died with no pc, no registers and no
@@ -655,5 +823,38 @@ mod tests {
         let before = dst;
         sha1_rnds4(&mut dst, [1, 2, 3, 4], 0);
         assert_ne!(dst, before);
+    }
+
+    #[test]
+    fn extrq_extracts_and_zero_extends_the_selected_field() {
+        assert_eq!(
+            super::sse4a_extract(0xAABB_CCDD_1122_3344, 0x20, 0x10),
+            0xCCDD_1122
+        );
+        // Length zero selects the full 64 bits.
+        assert_eq!(
+            super::sse4a_extract(0xAABB_CCDD_1122_3344, 0, 0),
+            0xAABB_CCDD_1122_3344
+        );
+        // Out-of-range selections shift in zeros, as hardware does.
+        assert_eq!(super::sse4a_extract(u64::MAX, 0x20, 0x30), 0xFFFF);
+    }
+
+    #[test]
+    fn insertq_replaces_the_field_and_preserves_the_rest() {
+        // The exact form Poppy Playtime executes at 0x8035f86f0: 32 bits at bit 16.
+        assert_eq!(
+            super::sse4a_insert(0xFFFF_FFFF_FFFF_FFFF, 0xDEAD_BEEF, 0x20, 0x10),
+            0xFFFF_DEAD_BEEF_FFFF
+        );
+        assert_eq!(
+            super::sse4a_insert(0x1111_2222_3333_4444, 0xAB, 0x8, 0x0),
+            0x1111_2222_3333_44AB
+        );
+        // Length zero replaces the whole low quadword.
+        assert_eq!(
+            super::sse4a_insert(u64::MAX, 0x1234, 0, 0),
+            0x1234
+        );
     }
 }

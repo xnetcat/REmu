@@ -357,13 +357,123 @@ pub fn dump_guest_write_journal(fault_address: u64, anchors: &[u64]) {
             emit_entry(b"recent", &entry, None, &mut buffer);
         }
     }
+
+    // Inventory of every uniform fill the emulator applied, newest first. A poison crash whose
+    // victim holds 0x40s while this inventory is empty proves the fill came from guest stores the
+    // journal cannot see, which redirects the whole investigation.
+    let mut forty_fills = 0_u64;
+    let mut bulk_zero_fills = 0_u64;
+    for sequence in (live_from..recorded).rev() {
+        let Some(entry) = read_slot(sequence) else {
+            continue;
+        };
+        let uniform = entry.uniform & !SAMPLED_PAYLOAD;
+        if uniform == 0x40 {
+            forty_fills += 1;
+            if forty_fills <= 96 {
+                emit_entry(b"fill-0x40", &entry, None, &mut buffer);
+            }
+        } else if uniform == 0x00 && entry.byte_count >= 0x1000 {
+            bulk_zero_fills += 1;
+            if bulk_zero_fills <= 32 {
+                emit_entry(b"fill-zero", &entry, None, &mut buffer);
+            }
+        }
+    }
+
     buffer.clear();
     buffer.push_bytes(b"[REMu][JOURNAL] end covering=");
     buffer.push_signed(covering.try_into().unwrap_or(i64::MAX));
     buffer.push_bytes(b" matched=");
     buffer.push_signed(matched.try_into().unwrap_or(i64::MAX));
+    buffer.push_bytes(b" fill40=");
+    buffer.push_signed(forty_fills.try_into().unwrap_or(i64::MAX));
+    buffer.push_bytes(b" fillzero=");
+    buffer.push_signed(bulk_zero_fills.try_into().unwrap_or(i64::MAX));
     buffer.push_bytes(b"\n");
     write_diagnostic(&buffer);
+
+    // Last because a nested fault while probing guest bytes would truncate everything after it:
+    // the raw neighbourhood of each plausible victim pointer. The shape of the damage — an
+    // unbroken fill, PM4-packet-like structure, or one isolated dword — separates writers no
+    // journal entry can.
+    dump_anchor_neighbourhoods(fault_address, anchors, &mut buffer);
+}
+
+/// Hex-dumps the bytes around each guest-plausible anchor and the fault address, clamped to each
+/// anchor's own 4 KiB page.
+///
+/// Readability is proven with `write(devnull, window, len)` before any load: the kernel reports
+/// EFAULT for an unreadable window instead of faulting the handler, and both `open` and `write`
+/// are async-signal-safe. This matters because the interesting anchors are frequently garbage —
+/// the poison pointer itself sits in a register, and a BUS_ADRERR fault address is mapped but
+/// unreadable.
+#[cfg(unix)]
+fn dump_anchor_neighbourhoods(fault_address: u64, anchors: &[u64], buffer: &mut DiagnosticBuffer) {
+    const HALF_WINDOW: u64 = 64;
+    // SAFETY: open is async-signal-safe; the descriptor is closed before returning.
+    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+    if devnull < 0 {
+        return;
+    }
+    let mut printed = [0_u64; 33];
+    let mut printed_count = 0;
+    for &anchor in anchors.iter().chain(std::iter::once(&fault_address)) {
+        if anchor < ANCHOR_FLOOR {
+            continue;
+        }
+        let page = anchor & !0xfff;
+        if printed[..printed_count].contains(&page) {
+            continue;
+        }
+        if printed_count == printed.len() {
+            break;
+        }
+        printed[printed_count] = page;
+        printed_count += 1;
+        let start = anchor.saturating_sub(HALF_WINDOW).max(page);
+        let end = anchor
+            .saturating_add(HALF_WINDOW)
+            .min(page.saturating_add(0x1000));
+        let length = (end - start) as usize;
+        // SAFETY: writing the window to /dev/null only requires the kernel to read it; an
+        // unreadable window returns EFAULT rather than raising a nested fault.
+        let probed = unsafe {
+            libc::write(devnull, start as *const std::ffi::c_void, length)
+        };
+        buffer.clear();
+        buffer.push_bytes(b"[REMu][JOURNAL] bytes at ");
+        buffer.push_hexadecimal(start);
+        buffer.push_bytes(b" around ");
+        buffer.push_hexadecimal(anchor);
+        if probed != length as isize {
+            buffer.push_bytes(b": unreadable\n");
+            write_diagnostic(buffer);
+            continue;
+        }
+        buffer.push_bytes(b": ");
+        for offset in start..end {
+            // SAFETY: the kernel just read this exact window through the probe write.
+            let byte = unsafe { std::ptr::read_volatile(offset as *const u8) };
+            let digits = b"0123456789abcdef";
+            buffer.push_bytes(&[
+                digits[(byte >> 4) as usize],
+                digits[(byte & 0xf) as usize],
+            ]);
+        }
+        buffer.push_bytes(b"\n");
+        write_diagnostic(buffer);
+    }
+    // SAFETY: close is async-signal-safe and the descriptor came from the open above.
+    unsafe { libc::close(devnull) };
+}
+
+#[cfg(not(unix))]
+fn dump_anchor_neighbourhoods(
+    _fault_address: u64,
+    _anchors: &[u64],
+    _buffer: &mut DiagnosticBuffer,
+) {
 }
 
 /// Reports a signal no recovery claimed, from signal context, then dumps the journal.
