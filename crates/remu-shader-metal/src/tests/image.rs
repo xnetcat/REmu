@@ -59,6 +59,95 @@ fn sampled_images_apply_dynamic_descriptor_component_selection_in_the_shader() {
 }
 
 #[test]
+fn a8_font_atlas_select_reads_word_three_of_its_own_descriptor_window() {
+    // Poppy Playtime's Slate/UMG font atlas: 1024x1024 R8Unorm data whose T# routes red into
+    // ALPHA and zeroes RGB (`destination_select = 0x800`, the PF_A8 pattern). Every other traced
+    // Poppy image carries the native 0x204. If this select is lost the shader falls back to the
+    // 0xFAC identity, an R8 texture samples as (r, 0, 0, 1), alpha is 1.0 across the quad, and
+    // each glyph renders as a solid opaque block. Pin the two things that carry it: the select is
+    // read from word three of the descriptor's *own* SGPR window, and the per-channel routing
+    // stays dynamic so one MSL function serves every atlas.
+    let control = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0, 1],
+        vector_data: 4,
+        // Deliberately not zero: the emitted register index must follow the binding, not s3.
+        scalar_resource: 12,
+        scalar_sampler: 8,
+        dimension: 1,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSample"),
+        words: vec![0, 0],
+        sources: vec![Operand::vector(0), Operand::vector(1), Operand::scalar(12)],
+        destinations: (4..8).map(Operand::vector).collect(),
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let mut evaluation = empty_evaluation();
+    // The live descriptor captured from the guest, verbatim.
+    let resource_descriptor = vec![
+        0x912f_2a00,
+        0xc010_0000,
+        0x00ff_c0ff,
+        0x9090_0800,
+        0,
+        0x0070_0000,
+        0,
+        0,
+    ];
+    evaluation.initial_scalar_registers[15] = resource_descriptor[3];
+    evaluation.scalar_registers[15] = resource_descriptor[3];
+    evaluation.image_bindings.push(ImageBinding {
+        pc: 0,
+        opcode: Opcode::Known("ImageSample"),
+        control,
+        resource_descriptor: resource_descriptor.into(),
+        sampler_descriptor: vec![0; 4].into(),
+        mip_level: None,
+    });
+
+    let shader = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("A8 font atlas swizzle should lower");
+
+    // `scalar_resource + 3`, seeded from the host's per-draw scalar metadata buffer.
+    assert!(
+        shader
+            .source
+            .contains("uint remu_s_15 = remu_initial_s[15];"),
+        "descriptor word three must be seeded from the scalar metadata buffer"
+    );
+    assert!(shader.source.contains("remu_s_15 & 0xFFFu"));
+    assert!(shader.source.contains("== 0u ? 0xFACu"));
+    // 0x800 decodes to X=0, Y=0, Z=0, W=R, so all four lanes must be extracted from the same
+    // word and the alpha lane must be able to reach a texel component.
+    for shift in [0_u32, 3, 6, 9] {
+        assert!(
+            shader.source.contains(&format!(">> {shift}u) & 7u")),
+            "missing destination-select lane at shift {shift}"
+        );
+        assert!(
+            shader.source.contains(&format!(">> {shift}u) & 7u) - 4u")),
+            "destination-select lane at shift {shift} cannot select a texel component"
+        );
+    }
+    // The swizzle must stay dynamic: baking 0x800 in would recompile per atlas descriptor.
+    assert!(!shader.source.contains("0x800"));
+}
+
+#[test]
 fn zero_lod_gather_returns_four_neighbor_values_from_the_selected_component() {
     let control = ImageControl {
         dmask: 4,

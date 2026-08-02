@@ -53,7 +53,8 @@ use super::{
     render_target_fast_clear_color, resident_color_view_sample_is_eligible,
     resident_depth_sample_is_eligible, sampled_image_bindings,
     shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
-    snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy, trace_image_descriptors,
+    snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy, trace_glyph_atlas,
+    trace_image_descriptors,
     trace_msaa_writes, trace_scanout_writes, trace_target_sampling, upload_image_textures,
     validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
 };
@@ -1027,6 +1028,43 @@ impl MetalPresenter {
             0x00c,
             0,
         )?;
+        // `crates/remu-shader-metal/src/compiler/image.rs` applies the T# destination select in
+        // the shader, reading it out of `remu_initial_s[scalar_resource + 3]`. This metadata is
+        // therefore the only carrier between the descriptor the host decoded and the swizzle the
+        // pixel shader applies. Poppy Playtime's Slate font atlas is the one traced binding whose
+        // select is not the native identity (0x800 = X0 Y0 Z0 W=R); if that word ever reaches the
+        // shader as zero the 0xFAC identity fallback fires, the R8 atlas samples as (r, 0, 0, 1),
+        // and every glyph quad becomes a solid opaque block. Report both sides so a tofu run says
+        // which one is wrong. A descriptor the guest materializes with SMEM loads legitimately
+        // differs here: the translated shader replays those loads before the sample.
+        if trace_glyph_atlas() {
+            for binding in &pixel_evaluation.image_bindings {
+                let Some(&descriptor_word) = binding.resource_descriptor.get(3) else {
+                    continue;
+                };
+                let select = descriptor_word & 0xfff;
+                if matches!(select, 0 | 0x204 | 0xfac) {
+                    continue;
+                }
+                let seeded = usize::try_from(binding.control.scalar_resource)
+                    .ok()
+                    .and_then(|scalar| scalar.checked_add(3))
+                    .and_then(|scalar| pixel_scalar_metadata.get(scalar).copied());
+                static LOGGED: OnceLock<Mutex<HashSet<(u32, u32)>>> = OnceLock::new();
+                let mut logged = LOGGED
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if logged.len() < 64 && logged.insert((binding.pc, descriptor_word)) {
+                    eprintln!(
+                        "[REMu][METAL][GLYPH-SELECT] pc={:#x} scalar_resource={} descriptor_word3={descriptor_word:#010x} descriptor_select={select:#x} seeded_word3={seeded:#010x?} seeded_select={:#x?}",
+                        binding.pc,
+                        binding.control.scalar_resource,
+                        seeded.map(|word| word & 0xfff),
+                    );
+                }
+            }
+        }
         let diagnostic_capture_enabled = if diagnostic_dump_video_target_consumer() {
             static VIDEO_CAPTURE_MATCHES: AtomicUsize = AtomicUsize::new(0);
             let is_target_candidate = draw.sequence >= diagnostic_dump_target_minimum_draw()
