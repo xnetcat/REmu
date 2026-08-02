@@ -450,13 +450,17 @@ fn dump_anchor_neighbourhoods(fault_address: u64, anchors: &[u64], buffer: &mut 
             continue;
         }
         let page = anchor & !0xfff;
-        if printed[..printed_count].contains(&page) {
+        // Deduplicate by window, not by page: the fault registers routinely hold both a table
+        // base and the victim slot inside it, and dropping the second window because it shares
+        // the first one's page discarded exactly the bytes the dump exists to show.
+        let window = anchor & !(HALF_WINDOW - 1);
+        if printed[..printed_count].contains(&window) {
             continue;
         }
         if printed_count == printed.len() {
             break;
         }
-        printed[printed_count] = page;
+        printed[printed_count] = window;
         printed_count += 1;
         let start = anchor.saturating_sub(HALF_WINDOW).max(page);
         let end = anchor
