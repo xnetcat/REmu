@@ -10,14 +10,13 @@ use remu_shader::GuestMemoryReader;
 use crate::{
     AMPR_COMMAND_ORDER, AMPR_READ_STAGING_POOL, AmprAddressWrite, AmprCommandBufferState,
     AmprCompletion, AmprReadCommand, KERNEL_EVENT_FILTER_AMPR, KernelQueuedEvent, PROBE_DISPATCH,
-    ProcessGuestMemory,
-    ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
-    SCE_KERNEL_ERROR_NO_SPACE, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
-    current_guest_thread_name, guest_memset, kernel_stat_payload_from_metadata,
-    lock_probe_dispatch_for_write, low_u32, notify_kernel_equeue_waiters,
-    process_guest_range_has_read_access, queue_kernel_event, read_guest_u64,
-    resolve_probe_guest_path, sce_kernel_error, trace_ampr_reads, try_read_process_guest_u64,
-    write_guest_u32, write_guest_u64,
+    ProbeDispatchState, ProcessGuestMemory, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+    SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NO_SPACE, SCE_KERNEL_ERROR_NOT_FOUND,
+    SCE_KERNEL_ERROR_OUT_OF_MEMORY, current_guest_thread_name, guest_memset,
+    kernel_stat_payload_from_metadata, lock_probe_dispatch_for_write, low_u32,
+    notify_kernel_equeue_waiters, process_guest_range_has_read_access, queue_kernel_event,
+    read_guest_u64, resolve_probe_guest_path, sce_kernel_error, trace_ampr_reads,
+    try_read_process_guest_u64, write_guest_u32, write_guest_u64,
 };
 
 const AMPR_ORDER_LOCK_COUNT: usize = 64;
@@ -524,22 +523,166 @@ fn apr_output_has_write_access(
 
 /// Reads one APR path without dereferencing an untrusted guest pointer.
 pub(crate) fn ampr_read_guest_path(address: u64) -> Option<String> {
+    ampr_read_guest_path_with(&ProcessGuestMemory, address)
+}
+
+fn ampr_read_guest_path_with(memory: &impl GuestMemoryReader, address: u64) -> Option<String> {
     if address == 0 {
         return None;
     }
+    const READ_CHUNK_BYTES: usize = 256;
     let mut bytes = Vec::with_capacity(64);
-    for offset in 0..AMPR_MAX_PATH_BYTES {
-        let offset = u64::try_from(offset).ok()?;
-        let mut byte = [0_u8];
-        if !ProcessGuestMemory.read(address.checked_add(offset)?, &mut byte) {
+    let mut offset = 0_usize;
+    let mut scalar_fallback = false;
+    while offset < AMPR_MAX_PATH_BYTES {
+        let remaining = AMPR_MAX_PATH_BYTES - offset;
+        let current = address.checked_add(u64::try_from(offset).ok()?)?;
+        let readable = memory.readable_prefix_length(current, remaining);
+        if readable == Some(0) {
             return None;
         }
-        if byte[0] == 0 {
+        let mut length = if scalar_fallback {
+            1
+        } else {
+            readable.unwrap_or(remaining).min(READ_CHUNK_BYTES)
+        };
+        let mut chunk = [0_u8; READ_CHUNK_BYTES];
+        if !memory.read(current, &mut chunk[..length]) {
+            // Readers without a zero-copy range query can reject a bulk read which crosses the
+            // end of an otherwise valid mapping. Fall back to byte reads for this uncommon case,
+            // retaining the resolver's prior fault behavior without penalizing mapped paths.
+            scalar_fallback = true;
+            length = 1;
+            if !memory.read(current, &mut chunk[..1]) {
+                return None;
+            }
+        }
+        if let Some(terminator) = chunk[..length].iter().position(|byte| *byte == 0) {
+            bytes.extend_from_slice(&chunk[..terminator]);
             return String::from_utf8(bytes).ok();
         }
-        bytes.push(byte[0]);
+        bytes.extend_from_slice(&chunk[..length]);
+        offset += length;
     }
     None
+}
+
+#[cfg(test)]
+mod guest_path_tests {
+    use std::cell::Cell;
+
+    use remu_shader::GuestMemoryReader;
+
+    use super::ampr_read_guest_path_with;
+
+    struct BoundedMemory {
+        base: u64,
+        bytes: Vec<u8>,
+        maximum_read: usize,
+        expose_prefix: bool,
+        reads: Cell<usize>,
+    }
+
+    impl GuestMemoryReader for BoundedMemory {
+        fn read(&self, address: u64, output: &mut [u8]) -> bool {
+            self.reads.set(self.reads.get() + 1);
+            if output.len() > self.maximum_read {
+                return false;
+            }
+            let Some(offset) = address
+                .checked_sub(self.base)
+                .and_then(|offset| usize::try_from(offset).ok())
+            else {
+                return false;
+            };
+            let Some(end) = offset.checked_add(output.len()) else {
+                return false;
+            };
+            let Some(source) = self.bytes.get(offset..end) else {
+                return false;
+            };
+            output.copy_from_slice(source);
+            true
+        }
+
+        fn readable_prefix_length(&self, address: u64, maximum_length: usize) -> Option<usize> {
+            if !self.expose_prefix {
+                return None;
+            }
+            let offset = address
+                .checked_sub(self.base)
+                .and_then(|offset| usize::try_from(offset).ok())?;
+            Some(
+                self.bytes
+                    .len()
+                    .saturating_sub(offset)
+                    .min(maximum_length)
+                    .min(self.maximum_read),
+            )
+        }
+    }
+
+    #[test]
+    fn mapped_apr_paths_are_read_in_bounded_chunks() {
+        let path = format!("/app0/{}", "asset/".repeat(100));
+        let mut bytes = path.as_bytes().to_vec();
+        bytes.push(0);
+        let memory = BoundedMemory {
+            base: 0x1000,
+            bytes,
+            maximum_read: 256,
+            expose_prefix: true,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            ampr_read_guest_path_with(&memory, memory.base).as_deref(),
+            Some(path.as_str())
+        );
+        assert_eq!(memory.reads.get(), 3);
+    }
+
+    #[test]
+    fn apr_path_read_falls_back_when_a_reader_cannot_describe_its_boundary() {
+        let memory = BoundedMemory {
+            base: 0x2000,
+            bytes: b"/app0/config.ini\0".to_vec(),
+            maximum_read: 1,
+            expose_prefix: false,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            ampr_read_guest_path_with(&memory, memory.base).as_deref(),
+            Some("/app0/config.ini")
+        );
+        assert_eq!(memory.reads.get(), memory.bytes.len() + 1);
+    }
+
+    #[test]
+    fn apr_path_read_rejects_unterminated_and_invalid_utf8_inputs() {
+        let unterminated = BoundedMemory {
+            base: 0x3000,
+            bytes: vec![b'x'; super::AMPR_MAX_PATH_BYTES],
+            maximum_read: 256,
+            expose_prefix: true,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            ampr_read_guest_path_with(&unterminated, unterminated.base),
+            None
+        );
+
+        let invalid_utf8 = BoundedMemory {
+            base: 0x4000,
+            bytes: vec![0xff, 0],
+            maximum_read: 256,
+            expose_prefix: true,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            ampr_read_guest_path_with(&invalid_utf8, invalid_utf8.base),
+            None
+        );
+    }
 }
 
 pub(crate) fn ampr_resolve_paths_with_prefix(
