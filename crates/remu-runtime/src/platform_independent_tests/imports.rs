@@ -464,9 +464,22 @@ fn pthread_threads_are_distinct_guest_pointer_objects() {
     assert_eq!(state.pthread_threads[&second].unique_id, 2);
     assert_eq!(state.pthread_threads[&second].name, "Thread-2");
 
+    crate::set_current_guest_thread_handle(first);
+    crate::set_current_guest_thread_unique_id(1);
+    assert_eq!(crate::current_guest_thread_handle(), first);
+    assert_eq!(crate::current_guest_thread_unique_id(), 1);
+    crate::set_current_guest_thread_handle(0);
+    crate::set_current_guest_thread_unique_id(0);
+
     for object in state.pthread_threads.into_values() {
         guest_free(object.handle);
     }
+
+    let mut exhausted = ProbeDispatchState {
+        next_thread_unique_id: u64::from(i32::MAX.cast_unsigned()) + 1,
+        ..ProbeDispatchState::default()
+    };
+    assert!(allocate_pthread_thread_object(&mut exhausted, "overflow").is_none());
 }
 
 #[test]

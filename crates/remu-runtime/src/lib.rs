@@ -1415,6 +1415,7 @@ static GUEST_IMPORT_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static CURRENT_GUEST_THREAD_POINTER: Cell<u64> = const { Cell::new(0) };
     static CURRENT_GUEST_THREAD_HANDLE: Cell<u64> = const { Cell::new(0) };
+    static CURRENT_GUEST_THREAD_UNIQUE_ID: Cell<u32> = const { Cell::new(0) };
     static CURRENT_GUEST_THREAD_EXIT_CONTEXT: Cell<*mut GuestThreadExitContext> = const { Cell::new(std::ptr::null_mut()) };
     static GUEST_PTHREAD_SPECIFIC: RefCell<BTreeMap<u32, (u64, u64)>> = const { RefCell::new(BTreeMap::new()) };
     static IMPORT_TELEMETRY_CACHE: RefCell<Option<(usize, Arc<ImportTelemetry>)>> = const { RefCell::new(None) };
@@ -1512,6 +1513,14 @@ fn set_current_guest_thread_handle(thread_handle: u64) {
     CURRENT_GUEST_THREAD_HANDLE.set(thread_handle);
 }
 
+fn current_guest_thread_unique_id() -> u64 {
+    u64::from(CURRENT_GUEST_THREAD_UNIQUE_ID.get())
+}
+
+fn set_current_guest_thread_unique_id(unique_id: u32) {
+    CURRENT_GUEST_THREAD_UNIQUE_ID.set(unique_id);
+}
+
 #[repr(C)]
 #[derive(Debug, Default)]
 struct GuestThreadExitContext {
@@ -1607,6 +1616,7 @@ fn invoke_guest_entry_with_exit(_entry: u64, _argument0: u64, _argument1: u64) -
 
 fn allocate_pthread_thread_object(state: &mut ProbeDispatchState, name: &str) -> Option<u64> {
     let unique_id = state.next_thread_unique_id.max(1);
+    i32::try_from(unique_id).ok()?;
     state.next_thread_unique_id = unique_id.checked_add(1)?;
     let handle = guest_calloc(1, PTHREAD_THREAD_OBJECT_SIZE);
     if handle == 0 {
@@ -1661,12 +1671,14 @@ fn spawn_guest_capable_thread(
         .is_ok_and(|length| length == GUEST_TLS_PREFIX_SIZE + GUEST_TLS_TCB_SIZE)
         .then(|| clone_guest_tls(&state.tls_template));
     let handle = allocate_pthread_thread_object(state, name)?;
+    let unique_id = u32::try_from(state.pthread_threads.get(&handle)?.unique_id).ok()?;
     let trace_name = name.to_owned();
     let spawned = std::thread::Builder::new()
         .name(trace_name.clone())
         .stack_size(HOST_PTHREAD_STACK_FLOOR)
         .spawn(move || {
             set_current_guest_thread_handle(handle);
+            set_current_guest_thread_unique_id(unique_id);
             set_current_guest_thread_name(Some(trace_name));
             if let Some(guest_tls) = guest_tls.as_ref() {
                 set_current_guest_thread_pointer(guest_tls.thread_pointer);
@@ -1676,6 +1688,7 @@ fn spawn_guest_capable_thread(
             retire_current_guest_import_trace();
             set_current_guest_thread_pointer(0);
             set_current_guest_thread_handle(0);
+            set_current_guest_thread_unique_id(0);
             drop(guest_tls);
             0
         });
@@ -1926,6 +1939,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.next_thread_unique_id = 1;
     let main_thread = allocate_pthread_thread_object(&mut state, "main")
         .expect("the process main-thread object allocation must succeed");
+    let main_thread_unique_id = u32::try_from(state.pthread_threads[&main_thread].unique_id)
+        .expect("the process main-thread ID must fit its signed ABI");
     state
         .thread_attributes
         .insert(main_thread, PthreadAttrState::default());
@@ -2040,6 +2055,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = GuestSyncState::default();
     set_current_guest_thread_handle(main_thread);
+    set_current_guest_thread_unique_id(main_thread_unique_id);
     drop(state);
     publish_system_splash(system_splash);
 }
@@ -3260,6 +3276,8 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         else {
             return ProbeImportReturn::integer(sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN));
         };
+        let unique_id = u32::try_from(state.pthread_threads[&handle].unique_id)
+            .expect("allocated guest thread IDs fit their signed ABI");
         let mut builder = std::thread::Builder::new();
         let guest_stack_size = usize::try_from(attributes.stack_size).unwrap_or(0);
         let page_alignment = usize::try_from(MACOS_GUEST_PAGE_ALIGNMENT).unwrap_or(0x4000);
@@ -3307,6 +3325,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
                 );
             }
             set_current_guest_thread_handle(handle);
+            set_current_guest_thread_unique_id(unique_id);
             set_current_guest_thread_name(trace_name.clone());
             set_current_guest_thread_pointer(guest_tls.thread_pointer);
             let result = run_guest_thread(entry, thread_argument);
@@ -3314,6 +3333,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             retire_current_guest_import_trace();
             set_current_guest_thread_pointer(0);
             set_current_guest_thread_handle(0);
+            set_current_guest_thread_unique_id(0);
             drop(guest_tls);
             if trace_guest_sync() {
                 eprintln!(
@@ -4648,7 +4668,7 @@ fn dispatch_stateless_import(
         // Async I/O is initialized with tuning parameters only; REmu services the requests
         // synchronously through the same file paths, so there is no queue to size here.
         "nu4a0-arQis" | "vYU8P9Td2Zo" => 0,
-        "EI-5-jlq2dE" => current_guest_thread_handle(),
+        "EI-5-jlq2dE" => current_guest_thread_unique_id(),
         "dKadqZFgKKQ" => ime_keyboard_get_resource_ids(arguments),
         "VkqLPArfFdc" => ime_keyboard_get_info(arguments[1]),
         "x8qnXqh-tiM" => 0,

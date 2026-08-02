@@ -267,6 +267,26 @@ impl MetalPresenter {
                 dispatch.gpu_publication_wait.buckets,
                 remu_gpu::DISPATCH_LATENCY_BUCKET_UPPER_NS,
             );
+            let direct = |import| dispatch.direct_import_calls_for(import);
+            use remu_gpu::DirectDispatchImport as DirectImport;
+            eprintln!(
+                "[REMu][PERF-DIRECT] window_ms={dispatch_window_ms} total={} process-time={} sce-self={} posix-self={} sce-thread-id={} sce-tls-get={} posix-tls-get={} sce-tls-set={} posix-tls-set={} sce-mutex-lock={} posix-mutex-lock={} sce-mutex-unlock={} posix-mutex-unlock={} posix-rwlock-write={} posix-rwlock-unlock={}",
+                calls(ImportFamily::Direct),
+                direct(DirectImport::KernelGetProcessTimeCounter),
+                direct(DirectImport::ScePthreadSelf),
+                direct(DirectImport::PosixPthreadSelf),
+                direct(DirectImport::ScePthreadGetThreadId),
+                direct(DirectImport::ScePthreadGetSpecific),
+                direct(DirectImport::PosixPthreadGetSpecific),
+                direct(DirectImport::ScePthreadSetSpecific),
+                direct(DirectImport::PosixPthreadSetSpecific),
+                direct(DirectImport::ScePthreadMutexLock),
+                direct(DirectImport::PosixPthreadMutexLock),
+                direct(DirectImport::ScePthreadMutexUnlock),
+                direct(DirectImport::PosixPthreadMutexUnlock),
+                direct(DirectImport::PosixPthreadRwlockWriteLock),
+                direct(DirectImport::PosixPthreadRwlockUnlock),
+            );
             eprintln!(
                 "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s color-op={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
                 f64::from(self.statistics.render_pass_ends_for_compute) / seconds,
