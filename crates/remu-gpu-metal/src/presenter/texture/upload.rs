@@ -30,8 +30,84 @@ use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
+
+fn trace_glyph_atlas_linear(
+    descriptor: GuestTextureDescriptor,
+    destination_select: u32,
+    linear: &[u8],
+) {
+    if !trace_glyph_atlas()
+        || !matches!(
+            descriptor.pixel_format,
+            MTLPixelFormat::R8Unorm | MTLPixelFormat::A8Unorm
+        )
+    {
+        return;
+    }
+    static LOGGED: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
+    let mut logged = LOGGED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if logged.len() >= 64 || !logged.insert((descriptor.address, destination_select)) {
+        return;
+    }
+
+    let mut histogram = [0_usize; 256];
+    for &value in linear {
+        histogram[usize::from(value)] += 1;
+    }
+    let occupied_values = histogram.iter().filter(|&&count| count != 0).count();
+    let nonzero = linear.len().saturating_sub(histogram[0]);
+    let fractional = nonzero.saturating_sub(histogram[255]);
+    eprintln!(
+        "[REMu][METAL][GLYPH-CONTENT] address={:#x} extent={}x{} pitch={} tile={} bytes={} zero={} full={} fractional={} values={occupied_values}",
+        descriptor.address,
+        descriptor.width,
+        descriptor.height,
+        descriptor.pitch,
+        descriptor.tile_mode,
+        linear.len(),
+        histogram[0],
+        histogram[255],
+        fractional,
+    );
+
+    let expected = usize::try_from(descriptor.width).ok().and_then(|width| {
+        usize::try_from(descriptor.height)
+            .ok()
+            .and_then(|height| width.checked_mul(height))
+    });
+    let Some(output_dir) = std::env::var_os("REMU_DUMP_MSL_DIR").map(PathBuf::from) else {
+        return;
+    };
+    if expected != Some(linear.len()) {
+        eprintln!(
+            "[REMu][METAL][GLYPH-CONTENT] dump skipped: {} bytes do not match {}x{}",
+            linear.len(),
+            descriptor.width,
+            descriptor.height,
+        );
+        return;
+    }
+    let mut pgm = format!("P5\n{} {}\n255\n", descriptor.width, descriptor.height).into_bytes();
+    pgm.extend_from_slice(linear);
+    let path = output_dir.join(format!(
+        "glyph-atlas-{:#x}-dst-{destination_select:03x}.pgm",
+        descriptor.address
+    ));
+    if let Err(error) = std::fs::write(&path, pgm) {
+        eprintln!(
+            "[REMu][METAL][GLYPH-CONTENT] failed to write {}: {error}",
+            path.display(),
+        );
+    } else {
+        eprintln!("[REMu][METAL][GLYPH-CONTENT] dumped {}", path.display(),);
+    }
+}
 
 pub(crate) fn sampled_texture_cache_accepts(
     resident_bytes: u64,
@@ -673,6 +749,11 @@ pub(crate) fn upload_image_textures(
                                 decode_sampled_texture_linear_from_raw(descriptor, &raw).map_err(
                                     |error| format!("image at PC {:#x}: {error}", binding.pc),
                                 )?;
+                            trace_glyph_atlas_linear(
+                                descriptor.guest,
+                                descriptor.destination_select,
+                                &linear,
+                            );
                             create_sampled_guest_texture(
                                 device,
                                 queue,

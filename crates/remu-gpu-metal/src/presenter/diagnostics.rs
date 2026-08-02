@@ -50,6 +50,27 @@ pub(super) fn trace_glyph_atlas() -> bool {
         .get_or_init(|| std::env::var_os("REMU_TRACE_GLYPH_ATLAS").is_some_and(|value| value == "1"))
 }
 
+pub(super) fn diagnostic_dump_glyph_draw() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_DUMP_GLYPH_DRAW").is_some_and(|value| value == "1")
+    })
+}
+
+pub(super) fn evaluation_samples_glyph_atlas(evaluation: &ShaderEvaluation) -> bool {
+    evaluation.image_bindings.iter().any(|binding| {
+        binding.opcode.starts_with("ImageSample")
+            && decode_image_descriptor(&binding.resource_descriptor).is_ok_and(|descriptor| {
+                descriptor.guest.tile_mode == 9
+                    && descriptor.destination_select == 0x800
+                    && matches!(
+                        descriptor.guest.pixel_format,
+                        MTLPixelFormat::R8Unorm | MTLPixelFormat::A8Unorm
+                    )
+            })
+    })
+}
+
 pub(super) fn trace_target_sampling() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -835,7 +856,7 @@ pub(super) fn diagnostic_target_draw_filter() -> Option<DiagnosticTargetDrawFilt
 const fn is_diagnostic_context_register(offset: u32) -> bool {
     matches!(
         offset,
-        0x191..=0x1b0 | 0x1b3 | 0x1b4 | 0x1b6 | 0x291 | 0x29b
+        0x191..=0x1b0 | 0x1b3 | 0x1b4 | 0x1b6 | 0x1e0..=0x1e7 | 0x291 | 0x29b
     )
 }
 
@@ -1435,6 +1456,61 @@ mod tests {
     use super::super::ResourceSpan;
     use super::*;
     use metal::{Device, MTLResourceOptions};
+
+    #[test]
+    fn glyph_draw_match_requires_sampled_mode9_red_atlas_with_alpha_destination() {
+        let binding = ImageBinding {
+            pc: 0,
+            opcode: remu_shader::Opcode::Known("ImageSample"),
+            control: remu_shader::ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 0,
+                scalar_sampler: 8,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: vec![
+                0x912e_bd00,
+                0xc010_0000,
+                0x00ff_c0ff,
+                0x9090_0800,
+                0,
+                0x0070_0000,
+                0,
+                0,
+            ]
+            .into(),
+            sampler_descriptor: vec![0x92, 0xfff000, 0x6500000, 0].into(),
+            mip_level: None,
+        };
+        let evaluation = ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: vec![binding.clone()],
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        };
+
+        assert!(evaluation_samples_glyph_atlas(&evaluation));
+
+        let mut wrong_operation = evaluation.clone();
+        wrong_operation.image_bindings[0].opcode = remu_shader::Opcode::Known("ImageLoad");
+        assert!(!evaluation_samples_glyph_atlas(&wrong_operation));
+
+        let mut wrong_destination = evaluation;
+        wrong_destination.image_bindings[0].resource_descriptor[3] = 0x9090_0000;
+        assert!(!evaluation_samples_glyph_atlas(&wrong_destination));
+    }
 
     #[test]
     fn video_chain_match_prefers_exact_descriptor_over_earlier_overlap() {
