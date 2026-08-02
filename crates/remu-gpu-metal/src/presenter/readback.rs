@@ -20,6 +20,7 @@ use metal::{
 use remu_gpu::IndexedDraw;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -868,11 +869,34 @@ pub(super) fn read_texture_array_linear(
     Ok(packed)
 }
 
+/// Suppresses every resident-texture writeback into guest memory.
+///
+/// A writeback republishes a host-captured span whose guest tenancy may have changed since
+/// capture — `free()` never touches a mapping, so no liveness check can see the change. This
+/// switch exists to attribute guest heap corruption: with it set, GPU-authored pixels never
+/// reach guest RAM (so readback-dependent rendering degrades), and a run that stops crashing
+/// names this family as the writer.
+fn texture_writeback_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var_os("REMU_DISABLE_TEXTURE_WRITEBACK").is_some_and(|value| value == "1")
+    })
+}
+
 pub(super) fn write_resident_texture_contents_to_guest(
     device: &Device,
     queue: &metal::CommandQueue,
     resident: &ResidentGuestTexture,
 ) -> Result<(), String> {
+    if texture_writeback_disabled() {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[REMu][METAL] REMU_DISABLE_TEXTURE_WRITEBACK: suppressing all resident texture writebacks"
+            );
+        }
+        return Ok(());
+    }
     if resident.mip_level_count == 1 {
         match resident.texture.texture_type() {
             MTLTextureType::D2 => {
