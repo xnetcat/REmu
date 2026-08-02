@@ -67,6 +67,7 @@ impl MetalPresenter {
             render_pass: None,
             compute_encoder: None,
             completion_sequences: Vec::new(),
+            flip_completions: Vec::new(),
         });
     }
 
@@ -661,6 +662,11 @@ fn pending_guest_write_range_overlaps(
 pub(crate) fn publish_guest_batch_completion(batch: &GuestCommandBatch) {
     for &sequence in &batch.completion_sequences {
         remu_gpu::record_gpu_submission_completed(sequence);
+    }
+    // Deferred flip retirements publish only here, after this batch's ordered guest-memory
+    // effects have been applied: the guest recycles the retired frame's memory on this signal.
+    for &completion in &batch.flip_completions {
+        remu_gpu::record_gpu_flip_completed(completion);
     }
 }
 

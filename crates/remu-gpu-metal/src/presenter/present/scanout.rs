@@ -262,6 +262,11 @@ impl MetalPresenter {
     }
 
     pub(crate) fn retire_completed_presentations(&mut self) {
+        // A presented frame's flip completion tells the guest to retire that frame and recycle
+        // its memory, so every guest batch that already completed must publish its ordered
+        // effects first. The standalone call sites in the event loop otherwise let a flip lead
+        // its own frame's RELEASE_MEM/writeback application by a full tick.
+        self.retire_completed_guest_batches();
         self.reconcile_pending_flips();
         loop {
             let Some(presentation) = self.pending_presentations.front() else {

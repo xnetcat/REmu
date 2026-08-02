@@ -361,6 +361,7 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
         }),
         compute_encoder: None,
         completion_sequences: vec![40],
+        flip_completions: Vec::new(),
     });
     sender
         .send(GpuEvent::QueueSubmission {
@@ -514,6 +515,7 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
         }),
         compute_encoder: None,
         completion_sequences: Vec::new(),
+        flip_completions: Vec::new(),
     });
 
     presenter
@@ -567,6 +569,7 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         render_pass: None,
         compute_encoder: None,
         completion_sequences: vec![40],
+        flip_completions: Vec::new(),
     });
     sender
         .send(GpuEvent::QueueSubmission {
@@ -1415,6 +1418,7 @@ fn pending_label_writes_coalesce_until_a_blocked_wait_commits_them() {
         render_pass: None,
         compute_encoder: None,
         completion_sequences: Vec::new(),
+        flip_completions: Vec::new(),
     });
 
     let (_label_space, address) = mapped_test_label();
@@ -1585,6 +1589,7 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
                 render_pass: None,
         compute_encoder: None,
                 completion_sequences: Vec::new(),
+                flip_completions: Vec::new(),
             });
     }
 
@@ -1640,6 +1645,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
             render_pass: None,
         compute_encoder: None,
             completion_sequences: Vec::new(),
+            flip_completions: Vec::new(),
         });
 
     let error = presenter
@@ -1699,6 +1705,7 @@ fn fill_committed_guest_batch_budget(
                 render_pass: None,
                 compute_encoder: None,
                 completion_sequences: Vec::new(),
+                flip_completions: Vec::new(),
             });
     }
 }
@@ -1819,6 +1826,7 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         render_pass: None,
         compute_encoder: None,
         completion_sequences: Vec::new(),
+        flip_completions: Vec::new(),
     };
     let (first_buffer, first_offset) = batch
         .upload_global_bytes(&device, &[1, 2, 3])
@@ -1971,6 +1979,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             render_pass: None,
         compute_encoder: None,
             completion_sequences: Vec::new(),
+            flip_completions: Vec::new(),
         });
 
     let (_completion_space, completion_address) = mapped_test_label();
@@ -1995,6 +2004,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             render_pass: None,
         compute_encoder: None,
             completion_sequences: Vec::new(),
+            flip_completions: Vec::new(),
         });
 
     presenter

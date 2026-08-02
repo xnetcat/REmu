@@ -181,11 +181,24 @@ impl MetalPresenter {
                     });
                     // A flip the guest replaces before presentation is never shown, but it was
                     // counted against flip pacing on acceptance and the guest still holds it in its
-                    // own pending queue. Retiring it here is the only decrement it can ever get.
+                    // own pending queue, so it still owes exactly one retirement. Publishing that
+                    // retirement HERE — at event-dequeue time — told Unreal the frame was done
+                    // while its ordered work was still queued or executing, and Unreal returned
+                    // the frame's transient memory to MallocBinned3 with its own render thread
+                    // still writing through pointers into it. Defer the completion behind the
+                    // ordered work exactly as SubmissionBoundary defers empty submissions.
                     if let Some(superseded) = self.pending_flip
                         && let Some(completion) = self.complete_flip(superseded.sequence)
                     {
-                        remu_gpu::record_gpu_flip_completed(completion);
+                        if let Some(batch) = self.open_guest_batch.as_mut() {
+                            batch.flip_completions.push(completion);
+                        } else if let Some(batch) = self.committed_guest_batches.back_mut() {
+                            batch.flip_completions.push(completion);
+                        } else {
+                            // Nothing queued or in flight: the superseded frame's work has
+                            // already retired and the completion is safe to publish now.
+                            remu_gpu::record_gpu_flip_completed(completion);
+                        }
                     }
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
                     self.pending_flip = Some(PendingFlip {

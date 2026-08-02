@@ -1432,6 +1432,13 @@ struct GuestCommandBatch {
     /// Queue scheduling can complete a newer global sequence before an older blocked queue, so
     /// every boundary is retained rather than incorrectly treating the maximum as a prefix.
     completion_sequences: Vec<u64>,
+    /// Flip completions that may publish only after this batch's ordered work has retired.
+    ///
+    /// A flip the guest replaces before presentation still owes its pacing decrement, but
+    /// Unreal retires the frame — and recycles its transient memory into the allocator — the
+    /// moment the completion is visible. Publishing it at event-dequeue time let the guest free
+    /// memory its own render thread was still writing, which is the MallocBinned3 corruption.
+    flip_completions: Vec<remu_gpu::GpuFlipCompletion>,
 }
 
 struct GlobalUploadChunk {
