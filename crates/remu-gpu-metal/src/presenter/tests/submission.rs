@@ -6,10 +6,9 @@ use metal::{
     MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
 };
 use remu_gpu::{
-    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuMemoryAcquire,
-    GpuFlipWait, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite,
-    GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
+    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuFlipWait,
+    GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
+    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
 };
 
 use remu_memory::{
@@ -20,24 +19,23 @@ use remu_shader::{GlobalMemoryBinding, Program, ShaderEvaluation};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, UploadedGlobalBuffer,
-};
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
-    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
+    collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
+};
+use super::super::{
+    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
-    GuestCommandBatch,
-    GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
-    GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor,
-    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, PendingFlip,
-    OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver,
-    PendingGlobalWriteback, PendingGuestMemoryWrite, PipelineCompileCandidate, ProgramIdentity,
-    QueueBlockReason, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
-    read_texture_linear, write_back_pending_globals,
+    GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus,
+    GuestMemoryWaitTracker, GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor,
+    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OpenGuestRenderPass, OrderedEventPoll,
+    OrderedEventSource, OrderedGpuEventReceiver, PendingFlip, PendingGlobalWriteback,
+    PendingGuestMemoryWrite, PipelineCompileCandidate, ProgramIdentity, QueueBlockReason,
+    apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write, read_texture_linear,
+    write_back_pending_globals,
 };
 
 fn enable_per_queue_batches(presenter: &mut MetalPresenter) {
@@ -85,6 +83,8 @@ fn committed_per_queue_test_batch(
             memory_writes,
             render_pass: None,
             compute_encoder: None,
+            max_encoded_signal: None,
+            signal_checkpoints: Vec::new(),
             completion_sequences: Vec::new(),
         });
     command_buffer
@@ -461,6 +461,8 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
             encoder,
         }),
         compute_encoder: None,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
         completion_sequences: vec![40],
     });
     sender
@@ -505,10 +507,13 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
 
     let (_release_space, release_address) = mapped_test_label();
     presenter
-        .execute_guest_memory_release(GpuMemoryRelease {
-            address: release_address,
-            value: GpuMemoryReleaseValue::Immediate32(1),
-        })
+        .execute_guest_memory_release(
+            OrderedEventSource::GuestQueue(0),
+            GpuMemoryRelease {
+                address: release_address,
+                value: GpuMemoryReleaseValue::Immediate32(1),
+            },
+        )
         .expect("a real release remains in the coalesced batch");
     let open = presenter
         .open_guest_batch
@@ -591,10 +596,13 @@ fn post_flip_release_mem_precedes_the_exact_flip_completion() {
         .clone();
     presenter.ensure_open_guest_batch(&queue);
     presenter
-        .execute_guest_memory_release(GpuMemoryRelease {
-            address: release_address,
-            value: GpuMemoryReleaseValue::Immediate32(0xfeed_beef),
-        })
+        .execute_guest_memory_release(
+            OrderedEventSource::GuestQueue(0),
+            GpuMemoryRelease {
+                address: release_address,
+                value: GpuMemoryReleaseValue::Immediate32(0xfeed_beef),
+            },
+        )
         .expect("post-flip release enters the same guest batch");
     presenter
         .open_guest_batch
@@ -671,6 +679,8 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
             encoder,
         }),
         compute_encoder: None,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
         completion_sequences: Vec::new(),
     });
 
@@ -725,6 +735,8 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         memory_writes: Vec::new(),
         render_pass: None,
         compute_encoder: None,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
         completion_sequences: vec![40],
     });
     sender
@@ -1574,16 +1586,21 @@ fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
         memory_writes: Vec::new(),
         render_pass: None,
         compute_encoder: None,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
         completion_sequences: Vec::new(),
     });
 
     let (_label_space, address) = mapped_test_label();
     for value in [1, 2] {
         presenter
-            .execute_guest_memory_release(GpuMemoryRelease {
-                address,
-                value: GpuMemoryReleaseValue::Immediate32(value),
-            })
+            .execute_guest_memory_release(
+                OrderedEventSource::GuestQueue(0),
+                GpuMemoryRelease {
+                    address,
+                    value: GpuMemoryReleaseValue::Immediate32(value),
+                },
+            )
             .expect("label release coalesces");
     }
     assert_eq!(
@@ -1758,7 +1775,9 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
                 guest_write_ranges: Vec::new(),
                 memory_writes,
                 render_pass: None,
-        compute_encoder: None,
+                compute_encoder: None,
+                max_encoded_signal: None,
+                signal_checkpoints: Vec::new(),
                 completion_sequences: Vec::new(),
             });
     }
@@ -1814,7 +1833,9 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
                 .expect("pin completion label mapping"),
             ],
             render_pass: None,
-        compute_encoder: None,
+            compute_encoder: None,
+            max_encoded_signal: None,
+            signal_checkpoints: Vec::new(),
             completion_sequences: Vec::new(),
         });
 
@@ -1875,6 +1896,8 @@ fn fill_committed_guest_batch_budget(
                 memory_writes,
                 render_pass: None,
                 compute_encoder: None,
+                max_encoded_signal: None,
+                signal_checkpoints: Vec::new(),
                 completion_sequences: Vec::new(),
             });
     }
@@ -1900,7 +1923,10 @@ fn required_flush_commits_at_the_in_flight_batch_budget() {
         .clone();
 
     presenter
-        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::CpuSynchronization)
+        .flush_guest_command_batch(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CpuSynchronization,
+        )
         .expect("a required flush commits at the in-flight budget");
 
     assert!(
@@ -1908,7 +1934,10 @@ fn required_flush_commits_at_the_in_flight_batch_budget() {
         "a synchronization site must not be handed an uncommitted batch"
     );
     assert_eq!(presenter.statistics.submitted_guest_batches, 1);
-    assert_eq!(presenter.statistics.batch_flushes_for_cpu_synchronization, 1);
+    assert_eq!(
+        presenter.statistics.batch_flushes_for_cpu_synchronization,
+        1
+    );
     assert_eq!(
         read_test_label(label_address),
         7,
@@ -1996,6 +2025,8 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         memory_writes: Vec::new(),
         render_pass: None,
         compute_encoder: None,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
         completion_sequences: Vec::new(),
     };
     let (first_buffer, first_offset) = batch
@@ -2148,7 +2179,9 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),
             render_pass: None,
-        compute_encoder: None,
+            compute_encoder: None,
+            max_encoded_signal: None,
+            signal_checkpoints: Vec::new(),
             completion_sequences: Vec::new(),
         });
 
@@ -2173,7 +2206,9 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                 .expect("pin later completion label"),
             ],
             render_pass: None,
-        compute_encoder: None,
+            compute_encoder: None,
+            max_encoded_signal: None,
+            signal_checkpoints: Vec::new(),
             completion_sequences: Vec::new(),
         });
 
@@ -3823,6 +3858,47 @@ fn guest_wait_never_reuses_a_producer_from_before_its_registration() {
 }
 
 #[test]
+fn immediate64_release_matches_qword_and_each_dword_wait_exactly() {
+    let release = GpuMemoryRelease {
+        address: 0x7000_4000,
+        value: GpuMemoryReleaseValue::Immediate64(0x8877_6655_4433_2211),
+    };
+    let wait = |address, is_64_bit| GpuMemoryWait {
+        address,
+        reference: 0,
+        mask: u64::MAX,
+        compare_function: 0,
+        is_64_bit,
+    };
+    assert_eq!(
+        release_value_for_wait(release, wait(release.address, true)),
+        Some(0x8877_6655_4433_2211)
+    );
+    assert_eq!(
+        release_value_for_wait(release, wait(release.address, false)),
+        Some(0x4433_2211)
+    );
+    assert_eq!(
+        release_value_for_wait(release, wait(release.address + 4, false)),
+        Some(0x8877_6655)
+    );
+    assert_eq!(
+        release_value_for_wait(release, wait(release.address + 8, false)),
+        None
+    );
+    assert_eq!(
+        release_value_for_wait(
+            GpuMemoryRelease {
+                value: GpuMemoryReleaseValue::Timestamp,
+                ..release
+            },
+            wait(release.address, true)
+        ),
+        None
+    );
+}
+
+#[test]
 fn guest_wait_does_not_latch_missing_or_nonmatching_producers() {
     let wait = GpuMemoryWait {
         address: 0x7000_2000,
@@ -3945,12 +4021,12 @@ fn per_queue_blocked_wait_flushes_only_its_queue_and_preserves_foreign_render_pa
         .as_mut()
         .expect("q0 open batch")
         .render_pass = Some(OpenGuestRenderPass {
-            key: GuestRenderPassKey {
-                targets: Vec::new(),
-                depth: None,
-            },
-            encoder,
-        });
+        key: GuestRenderPassKey {
+            targets: Vec::new(),
+            depth: None,
+        },
+        encoder,
+    });
 
     open_per_queue_batch(&mut presenter, 41);
     let (_label_space, address) = mapped_test_label();
@@ -3970,9 +4046,7 @@ fn per_queue_blocked_wait_flushes_only_its_queue_and_preserves_foreign_render_pa
 
     assert!(presenter.guest_queue_batches[&41].open_batch.is_none());
     assert_eq!(
-        presenter.guest_queue_batches[&41]
-            .committed_batches
-            .len(),
+        presenter.guest_queue_batches[&41].committed_batches.len(),
         1
     );
     assert!(
@@ -3999,12 +4073,10 @@ fn per_queue_terminal_fronts_retire_independently_and_remain_fifo_within_a_queue
     let (_label_space, address) = mapped_test_label();
     let mut q41_buffers = Vec::new();
     for value in [1, 2] {
-        let write = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
-            GpuMemoryRelease {
-                address,
-                value: GpuMemoryReleaseValue::Immediate32(value),
-            },
-        ))
+        let write = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+            address,
+            value: GpuMemoryReleaseValue::Immediate32(value),
+        }))
         .expect("pin ordered q41 label");
         q41_buffers.push(committed_per_queue_test_batch(
             &mut presenter,
@@ -4019,9 +4091,7 @@ fn per_queue_terminal_fronts_retire_independently_and_remain_fifo_within_a_queue
 
     presenter.retire_completed_guest_batches();
     assert_eq!(
-        presenter.guest_queue_batches[&0]
-            .committed_batches
-            .len(),
+        presenter.guest_queue_batches[&0].committed_batches.len(),
         1,
         "pending q0 front remains queued"
     );
@@ -4078,12 +4148,7 @@ fn per_queue_committed_batch_cap_is_global() {
     let blocker = device.new_shared_event();
     for index in 0..MAX_COMMITTED_GUEST_BATCHES {
         let queue_id = if index.is_multiple_of(2) { 0 } else { 41 };
-        committed_per_queue_test_batch(
-            &mut presenter,
-            queue_id,
-            Vec::new(),
-            Some((&blocker, 1)),
-        );
+        committed_per_queue_test_batch(&mut presenter, queue_id, Vec::new(), Some((&blocker, 1)));
     }
     assert_eq!(
         presenter.committed_guest_batch_count(),
@@ -4134,12 +4199,10 @@ fn per_queue_required_drain_has_one_deadline_and_continues_after_terminal_error(
         write_watch: None,
     };
     let (_label_space, completion_address) = mapped_test_label();
-    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
-        GpuMemoryRelease {
-            address: completion_address,
-            value: GpuMemoryReleaseValue::Immediate32(9),
-        },
-    ))
+    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+        address: completion_address,
+        value: GpuMemoryReleaseValue::Immediate32(9),
+    }))
     .expect("pin later queue completion label");
     let first = committed_per_queue_test_batch(&mut presenter, 0, vec![invalid], None);
     let later = committed_per_queue_test_batch(&mut presenter, 41, vec![completion], None);
@@ -4227,4 +4290,93 @@ fn per_queue_flush_clears_only_its_transient_bindings() {
     presenter
         .wait_for_guest_command_batches()
         .expect("test queues drain");
+}
+
+#[test]
+fn per_queue_registered_wait_uses_shared_events_and_host_ack_without_early_publication() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    open_per_queue_batch(&mut presenter, 41);
+    let (_label_space, label) = mapped_test_label();
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::MemoryAcquire(GpuMemoryAcquire {
+                engine: 0,
+                cb_db_control: 0,
+                base_address: label,
+                size_bytes: 4,
+                poll_interval: 0,
+                gcr_control: 0,
+            }),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_waits, 1);
+    assert_eq!(presenter.statistics.batch_flushes_for_blocked_wait, 0);
+    assert_eq!(
+        read_test_label(label),
+        0,
+        "release remains terminal-deferred"
+    );
+    let Some(QueueBlockReason::GuestSharedEventHostEffect {
+        consumer_queue_id,
+        consumer_ack: Some(consumer_ack),
+        terminal_dependencies,
+    }) = presenter.receiver.blocked_queues.get(&0)
+    else {
+        panic!("the acquire must wait on a consumer-side host acknowledgement");
+    };
+    assert_eq!(*consumer_queue_id, 0);
+    assert_eq!(
+        consumer_ack.producer().queue_id(),
+        0,
+        "producer signaling alone is not host-safe; the acknowledgement belongs to the consumer"
+    );
+    assert_eq!(terminal_dependencies.len(), 1);
+    assert_eq!(terminal_dependencies[0].producer().queue_id(), 41);
+
+    presenter.set_active_guest_queue(Some(0));
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("consumer and producer batches commit");
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("cross-queue signal/wait/ack settles");
+    assert_eq!(read_test_label(label), 1);
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert!(!presenter.receiver.blocked_queues.contains_key(&0));
+    assert!(
+        presenter.guest_queue_batches[&0]
+            .resource_dependencies
+            .is_empty(),
+        "host-retired producers no longer need cross-queue resource forwarding"
+    );
+    assert!(
+        presenter.guest_queue_batches[&41]
+            .retired_fence_write_ranges
+            .is_empty(),
+        "retired fence ranges are pruned after the last wait/resource reference"
+    );
+    remu_gpu::clear_event_sink();
 }

@@ -4,14 +4,13 @@
 use super::super::completion::{command_buffer_native_state_summary, trace_metal_command_stalls};
 use super::super::{
     OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD,
-    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED,
-    OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED_CPU_GPU,
+    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
+    OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
     OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
-    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW,
-    OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN,
-    RESIDENT_WRITEBACK_DISCARDED,
-    RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
-    RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState, WRITEBACK_TRIGGERS,
+    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
+    OWNED_UNRESOLVED_SPAN, RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_DISCARDED_BYTES,
+    RESIDENT_WRITEBACK_PUBLISHED, RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState,
+    WRITEBACK_TRIGGERS,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -20,14 +19,14 @@ use super::{
     PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PresenterFlow,
     RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_FLIP_AGE_LABELS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
     RESIDENT_WORK_AGE_LABELS, RESIDENT_WRITE_ATTRIBUTION_MISSES, SAMPLED_ALIAS_WRITEBACK_BYTES,
-    SAMPLED_ALIAS_WRITEBACK_COUNT,
-    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
-    SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
-    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, TEXTURE_DIRTY_VALIDATION_BYTES,
-    TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
-    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
-    TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT, describe_guest_batch,
-    presentation_drawable_size, process_memory_statistics, resident_texture_activity_latest_work,
+    SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
+    SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
+    SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
+    TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+    TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
+    TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, describe_guest_batch, presentation_drawable_size,
+    process_memory_statistics, resident_texture_activity_latest_work,
     resident_texture_activity_stats, resident_texture_backing_overlap_stats,
     resident_texture_lifetime_diagnostics_enabled, resident_texture_ownership_stats,
     take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
@@ -288,7 +287,7 @@ impl MetalPresenter {
                 direct(DirectImport::PosixPthreadRwlockUnlock),
             );
             eprintln!(
-                "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s color-op={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
+                "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s color-op={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s shared-host={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
                 f64::from(self.statistics.render_pass_ends_for_compute) / seconds,
                 f64::from(self.statistics.render_pass_ends_for_target_change) / seconds,
                 f64::from(self.statistics.render_pass_ends_for_color_operation) / seconds,
@@ -296,19 +295,34 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_from_event_loop) / seconds,
                 f64::from(self.statistics.batch_flushes_for_guest_memory_write) / seconds,
                 f64::from(self.statistics.batch_flushes_for_blocked_wait) / seconds,
+                f64::from(self.statistics.batch_flushes_for_shared_event_host_effect) / seconds,
                 f64::from(self.statistics.batch_flushes_for_flip_snapshot) / seconds,
                 f64::from(self.statistics.batch_flushes_for_work_capacity) / seconds,
                 f64::from(self.statistics.batch_flushes_for_command_processor_barrier) / seconds,
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
             );
-            let head_join = self.flip_completion_joins.first_key_value().map(|(sequence, join)| {
-                format!(
-                    "{sequence}:submission={:?}/submission-terminal={}/terminal={}",
-                    join.submission_sequence,
-                    join.submission_terminal,
-                    join.terminal_source.map_or("pending", |source| source.as_str()),
-                )
-            });
+            eprintln!(
+                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
+                f64::from(self.statistics.shared_event_signals) / seconds,
+                f64::from(self.statistics.shared_event_waits) / seconds,
+                f64::from(self.statistics.shared_event_host_blocks) / seconds,
+                f64::from(self.statistics.shared_event_host_wakes) / seconds,
+                self.statistics.shared_event_error_advances,
+                f64::from(self.statistics.shared_event_fallbacks_no_exact_producer) / seconds,
+                self.statistics.shared_event_fallbacks_timeline_overflow,
+            );
+            let head_join = self
+                .flip_completion_joins
+                .first_key_value()
+                .map(|(sequence, join)| {
+                    format!(
+                        "{sequence}:submission={:?}/submission-terminal={}/terminal={}",
+                        join.submission_sequence,
+                        join.submission_terminal,
+                        join.terminal_source
+                            .map_or("pending", |source| source.as_str()),
+                    )
+                });
             let (waiting_submission, waiting_terminal, joined_ordered) =
                 self.flip_completion_join_state_counts();
             eprintln!(
@@ -359,8 +373,7 @@ impl MetalPresenter {
             let compile_failed = PIPELINE_COMPILE_FAILED.swap(0, Ordering::Relaxed);
             let draw_gates = PIPELINE_DRAW_GATES.swap(0, Ordering::Relaxed);
             let compute_gates = PIPELINE_COMPUTE_GATES.swap(0, Ordering::Relaxed);
-            let (pipeline_blocks, memory_blocks, flip_blocks) =
-                self.receiver.block_reason_counts();
+            let (pipeline_blocks, memory_blocks, flip_blocks) = self.receiver.block_reason_counts();
             eprintln!(
                 "[REMu][PERF-PIPELINE] ready={}/{} active={}/{} failed={}/{} interval=enqueued:{compile_enqueued}/full:{compile_queue_full}/done:{compile_completed}/failed:{compile_failed}/gates:{draw_gates}/{compute_gates} blocked=pipeline:{pipeline_blocks}/memory:{memory_blocks}/flip:{flip_blocks}",
                 self.compiled_shader_pairs.len(),
@@ -937,10 +950,18 @@ impl MetalPresenter {
         self.statistics.batch_flushes_from_event_loop = 0;
         self.statistics.batch_flushes_for_guest_memory_write = 0;
         self.statistics.batch_flushes_for_blocked_wait = 0;
+        self.statistics.batch_flushes_for_shared_event_host_effect = 0;
         self.statistics.batch_flushes_for_flip_snapshot = 0;
         self.statistics.batch_flushes_for_work_capacity = 0;
         self.statistics.batch_flushes_for_command_processor_barrier = 0;
         self.statistics.batch_flushes_for_cpu_synchronization = 0;
+        self.statistics.shared_event_signals = 0;
+        self.statistics.shared_event_waits = 0;
+        self.statistics.shared_event_host_blocks = 0;
+        self.statistics.shared_event_host_wakes = 0;
+        self.statistics.shared_event_error_advances = 0;
+        self.statistics.shared_event_fallbacks_no_exact_producer = 0;
+        self.statistics.shared_event_fallbacks_timeline_overflow = 0;
         self.statistics.gpu_execution_time = Duration::ZERO;
         self.statistics.presentation_queue_latency = Duration::ZERO;
         self.statistics.last_audio_output_frames = audio_output;

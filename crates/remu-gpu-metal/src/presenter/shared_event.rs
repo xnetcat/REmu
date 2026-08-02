@@ -37,6 +37,11 @@ pub(crate) struct SharedEventFence {
 
 impl SharedEventFence {
     #[must_use]
+    pub(crate) const fn new(producer: SharedEventProducerId, value: u64) -> Self {
+        Self { producer, value }
+    }
+
+    #[must_use]
     pub(crate) const fn producer(self) -> SharedEventProducerId {
         self.producer
     }
@@ -54,6 +59,7 @@ pub(crate) struct SharedEventTimelineExhausted {
 }
 
 impl SharedEventTimelineExhausted {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn producer(self) -> SharedEventProducerId {
         self.producer
@@ -89,6 +95,7 @@ impl SharedEventTimeline {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn producer(&self) -> SharedEventProducerId {
         self.producer
@@ -97,6 +104,11 @@ impl SharedEventTimeline {
     #[must_use]
     pub(crate) fn event(&self) -> &SharedEventRef {
         &self.event
+    }
+
+    #[must_use]
+    pub(crate) fn event_owned(&self) -> SharedEvent {
+        self.event.clone()
     }
 
     /// Allocates the next nonzero value without ever wrapping a live event timeline.
@@ -163,11 +175,17 @@ impl GpuWaitFenceMap {
         self.by_wait.remove(&wait_id)
     }
 
+    pub(crate) fn fences(&self) -> impl Iterator<Item = SharedEventFence> + '_ {
+        self.by_wait.values().copied()
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.by_wait.len()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.by_wait.is_empty()
@@ -176,6 +194,7 @@ impl GpuWaitFenceMap {
 
 /// Terminal state relevant to the failed-batch `SharedEvent` retirement policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum SharedEventBatchTerminalState {
     Completed,
     Error,
@@ -189,11 +208,13 @@ pub(crate) struct SharedEventProducerMismatch {
 }
 
 impl SharedEventProducerMismatch {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn expected(self) -> SharedEventProducerId {
         self.expected
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn actual(self) -> SharedEventProducerId {
         self.actual

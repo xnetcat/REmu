@@ -682,7 +682,89 @@ impl MetalPresenter {
                 return Ok(synchronize_writable_global_source(binding, source));
             }
         }
-        Ok(QueuedGlobalReadSource::None)
+        if !self.per_queue_guest_batches {
+            return Ok(QueuedGlobalReadSource::None);
+        }
+        let Some(consumer_queue_id) = self.active_guest_queue else {
+            return Ok(QueuedGlobalReadSource::None);
+        };
+        let dependencies = self
+            .guest_queue_batches
+            .get(&consumer_queue_id)
+            .map(|state| state.resource_dependencies.clone())
+            .unwrap_or_default();
+        let mut selected = QueuedGlobalReadSource::None;
+        for (producer, fence_value) in dependencies {
+            if producer.queue_id() == consumer_queue_id {
+                continue;
+            }
+            let Some(state) = self.guest_queue_batches.get(&producer.queue_id()) else {
+                continue;
+            };
+            let batches = state
+                .committed_batches
+                .iter()
+                .chain(state.open_batch.iter())
+                .collect::<Vec<_>>();
+            let Some((fence_batch_index, checkpoint)) =
+                batches.iter().enumerate().find_map(|(index, batch)| {
+                    batch
+                        .signal_checkpoints
+                        .iter()
+                        .find(|checkpoint| checkpoint.fence.value() == fence_value)
+                        .copied()
+                        .map(|checkpoint| (index, checkpoint))
+                })
+            else {
+                if state
+                    .retired_fence_write_ranges
+                    .get(&fence_value)
+                    .is_some_and(|ranges| {
+                        ranges.iter().any(|&(address, length)| {
+                            guest_physical_ranges_overlap(
+                                address,
+                                length,
+                                binding.base_address,
+                                byte_count,
+                            )
+                        })
+                    })
+                {
+                    selected = QueuedGlobalReadSource::Synchronize;
+                    break;
+                }
+                continue;
+            };
+            let producer_source = (0..=fence_batch_index)
+                .rev()
+                .find_map(|index| {
+                    let batch = batches[index];
+                    let source = if index == fence_batch_index {
+                        queued_global_read_source_in_batch_prefix(
+                            batch,
+                            checkpoint.global_writeback_count,
+                            checkpoint.guest_write_range_count,
+                            checkpoint.memory_write_count,
+                            binding.base_address,
+                            byte_count,
+                        )
+                    } else {
+                        queued_global_read_source_in_batch(batch, binding.base_address, byte_count)
+                    };
+                    (!matches!(source, QueuedGlobalReadSource::None)).then_some(source)
+                })
+                .unwrap_or(QueuedGlobalReadSource::None);
+            // Fence checkpoints name ordering points, not immutable snapshots. A later packet in
+            // the producer batch may append to or replace the same Metal buffer after the signal,
+            // so forwarding that live buffer across queues would expose post-fence bytes. Until
+            // writable resources are fence-versioned, conservatively force the host-effect gate
+            // to retire the producer and rematerialize from truthful guest memory.
+            if !matches!(producer_source, QueuedGlobalReadSource::None) {
+                selected = QueuedGlobalReadSource::Synchronize;
+                break;
+            }
+        }
+        Ok(synchronize_writable_global_source(binding, selected))
     }
 
     pub(super) fn cached_index_buffer(
@@ -766,17 +848,49 @@ fn queued_global_read_source_in_batch(
     address: u64,
     byte_count: u64,
 ) -> QueuedGlobalReadSource {
-    if !guest_batch_writes_overlap(batch, address, byte_count) {
+    queued_global_read_source_in_batch_prefix(
+        batch,
+        batch.global_writebacks.len(),
+        batch.guest_write_ranges.len(),
+        batch.memory_writes.len(),
+        address,
+        byte_count,
+    )
+}
+
+fn queued_global_read_source_in_batch_prefix(
+    batch: &GuestCommandBatch,
+    global_writeback_count: usize,
+    guest_write_range_count: usize,
+    memory_write_count: usize,
+    address: u64,
+    byte_count: u64,
+) -> QueuedGlobalReadSource {
+    let global_writebacks = &batch.global_writebacks[..global_writeback_count];
+    let guest_write_ranges = &batch.guest_write_ranges[..guest_write_range_count];
+    let memory_writes = &batch.memory_writes[..memory_write_count];
+    let overlaps = memory_writes
+        .iter()
+        .any(|write| write.overlaps(address, byte_count))
+        || global_writebacks.iter().any(|writeback| {
+            u64::try_from(writeback.byte_count).is_ok_and(|length| {
+                guest_physical_ranges_overlap(writeback.guest_address, length, address, byte_count)
+            })
+        })
+        || guest_write_ranges.iter().any(|range| {
+            guest_physical_ranges_overlap(range.address, range.byte_count, address, byte_count)
+        });
+    if !overlaps {
         return QueuedGlobalReadSource::None;
     }
-    if batch.memory_writes.iter().any(|write| {
+    if memory_writes.iter().any(|write| {
         let (write_address, write_byte_count) = write.range();
         guest_physical_ranges_overlap(write_address, write_byte_count, address, byte_count)
     }) {
         return QueuedGlobalReadSource::Synchronize;
     }
     let mut candidate: Option<(Buffer, u64, bool, Option<GuestSharedMappingIdentity>)> = None;
-    for writeback in &batch.global_writebacks {
+    for writeback in global_writebacks {
         match contained_global_writeback_offset(writeback, address, byte_count) {
             QueuedWriteReadMatch::None => {}
             QueuedWriteReadMatch::Synchronize => {
@@ -799,7 +913,7 @@ fn queued_global_read_source_in_batch(
             }
         }
     }
-    for range in &batch.guest_write_ranges {
+    for range in guest_write_ranges {
         match contained_guest_write_offset(range, address, byte_count) {
             QueuedWriteReadMatch::None => {}
             QueuedWriteReadMatch::Synchronize => {

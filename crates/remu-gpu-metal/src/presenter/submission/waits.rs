@@ -3,8 +3,8 @@
 
 use super::{
     ActiveGuestMemoryWait, FlushPolicy, GuestBatchFlushReason, GuestMemoryWaitKey,
-    GuestMemoryWaitRecovery,
-    GuestMemoryWaitStatus, GuestMemoryWaitTracker, MetalPresenter, OrderedEventSource,
+    GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker, MetalPresenter,
+    OrderedEventSource,
 };
 use remu_gpu::{GpuMemoryWait, GpuWaitId};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,6 +24,7 @@ impl MetalPresenter {
         if let Some(ticket_id) = ticket_id
             && let Some(value) = remu_gpu::take_gpu_wait_latch(ticket_id)
         {
+            let _ = self.gpu_wait_fences.take(ticket_id);
             self.guest_memory_waits.complete(key);
             static RESUMED_TICKET_WAITS: AtomicUsize = AtomicUsize::new(0);
             let sequence = RESUMED_TICKET_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -38,6 +39,7 @@ impl MetalPresenter {
         if wait.address == 0 {
             self.guest_memory_waits.complete(key);
             if let Some(ticket_id) = ticket_id {
+                let _ = self.gpu_wait_fences.take(ticket_id);
                 remu_gpu::retire_gpu_wait(ticket_id);
             }
             return Ok(GuestMemoryWaitStatus::Satisfied);
@@ -45,6 +47,7 @@ impl MetalPresenter {
         let required_alignment = if wait.is_64_bit { 8 } else { 4 };
         if !wait.address.is_multiple_of(required_alignment) {
             if let Some(ticket_id) = ticket_id {
+                let _ = self.gpu_wait_fences.take(ticket_id);
                 remu_gpu::retire_gpu_wait(ticket_id);
             }
             return Err(format!(
@@ -52,6 +55,57 @@ impl MetalPresenter {
                 required_alignment * 8,
                 wait.address
             ));
+        }
+        if self.per_queue_guest_batches
+            && let Some(ticket_id) = ticket_id
+            && let Some(fence) = self.gpu_wait_fences.get(ticket_id)
+        {
+            let OrderedEventSource::GuestQueue(consumer_queue_id) = source else {
+                let _ = self.gpu_wait_fences.take(ticket_id);
+                remu_gpu::retire_gpu_wait(ticket_id);
+                return Err("registered guest wait has no logical queue identity".to_owned());
+            };
+            let producer_event = self
+                .guest_queue_batches
+                .get(&fence.producer().queue_id())
+                .ok_or_else(|| {
+                    format!(
+                        "registered wait references missing producer queue {}",
+                        fence.producer().queue_id()
+                    )
+                })?
+                .shared_event_timeline
+                .event_owned();
+            self.ensure_active_open_guest_batch()?;
+            let consumer = self
+                .guest_queue_batches
+                .get_mut(&consumer_queue_id)
+                .ok_or_else(|| format!("missing consumer guest queue {consumer_queue_id}"))?;
+            let batch = consumer
+                .open_batch
+                .as_mut()
+                .ok_or("shared-event wait has no open consumer batch")?;
+            batch.close_active_pass_encoders();
+            batch
+                .command_buffer
+                .encode_wait_for_event(&producer_event, fence.value());
+            consumer
+                .host_dependencies
+                .entry(fence.producer())
+                .and_modify(|value| *value = (*value).max(fence.value()))
+                .or_insert(fence.value());
+            consumer
+                .resource_dependencies
+                .entry(fence.producer())
+                .and_modify(|value| *value = (*value).max(fence.value()))
+                .or_insert(fence.value());
+            let taken = self.gpu_wait_fences.take(ticket_id);
+            debug_assert_eq!(taken, Some(fence));
+            remu_gpu::retire_gpu_wait(ticket_id);
+            self.guest_memory_waits.complete(key);
+            self.statistics.shared_event_waits =
+                self.statistics.shared_event_waits.saturating_add(1);
+            return Ok(GuestMemoryWaitStatus::Satisfied);
         }
         // A queued write to this label is the value the GPU will eventually observe, but it is
         // not completion evidence yet. The old fast path returned `Satisfied` from that future
@@ -73,8 +127,7 @@ impl MetalPresenter {
             Some(value) => {
                 if wait.is_satisfied_by(value) {
                     static DEFERRED_FUTURE_VALUE_WAITS: AtomicUsize = AtomicUsize::new(0);
-                    let sequence =
-                        DEFERRED_FUTURE_VALUE_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+                    let sequence = DEFERRED_FUTURE_VALUE_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
                     if sequence <= 16 || sequence.is_power_of_two() {
                         eprintln!(
                             "[REMu][LIFETIME-ORDER] phase=defer-future-wait sequence={sequence} address={:#x} value={value:#x} open_batch={} committed_batches={}",
@@ -88,6 +141,7 @@ impl MetalPresenter {
             None if wait.is_satisfied_by(read_guest_memory_wait_value(wait)) => {
                 self.guest_memory_waits.complete(key);
                 if let Some(ticket_id) = ticket_id {
+                    let _ = self.gpu_wait_fences.take(ticket_id);
                     remu_gpu::retire_gpu_wait(ticket_id);
                 }
                 return Ok(GuestMemoryWaitStatus::Satisfied);
@@ -100,6 +154,7 @@ impl MetalPresenter {
             None if wait.is_satisfied_by(read_guest_memory_wait_value(wait)) => {
                 self.guest_memory_waits.complete(key);
                 if let Some(ticket_id) = ticket_id {
+                    let _ = self.gpu_wait_fences.take(ticket_id);
                     remu_gpu::retire_gpu_wait(ticket_id);
                 }
                 return Ok(GuestMemoryWaitStatus::Satisfied);
@@ -111,13 +166,20 @@ impl MetalPresenter {
         // Closing this queue's current Metal batch preserves its work before the wait. The queue
         // scheduler retains this packet at the submission front and runs another guest queue;
         // later commands from this queue are never allowed to overtake the unsatisfied condition.
-        if let Err(error) =
-            self.flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::BlockedWait)
+        if let Err(error) = self
+            .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::BlockedWait)
         {
             if let Some(ticket_id) = ticket_id {
+                let _ = self.gpu_wait_fences.take(ticket_id);
                 remu_gpu::retire_gpu_wait(ticket_id);
             }
             return Err(error);
+        }
+        if self.per_queue_guest_batches && ticket_id.is_some() {
+            self.statistics.shared_event_fallbacks_no_exact_producer = self
+                .statistics
+                .shared_event_fallbacks_no_exact_producer
+                .saturating_add(1);
         }
         if ticket_id.is_none() {
             match self.guest_memory_waits.observe_unsatisfied(key) {

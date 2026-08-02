@@ -1,13 +1,13 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::{
-    OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PipelineCompileCandidate,
-    QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
-};
 use super::super::{
     GPU_EVENTS_PER_TICK, GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER,
     GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD,
+};
+use super::{
+    OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PipelineCompileCandidate,
+    QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
 };
 use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait};
 use std::collections::{HashMap, VecDeque};
@@ -315,6 +315,7 @@ impl OrderedGpuEventReceiver {
             QueueBlockReason::GuestMemoryWait(_)
             | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => true,
             reason @ (QueueBlockReason::FlipSafetyWait(_)
+            | QueueBlockReason::GuestSharedEventHostEffect { .. }
             | QueueBlockReason::GraphicsPipeline(_)
             | QueueBlockReason::ComputePipeline(_)) => !block_resolved(reason),
         });
@@ -322,6 +323,7 @@ impl OrderedGpuEventReceiver {
             QueueBlockReason::GuestMemoryWait(_)
             | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
             reason @ (QueueBlockReason::FlipSafetyWait(_)
+            | QueueBlockReason::GuestSharedEventHostEffect { .. }
             | QueueBlockReason::GraphicsPipeline(_)
             | QueueBlockReason::ComputePipeline(_)) => block_resolved(reason),
         }) {
@@ -342,6 +344,7 @@ impl OrderedGpuEventReceiver {
                         Some(
                             QueueBlockReason::GuestMemoryWait(_)
                                 | QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
+                                | QueueBlockReason::GuestSharedEventHostEffect { .. }
                                 | QueueBlockReason::FlipSafetyWait(_)
                         )
                     )
@@ -656,7 +659,8 @@ impl OrderedGpuEventReceiver {
                     pipeline += 1;
                 }
                 QueueBlockReason::GuestMemoryWait(_)
-                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => memory += 1,
+                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
+                | QueueBlockReason::GuestSharedEventHostEffect { .. } => memory += 1,
                 QueueBlockReason::FlipSafetyWait(_) => flip += 1,
             }
         }
@@ -719,6 +723,17 @@ impl OrderedGpuEventReceiver {
                             }
                             QueueBlockReason::GuestMemoryWaitPendingTerminal(wait) => {
                                 format!("memory-terminal:{:#x}", wait.address)
+                            }
+                            QueueBlockReason::GuestSharedEventHostEffect {
+                                consumer_queue_id,
+                                consumer_ack,
+                                terminal_dependencies,
+                            } => {
+                                format!(
+                                    "shared-event-host:q{consumer_queue_id}/ack:{}/terminal:{}",
+                                    consumer_ack.is_some(),
+                                    terminal_dependencies.len()
+                                )
                             }
                             QueueBlockReason::FlipSafetyWait(wait) => format!(
                                 "flip-safety:{:#x}/index:{}/required:{:?}",

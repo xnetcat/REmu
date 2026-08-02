@@ -3,21 +3,21 @@
 
 use super::super::WritebackTrigger;
 use super::{
-    GuestMemoryWriteOperation, MetalPresenter, PendingGlobalWriteback, PendingGuestMemoryWrite,
-    RangeSet, ResourceSpan, WriteWatchRefresh, guest_batch_writes_overlap, guest_ranges_overlap,
-    guest_texture_byte_count, merge_guest_batch_result, read_guest_memory_wait_value,
-    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_memory_copy,
-    refresh_resident_texture_write_watch, retire_sampled_textures_matching,
-    trace_resident_texture_removal,
+    GuestMemoryWriteOperation, MetalPresenter, OrderedEventSource, PendingGlobalWriteback,
+    PendingGuestMemoryWrite, RangeSet, ResourceSpan, WriteWatchRefresh, guest_batch_writes_overlap,
+    guest_ranges_overlap, guest_texture_byte_count, merge_guest_batch_result,
+    read_guest_memory_wait_value, rearm_color_metadata_clear, rearm_depth_metadata_clear,
+    record_diagnostic_memory_copy, refresh_resident_texture_write_watch,
+    retire_sampled_textures_matching, trace_resident_texture_removal,
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use remu_gpu::{
     GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
+    GpuWaitId,
 };
 use remu_memory::{
     CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_shared_mapping_identity,
-    notify_guest_memory_written, read_guest_shared_backing,
-    write_guest_shared_backing_if_identity,
+    notify_guest_memory_written, read_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +43,7 @@ impl MetalPresenter {
 
     pub(crate) fn execute_guest_memory_release(
         &mut self,
+        source: OrderedEventSource,
         release: GpuMemoryRelease,
     ) -> Result<(), String> {
         if release.address == 0 {
@@ -58,7 +59,22 @@ impl MetalPresenter {
                 8
             },
         );
-        self.queue_pending_guest_memory_write(GuestMemoryWriteOperation::Release(release))
+        let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(release))?;
+        let matching_waits = release_shared_event_waits(release);
+        if self.per_queue_guest_batches && !matching_waits.is_empty() {
+            let OrderedEventSource::GuestQueue(queue_id) = source else {
+                return Err("guest memory release has no logical queue identity".to_owned());
+            };
+            if self.active_open_guest_batch().is_some() {
+                self.encode_guest_release_shared_event(queue_id, &matching_waits)?;
+            } else {
+                self.statistics.shared_event_fallbacks_no_exact_producer = self
+                    .statistics
+                    .shared_event_fallbacks_no_exact_producer
+                    .saturating_add(1);
+            }
+        }
+        self.queue_pinned_guest_memory_write(pending)
     }
 
     pub(crate) fn execute_guest_memory_copy(&mut self, copy: GpuMemoryCopy) -> Result<(), String> {
@@ -205,8 +221,7 @@ impl MetalPresenter {
                 bytes
                     .try_reserve_exact(byte_count)
                     .map_err(|error| format!("could not stage DMA copy source: {error}"))?;
-                if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref()
-                {
+                if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref() {
                     bytes.extend_from_slice(snapshot);
                 } else {
                     // SAFETY: the runtime decodes DMA only for bounded non-null guest virtual
@@ -221,8 +236,7 @@ impl MetalPresenter {
                     bytes,
                 })?;
             } else {
-                if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref()
-                {
+                if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref() {
                     // SAFETY: snapshot validation above proves a complete immutable packet-time
                     // source, and the runtime validated the destination guest mapping.
                     unsafe {
@@ -328,6 +342,13 @@ impl MetalPresenter {
         write: GuestMemoryWriteOperation,
     ) -> Result<(), String> {
         let write = pin_guest_memory_write(write)?;
+        self.queue_pinned_guest_memory_write(write)
+    }
+
+    fn queue_pinned_guest_memory_write(
+        &mut self,
+        write: PendingGuestMemoryWrite,
+    ) -> Result<(), String> {
         // RELEASE_MEM/WRITE_DATA label updates are ordered after the Metal work already encoded
         // in this batch, but do not themselves require a new Metal submission. Publish them when
         // the owning command buffer retires. A later wait can inspect the deferred value, while
@@ -342,6 +363,50 @@ impl MetalPresenter {
             apply_pending_guest_memory_writes(std::slice::from_ref(&write))?;
             self.record_produced_guest_memory_writes(std::slice::from_ref(&write));
         }
+        Ok(())
+    }
+
+    fn encode_guest_release_shared_event(
+        &mut self,
+        queue_id: u64,
+        matching_waits: &[GpuWaitId],
+    ) -> Result<(), String> {
+        let state = self
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .ok_or_else(|| format!("missing guest queue {queue_id} for RELEASE_MEM"))?;
+        let fence = match state.shared_event_timeline.allocate_fence() {
+            Ok(fence) => fence,
+            Err(_) => {
+                self.statistics.shared_event_fallbacks_timeline_overflow = self
+                    .statistics
+                    .shared_event_fallbacks_timeline_overflow
+                    .saturating_add(1);
+                return Ok(());
+            }
+        };
+        let batch = state
+            .open_batch
+            .as_mut()
+            .ok_or("shared-event release has no open producer batch")?;
+        batch.close_active_pass_encoders();
+        batch
+            .command_buffer
+            .encode_signal_event(state.shared_event_timeline.event(), fence.value());
+        batch.max_encoded_signal = Some(fence);
+        batch
+            .signal_checkpoints
+            .push(super::super::SharedEventSignalCheckpoint {
+                fence,
+                global_writeback_count: batch.global_writebacks.len(),
+                guest_write_range_count: batch.guest_write_ranges.len(),
+                memory_write_count: batch.memory_writes.len(),
+            });
+        for &wait_id in matching_waits {
+            let _ = self.gpu_wait_fences.bind_if_unbound(wait_id, fence);
+        }
+        self.statistics.shared_event_signals =
+            self.statistics.shared_event_signals.saturating_add(1);
         Ok(())
     }
 
@@ -517,10 +582,9 @@ impl GuestMemoryWriteOperation {
                     4
                 },
             ),
-            Self::Copy { address, bytes } => (
-                *address,
-                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            ),
+            Self::Copy { address, bytes } => {
+                (*address, u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            }
             Self::Fill {
                 address,
                 dword_count,
@@ -638,6 +702,50 @@ impl GuestMemoryWriteOperation {
                 (payload, length)
             }
         }
+    }
+}
+
+fn release_shared_event_waits(release: GpuMemoryRelease) -> Vec<GpuWaitId> {
+    let byte_count = match release.value {
+        GpuMemoryReleaseValue::Immediate32(_) => 4,
+        GpuMemoryReleaseValue::Immediate64(_) => 8,
+        GpuMemoryReleaseValue::Timestamp => return Vec::new(),
+    };
+    remu_gpu::pending_gpu_waits_overlapping(release.address, byte_count)
+        .into_iter()
+        .filter_map(|(id, wait)| {
+            release_value_for_wait(release, wait)
+                .is_some_and(|value| wait.is_satisfied_by(value))
+                .then_some(id)
+        })
+        .collect()
+}
+
+pub(crate) fn release_value_for_wait(
+    release: GpuMemoryRelease,
+    wait: GpuMemoryWait,
+) -> Option<u64> {
+    match release.value {
+        GpuMemoryReleaseValue::Immediate32(value)
+            if !wait.is_64_bit && wait.address == release.address =>
+        {
+            Some(u64::from(value))
+        }
+        GpuMemoryReleaseValue::Immediate64(value) if wait.address == release.address => {
+            Some(if wait.is_64_bit {
+                value
+            } else {
+                value & u64::from(u32::MAX)
+            })
+        }
+        GpuMemoryReleaseValue::Immediate64(value)
+            if !wait.is_64_bit && wait.address == release.address.checked_add(4)? =>
+        {
+            Some(value >> 32)
+        }
+        GpuMemoryReleaseValue::Immediate32(_)
+        | GpuMemoryReleaseValue::Immediate64(_)
+        | GpuMemoryReleaseValue::Timestamp => None,
     }
 }
 
@@ -990,7 +1098,10 @@ pub(crate) fn apply_pending_guest_memory_writes(
                 byte_count,
                 &payload[..payload_length],
             );
-            if matches!(pending_write.operation, GuestMemoryWriteOperation::Copy { .. }) {
+            if matches!(
+                pending_write.operation,
+                GuestMemoryWriteOperation::Copy { .. }
+            ) {
                 // The immediate copy path notified the watch layer as it wrote; the deferred
                 // application owes the same dirtying so armed views of the destination revalidate.
                 let _ = notify_guest_memory_written(address, byte_count);

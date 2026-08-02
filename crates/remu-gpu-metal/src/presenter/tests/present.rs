@@ -12,18 +12,18 @@ use remu_gpu::{
 use remu_shader::PixelOutputKind;
 use std::time::{Duration, Instant};
 
+use super::super::{FlipTerminalSource, PendingPresentation};
 use super::{
     DecodedRenderTarget, DisplayConfiguration, GuestCommandBatch, GuestTextureDescriptor,
     MetalPresenter, OrderedEventPoll, OrderedEventSource, PendingFlip, PresentationResolution,
-    QueueBlockReason,
-    VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
-    appkit_persistent_state_is_ignored, clear_appkit_persistent_state_override,
-    decode_scanout_target, disable_appkit_state_restoration, headless_metal_value_is_enabled,
+    QueueBlockReason, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
+    VIDEO_OUT_TILING_MODE_TILE, appkit_persistent_state_is_ignored,
+    clear_appkit_persistent_state_override, decode_scanout_target,
+    disable_appkit_state_restoration, headless_metal_value_is_enabled,
     parse_presentation_resolution, presentation_drawable_size, presentation_viewport,
     process_memory_statistics, process_resident_bytes, raw_video_out_layout_is_linear,
     raw_video_out_texture_descriptor, read_texture_linear,
 };
-use super::super::{FlipTerminalSource, PendingPresentation};
 
 #[test]
 fn presenter_shows_and_hides_a_host_splash_without_guest_video_out() {
@@ -461,7 +461,10 @@ fn a_flip_without_a_presentable_surface_still_completes() {
         buffer_index: flip.buffer_index,
         required_flip_sequence: None,
     });
-    assert!(safe, "the surface-less terminal tail releases an unsnapshotted buffer");
+    assert!(
+        safe,
+        "the surface-less terminal tail releases an unsnapshotted buffer"
+    );
 
     presenter.finalize_pending_flip();
     assert!(
@@ -489,7 +492,10 @@ fn flip_wait_binds_only_to_the_latest_prior_flip_for_its_exact_buffer() {
         required_flip_sequence: None,
     });
     assert_eq!(same.required_flip_sequence, Some(1));
-    assert!(!same_safe, "same-buffer wait must bind to the prior unsafe flip");
+    assert!(
+        !same_safe,
+        "same-buffer wait must bind to the prior unsafe flip"
+    );
 
     let (different, different_safe) = presenter.bind_flip_safety_wait(GpuFlipWait {
         address: 0xefc2_0000_00,
@@ -520,7 +526,12 @@ fn flip_safety_prefix_closes_only_after_an_out_of_order_hole_is_safe() {
     presenter.mark_flip_buffer_safe(2, "newer-first");
     assert_eq!(presenter.safe_flip_sequence_prefix, 0);
     assert_eq!(presenter.flip_buffer_safety.len(), 2);
-    assert!(presenter.flip_buffer_safety.get(&2).is_some_and(|safety| safety.safe));
+    assert!(
+        presenter
+            .flip_buffer_safety
+            .get(&2)
+            .is_some_and(|safety| safety.safe)
+    );
 
     presenter.mark_flip_buffer_safe(1, "older-closes-hole");
     assert_eq!(presenter.safe_flip_sequence_prefix, 2);
@@ -545,7 +556,7 @@ fn terminal_private_snapshot_releases_a_blocked_flip_wait() {
         .expect("Metal queue")
         .new_command_buffer()
         .to_owned();
-    presenter.record_flip_snapshot_command(1, command_buffer.clone());
+    presenter.record_flip_snapshot_command(1, command_buffer.clone(), None);
     let wait = GpuFlipWait {
         address: flip.address,
         buffer_index: flip.buffer_index,
@@ -564,6 +575,8 @@ fn terminal_private_snapshot_releases_a_blocked_flip_wait() {
 fn flip_then_wait_in_one_submission_queues_snapshot_before_the_wait_can_block() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    presenter.per_queue_guest_batches = true;
+    presenter.set_active_guest_queue(Some(7));
     let descriptor = GuestTextureDescriptor {
         address: 0xefc0_0000_00,
         width: 64,
@@ -606,15 +619,37 @@ fn flip_then_wait_in_one_submission_queues_snapshot_before_the_wait_can_block() 
         .get(&1)
         .and_then(|safety| safety.snapshot_command_buffer.clone())
         .expect("flip handler enqueued an independent snapshot command buffer");
+    let snapshot_ready = presenter
+        .flip_buffer_safety
+        .get(&1)
+        .and_then(|safety| safety.snapshot_ready)
+        .expect("per-queue snapshot publishes a readiness fence");
+    assert_eq!(snapshot_ready.producer().queue_id(), 7);
     assert_ne!(snapshot.status(), MTLCommandBufferStatus::NotEnqueued);
     let wait = GpuFlipWait {
         address: flip.address,
         buffer_index: flip.buffer_index,
         required_flip_sequence: None,
     };
-    assert_eq!(presenter.bind_flip_safety_wait(wait).0.required_flip_sequence, Some(1));
+    assert_eq!(
+        presenter
+            .bind_flip_safety_wait(wait)
+            .0
+            .required_flip_sequence,
+        Some(1)
+    );
 
     snapshot.wait_until_completed();
+    assert!(
+        presenter
+            .guest_queue_batches
+            .get(&7)
+            .expect("snapshot producer queue")
+            .shared_event_timeline
+            .event()
+            .signaled_value()
+            >= snapshot_ready.value()
+    );
     presenter.retire_completed_flip_snapshots();
     assert!(presenter.bind_flip_safety_wait(wait).1);
 }
@@ -633,11 +668,15 @@ fn superseded_flip_without_a_snapshot_releases_its_buffer() {
     presenter.register_flip_completion_join(flip);
     presenter.release_flip_buffer_without_snapshot(1, "superseded-before-snapshot");
 
-    assert!(presenter.bind_flip_safety_wait(GpuFlipWait {
-        address: flip.address,
-        buffer_index: flip.buffer_index,
-        required_flip_sequence: None,
-    }).1);
+    assert!(
+        presenter
+            .bind_flip_safety_wait(GpuFlipWait {
+                address: flip.address,
+                buffer_index: flip.buffer_index,
+                required_flip_sequence: None,
+            })
+            .1
+    );
 }
 
 #[test]
@@ -939,6 +978,8 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
             memory_writes: Vec::new(),
             render_pass: None,
             compute_encoder: None,
+            max_encoded_signal: None,
+            signal_checkpoints: Vec::new(),
             completion_sequences: vec![77],
         });
 
@@ -974,7 +1015,10 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
         .expect("the superseded flip remains in its completion join");
     assert_eq!(deferred.submission_sequence, Some(77));
     assert!(!deferred.submission_terminal);
-    assert_eq!(deferred.terminal_source, Some(FlipTerminalSource::Superseded));
+    assert_eq!(
+        deferred.terminal_source,
+        Some(FlipTerminalSource::Superseded)
+    );
 
     // Once the batch reaches a terminal state and retires, the deferred completion publishes.
     outstanding.commit();

@@ -104,17 +104,34 @@ impl MetalPresenter {
             if self.layer.is_none() {
                 if let Some(command_queue) = self.command_queue.clone() {
                     if let Some(sequence) = self.claim_flip_terminal(flip.sequence) {
+                        let snapshot_ready = self
+                            .active_translated_scanout
+                            .filter(|scanout| scanout.sequence == flip.sequence)
+                            .and_then(|scanout| scanout.snapshot_ready);
+                        let snapshot_event = snapshot_ready.map(|fence| {
+                            self.guest_queue_batches
+                                .get(&fence.producer().queue_id())
+                                .expect("snapshot fence producer queue remains live")
+                                .shared_event_timeline
+                                .event_owned()
+                        });
                         let command_buffer = command_queue.new_command_buffer().to_owned();
                         command_buffer.set_label("REMu surface-less flip retirement tail");
+                        if let (Some(fence), Some(event)) =
+                            (snapshot_ready, snapshot_event.as_ref())
+                        {
+                            command_buffer.encode_wait_for_event(event, fence.value());
+                        }
                         command_buffer.commit();
-                        self.pending_presentations.push_back(super::super::PendingPresentation {
-                            command_buffer,
-                            submitted_at: std::time::Instant::now(),
-                            flip_sequence: Some(sequence),
-                            flip_terminal_source: super::super::FlipTerminalSource::SurfaceLess,
-                            drawable_presented: None,
-                            await_presented_reported: false,
-                        });
+                        self.pending_presentations
+                            .push_back(super::super::PendingPresentation {
+                                command_buffer,
+                                submitted_at: std::time::Instant::now(),
+                                flip_sequence: Some(sequence),
+                                flip_terminal_source: super::super::FlipTerminalSource::SurfaceLess,
+                                drawable_presented: None,
+                                await_presented_reported: false,
+                            });
                     }
                 } else {
                     eprintln!(
@@ -199,6 +216,7 @@ impl MetalPresenter {
                 address: flip.address,
                 buffer_index: flip.buffer_index,
                 snapshot_command_buffer: None,
+                snapshot_ready: None,
                 safe: false,
                 accepted_at: std::time::Instant::now(),
             },
@@ -230,6 +248,7 @@ impl MetalPresenter {
         &mut self,
         sequence: u64,
         command_buffer: metal::CommandBuffer,
+        snapshot_ready: Option<super::super::SharedEventFence>,
     ) {
         let Some(safety) = self.flip_buffer_safety.get_mut(&sequence) else {
             return;
@@ -238,6 +257,7 @@ impl MetalPresenter {
             return;
         }
         safety.snapshot_command_buffer = Some(command_buffer);
+        safety.snapshot_ready = snapshot_ready;
         if completion_order_trace_sequence(sequence) {
             eprintln!(
                 "[REMu][WAIT-FLIP-DONE] phase=snapshot-queued flip={sequence} address={:#x} index={}",
@@ -255,6 +275,7 @@ impl MetalPresenter {
         }
         safety.safe = true;
         safety.snapshot_command_buffer = None;
+        safety.snapshot_ready = None;
         if completion_order_trace_sequence(sequence) {
             eprintln!(
                 "[REMu][WAIT-FLIP-DONE] phase=safe flip={sequence} address={:#x} index={} source={source} age_ms={:.3}",
@@ -304,7 +325,9 @@ impl MetalPresenter {
             .filter_map(|(&sequence, safety)| {
                 let command_buffer = safety.snapshot_command_buffer.as_ref()?;
                 match command_buffer.status() {
-                    MTLCommandBufferStatus::Completed => Some((sequence, "snapshot-completed")),
+                    MTLCommandBufferStatus::Completed => {
+                        Some((sequence, "snapshot-completed", None))
+                    }
                     MTLCommandBufferStatus::Error => {
                         eprintln!(
                             "[REMu][METAL] {}",
@@ -313,15 +336,28 @@ impl MetalPresenter {
                                 command_buffer,
                             )
                         );
-                        Some((sequence, "snapshot-error"))
+                        Some((sequence, "snapshot-error", safety.snapshot_ready))
                     }
                     _ => None,
                 }
             })
             .collect::<Vec<_>>();
-        for (sequence, source) in terminal {
+        for (sequence, source, failed_fence) in terminal {
             // A terminal failure cannot keep reading the guest buffer and cannot be retried in
             // place. Report it above, then release the queue dependency so later frames progress.
+            if let Some(fence) = failed_fence
+                && let Some(state) = self.guest_queue_batches.get(&fence.producer().queue_id())
+                && state.shared_event_timeline.event().signaled_value() < fence.value()
+            {
+                state
+                    .shared_event_timeline
+                    .event()
+                    .set_signaled_value(fence.value());
+                self.statistics.shared_event_error_advances = self
+                    .statistics
+                    .shared_event_error_advances
+                    .saturating_add(1);
+            }
             self.mark_flip_buffer_safe(sequence, source);
         }
     }
@@ -525,9 +561,7 @@ impl MetalPresenter {
         // It must not publish the allocation while a draw writing the same target is still parked
         // on a cold pipeline: that presents the compositor clear and then treats the cover's
         // output as the next frame. The parked draw's own boundary finalizes it instead.
-        if !initial_flip_boundary
-            && self.pipeline_blocked_scanout_address().is_some()
-        {
+        if !initial_flip_boundary && self.pipeline_blocked_scanout_address().is_some() {
             return;
         }
         if initial_flip_boundary {
@@ -776,10 +810,26 @@ impl MetalPresenter {
             .clone();
         let queue = self.active_guest_command_queue()?;
         let snapshot = self.ensure_scanout_snapshot_texture(&device, descriptor);
-        // End and commit every encoder before the flip. The single Metal queue then orders this
-        // private-to-private copy between the frame's producer work and any later command stream
-        // that clears or reuses the same VideoOut allocation.
+        // End and commit every producer encoder before the flip. Per-queue mode publishes an
+        // explicit fence after this private-to-private copy because presentation and surface-less
+        // retirement use the legacy host queue; queue submission order alone cannot order them.
         self.flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::FlipSnapshot)?;
+        let snapshot_ready = if self.per_queue_guest_batches {
+            let queue_id = self
+                .active_guest_queue
+                .ok_or("translated scanout has no active guest queue")?;
+            let state = self.guest_queue_batches.get_mut(&queue_id).ok_or_else(|| {
+                format!("translated scanout guest queue {queue_id} is unavailable")
+            })?;
+            Some(
+                state
+                    .shared_event_timeline
+                    .allocate_fence()
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
         let command_buffer = queue.new_command_buffer().to_owned();
         command_buffer.set_label("REMu ordered VideoOut snapshot");
         let blit = command_buffer.new_blit_command_encoder();
@@ -796,6 +846,13 @@ impl MetalPresenter {
             MTLOrigin { x: 0, y: 0, z: 0 },
         );
         blit.end_encoding();
+        if let Some(fence) = snapshot_ready {
+            let state = self
+                .guest_queue_batches
+                .get(&fence.producer().queue_id())
+                .expect("snapshot fence producer queue remains live");
+            command_buffer.encode_signal_event(state.shared_event_timeline.event(), fence.value());
+        }
         command_buffer.commit();
         self.frame_texture = Some(snapshot);
         self.frame_texture_size = (descriptor.width, descriptor.height);
@@ -803,7 +860,7 @@ impl MetalPresenter {
             .pending_flip
             .filter(|flip| flip.address == address)
             .map_or(self.next_flip_sequence, |flip| flip.sequence);
-        self.record_flip_snapshot_command(sequence, command_buffer);
+        self.record_flip_snapshot_command(sequence, command_buffer, snapshot_ready);
         let snapshotted_content_version = self
             .resident_guest_textures
             .get(&descriptor)
@@ -814,6 +871,7 @@ impl MetalPresenter {
             width,
             height,
             sequence,
+            snapshot_ready,
             snapshotted_content_version,
         });
         if trace_scanout_writes() {
@@ -876,11 +934,9 @@ impl MetalPresenter {
         if current_version <= active.snapshotted_content_version {
             return;
         }
-        if let Err(error) = self.activate_translated_scanout(
-            active.address,
-            display.width,
-            display.height,
-        ) {
+        if let Err(error) =
+            self.activate_translated_scanout(active.address, display.width, display.height)
+        {
             eprintln!("[REMu][METAL] translated scanout refresh failed: {error}");
         }
     }

@@ -16,31 +16,30 @@ use std::time::Instant;
 
 use super::{
     ActiveTranslatedScanout, EVENT_POLL_INTERVAL, FlipTerminalSource, FlushPolicy,
-    GuestBatchFlushReason, GuestTextureDescriptor,
-    HostSplashTexture, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
-    MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, MetalPresenter,
-    OrderedEventSource, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED,
-    PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_COMPUTE_GATES,
-    PIPELINE_DRAW_GATES, PendingPresentation, PresentationResolution, PresentationResources,
-    PresenterFlow, RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_FLIP_AGE_LABELS,
+    GuestBatchFlushReason, GuestTextureDescriptor, HostSplashTexture, MIP_UPLOAD_BYTES,
+    MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES, MODE27_DECODE_COUNT,
+    MODE27_DECODE_NANOSECONDS, MetalPresenter, OrderedEventSource, PIPELINE_COMPILE_COMPLETED,
+    PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
+    PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PendingPresentation, PresentationResolution,
+    PresentationResources, PresenterFlow, RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_FLIP_AGE_LABELS,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WORK_AGE_LABELS,
-    RESIDENT_WRITE_ATTRIBUTION_MISSES, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
-    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
-    SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
-    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, TEXTURE_DIRTY_VALIDATION_BYTES,
-    TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
-    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
-    TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh,
-    capture_interval,
+    RESIDENT_WRITE_ATTRIBUTION_MISSES, SAMPLED_ALIAS_WRITEBACK_BYTES,
+    SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
+    SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
+    SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
+    TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+    TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
+    TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, capture_interval,
     compile_metal_library_with_tools, completed_command_buffer_gpu_duration,
     decode_guest_texture_linear_from_raw, describe_guest_batch, diagnostic_scanout_writer,
     diagnostic_texture_writer, process_memory_statistics, raw_video_out_texture_descriptor,
     read_texture_linear, refresh_resident_texture_write_watch,
     resident_texture_activity_latest_work, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_lifetime_diagnostics_enabled,
-    resident_texture_ownership_stats,
-    snapshot_guest_texture_raw, take_mode27_work_details, take_texture_dirty_work_details,
-    take_texture_snapshot_work_details, trace_resident_texture_removal, trace_scanout_writes,
+    resident_texture_ownership_stats, snapshot_guest_texture_raw, take_mode27_work_details,
+    take_texture_dirty_work_details, take_texture_snapshot_work_details,
+    trace_resident_texture_removal, trace_scanout_writes,
 };
 mod scanout;
 mod window;
@@ -60,18 +59,19 @@ impl MetalPresenter {
         }
         self.upload_pending_frame();
         self.refresh_translated_scanout_before_present();
-        let translated_snapshot = self
+        let active_translated_scanout = self
             .active_translated_scanout
-            .filter(|scanout| scanout.sequence == self.uploaded_flip_sequence)
-            .and_then(|scanout| {
-                self.scanout_snapshot_textures
-                    .get(&scanout.address)
-                    .filter(|snapshot| {
-                        snapshot.descriptor.width == scanout.width
-                            && snapshot.descriptor.height == scanout.height
-                    })
-                    .map(|snapshot| (snapshot.descriptor, snapshot.texture.clone()))
-            });
+            .filter(|scanout| scanout.sequence == self.uploaded_flip_sequence);
+        let snapshot_ready = active_translated_scanout.and_then(|scanout| scanout.snapshot_ready);
+        let translated_snapshot = active_translated_scanout.and_then(|scanout| {
+            self.scanout_snapshot_textures
+                .get(&scanout.address)
+                .filter(|snapshot| {
+                    snapshot.descriptor.width == scanout.width
+                        && snapshot.descriptor.height == scanout.height
+                })
+                .map(|snapshot| (snapshot.descriptor, snapshot.texture.clone()))
+        });
         let guest_frame_texture = self.frame_texture.clone();
         let host_splash = self
             .host_splash
@@ -95,6 +95,18 @@ impl MetalPresenter {
                 self.display.map(|display| (display.width, display.height)),
             )
         };
+        let snapshot_wait = (presentation_source == "translated")
+            .then_some(snapshot_ready)
+            .flatten()
+            .map(|fence| {
+                let event = self
+                    .guest_queue_batches
+                    .get(&fence.producer().queue_id())
+                    .expect("snapshot fence producer queue remains live")
+                    .shared_event_timeline
+                    .event_owned();
+                (fence, event)
+            });
         // Raw VideoOut fallback can be captured immediately before the translated render target
         // becomes available. Do not let that fallback consume the capture interval: the first
         // translated snapshot is the authoritative evidence for what Metal is actually about to
@@ -173,6 +185,9 @@ impl MetalPresenter {
         };
         let command_buffer = queue.new_command_buffer().to_owned();
         command_buffer.set_label("REMu guest presentation");
+        if let Some((fence, event)) = snapshot_wait.as_ref() {
+            command_buffer.encode_wait_for_event(event, fence.value());
+        }
         let Ok(destination_width) = u32::try_from(drawable.texture().width()) else {
             return;
         };

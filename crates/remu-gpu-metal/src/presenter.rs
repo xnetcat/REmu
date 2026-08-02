@@ -31,9 +31,6 @@ mod present;
 mod readback;
 mod sampler;
 mod shader;
-// B17 consumes these primitives when presenter batches become guest-queue-owned. Keep the layer
-// compiled and tested before that structural integration without pretending it is active yet.
-#[allow(dead_code)]
 mod shared_event;
 mod stats;
 mod submission;
@@ -50,12 +47,10 @@ use self::decode::{
     decode_image_descriptor, decode_metal_blend_attachment, decode_raster_state,
     decode_render_target_format, decode_render_targets, decode_scissor, decode_viewport,
     fallback_image_descriptor, graphics_pipeline_key, guest_viewport_y_scale_is_negative,
-    image_component_class,
-    initial_depth_clear_for_target, initial_render_target_clear_color, metal_color_write_mask,
-    metal_nonindexed_vertex_count, metal_primitive_type, noop_placeholder_cover_draw,
-    ngg_mesh_base_vertex,
-    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_indexed_ngg_indices,
-    prepare_nonindexed_ngg_indices,
+    image_component_class, initial_depth_clear_for_target, initial_render_target_clear_color,
+    metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
+    ngg_mesh_base_vertex, noop_placeholder_cover_draw, prepare_indexed_ngg_indices,
+    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
     raw_video_out_texture_descriptor, read_draw_indices, register_value,
     render_target_cmask_address, render_target_fast_clear_color, sampled_alias_descriptor,
 };
@@ -66,9 +61,9 @@ use self::decode::{
     DB_DEPTH_CLEAR, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE,
     DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, NGG_MESHLET_WORDS_PER_GROUP,
     SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
-    VIDEO_OUT_TILING_MODE_TILE, common_render_target_array_length, decode_fast_clear_color,
-    decode_ngg_subgroup_limits, decode_render_targets_from_registers, decode_scanout_target,
-    apply_transparent_premultiplied_fill_clear, disabled_metal_blend_attachment,
+    VIDEO_OUT_TILING_MODE_TILE, apply_transparent_premultiplied_fill_clear,
+    common_render_target_array_length, decode_fast_clear_color, decode_ngg_subgroup_limits,
+    decode_render_targets_from_registers, decode_scanout_target, disabled_metal_blend_attachment,
     graphics_shader_resource_key, initial_depth_clear_value,
     is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
     ngg_fullscreen_cover_draw, pixel_input_controls, raw_video_out_layout_is_linear,
@@ -82,9 +77,7 @@ use self::diagnostics::{
     capture_target_sample_textures, diagnostic_capture_pixel_output,
     diagnostic_capture_vertex_position, diagnostic_context_register_snapshot,
     diagnostic_disable_blending, diagnostic_disable_culling, diagnostic_disable_depth,
-    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
-    diagnostic_dump_glyph_draw,
-    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader,
+    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa, diagnostic_dump_glyph_draw,
     diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
@@ -94,21 +87,21 @@ use self::diagnostics::{
     diagnostic_force_visible_clip_depth, diagnostic_global_binding_head,
     diagnostic_overlapping_global_writers, diagnostic_overlapping_memory_copies,
     diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
-    diagnostic_scanout_writer, diagnostic_shader_summary, diagnostic_target_draw_filter,
-    diagnostic_texture_writer, diagnostic_texture_writer_enabled,
-    diagnostic_trace_all_target_contents, diagnostic_trace_target_contents,
-    diagnostic_trace_target_maximum_draw, diagnostic_trace_target_stride,
-    diagnostic_uploaded_global_binding_head, diagnostic_use_draw_merged_wave_counts,
-    diagnostic_video_chain_selected_draw, dump_msl_compute_filter_matches,
-    dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
-    evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison,
+    diagnostic_scanout_writer, diagnostic_shader_summary, diagnostic_skip_export_shader,
+    diagnostic_skip_pixel_shader, diagnostic_target_draw_filter, diagnostic_texture_writer,
+    diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
+    diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
+    diagnostic_trace_target_stride, diagnostic_uploaded_global_binding_head,
+    diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
+    dump_msl_compute_filter_matches, dump_msl_instruction_filter_matches,
+    dump_msl_pixel_filter_matches, evaluation_samples_glyph_atlas,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     record_diagnostic_global_writers, record_diagnostic_memory_copy,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer,
-    should_record_diagnostic_target_writer, trace_image_descriptors, trace_msaa_writes,
-    trace_glyph_atlas, trace_scanout_writes, trace_target_sampling,
-    trace_video_target_compute_consumer,
-    trace_video_target_consumers, trace_video_target_draw_consumer, video_target_binding_summary,
+    should_record_diagnostic_target_writer, trace_glyph_atlas, trace_image_descriptors,
+    trace_msaa_writes, trace_scanout_writes, trace_target_sampling,
+    trace_video_target_compute_consumer, trace_video_target_consumers,
+    trace_video_target_draw_consumer, video_target_binding_summary,
 };
 #[cfg(test)]
 use self::execute::{export_resource_render_stage, ngg_mesh_dispatch_required};
@@ -146,17 +139,20 @@ use self::shader::{
     effective_global_memory_binding, fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, ngg_memoryless_cover_export_stage,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
-    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_scalars,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base,
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
     lift_expanded_vertex_buffer_num_records, missing_vertex_parameter_exports,
     ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_mesh_draw_supported,
-    procedural_rectangle_export_stage,
-    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
-    shader_scalar_metadata, truncated_memoryless_ngg_rectangle_cover,
+    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
+    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
+    truncated_memoryless_ngg_rectangle_cover,
+};
+use self::shared_event::{
+    GpuWaitFenceMap, SharedEventFence, SharedEventProducerId, SharedEventTimeline,
 };
 #[cfg(test)]
 use self::stats::process_resident_bytes;
@@ -166,25 +162,22 @@ use self::stats::{
     OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD, OWNED_REMATERIALISE_BLIT,
     OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED,
     OWNED_REMATERIALISE_FAILED_CPU_GPU, OWNED_REMATERIALISE_FAILED_LAYOUT,
-    OWNED_REMATERIALISE_FAILED_MAPPING, OWNED_REMATERIALISE_FAILED_METAL,
-    OWNED_REMATERIALISE_VIEW,
+    OWNED_REMATERIALISE_FAILED_MAPPING, OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW,
     OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WRITE_ATTRIBUTION_MISSES,
-    RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_DISCARDED_BYTES,
-    RESIDENT_WRITEBACK_PUBLISHED, RESIDENT_WRITEBACK_PUBLISHED_BYTES,
-    SAMPLED_ALIAS_WRITEBACK_BYTES,
+    RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
+    RESIDENT_WRITEBACK_PUBLISHED_BYTES, SAMPLED_ALIAS_WRITEBACK_BYTES,
     SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    TEXTURE_SNAPSHOT_UNSTABLE_COUNT,
-    process_memory_statistics, record_mode27_work_detail, record_texture_dirty_work_detail,
-    record_texture_snapshot_work_detail, record_texture_work, take_mode27_work_details,
-    take_texture_dirty_work_details, take_texture_snapshot_work_details,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, process_memory_statistics, record_mode27_work_detail,
+    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
+    take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
 use self::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
@@ -196,15 +189,15 @@ use self::submission::{
     apply_pending_guest_memory_writes, pin_guest_memory_write, write_back_pending_globals,
 };
 use self::texture::{
-    RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, WrittenRegion,
-    decode_guest_texture_linear_from_raw,
+    RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
+    SpanQueryOrder, WrittenRegion, decode_guest_texture_linear_from_raw,
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_declared_span, resident_depth_sample_is_eligible, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
     retire_multisample_textures_overlapping_writeback, retire_sampled_textures_matching,
     retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
     snapshot_watched_guest_range, storage_image_requires_mip_hierarchy,
-    ResidentTextureMap, SpanQueryOrder, trace_resident_texture_removal, upload_image_textures,
+    trace_resident_texture_removal, upload_image_textures,
     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
     write_watched_guest_texture_linear,
 };
@@ -216,9 +209,9 @@ use self::texture::{
     depth_array_face_set_is_complete, ensure_mipmapped_resident_texture_in_map,
     guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
-    prepare_sampled_texture_upload, resident_texture_eviction_plan, sampled_texture_cache_accepts,
-    rematerialisation_blit_source_origin_y, sampled_texture_cache_needs_reload,
-    sampled_texture_cache_requires_eviction,
+    prepare_sampled_texture_upload, rematerialisation_blit_source_origin_y,
+    resident_texture_eviction_plan, sampled_texture_cache_accepts,
+    sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
     sampled_texture_key, sampled_texture_raw_range, snapshot_guest_texture_linear,
     snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
 };
@@ -238,8 +231,7 @@ use self::tiling::{
     encode_mode5_mip_chain_into_raw, guest_texture_descriptors_share_component_reordered_storage,
     mode5_within_block_byte_offset, mode9_within_block_byte_offset,
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_source_byte_offset,
-    mode27_within_block_byte_offset,
-    mode27_within_block_byte_offset_for_format,
+    mode27_within_block_byte_offset, mode27_within_block_byte_offset_for_format,
 };
 
 #[cfg(test)]
@@ -480,6 +472,7 @@ struct FlipBufferSafety {
     address: u64,
     buffer_index: u32,
     snapshot_command_buffer: Option<CommandBuffer>,
+    snapshot_ready: Option<SharedEventFence>,
     safe: bool,
     accepted_at: Instant,
 }
@@ -490,6 +483,8 @@ struct ActiveTranslatedScanout {
     width: u32,
     height: u32,
     sequence: u64,
+    /// Orders the guest-queue snapshot copy before legacy-queue presentation/tail work.
+    snapshot_ready: Option<SharedEventFence>,
     /// Resident `content_version` copied into the private scanout snapshot texture.
     snapshotted_content_version: u64,
 }
@@ -974,6 +969,13 @@ enum QueueBlockReason {
     /// Unlike a producerless wait, this queue does not need periodic CPU polling. Terminal
     /// publication wakes the exact overlapping wait after the label becomes guest-visible.
     GuestMemoryWaitPendingTerminal(GpuMemoryWait),
+    /// Presenter-thread work must wait for both the consumer to cross its encoded wait and every
+    /// producer's terminal host-side publication.
+    GuestSharedEventHostEffect {
+        consumer_queue_id: u64,
+        consumer_ack: Option<SharedEventFence>,
+        terminal_dependencies: Vec<SharedEventFence>,
+    },
     FlipSafetyWait(GpuFlipWait),
     GraphicsPipeline(GraphicsPipelineKey),
     ComputePipeline(ComputePipelineKey),
@@ -1139,7 +1141,9 @@ impl ResidentGuestTexture {
     ///
     /// A newly created allocation owns everything it declares: it either uploaded guest RAM or is
     /// about to be fully overwritten, and either way no other resident may answer for those bytes.
-    fn declared_authority(write_watch: &GuestTextureWriteWatch) -> (Option<ResourceSpan>, RangeSet) {
+    fn declared_authority(
+        write_watch: &GuestTextureWriteWatch,
+    ) -> (Option<ResourceSpan>, RangeSet) {
         let span = resident_declared_span(write_watch);
         if span.is_none_or(|span| span.backing().is_none()) {
             OWNED_UNRESOLVED_SPAN.fetch_add(1, Ordering::Relaxed);
@@ -1211,7 +1215,11 @@ impl ResidentGuestTexture {
 
     #[cfg(test)]
     fn note_gpu_authored_whole_span(&mut self) {
-        let written = self.span.as_ref().map(RangeSet::for_span).unwrap_or_default();
+        let written = self
+            .span
+            .as_ref()
+            .map(RangeSet::for_span)
+            .unwrap_or_default();
         self.note_gpu_authored(&written);
     }
 
@@ -1382,6 +1390,11 @@ struct CachedGlobalBuffer {
 /// submission behaviour exactly while the queue-local path can be validated independently.
 struct GuestQueueBatchState {
     command_queue: metal::CommandQueue,
+    shared_event_timeline: SharedEventTimeline,
+    host_retired_fence_value: u64,
+    host_dependencies: HashMap<SharedEventProducerId, u64>,
+    resource_dependencies: HashMap<SharedEventProducerId, u64>,
+    retired_fence_write_ranges: BTreeMap<u64, Vec<(u64, u64)>>,
     open_batch: Option<GuestCommandBatch>,
     committed_batches: VecDeque<GuestCommandBatch>,
     transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
@@ -1432,6 +1445,7 @@ enum FlushPolicy {
 enum GuestBatchFlushReason {
     EventLoop,
     BlockedWait,
+    SharedEventHostEffect,
     FlipSnapshot,
     WorkCapacity,
     CommandProcessorBarrier,
@@ -1457,10 +1471,18 @@ struct PresenterStatistics {
     batch_flushes_from_event_loop: u32,
     batch_flushes_for_guest_memory_write: u32,
     batch_flushes_for_blocked_wait: u32,
+    batch_flushes_for_shared_event_host_effect: u32,
     batch_flushes_for_flip_snapshot: u32,
     batch_flushes_for_work_capacity: u32,
     batch_flushes_for_command_processor_barrier: u32,
     batch_flushes_for_cpu_synchronization: u32,
+    shared_event_signals: u32,
+    shared_event_waits: u32,
+    shared_event_host_blocks: u32,
+    shared_event_host_wakes: u32,
+    shared_event_error_advances: u32,
+    shared_event_fallbacks_no_exact_producer: u32,
+    shared_event_fallbacks_timeline_overflow: u32,
     gpu_execution_time: Duration,
     presentation_queue_latency: Duration,
     last_audio_output_frames: u64,
@@ -1506,11 +1528,22 @@ struct GuestCommandBatch {
     memory_writes: Vec<PendingGuestMemoryWrite>,
     render_pass: Option<OpenGuestRenderPass>,
     compute_encoder: Option<ComputeCommandEncoder>,
+    /// Highest SharedEvent signal encoded at an exact command-stream point in this batch.
+    max_encoded_signal: Option<SharedEventFence>,
+    signal_checkpoints: Vec<SharedEventSignalCheckpoint>,
     /// Guest submissions whose final ordered work is contained in this Metal batch.
     ///
     /// Queue scheduling can complete a newer global sequence before an older blocked queue, so
     /// every boundary is retained rather than incorrectly treating the maximum as a prefix.
     completion_sequences: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SharedEventSignalCheckpoint {
+    fence: SharedEventFence,
+    global_writeback_count: usize,
+    guest_write_range_count: usize,
+    memory_write_count: usize,
 }
 
 struct GlobalUploadChunk {
@@ -1541,7 +1574,10 @@ enum GuestMemoryWriteOperation {
     /// them as `fence_label_dma`). Applying the copy at event-dequeue time made those fences
     /// visible ahead of the frame's in-flight Metal work, and the guest recycled frame memory
     /// its own threads were still writing.
-    Copy { address: u64, bytes: Vec<u8> },
+    Copy {
+        address: u64,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug)]
@@ -1875,6 +1911,7 @@ struct MetalPresenter {
     per_queue_guest_batches: bool,
     active_guest_queue: Option<u64>,
     guest_queue_batches: HashMap<u64, GuestQueueBatchState>,
+    gpu_wait_fences: GpuWaitFenceMap,
     presentation: Option<PresentationResources>,
     presentation_resolution: PresentationResolution,
     guest_bgra_bytes: Vec<u8>,
@@ -2079,6 +2116,7 @@ impl MetalPresenter {
                 .is_some_and(|value| value == "1"),
             active_guest_queue: None,
             guest_queue_batches: HashMap::new(),
+            gpu_wait_fences: GpuWaitFenceMap::default(),
             presentation,
             presentation_resolution,
             guest_bgra_bytes: Vec::new(),

@@ -5,17 +5,22 @@ use super::super::completion::{
     COMMAND_BUFFER_SETTLE_TIMEOUT, command_buffer_failure_message, settle_timeout_message,
     wait_until_settled_within,
 };
+use super::super::shared_event::{
+    SharedEventBatchTerminalState, SharedEventProducerId, terminal_shared_event_advance,
+};
 use super::super::{FlushPolicy, GuestQueueBatchState, PresenterStatistics};
-use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
-    GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter,
-    OrderedEventSource,
-    PendingGlobalWriteback, PendingGuestWriteRange, UploadedGlobalBuffer,
+    GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter, OrderedEventSource,
+    PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange, UploadedGlobalBuffer,
     guest_physical_ranges_overlap, guest_ranges_overlap,
 };
+use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use metal::foreign_types::ForeignType;
-use metal::{Buffer, CommandBuffer, ComputeCommandEncoder, Device, MTLCommandBufferStatus, MTLResourceOptions};
+use metal::{
+    Buffer, CommandBuffer, ComputeCommandEncoder, Device, MTLCommandBufferStatus,
+    MTLResourceOptions,
+};
 use objc::{msg_send, sel, sel_impl};
 use remu_memory::{
     CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_shared_backing_identity,
@@ -51,6 +56,108 @@ enum GlobalWritebackOutcome {
 }
 
 impl MetalPresenter {
+    pub(crate) fn encode_active_guest_queue_host_ack(
+        &mut self,
+    ) -> Result<Option<super::super::SharedEventFence>, String> {
+        let queue_id = self
+            .active_guest_queue
+            .ok_or("shared-event host acknowledgement has no active guest queue")?;
+        self.ensure_active_open_guest_batch()?;
+        let state = self
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .ok_or_else(|| format!("missing host-ack guest queue {queue_id}"))?;
+        let fence = match state.shared_event_timeline.allocate_fence() {
+            Ok(fence) => fence,
+            Err(_) => {
+                self.statistics.shared_event_fallbacks_timeline_overflow = self
+                    .statistics
+                    .shared_event_fallbacks_timeline_overflow
+                    .saturating_add(1);
+                return Ok(None);
+            }
+        };
+        let batch = state
+            .open_batch
+            .as_mut()
+            .expect("host acknowledgement opened a consumer batch");
+        batch.close_active_pass_encoders();
+        batch
+            .command_buffer
+            .encode_signal_event(state.shared_event_timeline.event(), fence.value());
+        batch.max_encoded_signal = Some(fence);
+        batch
+            .signal_checkpoints
+            .push(super::super::SharedEventSignalCheckpoint {
+                fence,
+                global_writeback_count: batch.global_writebacks.len(),
+                guest_write_range_count: batch.guest_write_ranges.len(),
+                memory_write_count: batch.memory_writes.len(),
+            });
+        self.statistics.shared_event_signals =
+            self.statistics.shared_event_signals.saturating_add(1);
+        Ok(Some(fence))
+    }
+
+    pub(crate) fn unsignaled_host_dependencies(
+        &mut self,
+        queue_id: u64,
+    ) -> Vec<super::super::SharedEventFence> {
+        let host_retired = self
+            .guest_queue_batches
+            .iter()
+            .map(|(&producer_queue_id, state)| {
+                (
+                    SharedEventProducerId::new(producer_queue_id),
+                    state.host_retired_fence_value,
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let Some(consumer) = self.guest_queue_batches.get_mut(&queue_id) else {
+            return Vec::new();
+        };
+        let before = consumer.host_dependencies.len();
+        consumer.host_dependencies.retain(|producer, value| {
+            host_retired.get(producer).copied().unwrap_or_default() < *value
+        });
+        consumer.resource_dependencies.retain(|producer, value| {
+            host_retired.get(producer).copied().unwrap_or_default() < *value
+        });
+        if consumer.host_dependencies.len() < before {
+            self.statistics.shared_event_host_wakes =
+                self.statistics.shared_event_host_wakes.saturating_add(1);
+        }
+        let unsignaled = consumer
+            .host_dependencies
+            .iter()
+            .map(|(&producer, &value)| super::super::SharedEventFence::new(producer, value))
+            .collect();
+        self.prune_retired_fence_write_ranges();
+        unsignaled
+    }
+
+    pub(crate) fn prune_retired_fence_write_ranges(&mut self) {
+        let mut referenced = self
+            .gpu_wait_fences
+            .fences()
+            .map(|fence| (fence.producer(), fence.value()))
+            .collect::<std::collections::HashSet<_>>();
+        for state in self.guest_queue_batches.values() {
+            referenced.extend(
+                state
+                    .resource_dependencies
+                    .iter()
+                    .map(|(&producer, &value)| (producer, value)),
+            );
+        }
+        for (&queue_id, state) in &mut self.guest_queue_batches {
+            let producer = SharedEventProducerId::new(queue_id);
+            state
+                .retired_fence_write_ranges
+                .retain(|&value, _| referenced.contains(&(producer, value)));
+        }
+    }
+
     pub(crate) fn set_active_guest_queue(&mut self, queue_id: Option<u64>) {
         self.active_guest_queue = if self.per_queue_guest_batches {
             queue_id
@@ -68,16 +175,21 @@ impl MetalPresenter {
         if self.guest_queue_batches.contains_key(&queue_id) {
             return Ok(());
         }
-        let device = self
-            .device
-            .as_ref()
-            .ok_or("Metal device is unavailable")?;
+        let device = self.device.as_ref().ok_or("Metal device is unavailable")?;
         let command_queue = device.new_command_queue();
         command_queue.set_label(&format!("REMu guest command queue {queue_id}"));
         self.guest_queue_batches.insert(
             queue_id,
             GuestQueueBatchState {
                 command_queue,
+                shared_event_timeline: super::super::SharedEventTimeline::new(
+                    device,
+                    SharedEventProducerId::new(queue_id),
+                ),
+                host_retired_fence_value: 0,
+                host_dependencies: std::collections::HashMap::new(),
+                resource_dependencies: std::collections::HashMap::new(),
+                retired_fence_write_ranges: std::collections::BTreeMap::new(),
                 open_batch: None,
                 committed_batches: std::collections::VecDeque::new(),
                 transient_global_buffer_cache: std::collections::HashMap::new(),
@@ -86,9 +198,7 @@ impl MetalPresenter {
         Ok(())
     }
 
-    pub(crate) fn active_guest_command_queue(
-        &mut self,
-    ) -> Result<metal::CommandQueue, String> {
+    pub(crate) fn active_guest_command_queue(&mut self) -> Result<metal::CommandQueue, String> {
         if !self.per_queue_guest_batches {
             return self
                 .command_queue
@@ -282,8 +392,10 @@ impl MetalPresenter {
 
     pub(crate) fn active_transient_global_buffer_cache(
         &self,
-    ) -> &std::collections::HashMap<super::super::GlobalBufferCacheKey, super::super::CachedGlobalBuffer>
-    {
+    ) -> &std::collections::HashMap<
+        super::super::GlobalBufferCacheKey,
+        super::super::CachedGlobalBuffer,
+    > {
         if !self.per_queue_guest_batches {
             return &self.transient_global_buffer_cache;
         }
@@ -299,8 +411,10 @@ impl MetalPresenter {
 
     pub(crate) fn active_transient_global_buffer_cache_mut(
         &mut self,
-    ) -> &mut std::collections::HashMap<super::super::GlobalBufferCacheKey, super::super::CachedGlobalBuffer>
-    {
+    ) -> &mut std::collections::HashMap<
+        super::super::GlobalBufferCacheKey,
+        super::super::CachedGlobalBuffer,
+    > {
         if !self.per_queue_guest_batches {
             return &mut self.transient_global_buffer_cache;
         }
@@ -366,7 +480,9 @@ impl MetalPresenter {
                         completed_command_buffer_gpu_duration(&batch.command_buffer);
                     self.publish_guest_batch_completion(&batch);
                     if let Err(error) = result {
-                        eprintln!("[REMu][METAL] queue {queue_id} guest batch finalization failed: {error}");
+                        eprintln!(
+                            "[REMu][METAL] queue {queue_id} guest batch finalization failed: {error}"
+                        );
                     }
                 }
             }
@@ -427,6 +543,33 @@ impl MetalPresenter {
     ) -> Result<(), String> {
         let execution_succeeded = execution_error.is_none();
         let mut result = execution_error.map_or(Ok(()), Err);
+        if !execution_succeeded
+            && let (Some(queue_id), Some(maximum_fence)) =
+                (batch.queue_id, batch.max_encoded_signal)
+        {
+            let producer = SharedEventProducerId::new(queue_id);
+            let state = self
+                .guest_queue_batches
+                .get_mut(&queue_id)
+                .ok_or_else(|| format!("missing terminal guest queue {queue_id}"))?;
+            if let Some(value) = terminal_shared_event_advance(
+                SharedEventBatchTerminalState::Error,
+                producer,
+                state.shared_event_timeline.event().signaled_value(),
+                Some(maximum_fence),
+            )
+            .map_err(|error| error.to_string())?
+            {
+                state
+                    .shared_event_timeline
+                    .event()
+                    .set_signaled_value(value);
+                self.statistics.shared_event_error_advances = self
+                    .statistics
+                    .shared_event_error_advances
+                    .saturating_add(1);
+            }
+        }
         if execution_succeeded {
             let writeback = write_back_pending_globals(&batch.global_writebacks);
             if let Ok(applied) = &writeback {
@@ -439,7 +582,45 @@ impl MetalPresenter {
         // state, publish them even when the draw/dispatch or an unrelated global readback failed.
         // This matches the existing policy of retiring the submission after a native error while
         // retaining the error as the primary result.
-        self.publish_terminal_guest_memory_writes(&batch.memory_writes, result)
+        let result = self.publish_terminal_guest_memory_writes(&batch.memory_writes, result);
+        let retired_fence_ranges = batch
+            .signal_checkpoints
+            .iter()
+            .map(|checkpoint| {
+                let mut ranges = batch.memory_writes[..checkpoint.memory_write_count]
+                    .iter()
+                    .map(PendingGuestMemoryWrite::range)
+                    .collect::<Vec<_>>();
+                ranges.extend(
+                    batch.global_writebacks[..checkpoint.global_writeback_count]
+                        .iter()
+                        .filter_map(|writeback| {
+                            u64::try_from(writeback.byte_count)
+                                .ok()
+                                .map(|length| (writeback.guest_address, length))
+                        }),
+                );
+                ranges.extend(
+                    batch.guest_write_ranges[..checkpoint.guest_write_range_count]
+                        .iter()
+                        .map(|range| (range.address, range.byte_count)),
+                );
+                (checkpoint.fence.value(), ranges)
+            })
+            .collect::<Vec<_>>();
+        if let (Some(queue_id), Some(maximum_fence)) = (batch.queue_id, batch.max_encoded_signal) {
+            let state = self
+                .guest_queue_batches
+                .get_mut(&queue_id)
+                .expect("terminal queue state remains live");
+            state.host_retired_fence_value =
+                state.host_retired_fence_value.max(maximum_fence.value());
+            for (fence_value, ranges) in retired_fence_ranges {
+                state.retired_fence_write_ranges.insert(fence_value, ranges);
+            }
+        }
+        self.prune_retired_fence_write_ranges();
+        result
     }
 
     pub(super) fn gpu_events_per_tick_budget(&self) -> usize {
@@ -454,9 +635,9 @@ impl MetalPresenter {
 
     pub(super) fn guest_submission_backpressure_full(&self) -> bool {
         self.committed_guest_batch_count() >= super::super::MAX_COMMITTED_GUEST_BATCHES
-            && self.active_open_guest_batch().is_none_or(|batch| {
-                batch.work.len() >= super::super::GUEST_BATCH_WORK_CAPACITY
-            })
+            && self
+                .active_open_guest_batch()
+                .is_none_or(|batch| batch.work.len() >= super::super::GUEST_BATCH_WORK_CAPACITY)
     }
 
     pub(crate) fn flush_guest_command_batch(
@@ -521,6 +702,12 @@ impl MetalPresenter {
                 self.statistics.batch_flushes_for_blocked_wait = self
                     .statistics
                     .batch_flushes_for_blocked_wait
+                    .saturating_add(1);
+            }
+            GuestBatchFlushReason::SharedEventHostEffect => {
+                self.statistics.batch_flushes_for_shared_event_host_effect = self
+                    .statistics
+                    .batch_flushes_for_shared_event_host_effect
                     .saturating_add(1);
             }
             GuestBatchFlushReason::FlipSnapshot => {
@@ -637,12 +824,8 @@ impl MetalPresenter {
         queue_ids.sort_unstable();
         let mut result = Ok(());
         for queue_id in queue_ids {
-            let flushed = self.flush_guest_queue_command_batch_by(
-                queue_id,
-                policy,
-                reason,
-                deadline,
-            );
+            let flushed =
+                self.flush_guest_queue_command_batch_by(queue_id, policy, reason, deadline);
             result = merge_guest_batch_result(result, "later guest queue flush", flushed);
         }
         result
@@ -660,6 +843,12 @@ impl MetalPresenter {
                 self.statistics.batch_flushes_for_blocked_wait = self
                     .statistics
                     .batch_flushes_for_blocked_wait
+                    .saturating_add(1);
+            }
+            GuestBatchFlushReason::SharedEventHostEffect => {
+                self.statistics.batch_flushes_for_shared_event_host_effect = self
+                    .statistics
+                    .batch_flushes_for_shared_event_host_effect
                     .saturating_add(1);
             }
             GuestBatchFlushReason::FlipSnapshot => {
@@ -768,10 +957,10 @@ impl MetalPresenter {
     }
 
     fn settle_next_global_guest_batch(&mut self, deadline: Instant) -> FrontBatchSettlement {
-        self.next_global_guest_batch_queue().map_or(
-            FrontBatchSettlement::Empty,
-            |queue_id| self.settle_front_guest_queue_batch(queue_id, deadline),
-        )
+        self.next_global_guest_batch_queue()
+            .map_or(FrontBatchSettlement::Empty, |queue_id| {
+                self.settle_front_guest_queue_batch(queue_id, deadline)
+            })
     }
 
     pub(crate) fn wait_for_guest_command_batches(&mut self) -> Result<(), String> {
@@ -895,6 +1084,8 @@ fn new_guest_command_batch(
         memory_writes: Vec::new(),
         render_pass: None,
         compute_encoder: None,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
         completion_sequences: Vec::new(),
     }
 }
@@ -1148,11 +1339,8 @@ impl GuestCommandBatch {
 
     pub(crate) fn ensure_compute_encoder(&mut self) -> &ComputeCommandEncoder {
         if self.compute_encoder.is_none() {
-            self.compute_encoder = Some(
-                self.command_buffer
-                    .new_compute_command_encoder()
-                    .to_owned(),
-            );
+            self.compute_encoder =
+                Some(self.command_buffer.new_compute_command_encoder().to_owned());
         }
         self.compute_encoder
             .as_ref()
@@ -1592,16 +1780,17 @@ fn write_changed_global_ranges_with(
         let byte_count = u64::try_from(cursor - start)
             .map_err(|_| "writable global buffer changed byte count does not fit u64")?;
         let published = match mode {
-            GlobalWritePublishMode::RequireLiveVa => {
-                write_guest_shared_backing_if_identity(
-                    address,
+            GlobalWritePublishMode::RequireLiveVa => write_guest_shared_backing_if_identity(
+                address,
+                range_identity,
+                &current_bytes[start..cursor],
+            ),
+            GlobalWritePublishMode::ProducerIdentity => {
+                trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
+                write_guest_shared_backing_at_identity(
                     range_identity,
                     &current_bytes[start..cursor],
                 )
-            }
-            GlobalWritePublishMode::ProducerIdentity => {
-                trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
-                write_guest_shared_backing_at_identity(range_identity, &current_bytes[start..cursor])
             }
         };
         if published {
@@ -1619,7 +1808,8 @@ fn write_changed_global_ranges_with(
         }
         if !published {
             let current = guest_shared_backing_identity(address, byte_count);
-            if matches!(mode, GlobalWritePublishMode::RequireLiveVa) && current != Some(range_identity)
+            if matches!(mode, GlobalWritePublishMode::RequireLiveVa)
+                && current != Some(range_identity)
             {
                 // VA moved mid-publish; fall back to the captured producer pages.
                 trace_diagnostic_guest_write("global-producer-identity", address, byte_count);

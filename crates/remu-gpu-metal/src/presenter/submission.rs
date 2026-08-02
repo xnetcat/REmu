@@ -2,25 +2,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    ActiveGuestMemoryWait, DisplayConfiguration, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT,
-    GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk, GuestBatchFlushReason,
-    FlipTerminalSource, GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
+    ActiveGuestMemoryWait, DisplayConfiguration, FlipTerminalSource, FlushPolicy,
+    GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
+    GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, GuestMemoryWaitKey,
     GuestMemoryWaitRecovery, GuestMemoryWaitStatus, GuestMemoryWaitTracker,
-    GuestMemoryWriteOperation,
-    MetalPresenter, OrderedEventPoll, OrderedEventSource,
+    GuestMemoryWriteOperation, MetalPresenter, OrderedEventPoll, OrderedEventSource,
     OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PendingFlip,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
     PipelineCompileCandidate, PresenterFlow, QueueBlockReason, RangeSet, ResourceSpan,
-    ScheduledGpuSubmission,
-    ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh, compute_pipeline_key,
-    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader, graphics_pipeline_key,
-    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
-    noop_placeholder_cover_draw, pixel_scalars,
-    rearm_color_metadata_clear,
-    rearm_depth_metadata_clear, record_diagnostic_memory_copy,
-    refresh_resident_texture_write_watch, register_value,
-    retire_sampled_textures_matching, trace_resident_texture_removal,
-    trace_video_target_compute_consumer, trace_video_target_draw_consumer,
+    ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer, WriteWatchRefresh,
+    compute_pipeline_key, diagnostic_skip_export_shader, diagnostic_skip_pixel_shader,
+    graphics_pipeline_key, guest_physical_ranges_overlap, guest_ranges_overlap,
+    guest_texture_byte_count, noop_placeholder_cover_draw, pixel_scalars,
+    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_memory_copy,
+    refresh_resident_texture_write_watch, register_value, retire_sampled_textures_matching,
+    trace_resident_texture_removal, trace_video_target_compute_consumer,
+    trace_video_target_draw_consumer,
 };
 use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
@@ -39,7 +36,9 @@ pub(crate) use self::batch::{
     merge_guest_batch_result,
 };
 #[cfg(test)]
-pub(crate) use self::memory::{apply_pending_guest_memory_writes, pin_guest_memory_write};
+pub(crate) use self::memory::{
+    apply_pending_guest_memory_writes, pin_guest_memory_write, release_value_for_wait,
+};
 pub(crate) use self::waits::read_guest_memory_wait_value;
 
 impl MetalPresenter {
@@ -76,6 +75,36 @@ impl MetalPresenter {
             // callback immediately releases its queue-local gate instead of remaining falsely
             // "active" until the next AppKit callback.
             self.receive_shader_compilations();
+            let shared_event_values = self
+                .guest_queue_batches
+                .iter()
+                .map(|(&queue_id, state)| {
+                    (
+                        super::SharedEventProducerId::new(queue_id),
+                        state.shared_event_timeline.event().signaled_value(),
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            let guest_queue_outstanding = self
+                .guest_queue_batches
+                .iter()
+                .map(|(&queue_id, state)| {
+                    (
+                        queue_id,
+                        state.open_batch.is_some() || !state.committed_batches.is_empty(),
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            let host_retired_values = self
+                .guest_queue_batches
+                .iter()
+                .map(|(&queue_id, state)| {
+                    (
+                        super::SharedEventProducerId::new(queue_id),
+                        state.host_retired_fence_value,
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>();
             let (source, event) = match self.receiver.try_recv(|reason| match reason {
                 QueueBlockReason::GraphicsPipeline(key) => {
                     self.compiled_shader_pairs.contains_key(key)
@@ -87,15 +116,40 @@ impl MetalPresenter {
                 }
                 QueueBlockReason::GuestMemoryWait(_)
                 | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
-                QueueBlockReason::FlipSafetyWait(wait) => wait
-                    .required_flip_sequence
-                    .is_none_or(|sequence| {
+                QueueBlockReason::GuestSharedEventHostEffect {
+                    consumer_queue_id,
+                    consumer_ack,
+                    terminal_dependencies,
+                } => {
+                    let consumer_reached_wait = consumer_ack.as_ref().map_or_else(
+                        || {
+                            !guest_queue_outstanding
+                                .get(consumer_queue_id)
+                                .copied()
+                                .unwrap_or(false)
+                        },
+                        |fence| {
+                            shared_event_values
+                                .get(&fence.producer())
+                                .is_some_and(|value| *value >= fence.value())
+                        },
+                    );
+                    consumer_reached_wait
+                        && terminal_dependencies.iter().all(|fence| {
+                            host_retired_values
+                                .get(&fence.producer())
+                                .is_some_and(|value| *value >= fence.value())
+                        })
+                }
+                QueueBlockReason::FlipSafetyWait(wait) => {
+                    wait.required_flip_sequence.is_none_or(|sequence| {
                         sequence <= self.safe_flip_sequence_prefix
                             || self
                                 .flip_buffer_safety
                                 .get(&sequence)
                                 .is_some_and(|safety| safety.safe)
-                    }),
+                    })
+                }
             }) {
                 OrderedEventPoll::Event { source, event } => (source, event),
                 OrderedEventPoll::Blocked => {
@@ -120,6 +174,42 @@ impl MetalPresenter {
                 OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
                 OrderedEventSource::Host { .. } => None,
             });
+            if let OrderedEventSource::GuestQueue(queue_id) = source {
+                let dependencies = self.unsignaled_host_dependencies(queue_id);
+                if !dependencies.is_empty()
+                    && !self.event_is_shared_event_gpu_orderable(source, &event)
+                {
+                    let acknowledgement = match self.encode_active_guest_queue_host_ack() {
+                        Ok(acknowledgement) => acknowledgement,
+                        Err(error) => {
+                            eprintln!(
+                                "[REMu][METAL] shared-event host acknowledgement failed queue={queue_id}: {error}"
+                            );
+                            None
+                        }
+                    };
+                    if let Err(error) = self.flush_guest_command_batch(
+                        FlushPolicy::Required,
+                        GuestBatchFlushReason::SharedEventHostEffect,
+                    ) {
+                        eprintln!(
+                            "[REMu][METAL] shared-event host-effect flush failed queue={queue_id}: {error}"
+                        );
+                    }
+                    self.statistics.shared_event_host_blocks =
+                        self.statistics.shared_event_host_blocks.saturating_add(1);
+                    self.receiver.block_event(
+                        source,
+                        event,
+                        QueueBlockReason::GuestSharedEventHostEffect {
+                            consumer_queue_id: queue_id,
+                            consumer_ack: acknowledgement,
+                            terminal_dependencies: dependencies,
+                        },
+                    );
+                    continue;
+                }
+            }
             match event {
                 GpuEvent::QueueSubmission { .. } => {
                     eprintln!("[REMu][METAL] ignored invalid nested GPU queue submission");
@@ -311,7 +401,7 @@ impl MetalPresenter {
                     }
                 },
                 GpuEvent::MemoryRelease(release) => {
-                    match self.execute_guest_memory_release(release) {
+                    match self.execute_guest_memory_release(source, release) {
                         Ok(()) => {
                             let byte_count = match release.value {
                                 remu_gpu::GpuMemoryReleaseValue::Immediate32(_) => 4,
@@ -602,5 +692,39 @@ impl MetalPresenter {
             FlushPolicy::Required,
             GuestBatchFlushReason::CommandProcessorBarrier,
         )
+    }
+}
+
+impl MetalPresenter {
+    /// Conservative host-effect gate for commands following an encoded Metal wait.
+    fn event_is_shared_event_gpu_orderable(
+        &self,
+        source: OrderedEventSource,
+        event: &GpuEvent,
+    ) -> bool {
+        match event {
+            GpuEvent::CommandProcessorBarrier | GpuEvent::PipelineBarrier(_) => true,
+            GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
+                self.active_open_guest_batch().is_some()
+                    || !self.active_committed_guest_batches().is_empty()
+            }
+            GpuEvent::SubmissionBoundary(_) => {
+                let initial_flip_boundary = matches!(
+                    (source, self.pending_flip_queue),
+                    (OrderedEventSource::GuestQueue(queue_id), Some(pending_queue))
+                        if queue_id == pending_queue
+                );
+                let write_completes_pending_flip = self.pending_flip_target_written_since_boundary
+                    && self.pending_flip.is_some_and(|flip| {
+                        self.pending_scanout_write_address == Some(flip.address)
+                            && flip.sequence != self.uploaded_flip_sequence
+                    });
+                !initial_flip_boundary && !write_completes_pending_flip
+            }
+            // Draw/compute preparation snapshots guest bytes and mutates shared residency/cache
+            // state on the presenter thread. DMA, acquire, waits, flips and host UI have still
+            // more direct CPU-visible effects. They must observe the producer event first.
+            _ => false,
+        }
     }
 }
