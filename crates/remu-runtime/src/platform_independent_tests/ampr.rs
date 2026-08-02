@@ -94,6 +94,56 @@ fn apr_resolver_imports_report_posix_failures_to_the_sdk_wrappers() {
     set_current_guest_thread_pointer(0);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn apr_resolvers_reject_unreadable_guest_ranges_without_dereferencing_them() {
+    let mut tls = [0_u64; 16];
+    let thread_pointer = tls.as_mut_ptr().addr() as u64;
+    set_current_guest_thread_pointer(thread_pointer);
+
+    let path = b"/app0/missing-apr-file.bin\0";
+    let path_list = [path.as_ptr().addr() as u64];
+    let mut id = 0x1234_5678_u32;
+    let mut size = u64::MAX;
+    let mut state = ProbeDispatchState::default();
+
+    let result = dispatch_probe_import(
+        "gEpBkcwxUjw",
+        [
+            path_list.as_ptr().addr() as u64,
+            1,
+            (&raw mut id).addr() as u64,
+            1,
+            0,
+            0,
+        ],
+        [0; 6],
+        &mut state,
+    );
+    assert_eq!(result, u64::MAX);
+    assert_eq!(read_guest_u32(thread_pointer + 0x40), libc::EFAULT.cast_unsigned());
+    assert_eq!(id, 0x1234_5678, "validation must precede output writes");
+
+    write_guest_u32(thread_pointer + 0x40, 0);
+    let result = dispatch_probe_import(
+        "w5fcCG+t31g",
+        [
+            1,
+            path_list.as_ptr().addr() as u64,
+            1,
+            (&raw mut id).addr() as u64,
+            (&raw mut size).addr() as u64,
+            0,
+        ],
+        [0; 6],
+        &mut state,
+    );
+    assert_eq!(result, u64::MAX);
+    assert_eq!(read_guest_u32(thread_pointer + 0x40), libc::EFAULT.cast_unsigned());
+
+    set_current_guest_thread_pointer(0);
+}
+
 #[test]
 fn ampr_read_records_a_deferred_transfer_without_touching_the_destination() {
     let path = create_ampr_test_file(b"host payload");
