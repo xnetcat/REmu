@@ -292,7 +292,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "nu4a0-arQis" => "sceKernelAioInitializeParam",
         "vYU8P9Td2Zo" => "sceKernelAioInitializeImpl",
         "geDaqgH9lTg" => "scePthreadKeyCreate",
-        "EI-5-jlq2dE" => "posix_pthread_getthreadid_np",
+        "EI-5-jlq2dE" => "scePthreadGetthreadid",
         "eR2bZFAAU0Q" => "sceSysmoduleUnloadModule",
         "buYbeLOGWmA" => "sceAppContentTemporaryDataMount2",
         "zE-wXIZjLoM" => "sceKernelDebugRaiseExceptionOnReleaseMode",
@@ -479,12 +479,15 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "-HOOCn0JY48" => "sceAgcDcbSetShRegistersIndirect",
         "hvUfkUIQcOE" => "sceAgcDcbSetUcRegistersIndirect",
         "D9sr1xGUriE" => "sceAgcCreatePrimState",
-        // Called by shipped titles, but this is NOT sceAgcCreateInterpolantMapping: that symbol
-        // is dbOlWdppb4o in libSceAgc's export table. The name was borrowed from SharpEmu, whose
-        // own comment records that it collides with a real catalog symbol of a different NID.
-        // REmu's handler was written against the borrowed name, so what this entry point actually
-        // does is an open question rather than a settled one.
-        "HV4j+E0MBHE" => "sceAgcUnknown_HV4j+E0MBHE",
+        // Two NIDs for one function, as with sceAgcDcbSetIndexSize above. `dbOlWdppb4o` is the
+        // symbol libSceAgc exports under this name in SDK 10.00 and no observed title calls it;
+        // `HV4j+E0MBHE` is what five titles actually import, 134 times a run. It appears in no
+        // published catalog — not SDK 10.00, shadPS4, ps4libdoc, SharpEmu's name set, the 3.20
+        // firmware stubs, nor ~8.4 billion generated candidates — which is the signature of an
+        // older SDK's hand-assigned NID: not derived from its name, so unguessable by
+        // construction. The function identity is inferred rather than read: Kyty and KytyPS5 both
+        // catalog it as the interpolant-mapping entry point from behavioural reverse engineering.
+        "dbOlWdppb4o" | "HV4j+E0MBHE" => "sceAgcCreateInterpolantMapping",
         "l4fM9K-Lyks" => "sceAgcDcbSetIndexBuffer",
         "GIIW2J37e70" => "sceAgcDcbSetIndexSize",
         "B+aG9DUnTKA" => "sceAgcDcbDrawIndexOffset",
@@ -498,7 +501,6 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         // The genuine sceAgcCreateInterpolantMapping. No observed title calls it — they call
         // HV4j+E0MBHE below, which is a different NID that REmu and SharpEmu both label with this
         // name. Naming both keeps a future caller from being reported as unknown.
-        "dbOlWdppb4o" => "sceAgcCreateInterpolantMapping",
         "vieBRwlh1Lw" => "sceAgcUpdateInterpolantMapping",
         // Named from libSceAgc's SDK 10.00 export table rather than by hashing: this NID is not
         // the SHA-1 of any symbol name. `GIIW2J37e70` above is the hashed NID for the same
