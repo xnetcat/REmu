@@ -12,8 +12,8 @@ use remu_gpu::{SYSTEM_UI_HEIGHT, SYSTEM_UI_WIDTH};
 use std::time::Instant;
 
 use super::{
-    ActiveTranslatedScanout, EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason,
-    GuestTextureDescriptor,
+    ActiveTranslatedScanout, EVENT_POLL_INTERVAL, FlipTerminalSource, FlushPolicy,
+    GuestBatchFlushReason, GuestTextureDescriptor,
     HostSplashTexture, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
     MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, MetalPresenter,
     OrderedEventSource, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED,
@@ -253,11 +253,12 @@ impl MetalPresenter {
         }
         // Presentation is where a finalized flip becomes guest-visible; an unfinalized flip has no
         // snapshot in this drawable and stays pending.
-        let flip_completion = self.complete_flip(self.finalized_flip_sequence);
+        let flip_sequence = self.claim_flip_terminal(self.finalized_flip_sequence);
         self.pending_presentations.push_back(PendingPresentation {
             command_buffer,
             submitted_at: Instant::now(),
-            flip_completion,
+            flip_sequence,
+            flip_terminal_source: FlipTerminalSource::Presentation,
         });
         self.redraw_pending = false;
     }

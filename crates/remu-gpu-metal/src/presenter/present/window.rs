@@ -236,6 +236,27 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_for_command_processor_barrier) / seconds,
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
             );
+            let head_join = self.flip_completion_joins.first_key_value().map(|(sequence, join)| {
+                format!(
+                    "{sequence}:submission={:?}/submission-terminal={}/terminal={}",
+                    join.submission_sequence,
+                    join.submission_terminal,
+                    join.terminal_source.map_or("pending", |source| source.as_str()),
+                )
+            });
+            let (waiting_submission, waiting_terminal, joined_ordered) =
+                self.flip_completion_join_state_counts();
+            eprintln!(
+                "[REMu][COMPLETION-ORDER] accepted={} deferred={} published={} outstanding={} waiting_submission={} waiting_terminal={} joined_ordered={} head={}",
+                self.flip_completion_join_statistics.accepted,
+                self.flip_completion_join_statistics.deferred,
+                self.flip_completion_join_statistics.published,
+                self.flip_completion_joins.len(),
+                waiting_submission,
+                waiting_terminal,
+                joined_ordered,
+                head_join.as_deref().unwrap_or("none"),
+            );
             let transitions = &self.statistics.render_pass_key_transitions;
             eprintln!(
                 "[REMu][PERF-RP-KEY] target count={:.0}/s addr={:.0}/s width={:.0}/s height={:.0}/s pitch={:.0}/s tile={:.0}/s format={:.0}/s bpp={:.0}/s samples={:.0}/s scanout={:.0}/s type={:.0}/s layers={:.0}/s base-layer={:.0}/s mip={:.0}/s mip-count={:.0}/s | depth presence={:.0}/s addr={:.0}/s width={:.0}/s height={:.0}/s pitch={:.0}/s tile={:.0}/s format={:.0}/s bpp={:.0}/s samples={:.0}/s layers={:.0}/s clear={:.0}/s clear-seq={:.0}/s",

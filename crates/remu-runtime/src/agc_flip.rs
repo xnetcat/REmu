@@ -338,6 +338,7 @@ pub(crate) fn request_agc_submission_completion(
     mut events: Vec<remu_gpu::GpuEvent>,
 ) -> bool {
     let sequence = state.agc_submission_count;
+    annotate_submission_flips(&mut events, sequence);
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
     if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
         state
@@ -355,6 +356,7 @@ pub(crate) fn request_agc_compute_submission_completion(
     mut events: Vec<remu_gpu::GpuEvent>,
 ) -> bool {
     let sequence = state.agc_submission_count;
+    annotate_submission_flips(&mut events, sequence);
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
     // Backend queue zero is reserved for graphics. Compute completion is delivered exclusively
     // through the driver-wide AGC user interrupt below; also routing it through the owner's
@@ -365,6 +367,18 @@ pub(crate) fn request_agc_compute_submission_completion(
         true
     } else {
         false
+    }
+}
+
+fn annotate_submission_flips(events: &mut [remu_gpu::GpuEvent], sequence: u64) {
+    for event in events {
+        if let remu_gpu::GpuEvent::Flip {
+            submission_sequence,
+            ..
+        } = event
+        {
+            *submission_sequence = Some(sequence);
+        }
     }
 }
 
@@ -439,6 +453,7 @@ pub(crate) fn agc_submit_ordered_video_out_flip(
         address: target.address,
         buffer_index,
         flip_argument,
+        submission_sequence: None,
         width: target.attributes.width,
         height: target.attributes.height,
         pitch: target.attributes.pitch,

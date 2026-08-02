@@ -67,7 +67,6 @@ impl MetalPresenter {
             render_pass: None,
             compute_encoder: None,
             completion_sequences: Vec::new(),
-            flip_completions: Vec::new(),
         });
     }
 
@@ -85,7 +84,7 @@ impl MetalPresenter {
                     let result = self.finish_terminal_guest_batch(&batch, None);
                     self.statistics.gpu_execution_time +=
                         completed_command_buffer_gpu_duration(&batch.command_buffer);
-                    publish_guest_batch_completion(&batch);
+                    self.publish_guest_batch_completion(&batch);
                     if let Err(error) = result {
                         eprintln!(
                             "[REMu][METAL] completed guest batch finalization failed: {error}"
@@ -110,7 +109,7 @@ impl MetalPresenter {
                     // A terminal native failure cannot be retried in-place. Publish both its
                     // ordered CPU labels and submission ID after reporting the error so the guest
                     // observes one failed queue item instead of a producerless 120-second wait.
-                    publish_guest_batch_completion(&batch);
+                    self.publish_guest_batch_completion(&batch);
                     if let Err(error) = result {
                         eprintln!("[REMu][METAL] {error}");
                     }
@@ -277,7 +276,7 @@ impl MetalPresenter {
         let result = self.finish_terminal_guest_batch(&batch, execution_error);
         self.statistics.gpu_execution_time +=
             completed_command_buffer_gpu_duration(&batch.command_buffer);
-        publish_guest_batch_completion(&batch);
+        self.publish_guest_batch_completion(&batch);
         FrontBatchSettlement::Retired(result)
     }
 
@@ -659,14 +658,11 @@ fn pending_guest_write_range_overlaps(
     )
 }
 
-pub(crate) fn publish_guest_batch_completion(batch: &GuestCommandBatch) {
-    for &sequence in &batch.completion_sequences {
-        remu_gpu::record_gpu_submission_completed(sequence);
-    }
-    // Deferred flip retirements publish only here, after this batch's ordered guest-memory
-    // effects have been applied: the guest recycles the retired frame's memory on this signal.
-    for &completion in &batch.flip_completions {
-        remu_gpu::record_gpu_flip_completed(completion);
+impl MetalPresenter {
+    pub(crate) fn publish_guest_batch_completion(&mut self, batch: &GuestCommandBatch) {
+        for &sequence in &batch.completion_sequences {
+            self.publish_guest_submission_completion(sequence);
+        }
     }
 }
 

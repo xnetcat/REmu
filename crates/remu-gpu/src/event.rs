@@ -45,6 +45,10 @@ pub enum GpuEvent {
         address: u64,
         buffer_index: u32,
         flip_argument: u64,
+        /// Exact guest submission containing the in-stream flip packet.
+        ///
+        /// Standalone VideoOut flips are host events and deliberately carry no submission.
+        submission_sequence: Option<u64>,
         width: u32,
         height: u32,
         pitch: u32,

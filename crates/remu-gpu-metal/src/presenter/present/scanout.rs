@@ -91,13 +91,29 @@ impl MetalPresenter {
         if let Some(flip) = flip {
             self.finalized_flip_sequence = flip.sequence;
             self.garbage_collect_resident_textures(flip.sequence);
-            // Without a surface the finalized snapshot is as guest-visible as the frame will ever
-            // become. Host windowing state must not gate guest flip pacing: leaving the flip
-            // outstanding here is what pins headless and occluded runs at the pacing backlog.
-            if self.layer.is_none()
-                && let Some(completion) = self.complete_flip(flip.sequence)
-            {
-                remu_gpu::record_gpu_flip_completed(completion);
+            // Without a drawable, queue a tail command buffer behind the snapshot and guest work.
+            // The old synchronous completion let the guest recycle the scanout allocation while
+            // Metal still held it in flight. A tail remains asynchronous without depending on
+            // windowing state and gives this half of the completion join a truthful terminal point.
+            if self.layer.is_none() {
+                if let Some(command_queue) = self.command_queue.clone() {
+                    if let Some(sequence) = self.claim_flip_terminal(flip.sequence) {
+                        let command_buffer = command_queue.new_command_buffer().to_owned();
+                        command_buffer.set_label("REMu surface-less flip retirement tail");
+                        command_buffer.commit();
+                        self.pending_presentations.push_back(super::super::PendingPresentation {
+                            command_buffer,
+                            submitted_at: std::time::Instant::now(),
+                            flip_sequence: Some(sequence),
+                            flip_terminal_source: super::super::FlipTerminalSource::SurfaceLess,
+                        });
+                    }
+                } else {
+                    eprintln!(
+                        "[REMu][COMPLETION-ORDER] phase=surface-less-blocked flip={} reason=command-queue-unavailable",
+                        flip.sequence,
+                    );
+                }
             }
         }
         self.pending_scanout_write_address = None;
@@ -116,36 +132,145 @@ impl MetalPresenter {
         }
     }
 
-    /// Retires the pending flip when it is `sequence`, yielding the completion to publish.
+    /// Claims the terminal side of `sequence` for exactly one retirement path.
     ///
     /// Every accepted flip increments the guest's pacing counter and only a completion decrements
     /// it, so exactly one caller may retire a given sequence: presentation, a surface-less
     /// finalization, or replacement by a newer flip.
-    pub(crate) fn complete_flip(&mut self, sequence: u64) -> Option<remu_gpu::GpuFlipCompletion> {
-        let flip = self.pending_flip.filter(|flip| {
-            flip.sequence == sequence && flip.sequence > self.submitted_flip_sequence
-        })?;
-        self.submitted_flip_sequence = flip.sequence;
-        Some(remu_gpu::GpuFlipCompletion {
-            address: flip.address,
-            buffer_index: flip.buffer_index,
-            flip_argument: flip.flip_argument,
-        })
+    pub(crate) fn claim_flip_terminal(&mut self, sequence: u64) -> Option<u64> {
+        let join = self.flip_completion_joins.get_mut(&sequence)?;
+        if join.terminal_claimed {
+            return None;
+        }
+        join.terminal_claimed = true;
+        self.submitted_flip_sequence = self.submitted_flip_sequence.max(sequence);
+        Some(sequence)
+    }
+
+    pub(crate) fn register_flip_completion_join(&mut self, flip: super::super::PendingFlip) {
+        let submission_terminal = flip.submission_sequence.is_none();
+        let replaced = self.flip_completion_joins.insert(
+            flip.sequence,
+            super::super::FlipCompletionJoin {
+                completion: remu_gpu::GpuFlipCompletion {
+                    address: flip.address,
+                    buffer_index: flip.buffer_index,
+                    flip_argument: flip.flip_argument,
+                },
+                submission_sequence: flip.submission_sequence,
+                submission_terminal,
+                terminal_claimed: false,
+                terminal_source: None,
+                accepted_at: std::time::Instant::now(),
+            },
+        );
+        debug_assert!(replaced.is_none(), "flip sequence must be unique");
+        self.flip_completion_join_statistics.accepted = self
+            .flip_completion_join_statistics
+            .accepted
+            .saturating_add(1);
+        if completion_order_trace_sequence(flip.sequence) {
+            eprintln!(
+                "[REMu][COMPLETION-ORDER] phase=accept flip={} submission={:?} submission_terminal={submission_terminal}",
+                flip.sequence, flip.submission_sequence,
+            );
+        }
+    }
+
+    pub(crate) fn mark_flip_terminal(
+        &mut self,
+        sequence: u64,
+        source: super::super::FlipTerminalSource,
+    ) {
+        let Some(join) = self.flip_completion_joins.get_mut(&sequence) else {
+            return;
+        };
+        if join.terminal_source.is_some() {
+            return;
+        }
+        join.terminal_source = Some(source);
+        if !join.submission_terminal {
+            self.flip_completion_join_statistics.deferred = self
+                .flip_completion_join_statistics
+                .deferred
+                .saturating_add(1);
+        }
+        self.publish_ready_flip_completions();
+    }
+
+    pub(crate) fn publish_guest_submission_completion(&mut self, submission_sequence: u64) {
+        // Submission visibility is published only after finish_terminal_guest_batch applied every
+        // ordered CPU-visible effect. Only then may flips carrying this exact sequence join it.
+        remu_gpu::record_gpu_submission_completed(submission_sequence);
+        let mut marked = 0_u64;
+        for join in self.flip_completion_joins.values_mut().filter(|join| {
+            join.submission_sequence == Some(submission_sequence) && !join.submission_terminal
+        }) {
+            join.submission_terminal = true;
+            if join.terminal_source.is_none() {
+                marked = marked.saturating_add(1);
+            }
+        }
+        self.flip_completion_join_statistics.deferred = self
+            .flip_completion_join_statistics
+            .deferred
+            .saturating_add(marked);
+        self.publish_ready_flip_completions();
+    }
+
+    fn publish_ready_flip_completions(&mut self) {
+        loop {
+            let Some((&sequence, join)) = self.flip_completion_joins.first_key_value() else {
+                return;
+            };
+            let Some(source) = join.terminal_source else {
+                return;
+            };
+            if !join.submission_terminal {
+                return;
+            }
+            let join = self
+                .flip_completion_joins
+                .remove(&sequence)
+                .expect("front flip completion join exists");
+            remu_gpu::record_gpu_flip_completed(join.completion);
+            self.flip_completion_join_statistics.published = self
+                .flip_completion_join_statistics
+                .published
+                .saturating_add(1);
+            if completion_order_trace_sequence(sequence) {
+                eprintln!(
+                    "[REMu][COMPLETION-ORDER] phase=publish flip={sequence} submission={:?} terminal={} submission_terminal=true age_ms={:.3}",
+                    join.submission_sequence,
+                    source.as_str(),
+                    join.accepted_at.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
     }
 
     /// Flips this presenter still owns: accepted but neither presented nor already published.
     fn outstanding_flip_count(&self) -> usize {
-        let unpresented = self
-            .next_flip_sequence
-            .saturating_sub(self.submitted_flip_sequence);
-        let awaiting_presentation = self
-            .pending_presentations
-            .iter()
-            .filter(|presentation| presentation.flip_completion.is_some())
+        self.flip_completion_joins.len()
+    }
+
+    pub(crate) fn flip_completion_join_state_counts(&self) -> (usize, usize, usize) {
+        let waiting_submission = self
+            .flip_completion_joins
+            .values()
+            .filter(|join| !join.submission_terminal)
             .count();
-        usize::try_from(unpresented)
-            .unwrap_or(usize::MAX)
-            .saturating_add(awaiting_presentation)
+        let waiting_terminal = self
+            .flip_completion_joins
+            .values()
+            .filter(|join| join.terminal_source.is_none())
+            .count();
+        let joined_ordered = self
+            .flip_completion_joins
+            .values()
+            .filter(|join| join.submission_terminal && join.terminal_source.is_some())
+            .count();
+        (waiting_submission, waiting_terminal, joined_ordered)
     }
 
     /// Re-syncs the guest's flip pacing counter against this presenter's flip accounting.
@@ -167,8 +292,10 @@ impl MetalPresenter {
         let Some(observed) = remu_gpu::reconcile_gpu_flips_pending(outstanding) else {
             return;
         };
+        let (waiting_submission, waiting_terminal, joined_ordered) =
+            self.flip_completion_join_state_counts();
         eprintln!(
-            "[REMu][METAL] flip accounting diverged: guest pending={observed} presenter outstanding={outstanding} next={} finalized={} uploaded={} submitted={} presentations={}; corrected to {outstanding}",
+            "[REMu][METAL] flip accounting diverged: guest pending={observed} presenter outstanding={outstanding} joins=wait-submission:{waiting_submission}/wait-terminal:{waiting_terminal}/joined-ordered:{joined_ordered} next={} finalized={} uploaded={} submitted={} presentations={}; corrected to {outstanding}",
             self.next_flip_sequence,
             self.finalized_flip_sequence,
             self.uploaded_flip_sequence,
@@ -278,14 +405,18 @@ impl MetalPresenter {
                         .pending_presentations
                         .pop_front()
                         .expect("front presentation exists");
-                    self.statistics.completed_presents =
-                        self.statistics.completed_presents.saturating_add(1);
+                    if presentation.flip_terminal_source
+                        == super::super::FlipTerminalSource::Presentation
+                    {
+                        self.statistics.completed_presents =
+                            self.statistics.completed_presents.saturating_add(1);
+                    }
                     self.statistics.gpu_execution_time +=
                         completed_command_buffer_gpu_duration(&presentation.command_buffer);
                     self.statistics.presentation_queue_latency +=
                         presentation.submitted_at.elapsed();
-                    if let Some(completion) = presentation.flip_completion {
-                        remu_gpu::record_gpu_flip_completed(completion);
+                    if let Some(sequence) = presentation.flip_sequence {
+                        self.mark_flip_terminal(sequence, presentation.flip_terminal_source);
                     }
                 }
                 MTLCommandBufferStatus::Error => {
@@ -303,8 +434,8 @@ impl MetalPresenter {
                     // A terminal presentation failure cannot be retried in place. Complete the
                     // flip after reporting it so the guest does not deadlock on an unavailable
                     // drawable while later frames may still recover.
-                    if let Some(completion) = presentation.flip_completion {
-                        remu_gpu::record_gpu_flip_completed(completion);
+                    if let Some(sequence) = presentation.flip_sequence {
+                        self.mark_flip_terminal(sequence, presentation.flip_terminal_source);
                     }
                 }
                 _ => return,
@@ -697,4 +828,8 @@ impl MetalPresenter {
             }
         }
     }
+}
+
+fn completion_order_trace_sequence(sequence: u64) -> bool {
+    sequence <= 32 || sequence.is_power_of_two()
 }

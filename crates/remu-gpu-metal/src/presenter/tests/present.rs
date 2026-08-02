@@ -22,6 +22,7 @@ use super::{
     process_memory_statistics, process_resident_bytes, raw_video_out_layout_is_linear,
     raw_video_out_texture_descriptor, read_texture_linear,
 };
+use super::super::FlipTerminalSource;
 
 #[test]
 fn presenter_shows_and_hides_a_host_splash_without_guest_video_out() {
@@ -267,6 +268,7 @@ fn pending_flip_without_a_source_retries_at_the_submission_boundary() {
         address: descriptor.address,
         buffer_index: 0,
         flip_argument: 0,
+        submission_sequence: None,
         sequence: 1,
     });
     presenter.pending_flip_queue = Some(7);
@@ -326,6 +328,7 @@ fn a_write_to_the_other_registered_buffer_waits_for_its_own_flip() {
         address: front.address,
         buffer_index: 0,
         flip_argument: 0,
+        submission_sequence: None,
         sequence: 1,
     });
     presenter.uploaded_flip_sequence = 1;
@@ -357,6 +360,7 @@ fn a_write_to_the_other_registered_buffer_waits_for_its_own_flip() {
         address: back.address,
         buffer_index: 1,
         flip_argument: 0,
+        submission_sequence: None,
         sequence: 2,
     });
     presenter.next_flip_sequence = 2;
@@ -384,12 +388,15 @@ fn a_flip_without_a_presentable_surface_still_completes() {
         pixel_format: 0x8000_0000_0000_0000,
         tiling_mode: 0,
     });
-    presenter.pending_flip = Some(PendingFlip {
+    let flip = PendingFlip {
         address: 0xefc0_0000_00,
         buffer_index: 1,
         flip_argument: 0x42,
+        submission_sequence: None,
         sequence: 1,
-    });
+    };
+    presenter.register_flip_completion_join(flip);
+    presenter.pending_flip = Some(flip);
     presenter.next_flip_sequence = 1;
     assert!(
         presenter.layer.is_none(),
@@ -398,6 +405,17 @@ fn a_flip_without_a_presentable_surface_still_completes() {
 
     presenter.finalize_pending_flip();
     assert_eq!(presenter.submitted_flip_sequence, 1);
+    assert!(
+        remu_gpu::take_gpu_completed_flips().is_empty(),
+        "surface-less finalization must wait for its asynchronous tail command buffer"
+    );
+    presenter
+        .pending_presentations
+        .front()
+        .expect("surface-less retirement tail")
+        .command_buffer
+        .wait_until_completed();
+    presenter.retire_completed_presentations();
     assert_eq!(
         remu_gpu::take_gpu_completed_flips(),
         [GpuFlipCompletion {
@@ -415,6 +433,136 @@ fn a_flip_without_a_presentable_surface_still_completes() {
 }
 
 #[test]
+fn surface_less_flip_without_a_command_queue_remains_unclaimed() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    presenter.display = Some(DisplayConfiguration {
+        width: 640,
+        height: 360,
+        pitch: 640,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 0,
+    });
+    let flip = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0x43,
+        submission_sequence: None,
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+    presenter.pending_flip = Some(flip);
+    presenter.next_flip_sequence = 1;
+    presenter.command_queue = None;
+
+    presenter.finalize_pending_flip();
+
+    let join = presenter
+        .flip_completion_joins
+        .get(&1)
+        .expect("unretired flip remains joined");
+    assert!(!join.terminal_claimed);
+    assert!(join.terminal_source.is_none());
+    assert_eq!(presenter.submitted_flip_sequence, 0);
+    assert!(presenter.pending_presentations.is_empty());
+    assert!(remu_gpu::take_gpu_completed_flips().is_empty());
+}
+
+#[test]
+fn flip_completion_join_waits_for_both_terminal_orders() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    let first_submission = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
+    let first = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0x101,
+        submission_sequence: Some(first_submission),
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(first);
+    assert_eq!(presenter.claim_flip_terminal(1), Some(1));
+    presenter.mark_flip_terminal(1, FlipTerminalSource::Presentation);
+    assert!(
+        remu_gpu::take_gpu_completed_flips().is_empty(),
+        "presentation-first completion waits for the exact submission"
+    );
+    presenter.publish_guest_submission_completion(first_submission);
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips()
+            .iter()
+            .map(|completion| completion.flip_argument)
+            .collect::<Vec<_>>(),
+        [0x101]
+    );
+
+    let second_submission = first_submission.saturating_add(1);
+    let second = PendingFlip {
+        address: 0xefc2_0000_00,
+        buffer_index: 1,
+        flip_argument: 0x102,
+        submission_sequence: Some(second_submission),
+        sequence: 2,
+    };
+    presenter.register_flip_completion_join(second);
+    presenter.publish_guest_submission_completion(second_submission);
+    assert!(
+        remu_gpu::take_gpu_completed_flips().is_empty(),
+        "submission-first completion waits for the presentation terminal point"
+    );
+    assert_eq!(presenter.claim_flip_terminal(2), Some(2));
+    presenter.mark_flip_terminal(2, FlipTerminalSource::Presentation);
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips()
+            .iter()
+            .map(|completion| completion.flip_argument)
+            .collect::<Vec<_>>(),
+        [0x102]
+    );
+    assert_eq!(presenter.flip_completion_join_statistics.deferred, 2);
+    assert_eq!(presenter.flip_completion_join_statistics.published, 2);
+}
+
+#[test]
+fn cross_queue_submission_completion_cannot_overtake_an_older_flip() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let _ = remu_gpu::take_gpu_completed_flips();
+    let older_submission = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
+    let newer_submission = older_submission.saturating_add(1);
+    for (sequence, submission_sequence, flip_argument) in
+        [(1, older_submission, 0x201), (2, newer_submission, 0x202)]
+    {
+        let flip = PendingFlip {
+            address: 0xefc0_0000_00 + sequence * 0x0200_0000,
+            buffer_index: sequence as u32,
+            flip_argument,
+            submission_sequence: Some(submission_sequence),
+            sequence,
+        };
+        presenter.register_flip_completion_join(flip);
+        assert_eq!(presenter.claim_flip_terminal(sequence), Some(sequence));
+        presenter.mark_flip_terminal(sequence, FlipTerminalSource::Presentation);
+    }
+
+    presenter.publish_guest_submission_completion(newer_submission);
+    assert!(
+        remu_gpu::take_gpu_completed_flips().is_empty(),
+        "a newer queue's terminal submission must not overtake the older accepted flip"
+    );
+    presenter.publish_guest_submission_completion(older_submission);
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips()
+            .iter()
+            .map(|completion| completion.flip_argument)
+            .collect::<Vec<_>>(),
+        [0x201, 0x202]
+    );
+}
+
+#[test]
 fn a_superseded_flip_is_completed_when_the_next_flip_replaces_it() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
@@ -427,12 +575,15 @@ fn a_superseded_flip_is_completed_when_the_next_flip_replaces_it() {
         pixel_format: 0x8000_0000_0000_0000,
         tiling_mode: 0,
     });
-    presenter.pending_flip = Some(PendingFlip {
+    let first = PendingFlip {
         address: 0xefc0_0000_00,
         buffer_index: 0,
         flip_argument: 0x11,
+        submission_sequence: None,
         sequence: 1,
-    });
+    };
+    presenter.register_flip_completion_join(first);
+    presenter.pending_flip = Some(first);
     presenter.next_flip_sequence = 1;
     presenter.finalized_flip_sequence = 1;
     presenter.uploaded_flip_sequence = 1;
@@ -442,6 +593,7 @@ fn a_superseded_flip_is_completed_when_the_next_flip_replaces_it() {
             address: 0xefc2_0000_00,
             buffer_index: 1,
             flip_argument: 0x22,
+            submission_sequence: None,
             width: 640,
             height: 360,
             pitch: 640,
@@ -454,19 +606,27 @@ fn a_superseded_flip_is_completed_when_the_next_flip_replaces_it() {
     assert_eq!(presenter.submitted_flip_sequence, 2);
     assert_eq!(
         remu_gpu::take_gpu_completed_flips(),
-        [
-            GpuFlipCompletion {
-                address: 0xefc0_0000_00,
-                buffer_index: 0,
-                flip_argument: 0x11,
-            },
-            GpuFlipCompletion {
-                address: 0xefc2_0000_00,
-                buffer_index: 1,
-                flip_argument: 0x22,
-            }
-        ],
-        "the replaced flip is retired before the flip that replaced it"
+        [GpuFlipCompletion {
+            address: 0xefc0_0000_00,
+            buffer_index: 0,
+            flip_argument: 0x11,
+        }],
+        "the standalone superseded flip retires before the asynchronous replacement tail"
+    );
+    presenter
+        .pending_presentations
+        .front()
+        .expect("replacement retirement tail")
+        .command_buffer
+        .wait_until_completed();
+    presenter.retire_completed_presentations();
+    assert_eq!(
+        remu_gpu::take_gpu_completed_flips(),
+        [GpuFlipCompletion {
+            address: 0xefc2_0000_00,
+            buffer_index: 1,
+            flip_argument: 0x22,
+        }]
     );
 }
 
@@ -487,12 +647,15 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
         pixel_format: 0x8000_0000_0000_0000,
         tiling_mode: 0,
     });
-    presenter.pending_flip = Some(PendingFlip {
+    let first = PendingFlip {
         address: 0xefc0_0000_00,
         buffer_index: 0,
         flip_argument: 0x11,
+        submission_sequence: Some(77),
         sequence: 1,
-    });
+    };
+    presenter.register_flip_completion_join(first);
+    presenter.pending_flip = Some(first);
     presenter.next_flip_sequence = 1;
     presenter.finalized_flip_sequence = 1;
     presenter.uploaded_flip_sequence = 1;
@@ -512,8 +675,7 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
             memory_writes: Vec::new(),
             render_pass: None,
             compute_encoder: None,
-            completion_sequences: Vec::new(),
-            flip_completions: Vec::new(),
+            completion_sequences: vec![77],
         });
 
     sender
@@ -521,6 +683,7 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
             address: 0xefc2_0000_00,
             buffer_index: 1,
             flip_argument: 0x22,
+            submission_sequence: None,
             width: 640,
             height: 360,
             pitch: 640,
@@ -542,19 +705,12 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
         "the superseded flip must not retire while ordered guest work is outstanding"
     );
     let deferred = presenter
-        .committed_guest_batches
-        .back()
-        .expect("the outstanding batch is still queued")
-        .flip_completions
-        .clone();
-    assert_eq!(
-        deferred
-            .iter()
-            .map(|completion| completion.flip_argument)
-            .collect::<Vec<_>>(),
-        [0x11],
-        "the superseded completion waits on the outstanding batch"
-    );
+        .flip_completion_joins
+        .get(&1)
+        .expect("the superseded flip remains in its completion join");
+    assert_eq!(deferred.submission_sequence, Some(77));
+    assert!(!deferred.submission_terminal);
+    assert_eq!(deferred.terminal_source, Some(FlipTerminalSource::Superseded));
 
     // Once the batch reaches a terminal state and retires, the deferred completion publishes.
     outstanding.commit();
@@ -580,6 +736,7 @@ fn leaked_flip_pacing_is_reconciled_against_the_presenter_sequences() {
         address: 0xefc0_0000_00,
         buffer_index: 0,
         flip_argument: 0,
+        submission_sequence: None,
         width: 640,
         height: 360,
         pitch: 640,
@@ -633,6 +790,7 @@ fn a_cold_pipeline_cover_holds_its_frame_back_from_a_foreign_submission_boundary
         address: descriptor.address,
         buffer_index: 0,
         flip_argument: 0,
+        submission_sequence: None,
         sequence: 1,
     });
     presenter.pending_flip_queue = Some(7);

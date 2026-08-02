@@ -1,7 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -428,7 +428,41 @@ struct PendingFlip {
     address: u64,
     buffer_index: u32,
     flip_argument: u64,
+    submission_sequence: Option<u64>,
     sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlipTerminalSource {
+    Presentation,
+    Superseded,
+    SurfaceLess,
+}
+
+impl FlipTerminalSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Presentation => "presentation",
+            Self::Superseded => "superseded",
+            Self::SurfaceLess => "surface-less",
+        }
+    }
+}
+
+struct FlipCompletionJoin {
+    completion: remu_gpu::GpuFlipCompletion,
+    submission_sequence: Option<u64>,
+    submission_terminal: bool,
+    terminal_claimed: bool,
+    terminal_source: Option<FlipTerminalSource>,
+    accepted_at: Instant,
+}
+
+#[derive(Default)]
+struct FlipCompletionJoinStatistics {
+    accepted: u64,
+    deferred: u64,
+    published: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1336,7 +1370,8 @@ struct PendingGlobalWriteback {
 struct PendingPresentation {
     command_buffer: CommandBuffer,
     submitted_at: Instant,
-    flip_completion: Option<remu_gpu::GpuFlipCompletion>,
+    flip_sequence: Option<u64>,
+    flip_terminal_source: FlipTerminalSource,
 }
 
 /// Whether a flush may decline to commit the open guest batch.
@@ -1433,13 +1468,6 @@ struct GuestCommandBatch {
     /// Queue scheduling can complete a newer global sequence before an older blocked queue, so
     /// every boundary is retained rather than incorrectly treating the maximum as a prefix.
     completion_sequences: Vec<u64>,
-    /// Flip completions that may publish only after this batch's ordered work has retired.
-    ///
-    /// A flip the guest replaces before presentation still owes its pacing decrement, but
-    /// Unreal retires the frame — and recycles its transient memory into the allocator — the
-    /// moment the completion is visible. Publishing it at event-dequeue time let the guest free
-    /// memory its own render thread was still writing, which is the MallocBinned3 corruption.
-    flip_completions: Vec<remu_gpu::GpuFlipCompletion>,
 }
 
 struct GlobalUploadChunk {
@@ -1819,6 +1847,12 @@ struct MetalPresenter {
     finalized_flip_sequence: u64,
     uploaded_flip_sequence: u64,
     submitted_flip_sequence: u64,
+    /// Accepted flips awaiting the two independently terminal halves of their completion join.
+    ///
+    /// The ordered map also prevents a newer cross-queue flip from becoming guest-visible ahead
+    /// of an older accepted flip whose exact guest submission has not retired yet.
+    flip_completion_joins: BTreeMap<u64, FlipCompletionJoin>,
+    flip_completion_join_statistics: FlipCompletionJoinStatistics,
     startup_error: Option<String>,
     logged_unsupported_layout: bool,
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
@@ -2010,6 +2044,8 @@ impl MetalPresenter {
             finalized_flip_sequence: 0,
             uploaded_flip_sequence: 0,
             submitted_flip_sequence: 0,
+            flip_completion_joins: BTreeMap::new(),
+            flip_completion_join_statistics: FlipCompletionJoinStatistics::default(),
             startup_error: None,
             logged_unsupported_layout: false,
             logged_unsupported_guest_draws: HashSet::new(),
