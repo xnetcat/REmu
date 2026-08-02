@@ -708,6 +708,9 @@ fn av_player_queue_event(
             event,
             delivery,
         });
+    if delivery == AvPlayerEventDelivery::Controller {
+        crate::wake_av_player_controller(state);
+    }
 }
 
 pub(crate) fn take_av_player_calling_thread_callbacks(
@@ -725,30 +728,59 @@ pub(crate) fn take_av_player_calling_thread_callbacks(
     calling_thread
 }
 
+/// Takes the asynchronous notifications owned by the controller thread.
+pub(crate) fn take_av_player_controller_callbacks(
+    state: &mut ProbeDispatchState,
+) -> Vec<AvPlayerEventCallback> {
+    let mut controller = Vec::new();
+    state.av_player.pending_callbacks.retain(|callback| {
+        if callback.delivery == AvPlayerEventDelivery::Controller {
+            controller.push(*callback);
+            false
+        } else {
+            true
+        }
+    });
+    controller
+}
+
 pub(crate) fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallback>) {
     for callback in callbacks {
-        if !process_guest_range_is_readable(callback.function, 1) {
-            eprintln!(
-                "[REMu][AVPLAYER] rejected unreadable event={} callback={:#x}",
-                callback.event, callback.function
-            );
-            continue;
-        }
-        type Callback = unsafe extern "C" fn(u64, u64, u64, u64);
-        // SAFETY: InitEx supplies a live guest SysV event callback and opaque event object. The
-        // process-wide dispatch lock has already been released, so this callback may re-enter any
-        // AVPlayer export exactly as the native library permits.
-        let function: Callback = unsafe { std::mem::transmute(callback.function) };
-        // SAFETY: The callback ABI is `(object, event, source_id, event_data)`.
-        unsafe { function(callback.object, callback.event, 0, 0) };
-        eprintln!(
-            "[REMu][AVPLAYER] delivered event={} callback={:#x} thread={:?}/{:#x}",
-            callback.event,
-            callback.function,
-            current_guest_thread_name(),
-            current_guest_thread_handle(),
-        );
+        invoke_av_player_event_callback(callback);
     }
+}
+
+pub(crate) fn invoke_av_player_event_callback(callback: AvPlayerEventCallback) {
+    type Callback = unsafe extern "C" fn(u64, u64, u64, u64);
+    if !process_guest_range_is_readable(callback.function, 1) {
+        eprintln!(
+            "[REMu][AVPLAYER] rejected unreadable event={} callback={:#x}",
+            callback.event, callback.function
+        );
+        return;
+    }
+    // A handler that never returns is otherwise visible only as a missing `delivered` line, which
+    // is indistinguishable from a notification that was never queued.
+    eprintln!(
+        "[REMu][AVPLAYER] dispatching event={} callback={:#x} thread={:?}/{:#x}",
+        callback.event,
+        callback.function,
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+    );
+    // SAFETY: InitEx supplies a live guest SysV event callback and opaque event object. The
+    // process-wide dispatch lock has already been released, so this callback may re-enter any
+    // AVPlayer export exactly as the native library permits.
+    let function: Callback = unsafe { std::mem::transmute(callback.function) };
+    // SAFETY: The callback ABI is `(object, event, source_id, event_data)`.
+    unsafe { function(callback.object, callback.event, 0, 0) };
+    eprintln!(
+        "[REMu][AVPLAYER] delivered event={} callback={:#x} thread={:?}/{:#x}",
+        callback.event,
+        callback.function,
+        current_guest_thread_name(),
+        current_guest_thread_handle(),
+    );
 }
 
 pub(crate) fn invoke_av_player_texture_deallocations(

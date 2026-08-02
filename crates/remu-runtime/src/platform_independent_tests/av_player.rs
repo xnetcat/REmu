@@ -1315,3 +1315,91 @@ fn av_player_video_catch_up_bounds_large_frame_drains_by_bytes() {
         6
     );
 }
+
+static BLOCKED_EVENT_ENTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BLOCKED_EVENT_RELEASED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A guest event handler that never returns until the test releases it.
+extern "C" fn av_player_blocking_event_callback(
+    _object: u64,
+    _event: u64,
+    _source: u64,
+    _data: u64,
+) {
+    BLOCKED_EVENT_ENTERED.store(true, std::sync::atomic::Ordering::Release);
+    while !BLOCKED_EVENT_RELEASED.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn av_player_blocked_controller_callback_never_stalls_a_guest_import() {
+    // The controller thread drains the process-wide dispatch state, so the queue this test fills
+    // has to be the same one the guest fills.
+    let dispatch =
+        crate::PROBE_DISPATCH.get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let (finished, import_returned) = std::sync::mpsc::channel();
+    let importer = std::thread::spawn(move || {
+        let mut state = crate::lock_probe_dispatch_for_write(dispatch);
+        let handle = av_player_test_player(&mut state);
+        let (sender, frames) = std::sync::mpsc::sync_channel(1);
+        drop(sender);
+        {
+            let player = state.av_player.players.get_mut(&handle).unwrap();
+            player.source = Some("controller-thread.mp4".to_owned());
+            player.duration = Duration::from_millis(9_109);
+            player.active_session = true;
+            player.playing_since = Some(Instant::now());
+            player.event_callback = av_player_blocking_event_callback as *const () as usize as u64;
+            player.video_decoder = Some(crate::AvPlayerDecoder {
+                child: None,
+                frames: std::sync::Mutex::new(frames),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                worker: None,
+                progress: Some(std::sync::Arc::new(
+                    crate::AvPlayerDecoderProgress::default(),
+                )),
+            });
+        }
+        // End of stream queues the Stop an intro movie delivers on its way out of the cutscene.
+        let mut frame_info = [0_u8; 112];
+        assert_eq!(
+            crate::av_player_get_video_data(
+                [handle, frame_info.as_mut_ptr().addr() as u64, 0, 0, 0, 0],
+                true,
+                &mut state,
+            ),
+            0
+        );
+        // Exactly what `import_dispatch` takes back from the dispatch state once its import ran.
+        let calling_thread = crate::take_av_player_calling_thread_callbacks(&mut state);
+        let deallocations = std::mem::take(&mut state.av_player.pending_texture_deallocations);
+        drop(state);
+        crate::invoke_av_player_event_callbacks(calling_thread);
+        crate::invoke_av_player_texture_deallocations(deallocations);
+        finished.send(handle).ok();
+    });
+
+    let handle = import_returned.recv_timeout(Duration::from_secs(10));
+    let entered = handle.is_ok()
+        && (0..1_000).any(|_| {
+            if BLOCKED_EVENT_ENTERED.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+    BLOCKED_EVENT_RELEASED.store(true, std::sync::atomic::Ordering::Release);
+    let handle = handle.expect("a blocked controller callback must not hold a guest import");
+    importer.join().unwrap();
+    assert!(
+        entered,
+        "the controller thread, not the importing guest thread, delivers end of stream"
+    );
+
+    let mut state = crate::lock_probe_dispatch_for_write(dispatch);
+    assert_eq!(crate::av_player_close(handle, &mut state), 0);
+    state.av_player.pending_callbacks.clear();
+}
