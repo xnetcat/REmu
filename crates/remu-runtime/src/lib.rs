@@ -6834,42 +6834,52 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
     if registers == 0 || register_count < 2 {
         return reject(0, format!("registers={registers:#x} count={register_count}"));
     }
-    let expected = match shader_type {
-        0 => (0x20c, 0x20d),
-        1 => (0x008, 0x009),
-        2 | 6 => (0x0c8, 0x0c9),
-        4 => (0x08a, 0x08b),
-        7 => (0x148, 0x149),
-        // Gen5 defines shader stages REmu has no register mapping for yet; a title using one
-        // loses those draws entirely, so name the stage rather than dropping it quietly. The
-        // header's own (lo, hi) register indices identify the stage the guest expects, which is
-        // exactly the datum needed to add the missing mapping.
+    // The program-address register each stage writes its code pointer into. `None` means the stage
+    // has no program pair at all, which is a property of the stage rather than a gap here:
+    //
+    //   kGsFront(4) and kHsFront(5) are the front halves of a merged stage — the fused shader
+    //   carries the back half's registers, so the front half never names a program address.
+    //   kFs(8) is a function shader: callable code, not a dispatchable stage.
+    //
+    // Measured in Poppy Playtime, and the values are what settle it. Types 0/1/2/6 lead with a
+    // ZERO pair — an empty slot waiting for this patch. A type-4 block instead reads
+    // [0x8a=0x60000003 0x8b=0x30010 ...]: live RSRC1/RSRC2 data, with no zero pair anywhere in the
+    // block. A type-6 block carries both `0xc8/0xc9 = 0` and `0x88/0x89 = 0` (real program slots)
+    // alongside a non-zero `0x8a/0x8b`, which is what proves 0x8a is RSRC1 and not a program low.
+    // Patching entries [0]/[1] positionally therefore destroyed two live guest values on every
+    // type-4 registration.
+    let program_low = match shader_type {
+        0 => Some(0x20c_u32),
+        1 => Some(0x008),
+        2 | 6 => Some(0x0c8),
+        7 => Some(0x148),
+        4 | 5 | 8 => None,
         _ => {
-            return reject(
+            // An unmapped stage is a capability gap worth seeing, but declining costs the guest a
+            // shader it cannot use. Report it and accept: a missing patch loses at most an address
+            // the title may set elsewhere, while a decline loses the draws outright.
+            reject(
                 1,
                 format!(
-                    "observed=({:#x}, {:#x}) count={register_count}",
+                    "observed=({:#x}, {:#x}) count={register_count}; accepted without patching",
                     read_guest_u32(registers),
                     read_guest_u32(registers + 8)
                 ),
             );
+            None
         }
     };
-    let observed = (read_guest_u32(registers), read_guest_u32(registers + 8));
-    if observed != expected {
-        return reject(
-            2,
-            format!("observed={observed:#x?} expected={expected:#x?}"),
-        );
-    }
-    // Which shader types a title actually registers, and the program-register pair each one
-    // carries, is otherwise only observable when the pair MISMATCHES — and no title has ever
-    // produced a mismatch, so the expected values above have never been confirmed against a
-    // guest. One line per distinct combination makes the accepted set readable too, which is
-    // what settles whether an expected pair is right or merely never exercised.
+    // Which shader types a title registers, and what each block actually contains, is not
+    // derivable from any header — entry order is a property of the shader compiler. One line per
+    // distinct combination is what turned this function's register handling from folklore into
+    // something measured.
     {
         static ACCEPTED: OnceLock<Mutex<BTreeSet<(u8, u32, u32)>>> = OnceLock::new();
-        let combination = (shader_type, observed.0, observed.1);
+        let combination = (
+            shader_type,
+            read_guest_u32(registers),
+            read_guest_u32(registers + 8),
+        );
         if ACCEPTED
             .get_or_init(|| Mutex::new(BTreeSet::new()))
             .lock()
@@ -6890,31 +6900,44 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
+            // Single-line: the `#` alternate form pretty-prints `Some(..)` across three lines and
+            // makes the record ungreppable, which defeats the point of logging it.
+            let program_low = program_low
+                .map_or_else(|| "none".to_owned(), |offset| format!("{offset:#x}"));
             eprintln!(
                 "[REMu][AGC] accepted shader registration type={shader_type} \
-                 registers=({:#x}, {:#x}) count={register_count} block=[{block}]",
-                observed.0, observed.1
+                 program_low={program_low} count={register_count} block=[{block}]"
             );
         }
     }
-    write_guest_u32(registers + 4, ((code >> 8) & 0xffff_ffff) as u32);
-    write_guest_u32(registers + 12, ((code >> 40) & 0xff) as u32);
-    // `registers` is derived from a just-relocated header field; if the relocation was wrong,
-    // these two stores land at an arbitrary heap address, so both are journaled.
-    remu_memory::record_guest_write(
-        remu_memory::GuestWriteSite::ShaderPatch,
-        registers + 4,
-        4,
-        &(((code >> 8) & 0xffff_ffff) as u32).to_le_bytes(),
-        0,
-    );
-    remu_memory::record_guest_write(
-        remu_memory::GuestWriteSite::ShaderPatch,
-        registers + 12,
-        4,
-        &(((code >> 40) & 0xff) as u32).to_le_bytes(),
-        0,
-    );
+    let Some(program_low) = program_low else {
+        // No program pair for this stage. Accepting without patching is what the console does and
+        // what KytyPS5 implements; the previous behaviour declined type 8 outright, which cost
+        // Poppy Playtime 388 shader registrations per run.
+        return true;
+    };
+    let count = u64::from(register_count);
+    // Search rather than index. The pair is at entries [0]/[1] in every block measured so far, but
+    // that is the shader compiler's choice, not the ABI's: SharpEmu-upstream records GTA V hull
+    // shaders leading with RSRC1/RSRC2 and the program pair sitting further in.
+    for (offset, value) in [
+        (program_low, ((code >> 8) & 0xffff_ffff) as u32),
+        (program_low + 1, ((code >> 40) & 0xff) as u32),
+    ] {
+        let Some(entry) = agc_api::find_shader_register(registers, count, offset, 0) else {
+            continue;
+        };
+        write_guest_u32(entry + 4, value);
+        // `registers` is derived from a just-relocated header field; if the relocation was wrong,
+        // this store lands at an arbitrary heap address, so it is journaled.
+        remu_memory::record_guest_write(
+            remu_memory::GuestWriteSite::ShaderPatch,
+            entry + 4,
+            4,
+            &value.to_le_bytes(),
+            0,
+        );
+    }
     true
 }
 

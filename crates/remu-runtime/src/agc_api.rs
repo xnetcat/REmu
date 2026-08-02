@@ -719,7 +719,12 @@ pub(crate) fn agc_get_fused_shader_size(arguments: [u64; 6]) -> u64 {
 }
 
 /// Finds a shader register by its hardware offset, skipping earlier occurrences.
-fn find_shader_register(registers: u64, count: u64, offset: u32, occurrence: u32) -> Option<u64> {
+pub(crate) fn find_shader_register(
+    registers: u64,
+    count: u64,
+    offset: u32,
+    occurrence: u32,
+) -> Option<u64> {
     let mut seen = 0;
     for index in 0..count {
         let entry = registers + index * SHADER_REGISTER_SIZE;
