@@ -231,10 +231,13 @@ fn temporary_app_content_mount_is_not_a_save_data_slot() {
     );
     assert_eq!(&mount_point[..7], b"/temp0\0");
     assert!(temporary.path.join("temp0").is_dir());
-    assert!(
+    // `/download0` shares the flat save root, so a search must not report it as a save slot.
+    std::fs::create_dir_all(temporary.path.join("download0")).unwrap();
+    assert_eq!(
         crate::enumerate_save_data_entries(&temporary.path, "")
             .unwrap()
-            .is_empty()
+            .len(),
+        0
     );
 }
 

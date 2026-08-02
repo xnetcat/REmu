@@ -252,10 +252,13 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
     if existed && create {
         return sce_kernel_error(SAVE_DATA_ERROR_EXISTS);
     }
+    // A prepared mount points `path` at its staging tree, so comparing only `path` would let the
+    // same slot be mounted a second time and have the committed directory renamed out from under
+    // the second mount's live descriptors.
     if state
         .save_mounts
         .values()
-        .any(|mounted| mounted.path == slot)
+        .any(|mounted| mounted.path == slot || mounted.committed_path == slot)
     {
         return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
     }
@@ -511,12 +514,15 @@ pub(crate) fn save_data_commit(arguments: [u64; 6], state: &mut ProbeDispatchSta
         eprintln!("[REMu][SAVEDATA] commit failed resource={resource}: {error}");
         return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
     }
+    // The rename already landed, so the transaction is over whether or not the mount survived a
+    // racing Umount2. Retiring it after the lookup would leave the resource prepared forever and
+    // every later Umount2 and Prepare reporting BUSY.
+    state.save_transactions.remove(&resource);
+    state.prepared_save_resources.remove(&resource);
     let Some(mounted) = state.save_mounts.get_mut(&transaction.mount_point) else {
         return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
     };
     mounted.path.clone_from(&transaction.committed_path);
-    state.save_transactions.remove(&resource);
-    state.prepared_save_resources.remove(&resource);
     eprintln!("[REMu][SAVEDATA] committed resource={resource}");
     0
 }
@@ -549,6 +555,7 @@ pub(crate) fn enumerate_save_data_entries(
         };
         if name.to_ascii_lowercase().starts_with("sce_")
             || name.eq_ignore_ascii_case("temp0")
+            || name.eq_ignore_ascii_case("download0")
             || (!pattern.is_empty() && !save_data_pattern_matches(&name, pattern))
         {
             continue;

@@ -2580,7 +2580,11 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             .join(",");
         eprintln!("[REMu][IMPORT] hits={hit} hot=[{summary}]");
     }
-    if !telemetry.seen[index].swap(true, Ordering::Relaxed) {
+    // After the first call for this NID the flag never changes again, so a relaxed load keeps the
+    // steady state a plain read instead of an atomic read-modify-write on every import.
+    if !telemetry.seen[index].load(Ordering::Relaxed)
+        && !telemetry.seen[index].swap(true, Ordering::Relaxed)
+    {
         let name = nid_display_name(nid).unwrap_or("unknown");
         eprintln!(
             "[REMu][IMPORT] first_hit={} nid={} name={} return={guest_return_address:#x} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
@@ -2617,8 +2621,12 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     if nid == "T72hz6ffq08" {
         static RENDER_THREAD_YIELD_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
         const BLOCKING_RENDER_QUERY_YIELD_RETURN: u64 = 0x8011_42b17;
-        let thread_name = current_guest_thread_name();
-        if trace_guest_sync() && thread_name.contains("RenderThread") {
+        // Naming the guest thread allocates, and this is the hottest spin-wait import in an
+        // Unreal TaskGraph title, so test the trace gate before paying for the name.
+        let thread_name = trace_guest_sync()
+            .then(current_guest_thread_name)
+            .unwrap_or_default();
+        if thread_name.contains("RenderThread") {
             let sequence = RENDER_THREAD_YIELD_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
             if trace_logarithmic_sequence(sequence, 32) {
                 let stack = std::array::from_fn::<_, 32, _>(|index| {
@@ -4877,7 +4885,10 @@ fn dispatch_probe_import(
             if let Some(result) = dispatch_extended_import(nid, arguments, state) {
                 return result;
             }
-            if state.unimplemented_nids.insert(nid.to_owned()) {
+            // A repeated unimplemented call is common; probing first keeps the `String` allocation
+            // to the first report instead of every one, under the process-wide write lock.
+            if !state.unimplemented_nids.contains(nid) {
+                state.unimplemented_nids.insert(nid.to_owned());
                 eprintln!(
                     "[REMu][IMPORT] unimplemented nid={nid} name={} args={:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
                     nid_display_name(nid).unwrap_or("unknown"),

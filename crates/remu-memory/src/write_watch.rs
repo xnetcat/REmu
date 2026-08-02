@@ -7,8 +7,8 @@
 //! a resident Metal resource and refresh only the host pages that the guest CPU has changed.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 mod diagnostic;
 
@@ -92,6 +92,18 @@ pub fn notify_guest_memory_written_excluding(
         }
     }
     notified
+}
+
+/// Reads `REMU_DISABLE_CPU_WRITE_WATCH` once for the process.
+///
+/// One watch is constructed per shared-registry record per snapshot, so reading the environment
+/// per construction is a linear `environ` scan on the hottest memory path under Rosetta, and lets
+/// the flag be observed inconsistently across watches within a single run.
+fn precise_tracking_requested() -> bool {
+    static PRECISE_TRACKING: OnceLock<bool> = OnceLock::new();
+    *PRECISE_TRACKING.get_or_init(|| {
+        std::env::var_os("REMU_DISABLE_CPU_WRITE_WATCH").is_none_or(|value| value != "1")
+    })
 }
 
 /// Why a CPU write watch stopped observing its original mapping.
@@ -182,8 +194,7 @@ impl CpuWriteWatch {
                 "CPU write watch page count does not fit this host",
             )
         })?;
-        let precise_tracking =
-            std::env::var_os("REMU_DISABLE_CPU_WRITE_WATCH").is_none_or(|value| value != "1");
+        let precise_tracking = precise_tracking_requested();
         let mut pages = Vec::new();
         pages.try_reserve_exact(page_count).map_err(|error| {
             io::Error::new(

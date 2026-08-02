@@ -373,8 +373,9 @@ events take `GPU_EVENT_SINK_TEST` to serialize, but 121 tests reach the import d
 holding it, so an event emitted by one test can be delivered to another test's receiver.
 
 Until this is fixed, verification runs must pass `--test-threads=1`, which makes the suite
-deterministic. The fix is either to make every test that can emit take the guard, or to route test
-events through the existing thread-local capture instead of the process-global sink.
+deterministic. The fix is either to make every test that can emit take the guard, or to add a
+thread-local event sink to `remu-gpu` and route test events through it. `remu-gpu` has no
+thread-local capture today, so the second option is new code, not a rewiring of what exists.
 
 ## Subsystem table
 

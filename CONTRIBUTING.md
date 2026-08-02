@@ -59,7 +59,7 @@ cargo test --workspace -- --test-threads=1
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --target x86_64-apple-darwin -- --test-threads=1
 cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
-python3 -m unittest scripts/tests/test_audit_import_coverage.py
+python3 -m unittest discover -s scripts/tests
 ```
 
 `--test-threads=1` is required until the order-dependent runtime suite recorded in

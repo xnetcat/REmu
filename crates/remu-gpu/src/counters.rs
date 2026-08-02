@@ -21,6 +21,9 @@ pub(crate) static GPU_COMPLETED_SUBMISSIONS: OnceLock<Mutex<BTreeSet<u64>>> = On
 
 pub(crate) static GPU_COMPLETED_FLIPS: OnceLock<Mutex<Vec<GpuFlipCompletion>>> = OnceLock::new();
 
+/// Length of `GPU_COMPLETED_FLIPS`, maintained under that mutex so the drain side can skip it.
+static GPU_COMPLETED_FLIPS_PENDING: AtomicUsize = AtomicUsize::new(0);
+
 static GPU_COMPLETION_NOTIFIER: OnceLock<fn()> = OnceLock::new();
 
 pub(crate) static AUDIO_OUTPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -248,20 +251,29 @@ pub fn gpu_completed_submission_ids_snapshot() -> Vec<u64> {
 /// Publishes completion of one display-buffer presentation.
 pub fn record_gpu_flip_completed(completion: GpuFlipCompletion) {
     cancel_pending_gpu_flips(1);
-    GPU_COMPLETED_FLIPS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(completion);
+    {
+        let mut completed = GPU_COMPLETED_FLIPS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        completed.push(completion);
+        GPU_COMPLETED_FLIPS_PENDING.store(completed.len(), Ordering::Release);
+    }
     record_gpu_progress();
     notify_gpu_completion_consumer();
 }
 
 /// Drains display-buffer presentations completed since the previous runtime refresh.
 pub fn take_gpu_completed_flips() -> Vec<GpuFlipCompletion> {
+    // Asked at every stateful import boundary; keep the empty case off a process-global mutex
+    // whose other side is the Metal completion handler.
+    if GPU_COMPLETED_FLIPS_PENDING.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
     let mut completed = GPU_COMPLETED_FLIPS
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    GPU_COMPLETED_FLIPS_PENDING.store(0, Ordering::Release);
     std::mem::take(&mut *completed)
 }

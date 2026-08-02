@@ -62,8 +62,15 @@ debugger_status=$?
 set -e
 
 revision=$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)
+# A commit name for a tree with uncommitted changes describes a build that was never committed.
+if [ "$revision" != unknown ] && ! git -C "$repo_dir" diff-index --quiet HEAD -- 2>/dev/null; then
+    revision="$revision-dirty"
+fi
 process_result=$(grep -E 'Process [0-9]+ (exited|stopped)' "$run_dir/debugger.log" | tail -n 1 || true)
 if printf '%s\n' "$process_result" | grep -q 'SIGALRM'; then
+    outcome=timeout
+elif printf '%s\n' "$process_result" | grep -q 'exited with status = 142'; then
+    # The probe's own timeout terminates the guest with _exit(142); it no longer raises SIGALRM.
     outcome=timeout
 elif printf '%s\n' "$process_result" | grep -q 'exited with status'; then
     outcome=guest-exit

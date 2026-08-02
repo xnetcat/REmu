@@ -180,7 +180,10 @@ pub(crate) fn message_dialog_update_status(state: &mut ProbeDispatchState) -> u6
     u64::from(state.services.message_dialog_status)
 }
 
-pub(crate) fn message_dialog_get_status(state: &ProbeDispatchState) -> u64 {
+/// A title that only ever calls `GetStatus` still has to observe the dialog finishing, so this
+/// polls the host exactly as `UpdateStatus` does instead of returning a status nothing advances.
+pub(crate) fn message_dialog_get_status(state: &mut ProbeDispatchState) -> u64 {
+    poll_message_dialog(state);
     u64::from(state.services.message_dialog_status)
 }
 
@@ -270,7 +273,9 @@ pub(crate) fn save_data_dialog_update_status(state: &mut ProbeDispatchState) -> 
     state.services.save_data_dialog_status.cast_unsigned().into()
 }
 
-pub(crate) fn save_data_dialog_get_status(state: &ProbeDispatchState) -> u64 {
+/// See [`message_dialog_get_status`]: a `GetStatus`-only poll loop must still make progress.
+pub(crate) fn save_data_dialog_get_status(state: &mut ProbeDispatchState) -> u64 {
+    poll_save_data_dialog(state);
     state.services.save_data_dialog_status.cast_unsigned().into()
 }
 
@@ -378,7 +383,9 @@ pub(crate) fn error_dialog_update_status(state: &mut ProbeDispatchState) -> u64 
     u64::from(state.services.error_dialog_status)
 }
 
-pub(crate) fn error_dialog_get_status(state: &ProbeDispatchState) -> u64 {
+/// See [`message_dialog_get_status`]: a `GetStatus`-only poll loop must still make progress.
+pub(crate) fn error_dialog_get_status(state: &mut ProbeDispatchState) -> u64 {
+    poll_error_dialog(state);
     u64::from(state.services.error_dialog_status)
 }
 

@@ -212,6 +212,10 @@ if [ "${REMU_METAL_HUD_LOG:-0}" = 1 ]; then
     export MTL_HUD_ENABLED MTL_HUD_LOG_ENABLED
 fi
 revision=$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)
+# A commit name for a tree with uncommitted changes describes a build that was never committed.
+if [ "$revision" != unknown ] && ! git -C "$repo_dir" diff-index --quiet HEAD -- 2>/dev/null; then
+    revision="$revision-dirty"
+fi
 started_at=$(date +%s)
 child_pid=
 
