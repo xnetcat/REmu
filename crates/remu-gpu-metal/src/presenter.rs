@@ -237,7 +237,7 @@ use self::tiling::{
 #[cfg(test)]
 use remu_memory::guest_shared_mapping_identity;
 use remu_shader::PixelOutputKind;
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::KeyCode;
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::window::Window;
@@ -1908,6 +1908,8 @@ struct MetalPresenter {
     device: Option<Device>,
     layer: Option<MetalLayer>,
     command_queue: Option<metal::CommandQueue>,
+    /// Wakes AppKit immediately when a guest Metal batch reaches a terminal state.
+    event_loop_waker: Option<EventLoopProxy<()>>,
     per_queue_guest_batches: bool,
     active_guest_queue: Option<u64>,
     guest_queue_batches: HashMap<u64, GuestQueueBatchState>,
@@ -2112,6 +2114,7 @@ impl MetalPresenter {
             device: Some(device),
             layer: None,
             command_queue: Some(command_queue),
+            event_loop_waker: None,
             per_queue_guest_batches: std::env::var_os("REMU_PER_QUEUE_BATCHES")
                 .is_some_and(|value| value == "1"),
             active_guest_queue: None,
@@ -2230,6 +2233,10 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     let event_loop = builder
         .build()
         .map_err(|error| format!("event loop failed: {error}"))?;
+    presenter.event_loop_waker = Some(event_loop.create_proxy());
+    if presenter.per_queue_guest_batches {
+        eprintln!("[REMu][METAL] guest-batch completion wakeups enabled");
+    }
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
     // Winit owns NSApplication's delegate and launch state. Calling `finishLaunching` or its
     // delegate callback ourselves marks the delegate as running before `run_app`, causing a

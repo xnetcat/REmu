@@ -16,6 +16,7 @@ use super::{
     guest_physical_ranges_overlap, guest_ranges_overlap,
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
+use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
 use metal::{
     Buffer, CommandBuffer, ComputeCommandEncoder, Device, MTLCommandBufferStatus,
@@ -747,6 +748,11 @@ impl MetalPresenter {
         // to at most one buffer per unchanged guest address range per batch.
         self.transient_global_buffer_cache.clear();
         batch.committed_at = Some(Instant::now());
+        if self.per_queue_guest_batches
+            && let Some(waker) = self.event_loop_waker.clone()
+        {
+            attach_guest_batch_completion_waker(&batch.command_buffer, waker);
+        }
         batch.command_buffer.commit();
         self.statistics.submitted_guest_batches =
             self.statistics.submitted_guest_batches.saturating_add(1);
@@ -792,6 +798,7 @@ impl MetalPresenter {
                 }
             }
         }
+        let completion_waker = self.event_loop_waker.clone();
         let state = self
             .guest_queue_batches
             .get_mut(&queue_id)
@@ -808,6 +815,9 @@ impl MetalPresenter {
         }
         state.transient_global_buffer_cache.clear();
         batch.committed_at = Some(Instant::now());
+        if let Some(waker) = completion_waker {
+            attach_guest_batch_completion_waker(&batch.command_buffer, waker);
+        }
         batch.command_buffer.commit();
         state.committed_batches.push_back(batch);
         self.record_guest_batch_flush(reason);
@@ -1067,6 +1077,17 @@ impl MetalPresenter {
             }
         }
     }
+}
+
+fn attach_guest_batch_completion_waker(
+    command_buffer: &CommandBuffer,
+    waker: winit::event_loop::EventLoopProxy<()>,
+) {
+    let handler = ConcreteBlock::new(move |_| {
+        let _ = waker.send_event(());
+    })
+    .copy();
+    command_buffer.add_completed_handler(&handler);
 }
 
 fn new_guest_command_batch(
