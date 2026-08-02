@@ -547,6 +547,13 @@ impl MetalPresenter {
                             .expect("GPU-written aliases acquired the command queue"),
                         &resident,
                     )?;
+                    // The writeback made guest RAM and the Metal allocation identical and
+                    // refreshed the watch's content baseline, so the resident is CPU-owned
+                    // again and adoptable. Re-adopting it also breaks the per-frame cycle:
+                    // the next bind sees no GPU-written alias and skips this whole path.
+                    let mut resident = resident;
+                    resident.gpu_written = false;
+                    quarantine_retired_resident(&mut self.retired_texture_quarantine, resident);
                 }
             }
         }
