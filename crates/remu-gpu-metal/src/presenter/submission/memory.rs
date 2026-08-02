@@ -10,13 +10,14 @@ use super::{
     refresh_resident_texture_write_watch, retire_sampled_textures_matching,
     trace_resident_texture_removal,
 };
-use crate::presenter::diagnostics::trace_diagnostic_guest_write;
+use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use remu_gpu::{
     GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
 };
 use remu_memory::{
-    CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_mapping_identity,
-    notify_guest_memory_written, read_guest_shared_backing, write_guest_shared_backing_if_identity,
+    CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_shared_mapping_identity,
+    guest_write_journal_enabled, notify_guest_memory_written, read_guest_shared_backing,
+    write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -205,6 +206,19 @@ impl MetalPresenter {
                         byte_count,
                     );
                 }
+            }
+            if guest_write_journal_enabled() {
+                // SAFETY: the copy above just wrote exactly these bytes, so the destination is
+                // readable for the journal's uniformity scan.
+                let written = unsafe {
+                    std::slice::from_raw_parts(copy.destination_address as *const u8, byte_count)
+                };
+                journal_guest_write(
+                    GuestWriteSite::DmaCopy,
+                    copy.destination_address,
+                    copy.byte_count,
+                    written,
+                );
             }
             let _ = notify_guest_memory_written(copy.destination_address, copy.byte_count);
             self.record_submitted_gpu_waits_in_range(copy.destination_address, copy.byte_count);
@@ -493,6 +507,50 @@ impl GuestMemoryWriteOperation {
     pub(crate) fn overlaps(&self, address: u64, byte_count: u64) -> bool {
         let (write_address, write_byte_count) = self.range();
         guest_ranges_overlap(write_address, write_byte_count, address, byte_count)
+    }
+
+    fn journal_site(&self) -> GuestWriteSite {
+        match self {
+            Self::Release(_) => GuestWriteSite::ReleaseMem,
+            Self::Write(_) => GuestWriteSite::WriteData,
+            Self::Fill { .. } => GuestWriteSite::DmaFill,
+        }
+    }
+
+    /// Returns the leading published bytes, or an empty slice when the value is only known to the
+    /// applying store, so the journal reports the verdict as unknown instead of inventing zeros.
+    fn journal_payload(&self) -> ([u8; 8], usize) {
+        let mut payload = [0_u8; 8];
+        match self {
+            Self::Release(GpuMemoryRelease {
+                value: GpuMemoryReleaseValue::Immediate32(value),
+                ..
+            }) => {
+                payload[..4].copy_from_slice(&value.to_le_bytes());
+                (payload, 4)
+            }
+            Self::Release(GpuMemoryRelease {
+                value: GpuMemoryReleaseValue::Immediate64(value),
+                ..
+            }) => {
+                payload.copy_from_slice(&value.to_le_bytes());
+                (payload, 8)
+            }
+            Self::Release(_) => (payload, 0),
+            Self::Write(write) => {
+                let mut length = 0;
+                for value in write.values.iter().take(2) {
+                    payload[length..length + 4].copy_from_slice(&value.to_le_bytes());
+                    length += 4;
+                }
+                (payload, length)
+            }
+            Self::Fill { value, .. } => {
+                payload[..4].copy_from_slice(&value.to_le_bytes());
+                payload[4..].copy_from_slice(&value.to_le_bytes());
+                (payload, 8)
+            }
+        }
     }
 }
 
@@ -814,6 +872,16 @@ pub(crate) fn apply_pending_guest_memory_writes(
                 "deferred guest memory write has no mapping lifetime guard address={address:#x} bytes={byte_count}"
             ))
         };
+        if result.is_ok() {
+            let (address, byte_count) = pending_write.range();
+            let (payload, payload_length) = pending_write.operation.journal_payload();
+            journal_guest_write(
+                pending_write.operation.journal_site(),
+                address,
+                byte_count,
+                &payload[..payload_length],
+            );
+        }
         if let Some(trace) = pixel_pipe_trace {
             let GuestMemoryWriteOperation::Release(release) = pending_write.operation else {
                 unreachable!("only a release can carry pixel-pipe trace provenance");

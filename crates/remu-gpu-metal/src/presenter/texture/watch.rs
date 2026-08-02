@@ -18,7 +18,7 @@ use super::{
 };
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
-    CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_backing_alias_segments,
+    CpuWriteWatch, CpuWriteWatchRetirement, GuestWriteSite, guest_shared_backing_alias_segments,
     guest_shared_mapping_epoch, guest_shared_mapping_identity, read_guest_shared_backing,
     write_guest_shared_backing_scattered,
 };
@@ -1414,6 +1414,11 @@ pub(crate) fn write_watched_guest_range(
         write_guest_shared_backing_scattered(address, byte_count, &segments)
     })?;
     if wrote {
+        crate::presenter::diagnostics::journal_guest_write_segments(
+            GuestWriteSite::TextureWritebackRange,
+            address,
+            &segments,
+        );
         // A backing write bypasses every armed page, so watches on other aliases of these
         // bytes would keep validating as clean against content that just changed. Publish the
         // write to every intersecting watch except the writer's own — a self-writeback must

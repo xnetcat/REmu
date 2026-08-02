@@ -291,6 +291,11 @@ pub(super) fn write_watched_guest_texture_linear(
                 descriptor.address
             ));
         }
+        crate::presenter::diagnostics::journal_guest_write_segments(
+            remu_memory::GuestWriteSite::TextureWritebackRows,
+            descriptor.address,
+            &segments,
+        );
         let _ = remu_memory::notify_guest_memory_written_excluding(
             descriptor.address,
             byte_count,
@@ -358,8 +363,14 @@ pub(super) fn write_watched_guest_texture_linear(
     );
     for (offset, length) in published {
         let start = usize::try_from(offset).map_err(|_| "published offset does not fit usize")?;
-        write_watch
-            .record_content_snapshot(descriptor.address + offset, &raw[start..start + length]);
+        let bytes = &raw[start..start + length];
+        crate::presenter::diagnostics::journal_guest_write(
+            remu_memory::GuestWriteSite::TextureWritebackTiled,
+            descriptor.address + offset,
+            length as u64,
+            bytes,
+        );
+        write_watch.record_content_snapshot(descriptor.address + offset, bytes);
     }
     Ok(())
 }

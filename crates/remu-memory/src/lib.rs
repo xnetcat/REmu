@@ -10,6 +10,14 @@ use remu_core::GuestAddress;
 use remu_loader::LoadedExecutable;
 use thiserror::Error;
 
+mod guest_write_journal;
+pub use guest_write_journal::{
+    GUEST_WRITE_JOURNAL_VARIABLE, GuestWriteSite, address_looks_poisoned,
+    dump_guest_write_journal, guest_write_journal_enabled, record_guest_write,
+};
+
+mod signal_text;
+
 #[cfg(target_os = "macos")]
 mod write_watch;
 #[cfg(target_os = "macos")]

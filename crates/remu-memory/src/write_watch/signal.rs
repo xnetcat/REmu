@@ -47,6 +47,8 @@ static PREVIOUS_SIGBUS: PreviousAction = PreviousAction::new();
 static PREVIOUS_SIGSEGV: PreviousAction = PreviousAction::new();
 
 pub(super) fn install_fault_handlers() -> io::Result<()> {
+    // Resolve the journal's enable flag here so the handler never reads the environment.
+    let _ = crate::guest_write_journal_enabled();
     let result = HANDLER_RESULT.get_or_init(|| {
         // SAFETY: the static previous-action slots outlive the process and the installed callback
         // has the SA_SIGINFO ABI required by sigaction.
@@ -238,6 +240,19 @@ fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) 
         format_fault_registers(registers, &mut buffer);
     }
     write_signal_diagnostic_bytes(buffer.as_slice());
+    // A declined fault is normally the crash itself. When the journal is armed, name every
+    // emulator publication that covers the faulting bytes before the process dies. The register
+    // values anchor the dump: a poisoned dereference faults on the derived garbage pointer, while
+    // the corrupted slot it was loaded from is still in the interrupted register file.
+    let mut anchors = [0_u64; REGISTER_COUNT];
+    let mut anchor_count = 0;
+    if let Some(registers) = registers.as_ref() {
+        for register in registers {
+            anchors[anchor_count] = register.value;
+            anchor_count += 1;
+        }
+    }
+    crate::dump_guest_write_journal(report.address, &anchors[..anchor_count]);
 }
 
 /// Reads the interrupted instruction pointer and integer registers out of the machine context.

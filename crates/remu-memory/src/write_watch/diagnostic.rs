@@ -3,75 +3,11 @@
 
 //! Allocation-free fault reporting for the write-watch signal handlers.
 //!
-//! Signal context forbids allocation and `core::fmt`, so every field is rendered by hand into
-//! caller-owned storage. The handler observes each process SIGSEGV/SIGBUS while CPU write watching
-//! is active, which makes this the only report emitted before an unrelated fault refaults under
-//! the previous action and terminates the process.
+//! The handler observes each process SIGSEGV/SIGBUS while CPU write watching is active, which makes
+//! this the only report emitted before an unrelated fault refaults under the previous action and
+//! terminates the process.
 
-/// Fixed capacity for a complete fault report, including its register line and newlines.
-pub(super) const DIAGNOSTIC_CAPACITY: usize = 1280;
-
-pub(super) struct DiagnosticBuffer {
-    bytes: [u8; DIAGNOSTIC_CAPACITY],
-    length: usize,
-}
-
-impl DiagnosticBuffer {
-    pub(super) const fn new() -> Self {
-        Self {
-            bytes: [0; DIAGNOSTIC_CAPACITY],
-            length: 0,
-        }
-    }
-
-    /// Appends as much of `value` as still fits. Truncation keeps the report readable instead of
-    /// panicking inside a signal handler.
-    pub(super) fn push_bytes(&mut self, value: &[u8]) {
-        let available = DIAGNOSTIC_CAPACITY - self.length;
-        let copied = value.len().min(available);
-        self.bytes[self.length..self.length + copied].copy_from_slice(&value[..copied]);
-        self.length += copied;
-    }
-
-    pub(super) fn push_hexadecimal(&mut self, value: u64) {
-        self.push_bytes(b"0x");
-        let mut digits = [0_u8; 16];
-        for (index, digit) in digits.iter_mut().enumerate() {
-            let nibble = (value >> (60 - index * 4)) & 0xf;
-            *digit = b"0123456789abcdef"[nibble as usize];
-        }
-        let leading = digits
-            .iter()
-            .position(|&digit| digit != b'0')
-            .unwrap_or(digits.len() - 1);
-        self.push_bytes(&digits[leading..]);
-    }
-
-    pub(super) fn push_signed(&mut self, value: i64) {
-        let magnitude = if value < 0 {
-            self.push_bytes(b"-");
-            value.unsigned_abs()
-        } else {
-            value.unsigned_abs()
-        };
-        let mut digits = [0_u8; 20];
-        let mut index = digits.len();
-        let mut remaining = magnitude;
-        loop {
-            index -= 1;
-            digits[index] = b'0' + (remaining % 10) as u8;
-            remaining /= 10;
-            if remaining == 0 {
-                break;
-            }
-        }
-        self.push_bytes(&digits[index..]);
-    }
-
-    pub(super) fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.length]
-    }
-}
+pub(super) use crate::signal_text::DiagnosticBuffer;
 
 /// Where a faulting address lives relative to the emulator's guest address-space reservations.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -221,17 +157,10 @@ fn signal_code_name(signal: i32, code: i32) -> &'static [u8] {
 }
 
 #[cfg(test)]
-fn push_hexadecimal_for_test(value: u64) -> String {
-    let mut buffer = DiagnosticBuffer::new();
-    buffer.push_hexadecimal(value);
-    String::from_utf8(buffer.as_slice().to_vec()).expect("hexadecimal digits are ASCII")
-}
-
-#[cfg(test)]
 mod tests {
     use super::{
         BUS_OBJERR, DiagnosticBuffer, FaultReason, FaultRegister, FaultReport, FaultSpace,
-        SEGV_ACCERR, format_fault_registers, format_fault_report, push_hexadecimal_for_test,
+        SEGV_ACCERR, format_fault_registers, format_fault_report,
     };
 
     fn rendered(report: FaultReport, reason: FaultReason) -> String {
@@ -318,21 +247,5 @@ mod tests {
         }; 32];
         format_fault_registers(&registers, &mut buffer);
         assert!(buffer.as_slice().ends_with(b"\n"));
-    }
-
-    #[test]
-    fn renders_boundary_addresses_without_truncation_or_padding() {
-        assert_eq!(push_hexadecimal_for_test(0), "0x0");
-        assert_eq!(push_hexadecimal_for_test(u64::MAX), "0xffffffffffffffff");
-        assert_eq!(push_hexadecimal_for_test(0x10), "0x10");
-    }
-
-    #[test]
-    fn truncates_instead_of_panicking_when_a_report_exceeds_its_buffer() {
-        let mut buffer = DiagnosticBuffer::new();
-        for _ in 0..=super::DIAGNOSTIC_CAPACITY / 10 {
-            buffer.push_bytes(b"0123456789");
-        }
-        assert_eq!(buffer.as_slice().len(), super::DIAGNOSTIC_CAPACITY);
     }
 }

@@ -11,7 +11,10 @@ use super::{
 };
 use metal::MTLPixelFormat;
 use remu_gpu::{ComputeDispatch, GpuMemoryCopy, GpuRegister, IndexedDraw, ShaderSnapshot};
-use remu_memory::{guest_shared_backing_identity, guest_shared_backing_ranges_overlap};
+use remu_memory::{
+    GuestWriteSite, guest_shared_backing_identity, guest_shared_backing_ranges_overlap,
+    guest_write_journal_enabled, record_guest_write,
+};
 use remu_shader::{
     GlobalMemoryBinding, ImageBinding, Program, ShaderEvaluation, ShaderMetadata,
     image_is_comparison,
@@ -1307,6 +1310,44 @@ fn diagnostic_guest_write_overlap(address: u64, byte_count: u64) -> Option<&'sta
     }
     guest_shared_backing_ranges_overlap(trace_address, trace_byte_count, address, byte_count)
         .then_some("physical-alias")
+}
+
+/// Records one host-authored guest range in the guest-write journal.
+///
+/// `payload` names the bytes published at `address`; `byte_count` may exceed it when the site only
+/// has a prefix, which the journal reports rather than assuming.
+pub(super) fn journal_guest_write(
+    site: GuestWriteSite,
+    address: u64,
+    byte_count: u64,
+    payload: &[u8],
+) {
+    record_guest_write(
+        site,
+        address,
+        byte_count,
+        payload,
+        remu_gpu::gpu_completed_submission_sequence(),
+    );
+}
+
+/// Records a scattered publication, one entry per contiguous run it actually wrote.
+pub(super) fn journal_guest_write_segments(
+    site: GuestWriteSite,
+    address: u64,
+    segments: &[(u64, &[u8])],
+) {
+    if !guest_write_journal_enabled() {
+        return;
+    }
+    for (offset, bytes) in segments {
+        journal_guest_write(
+            site,
+            address.wrapping_add(*offset),
+            bytes.len() as u64,
+            bytes,
+        );
+    }
 }
 
 pub(super) fn trace_diagnostic_guest_write(kind: &'static str, address: u64, byte_count: u64) {

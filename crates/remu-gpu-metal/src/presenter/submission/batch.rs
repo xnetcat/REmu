@@ -6,7 +6,7 @@ use super::super::completion::{
     wait_until_settled_within,
 };
 use super::super::FlushPolicy;
-use crate::presenter::diagnostics::trace_diagnostic_guest_write;
+use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter,
@@ -17,7 +17,7 @@ use metal::foreign_types::ForeignType;
 use metal::{Buffer, CommandBuffer, ComputeCommandEncoder, Device, MTLCommandBufferStatus, MTLResourceOptions};
 use objc::{msg_send, sel, sel_impl};
 use remu_memory::{
-    CpuWriteWatch, GuestSharedMappingIdentity, guest_shared_backing_identity,
+    CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_shared_backing_identity,
     read_guest_shared_backing, write_guest_shared_backing_at_identity,
     write_guest_shared_backing_if_identity,
 };
@@ -1023,6 +1023,19 @@ fn write_changed_global_ranges_with(
                 write_guest_shared_backing_at_identity(range_identity, &current_bytes[start..cursor])
             }
         };
+        if published {
+            journal_guest_write(
+                match mode {
+                    GlobalWritePublishMode::RequireLiveVa => GuestWriteSite::GlobalWriteback,
+                    GlobalWritePublishMode::ProducerIdentity => {
+                        GuestWriteSite::GlobalWritebackIdentity
+                    }
+                },
+                address,
+                byte_count,
+                &current_bytes[start..cursor],
+            );
+        }
         if !published {
             let current = guest_shared_backing_identity(address, byte_count);
             if matches!(mode, GlobalWritePublishMode::RequireLiveVa) && current != Some(range_identity)
@@ -1033,6 +1046,12 @@ fn write_changed_global_ranges_with(
                     range_identity,
                     &current_bytes[start..cursor],
                 ) {
+                    journal_guest_write(
+                        GuestWriteSite::GlobalWritebackIdentity,
+                        address,
+                        byte_count,
+                        &current_bytes[start..cursor],
+                    );
                     continue;
                 }
                 trace_discarded_stale_global_writeback(
@@ -1137,6 +1156,12 @@ fn write_changed_global_ranges_direct(
                 cursor - start,
             );
         }
+        journal_guest_write(
+            GuestWriteSite::GlobalWritebackDirect,
+            writeback.guest_address.wrapping_add(start as u64),
+            (cursor - start) as u64,
+            &current_bytes[start..cursor],
+        );
     }
     Ok(())
 }
