@@ -4,7 +4,8 @@
 use super::{
     AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT,
     AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT,
-    AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry, GPU_EVENT_SINK_TEST, VideoOutState,
+    AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry, GPU_EVENT_SINK_TEST,
+    VideoOutBufferAttributes, VideoOutState,
     agc_apply_submission_registers, agc_pm4, compute_graphics_state, decode_agc_dma_data,
     decode_agc_memory_acquire, decode_agc_memory_wait, low_u32,
 };
@@ -105,6 +106,87 @@ fn pfp_sync_me_rejects_a_non_native_packet_length() {
     assert!(matches!(
         result,
         Err(crate::AgcSubmissionError::PfpSyncMePacketLength { actual: 3 })
+    ));
+    assert_eq!(submission_count, 0);
+}
+
+#[test]
+fn wait_flip_done_maps_exact_packet_arguments_to_the_registered_buffer() {
+    let address = 0x0070_2468_0000;
+    let attributes = VideoOutBufferAttributes {
+        width: 3_840,
+        height: 2_160,
+        pitch: 3_840,
+        pixel_format: 0x8000_0000_2200_0000,
+        tiling_mode: 0,
+    };
+    let video_out = VideoOutState {
+        is_open: true,
+        display_buffers: vec![0, address],
+        display_buffer_attributes: vec![None, Some(attributes)],
+        ..VideoOutState::default()
+    };
+    let packet = [
+        agc_pm4(7, AGC_IT_NOP, crate::AGC_R_WAIT_FLIP_DONE),
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let mut submission_count = 0;
+    let (result, events) = crate::capture_agc_gpu_events(|| {
+        crate::agc_parse_submission(
+            packet.as_ptr().addr() as u64,
+            u32::try_from(packet.len()).expect("command dword count"),
+            &mut crate::AgcSubmissionContext {
+                graphics: &mut AgcGraphicsState::default(),
+                shaders: &mut AgcShaderRegistry::default(),
+                video_out: &video_out,
+                submission_count: &mut submission_count,
+                flips: &mut Vec::new(),
+                event_writes: &mut Vec::new(),
+            },
+        )
+    });
+
+    result.expect("valid WAIT_FLIP_DONE packet");
+    assert_eq!(submission_count, 1);
+    assert_eq!(
+        events,
+        [remu_gpu::GpuEvent::WaitFlipDone(remu_gpu::GpuFlipWait {
+            address,
+            buffer_index: 1,
+            required_flip_sequence: None,
+        })]
+    );
+}
+
+#[test]
+fn wait_flip_done_rejects_a_non_native_packet_length() {
+    let packet = [
+        agc_pm4(3, AGC_IT_NOP, crate::AGC_R_WAIT_FLIP_DONE),
+        1,
+        0,
+    ];
+    let mut submission_count = 0;
+    let result = crate::agc_parse_submission(
+        packet.as_ptr().addr() as u64,
+        u32::try_from(packet.len()).expect("command dword count"),
+        &mut crate::AgcSubmissionContext {
+            graphics: &mut AgcGraphicsState::default(),
+            shaders: &mut AgcShaderRegistry::default(),
+            video_out: &VideoOutState::default(),
+            submission_count: &mut submission_count,
+            flips: &mut Vec::new(),
+            event_writes: &mut Vec::new(),
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(crate::AgcSubmissionError::WaitFlipDonePacketLength { actual: 3 })
     ));
     assert_eq!(submission_count, 0);
 }

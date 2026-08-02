@@ -9,12 +9,14 @@ use crate::{
     AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_INDEX_TYPE, AGC_IT_NOP,
     AGC_IT_NUM_INSTANCES, AGC_IT_PFP_SYNC_ME, AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE,
     AGC_IT_WAIT_REG_MEM, AGC_IT_WRITE_DATA, AGC_R_ACB_RESET, AGC_R_ACQUIRE_MEM, AGC_R_DMA_DATA,
-    AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_WAIT_MEM_32,
-    AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA, AgcComputeDispatchError, AgcGraphicsState,
+    AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM,
+    AGC_R_WAIT_FLIP_DONE, AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA,
+    AgcComputeDispatchError, AgcGraphicsState,
     AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory, VideoOutState,
     agc_apply_set_base, agc_apply_submission_registers, agc_decode_compute_dispatch, agc_emit_draw,
     agc_emit_draw_with_indirect_arguments, agc_emit_indexed_draw, agc_image_binding_address,
-    agc_submit_ordered_video_out_flip, emit_agc_gpu_event, read_guest_u32, read_guest_u64,
+    agc_submit_ordered_video_out_flip, agc_video_out_target, emit_agc_gpu_event, read_guest_u32,
+    read_guest_u64,
     trace_agc_programs, trace_agc_registers, trace_agc_shaders, trace_guest_sync,
     trace_logarithmic_sequence,
 };
@@ -474,6 +476,32 @@ pub(crate) fn agc_handle_submission_packet(
         && let Some(wait) = decode_agc_memory_wait(packet_address, register, false)
     {
         emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryWait(wait));
+    }
+    if opcode == AGC_IT_NOP && register == AGC_R_WAIT_FLIP_DONE {
+        if length != 7 {
+            return Err(AgcSubmissionError::WaitFlipDonePacketLength { actual: length });
+        }
+        let handle = read_guest_u32(packet_address + 4);
+        let buffer_index = read_guest_u32(packet_address + 8);
+        if let Some(target) = agc_video_out_target(video_out, handle, buffer_index) {
+            static WAIT_FLIP_DONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+            let sequence = WAIT_FLIP_DONE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if trace_agc_programs() || trace_logarithmic_sequence(sequence as u64, 8) {
+                eprintln!(
+                    "[REMu][AGC][WAIT-FLIP-DONE] phase=accept sequence={sequence} packet={packet_address:#x} handle={handle} index={buffer_index} address={:#x}",
+                    target.address,
+                );
+            }
+            emit_agc_gpu_event(remu_gpu::GpuEvent::WaitFlipDone(remu_gpu::GpuFlipWait {
+                address: target.address,
+                buffer_index,
+                required_flip_sequence: None,
+            }));
+        } else {
+            eprintln!(
+                "[REMu][AGC][WAIT-FLIP-DONE] ignored invalid VideoOut target packet={packet_address:#x} handle={handle} index={buffer_index}"
+            );
+        }
     }
     if opcode == AGC_IT_WAIT_REG_MEM
         && length >= 7

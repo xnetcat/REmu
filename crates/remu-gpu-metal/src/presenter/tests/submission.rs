@@ -7,9 +7,11 @@ use metal::{
 };
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuMemoryAcquire,
-    GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite,
+    GpuFlipWait, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
+    GpuMemoryWrite,
     GpuPipelineBarrier, GpuPipelineStage, gpu_event_channel,
 };
+
 use remu_memory::{
     CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
     GuestProtection, guest_shared_backing_identity, guest_shared_backing_range,
@@ -35,6 +37,52 @@ use super::{
     QueueBlockReason, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
     read_texture_linear, write_back_pending_globals,
 };
+
+#[test]
+fn flip_wait_blocks_only_its_queue_front_and_preserves_the_following_boundary() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let flip = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0,
+        submission_sequence: None,
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 17,
+            events: vec![
+                GpuEvent::WaitFlipDone(GpuFlipWait {
+                    address: flip.address,
+                    buffer_index: flip.buffer_index,
+                    required_flip_sequence: None,
+                }),
+                GpuEvent::SubmissionBoundary(0xfeed),
+            ],
+        })
+        .expect("ordered wait submission reaches presenter");
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert!(matches!(
+        presenter.receiver.blocked_queues.get(&17),
+        Some(QueueBlockReason::FlipSafetyWait(GpuFlipWait {
+            required_flip_sequence: Some(1),
+            ..
+        }))
+    ));
+    assert_eq!(
+        presenter.receiver.pending_event_count(),
+        2,
+        "the wait and boundary stay at the same queue front"
+    );
+
+    presenter.mark_flip_buffer_safe(1, "test");
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert!(!presenter.receiver.blocked_queues.contains_key(&17));
+    assert_eq!(presenter.receiver.pending_event_count(), 0);
+}
 
 fn mapped_test_label() -> (GuestAddressSpace, u64) {
     let mut address_space =

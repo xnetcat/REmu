@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{
-    MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLStorageMode, MTLStoreAction, MTLTextureType,
-    MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
+    MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat, MTLStorageMode,
+    MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
 };
 use remu_gpu::{
-    GpuColorTarget, GpuEvent, GpuFlipCompletion, GpuHostImage, GpuScanoutTarget, gpu_event_channel,
+    GpuColorTarget, GpuEvent, GpuFlipCompletion, GpuFlipWait, GpuHostImage, GpuScanoutTarget,
+    gpu_event_channel,
 };
 use remu_shader::PixelOutputKind;
 use std::time::{Duration, Instant};
@@ -424,12 +425,188 @@ fn a_flip_without_a_presentable_surface_still_completes() {
             flip_argument: 0x42,
         }]
     );
+    let (_, safe) = presenter.bind_flip_safety_wait(GpuFlipWait {
+        address: flip.address,
+        buffer_index: flip.buffer_index,
+        required_flip_sequence: None,
+    });
+    assert!(safe, "the surface-less terminal tail releases an unsnapshotted buffer");
 
     presenter.finalize_pending_flip();
     assert!(
         remu_gpu::take_gpu_completed_flips().is_empty(),
         "a flip is retired exactly once"
     );
+}
+
+#[test]
+fn flip_wait_binds_only_to_the_latest_prior_flip_for_its_exact_buffer() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let flip = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0,
+        submission_sequence: None,
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+
+    let (same, same_safe) = presenter.bind_flip_safety_wait(GpuFlipWait {
+        address: flip.address,
+        buffer_index: flip.buffer_index,
+        required_flip_sequence: None,
+    });
+    assert_eq!(same.required_flip_sequence, Some(1));
+    assert!(!same_safe, "same-buffer wait must bind to the prior unsafe flip");
+
+    let (different, different_safe) = presenter.bind_flip_safety_wait(GpuFlipWait {
+        address: 0xefc2_0000_00,
+        buffer_index: 1,
+        required_flip_sequence: None,
+    });
+    assert_eq!(different.required_flip_sequence, None);
+    assert!(different_safe, "a never-flipped buffer has no dependency");
+
+    presenter.mark_flip_buffer_safe(1, "test");
+    assert!(presenter.bind_flip_safety_wait(same).1);
+}
+
+#[test]
+fn flip_safety_prefix_closes_only_after_an_out_of_order_hole_is_safe() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    for sequence in 1..=2 {
+        presenter.register_flip_completion_join(PendingFlip {
+            address: 0xefc0_0000_00 + sequence * 0x0200_0000,
+            buffer_index: (sequence - 1) as u32,
+            flip_argument: 0,
+            submission_sequence: None,
+            sequence,
+        });
+    }
+
+    presenter.mark_flip_buffer_safe(2, "newer-first");
+    assert_eq!(presenter.safe_flip_sequence_prefix, 0);
+    assert_eq!(presenter.flip_buffer_safety.len(), 2);
+    assert!(presenter.flip_buffer_safety.get(&2).is_some_and(|safety| safety.safe));
+
+    presenter.mark_flip_buffer_safe(1, "older-closes-hole");
+    assert_eq!(presenter.safe_flip_sequence_prefix, 2);
+    assert!(presenter.flip_buffer_safety.is_empty());
+}
+
+#[test]
+fn terminal_private_snapshot_releases_a_blocked_flip_wait() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let flip = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0,
+        submission_sequence: None,
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+    let command_buffer = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .new_command_buffer()
+        .to_owned();
+    presenter.record_flip_snapshot_command(1, command_buffer.clone());
+    let wait = GpuFlipWait {
+        address: flip.address,
+        buffer_index: flip.buffer_index,
+        required_flip_sequence: None,
+    };
+    assert!(!presenter.bind_flip_safety_wait(wait).1);
+
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    presenter.retire_completed_flip_snapshots();
+    assert!(presenter.bind_flip_safety_wait(wait).1);
+    assert_eq!(presenter.safe_flip_sequence_prefix, 1);
+}
+
+#[test]
+fn flip_then_wait_in_one_submission_queues_snapshot_before_the_wait_can_block() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let descriptor = GuestTextureDescriptor {
+        address: 0xefc0_0000_00,
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter.ensure_direct_scanout_texture(&device, descriptor);
+    presenter
+        .direct_scanout_textures
+        .get_mut(&descriptor.address)
+        .expect("direct scanout source")
+        .initialized = true;
+    presenter.display = Some(DisplayConfiguration {
+        width: descriptor.width,
+        height: descriptor.height,
+        pitch: descriptor.pitch,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 0,
+    });
+    let flip = PendingFlip {
+        address: descriptor.address,
+        buffer_index: 0,
+        flip_argument: 0,
+        submission_sequence: None,
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+    presenter.pending_flip = Some(flip);
+    presenter.next_flip_sequence = 1;
+
+    // This is the exact order used by the event loop: processing Flip finalizes its private copy
+    // synchronously before the following WaitFlipDone event can park the queue front.
+    presenter.finalize_pending_flip();
+    let snapshot = presenter
+        .flip_buffer_safety
+        .get(&1)
+        .and_then(|safety| safety.snapshot_command_buffer.clone())
+        .expect("flip handler enqueued an independent snapshot command buffer");
+    assert_ne!(snapshot.status(), MTLCommandBufferStatus::NotEnqueued);
+    let wait = GpuFlipWait {
+        address: flip.address,
+        buffer_index: flip.buffer_index,
+        required_flip_sequence: None,
+    };
+    assert_eq!(presenter.bind_flip_safety_wait(wait).0.required_flip_sequence, Some(1));
+
+    snapshot.wait_until_completed();
+    presenter.retire_completed_flip_snapshots();
+    assert!(presenter.bind_flip_safety_wait(wait).1);
+}
+
+#[test]
+fn superseded_flip_without_a_snapshot_releases_its_buffer() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let flip = PendingFlip {
+        address: 0xefc0_0000_00,
+        buffer_index: 0,
+        flip_argument: 0,
+        submission_sequence: None,
+        sequence: 1,
+    };
+    presenter.register_flip_completion_join(flip);
+    presenter.release_flip_buffer_without_snapshot(1, "superseded-before-snapshot");
+
+    assert!(presenter.bind_flip_safety_wait(GpuFlipWait {
+        address: flip.address,
+        buffer_index: flip.buffer_index,
+        required_flip_sequence: None,
+    }).1);
 }
 
 #[test]

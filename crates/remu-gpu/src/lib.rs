@@ -19,7 +19,7 @@ pub use compute::{
 
 mod event;
 pub use event::{
-    GpuEvent, GpuFlipCompletion, GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryCopySnapshot,
+    GpuEvent, GpuFlipCompletion, GpuFlipWait, GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryCopySnapshot,
     GpuMemoryCopySnapshotBudgetExceeded, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
     GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, GpuWaitId,
     gpu_memory_copy_snapshot_statistics,

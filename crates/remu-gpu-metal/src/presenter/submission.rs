@@ -47,6 +47,7 @@ impl MetalPresenter {
     pub(super) fn receive_events(&mut self) -> PresenterFlow {
         self.receive_shader_compilations();
         self.retire_completed_guest_batches();
+        self.retire_completed_flip_snapshots();
         self.retire_completed_presentations();
         // A guest label may have been published by a Metal batch that retired since the previous
         // AppKit tick. Before clearing the block graph, bounded dependency ingress discovers any
@@ -85,6 +86,15 @@ impl MetalPresenter {
                         || self.failed_compute_pipelines.contains(key)
                 }
                 QueueBlockReason::GuestMemoryWait(_) => false,
+                QueueBlockReason::FlipSafetyWait(wait) => wait
+                    .required_flip_sequence
+                    .is_none_or(|sequence| {
+                        sequence <= self.safe_flip_sequence_prefix
+                            || self
+                                .flip_buffer_safety
+                                .get(&sequence)
+                                .is_some_and(|safety| safety.safe)
+                    }),
             }) {
                 OrderedEventPoll::Event { source, event } => (source, event),
                 OrderedEventPoll::Blocked => {
@@ -189,10 +199,14 @@ impl MetalPresenter {
                     // the frame's transient memory to MallocBinned3 with its own render thread
                     // still writing through pointers into it. Defer the completion behind the
                     // ordered work exactly as SubmissionBoundary defers empty submissions.
-                    if let Some(superseded) = self.pending_flip
-                        && let Some(sequence) = self.claim_flip_terminal(superseded.sequence)
-                    {
-                        self.mark_flip_terminal(sequence, FlipTerminalSource::Superseded);
+                    if let Some(superseded) = self.pending_flip {
+                        self.release_flip_buffer_without_snapshot(
+                            superseded.sequence,
+                            "superseded-before-snapshot",
+                        );
+                        if let Some(sequence) = self.claim_flip_terminal(superseded.sequence) {
+                            self.mark_flip_terminal(sequence, FlipTerminalSource::Superseded);
+                        }
                     }
                     self.next_flip_sequence = self.next_flip_sequence.saturating_add(1);
                     let flip = PendingFlip {
@@ -227,6 +241,32 @@ impl MetalPresenter {
                         eprintln!(
                             "[REMu][METAL] PFP_SYNC_ME command-processor barrier failed: {error}"
                         );
+                    }
+                }
+                GpuEvent::WaitFlipDone(wait) => {
+                    let (wait, safe) = self.bind_flip_safety_wait(wait);
+                    static WAIT_FLIP_DONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+                    let occurrence = WAIT_FLIP_DONE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if safe {
+                        if occurrence <= 32 || occurrence.is_power_of_two() {
+                            eprintln!(
+                                "[REMu][WAIT-FLIP-DONE] phase=pass occurrence={occurrence} address={:#x} index={} required={:?}",
+                                wait.address, wait.buffer_index, wait.required_flip_sequence,
+                            );
+                        }
+                    } else {
+                        if occurrence <= 32 || occurrence.is_power_of_two() {
+                            eprintln!(
+                                "[REMu][WAIT-FLIP-DONE] phase=block occurrence={occurrence} address={:#x} index={} required={:?}",
+                                wait.address, wait.buffer_index, wait.required_flip_sequence,
+                            );
+                        }
+                        self.receiver.block_event(
+                            source,
+                            GpuEvent::WaitFlipDone(wait),
+                            QueueBlockReason::FlipSafetyWait(wait),
+                        );
+                        continue;
                     }
                 }
                 GpuEvent::PipelineBarrier(barrier) => self.end_guest_pipeline_barrier(barrier),

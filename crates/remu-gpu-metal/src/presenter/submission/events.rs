@@ -307,18 +307,20 @@ impl OrderedGpuEventReceiver {
 
     pub(crate) fn try_recv(
         &mut self,
-        pipeline_resolved: impl Fn(&QueueBlockReason) -> bool,
+        block_resolved: impl Fn(&QueueBlockReason) -> bool,
     ) -> OrderedEventPoll {
         self.ingest(dependency_ingress_budget());
         self.blocked_queues.retain(|_, reason| match reason {
             QueueBlockReason::GuestMemoryWait(_) => true,
-            reason @ (QueueBlockReason::GraphicsPipeline(_)
-            | QueueBlockReason::ComputePipeline(_)) => !pipeline_resolved(reason),
+            reason @ (QueueBlockReason::FlipSafetyWait(_)
+            | QueueBlockReason::GraphicsPipeline(_)
+            | QueueBlockReason::ComputePipeline(_)) => !block_resolved(reason),
         });
         if self.host_block.as_ref().is_some_and(|reason| match reason {
             QueueBlockReason::GuestMemoryWait(_) => false,
-            reason @ (QueueBlockReason::GraphicsPipeline(_)
-            | QueueBlockReason::ComputePipeline(_)) => pipeline_resolved(reason),
+            reason @ (QueueBlockReason::FlipSafetyWait(_)
+            | QueueBlockReason::GraphicsPipeline(_)
+            | QueueBlockReason::ComputePipeline(_)) => block_resolved(reason),
         }) {
             self.host_block = None;
         }
@@ -334,7 +336,10 @@ impl OrderedGpuEventReceiver {
                 !display_path_event
                     || !matches!(
                         self.blocked_queues.get(queue_id),
-                        Some(QueueBlockReason::GuestMemoryWait(_))
+                        Some(
+                            QueueBlockReason::GuestMemoryWait(_)
+                                | QueueBlockReason::FlipSafetyWait(_)
+                        )
                     )
             })
             .filter_map(|(_, queue)| queue.front())
@@ -632,18 +637,20 @@ impl OrderedGpuEventReceiver {
         })
     }
 
-    pub(crate) fn block_reason_counts(&self) -> (usize, usize) {
+    pub(crate) fn block_reason_counts(&self) -> (usize, usize, usize) {
         let mut pipeline = 0;
         let mut memory = 0;
+        let mut flip = 0;
         for reason in self.blocked_queues.values().chain(self.host_block.iter()) {
             match reason {
                 QueueBlockReason::GraphicsPipeline(_) | QueueBlockReason::ComputePipeline(_) => {
                     pipeline += 1;
                 }
                 QueueBlockReason::GuestMemoryWait(_) => memory += 1,
+                QueueBlockReason::FlipSafetyWait(_) => flip += 1,
             }
         }
-        (pipeline, memory)
+        (pipeline, memory, flip)
     }
 
     pub(crate) fn queue_diagnostics(&self) -> String {
@@ -683,6 +690,10 @@ impl OrderedGpuEventReceiver {
                                 )
                             }
                             GpuEvent::Flip { address, .. } => format!("flip:{address:#x}"),
+                            GpuEvent::WaitFlipDone(wait) => format!(
+                                "wait-flip:{:#x}/index:{}/required:{:?}",
+                                wait.address, wait.buffer_index, wait.required_flip_sequence
+                            ),
                             GpuEvent::SubmissionBoundary(sequence) => {
                                 format!("boundary:{sequence}")
                             }
@@ -696,6 +707,10 @@ impl OrderedGpuEventReceiver {
                             QueueBlockReason::GuestMemoryWait(wait) => {
                                 format!("memory:{:#x}", wait.address)
                             }
+                            QueueBlockReason::FlipSafetyWait(wait) => format!(
+                                "flip-safety:{:#x}/index:{}/required:{:?}",
+                                wait.address, wait.buffer_index, wait.required_flip_sequence
+                            ),
                             QueueBlockReason::GraphicsPipeline(key) => format!(
                                 "pipeline:{:#x}/{:#x}",
                                 key.export_shader_address, key.pixel_shader_address

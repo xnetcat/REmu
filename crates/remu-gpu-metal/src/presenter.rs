@@ -16,7 +16,8 @@ use metal::{
     MTLWinding, MetalLayer, RenderCommandEncoder, RenderPipelineState, SamplerState, Texture,
 };
 use remu_gpu::{
-    ComputeDispatch, GpuEvent, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite, IndexedDraw,
+    ComputeDispatch, GpuEvent, GpuFlipWait, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite,
+    IndexedDraw,
 };
 use remu_memory::{CpuWriteWatch, CpuWriteWatchRetirement, GuestSharedMappingIdentity};
 mod cache;
@@ -462,6 +463,14 @@ struct FlipCompletionJoinStatistics {
     accepted: u64,
     deferred: u64,
     published: u64,
+}
+
+struct FlipBufferSafety {
+    address: u64,
+    buffer_index: u32,
+    snapshot_command_buffer: Option<CommandBuffer>,
+    safe: bool,
+    accepted_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -949,6 +958,7 @@ struct ScheduledHostEvent {
 #[derive(Clone, Debug)]
 enum QueueBlockReason {
     GuestMemoryWait(GpuMemoryWait),
+    FlipSafetyWait(GpuFlipWait),
     GraphicsPipeline(GraphicsPipelineKey),
     ComputePipeline(ComputePipelineKey),
 }
@@ -1857,6 +1867,11 @@ struct MetalPresenter {
     /// of an older accepted flip whose exact guest submission has not retired yet.
     flip_completion_joins: BTreeMap<u64, FlipCompletionJoin>,
     flip_completion_join_statistics: FlipCompletionJoinStatistics,
+    /// Latest accepted flip generation for each registered `(address, index)` pair.
+    last_flip_sequence_by_buffer: HashMap<(u64, u32), u64>,
+    /// Private-snapshot safety for accepted flips newer than `safe_flip_sequence_prefix`.
+    flip_buffer_safety: BTreeMap<u64, FlipBufferSafety>,
+    safe_flip_sequence_prefix: u64,
     startup_error: Option<String>,
     logged_unsupported_layout: bool,
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
@@ -2044,6 +2059,9 @@ impl MetalPresenter {
             submitted_flip_sequence: 0,
             flip_completion_joins: BTreeMap::new(),
             flip_completion_join_statistics: FlipCompletionJoinStatistics::default(),
+            last_flip_sequence_by_buffer: HashMap::new(),
+            flip_buffer_safety: BTreeMap::new(),
+            safe_flip_sequence_prefix: 0,
             startup_error: None,
             logged_unsupported_layout: false,
             logged_unsupported_guest_draws: HashSet::new(),

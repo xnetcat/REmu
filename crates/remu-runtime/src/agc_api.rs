@@ -111,6 +111,7 @@ pub(crate) const AGC_IT_SET_CONTEXT_REG_INDIRECT: u32 = 0x9f;
 const AGC_R_ZERO: u32 = 0x00;
 pub(crate) const AGC_R_DRAW_INDEX_AUTO: u32 = 0x04;
 pub(crate) const AGC_R_DRAW_RESET: u32 = 0x05;
+pub(crate) const AGC_R_WAIT_FLIP_DONE: u32 = 0x06;
 pub(crate) const AGC_R_ACB_RESET: u32 = 0x09;
 pub(crate) const AGC_R_WAIT_MEM_32: u32 = 0x0a;
 pub(crate) const AGC_R_SH_REGS_INDIRECT: u32 = 0x11;

@@ -85,6 +85,12 @@ impl MetalPresenter {
                 }
                 Err(error) => {
                     eprintln!("[REMu][METAL] translated scanout synchronization failed: {error}");
+                    if let Some(flip) = flip {
+                        self.release_flip_buffer_without_snapshot(
+                            flip.sequence,
+                            "translated-snapshot-error",
+                        );
+                    }
                     "translated-error"
                 }
             };
@@ -114,6 +120,10 @@ impl MetalPresenter {
                     eprintln!(
                         "[REMu][COMPLETION-ORDER] phase=surface-less-blocked flip={} reason=command-queue-unavailable",
                         flip.sequence,
+                    );
+                    self.release_flip_buffer_without_snapshot(
+                        flip.sequence,
+                        "surface-less-command-queue-unavailable",
                     );
                 }
             }
@@ -150,6 +160,7 @@ impl MetalPresenter {
     }
 
     pub(crate) fn register_flip_completion_join(&mut self, flip: super::super::PendingFlip) {
+        self.register_flip_buffer_safety(flip);
         let submission_terminal = flip.submission_sequence.is_none();
         let replaced = self.flip_completion_joins.insert(
             flip.sequence,
@@ -176,6 +187,142 @@ impl MetalPresenter {
                 "[REMu][COMPLETION-ORDER] phase=accept flip={} submission={:?} submission_terminal={submission_terminal}",
                 flip.sequence, flip.submission_sequence,
             );
+        }
+    }
+
+    fn register_flip_buffer_safety(&mut self, flip: super::super::PendingFlip) {
+        self.last_flip_sequence_by_buffer
+            .insert((flip.address, flip.buffer_index), flip.sequence);
+        let replaced = self.flip_buffer_safety.insert(
+            flip.sequence,
+            super::super::FlipBufferSafety {
+                address: flip.address,
+                buffer_index: flip.buffer_index,
+                snapshot_command_buffer: None,
+                safe: false,
+                accepted_at: std::time::Instant::now(),
+            },
+        );
+        debug_assert!(replaced.is_none(), "flip safety sequence must be unique");
+    }
+
+    pub(crate) fn bind_flip_safety_wait(
+        &self,
+        mut wait: remu_gpu::GpuFlipWait,
+    ) -> (remu_gpu::GpuFlipWait, bool) {
+        if wait.required_flip_sequence.is_none() {
+            wait.required_flip_sequence = self
+                .last_flip_sequence_by_buffer
+                .get(&(wait.address, wait.buffer_index))
+                .copied();
+        }
+        let safe = wait.required_flip_sequence.is_none_or(|sequence| {
+            sequence <= self.safe_flip_sequence_prefix
+                || self
+                    .flip_buffer_safety
+                    .get(&sequence)
+                    .is_some_and(|safety| safety.safe)
+        });
+        (wait, safe)
+    }
+
+    pub(crate) fn record_flip_snapshot_command(
+        &mut self,
+        sequence: u64,
+        command_buffer: metal::CommandBuffer,
+    ) {
+        let Some(safety) = self.flip_buffer_safety.get_mut(&sequence) else {
+            return;
+        };
+        if safety.safe {
+            return;
+        }
+        safety.snapshot_command_buffer = Some(command_buffer);
+        if completion_order_trace_sequence(sequence) {
+            eprintln!(
+                "[REMu][WAIT-FLIP-DONE] phase=snapshot-queued flip={sequence} address={:#x} index={}",
+                safety.address, safety.buffer_index,
+            );
+        }
+    }
+
+    pub(crate) fn mark_flip_buffer_safe(&mut self, sequence: u64, source: &'static str) {
+        let Some(safety) = self.flip_buffer_safety.get_mut(&sequence) else {
+            return;
+        };
+        if safety.safe {
+            return;
+        }
+        safety.safe = true;
+        safety.snapshot_command_buffer = None;
+        if completion_order_trace_sequence(sequence) {
+            eprintln!(
+                "[REMu][WAIT-FLIP-DONE] phase=safe flip={sequence} address={:#x} index={} source={source} age_ms={:.3}",
+                safety.address,
+                safety.buffer_index,
+                safety.accepted_at.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        self.advance_safe_flip_sequence_prefix();
+    }
+
+    fn advance_safe_flip_sequence_prefix(&mut self) {
+        loop {
+            let next = self.safe_flip_sequence_prefix.saturating_add(1);
+            if !self
+                .flip_buffer_safety
+                .get(&next)
+                .is_some_and(|safety| safety.safe)
+            {
+                return;
+            }
+            self.flip_buffer_safety.remove(&next);
+            self.safe_flip_sequence_prefix = next;
+        }
+    }
+
+    pub(crate) fn release_flip_buffer_without_snapshot(
+        &mut self,
+        sequence: u64,
+        source: &'static str,
+    ) {
+        let unsnapshotted = self
+            .flip_buffer_safety
+            .get(&sequence)
+            .is_some_and(|safety| safety.snapshot_command_buffer.is_none() && !safety.safe);
+        if unsnapshotted {
+            // No native operation owns a read of this allocation. The caller has either retired
+            // the only possible consumer or proved that no snapshot could be enqueued.
+            self.mark_flip_buffer_safe(sequence, source);
+        }
+    }
+
+    pub(crate) fn retire_completed_flip_snapshots(&mut self) {
+        let terminal = self
+            .flip_buffer_safety
+            .iter()
+            .filter_map(|(&sequence, safety)| {
+                let command_buffer = safety.snapshot_command_buffer.as_ref()?;
+                match command_buffer.status() {
+                    MTLCommandBufferStatus::Completed => Some((sequence, "snapshot-completed")),
+                    MTLCommandBufferStatus::Error => {
+                        eprintln!(
+                            "[REMu][METAL] {}",
+                            command_buffer_failure_message(
+                                "VideoOut snapshot command buffer",
+                                command_buffer,
+                            )
+                        );
+                        Some((sequence, "snapshot-error"))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        for (sequence, source) in terminal {
+            // A terminal failure cannot keep reading the guest buffer and cannot be retried in
+            // place. Report it above, then release the queue dependency so later frames progress.
+            self.mark_flip_buffer_safe(sequence, source);
         }
     }
 
@@ -445,6 +592,14 @@ impl MetalPresenter {
                     self.statistics.presentation_queue_latency +=
                         presentation.submitted_at.elapsed();
                     if let Some(sequence) = presentation.flip_sequence {
+                        if presentation.flip_terminal_source
+                            == super::super::FlipTerminalSource::SurfaceLess
+                        {
+                            self.release_flip_buffer_without_snapshot(
+                                sequence,
+                                "surface-less-tail-completed",
+                            );
+                        }
                         self.mark_flip_terminal(sequence, presentation.flip_terminal_source);
                     }
                 }
@@ -464,6 +619,14 @@ impl MetalPresenter {
                     // flip after reporting it so the guest does not deadlock on an unavailable
                     // drawable while later frames may still recover.
                     if let Some(sequence) = presentation.flip_sequence {
+                        if presentation.flip_terminal_source
+                            == super::super::FlipTerminalSource::SurfaceLess
+                        {
+                            self.release_flip_buffer_without_snapshot(
+                                sequence,
+                                "surface-less-tail-error",
+                            );
+                        }
                         self.mark_flip_terminal(sequence, presentation.flip_terminal_source);
                     }
                 }
@@ -644,6 +807,7 @@ impl MetalPresenter {
             .pending_flip
             .filter(|flip| flip.address == address)
             .map_or(self.next_flip_sequence, |flip| flip.sequence);
+        self.record_flip_snapshot_command(sequence, command_buffer);
         let snapshotted_content_version = self
             .resident_guest_textures
             .get(&descriptor)
@@ -841,6 +1005,9 @@ impl MetalPresenter {
                 .map(|bytes| (descriptor, bytes))
         });
         self.uploaded_flip_sequence = flip.sequence;
+        // Raw scanout is copied through an immutable host snapshot and then uploaded into a
+        // private Metal texture. No later render into the guest buffer can change this frame.
+        self.mark_flip_buffer_safe(flip.sequence, "raw-private-snapshot");
         if flip.sequence == 1 {
             eprintln!(
                 "[REMu][METAL] uploaded first guest display buffer format={:#x}",

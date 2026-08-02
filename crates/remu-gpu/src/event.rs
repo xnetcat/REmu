@@ -55,6 +55,13 @@ pub enum GpuEvent {
         pixel_format: u64,
         tiling_mode: u32,
     },
+    /// A Gen5 `WAIT_FLIP_DONE` command-processor dependency.
+    ///
+    /// The backend binds an unbound wait to the newest flip it has already accepted for this
+    /// exact VideoOut buffer. Keeping that generation in the requeued event prevents a newer flip
+    /// from extending an older wait while its queue front is parked. `None` therefore means
+    /// "bind on first execution", not "wait for every future flip".
+    WaitFlipDone(GpuFlipWait),
     /// A `PFP_SYNC_ME` command-processor dependency.
     ///
     /// Following parser-front-end work, especially indirect argument fetches, must not overtake
@@ -86,6 +93,14 @@ pub enum GpuEvent {
     /// monotonic value to deliver `sceAgcDriverAddEqEvent` completion notifications.
     SubmissionBoundary(u64),
     Shutdown,
+}
+
+/// One queue-ordered request to stop rendering until a VideoOut buffer is reusable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuFlipWait {
+    pub address: u64,
+    pub buffer_index: u32,
+    pub required_flip_sequence: Option<u64>,
 }
 
 /// One display-buffer flip whose presentation command reached a terminal backend state.
