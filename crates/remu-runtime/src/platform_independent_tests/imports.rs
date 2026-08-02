@@ -1,8 +1,6 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::BTreeMap;
-
 use std::sync::atomic::Ordering;
 
 use super::{
@@ -518,10 +516,8 @@ fn pthread_keys_reuse_deleted_slots_and_clear_values_before_destructors() {
     assert_eq!(replacement_key, first_key);
     let replacement_generation = state.pthread_keys[&replacement_key].generation;
     crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
-        values.insert(
-            replacement_key,
-            (replacement_generation.saturating_sub(1), 0xdead_beef),
-        );
+        values[replacement_key as usize] =
+            (replacement_generation.saturating_sub(1), 0xdead_beef);
     });
     assert_eq!(
         crate::pthread_get_specific(replacement_key),
@@ -532,7 +528,7 @@ fn pthread_keys_reuse_deleted_slots_and_clear_values_before_destructors() {
         crate::take_current_thread_specific_destructors(&state).is_empty(),
         "a reused key must not inherit the deleted key's thread-specific value"
     );
-    crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
+    crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| values.fill((0, 0)));
 }
 
 #[test]
@@ -554,7 +550,12 @@ fn pthread_set_specific_is_a_stateless_leaf_import() {
         crate::dispatch_stateless_import("WrOLvHU0yQM", arguments, [0; 6]),
         Some(u64::from(libc::EINVAL.cast_unsigned()))
     );
-    crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
+    assert_eq!(crate::pthread_get_specific(256), 0);
+    assert_eq!(
+        crate::pthread_set_specific([256, 0xdead_beef, 0, 0, 0, 0]),
+        crate::sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| values.fill((0, 0)));
 }
 
 #[test]

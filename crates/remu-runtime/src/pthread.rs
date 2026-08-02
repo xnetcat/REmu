@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 use crate::{
@@ -468,7 +467,7 @@ pub(crate) fn pthread_key_delete(key: u32, state: &mut ProbeDispatchState) -> u6
     }
     PTHREAD_KEY_GENERATIONS[key as usize].store(0, Ordering::Release);
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
-        values.remove(&key);
+        values[key as usize] = (0, 0);
     });
     0
 }
@@ -485,7 +484,7 @@ pub(crate) fn pthread_set_specific(arguments: [u64; 6]) -> u64 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
-        values.insert(key, (generation, arguments[1]));
+        values[key as usize] = (generation, arguments[1]);
     });
     0
 }
@@ -502,7 +501,7 @@ pub(crate) fn pthread_get_specific(key: u32) -> u64 {
     }
     GUEST_PTHREAD_SPECIFIC.with_borrow(|values| {
         values
-            .get(&key)
+            .get(key as usize)
             .filter(|(stored_generation, _)| *stored_generation == generation)
             .map_or(0, |(_, value)| *value)
     })
@@ -516,7 +515,7 @@ pub(crate) fn take_current_thread_specific_destructors(
             .pthread_keys
             .iter()
             .filter_map(|(&key, &key_state)| {
-                let (generation, value) = values.get_mut(&key)?;
+                let (generation, value) = values.get_mut(key as usize)?;
                 if *generation != key_state.generation || key_state.destructor == 0 || *value == 0 {
                     return None;
                 }
@@ -566,7 +565,7 @@ pub(crate) fn run_guest_thread_destructors() {
             unsafe { destructor(argument) };
         }
     }
-    GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
+    GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| values.fill((0, 0)));
 }
 
 pub(crate) fn pthread_condition_attr_init(address: u64, state: &mut ProbeDispatchState) -> u64 {
