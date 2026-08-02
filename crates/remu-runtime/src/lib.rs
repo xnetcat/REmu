@@ -1425,12 +1425,9 @@ thread_local! {
     static KERNEL_MEMORY_READABLE_RANGES_CACHE: RefCell<Option<(usize, Arc<[(u64, u64)]>)>> = const { RefCell::new(None) };
 }
 
-static PTHREAD_KEY_GENERATIONS: OnceLock<RwLock<[u64; 256]>> = OnceLock::new();
+static PTHREAD_KEY_GENERATIONS: [AtomicU64; 256] =
+    [const { AtomicU64::new(0) }; 256];
 static NEXT_PTHREAD_KEY_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-fn pthread_key_generations() -> &'static RwLock<[u64; 256]> {
-    PTHREAD_KEY_GENERATIONS.get_or_init(|| RwLock::new([0; 256]))
-}
 
 #[cfg(target_os = "macos")]
 fn cached_kernel_memory_readable_range_end(address: u64) -> Option<u64> {
@@ -1952,9 +1949,9 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     }
     state.pthread_condition_attributes.clear();
     state.pthread_keys.clear();
-    *pthread_key_generations()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = [0; 256];
+    for generation in &PTHREAD_KEY_GENERATIONS {
+        generation.store(0, Ordering::Release);
+    }
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(BTreeMap::clear);
     state.exit_callbacks.clear();
     state.process_param_address = image.process_param.map_or(0, GuestAddress::get);

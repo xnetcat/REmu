@@ -3,10 +3,10 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     GUEST_PTHREAD_SPECIFIC, MACOS_GUEST_PAGE_ALIGNMENT, NEXT_PTHREAD_KEY_GENERATION,
-    PROBE_DISPATCH, ProbeDispatchState, PthreadAttrObject, PthreadAttrState, PthreadKeyState,
-    PthreadMutexAttrObject, PthreadMutexAttrState, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
-    SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TRY_AGAIN, current_guest_thread_handle,
-    guest_calloc, guest_free, low_i32, low_u32, pthread_key_generations, read_guest_cstring,
+    PROBE_DISPATCH, PTHREAD_KEY_GENERATIONS, ProbeDispatchState, PthreadAttrObject,
+    PthreadAttrState, PthreadKeyState, PthreadMutexAttrObject, PthreadMutexAttrState,
+    SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TRY_AGAIN,
+    current_guest_thread_handle, guest_calloc, guest_free, low_i32, low_u32, read_guest_cstring,
     read_guest_u32, sce_kernel_error, write_guest_u32, write_guest_u64,
 };
 
@@ -457,9 +457,7 @@ pub(crate) fn pthread_key_create(arguments: [u64; 6], state: &mut ProbeDispatchS
             generation,
         },
     );
-    pthread_key_generations()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)[key as usize] = generation;
+    PTHREAD_KEY_GENERATIONS[key as usize].store(generation, Ordering::Release);
     write_guest_u32(arguments[0], key);
     0
 }
@@ -468,9 +466,7 @@ pub(crate) fn pthread_key_delete(key: u32, state: &mut ProbeDispatchState) -> u6
     if state.pthread_keys.remove(&key).is_none() {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    pthread_key_generations()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)[key as usize] = 0;
+    PTHREAD_KEY_GENERATIONS[key as usize].store(0, Ordering::Release);
     GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
         values.remove(&key);
     });
@@ -479,10 +475,9 @@ pub(crate) fn pthread_key_delete(key: u32, state: &mut ProbeDispatchState) -> u6
 
 pub(crate) fn pthread_set_specific(arguments: [u64; 6]) -> u64 {
     let key = low_u32(arguments[0]);
-    let Some(&generation) = pthread_key_generations()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    let Some(generation) = PTHREAD_KEY_GENERATIONS
         .get(key as usize)
+        .map(|generation| generation.load(Ordering::Acquire))
     else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
@@ -496,10 +491,9 @@ pub(crate) fn pthread_set_specific(arguments: [u64; 6]) -> u64 {
 }
 
 pub(crate) fn pthread_get_specific(key: u32) -> u64 {
-    let Some(&generation) = pthread_key_generations()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    let Some(generation) = PTHREAD_KEY_GENERATIONS
         .get(key as usize)
+        .map(|generation| generation.load(Ordering::Acquire))
     else {
         return 0;
     };
