@@ -4,13 +4,13 @@
 use super::{
     CachedSampledTexture, DecodedImageDescriptor, GuestTextureContentState, GuestTextureDescriptor,
     GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
-    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, ResourceSpan,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
     TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, guest_texture_byte_count,
-    gpu_written_resident_serving_sampled_key, guest_texture_descriptors_overlap,
+    gpu_written_resident_serving_sampled_key,
     mode5_mip_chain_layout, mode27_mip_chain_layout, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
     texture_alias_trace_match, trace_alias_correlated_acquire, trace_resident_texture_removal,
@@ -218,10 +218,17 @@ impl MetalPresenter {
             }
             RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
         }
+        // Resolve each invalidated descriptor once instead of once per multisample entry.
+        let invalidated_multisample_spans = invalidated_multisample_descriptors
+            .iter()
+            .filter_map(|descriptor| ResourceSpan::for_texture(*descriptor))
+            .collect::<Vec<_>>();
         self.multisample_textures.retain(|key, _| {
-            !invalidated_multisample_descriptors
-                .iter()
-                .any(|descriptor| guest_texture_descriptors_overlap(key.descriptor, *descriptor))
+            !ResourceSpan::for_texture(key.descriptor).is_some_and(|candidate| {
+                invalidated_multisample_spans
+                    .iter()
+                    .any(|invalidated| candidate.overlaps(invalidated))
+            })
         });
 
         let sampled_keys = self
@@ -1058,6 +1065,7 @@ pub(crate) fn watch_resident_texture(
         }
         watch_sampled_texture(DecodedImageDescriptor {
             guest: descriptor,
+            span: ResourceSpan::for_texture(descriptor),
             destination_select: 0,
             base_mip_level: 0,
             mip_level_count: 1,
@@ -1079,6 +1087,7 @@ pub(crate) fn refresh_sampled_texture_write_watch(
             let was_dirty = cached.write_watch.is_dirty();
             let mut renewed = watch_sampled_texture(DecodedImageDescriptor {
                 guest: key.descriptor,
+                span: ResourceSpan::for_texture(key.descriptor),
                 // Component selection is lowered into each shader and does not change the host
                 // texture allocation or the guest bytes covered by its write watch.
                 destination_select: 0,

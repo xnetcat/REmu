@@ -1,9 +1,11 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::{GuestTextureDescriptor, ResidentGuestTexture, guest_texture_descriptors_overlap};
+use super::{
+    GuestTextureDescriptor, ResidentGuestTexture, ResidentTextureMap, ResourceSpan, SpanQueryOrder,
+};
 use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub(crate) const RESIDENT_WORK_AGE_LABELS: [&str; 6] = [
     "0-63",
@@ -49,7 +51,7 @@ pub(crate) struct ResidentTextureActivityStats {
 }
 
 pub(crate) fn resident_texture_activity_stats(
-    residents: &HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    residents: &ResidentTextureMap,
     current_work: u64,
     current_flip: u64,
 ) -> ResidentTextureActivityStats {
@@ -79,7 +81,7 @@ pub(crate) struct ResidentTextureEvictionPlan {
 /// are preferred because guest RAM is already authoritative, followed by the oldest GPU-owned
 /// allocations.
 pub(crate) fn resident_texture_eviction_plan(
-    residents: &HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    residents: &ResidentTextureMap,
     byte_capacity: u64,
     current_flip: u64,
     maximum_evictions: usize,
@@ -98,11 +100,19 @@ pub(crate) fn resident_texture_eviction_plan(
         .values()
         .filter(|resident| resident.last_use.flip < current_flip)
         .filter(|resident| {
+            // The pairwise scan this replaces was quadratic in the resident count and took the
+            // shared-mapping lock once per pair.
             !resident.gpu_written
-                || !residents.values().any(|other| {
-                    other.descriptor != resident.descriptor
-                        && other.gpu_written
-                        && guest_texture_descriptors_overlap(resident.descriptor, other.descriptor)
+                || !ResourceSpan::for_texture(resident.descriptor).is_some_and(|span| {
+                    residents
+                        .overlapping(&span, SpanQueryOrder::QueryFirst)
+                        .into_iter()
+                        .any(|other| {
+                            other != resident.descriptor
+                                && residents
+                                    .get(&other)
+                                    .is_some_and(|other| other.gpu_written)
+                        })
                 })
         })
         .map(|resident| {
@@ -201,7 +211,7 @@ struct BackingInterval {
 }
 
 pub(crate) fn resident_texture_backing_overlap_stats(
-    residents: &HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    residents: &ResidentTextureMap,
 ) -> ResidentTextureBackingOverlapStats {
     let mut intervals = residents
         .values()

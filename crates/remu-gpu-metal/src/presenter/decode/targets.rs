@@ -8,7 +8,8 @@ use super::{
     DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_SIZE, DB_DEPTH_SIZE_XY, DB_DEPTH_SLICE,
     DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_INFO, DB_Z_READ_BASE,
     DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, DecodedDepthTarget,
-    DecodedRenderTarget, GuestTextureDescriptor, RenderTargetFormat, decode_scanout_target,
+    DecodedRenderTarget, GuestTextureDescriptor, RenderTargetFormat, ResourceSpan,
+    decode_scanout_target,
     effective_linear_pitch, guest_texture_byte_count, half_float_to_f32, register_value,
     tiled_block_dimensions, trace_target_sampling, unsigned_float_to_f32,
 };
@@ -424,17 +425,20 @@ pub(crate) fn decode_render_target_state(
     } else {
         width
     };
+    let texture = GuestTextureDescriptor {
+        address,
+        width,
+        height,
+        pitch,
+        tile_mode,
+        pixel_format: format.pixel_format,
+        bytes_per_pixel: format.bytes_per_pixel,
+    };
     Ok(DecodedRenderTarget {
         guest_slot,
-        texture: GuestTextureDescriptor {
-            address,
-            width,
-            height,
-            pitch,
-            tile_mode,
-            pixel_format: format.pixel_format,
-            bytes_per_pixel: format.bytes_per_pixel,
-        },
+        texture,
+        // The one place a colour target's physical span is resolved, mirroring the SRD path.
+        span: ResourceSpan::for_texture(texture),
         output_kind: format.output_kind,
         write_mask,
         direct_scanout: false,
@@ -781,6 +785,7 @@ pub(crate) fn decode_depth_target(
     }
     Ok(Some(DecodedDepthTarget {
         texture,
+        span: ResourceSpan::for_texture(texture),
         layer_count,
         htile_address,
         compare,

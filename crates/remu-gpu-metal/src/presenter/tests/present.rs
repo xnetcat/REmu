@@ -675,6 +675,7 @@ fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
     let register_decoded_target = DecodedRenderTarget {
         guest_slot: 0,
         texture: descriptor,
+        span: super::ResourceSpan::for_texture(descriptor),
         output_kind: PixelOutputKind::Float,
         write_mask: 0xf,
         direct_scanout: false,

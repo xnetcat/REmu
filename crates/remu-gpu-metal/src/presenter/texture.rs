@@ -4,11 +4,12 @@
 use super::{
     CachedSampledTexture, DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget,
     DepthArrayKey, DepthArrayResidentTexture, DirectScanoutTexture, GuestTextureContentState,
-    GuestTextureDescriptor, GuestTextureOverlapQuery, GuestTextureWatchRange,
+    GuestTextureDescriptor, GuestTextureWatchRange,
     GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
     MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
     RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
     RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidentGuestTexture,
+    ResourceSpan,
     ResidentTextureActivityStamp, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
@@ -31,7 +32,8 @@ use super::{
     is_writable_image_opcode, mode5_mip_chain_layout, mode27_mip_chain_layout,
     record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, render_resolve_candidate_matches,
-    sampled_alias_descriptor, sampler_uses_normalized_coordinates, texture_element_layout,
+    sampled_alias_descriptor, sampler_uses_normalized_coordinates, spans_overlap,
+    texture_element_layout,
     trace_glyph_atlas, trace_image_descriptors, trace_target_sampling,
     trace_video_target_consumers,
     write_resident_texture_contents_to_guest,
@@ -43,6 +45,7 @@ mod correlation;
 mod depth_array;
 mod lifetime;
 mod mips;
+mod resident_map;
 mod residency;
 mod retire;
 mod sampled;
@@ -64,6 +67,9 @@ pub(crate) use self::mips::{
     create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
+pub(crate) use self::resident_map::{ResidentTextureMap, SpanQueryOrder};
+#[cfg(test)]
+pub(crate) use self::resident_map::ResidentSpanIndex;
 pub(crate) use self::residency::{
     QuarantineAdoption, RETIRED_TEXTURE_QUARANTINE_CAPACITY, adopt_quarantined_resident,
     ensure_resident_texture_in_map, quarantine_retired_resident, resident_texture_ownership_stats,

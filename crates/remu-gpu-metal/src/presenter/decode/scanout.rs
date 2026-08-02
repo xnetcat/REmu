@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    DecodedRenderTarget, DisplayConfiguration, GuestTextureDescriptor, decode_render_target_state,
+    DecodedRenderTarget, DisplayConfiguration, GuestTextureDescriptor, ResourceSpan,
+    decode_render_target_state,
 };
 use metal::MTLPixelFormat;
 use remu_gpu::GpuScanoutTarget;
@@ -46,17 +47,19 @@ pub(crate) fn decode_scanout_target(
             target.address, target.width, target.height, target.pitch
         ));
     }
+    let texture = GuestTextureDescriptor {
+        address: target.address,
+        width: target.width,
+        height: target.height,
+        pitch: target.pitch,
+        tile_mode: 0,
+        pixel_format,
+        bytes_per_pixel,
+    };
     Ok(DecodedRenderTarget {
         guest_slot: target.export_slot,
-        texture: GuestTextureDescriptor {
-            address: target.address,
-            width: target.width,
-            height: target.height,
-            pitch: target.pitch,
-            tile_mode: 0,
-            pixel_format,
-            bytes_per_pixel,
-        },
+        texture,
+        span: ResourceSpan::for_texture(texture),
         output_kind: PixelOutputKind::Float,
         write_mask: target.write_mask,
         direct_scanout: true,

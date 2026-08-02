@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedSampledTexture, GuestTextureDescriptor, GuestTextureOverlapQuery,
-    MultisampleResidentTexture, MultisampleTextureKey, ResidentGuestTexture, SampledTextureKey,
-    guest_ranges_overlap, guest_texture_byte_count, quarantine_retired_resident,
+    CachedSampledTexture, GuestTextureDescriptor, MultisampleResidentTexture,
+    MultisampleTextureKey, ResidentGuestTexture, ResidentTextureMap, ResourceSpan,
+    SampledTextureKey, guest_ranges_overlap, guest_texture_byte_count,
+    quarantine_retired_resident,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -96,12 +97,19 @@ pub(crate) fn retire_sampled_textures_matching(
     }
 }
 
+/// Retires every sampled interpretation that overlaps `span`, which the caller resolved at decode.
+///
+/// A `None` span names a descriptor the overlap predicate can never match, so nothing is retired.
 pub(crate) fn retire_overlapping_sampled_textures(
     cache: &mut HashMap<SampledTextureKey, CachedSampledTexture>,
-    descriptor: GuestTextureDescriptor,
+    span: Option<ResourceSpan>,
 ) {
-    let overlap = GuestTextureOverlapQuery::new(descriptor);
-    retire_sampled_textures_matching(cache, |_, cached| overlap.overlaps_query(&cached.overlap));
+    let Some(span) = span else {
+        return;
+    };
+    retire_sampled_textures_matching(cache, |_, cached| {
+        cached.overlap.is_some_and(|cached| span.overlaps(&cached))
+    });
 }
 
 pub(crate) fn retire_sampled_textures_overlapping_writeback(
@@ -125,7 +133,7 @@ pub(crate) fn retire_sampled_textures_overlapping_writeback(
 }
 
 pub(crate) fn retire_resident_textures_overlapping_writeback(
-    cache: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
+    cache: &mut ResidentTextureMap,
     retired_texture_quarantine: &mut HashMap<GuestTextureDescriptor, ResidentGuestTexture>,
     alias_ranges: &[(u64, u64)],
     source_descriptor: GuestTextureDescriptor,

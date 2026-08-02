@@ -5,65 +5,95 @@ use super::{GuestTextureDescriptor, guest_texture_byte_count};
 use metal::MTLPixelFormat;
 use remu_memory::{GuestSharedMappingIdentity, guest_shared_mapping_identity};
 
-#[derive(Clone, Copy)]
-pub(crate) struct GuestTextureOverlapQuery {
-    descriptor: GuestTextureDescriptor,
-    byte_count: Option<u64>,
+/// The guest bytes a decoded resource names, resolved once when its descriptor is decoded.
+///
+/// `backing` is the GPU-physical identity of `address .. address + len`; it is absent when the
+/// range has no complete live shared mapping. Resolving it once keeps the process-global
+/// shared-mapping registry lock off every per-draw candidate pair, and the admission-time
+/// identity keeps naming the same physical storage if the original VA is later rebound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceSpan {
+    address: u64,
+    len: u64,
     backing: Option<GuestSharedMappingIdentity>,
 }
 
-impl GuestTextureOverlapQuery {
-    pub(crate) fn new(descriptor: GuestTextureDescriptor) -> Self {
-        let byte_count = guest_texture_byte_count(descriptor);
-        let backing = byte_count.and_then(|byte_count| {
-            remu_memory::guest_shared_backing_identity(descriptor.address, byte_count)
-        });
+impl ResourceSpan {
+    /// Resolves a texture descriptor's span, or `None` when its byte count overflows.
+    ///
+    /// `None` is the same answer the overlap predicate gives such a descriptor: it can never
+    /// overlap anything, so it is never admitted to an interval index either.
+    pub(crate) fn for_texture(descriptor: GuestTextureDescriptor) -> Option<Self> {
+        Some(Self::new(
+            descriptor.address,
+            guest_texture_byte_count(descriptor)?,
+        ))
+    }
+
+    pub(crate) fn new(address: u64, len: u64) -> Self {
         Self {
-            descriptor,
-            byte_count,
-            backing,
+            address,
+            len,
+            backing: remu_memory::guest_shared_backing_identity(address, len),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn overlaps(&self, other: GuestTextureDescriptor) -> bool {
-        self.overlaps_query(&Self::new(other))
+    pub(crate) fn address(&self) -> u64 {
+        self.address
     }
 
-    /// Reports overlap with a descriptor whose physical identity was resolved previously.
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn end(&self) -> u64 {
+        self.address.saturating_add(self.len)
+    }
+
+    pub(crate) fn backing(&self) -> Option<GuestSharedMappingIdentity> {
+        self.backing
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlaps_texture(&self, other: GuestTextureDescriptor) -> bool {
+        Self::for_texture(other).is_some_and(|other| self.overlaps(&other))
+    }
+
+    /// Reports overlap against a span whose physical identity was resolved previously.
     ///
-    /// Sampled textures keep this query for their cache lifetime. Render-target invalidation can
-    /// therefore scan the cache without taking the process-global shared-mapping registry lock
-    /// once per entry. Keeping the admission-time identity also preserves the physical storage
-    /// represented by a cached texture if its original VA is later rebound.
-    pub(crate) fn overlaps_query(&self, other: &Self) -> bool {
-        let (Some(left_bytes), Some(right_bytes)) = (self.byte_count, other.byte_count) else {
-            return false;
-        };
-        if guest_ranges_overlap(
-            self.descriptor.address,
-            left_bytes,
-            other.descriptor.address,
-            right_bytes,
-        ) {
+    /// This is the whole overlap predicate `guest_texture_descriptors_overlap` implements, with
+    /// both identities supplied instead of resolved per call. The fallback is asymmetric — the
+    /// registry only walks aliases of the left operand's backing — so callers must keep the
+    /// operand order the linear scan they replace used.
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        if guest_ranges_overlap(self.address, self.len, other.address, other.len) {
             return true;
         }
         let (Some(left_backing), Some(right_backing)) = (self.backing, other.backing) else {
             return remu_memory::guest_shared_backing_ranges_overlap(
-                self.descriptor.address,
-                left_bytes,
-                other.descriptor.address,
-                right_bytes,
+                self.address,
+                self.len,
+                other.address,
+                other.len,
             );
         };
         left_backing.backing_id == right_backing.backing_id
             && guest_ranges_overlap(
                 left_backing.backing_offset,
-                left_bytes,
+                self.len,
                 right_backing.backing_offset,
-                right_bytes,
+                other.len,
             )
     }
+}
+
+/// Overlap between two spans resolved at decode, in `left.overlaps(right)` operand order.
+///
+/// A `None` operand names a descriptor whose byte count overflows, which the predicate answers
+/// false for against everything.
+pub(crate) fn spans_overlap(left: Option<ResourceSpan>, right: Option<ResourceSpan>) -> bool {
+    left.zip(right)
+        .is_some_and(|(left, right)| left.overlaps(&right))
 }
 
 pub(crate) fn guest_texture_descriptors_overlap(

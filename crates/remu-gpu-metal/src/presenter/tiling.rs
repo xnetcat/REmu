@@ -20,12 +20,12 @@ pub(crate) use self::blocks::{
 #[cfg(test)]
 pub(crate) use self::descriptors::guest_texture_descriptors_share_component_reordered_storage;
 pub(crate) use self::descriptors::{
-    GuestTextureOverlapQuery, guest_physical_ranges_overlap, guest_ranges_overlap,
+    ResourceSpan, guest_physical_ranges_overlap, guest_ranges_overlap,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    render_resolve_candidate_matches,
+    render_resolve_candidate_matches, spans_overlap,
 };
 #[cfg(test)]
 pub(crate) use self::mode5::encode_mode5_mip_chain_into_raw;

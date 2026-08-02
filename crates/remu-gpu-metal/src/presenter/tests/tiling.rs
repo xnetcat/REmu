@@ -247,6 +247,7 @@ fn mode27_volume_detile_applies_each_surface_z_xor() {
     let decoded = super::decode_sampled_texture_linear_from_raw(
         super::DecodedImageDescriptor {
             guest: descriptor,
+            span: super::ResourceSpan::for_texture(descriptor),
             destination_select: 0xfac,
             base_mip_level: 0,
             mip_level_count: 1,

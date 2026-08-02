@@ -4,10 +4,10 @@
 use super::completion::{commit_and_settle, settle};
 use super::{
     DecodedRenderTarget, GuestTextureDescriptor, METAL_TEXTURE_BUFFER_ROW_ALIGNMENT,
-    MetalPresenter, PendingTextureReadback, ResidentGuestTexture, TextureReadbackLayout,
-    capture_interval, diagnostic_dump_target_before_pixel_shader,
+    MetalPresenter, PendingTextureReadback, ResidentGuestTexture, SpanQueryOrder,
+    TextureReadbackLayout, capture_interval, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_minimum_draw, diagnostic_scanout_writer,
-    encode_mode27_mip_chain_into_raw, guest_texture_descriptors_overlap, half_float_to_f32,
+    encode_mode27_mip_chain_into_raw, half_float_to_f32,
     half_float_to_srgb_unorm8, half_float_to_unorm8, linear_unorm8_to_srgb_unorm8,
     mode27_mip_chain_layout, snapshot_watched_guest_range, texture_element_layout,
     unsigned_float_to_f32, unsigned_float_to_srgb_unorm8, write_guest_texture_linear_into_raw_at_z,
@@ -49,16 +49,16 @@ impl MetalPresenter {
         // scanout target metadata. This predicate is intentionally not used for texture routing
         // or initialization, and therefore cannot alter guest rendering.
         let overlaps_translated_scanout = |address: u64, width: u32, height: u32| {
-            self.resident_guest_textures
-                .values()
-                .filter(|resident| {
-                    resident.descriptor.address == address
-                        && resident.descriptor.width == width
-                        && resident.descriptor.height == height
-                })
-                .any(|resident| {
-                    guest_texture_descriptors_overlap(resident.descriptor, target.texture)
-                })
+            target.span.is_some_and(|span| {
+                self.resident_guest_textures
+                    .overlapping(&span, SpanQueryOrder::ResidentFirst)
+                    .into_iter()
+                    .any(|resident| {
+                        resident.address == address
+                            && resident.width == width
+                            && resident.height == height
+                    })
+            })
         };
         target.direct_scanout
             || self

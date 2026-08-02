@@ -692,6 +692,7 @@ fn promotes_small_depth_target_to_the_color_framebuffer_extent() {
     };
     let depth = DecodedDepthTarget {
         texture: descriptor,
+        span: super::ResourceSpan::for_texture(descriptor),
         layer_count: 1,
         htile_address: None,
         compare: MTLCompareFunction::Less,
@@ -763,6 +764,7 @@ fn promotes_layered_depth_target_without_collapsing_its_slices() {
     };
     let depth = DecodedDepthTarget {
         texture: descriptor,
+        span: super::ResourceSpan::for_texture(descriptor),
         layer_count: 3,
         htile_address: None,
         compare: MTLCompareFunction::Less,

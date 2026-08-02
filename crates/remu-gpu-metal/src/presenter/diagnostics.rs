@@ -1391,6 +1391,7 @@ pub(super) fn dump_msl_instruction_filter_matches(pixel_instruction_count: usize
 
 #[cfg(test)]
 mod tests {
+    use super::super::ResourceSpan;
     use super::*;
     use metal::{Device, MTLResourceOptions};
 
@@ -1494,16 +1495,18 @@ mod tests {
         } else {
             1
         };
+        let guest = GuestTextureDescriptor {
+            address,
+            width,
+            height,
+            pitch: width,
+            tile_mode: 0,
+            pixel_format,
+            bytes_per_pixel,
+        };
         DecodedImageDescriptor {
-            guest: GuestTextureDescriptor {
-                address,
-                width,
-                height,
-                pitch: width,
-                tile_mode: 0,
-                pixel_format,
-                bytes_per_pixel,
-            },
+            guest,
+            span: ResourceSpan::for_texture(guest),
             destination_select: 0,
             base_mip_level: 0,
             mip_level_count: 1,
