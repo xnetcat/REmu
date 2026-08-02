@@ -658,6 +658,51 @@ fn preserves_indirect_register_packet_fields_while_patching() {
 }
 
 #[test]
+fn builds_empty_indirect_register_packets_before_patching_them() {
+    for (build_nid, address_nid, add_nid, opcode, registers, register_count) in [
+        (
+            "ZvwO9euwYzc",
+            "vcmNN+AAXnY",
+            "d-6uF9sZDIU",
+            IT_SET_CONTEXT_REG_INDIRECT,
+            0x900e_25f5_3c_u64,
+            0x1f_u64,
+        ),
+        (
+            "hvUfkUIQcOE",
+            "6lNcCp+fxi4",
+            "vRoArM9zaIk",
+            IT_SET_UCONFIG_REG_INDIRECT,
+            0x9145_36f4_74_u64,
+            1_u64,
+        ),
+    ] {
+        let mut fixture = CommandFixture::new(0);
+        let buffer = fixture.address();
+        let command = call(build_nid, args(&[buffer, 0, 0]), [0; 6]);
+
+        assert_eq!(command, fixture.start());
+        assert_eq!(fixture.words[0], pm4(5, opcode, 0));
+        assert_eq!(&fixture.words[1..3], &[0, 0]);
+        assert_eq!(fixture.words[4] & 0x3fff, 0);
+        assert_eq!(call(address_nid, args(&[command, registers]), [0; 6]), 0);
+        assert_eq!(call(add_nid, args(&[command, register_count]), [0; 6]), 0);
+        assert_eq!(fixture.words[1], low_u32(registers) & !3);
+        assert_eq!(fixture.words[2], low_u32(registers >> 32));
+        assert_eq!(fixture.words[4] & 0x3fff, low_u32(register_count));
+    }
+
+    let mut fixture = CommandFixture::new(0);
+    let buffer = fixture.address();
+    assert_eq!(
+        call("ZvwO9euwYzc", args(&[buffer, 0, 1]), [0; 6]),
+        0,
+        "a non-empty register fetch still requires a usable address"
+    );
+    assert_eq!(fixture.cursor(), fixture.start());
+}
+
+#[test]
 fn builds_and_patches_native_dma_data() {
     let mut fixture = CommandFixture::new(0);
     let buffer = fixture.address();
