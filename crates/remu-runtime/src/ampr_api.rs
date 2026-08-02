@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use remu_shader::GuestMemoryReader;
@@ -570,10 +571,13 @@ fn ampr_read_guest_path_with(memory: &impl GuestMemoryReader, address: u64) -> O
 #[cfg(test)]
 mod guest_path_tests {
     use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     use remu_shader::GuestMemoryReader;
 
-    use super::ampr_read_guest_path_with;
+    use super::{ampr_read_guest_path_with, ampr_record_resolved_file};
+    use crate::ProbeDispatchState;
 
     struct BoundedMemory {
         base: u64,
@@ -683,6 +687,27 @@ mod guest_path_tests {
             None
         );
     }
+
+    #[test]
+    fn repeated_apr_resolution_retains_only_a_matching_open_file() {
+        let file_id = 0x1234_5678;
+        let original_path = PathBuf::from("/host/assets/original.pak");
+        let replacement_path = PathBuf::from("/host/assets/collision.pak");
+        let retained = Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap());
+        let mut state = ProbeDispatchState::default();
+        state.ampr_files.insert(file_id, original_path.clone());
+        state.ampr_file_handles.insert(file_id, retained.clone());
+
+        ampr_record_resolved_file(&mut state, file_id, original_path);
+        assert!(Arc::ptr_eq(
+            state.ampr_file_handles.get(&file_id).unwrap(),
+            &retained
+        ));
+
+        ampr_record_resolved_file(&mut state, file_id, replacement_path.clone());
+        assert_eq!(state.ampr_files.get(&file_id), Some(&replacement_path));
+        assert!(!state.ampr_file_handles.contains_key(&file_id));
+    }
 }
 
 pub(crate) fn ampr_resolve_paths_with_prefix(
@@ -734,8 +759,7 @@ fn ampr_resolve_one_path(
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     let file_id = ampr_file_id(guest_path);
-    state.ampr_files.insert(file_id, host_path.clone());
-    state.ampr_file_handles.remove(&file_id);
+    ampr_record_resolved_file(state, file_id, host_path.clone());
     if ids != 0 {
         write_guest_u32(ids + index * 4, file_id);
     }
@@ -754,6 +778,19 @@ fn ampr_resolve_one_path(
         );
     }
     0
+}
+
+/// Records the physical file behind an APR identifier without throwing away a still-valid open
+/// descriptor when a title resolves the same asset again.
+///
+/// File identifiers are only 32 bits, so a distinct path can replace an existing mapping. That
+/// case must evict the old handle or a later positional read would silently access the previous
+/// file through the colliding identifier.
+fn ampr_record_resolved_file(state: &mut ProbeDispatchState, file_id: u32, host_path: PathBuf) {
+    let previous = state.ampr_files.insert(file_id, host_path.clone());
+    if previous.as_ref() != Some(&host_path) {
+        state.ampr_file_handles.remove(&file_id);
+    }
 }
 
 /// Reports the size of an already resolved APR file.
