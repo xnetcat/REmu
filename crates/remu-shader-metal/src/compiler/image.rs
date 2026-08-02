@@ -614,28 +614,55 @@ impl Compiler<'_> {
         if metal_dim == 1 && matches!(image.dimension, 2 | 3) {
             sample_coordinates = self.temp("float2", &format!("{coordinates}.xy"));
         }
-        let coordinate_arguments = if image.dimension == 3 && metal_dim == 3 {
-            let face_uv = self.temp(
-                "float2",
-                &format!("float2({coordinates}.x - 1.0f, {coordinates}.y - 1.0f)"),
-            );
-            let layer = self.temp(
-                "uint",
-                &format!(
-                    "min(uint(rint(max({coordinates}.z, 0.0f))), tex{binding_index}.get_array_size() - 1u)"
-                ),
-            );
-            format!("{face_uv}, {layer}")
+        let coordinate_arguments = if metal_dim == 3 {
+            let (array_uv, layer) = if image.dimension == 3 {
+                // Cube coordinates are the face-atlas triple described above.
+                (
+                    self.temp(
+                        "float2",
+                        &format!(
+                            "float2({coordinates}.x - 1.0f, {coordinates}.y - 1.0f)"
+                        ),
+                    ),
+                    self.temp(
+                        "uint",
+                        &format!(
+                            "min(uint(rint(max({coordinates}.z, 0.0f))), tex{binding_index}.get_array_size() - 1u)"
+                        ),
+                    ),
+                )
+            } else if image.dimension == 2 {
+                // A 3D MIMG address rematerialized by an array SRD retains Z as the discrete
+                // layer. Metal still requires the coordinate and layer as separate arguments.
+                (
+                    self.temp("float2", &format!("{coordinates}.xy")),
+                    self.temp(
+                        "uint",
+                        &format!(
+                            "min(uint(rint(max({coordinates}.z, 0.0f))), tex{binding_index}.get_array_size() - 1u)"
+                        ),
+                    ),
+                )
+            } else {
+                // A 1D/2D MIMG address has no layer operand. Descriptor rematerialization can
+                // still bind an array resource, in which case the only represented layer is 0.
+                (sample_coordinates.clone(), "0u".to_owned())
+            };
+            format!("{array_uv}, {layer}")
         } else {
             sample_coordinates
         };
         let extra = if is_gather {
             String::new()
         } else if has_gradients {
-            if image.dimension == 3 && metal_dim == 3 {
-                // The guest supplies derivatives of the face-atlas coordinates, which are the
-                // 2D face coordinates up to the constant offset, so they pass through directly.
-                format!(", gradient2d({gradient_x}.xy, {gradient_y}.xy)")
+            if metal_dim == 3 {
+                // Array textures always take 2D gradients. A guest 3D/cube address carries a
+                // third coordinate for depth/layer selection, never a spatial array derivative.
+                if matches!(image.dimension, 2 | 3) {
+                    format!(", gradient2d({gradient_x}.xy, {gradient_y}.xy)")
+                } else {
+                    format!(", gradient2d({gradient_x}, {gradient_y})")
+                }
             } else if metal_dim == 2 {
                 let gradient = "gradient3d";
                 format!(", {gradient}({gradient_x}, {gradient_y})")

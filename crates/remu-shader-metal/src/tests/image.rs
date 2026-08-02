@@ -794,3 +794,92 @@ fn rematerializes_dim3_sample_against_type2d_srd_like_ue_slate() {
         shader.source
     );
 }
+
+fn compile_array_srd_sample(texture_type: u32, dimension: u32) -> String {
+    let address_registers = if dimension == 2 {
+        vec![0, 1, 2]
+    } else {
+        vec![0, 1]
+    };
+    let control = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: address_registers.clone(),
+        vector_data: 4,
+        scalar_resource: 0,
+        scalar_sampler: 8,
+        dimension,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSample"),
+        words: vec![0, 0],
+        sources: address_registers
+            .into_iter()
+            .map(Operand::vector)
+            .chain([Operand::scalar(0), Operand::scalar(8)])
+            .collect(),
+        destinations: (4..8).map(Operand::vector).collect(),
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let mut evaluation = empty_evaluation();
+    let mut resource_descriptor = vec![0; 8];
+    resource_descriptor[3] = 0x204 | (texture_type << 28);
+    evaluation.image_bindings.push(ImageBinding {
+        pc: 0,
+        opcode: Opcode::Known("ImageSample"),
+        control,
+        resource_descriptor: resource_descriptor.into(),
+        sampler_descriptor: vec![0; 4].into(),
+        mip_level: None,
+    });
+    compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("array SRD sample should lower")
+    .source
+}
+
+#[test]
+fn array_srd_types_supply_layer_zero_for_2d_mimg_addresses() {
+    for texture_type in [12, 13, 15] {
+        let source = compile_array_srd_sample(texture_type, 1);
+        assert!(
+            source.contains("texture2d_array<float> tex0"),
+            "TYPE={texture_type} must bind a Metal array texture:\n{source}"
+        );
+        let sample = source
+            .lines()
+            .find(|line| line.contains("tex0.sample("))
+            .expect("sample call");
+        assert!(
+            sample.contains(", 0u)"),
+            "TYPE={texture_type} DIM=2D must explicitly select layer zero: {sample}"
+        );
+    }
+}
+
+#[test]
+fn array_srd_separates_a_3d_mimg_z_coordinate_into_a_layer() {
+    let source = compile_array_srd_sample(12, 2);
+    assert!(source.contains("texture2d_array<float> tex0"));
+    assert!(source.contains(".xy"));
+    assert!(source.contains("tex0.get_array_size() - 1u"));
+    let sample = source
+        .lines()
+        .find(|line| line.contains("tex0.sample("))
+        .expect("sample call");
+    assert!(
+        sample.matches(',').count() >= 2,
+        "array sample must pass separate coordinate and layer arguments: {sample}"
+    );
+}
