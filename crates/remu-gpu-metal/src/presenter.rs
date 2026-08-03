@@ -1620,6 +1620,9 @@ struct PresenterStatistics {
     batch_flushes_for_cpu_synchronization: u32,
     shared_event_signals: u32,
     shared_event_waits: u32,
+    /// A3: same-queue `WAIT_REG_MEM`s the producer index proved were encoded ahead on this very
+    /// queue, so Metal FIFO order already satisfies them and no GPU event wait is encoded.
+    same_queue_wait_elisions: u32,
     shared_event_host_blocks: u32,
     shared_event_host_block_kinds: [u32; SHARED_HOST_KIND_COUNT],
     shared_event_host_wakes: u32,

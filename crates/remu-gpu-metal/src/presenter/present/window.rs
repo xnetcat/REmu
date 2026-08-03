@@ -329,9 +329,10 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
             );
             eprintln!(
-                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s acquire-noop-drops={:.0}/s gpu-ordered-waits={:.0}/s gpu-ordered-compute={:.0}/s gpu-ordered-draw={:.0}/s footprint-incomplete={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
+                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s same-queue-elided={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s acquire-noop-drops={:.0}/s gpu-ordered-waits={:.0}/s gpu-ordered-compute={:.0}/s gpu-ordered-draw={:.0}/s footprint-incomplete={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
                 f64::from(self.statistics.shared_event_signals) / seconds,
                 f64::from(self.statistics.shared_event_waits) / seconds,
+                f64::from(self.statistics.same_queue_wait_elisions) / seconds,
                 f64::from(self.statistics.shared_event_host_blocks) / seconds,
                 f64::from(self.statistics.shared_event_host_wakes) / seconds,
                 f64::from(self.statistics.shared_event_acquire_noop_drops) / seconds,
@@ -1206,6 +1207,7 @@ impl MetalPresenter {
         self.statistics.batch_flushes_for_cpu_synchronization = 0;
         self.statistics.shared_event_signals = 0;
         self.statistics.shared_event_waits = 0;
+        self.statistics.same_queue_wait_elisions = 0;
         self.statistics.shared_event_host_blocks = 0;
         self.statistics.shared_event_host_block_kinds = [0; super::super::SHARED_HOST_KIND_COUNT];
         self.statistics.shared_event_host_wakes = 0;
