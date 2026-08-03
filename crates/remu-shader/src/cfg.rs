@@ -68,9 +68,7 @@ impl ControlFlowGraph {
     /// Predecessor block ids of one block.
     #[must_use]
     pub fn predecessors(&self, block: BlockId) -> &[BlockId] {
-        self.predecessors
-            .get(block)
-            .map_or(&[], Vec::as_slice)
+        self.predecessors.get(block).map_or(&[], Vec::as_slice)
     }
 
     /// The entry block id (always `0` for a non-empty program).
@@ -179,7 +177,10 @@ pub fn build_control_flow_graph(program: &Program) -> ControlFlowGraph {
 
     let mut blocks: Vec<BasicBlock> = Vec::with_capacity(leader_list.len());
     for (block, &first) in leader_list.iter().enumerate() {
-        let end = leader_list.get(block + 1).copied().unwrap_or(instructions.len());
+        let end = leader_list
+            .get(block + 1)
+            .copied()
+            .unwrap_or(instructions.len());
         let last = end - 1;
         let last_instruction = &instructions[last];
         let (exit, successors) = classify_exit(

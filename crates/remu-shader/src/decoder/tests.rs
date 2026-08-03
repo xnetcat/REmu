@@ -1055,12 +1055,42 @@ fn decodes_clean_room_ps5_extension_regression_envelopes() {
 const FLAT_SHARED_LOAD_STORE: &[(u32, &str, &str, &str)] = &[
     (0x08, "FlatLoadUbyte", "ScratchLoadUbyte", "GlobalLoadUbyte"),
     (0x0c, "FlatLoadDword", "ScratchLoadDword", "GlobalLoadDword"),
-    (0x0d, "FlatLoadDwordx2", "ScratchLoadDwordx2", "GlobalLoadDwordx2"),
-    (0x0e, "FlatLoadDwordx4", "ScratchLoadDwordx4", "GlobalLoadDwordx4"),
-    (0x0f, "FlatLoadDwordx3", "ScratchLoadDwordx3", "GlobalLoadDwordx3"),
-    (0x1c, "FlatStoreDword", "ScratchStoreDword", "GlobalStoreDword"),
-    (0x1d, "FlatStoreDwordx2", "ScratchStoreDwordx2", "GlobalStoreDwordx2"),
-    (0x24, "FlatLoadShortD16", "ScratchLoadShortD16", "GlobalLoadShortD16"),
+    (
+        0x0d,
+        "FlatLoadDwordx2",
+        "ScratchLoadDwordx2",
+        "GlobalLoadDwordx2",
+    ),
+    (
+        0x0e,
+        "FlatLoadDwordx4",
+        "ScratchLoadDwordx4",
+        "GlobalLoadDwordx4",
+    ),
+    (
+        0x0f,
+        "FlatLoadDwordx3",
+        "ScratchLoadDwordx3",
+        "GlobalLoadDwordx3",
+    ),
+    (
+        0x1c,
+        "FlatStoreDword",
+        "ScratchStoreDword",
+        "GlobalStoreDword",
+    ),
+    (
+        0x1d,
+        "FlatStoreDwordx2",
+        "ScratchStoreDwordx2",
+        "GlobalStoreDwordx2",
+    ),
+    (
+        0x24,
+        "FlatLoadShortD16",
+        "ScratchLoadShortD16",
+        "GlobalLoadShortD16",
+    ),
 ];
 
 fn flat_word(opcode: u32, segment: u32) -> u32 {

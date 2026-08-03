@@ -191,7 +191,10 @@ fn walk_structured(
 }
 
 /// Asserts the structured reconstruction reproduces the raw graph walk for every supplied oracle.
-fn assert_structured_matches_graph(cfg: &ControlFlowGraph, oracles: &[fn(BlockId, usize) -> usize]) {
+fn assert_structured_matches_graph(
+    cfg: &ControlFlowGraph,
+    oracles: &[fn(BlockId, usize) -> usize],
+) {
     let structured = cfg.structure();
     for (index, base) in oracles.iter().enumerate() {
         let mut raw_oracle = *base;
@@ -465,7 +468,11 @@ fn builds_a_conditional_diamond_from_a_decoded_program() {
     assert_eq!(entry.exit, BlockExit::Conditional);
     assert_eq!(entry.successors.len(), 2);
     // The post-dominator of the entry is the shared endpgm block.
-    assert!(cfg.post_dominators().immediate_post_dominator(cfg.entry()).is_some());
+    assert!(
+        cfg.post_dominators()
+            .immediate_post_dominator(cfg.entry())
+            .is_some()
+    );
     assert!(cfg.is_reducible());
     assert_structured_matches_graph(&cfg, ALL_ORACLES);
 }

@@ -221,22 +221,46 @@ fn flat_memory_op_name(code: u32, prefix: &str, allow_atomic: bool) -> Option<&'
             "GlobalStoreShortD16Hi"
         ),
         0x1c => seg!("FlatStoreDword", "ScratchStoreDword", "GlobalStoreDword"),
-        0x1d => seg!("FlatStoreDwordx2", "ScratchStoreDwordx2", "GlobalStoreDwordx2"),
-        0x1e => seg!("FlatStoreDwordx4", "ScratchStoreDwordx4", "GlobalStoreDwordx4"),
-        0x1f => seg!("FlatStoreDwordx3", "ScratchStoreDwordx3", "GlobalStoreDwordx3"),
-        0x20 => seg!("FlatLoadUbyteD16", "ScratchLoadUbyteD16", "GlobalLoadUbyteD16"),
+        0x1d => seg!(
+            "FlatStoreDwordx2",
+            "ScratchStoreDwordx2",
+            "GlobalStoreDwordx2"
+        ),
+        0x1e => seg!(
+            "FlatStoreDwordx4",
+            "ScratchStoreDwordx4",
+            "GlobalStoreDwordx4"
+        ),
+        0x1f => seg!(
+            "FlatStoreDwordx3",
+            "ScratchStoreDwordx3",
+            "GlobalStoreDwordx3"
+        ),
+        0x20 => seg!(
+            "FlatLoadUbyteD16",
+            "ScratchLoadUbyteD16",
+            "GlobalLoadUbyteD16"
+        ),
         0x21 => seg!(
             "FlatLoadUbyteD16Hi",
             "ScratchLoadUbyteD16Hi",
             "GlobalLoadUbyteD16Hi"
         ),
-        0x22 => seg!("FlatLoadSbyteD16", "ScratchLoadSbyteD16", "GlobalLoadSbyteD16"),
+        0x22 => seg!(
+            "FlatLoadSbyteD16",
+            "ScratchLoadSbyteD16",
+            "GlobalLoadSbyteD16"
+        ),
         0x23 => seg!(
             "FlatLoadSbyteD16Hi",
             "ScratchLoadSbyteD16Hi",
             "GlobalLoadSbyteD16Hi"
         ),
-        0x24 => seg!("FlatLoadShortD16", "ScratchLoadShortD16", "GlobalLoadShortD16"),
+        0x24 => seg!(
+            "FlatLoadShortD16",
+            "ScratchLoadShortD16",
+            "GlobalLoadShortD16"
+        ),
         0x25 => seg!(
             "FlatLoadShortD16Hi",
             "ScratchLoadShortD16Hi",
