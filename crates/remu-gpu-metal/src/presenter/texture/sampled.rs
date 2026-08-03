@@ -28,10 +28,8 @@ use metal::{
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
 use remu_shader::{ShaderEvaluation, image_is_comparison};
-use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 impl MetalPresenter {
@@ -114,20 +112,9 @@ impl MetalPresenter {
                                         )
                                 });
                             if aliases_sample && trace_target_sampling() {
-                                static LOGGED_ALIAS_FLUSHES: OnceLock<
-                                    Mutex<HashSet<(u64, u64, u32, u32)>>,
-                                > = OnceLock::new();
-                                let key = (
-                                    resident.descriptor.address,
-                                    sampled.guest.address,
-                                    sampled.base_mip_level,
-                                    sampled.mip_level_count,
-                                );
-                                let mut logged = LOGGED_ALIAS_FLUSHES
-                                    .get_or_init(|| Mutex::new(HashSet::new()))
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if logged.len() < 256 && logged.insert(key) {
+                                // K1: lock-free bounded sampler (was a mutex-guarded HashSet).
+                                static LOGGED_ALIAS_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+                                if LOGGED_ALIAS_FLUSHES.fetch_add(1, Ordering::Relaxed) < 256 {
                                     eprintln!(
                                         "[REMu][METAL][ALIAS-FLUSH] resident={:#x}/{}x{}/p{}/{:?}/tile{}/mips{}/type{}/layers{} sampled={:#x}/{}x{}/p{}/{:?}/tile{}/base{}/mips{}/type{}/layers{} select={:#x} comparison={comparison} pc={:#x} declared_overlap={}",
                                         resident.descriptor.address,
@@ -620,13 +607,10 @@ pub(crate) fn create_sampled_guest_texture(
             MTLPixelFormat::R8Unorm | MTLPixelFormat::RG8Unorm
         )
     {
-        static LOGGED_VIDEO_UPLOADS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
+        // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+        static LOGGED_VIDEO_UPLOADS: AtomicUsize = AtomicUsize::new(0);
         let fingerprint = guest_frame_fingerprint(linear);
-        let mut logged = LOGGED_VIDEO_UPLOADS
-            .get_or_init(|| Mutex::new(HashSet::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if logged.len() < 32 && logged.insert((guest.address, fingerprint)) {
+        if LOGGED_VIDEO_UPLOADS.fetch_add(1, Ordering::Relaxed) < 32 {
             let (minimum, maximum, total) = linear.iter().fold(
                 (u8::MAX, u8::MIN, 0_u64),
                 |(minimum, maximum, total), &value| {

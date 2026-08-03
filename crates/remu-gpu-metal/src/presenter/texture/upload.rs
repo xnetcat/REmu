@@ -32,8 +32,8 @@ use remu_memory::guest_shared_mapping_identity;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 fn trace_glyph_atlas_linear(
     descriptor: GuestTextureDescriptor,
@@ -49,12 +49,9 @@ fn trace_glyph_atlas_linear(
     {
         return;
     }
-    static LOGGED: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
-    let mut logged = LOGGED
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if logged.len() >= 64 || !logged.insert((descriptor.address, destination_select)) {
+    // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) >= 64 {
         return;
     }
 
@@ -257,12 +254,9 @@ pub(crate) fn upload_image_textures(
                 // A fallback image samples as opaque black, so any draw that modulates by its
                 // alpha renders solid covers (Poppy menu glyphs). Name the failing descriptor
                 // once so the responsible guest SRD is attributable from the run log.
-                static LOGGED: OnceLock<Mutex<HashSet<Vec<u32>>>> = OnceLock::new();
-                let mut logged = LOGGED
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if logged.len() < 64 && logged.insert(binding.resource_descriptor.to_vec()) {
+                // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
                     eprintln!(
                         "[REMu][METAL][IMAGE-FALLBACK] pc={:#x} opcode={} words={:08x?} error={error}",
                         binding.pc, binding.opcode, binding.resource_descriptor,
@@ -298,14 +292,9 @@ pub(crate) fn upload_image_textures(
                     MTLPixelFormat::R8Unorm | MTLPixelFormat::A8Unorm
                 )
             {
-                static LOGGED: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
-                let mut logged = LOGGED
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if logged.len() < 64
-                    && logged.insert((descriptor.guest.address, descriptor.destination_select))
-                {
+                // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
                     eprintln!(
                         "[REMu][METAL][GLYPH-ATLAS] stage={trace_stage} pc={:#x} fallback={fallback} words={:08x?} address={:#x} extent={}x{} pitch={} format={:?} tile={} dst_sel={:#x} mips={}..={} type={}",
                         binding.pc,
@@ -329,23 +318,11 @@ pub(crate) fn upload_image_textures(
                 && descriptor.guest.width == 1_920
                 && descriptor.guest.height == 1_080
             {
-                static LOGGED: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, bool, bool)>>> =
-                    OnceLock::new();
+                // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
                 let normalized_coordinates =
                     sampler_uses_normalized_coordinates(&binding.sampler_descriptor);
-                let key = (
-                    descriptor.guest.address,
-                    descriptor.guest.tile_mode,
-                    descriptor.destination_select,
-                    descriptor.mip_level_count,
-                    comparison,
-                    normalized_coordinates,
-                );
-                let mut logged = LOGGED
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if logged.len() < 128 && logged.insert(key) {
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 128 {
                     let byte_count = guest_texture_byte_count(descriptor.guest);
                     let mapping = byte_count.and_then(|byte_count| {
                         guest_shared_mapping_identity(descriptor.guest.address, byte_count)
@@ -564,13 +541,9 @@ pub(crate) fn upload_image_textures(
                 && select_multisample
                 && let Some((version, source, _)) = multisample_resolve.as_ref()
             {
-                static LOGGED_RESOLVES: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
-                let key = (descriptor.guest.address, source.address);
-                let mut logged = LOGGED_RESOLVES
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if logged.len() < 256 && logged.insert(key) {
+                // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                static LOGGED_RESOLVES: AtomicUsize = AtomicUsize::new(0);
+                if LOGGED_RESOLVES.fetch_add(1, Ordering::Relaxed) < 256 {
                     eprintln!(
                         "[REMu][METAL][MSAA-SAMPLE] guest={:#x} source={:#x} version={} format={:?} tile={}",
                         descriptor.guest.address,

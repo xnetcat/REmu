@@ -15,8 +15,7 @@ use super::{
 use metal::{MTLClearColor, MTLCompareFunction, MTLPixelFormat};
 use remu_gpu::{GpuRegister, IndexedDraw};
 use remu_shader::PixelOutputKind;
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) fn decode_render_target_format(
     data_format: u32,
@@ -781,22 +780,9 @@ fn decode_depth_target_impl(
         ..base_texture
     };
     if emit_diagnostics && trace_target_sampling() {
-        static LOGGED_DEPTH_TARGETS: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, u32, u32, u32)>>> =
-            OnceLock::new();
-        let key = (
-            base_address,
-            width,
-            height,
-            z_info,
-            control,
-            render_control,
-            encoded_view,
-        );
-        let mut logged = LOGGED_DEPTH_TARGETS
-            .get_or_init(|| Mutex::new(HashSet::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if logged.len() < 256 && logged.insert(key) {
+        // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+        static LOGGED_DEPTH_TARGETS: AtomicUsize = AtomicUsize::new(0);
+        if LOGGED_DEPTH_TARGETS.fetch_add(1, Ordering::Relaxed) < 256 {
             let encoded_size = register_value(&draw.context_registers, DB_DEPTH_SIZE);
             let encoded_slice = register_value(&draw.context_registers, DB_DEPTH_SLICE);
             let bytes = guest_texture_byte_count(texture);

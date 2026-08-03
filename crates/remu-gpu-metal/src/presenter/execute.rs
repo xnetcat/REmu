@@ -250,25 +250,13 @@ impl MetalPresenter {
         let diagnostic_disable_depth_for_draw = diagnostic_disable_depth()
             && (!diagnostic_disable_combined_raster || diagnostic_complex_msaa_raster);
         if trace_target_sampling() {
-            static LOGGED_TARGETS: OnceLock<Mutex<HashSet<(u64, u32, u32, MTLPixelFormat, u32)>>> =
-                OnceLock::new();
-            let mut logged = LOGGED_TARGETS
-                .get_or_init(|| Mutex::new(HashSet::new()))
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+            static LOGGED_TARGETS: AtomicUsize = AtomicUsize::new(0);
             for target in &targets {
                 let descriptor = target.texture;
-                let key = (
-                    descriptor.address,
-                    descriptor.width,
-                    descriptor.height,
-                    descriptor.pixel_format,
-                    descriptor.tile_mode,
-                );
                 if descriptor.width == 1_920
                     && descriptor.height == 1_080
-                    && logged.len() < 256
-                    && logged.insert(key)
+                    && LOGGED_TARGETS.fetch_add(1, Ordering::Relaxed) < 256
                 {
                     let primary = target.guest_slot * CB_COLOR_REGISTER_STRIDE;
                     let fmask = register_value(&draw.context_registers, CB_COLOR0_FMASK + primary);
@@ -809,13 +797,9 @@ impl MetalPresenter {
                             .is_some_and(|shader| shader.program.instructions.len() == count)
                     }))
             {
-                static DUMPED_SCANOUT_PAIRS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
-                let pair = (draw.export_shader_address, draw.pixel_shader_address);
-                let mut dumped = DUMPED_SCANOUT_PAIRS
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if dumped.len() < 128 && dumped.insert(pair) {
+                // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                static DUMPED_SCANOUT_PAIRS: AtomicUsize = AtomicUsize::new(0);
+                if DUMPED_SCANOUT_PAIRS.fetch_add(1, Ordering::Relaxed) < 128 {
                     let sampled = sampled_image_bindings(pixel_evaluation)
                         .map(|binding| {
                             let descriptor =
@@ -1166,12 +1150,9 @@ impl MetalPresenter {
                     .ok()
                     .and_then(|scalar| scalar.checked_add(3))
                     .and_then(|scalar| pixel_scalar_metadata.get(scalar).copied());
-                static LOGGED: OnceLock<Mutex<HashSet<(u32, u32)>>> = OnceLock::new();
-                let mut logged = LOGGED
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if logged.len() < 64 && logged.insert((binding.pc, descriptor_word)) {
+                // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
                     eprintln!(
                         "[REMu][METAL][GLYPH-SELECT] pc={:#x} scalar_resource={} descriptor_word3={descriptor_word:#010x} descriptor_select={select:#x} seeded_word3={seeded:#010x?} seeded_select={:#x?}",
                         binding.pc,
