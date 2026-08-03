@@ -2,7 +2,7 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl};
 use remu_core::GuestAddress;
 use remu_loader::LoadedExecutable;
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     GuestTls, LinkError, MACOS_GUEST_PAGE_ALIGNMENT, PT_TLS, add_address,
@@ -178,6 +178,51 @@ pub(crate) fn install_tls_support(
         patched_loads,
         patched_stores,
     })
+}
+
+/// Computes each module's static-TLS block size below the thread pointer, keyed by module id.
+///
+/// This is the same accumulation `install_tls_support` performs while laying out the static block,
+/// exposed for the relocation pass so a `TPOFF64` fixup can be expressed relative to the thread
+/// pointer before the block itself is written. Modules without a static-TLS block are absent from
+/// the map, so callers treat a missing entry as a zero offset.
+pub(crate) fn static_tls_offsets(
+    images: &[TlsImageInput<'_>],
+) -> Result<BTreeMap<u64, u64>, LinkError> {
+    let mut static_block_size = 0;
+    let mut offsets = BTreeMap::new();
+    for image in images {
+        let Some(tls_header) = image
+            .executable
+            .info
+            .elf
+            .as_ref()
+            .and_then(|elf| {
+                elf.program_headers
+                    .iter()
+                    .find(|header| header.program_type == PT_TLS)
+            })
+            .filter(|header| header.memory_size != 0)
+        else {
+            continue;
+        };
+        let alignment = if tls_header.alignment == 0 {
+            1
+        } else {
+            tls_header.alignment
+        };
+        if !alignment.is_power_of_two() {
+            return Err(LinkError::InvalidTlsAlignment(alignment));
+        }
+        static_block_size = calculate_static_tls_offset(
+            static_block_size,
+            tls_header.memory_size,
+            alignment,
+            tls_header.virtual_address.get(),
+        )?;
+        offsets.insert(image.module_id, static_block_size);
+    }
+    Ok(offsets)
 }
 
 pub(crate) fn scan_tls_immediate_stores<'a>(

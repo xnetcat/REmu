@@ -1,6 +1,12 @@
-use remu_core::GuestAddress;
-use remu_loader::{DynamicInfo, Elf64Symbol, SceLibraryReference, SceModuleReference};
+use std::collections::BTreeMap;
 
+use remu_core::GuestAddress;
+use remu_loader::{DynamicInfo, Elf64Rela, Elf64Symbol, SceLibraryReference, SceModuleReference};
+
+use super::relocation::{
+    R_X86_64_DTPMOD64, R_X86_64_DTPOFF64, R_X86_64_TPOFF64, TlsRelocationContext,
+    TlsSymbolResolution, resolve_tls_reference, tls_relocation_value,
+};
 use super::{ProcessSymbolKey, encode_sce_id, process_symbol_key};
 use crate::sce_symbol_nid;
 
@@ -43,6 +49,74 @@ fn resolves_symbols_by_namespace_versions_and_type_not_local_encoded_ids() {
         export_key
     );
     assert!(process_symbol_key(&exported, &symbol("someNid#Z#Z", 0x12, 1)).is_err());
+}
+
+#[test]
+fn tls_relocation_values_are_module_offset_and_thread_pointer_relative() {
+    let resolution = TlsSymbolResolution {
+        module_id: 3,
+        tls_offset: 0x40,
+        static_offset: 0x100,
+    };
+    // DTPMOD64 names the module and ignores the addend.
+    assert_eq!(tls_relocation_value(R_X86_64_DTPMOD64, &resolution, 0x1000), 3);
+    // DTPOFF64 is the offset within the module's own TLS block.
+    assert_eq!(tls_relocation_value(R_X86_64_DTPOFF64, &resolution, 8), 0x48);
+    // TPOFF64 is that offset expressed below the thread pointer (variant II).
+    assert_eq!(
+        tls_relocation_value(R_X86_64_TPOFF64, &resolution, 8),
+        0x48_u64.wrapping_sub(0x100)
+    );
+}
+
+#[test]
+fn a_cross_module_tls_reference_resolves_through_its_defining_module() {
+    // A module references an undefined TLS symbol whose storage lives in another module (id 5).
+    let mut referencing = dynamic_namespace(false, 4, 3, 7, 2, 1);
+    referencing.symbols = vec![symbol("", 0, 0), symbol("tlsNid#E#D", 0x16, 0)];
+    let key = process_symbol_key(&referencing, &referencing.symbols[1]).unwrap();
+    let mut tls_symbols = BTreeMap::new();
+    tls_symbols.insert(
+        key,
+        TlsSymbolResolution {
+            module_id: 5,
+            tls_offset: 0x20,
+            static_offset: 0x200,
+        },
+    );
+    let context = TlsRelocationContext {
+        module_id: 2,
+        module_static_offset: 0x80,
+        tls_symbols: &tls_symbols,
+    };
+
+    let cross = resolve_tls_reference(&referencing, &context, &tls_relocation(R_X86_64_DTPMOD64, 1, 0))
+        .unwrap();
+    // The defining module (5), not the referencing module (2), names the DTPMOD64 slot.
+    assert_eq!(cross.module_id, 5);
+    assert_eq!(tls_relocation_value(R_X86_64_DTPMOD64, &cross, 0), 5);
+
+    // A symbol defined in the referencing module keeps its own module id and static offset.
+    let mut defined = dynamic_namespace(false, 4, 3, 7, 2, 1);
+    defined.symbols = vec![symbol("", 0, 0), symbol("localTls#E#D", 0x16, 7)];
+    let local =
+        resolve_tls_reference(&defined, &context, &tls_relocation(R_X86_64_TPOFF64, 1, 0x10)).unwrap();
+    assert_eq!(local.module_id, 2);
+    assert_eq!(local.tls_offset, 0x100);
+    assert_eq!(local.static_offset, 0x80);
+    assert_eq!(
+        tls_relocation_value(R_X86_64_TPOFF64, &local, 0x10),
+        (0x100_u64 + 0x10).wrapping_sub(0x80)
+    );
+}
+
+fn tls_relocation(relocation_type: u32, symbol_index: u32, addend: i64) -> Elf64Rela {
+    Elf64Rela {
+        offset: GuestAddress::new(0x1000),
+        symbol_index,
+        relocation_type,
+        addend,
+    }
 }
 
 fn symbol(name: &str, info: u8, section_index: u16) -> Elf64Symbol {

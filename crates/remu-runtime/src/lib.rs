@@ -3919,6 +3919,32 @@ fn invoke_guest_module_initializers(
     0
 }
 
+/// Runs each ifunc resolver and writes its chosen target into the relocated slot (F2).
+///
+/// This mirrors glibc's startup ifunc pass: the resolvers are guest code that cannot run at link
+/// time, so `IRELATIVE` relocations are recorded during linking and resolved here — after the
+/// thread pointer is installed and before any module initializer — so an initializer that calls an
+/// ifunc-dispatched symbol reaches the resolved implementation rather than the resolver.
+#[cfg(target_arch = "x86_64")]
+fn resolve_pending_ifunc_relocations(image: &LinkedImage) {
+    for pending in &image.pending_ifunc_relocations {
+        // SAFETY: the resolver is a relocated guest ifunc resolver in executable guest memory. The
+        // SysV x86-64 ifunc ABI passes a hardware-capability mask in rdi and a cpu-features pointer
+        // in rsi; a conservative (0, null) makes the resolver select its baseline implementation.
+        let resolver: unsafe extern "C" fn(u64, u64) -> u64 =
+            unsafe { std::mem::transmute(pending.resolver) };
+        let resolved = unsafe { resolver(0, 0) };
+        eprintln!(
+            "[REMu][MODULE] resolved ifunc target={} resolver={:#x} -> {resolved:#x}",
+            pending.target, pending.resolver
+        );
+        write_guest_u64(pending.target.get(), resolved);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn resolve_pending_ifunc_relocations(_image: &LinkedImage) {}
+
 fn kernel_load_start_module(arguments: [u64; 6]) -> u64 {
     if arguments[5] != 0 {
         write_guest_u32(arguments[5], 0);
@@ -8653,6 +8679,7 @@ fn probe_entry(
     trace_linked_guest_code(image);
     start_abi_gap_reporter();
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
+    resolve_pending_ifunc_relocations(image);
     invoke_guest_module_initializers(&image.module_initializers, 0, 0);
     remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::ModuleInitializersComplete);
     if timeout_seconds != 0 {

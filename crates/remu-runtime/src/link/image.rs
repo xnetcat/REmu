@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use crate::probe_entry;
-use crate::tls::{TlsImageInput, install_tls_support, scan_tls_immediate_stores};
+use crate::tls::{TlsImageInput, install_tls_support, scan_tls_immediate_stores, static_tls_offsets};
 use crate::unwind::{GuestUnwindModule, collect_unwind_fdes_at, guest_unwind_module};
 use remu_core::GuestAddress;
 use remu_loader::{LoadedExecutable, resolve_module_dependency_graph};
@@ -12,10 +12,11 @@ use std::path::Path;
 
 use super::{
     ImportResolutionRecord, ImportResolutionStats, ImportStub, LinkError, LinkedGuestModule,
-    ModuleLinkReport, RelocationStats, add_relocation_stats, append_object_initializers,
-    apply_relocations_at, calculate_process_auxiliary_reserve, collect_import_resolutions,
-    collect_process_exports, create_import_stubs, discover_runtime_module_paths,
-    main_base_export_input, map_bundled_modules, module_exports_by_nid, resolve_process_param,
+    ModuleLinkReport, PendingIfunc, RelocationStats, TlsRelocationContext, add_relocation_stats,
+    append_object_initializers, apply_relocations_at, calculate_process_auxiliary_reserve,
+    collect_import_resolutions, collect_process_exports, collect_tls_symbols, create_import_stubs,
+    discover_runtime_module_paths, main_base_export_input, map_bundled_modules,
+    module_exports_by_nid, resolve_process_param,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +41,8 @@ pub struct LinkedImage {
     pub(crate) module_initializers: Vec<GuestAddress>,
     pub(crate) bundled_modules: Vec<LinkedGuestModule>,
     pub(crate) unwind_modules: Vec<GuestUnwindModule>,
+    /// Ifunc relocations whose guest resolvers run once at process entry (F2).
+    pub(crate) pending_ifunc_relocations: Vec<PendingIfunc>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,8 +155,39 @@ impl LinkedImage {
             std::iter::once(dynamic).chain(linked_modules.iter().map(|module| module.dynamic)),
             &process_exports,
         )?;
+        // Lay out the static-TLS blocks up front so a TLS relocation can name the thread-pointer-
+        // relative and defining-module offsets it needs before `install_tls_support` writes those
+        // blocks. The image list is the same order the installer uses (main first, then modules).
+        let main_base = memory.image_base();
+        let tls_layout_inputs = std::iter::once(TlsImageInput {
+            executable,
+            base: main_base,
+            module_id: 1,
+        })
+        .chain(linked_modules.iter().map(|module| TlsImageInput {
+            executable: module.executable,
+            base: module.base,
+            module_id: module.tls_module_id,
+        }))
+        .collect::<Vec<_>>();
+        let module_static_offsets = static_tls_offsets(&tls_layout_inputs)?;
+        let static_offset_of =
+            |module_id: u64| module_static_offsets.get(&module_id).copied().unwrap_or(0);
+        let tls_symbols = collect_tls_symbols(
+            &std::iter::once((1_u64, static_offset_of(1), dynamic))
+                .chain(linked_modules.iter().map(|module| {
+                    (
+                        module.tls_module_id,
+                        static_offset_of(module.tls_module_id),
+                        module.dynamic,
+                    )
+                }))
+                .collect::<Vec<_>>(),
+        )?;
+
         let mut import_stubs = Vec::new();
         let mut relocation_stats = RelocationStats::default();
+        let mut pending_ifunc_relocations = Vec::new();
         let mut unwind_fdes = Vec::new();
         for module in &linked_modules {
             let (module_stubs, symbol_stubs) = create_import_stubs(
@@ -163,15 +197,21 @@ impl LinkedImage {
                 &process_exports,
             )?;
             import_stubs.extend(module_stubs);
+            let tls_context = TlsRelocationContext {
+                module_id: module.tls_module_id,
+                module_static_offset: static_offset_of(module.tls_module_id),
+                tls_symbols: &tls_symbols,
+            };
             add_relocation_stats(
                 &mut relocation_stats,
                 apply_relocations_at(
                     &mut memory,
                     module.base,
-                    module.tls_module_id,
+                    &tls_context,
                     module.dynamic,
                     &symbol_stubs,
                     &process_exports,
+                    &mut pending_ifunc_relocations,
                 )?,
             );
             unwind_fdes.extend(collect_unwind_fdes_at(
@@ -184,17 +224,22 @@ impl LinkedImage {
         let (main_stubs, symbol_stubs) =
             create_import_stubs(&mut memory, dynamic, import_stubs.len(), &process_exports)?;
         import_stubs.extend(main_stubs);
-        let main_base = memory.image_base();
         let process_param = resolve_process_param(elf, main_base)?;
+        let main_tls_context = TlsRelocationContext {
+            module_id: 1,
+            module_static_offset: static_offset_of(1),
+            tls_symbols: &tls_symbols,
+        };
         add_relocation_stats(
             &mut relocation_stats,
             apply_relocations_at(
                 &mut memory,
                 main_base,
-                1,
+                &main_tls_context,
                 dynamic,
                 &symbol_stubs,
                 &process_exports,
+                &mut pending_ifunc_relocations,
             )?,
         );
         unwind_fdes.extend(collect_unwind_fdes_at(&memory, main_base, executable)?);
@@ -239,18 +284,7 @@ impl LinkedImage {
         // aliases the ELF entry point, so invoking it here would start the title once with null
         // process arguments and then start it a second time below. Dependency modules have no
         // independent process entry and therefore still require loader-driven initialization.
-        let tls_inputs = std::iter::once(TlsImageInput {
-            executable,
-            base: main_base,
-            module_id: 1,
-        })
-        .chain(linked_modules.iter().map(|module| TlsImageInput {
-            executable: module.executable,
-            base: module.base,
-            module_id: module.tls_module_id,
-        }))
-        .collect::<Vec<_>>();
-        let tls = install_tls_support(&mut memory, &tls_inputs, &tls_store_plan)?;
+        let tls = install_tls_support(&mut memory, &tls_layout_inputs, &tls_store_plan)?;
         memory.finalize_permissions()?;
         Ok(Self {
             memory,
@@ -264,6 +298,7 @@ impl LinkedImage {
             module_initializers,
             bundled_modules,
             unwind_modules,
+            pending_ifunc_relocations,
         })
     }
 

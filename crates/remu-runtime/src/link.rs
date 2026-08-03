@@ -50,7 +50,11 @@ use self::modules::{
     map_bundled_modules, resolve_process_param,
 };
 use self::native_symbols::{native_import_target, synthetic_data_import_target};
-use self::relocation::{add_relocation_stats, apply_relocations_at, defined_symbol_address_at};
+use self::relocation::{
+    TlsRelocationContext, add_relocation_stats, apply_relocations_at, collect_tls_symbols,
+    defined_symbol_address_at,
+};
+pub(crate) use self::relocation::PendingIfunc;
 
 #[derive(Debug, Error)]
 pub enum LinkError {
