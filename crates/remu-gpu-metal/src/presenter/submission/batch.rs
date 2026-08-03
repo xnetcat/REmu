@@ -33,10 +33,8 @@ use metal::{
 };
 use objc::{msg_send, sel, sel_impl};
 use remu_memory::{
-    CpuWriteWatch, GuardedBackingWrite, GuestSharedMappingIdentity, GuestWriteSite,
-    guest_shared_backing_identity, read_guest_shared_backing,
-    write_guest_shared_backing_at_identity_with_baseline,
-    write_guest_shared_backing_if_identity_and_baseline,
+    CpuWriteWatch, GuestRangeLease, GuestSharedMappingIdentity, GuestWriteSite,
+    LeasePublishOutcome, guest_shared_backing_identity, read_guest_shared_backing,
 };
 use remu_shader::ShaderEvaluation;
 use std::io::ErrorKind;
@@ -2233,27 +2231,21 @@ pub(crate) fn write_back_pending_globals(
         let outcome = if let Some(expected) = writeback.mapping_identity {
             let byte_count = u64::try_from(writeback.byte_count)
                 .map_err(|_| "writable global buffer byte count does not fit u64")?;
-            let current = guest_shared_backing_identity(writeback.guest_address, byte_count);
-            if current != Some(expected) {
+            let lease = GuestRangeLease::adopt(writeback.guest_address, byte_count, expected);
+            if !lease.live_va_matches() {
                 // Prospero recycles direct-memory VAs while GPU work is still draining. Publishing
                 // through the captured producer identity keeps GPU results on those physical pages
                 // (Poppy Slate glyph prep at 0x9010960000). Discarding left every later reader of
-                // that backing with the pre-dispatch snapshot and solid tofu glyphs.
+                // that backing with the pre-dispatch snapshot and solid tofu glyphs. The lease
+                // still yields every run the guest has since written.
                 trace_remapped_global_writeback_published_by_identity(
                     writeback.guest_address,
                     writeback.byte_count,
                     expected,
-                    current,
+                    guest_shared_backing_identity(writeback.guest_address, byte_count),
                 );
-                write_changed_global_ranges_at_identity(
-                    writeback,
-                    current_bytes,
-                    original_bytes,
-                    expected,
-                )?
-            } else {
-                write_changed_global_ranges(writeback, current_bytes, original_bytes)?
             }
+            write_changed_global_ranges_leased(writeback, current_bytes, original_bytes, &lease)?
         } else if let Some(write_watch) = writeback.write_watch.as_ref() {
             match write_watch.with_live_mapping(|| {
                 write_changed_global_ranges_direct(writeback, current_bytes, original_bytes)
@@ -2333,50 +2325,11 @@ fn pending_global_original_bytes(writeback: &PendingGlobalWriteback) -> Result<&
     })
 }
 
-fn write_changed_global_ranges(
+fn write_changed_global_ranges_leased(
     writeback: &PendingGlobalWriteback,
     current_bytes: &[u8],
     original_bytes: &[u8],
-) -> Result<GlobalWritebackOutcome, String> {
-    let expected = writeback
-        .mapping_identity
-        .expect("shared writeback path has a mapping identity");
-    write_changed_global_ranges_with(
-        writeback,
-        current_bytes,
-        original_bytes,
-        expected,
-        GlobalWritePublishMode::RequireLiveVa,
-    )
-}
-
-fn write_changed_global_ranges_at_identity(
-    writeback: &PendingGlobalWriteback,
-    current_bytes: &[u8],
-    original_bytes: &[u8],
-    expected: GuestSharedMappingIdentity,
-) -> Result<GlobalWritebackOutcome, String> {
-    write_changed_global_ranges_with(
-        writeback,
-        current_bytes,
-        original_bytes,
-        expected,
-        GlobalWritePublishMode::ProducerIdentity,
-    )
-}
-
-#[derive(Clone, Copy)]
-enum GlobalWritePublishMode {
-    RequireLiveVa,
-    ProducerIdentity,
-}
-
-fn write_changed_global_ranges_with(
-    writeback: &PendingGlobalWriteback,
-    current_bytes: &[u8],
-    original_bytes: &[u8],
-    expected: GuestSharedMappingIdentity,
-    mode: GlobalWritePublishMode,
+    lease: &GuestRangeLease,
 ) -> Result<GlobalWritebackOutcome, String> {
     let mut cursor = 0;
     while cursor < current_bytes.len() {
@@ -2390,125 +2343,47 @@ fn write_changed_global_ranges_with(
         if start == cursor {
             continue;
         }
+        let run_offset = u64::try_from(start)
+            .map_err(|_| "writable global buffer changed offset does not fit u64")?;
         let address = writeback
             .guest_address
-            .checked_add(
-                u64::try_from(start)
-                    .map_err(|_| "writable global buffer changed offset does not fit u64")?,
-            )
+            .checked_add(run_offset)
             .ok_or("writable global buffer changed address overflow")?;
-        let backing_offset = expected
-            .backing_offset
-            .checked_add(
-                u64::try_from(start)
-                    .map_err(|_| "writable global buffer backing offset does not fit u64")?,
-            )
-            .ok_or("writable global buffer backing offset overflow")?;
-        let range_identity = GuestSharedMappingIdentity {
-            backing_id: expected.backing_id,
-            backing_offset,
-        };
         let byte_count = u64::try_from(cursor - start)
             .map_err(|_| "writable global buffer changed byte count does not fit u64")?;
         let source = &current_bytes[start..cursor];
         let baseline = &original_bytes[start..cursor];
-        let outcome = match mode {
-            GlobalWritePublishMode::RequireLiveVa => {
-                write_guest_shared_backing_if_identity_and_baseline(
-                    address,
-                    range_identity,
-                    baseline,
-                    source,
-                )
+        match lease.publish_run_if_baseline(run_offset, baseline, source) {
+            LeasePublishOutcome::AppliedAtLiveVa => {
+                journal_guest_write(GuestWriteSite::GlobalWriteback, address, byte_count, source);
             }
-            GlobalWritePublishMode::ProducerIdentity => {
+            LeasePublishOutcome::AppliedByIdentity => {
                 trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
-                write_guest_shared_backing_at_identity_with_baseline(
-                    range_identity,
-                    baseline,
-                    source,
-                )
-            }
-        };
-        match outcome {
-            GuardedBackingWrite::Applied => {
                 journal_guest_write(
-                    match mode {
-                        GlobalWritePublishMode::RequireLiveVa => GuestWriteSite::GlobalWriteback,
-                        GlobalWritePublishMode::ProducerIdentity => {
-                            GuestWriteSite::GlobalWritebackIdentity
-                        }
-                    },
+                    GuestWriteSite::GlobalWritebackIdentity,
                     address,
                     byte_count,
                     source,
                 );
             }
-            GuardedBackingWrite::GuestModified => {
-                trace_kept_guest_bytes_over_writeback(
+            LeasePublishOutcome::GuestModified => {
+                trace_kept_guest_bytes_over_writeback(address, cursor - start, "leased");
+            }
+            LeasePublishOutcome::Revoked => {
+                trace_discarded_stale_global_writeback(
                     address,
                     cursor - start,
-                    match mode {
-                        GlobalWritePublishMode::RequireLiveVa => "live-va",
-                        GlobalWritePublishMode::ProducerIdentity => "producer-identity",
-                    },
+                    "lease revoked",
+                    lease.identity(),
+                    guest_shared_backing_identity(address, byte_count),
                 );
+                return Ok(GlobalWritebackOutcome::DiscardedStale);
             }
-            GuardedBackingWrite::Unavailable => {
-                let current = guest_shared_backing_identity(address, byte_count);
-                if matches!(mode, GlobalWritePublishMode::RequireLiveVa)
-                    && current != Some(range_identity)
-                {
-                    // VA moved mid-publish; fall back to the captured producer pages, still
-                    // yielding to any guest store that landed after the capture.
-                    trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
-                    match write_guest_shared_backing_at_identity_with_baseline(
-                        range_identity,
-                        baseline,
-                        source,
-                    ) {
-                        GuardedBackingWrite::Applied => {
-                            journal_guest_write(
-                                GuestWriteSite::GlobalWritebackIdentity,
-                                address,
-                                byte_count,
-                                source,
-                            );
-                            continue;
-                        }
-                        GuardedBackingWrite::GuestModified => {
-                            trace_kept_guest_bytes_over_writeback(
-                                address,
-                                cursor - start,
-                                "va-moved-fallback",
-                            );
-                            continue;
-                        }
-                        GuardedBackingWrite::Unavailable => {
-                            trace_discarded_stale_global_writeback(
-                                address,
-                                cursor - start,
-                                "during completion",
-                                range_identity,
-                                current,
-                            );
-                            return Ok(GlobalWritebackOutcome::DiscardedStale);
-                        }
-                    }
-                }
-                if matches!(mode, GlobalWritePublishMode::ProducerIdentity) {
-                    trace_discarded_stale_global_writeback(
-                        address,
-                        cursor - start,
-                        "producer identity unavailable",
-                        range_identity,
-                        current,
-                    );
-                    return Ok(GlobalWritebackOutcome::DiscardedStale);
-                }
+            LeasePublishOutcome::WriteFailed => {
                 return Err(format!(
-                    "writable global buffer backing write failed address={address:#x} bytes={} identity={range_identity:?}",
-                    cursor - start
+                    "writable global buffer backing write failed address={address:#x} bytes={} identity={:?}",
+                    cursor - start,
+                    lease.identity(),
                 ));
             }
         }

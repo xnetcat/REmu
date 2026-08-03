@@ -36,8 +36,8 @@ pub use protection::{
 mod shared;
 pub(crate) use shared::guest_write_alias_segments;
 pub use shared::{
-    GuardedBackingWrite, GuestSharedBackingRange, GuestSharedBackingSegment,
-    GuestSharedMappingIdentity, guest_shared_backing_alias_segments,
+    GuardedBackingWrite, GuestRangeLease, GuestSharedBackingRange, GuestSharedBackingSegment,
+    GuestSharedMappingIdentity, LeasePublishOutcome, guest_shared_backing_alias_segments,
     guest_shared_backing_identity, guest_shared_backing_range,
     guest_shared_backing_ranges_overlap, guest_shared_backing_segments, guest_shared_mapping_epoch,
     guest_shared_mapping_identity, read_guest_shared_backing, write_guest_shared_backing,

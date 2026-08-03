@@ -800,6 +800,207 @@ pub fn write_guest_shared_backing_at_identity_with_baseline(
     guarded_backing_write(&backing, identity.backing_offset, baseline, source)
 }
 
+/// A capture-time claim on a guest range's physical backing, held by a host-side producer —
+/// today a GPU writeback — from capture until publication.
+///
+/// The lease is the one concept that answers "may this producer still publish into guest
+/// memory?" (audit B21). This first stage is a behaviour-preserving wrapper: it records the
+/// resolved identity and the shared-mapping epoch at acquisition, and its publish method
+/// performs, under a single registry-lock pass, exactly the dance its call sites previously
+/// spelled out — live-VA publish, then the physically-keyed producer-identity licence — with
+/// the capture-baseline guard applied in every mode. Later stages tighten invalidation
+/// (release, decommit, address-space drop) behind the same method.
+pub struct GuestRangeLease {
+    address: u64,
+    byte_count: u64,
+    identity: GuestSharedMappingIdentity,
+    /// Keeps the backing object alive across the lease so later invalidation stages can
+    /// compare object identity; it deliberately grants no publication licence — every publish
+    /// re-proves live mapping coverage under the registry lock.
+    _backing: Option<GuestPhysicalBacking>,
+    acquisition_epoch: u64,
+}
+
+/// Outcome of a leased baseline-guarded publication of one changed run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeasePublishOutcome {
+    /// The guest VA still resolves to the leased identity and the bytes were published there.
+    AppliedAtLiveVa,
+    /// The VA moved; the bytes were published through the producer-identity licence.
+    AppliedByIdentity,
+    /// The guest wrote inside the run after capture; nothing was written, the guest bytes win.
+    GuestModified,
+    /// Neither the live VA nor the identity licence admits the publication.
+    Revoked,
+    /// The VA resolves to the leased identity but the backing write failed — an I/O defect,
+    /// not an ownership change; callers should surface it as an error.
+    WriteFailed,
+}
+
+impl GuestRangeLease {
+    /// Resolves and claims `address..address+byte_count` now.
+    #[must_use]
+    pub fn acquire(address: u64, byte_count: u64) -> Option<Self> {
+        let epoch = guest_shared_mapping_epoch();
+        let mappings = shared_mappings()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (backing, offset, _) = resolve_shared_backing_range(&mappings, address, byte_count)?;
+        let identity = GuestSharedMappingIdentity {
+            backing_id: backing.id(),
+            backing_offset: offset,
+        };
+        Some(Self {
+            address,
+            byte_count,
+            identity,
+            _backing: Some(backing),
+            acquisition_epoch: epoch,
+        })
+    }
+
+    /// Adopts an identity resolved earlier — an upload-time capture — without re-resolving.
+    ///
+    /// The backing object is pinned when it still has a live mapping; a range whose backing is
+    /// already gone still constructs, and every publish through it then reports [`Revoked`]
+    /// exactly as the unadopted path would.
+    ///
+    /// [`Revoked`]: LeasePublishOutcome::Revoked
+    #[must_use]
+    pub fn adopt(address: u64, byte_count: u64, identity: GuestSharedMappingIdentity) -> Self {
+        let backing = {
+            let mappings = shared_mappings()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            mappings
+                .values()
+                .find(|record| record.backing.id() == identity.backing_id)
+                .map(|record| record.backing.clone())
+        };
+        Self {
+            address,
+            byte_count,
+            identity,
+            _backing: backing,
+            acquisition_epoch: guest_shared_mapping_epoch(),
+        }
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> GuestSharedMappingIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+
+    /// Reports whether the guest VA still resolves to the leased identity.
+    #[must_use]
+    pub fn live_va_matches(&self) -> bool {
+        guest_shared_backing_identity(self.address, self.byte_count) == Some(self.identity)
+    }
+
+    /// Publishes one changed run while the capture-time baseline still holds.
+    ///
+    /// One registry-lock pass: if the run's VA still resolves to the leased identity, the
+    /// baseline-guarded write lands there; otherwise the producer-identity licence applies —
+    /// physically keyed backing, full live coverage — with the same baseline guard. A run the
+    /// guest has since written is never overwritten in any mode.
+    #[must_use]
+    pub fn publish_run_if_baseline(
+        &self,
+        run_offset: u64,
+        baseline: &[u8],
+        source: &[u8],
+    ) -> LeasePublishOutcome {
+        debug_assert_eq!(baseline.len(), source.len());
+        let Ok(run_bytes) = u64::try_from(source.len()) else {
+            return LeasePublishOutcome::Revoked;
+        };
+        if run_bytes == 0 {
+            return LeasePublishOutcome::Revoked;
+        }
+        let Some(run_address) = self.address.checked_add(run_offset) else {
+            return LeasePublishOutcome::Revoked;
+        };
+        let Some(run_backing_offset) = self.identity.backing_offset.checked_add(run_offset)
+        else {
+            return LeasePublishOutcome::Revoked;
+        };
+        let Some(run_backing_end) = run_backing_offset.checked_add(run_bytes) else {
+            return LeasePublishOutcome::Revoked;
+        };
+        let mappings = shared_mappings()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((backing, offset, _)) =
+            resolve_shared_backing_range(&mappings, run_address, run_bytes)
+            && backing.id() == self.identity.backing_id
+            && offset == run_backing_offset
+        {
+            return match guarded_backing_write(&backing, offset, baseline, source) {
+                GuardedBackingWrite::Applied => LeasePublishOutcome::AppliedAtLiveVa,
+                GuardedBackingWrite::GuestModified => LeasePublishOutcome::GuestModified,
+                GuardedBackingWrite::Unavailable => LeasePublishOutcome::WriteFailed,
+            };
+        }
+        // The VA moved. Publish through the producer-identity licence, under its two bounds.
+        let Some(backing) = mappings
+            .values()
+            .find(|record| record.backing.id() == self.identity.backing_id)
+            .map(|record| record.backing.clone())
+        else {
+            trace_refused_identity_write(
+                &mappings,
+                self.identity,
+                run_bytes,
+                "backing has no live mapping",
+            );
+            return LeasePublishOutcome::Revoked;
+        };
+        if backing.is_virtually_keyed() {
+            trace_refused_identity_write(
+                &mappings,
+                self.identity,
+                run_bytes,
+                "virtually keyed backing",
+            );
+            return LeasePublishOutcome::Revoked;
+        }
+        if run_backing_end > backing.size() {
+            trace_refused_identity_write(&mappings, self.identity, run_bytes, "range exceeds backing");
+            return LeasePublishOutcome::Revoked;
+        }
+        if !identity_range_is_live(
+            &mappings,
+            self.identity.backing_id,
+            run_backing_offset,
+            run_backing_end,
+        ) {
+            trace_refused_identity_write(
+                &mappings,
+                self.identity,
+                run_bytes,
+                "no live mapping covers the range",
+            );
+            return LeasePublishOutcome::Revoked;
+        }
+        match guarded_backing_write(&backing, run_backing_offset, baseline, source) {
+            GuardedBackingWrite::Applied => LeasePublishOutcome::AppliedByIdentity,
+            GuardedBackingWrite::GuestModified => LeasePublishOutcome::GuestModified,
+            GuardedBackingWrite::Unavailable => LeasePublishOutcome::Revoked,
+        }
+    }
+
+    /// The shared-mapping epoch recorded at acquisition; later invalidation stages compare it.
+    #[must_use]
+    pub fn acquisition_epoch(&self) -> u64 {
+        self.acquisition_epoch
+    }
+}
+
 /// Reports whether live records cover every byte of a physical interval in one backing.
 fn identity_range_is_live(
     mappings: &BTreeMap<u64, SharedMappingRecord>,

@@ -482,6 +482,183 @@ fn identity_targeted_backing_write_publishes_a_fully_covered_physical_range() {
 }
 
 #[test]
+fn a_lease_publishes_a_clean_run_at_the_live_va() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    memory.write(mapped, &[0x11; 8]).unwrap();
+    let lease = GuestRangeLease::acquire(mapped.get(), 8).expect("live range leases");
+
+    assert_eq!(
+        lease.publish_run_if_baseline(0, &[0x11; 8], &[0x5a; 8]),
+        LeasePublishOutcome::AppliedAtLiveVa
+    );
+    let mut observed = [0_u8; 8];
+    memory.read(mapped, &mut observed).unwrap();
+    assert_eq!(observed, [0x5a; 8]);
+}
+
+#[test]
+fn a_lease_yields_to_a_guest_store_after_capture() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    memory.write(mapped, &[0x11; 8]).unwrap();
+    let lease = GuestRangeLease::acquire(mapped.get(), 8).expect("live range leases");
+
+    // The guest recycles the range after the capture.
+    memory.write(mapped, &[0x77; 8]).unwrap();
+
+    assert_eq!(
+        lease.publish_run_if_baseline(0, &[0x11; 8], &[0x5a; 8]),
+        LeasePublishOutcome::GuestModified
+    );
+    let mut observed = [0_u8; 8];
+    memory.read(mapped, &mut observed).unwrap();
+    assert_eq!(observed, [0x77; 8], "the guest's newer bytes survive");
+}
+
+#[test]
+fn a_lease_follows_a_recycled_va_through_the_identity_licence() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let observer = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let lease = GuestRangeLease::acquire(mapped.get(), 8).expect("live range leases");
+
+    // Prospero recycles the producer VA onto a different backing offset mid-flight.
+    memory.unmap(mapped, GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(mapped),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+    assert_eq!(
+        lease.publish_run_if_baseline(0, &[0; 8], &[0x5a; 8]),
+        LeasePublishOutcome::AppliedByIdentity
+    );
+    let mut observed = [0_u8; 8];
+    memory.read(observer, &mut observed).unwrap();
+    assert_eq!(observed, [0x5a; 8], "the original physical pages hold the GPU result");
+}
+
+#[test]
+fn a_lease_yields_to_guest_stores_on_recycled_physical_pages() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let observer = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let lease = GuestRangeLease::acquire(mapped.get(), 8).expect("live range leases");
+
+    memory.unmap(mapped, GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(mapped),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    // The allocator hands the original physical pages out and the guest stores through the
+    // surviving alias before the delayed publication lands.
+    memory.write(observer, &[0x77; 8]).unwrap();
+
+    assert_eq!(
+        lease.publish_run_if_baseline(0, &[0; 8], &[0x5a; 8]),
+        LeasePublishOutcome::GuestModified
+    );
+    let mut observed = [0_u8; 8];
+    memory.read(observer, &mut observed).unwrap();
+    assert_eq!(observed, [0x77; 8], "recycled heap keeps the guest's bytes");
+}
+
+#[test]
+fn a_lease_is_revoked_when_the_backing_loses_every_live_mapping() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let lease = GuestRangeLease::acquire(mapped.get(), 8).expect("live range leases");
+
+    memory.unmap(mapped, GUEST_PAGE_SIZE).unwrap();
+
+    assert_eq!(
+        lease.publish_run_if_baseline(0, &[0; 8], &[0x5a; 8]),
+        LeasePublishOutcome::Revoked
+    );
+}
+
+#[test]
 fn replacing_shared_pages_removes_their_backing_identity() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
