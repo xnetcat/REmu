@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
 
@@ -145,6 +145,11 @@ pub(crate) struct GuestMutexState {
 pub(crate) struct GuestMutexEntry {
     pub(crate) state: Mutex<GuestMutexState>,
     pub(crate) wake: Condvar,
+    /// Cleared while holding `state` before this generation is removed from its shard.
+    ///
+    /// Thread-local lookup caches may keep the `Arc` alive after destruction, so every operation
+    /// rechecks this bit under `state` before observing or changing ownership.
+    pub(crate) active: AtomicBool,
     pub(crate) storage_address: u64,
     /// Opaque object installed in the guest's `ScePthreadMutex` storage by the init ABI.
     ///

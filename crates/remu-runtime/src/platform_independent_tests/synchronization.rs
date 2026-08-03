@@ -528,6 +528,41 @@ fn mutex_types_apply_gen5_same_thread_relock_semantics() {
 }
 
 #[test]
+fn mutex_lookup_cache_does_not_resurrect_a_destroyed_generation() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let address = 0x7fff_0000_1450;
+    assert_eq!(
+        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    let first = crate::guest_mutex_entry(address, false).expect("first mutex generation");
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+
+    assert_eq!(
+        crate::guest_mutex_init(
+            address,
+            crate::PthreadMutexAttrState {
+                mutex_type: 2,
+                ..crate::PthreadMutexAttrState::default()
+            }
+        ),
+        0
+    );
+    let second = crate::guest_mutex_entry(address, false).expect("second mutex generation");
+    assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    // A stale default-mutex generation would report EBUSY here. The replacement is recursive.
+    assert_eq!(crate::guest_mutex_lock(address, true), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+}
+
+#[test]
 fn mutex_unlock_rejects_missing_and_non_owner_mutexes() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
