@@ -253,6 +253,19 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .iter()
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
+        if trace_logarithmic_sequence(state.video_out.completed_flip_count, 8) {
+            eprintln!(
+                "[REMu][VIDEO] completed flip count={} handle={} index={} address={:#x} argument={:#x} runtime_pending={} backend_pending={} equeues={}",
+                state.video_out.completed_flip_count,
+                pending.handle,
+                pending.completion.buffer_index,
+                pending.completion.address,
+                pending.completion.flip_argument,
+                state.pending_video_out_flips.len(),
+                remu_gpu::gpu_flips_pending(),
+                registrations.len(),
+            );
+        }
         for (equeue, user_data) in registrations {
             queue_kernel_event(
                 state,
@@ -269,12 +282,6 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
                 },
             );
             queued = true;
-            if trace_logarithmic_sequence(state.agc_submission_count, 8) {
-                eprintln!(
-                    "[REMu][VIDEO] completed flip handle={} index={} address={:#x} equeue={equeue:#x}",
-                    pending.handle, pending.completion.buffer_index, pending.completion.address,
-                );
-            }
         }
         // Flip completion coincides with a display vblank on the console. Wake vblank waiters with
         // OrbisVideoOutInternalEventId::Vblank (ident=1).

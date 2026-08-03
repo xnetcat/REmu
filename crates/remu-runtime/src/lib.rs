@@ -9359,6 +9359,25 @@ fn report_diagnostic_stall_attribution() {
         .get()
         .and_then(|dispatch| dispatch.try_read().ok())
         .map(|state| state.agc_completion_telemetry.clone());
+    let video_progress = PROBE_DISPATCH
+        .get()
+        .and_then(|dispatch| dispatch.try_read().ok())
+        .map(|state| {
+            let last_completed_flip = state.video_out.last_completed_flip.map(|flip| {
+                (
+                    flip.buffer_index,
+                    flip.flip_argument,
+                    flip.process_time_counter,
+                )
+            });
+            (
+                state.video_out.completed_flip_count,
+                state.pending_video_out_flips.len(),
+                state.video_out.flip_events.len(),
+                state.video_out.vblank_events.len(),
+                last_completed_flip,
+            )
+        });
     let (_h, events) = event_state::lock_event_state_for_read();
     let pending_graphics_range = events
         .pending_agc_completions
@@ -9395,6 +9414,22 @@ fn report_diagnostic_stall_attribution() {
         .keys()
         .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
         .count();
+    if let Some((
+        completed_flips,
+        runtime_pending,
+        flip_event_registrations,
+        vblank_event_registrations,
+        last_completed_flip,
+    )) = video_progress
+    {
+        eprintln!(
+            "[REMu][STALL-VIDEO] completed_flips={} runtime_pending={} backend_pending={gpu_flips} flip_event_registrations={} vblank_event_registrations={} last_completed={last_completed_flip:?}",
+            completed_flips,
+            runtime_pending,
+            flip_event_registrations,
+            vblank_event_registrations,
+        );
+    }
     if let (Some(submission_count), Some(telemetry)) = (submission_count, telemetry) {
         eprintln!(
             "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?}",

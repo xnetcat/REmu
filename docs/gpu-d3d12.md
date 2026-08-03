@@ -145,8 +145,10 @@ thick 4 KiB blocks (8 KiB total); treating depth slices as sixteen independently
 incorrectly produced a 64 KiB footprint and overwrote adjacent MallocBinned3 free-list nodes. The
 corrected GFX10 S3 address equations survived a 75-second DRED-enabled run, advanced from the old
 deterministic access violation at submission 16 to submission 595, kept the GPU worker active, and
-left WASAPI active. This is a crash/progress regression result, not yet a Poppy playability claim:
-only one VideoOut flip was observed during that bounded run.
+left WASAPI active. A follow-up 60-second run with cumulative VideoOut telemetry completed nine
+alternating-buffer flips and left the tenth queued while the GPU was still making progress. This is
+a crash and presentation-progress regression result, not yet a Poppy playability claim: current
+per-draw/dispatch fencing and guest-memory publication still make this workload much too slow.
 
 ## Crate and data-flow boundaries
 
