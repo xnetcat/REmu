@@ -217,7 +217,8 @@ use self::texture::{
     sampled_texture_raw_range, snapshot_guest_texture_raw, snapshot_watched_guest_range,
     storage_image_requires_mip_hierarchy, trace_resident_texture_removal, upload_image_textures,
     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
-    write_watched_guest_texture_linear,
+    write_watched_guest_texture_linear, TextureWritebackOutcome,
+    ensure_read_watch_materializer_registered,
 };
 #[cfg(test)]
 use self::texture::{
@@ -2332,6 +2333,11 @@ struct MetalPresenter {
 
 impl MetalPresenter {
     fn new(receiver: Receiver<GpuEvent>) -> Result<Self, String> {
+        // D5: register the read-watch materializer before any resident can arm a read-watch.
+        // Without a materializer, `CpuWriteWatch::new_read_materialized` loudly refuses.
+        // Production residents still use write-watches until prestaged host buffers are wired
+        // (NOTES Batch B4 seam); this only installs the signal-safe memcpy path.
+        ensure_read_watch_materializer_registered();
         let device = Device::system_default().ok_or("no Metal device is available")?;
         let command_queue = device.new_command_queue();
         command_queue.set_label("REmu guest command queue");

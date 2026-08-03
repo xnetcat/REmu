@@ -38,9 +38,7 @@ use super::{
     texture_element_layout, tiled_block_bytes, tiled_block_dimensions, trace_glyph_atlas,
     trace_image_descriptors, trace_target_sampling, trace_video_target_consumers,
 };
-use remu_memory::{
-    CpuWriteWatchRetirement, read_guest_shared_backing, write_guest_shared_backing_scattered,
-};
+use remu_memory::{CpuWriteWatchRetirement, read_guest_shared_backing};
 #[cfg(test)]
 use remu_memory::{guest_shared_mapping_identity, write_guest_shared_backing};
 mod correlation;
@@ -49,6 +47,7 @@ mod extent;
 mod lifetime;
 mod mips;
 mod ranges;
+mod read_watch;
 mod residency;
 mod resident_map;
 mod retire;
@@ -73,6 +72,7 @@ pub(crate) use self::mips::{
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::ranges::RangeSet;
+pub(crate) use self::read_watch::ensure_read_watch_materializer_registered;
 #[cfg(test)]
 pub(crate) use self::residency::rematerialisation_blit_source_origin_y;
 pub(crate) use self::residency::{
@@ -108,13 +108,12 @@ pub(crate) use self::upload::{
 #[cfg(test)]
 pub(crate) use self::watch::guest_texture_raw_range;
 pub(crate) use self::watch::{
-    authored_segments, persistent_sampled_texture_write_watch,
-    refresh_resident_texture_write_watch, refresh_sampled_texture_write_watch,
-    resident_texture_raw_byte_count, sampled_texture_raw_range,
+    persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
+    refresh_sampled_texture_write_watch, resident_texture_raw_byte_count, sampled_texture_raw_range,
     sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
     snapshot_guest_texture_raw, snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
     snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
-    watch_sampled_texture, write_watched_guest_range,
+    watch_sampled_texture, write_watched_guest_range, TextureWritebackOutcome,
 };
 
 /// Metal exposes this C structure by value in the swizzled texture-view Objective-C method.
@@ -230,12 +229,16 @@ pub(super) fn write_guest_texture_linear_into_raw_at_z(
 /// `authored` names the runs the GPU actually wrote, as offsets from `descriptor.address`; `None`
 /// publishes the whole declared range. Only the tiled path consults it — a linear image already
 /// publishes exactly its visible rows and never touches the padding between them.
+///
+/// Publication goes through [`remu_memory::GuestRangeLease`] (MASTER-PLAN D3). A revoked lease
+/// returns [`TextureWritebackOutcome::DiscardedStale`] so the caller can demote the resident
+/// (D4-texture) instead of silently publishing into recycled guest memory.
 pub(super) fn write_watched_guest_texture_linear(
     descriptor: GuestTextureDescriptor,
     linear: &[u8],
     authored: Option<&[(u64, u64)]>,
     write_watch: &GuestTextureWriteWatch,
-) -> Result<(), String> {
+) -> Result<TextureWritebackOutcome, String> {
     if write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced) {
         return Err(format!(
             "guest texture mapping {:#x} was retired before writeback",
@@ -281,101 +284,60 @@ pub(super) fn write_watched_guest_texture_linear(
                 descriptor.address
             ));
         }
-        let wrote = write_watch.with_live_backing(|| {
-            remu_memory::write_guest_shared_backing_scattered(
-                descriptor.address,
-                byte_count,
-                &segments,
-            )
-        })?;
-        if !wrote {
+        let mut raw = vec![0_u8; destination_length];
+        let mut runs = Vec::with_capacity(segments.len());
+        for (offset, bytes) in &segments {
+            let start = usize::try_from(*offset)
+                .map_err(|_| "linear writeback row offset does not fit usize")?;
+            let end = start
+                .checked_add(bytes.len())
+                .ok_or("linear writeback row range overflows")?;
+            raw.get_mut(start..end)
+                .ok_or("linear writeback row exceeds its footprint")?
+                .copy_from_slice(bytes);
+            runs.push((
+                *offset,
+                offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(0)),
+            ));
+        }
+        return write_watched_guest_range(
+            descriptor.address,
+            &raw,
+            Some(&runs),
+            None,
+            write_watch,
+            None,
+        );
+    }
+    let baseline = write_watch.with_live_backing(|| {
+        let mut destination = vec![0; destination_length];
+        if !read_guest_shared_backing(descriptor.address, &mut destination) {
             return Err(format!(
-                "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
+                "guest texture range {:#x}+{byte_count:#x} has no complete live shared backing",
                 descriptor.address
             ));
         }
-        crate::presenter::diagnostics::journal_guest_write_segments(
-            remu_memory::GuestWriteSite::TextureWritebackRows,
-            descriptor.address,
-            &segments,
-        );
-        let _ = remu_memory::notify_guest_memory_written_excluding(
-            descriptor.address,
-            byte_count,
-            &write_watch.cpu_watches(),
-        );
-        for (offset, bytes) in &segments {
-            write_watch.record_content_snapshot(descriptor.address + offset, bytes);
-        }
-        return Ok(());
+        Ok(destination)
+    })??;
+    let mut destination = baseline.clone();
+    write_guest_texture_linear_into_raw(descriptor, linear, &mut destination)?;
+    // The tiled footprint is re-encoded through a read-modify-write, so a guest store
+    // between the read above and this write would be reverted. Detect that store by
+    // its fault generation and abort loudly rather than publish over it.
+    if write_watch.generations() != entry_generations {
+        return Err(format!(
+            "guest wrote texture range {:#x} during writeback; publishing would revert it",
+            descriptor.address
+        ));
     }
-    let raw = write_watch
-        .with_live_backing(|| {
-            let mut destination = vec![0; destination_length];
-            if !read_guest_shared_backing(descriptor.address, &mut destination) {
-                return Err(format!(
-                    "guest texture range {:#x}+{byte_count:#x} has no complete live shared backing",
-                    descriptor.address
-                ));
-            }
-            write_guest_texture_linear_into_raw(descriptor, linear, &mut destination)?;
-            // The tiled footprint is re-encoded through a read-modify-write, so a guest store
-            // between the read above and this write would be reverted. Detect that store by
-            // its fault generation and abort loudly rather than publish over it.
-            if write_watch.generations() != entry_generations {
-                return Err(format!(
-                    "guest wrote texture range {:#x} during writeback; publishing would revert it",
-                    descriptor.address
-                ));
-            }
-            // The retile filled `destination` over a snapshot of the whole padded footprint.
-            // Publishing all of it republishes bytes the GPU never authored, which is how a
-            // freed render target's stale capture lands on live guest heap.
-            let published = {
-                let segments = match authored {
-                    Some(runs) => authored_segments(&destination, runs),
-                    None => vec![(0, destination.as_slice())],
-                };
-                if !segments.is_empty()
-                    && !write_guest_shared_backing_scattered(
-                        descriptor.address,
-                        byte_count,
-                        &segments,
-                    )
-                {
-                    return Err(format!(
-                        "guest texture range {:#x}+{byte_count:#x} lost shared backing during writeback",
-                        descriptor.address
-                    ));
-                }
-                segments
-                    .iter()
-                    .map(|(offset, bytes)| (*offset, bytes.len()))
-                    .collect::<Vec<_>>()
-            };
-            Ok((destination, published))
-        })
-        .and_then(|result| result)?;
-    let (raw, published) = raw;
-    // See write_watched_guest_range: a backing write is invisible to armed pages, so every
-    // other intersecting watch must hear about it before this watch re-baselines itself.
-    let _ = remu_memory::notify_guest_memory_written_excluding(
+    write_watched_guest_range(
         descriptor.address,
-        byte_count,
-        &write_watch.cpu_watches(),
-    );
-    for (offset, length) in published {
-        let start = usize::try_from(offset).map_err(|_| "published offset does not fit usize")?;
-        let bytes = &raw[start..start + length];
-        crate::presenter::diagnostics::journal_guest_write(
-            remu_memory::GuestWriteSite::TextureWritebackTiled,
-            descriptor.address + offset,
-            length as u64,
-            bytes,
-        );
-        write_watch.record_content_snapshot(descriptor.address + offset, bytes);
-    }
-    Ok(())
+        &destination,
+        authored,
+        Some(&baseline),
+        write_watch,
+        None,
+    )
 }
 
 #[cfg(test)]

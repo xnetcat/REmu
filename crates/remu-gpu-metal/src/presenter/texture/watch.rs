@@ -17,9 +17,9 @@ use super::{
 };
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
-    CpuWriteWatch, CpuWriteWatchRetirement, GuestWriteSite, guest_shared_backing_alias_segments,
+    CpuWriteWatch, CpuWriteWatchRetirement, GuestRangeLease, GuestWriteSite, LeasePublishOutcome,
+    guest_shared_backing_alias_segments, guest_shared_backing_identity,
     guest_shared_mapping_epoch, guest_shared_mapping_identity, read_guest_shared_backing,
-    write_guest_shared_backing_scattered,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,6 +32,15 @@ use std::time::Instant;
 /// size. A false-positive protection fault therefore hashes only the touched neighborhood rather
 /// than copying and decoding a complete multi-megabyte image.
 const CONTENT_FINGERPRINT_CHUNK_BYTES: u64 = 4 * 1024;
+
+/// Outcome of a leased texture publication into guest memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextureWritebackOutcome {
+    /// At least one authored run landed (live VA or producer identity).
+    Applied,
+    /// The lease was revoked (mapping gone / identity refused); caller must demote loudly.
+    DiscardedStale,
+}
 
 /// Attempts allowed while trying to copy a guest resource nobody else is writing.
 ///
@@ -760,31 +769,89 @@ impl GuestTextureWriteWatch {
         if address < self.address || snapshot_end > watch_end {
             return;
         }
+        let mut partial_indices = Vec::new();
+        {
+            let mut state = self
+                .content_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for index in 0..state.chunk_fingerprints.len() {
+                let Some((chunk_address, chunk_bytes)) = content_chunk_range(self, index) else {
+                    continue;
+                };
+                let chunk_end = chunk_address.saturating_add(chunk_bytes);
+                // No overlap with the published run.
+                if snapshot_end <= chunk_address || address >= chunk_end {
+                    continue;
+                }
+                // Fully covered: fingerprint directly from the published bytes.
+                if address <= chunk_address && chunk_end <= snapshot_end {
+                    let Ok(start) = usize::try_from(chunk_address - address) else {
+                        continue;
+                    };
+                    let Ok(length) = usize::try_from(chunk_bytes) else {
+                        continue;
+                    };
+                    let Some(chunk) = bytes.get(start..start.saturating_add(length)) else {
+                        continue;
+                    };
+                    state.chunk_fingerprints[index] = content_fingerprint(chunk);
+                    state.initialized_chunks[index] = true;
+                    continue;
+                }
+                // Partial coverage: must re-fingerprint from the live guest mapping. Leaving the
+                // chunk stale (pre-D3) false-positives a later content validation as a CPU rewrite
+                // when only a sub-chunk publish landed (MASTER-PLAN D3 precondition).
+                partial_indices.push(index);
+            }
+            state.pending_dirty_ranges.clear();
+        }
+        if partial_indices.is_empty() {
+            return;
+        }
+        let live_fingerprints = self
+            .with_live_backing(|| {
+                let mut fingerprints = Vec::with_capacity(partial_indices.len());
+                for &index in &partial_indices {
+                    let (chunk_address, chunk_bytes) = content_chunk_range(self, index)
+                        .ok_or("partial content snapshot chunk is out of range")?;
+                    let length = usize::try_from(chunk_bytes)
+                        .map_err(|_| "partial content snapshot chunk is too large")?;
+                    let mut chunk = vec![0_u8; length];
+                    // SAFETY: with_live_backing pins every covering alias for this copy.
+                    unsafe {
+                        self.copy_from_live_aliases(chunk_address, &mut chunk)?;
+                    }
+                    fingerprints.push((index, content_fingerprint(&chunk)));
+                }
+                Ok::<_, String>(fingerprints)
+            })
+            .and_then(|result| result);
         let mut state = self
             .content_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for index in 0..state.chunk_fingerprints.len() {
-            let Some((chunk_address, chunk_bytes)) = content_chunk_range(self, index) else {
-                continue;
-            };
-            let chunk_end = chunk_address.saturating_add(chunk_bytes);
-            if address > chunk_address || chunk_end > snapshot_end {
-                continue;
+        match live_fingerprints {
+            Ok(fingerprints) => {
+                for (index, fingerprint) in fingerprints {
+                    if let Some(slot) = state.chunk_fingerprints.get_mut(index) {
+                        *slot = fingerprint;
+                    }
+                    if let Some(initialized) = state.initialized_chunks.get_mut(index) {
+                        *initialized = true;
+                    }
+                }
             }
-            let Ok(start) = usize::try_from(chunk_address - address) else {
-                continue;
-            };
-            let Ok(length) = usize::try_from(chunk_bytes) else {
-                continue;
-            };
-            let Some(chunk) = bytes.get(start..start.saturating_add(length)) else {
-                continue;
-            };
-            state.chunk_fingerprints[index] = content_fingerprint(chunk);
-            state.initialized_chunks[index] = true;
+            Err(_) => {
+                // Could not pin/read: mark partials uninitialized so the next validation
+                // re-examines them instead of trusting a stale fingerprint.
+                for index in partial_indices {
+                    if let Some(initialized) = state.initialized_chunks.get_mut(index) {
+                        *initialized = false;
+                    }
+                }
+            }
         }
-        state.pending_dirty_ranges.clear();
     }
 
     /// Fingerprint the live guest mapping in place without allocating a full host snapshot.
@@ -1430,13 +1497,19 @@ pub(crate) fn snapshot_watched_guest_texture_raw(
 /// republication is how a read-modify-write writeback overwrites bytes this allocation does not
 /// answer for — pitch and chain padding, a neighbouring tenant's surface, or, once the guest has
 /// freed the render target, whatever its heap put there since.
+///
+/// `baseline_raw`, when present, is the pre-patch guest snapshot for the same span as `raw`. RMW
+/// callers pass it so [`GuestRangeLease::publish_run_if_baseline`] can refuse a run the guest has
+/// since written (MASTER-PLAN D3). When absent, each run's baseline is read live immediately
+/// before publish (linear row path).
 pub(crate) fn write_watched_guest_range(
     address: u64,
     raw: &[u8],
     authored: Option<&[(u64, u64)]>,
+    baseline_raw: Option<&[u8]>,
     write_watch: &GuestTextureWriteWatch,
     expected_generations: Option<&[u64]>,
-) -> Result<(), String> {
+) -> Result<TextureWritebackOutcome, String> {
     if write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced) {
         return Err(format!(
             "guest range mapping {address:#x} was retired before writeback"
@@ -1458,34 +1531,172 @@ pub(crate) fn write_watched_guest_range(
         None => vec![(0, raw)],
     };
     if segments.is_empty() {
-        return Ok(());
+        return Ok(TextureWritebackOutcome::Applied);
     }
-    let wrote = write_watch.with_live_backing(|| {
-        write_guest_shared_backing_scattered(address, byte_count, &segments)
-    })?;
-    if wrote {
-        crate::presenter::diagnostics::journal_guest_write_segments(
-            GuestWriteSite::TextureWritebackRange,
-            address,
-            &segments,
-        );
-        // A backing write bypasses every armed page, so watches on other aliases of these
-        // bytes would keep validating as clean against content that just changed. Publish the
-        // write to every intersecting watch except the writer's own — a self-writeback must
-        // leave the writer quiescent — then re-baseline its fingerprints.
-        let _ = remu_memory::notify_guest_memory_written_excluding(
-            address,
-            byte_count,
-            &write_watch.cpu_watches(),
-        );
-        for (offset, bytes) in &segments {
-            write_watch.record_content_snapshot(address.saturating_add(*offset), bytes);
+    let captured_baselines;
+    let baseline_source = if let Some(baseline) = baseline_raw {
+        if baseline.len() != raw.len() {
+            return Err(format!(
+                "texture writeback baseline length {} != payload {}",
+                baseline.len(),
+                raw.len()
+            ));
         }
-        Ok(())
+        captured_baselines = match authored {
+            Some(runs) => authored_segments(baseline, runs),
+            None => vec![(0, baseline)],
+        };
+        BaselineSource::Captured {
+            baselines: &captured_baselines,
+        }
     } else {
-        Err(format!(
-            "guest range {address:#x}+{byte_count:#x} lost shared backing during writeback"
-        ))
+        BaselineSource::LiveGuest
+    };
+    publish_segments_leased(
+        address,
+        byte_count,
+        &segments,
+        baseline_source,
+        write_watch,
+        GuestWriteSite::TextureWritebackRange,
+    )
+}
+
+/// How a leased texture publish obtains the capture-time baseline for each run.
+enum BaselineSource<'a> {
+    /// Read the current guest bytes immediately before each publish (linear row path).
+    LiveGuest,
+    /// Use bytes captured before the GPU retile patched `raw` (RMW tiled/mip/layered path).
+    Captured { baselines: &'a [(u64, &'a [u8])] },
+}
+
+/// Publishes authored texture runs through a short-lived [`GuestRangeLease`].
+///
+/// A revoked lease becomes [`TextureWritebackOutcome::DiscardedStale`] (D4-texture): the caller
+/// demotes the resident to `Stale` rather than silently rebuilding or publishing by a dead identity.
+fn publish_segments_leased(
+    address: u64,
+    byte_count: u64,
+    segments: &[(u64, &[u8])],
+    baselines: BaselineSource<'_>,
+    write_watch: &GuestTextureWriteWatch,
+    site: GuestWriteSite,
+) -> Result<TextureWritebackOutcome, String> {
+    let lease = GuestRangeLease::acquire(address, byte_count).ok_or_else(|| {
+        format!("guest texture range {address:#x}+{byte_count:#x} has no leasable shared backing")
+    })?;
+    let mut applied_any = false;
+    let mut journal: Vec<(u64, Vec<u8>)> = Vec::with_capacity(segments.len());
+    for (offset, source) in segments {
+        let live_baseline = match baselines {
+            BaselineSource::LiveGuest => {
+                let mut buffer = vec![0_u8; source.len()];
+                let run_address = address.checked_add(*offset).ok_or_else(|| {
+                    format!("texture writeback run address overflows offset={offset:#x}")
+                })?;
+                if !read_guest_shared_backing(run_address, &mut buffer) {
+                    return Err(format!(
+                        "guest texture range {run_address:#x}+{:#x} lost shared backing while capturing lease baseline",
+                        source.len()
+                    ));
+                }
+                Some(buffer)
+            }
+            BaselineSource::Captured { .. } => None,
+        };
+        let baseline: &[u8] = match (&baselines, live_baseline.as_deref()) {
+            (BaselineSource::LiveGuest, Some(bytes)) => bytes,
+            (
+                BaselineSource::Captured {
+                    baselines: captured,
+                },
+                None,
+            ) => {
+                let Some((_, bytes)) =
+                    captured.iter().find(|(run_offset, _)| *run_offset == *offset)
+                else {
+                    return Err(format!(
+                        "texture writeback missing capture baseline for offset={offset:#x}"
+                    ));
+                };
+                if bytes.len() != source.len() {
+                    return Err(format!(
+                        "texture writeback baseline length {} != source {} at offset={offset:#x}",
+                        bytes.len(),
+                        source.len()
+                    ));
+                }
+                *bytes
+            }
+            _ => unreachable!("baseline source pairing"),
+        };
+        match lease.publish_run_if_baseline(*offset, baseline, source) {
+            LeasePublishOutcome::AppliedAtLiveVa | LeasePublishOutcome::AppliedByIdentity => {
+                applied_any = true;
+                journal.push((*offset, source.to_vec()));
+            }
+            LeasePublishOutcome::GuestModified => {
+                // Guest bytes win — same contract as global leased writebacks.
+            }
+            LeasePublishOutcome::Revoked => {
+                trace_discarded_stale_texture_writeback(
+                    address.saturating_add(*offset),
+                    source.len(),
+                    lease.identity(),
+                    guest_shared_backing_identity(
+                        address.saturating_add(*offset),
+                        u64::try_from(source.len()).unwrap_or(0),
+                    ),
+                );
+                return Ok(TextureWritebackOutcome::DiscardedStale);
+            }
+            LeasePublishOutcome::WriteFailed => {
+                return Err(format!(
+                    "guest texture backing write failed address={:#x} bytes={} identity={:?}",
+                    address.saturating_add(*offset),
+                    source.len(),
+                    lease.identity(),
+                ));
+            }
+        }
+    }
+    if !applied_any {
+        // Every run was GuestModified: nothing published, but the lease was live.
+        return Ok(TextureWritebackOutcome::Applied);
+    }
+    let journal_refs: Vec<(u64, &[u8])> = journal
+        .iter()
+        .map(|(offset, bytes)| (*offset, bytes.as_slice()))
+        .collect();
+    crate::presenter::diagnostics::journal_guest_write_segments(site, address, &journal_refs);
+    // A backing write bypasses every armed page, so watches on other aliases of these
+    // bytes would keep validating as clean against content that just changed. Publish the
+    // write to every intersecting watch except the writer's own — a self-writeback must
+    // leave the writer quiescent — then re-baseline its fingerprints.
+    let _ = remu_memory::notify_guest_memory_written_excluding(
+        address,
+        byte_count,
+        &write_watch.cpu_watches(),
+    );
+    for (offset, bytes) in &journal {
+        write_watch.record_content_snapshot(address.saturating_add(*offset), bytes);
+    }
+    Ok(TextureWritebackOutcome::Applied)
+}
+
+fn trace_discarded_stale_texture_writeback(
+    address: u64,
+    byte_count: usize,
+    expected: remu_memory::GuestSharedMappingIdentity,
+    current: Option<remu_memory::GuestSharedMappingIdentity>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DISCARDED: AtomicUsize = AtomicUsize::new(0);
+    let sequence = DISCARDED.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL] discarded stale texture writeback sequence={sequence} lease revoked address={address:#x} bytes={byte_count} expected={expected:?} current={current:?}"
+        );
     }
 }
 
@@ -1502,7 +1713,14 @@ pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(
 
 #[cfg(test)]
 mod content_validation_tests {
-    use super::contiguous_dirty_chunk_runs;
+    use super::{
+        CONTENT_FINGERPRINT_CHUNK_BYTES, TextureWritebackOutcome, contiguous_dirty_chunk_runs,
+        content_fingerprint, write_watched_guest_range,
+    };
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection, GuestRangeLease, LeasePublishOutcome,
+    };
 
     #[test]
     fn coalesces_only_adjacent_dirty_fingerprint_chunks() {
@@ -1511,5 +1729,136 @@ mod content_validation_tests {
             contiguous_dirty_chunk_runs(&[1, 2, 3, 7, 9, 10]),
             vec![(1, 3), (7, 1), (9, 2)]
         );
+    }
+
+    #[test]
+    fn partial_chunk_publish_refingerprints_from_live_guest() {
+        // D3 precondition: a sub-chunk publish must not leave the chunk fingerprint stale.
+        let mut memory =
+            GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing =
+            GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest physical backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("mapping");
+        let watch_bytes = CONTENT_FINGERPRINT_CHUNK_BYTES * 2;
+        // SAFETY: the mapping stays live for the watch's lifetime.
+        let cpu_watch =
+            unsafe { remu_memory::CpuWriteWatch::new(address.get(), watch_bytes).expect("watch") };
+        let watch = super::GuestTextureWriteWatch {
+            address: address.get(),
+            byte_count: watch_bytes,
+            ranges: vec![super::GuestTextureWatchRange {
+                watch: cpu_watch,
+                canonical_address: address.get(),
+            }],
+            content_state: std::sync::Arc::new(std::sync::Mutex::new(
+                super::GuestTextureContentState {
+                    chunk_fingerprints: vec![0; 2],
+                    initialized_chunks: vec![false; 2],
+                    pending_dirty_ranges: Vec::new(),
+                },
+            )),
+        };
+        let mut live = vec![0x11_u8; CONTENT_FINGERPRINT_CHUNK_BYTES as usize];
+        memory.write(address, &live).expect("seed first chunk");
+        let half = CONTENT_FINGERPRINT_CHUNK_BYTES as usize / 2;
+        let published = vec![0xaa_u8; half];
+        // Land the partial publish into guest, then record — the live re-fingerprint path must
+        // see published||remainder and initialize the chunk.
+        memory
+            .write(address, &published)
+            .expect("land published half");
+        live[..half].copy_from_slice(&published);
+        watch.record_content_snapshot(address.get(), &published);
+        let state = watch
+            .content_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state.initialized_chunks[0],
+            "partial publish must initialize the overlapped chunk"
+        );
+        assert_eq!(
+            state.chunk_fingerprints[0],
+            content_fingerprint(&live),
+            "partial chunk must fingerprint the live mapping, not stay stale"
+        );
+        assert!(
+            !state.initialized_chunks[1],
+            "untouched chunk stays uninitialized"
+        );
+    }
+
+    #[test]
+    fn revoked_texture_lease_publish_is_discarded_stale() {
+        let mut memory =
+            GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing =
+            GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest physical backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("mapping");
+        let lease = GuestRangeLease::acquire(address.get(), 64).expect("lease while mapped");
+        let identity = lease.identity();
+        drop(lease);
+        memory
+            .unmap(address, GUEST_PAGE_SIZE)
+            .expect("unmap texture range");
+        let revoked = GuestRangeLease::adopt(address.get(), 64, identity);
+        assert_eq!(
+            revoked.publish_run_if_baseline(0, &[0_u8; 64], &[0x5a_u8; 64]),
+            LeasePublishOutcome::Revoked,
+            "D4: a lease whose backing is gone must revoke, never silent-publish"
+        );
+
+        // Remap and prove the leased writeback path applies when the VA is live.
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("remap");
+        // SAFETY: mapping live until watch drops.
+        let cpu_watch =
+            unsafe { remu_memory::CpuWriteWatch::new(address.get(), 64).expect("watch") };
+        let watch = super::GuestTextureWriteWatch {
+            address: address.get(),
+            byte_count: 64,
+            ranges: vec![super::GuestTextureWatchRange {
+                watch: cpu_watch,
+                canonical_address: address.get(),
+            }],
+            content_state: std::sync::Arc::new(std::sync::Mutex::new(
+                super::GuestTextureContentState {
+                    chunk_fingerprints: vec![0; 1],
+                    initialized_chunks: vec![false; 1],
+                    pending_dirty_ranges: Vec::new(),
+                },
+            )),
+        };
+        let raw = [0x5a_u8; 64];
+        let outcome =
+            write_watched_guest_range(address.get(), &raw, None, None, &watch, None)
+                .expect("publish");
+        assert_eq!(outcome, TextureWritebackOutcome::Applied);
     }
 }

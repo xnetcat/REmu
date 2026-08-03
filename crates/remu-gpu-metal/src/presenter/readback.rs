@@ -16,7 +16,7 @@ use super::{
     retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
     texture_element_layout, unsigned_float_to_f32, unsigned_float_to_srgb_unorm8,
     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
-    write_watched_guest_texture_linear,
+    write_watched_guest_texture_linear, StaleSource, TextureWritebackOutcome,
 };
 use metal::{
     Device, MTLBlitOption, MTLOrigin, MTLPixelFormat, MTLResourceOptions, MTLSize, MTLStorageMode,
@@ -192,13 +192,29 @@ impl MetalPresenter {
             .get_mut(&descriptor)
             .ok_or("resident texture disappeared before its writeback")?;
         let published_bytes = resident.gpu_authored.byte_count();
-        write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-        // Guest RAM and the Metal allocation are identical now: the allocation stays in place,
-        // still the authority for its bytes and owing none of them.
-        resident.clear_gpu_authored();
-        RESIDENT_WRITEBACK_PUBLISHED[trigger.index()].fetch_add(1, Ordering::Relaxed);
-        RESIDENT_WRITEBACK_PUBLISHED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
-        Ok(true)
+        let outcome = write_resident_texture_contents_to_guest(&device, &queue, resident)?;
+        match outcome {
+            TextureWritebackOutcome::Applied => {
+                // Guest RAM and the Metal allocation are identical now: the allocation stays in
+                // place, still the authority for its bytes and owing none of them.
+                resident.clear_gpu_authored();
+                RESIDENT_WRITEBACK_PUBLISHED[trigger.index()].fetch_add(1, Ordering::Relaxed);
+                RESIDENT_WRITEBACK_PUBLISHED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
+                Ok(true)
+            }
+            TextureWritebackOutcome::DiscardedStale => {
+                // D4-texture: a revoked lease must demote loudly, never silently rebuild.
+                RESIDENT_WRITEBACK_DISCARDED[trigger.index()].fetch_add(1, Ordering::Relaxed);
+                RESIDENT_WRITEBACK_DISCARDED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
+                eprintln!(
+                    "[REMu][METAL] demoting resident after revoked texture writeback lease address={:#x} trigger={}",
+                    resident.descriptor.address,
+                    trigger.label(),
+                );
+                resident.demote(StaleSource::GuestMemory);
+                Ok(false)
+            }
+        }
     }
 
     pub(super) fn direct_scanout_needs_initial_clear(&self, address: u64) -> bool {
@@ -1190,9 +1206,9 @@ pub(super) fn write_resident_texture_contents_to_guest(
     device: &Device,
     queue: &metal::CommandQueue,
     resident: &ResidentGuestTexture,
-) -> Result<(), String> {
+) -> Result<TextureWritebackOutcome, String> {
     if !resident.gpu_written() {
-        return Ok(());
+        return Ok(TextureWritebackOutcome::Applied);
     }
     let authored = resident.gpu_authored_offsets();
     if resident.mip_level_count == 1 {
@@ -1250,11 +1266,12 @@ pub(super) fn write_resident_texture_contents_to_guest(
     // The chain snapshot below seeds the published bytes; a guest store between it and the
     // publish would be reverted. Capture the fault generations here so the publish can abort.
     let entry_generations = resident.write_watch.generations();
-    let mut raw = snapshot_watched_guest_range(
+    let baseline = snapshot_watched_guest_range(
         resident.descriptor.address,
         layout.byte_count,
         &resident.write_watch,
     )?;
+    let mut raw = baseline.clone();
     let mut levels = Vec::with_capacity(layout.levels.len());
     for mip_level in 0..resident.mip_level_count {
         levels.push(read_texture_mip_linear(
@@ -1270,6 +1287,7 @@ pub(super) fn write_resident_texture_contents_to_guest(
         resident.descriptor.address,
         &raw,
         authored.as_deref(),
+        Some(&baseline),
         &resident.write_watch,
         Some(&entry_generations),
     )
@@ -1279,7 +1297,7 @@ fn write_layered_resident_texture_contents_to_guest(
     resident: &ResidentGuestTexture,
     linear: &[u8],
     authored: Option<&[(u64, u64)]>,
-) -> Result<(), String> {
+) -> Result<TextureWritebackOutcome, String> {
     let face_raw_bytes = usize::try_from(
         super::guest_texture_byte_count(resident.descriptor)
             .ok_or("layered guest texture face byte count overflows")?,
@@ -1305,11 +1323,12 @@ fn write_layered_resident_texture_contents_to_guest(
         .checked_mul(layer_count)
         .ok_or("layered guest texture raw size overflows")?;
     let entry_generations = resident.write_watch.generations();
-    let mut raw = snapshot_watched_guest_range(
+    let baseline = snapshot_watched_guest_range(
         resident.descriptor.address,
         raw_bytes,
         &resident.write_watch,
     )?;
+    let mut raw = baseline.clone();
     for layer in 0..layer_count {
         let linear_start = layer * face_linear_bytes;
         let raw_start = layer * face_raw_bytes;
@@ -1324,6 +1343,7 @@ fn write_layered_resident_texture_contents_to_guest(
         resident.descriptor.address,
         &raw,
         authored,
+        Some(&baseline),
         &resident.write_watch,
         Some(&entry_generations),
     )
